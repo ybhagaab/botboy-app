@@ -1,0 +1,222 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "prd/feature_experiment.v1",
+  "version": "1.0.0",
+  "family": "prd",
+  "variant": "feature_experiment",
+  "purpose": "Guide a focused feature or experiment specification with testable requirements, controlled exposure, reliable telemetry, decision gates, and safe rollout behavior.",
+  "audience": [
+    "product owner",
+    "engineering and quality teams",
+    "design and analytics partners",
+    "experiment and operational reviewers"
+  ],
+  "required_inputs": [
+    "document_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "stakeholder_source_requirements",
+    "problem_and_evidence",
+    "hypothesis",
+    "decision_supported",
+    "objectives_and_non_goals",
+    "scope_personas_and_eligibility",
+    "use_cases",
+    "control_and_treatment",
+    "requirements",
+    "acceptance_and_test_scenarios",
+    "metric_definitions",
+    "telemetry_plan",
+    "experiment_decision_rules",
+    "rollout_and_rollback_plan"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "document_control",
+      "title": "Document control and status",
+      "requirement": "mandatory",
+      "purpose": "Identify ownership, version, lifecycle state, and approval status."
+    },
+    {
+      "section_id": "source_requirements",
+      "title": "Stakeholder and business source requirements",
+      "requirement": "mandatory",
+      "purpose": "Record the authoritative needs from which use cases and requirements are derived."
+    },
+    {
+      "section_id": "terminology",
+      "title": "Terminology",
+      "requirement": "mandatory",
+      "purpose": "Define stable terms, actors, states, events, and measures."
+    },
+    {
+      "section_id": "problem_value_evidence",
+      "title": "Problem, value, and evidence",
+      "requirement": "mandatory",
+      "purpose": "Explain the observed problem, affected outcomes, and decision relevance."
+    },
+    {
+      "section_id": "objectives_hypothesis",
+      "title": "Objectives, hypothesis, decision, and non-goals",
+      "requirement": "mandatory",
+      "purpose": "State what the experiment tests, which decision it informs, and what is out of scope."
+    },
+    {
+      "section_id": "scope_eligibility_assignment",
+      "title": "Scope, personas, eligibility, exclusions, segmentation, and assignment",
+      "requirement": "mandatory",
+      "purpose": "Define who can enter the experiment and how assignment remains interpretable."
+    },
+    {
+      "section_id": "use_cases_flows",
+      "title": "Use cases and current, proposed, and treatment flows",
+      "requirement": "mandatory",
+      "purpose": "Describe numbered use cases and observable end-to-end behavior."
+    },
+    {
+      "section_id": "control_treatment_exposure",
+      "title": "Control, treatment, exposure, and contamination controls",
+      "requirement": "mandatory",
+      "purpose": "Define variants, exposure semantics, and protections against cross-variant contamination."
+    },
+    {
+      "section_id": "requirements",
+      "title": "Functional and non-functional requirements",
+      "requirement": "mandatory",
+      "purpose": "Specify atomic, necessary, traceable, prioritized, and verifiable behavior."
+    },
+    {
+      "section_id": "event_property_dictionary",
+      "title": "Event and property dictionary",
+      "requirement": "mandatory",
+      "purpose": "Define telemetry events, properties, producers, consumers, and expected states."
+    },
+    {
+      "section_id": "funnel_metrics",
+      "title": "Funnel and metric definitions",
+      "requirement": "mandatory",
+      "purpose": "Define populations, windows, grains, dimensions, comparators, and calculation rules."
+    },
+    {
+      "section_id": "data_quality",
+      "title": "Data-quality and reconciliation checks",
+      "requirement": "mandatory",
+      "purpose": "Specify behavior for missing, duplicate, delayed, inconsistent, and unreconciled telemetry."
+    },
+    {
+      "section_id": "metrics_gates",
+      "title": "Primary, secondary, guardrail metrics, and decision gates",
+      "requirement": "mandatory",
+      "purpose": "Connect measures and quality thresholds to ramp, stop, and final decision rules."
+    },
+    {
+      "section_id": "acceptance_test_traceability",
+      "title": "Acceptance, test matrix, and traceability",
+      "requirement": "mandatory",
+      "purpose": "Link source needs, use cases, requirements, scenarios, telemetry, and verification."
+    },
+    {
+      "section_id": "edge_failure_behavior",
+      "title": "Edge, error, accessibility, and failure behavior",
+      "requirement": "mandatory",
+      "purpose": "Define observable behavior outside the primary success path."
+    },
+    {
+      "section_id": "dependencies_risks_assumptions",
+      "title": "Dependencies, risks, assumptions, and tenets",
+      "requirement": "mandatory",
+      "purpose": "Expose conditions and principles that can change delivery or interpretation."
+    },
+    {
+      "section_id": "verification_signoff",
+      "title": "Verification and stakeholder sign-off",
+      "requirement": "mandatory",
+      "purpose": "Assign verification methods, reviewers, and approval state."
+    },
+    {
+      "section_id": "ramp_rollback_analysis",
+      "title": "Ramp, stop, rollback, analysis, and operational ownership",
+      "requirement": "mandatory",
+      "purpose": "Define safe release controls, analysis timing, recovery, and accountable operators."
+    }
+  ],
+  "narrative_rules": [
+    "Derive each requirement from an authoritative need and a numbered use case.",
+    "Add a requirement only when existing requirements do not cover a valid use case.",
+    "Keep each requirement singular, observable, necessary or explicitly optional, prioritized, and verifiable.",
+    "Separate stakeholder-driven requirements from system-design requirements.",
+    "State the hypothesis, decision, control, treatment, and exposure semantics before interpreting experiment measures.",
+    "Describe conditions before required behavior when a condition applies.",
+    "Keep objective, mechanism, requirement, acceptance result, telemetry, and decision rule distinct.",
+    "Include negative, boundary, accessibility, error, and recovery behavior where applicable."
+  ],
+  "evidence_rules": [
+    "Trace every measure to its definition, population, window, grain, dimensions, comparator, source, freshness, and caveat.",
+    "Keep actual observations, forecasts, assumptions, targets, and commitments in separate evidence states.",
+    "Define treatment exposure independently from downstream outcomes.",
+    "Specify detection and handling for missing, duplicate, delayed, or inconsistent telemetry.",
+    "Do not permit an experiment decision when required data-quality gates fail.",
+    "Link every material claim and decision gate to the claim registry."
+  ],
+  "terminology_rules": [
+    "Use stable identifiers for source needs, use cases, requirements, acceptance criteria, tests, events, metrics, dependencies, and variants.",
+    "Use one defined term for each actor, eligibility state, exposure, outcome, and guardrail.",
+    "Distinguish control, treatment, assignment, eligibility, exposure, conversion, and analysis population.",
+    "Expand acronyms at first use unless an approved glossary marks them as established."
+  ],
+  "formatting_rules": [
+    "Number use cases, requirements, acceptance criteria, test scenarios, events, metrics, and dependencies for traceability.",
+    "Use tables for dictionaries, traceability, test matrices, and aligned variant comparisons.",
+    "Keep causal rationale in prose rather than relying on tables alone.",
+    "Show lifecycle and approval state for requirements and decisions.",
+    "Apply the current organization template before default product-document formatting."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "tenets.v1",
+    "safety_instructions",
+    "migration_and_backfill",
+    "supporting_appendices"
+  ],
+  "hard_fail_rules": [
+    "Block publication when exposure is undefined or contamination controls are missing where needed.",
+    "Block publication when missing, duplicate, delayed, or inconsistent telemetry has no defined behavior.",
+    "Block publication when a requirement is compound, ambiguous, unobservable, unnecessary, or unverifiable.",
+    "Block publication when traceability from source need through verification is missing.",
+    "Block publication when rollout lacks stop or rollback behavior.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical context.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, fact, or commitment is silently introduced.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes a requirement, decision, or protected fact.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "prd.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.feature_experiment",
+      "authority": "source_reference",
+      "fingerprint": "882ed2322280db0befeaf6f5fb433c4ec7ee87f98d763bcb9ca883a46166244d",
+      "reference": "Supplied focused feature and experiment reference"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    }
+  ]
+}

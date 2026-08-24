@@ -1,0 +1,111 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "business_document/adaptive.v1",
+  "version": "1.0.0",
+  "family": "business_document",
+  "variant": "adaptive",
+  "purpose": "Guide an audience-aware business document when the requested format does not require a specialized fixed contract, including one-pagers, alignment briefs, proposals, explainers, content-team briefs, and launch notes.",
+  "audience": [
+    "business and cross-functional stakeholders",
+    "non-technical partner teams",
+    "decision-makers and reviewers",
+    "readers inferred from the owner request"
+  ],
+  "required_inputs": [],
+  "ordered_sections": [
+    {
+      "section_id": "reader_outcome",
+      "title": "Purpose and reader outcome",
+      "requirement": "conditional",
+      "purpose": "Establish what the reader should understand, decide, align on, or do."
+    },
+    {
+      "section_id": "essential_context",
+      "title": "Essential context",
+      "requirement": "conditional",
+      "purpose": "Give only the background needed by the inferred audience."
+    },
+    {
+      "section_id": "core_narrative",
+      "title": "Core narrative",
+      "requirement": "conditional",
+      "purpose": "Develop the main explanation, proposal, update, or argument in the clearest fit-for-purpose structure."
+    },
+    {
+      "section_id": "choices_or_ask",
+      "title": "Choices, recommendation, or ask",
+      "requirement": "conditional",
+      "purpose": "Make a decision, recommendation, requested feedback, or next action explicit when one exists."
+    },
+    {
+      "section_id": "evidence_and_gaps",
+      "title": "Evidence, assumptions, and gaps",
+      "requirement": "conditional",
+      "purpose": "Use available evidence and identify only consequential uncertainty without creating placeholder-heavy prose."
+    },
+    {
+      "section_id": "next_steps",
+      "title": "Next steps",
+      "requirement": "conditional",
+      "purpose": "Record authorized follow-through or the next discussion when it helps the reader."
+    }
+  ],
+  "narrative_rules": [
+    "Infer the audience, purpose, reading context, and desired outcome before choosing the outline.",
+    "Choose the format, length, headings, and level of detail that best serve the reader; do not force every section into every document.",
+    "Start with the takeaway, purpose, proposal, or context the reader needs first.",
+    "Use prose for explanation and causality, and use lists or tables only when they improve scanning or comparison.",
+    "For non-technical audiences, explain impact and choices before implementation detail.",
+    "Ask for clarification only when materially different formats would change the usefulness of the result; otherwise make a bounded planning judgment.",
+    "Do not output a template, drafting commentary, source labels, or empty placeholder sections as the document."
+  ],
+  "evidence_rules": [
+    "Use only source-supported facts and preserve their evidence state and qualifiers.",
+    "Missing data is acceptable in early maturity when it is identified honestly and does not become an invented baseline, target, result, or proof.",
+    "A proposed measure can be useful before a baseline or target exists; label it as proposed and state the material gap.",
+    "Do not convert a recommendation, assumption, forecast, open question, or dependency into an approved decision or commitment.",
+    "Do not invent owners, dates, approvals, classifications, requirements, or document-control values."
+  ],
+  "terminology_rules": [
+    "Use terms the inferred audience can understand and define necessary technical language at first use.",
+    "Use stable names for products, teams, capabilities, choices, and measures.",
+    "Distinguish observed facts, interpretations, proposals, decisions, and commitments."
+  ],
+  "formatting_rules": [
+    "Use a descriptive title supported by the request.",
+    "Use only headings that contain useful content.",
+    "Prefer a brief structure for one-pagers and alignment briefs unless the owner requests detail.",
+    "Place supporting detail after the main takeaway or in an appendix only when needed.",
+    "Apply the current organization template when the owner or authoritative context supplies one."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "tenets.v1",
+    "supporting_appendices"
+  ],
+  "hard_fail_rules": [
+    "Block publication when evidence is fabricated, untraceable, materially strengthened, or assigned a false state.",
+    "Block publication when a date, owner, target, approval, requirement, classification, or commitment is silently introduced.",
+    "Block publication when the intended purpose or reader outcome is too ambiguous to produce a usable document.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when drafting instructions, server labels, or repeated placeholders appear as document content.",
+    "Block publication when language repair changes protected meaning.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "business_document.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.6.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    }
+  ]
+}

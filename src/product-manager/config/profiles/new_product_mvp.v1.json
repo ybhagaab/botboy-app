@@ -1,0 +1,211 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "prd/new_product_mvp.v1",
+  "version": "1.0.0",
+  "family": "prd",
+  "variant": "new_product_mvp",
+  "purpose": "Guide a broad new-product or minimum viable product specification across activated capabilities, with testable requirements, explicit deferred scope, telemetry, and operational release controls.",
+  "audience": [
+    "product owner",
+    "engineering and quality teams",
+    "design, data, and operations partners",
+    "stakeholder approvers"
+  ],
+  "required_inputs": [
+    "document_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "stakeholder_source_requirements",
+    "problem_value_and_evidence",
+    "objectives_success_conditions_and_non_goals",
+    "scope_personas_and_eligibility",
+    "use_cases",
+    "current_and_proposed_flows",
+    "activated_capability_modules",
+    "requirements",
+    "acceptance_and_test_scenarios",
+    "metrics_and_telemetry",
+    "dependencies_risks_and_assumptions",
+    "rollout_and_rollback_plan"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "document_control",
+      "title": "Document control and status",
+      "requirement": "mandatory",
+      "purpose": "Identify ownership, version, lifecycle state, and approval status."
+    },
+    {
+      "section_id": "source_requirements",
+      "title": "Stakeholder and business source requirements",
+      "requirement": "mandatory",
+      "purpose": "Record the authoritative needs that drive the product definition."
+    },
+    {
+      "section_id": "terminology",
+      "title": "Terminology",
+      "requirement": "mandatory",
+      "purpose": "Define stable product, customer, system, state, and measurement terms."
+    },
+    {
+      "section_id": "problem_value_evidence",
+      "title": "Problem, value, and evidence",
+      "requirement": "mandatory",
+      "purpose": "Explain the observed need, affected outcomes, and evidence supporting the product investment."
+    },
+    {
+      "section_id": "objectives_non_goals",
+      "title": "Objectives, success conditions, and non-goals",
+      "requirement": "mandatory",
+      "purpose": "Define intended outcomes and explicit boundaries for the minimum viable scope."
+    },
+    {
+      "section_id": "scope_personas_eligibility",
+      "title": "Scope, personas, and eligibility",
+      "requirement": "mandatory",
+      "purpose": "Identify supported actors, contexts, entry conditions, and excluded scope."
+    },
+    {
+      "section_id": "use_cases_flows",
+      "title": "Use cases and current and proposed flows",
+      "requirement": "mandatory",
+      "purpose": "Describe numbered use cases and observable end-to-end behavior."
+    },
+    {
+      "section_id": "capability_modules",
+      "title": "Activated capability modules",
+      "requirement": "mandatory",
+      "purpose": "Define the objective, flow, requirements, acceptance, telemetry, dependencies, failure behavior, and deferred scope for each activated capability."
+    },
+    {
+      "section_id": "requirements",
+      "title": "Functional and non-functional requirements",
+      "requirement": "mandatory",
+      "purpose": "Specify atomic, necessary, prioritized, traceable, and verifiable behavior."
+    },
+    {
+      "section_id": "acceptance_traceability",
+      "title": "Acceptance, test scenarios, and traceability",
+      "requirement": "mandatory",
+      "purpose": "Connect source needs, use cases, requirements, scenarios, and verification evidence."
+    },
+    {
+      "section_id": "metrics_telemetry_quality",
+      "title": "Metrics, telemetry, and data quality",
+      "requirement": "mandatory",
+      "purpose": "Define success measures, instrumentation, ownership, and behavior when data is incomplete or inconsistent."
+    },
+    {
+      "section_id": "edge_failure_behavior",
+      "title": "Edge, error, accessibility, and failure behavior",
+      "requirement": "mandatory",
+      "purpose": "Specify observable behavior outside the primary success path."
+    },
+    {
+      "section_id": "dependencies_risks_assumptions",
+      "title": "Dependencies, risks, assumptions, and tenets",
+      "requirement": "mandatory",
+      "purpose": "Expose conditions, ownership, mitigations, and principles that affect delivery."
+    },
+    {
+      "section_id": "verification_signoff",
+      "title": "Verification method and stakeholder sign-off",
+      "requirement": "mandatory",
+      "purpose": "Assign verification methods, reviewers, and approval state."
+    },
+    {
+      "section_id": "rollout_rollback_ownership",
+      "title": "Rollout, rollback, and operational ownership",
+      "requirement": "mandatory",
+      "purpose": "Define staged release, recovery, support, and accountable operational ownership."
+    }
+  ],
+  "narrative_rules": [
+    "Derive requirements from authoritative source needs through numbered use cases.",
+    "Add a requirement only when an existing requirement does not cover a valid use case.",
+    "Keep every requirement singular, observable, necessary or explicitly optional, prioritized, and verifiable.",
+    "Separate stakeholder-driven behavior from implementation or system-design constraints.",
+    "Organize broad scope into activated capability modules rather than one undifferentiated requirement list.",
+    "For each activated module, state its objective, flow, requirements, acceptance, telemetry, dependencies, failure behavior, and deferred scope.",
+    "Make minimum viable boundaries and deferred capabilities explicit.",
+    "Describe customer or business value before detailed implementation behavior.",
+    "Include negative, boundary, accessibility, error, and recovery behavior where applicable."
+  ],
+  "evidence_rules": [
+    "Trace material claims to approved sources or visibly labeled assumptions.",
+    "For every metric, retain its definition, population, period, grain, comparator, source, freshness, and caveat.",
+    "Keep observations, targets, forecasts, assumptions, and commitments in separate evidence states.",
+    "Define instrumentation and data-quality behavior for every activated capability where measurement is required.",
+    "Do not infer acceptance, telemetry, or release readiness from source silence.",
+    "Record deferred scope as a decision, not as an implied future commitment."
+  ],
+  "terminology_rules": [
+    "Use stable identifiers for source needs, use cases, requirements, acceptance criteria, tests, metrics, dependencies, and capability modules.",
+    "Use one defined term for each actor, product object, state, flow, and outcome.",
+    "Distinguish minimum viable scope, deferred scope, non-goals, dependencies, and later possibilities.",
+    "Expand acronyms at first use unless an approved glossary marks them as established."
+  ],
+  "formatting_rules": [
+    "Number use cases, requirements, acceptance criteria, test scenarios, metrics, and dependencies for traceability.",
+    "Use a repeatable module structure only for activated capabilities, without creating empty sections for inactive capabilities.",
+    "Use tables for traceability, dictionaries, state behavior, and aligned comparisons.",
+    "Keep rationale and causal reasoning in prose.",
+    "Show lifecycle and approval state for requirements and release decisions.",
+    "Apply the current organization template before default product-document formatting."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "client_navigation_and_discovery",
+    "playback",
+    "content_management_model",
+    "ingestion_and_transcoding",
+    "recommendation",
+    "search",
+    "history",
+    "watchlist",
+    "continue_watching",
+    "moderation_and_operations",
+    "migration_and_backfill",
+    "tenets.v1"
+  ],
+  "hard_fail_rules": [
+    "Block publication when an activated capability lacks its objective, flow, requirements, acceptance, telemetry, dependencies, failure behavior, or deferred scope.",
+    "Block publication when a requirement is compound, ambiguous, unobservable, unnecessary, or unverifiable.",
+    "Block publication when traceability from source need through verification is missing.",
+    "Block publication when rollout lacks rollback and operational ownership.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical context.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, fact, or commitment is silently introduced.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes a requirement, decision, or protected fact.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "prd.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.new_product_mvp",
+      "authority": "source_reference",
+      "fingerprint": "198f4f572a606662a9aa3ef6c9eb69932a53b375ecad71c14f3b6f10dc0681cd",
+      "reference": "Supplied new-product and minimum viable product reference"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    }
+  ]
+}

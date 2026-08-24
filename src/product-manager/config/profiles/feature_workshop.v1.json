@@ -1,0 +1,166 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "business_document/feature_workshop.v1",
+  "version": "1.0.0",
+  "family": "business_document",
+  "variant": "feature_workshop",
+  "purpose": "Guide an evidence-led feature strategy or workshop document from customer and business imperatives to traceable experience cases and roadmap choices.",
+  "audience": [
+    "workshop decision-makers",
+    "product and design stakeholders",
+    "engineering and data partners",
+    "roadmap owners"
+  ],
+  "required_inputs": [
+    "document_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "decisions_sought",
+    "customer_and_business_evidence",
+    "desired_experience_principles",
+    "current_experience",
+    "roadmap_context",
+    "feature_or_experience_cases",
+    "validation_approach"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "purpose_decisions",
+      "title": "Purpose and decisions sought",
+      "requirement": "mandatory",
+      "purpose": "Set the workshop scope and identify the choices participants must make."
+    },
+    {
+      "section_id": "evidence_imperatives",
+      "title": "Evidence and customer or business imperatives",
+      "requirement": "mandatory",
+      "purpose": "Establish the observed needs and consequences that shape the work."
+    },
+    {
+      "section_id": "experience_principles",
+      "title": "Desired-experience principles",
+      "requirement": "mandatory",
+      "purpose": "State the principles used to evaluate cases and resolve tensions."
+    },
+    {
+      "section_id": "current_experience_gaps",
+      "title": "Current experience and gaps",
+      "requirement": "mandatory",
+      "purpose": "Describe present behavior and the evidence-backed gaps to address."
+    },
+    {
+      "section_id": "roadmap_case_overview",
+      "title": "Roadmap and case overview",
+      "requirement": "mandatory",
+      "purpose": "Show how the cases relate to imperatives, principles, and roadmap choices."
+    },
+    {
+      "section_id": "feature_experience_cases",
+      "title": "Feature and experience cases",
+      "requirement": "mandatory",
+      "purpose": "Develop each case from problem and evidence through outcome, mechanism, validation, and roadmap linkage."
+    },
+    {
+      "section_id": "convergence_end_state",
+      "title": "Convergence or end-state case",
+      "requirement": "conditional",
+      "purpose": "Describe how separate cases converge when a shared destination is decision-relevant."
+    },
+    {
+      "section_id": "dependencies_validation",
+      "title": "Cross-case dependencies and validation",
+      "requirement": "mandatory",
+      "purpose": "Identify shared constraints, sequencing, validation, and interactions among cases."
+    },
+    {
+      "section_id": "faq",
+      "title": "FAQ",
+      "requirement": "mandatory",
+      "purpose": "Address material stakeholder questions, unresolved issues, and ownership for resolution."
+    },
+    {
+      "section_id": "evidence_appendices",
+      "title": "Evidence appendices",
+      "requirement": "conditional",
+      "purpose": "Provide detailed support while keeping decision-critical reasoning in the narrative."
+    }
+  ],
+  "narrative_rules": [
+    "State the decisions sought before presenting feature detail.",
+    "Move from evidence to imperative, desired experience, case, validation, and roadmap implication.",
+    "For every case, identify a case ID, problem and evidence, importance, desired customer outcome, proposed mechanism, validation method, and roadmap linkage.",
+    "Let each case use the detail it needs; do not force all cases into mechanically identical blocks.",
+    "Activate technical constraints, data, fallback, experiment, dependency, migration, or convergence content only when relevant.",
+    "Make cross-case tensions, sequencing, and shared dependencies explicit.",
+    "Place an important FAQ answer in the narrative when the decision depends on it."
+  ],
+  "evidence_rules": [
+    "Connect every imperative and case problem to traceable evidence or a visible assumption.",
+    "Distinguish observed outcomes from proposed mechanisms and future targets.",
+    "For metrics, retain definition, population, period, comparator, source, freshness, and caveat.",
+    "State the validation method and decision relevance for each case.",
+    "Do not infer roadmap priority or commitment from source formatting or comments."
+  ],
+  "terminology_rules": [
+    "Use stable names for imperatives, experience principles, cases, roadmap items, and validation measures.",
+    "Give every case a unique durable identifier.",
+    "Use customer-outcome language separately from mechanism or implementation language.",
+    "Expand acronyms at first use unless an approved glossary marks them as established for the audience."
+  ],
+  "formatting_rules": [
+    "Present the roadmap and case overview in a traceable compact format.",
+    "Use a consistent minimum case header while allowing conditional case content.",
+    "Number prioritized FAQ entries and identify owners and dates for unresolved answers.",
+    "Keep core evidence and causal reasoning in the narrative; use appendices for detail.",
+    "Apply the current organization template before default narrative formatting."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "technical_constraints",
+    "data_and_telemetry",
+    "fallback_behavior",
+    "experiment_design",
+    "dependency_and_migration",
+    "convergence_end_state",
+    "tenets.v1"
+  ],
+  "hard_fail_rules": [
+    "Block publication when the decisions sought are missing.",
+    "Block publication when a case lacks its problem or evidence, desired outcome, proposed mechanism, validation method, or roadmap linkage.",
+    "Block publication when roadmap traceability is missing or contradicts the case narrative.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical context.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, priority, or commitment is silently introduced.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes a decision or another protected meaning.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "business_document.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.feature_workshop",
+      "authority": "source_reference",
+      "fingerprint": "20003f30d3a014b8bdd55f64c94e3e89b487c355f4d9de47e6ab87c94bb72d59",
+      "reference": "Supplied feature-workshop reference"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    }
+  ]
+}

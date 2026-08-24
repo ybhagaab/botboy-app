@@ -1,0 +1,187 @@
+{
+  "schema_version": "document-rubric-set.v1",
+  "rubric_set_id": "document_quality.v1",
+  "version": "1.0.0",
+  "publication_policy": {
+    "minimum_total_score": 85,
+    "minimum_category_percent": 70,
+    "hard_failures_allowed": 0
+  },
+  "rubrics": [
+    {
+      "rubric_id": "op.v1",
+      "weight_total": 100,
+      "categories": [
+        {
+          "category_id": "narrative_strategy_coherence",
+          "title": "Narrative and strategy coherence",
+          "weight": 25
+        },
+        {
+          "category_id": "evidence_integrity",
+          "title": "Evidence integrity",
+          "weight": 25
+        },
+        {
+          "category_id": "theme_initiative_resource_linkage",
+          "title": "Theme/initiative/resource linkage",
+          "weight": 20
+        },
+        {
+          "category_id": "voice_language",
+          "title": "Voice and language",
+          "weight": 15
+        },
+        {
+          "category_id": "executive_utility",
+          "title": "Executive utility",
+          "weight": 10
+        },
+        {
+          "category_id": "format_navigation",
+          "title": "Format/navigation",
+          "weight": 5
+        }
+      ]
+    },
+    {
+      "rubric_id": "business_document.v1",
+      "weight_total": 100,
+      "categories": [
+        {
+          "category_id": "decision_clarity",
+          "title": "Decision clarity",
+          "weight": 25
+        },
+        {
+          "category_id": "customer_business_consequence",
+          "title": "Customer/business consequence",
+          "weight": 20
+        },
+        {
+          "category_id": "options_tradeoffs",
+          "title": "Options and tradeoffs",
+          "weight": 20
+        },
+        {
+          "category_id": "evidence",
+          "title": "Evidence",
+          "weight": 15
+        },
+        {
+          "category_id": "recommendation_actions",
+          "title": "Recommendation/actions",
+          "weight": 10
+        },
+        {
+          "category_id": "language_format",
+          "title": "Language/format",
+          "weight": 10
+        }
+      ]
+    },
+    {
+      "rubric_id": "prd.v1",
+      "weight_total": 100,
+      "categories": [
+        {
+          "category_id": "requirement_testability",
+          "title": "Requirement testability",
+          "weight": 30
+        },
+        {
+          "category_id": "traceability",
+          "title": "Traceability",
+          "weight": 20
+        },
+        {
+          "category_id": "scope_flow",
+          "title": "Scope/flow",
+          "weight": 15
+        },
+        {
+          "category_id": "measurement",
+          "title": "Measurement",
+          "weight": 15
+        },
+        {
+          "category_id": "risk_rollout",
+          "title": "Risk/rollout",
+          "weight": 10
+        },
+        {
+          "category_id": "language_format",
+          "title": "Language/format",
+          "weight": 10
+        }
+      ]
+    },
+    {
+      "rubric_id": "user_stories.v1",
+      "weight_total": 100,
+      "categories": [
+        {
+          "category_id": "schema",
+          "title": "Schema",
+          "weight": 25
+        },
+        {
+          "category_id": "acceptance_testability",
+          "title": "Acceptance testability",
+          "weight": 25
+        },
+        {
+          "category_id": "traceability",
+          "title": "Traceability",
+          "weight": 20
+        },
+        {
+          "category_id": "story_quality",
+          "title": "Story quality",
+          "weight": 20
+        },
+        {
+          "category_id": "workbook_hygiene",
+          "title": "Workbook hygiene",
+          "weight": 10
+        }
+      ]
+    },
+    {
+      "rubric_id": "email.v1",
+      "weight_total": 100,
+      "categories": [
+        {
+          "category_id": "clear_answer_ask",
+          "title": "Clear answer/ask",
+          "weight": 25
+        },
+        {
+          "category_id": "audience_recipient_correctness",
+          "title": "Audience and recipient correctness",
+          "weight": 20
+        },
+        {
+          "category_id": "action_ownership_deadlines",
+          "title": "Action ownership/deadlines",
+          "weight": 20
+        },
+        {
+          "category_id": "concision_mobile_readability",
+          "title": "Concision and mobile readability",
+          "weight": 15
+        },
+        {
+          "category_id": "evidence_context_sufficiency",
+          "title": "Evidence/context sufficiency",
+          "weight": 10
+        },
+        {
+          "category_id": "tone_classification_mechanics",
+          "title": "Tone, classification, and mechanics",
+          "weight": 10
+        }
+      ]
+    }
+  ]
+}

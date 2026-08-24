@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# OS files
+.DS_Store
+**/.DS_Store
+
+# Environment & secrets (credentials live in ~/.personal-productivity-tracker/)
+.env
+**/.env
+
+# Logs & databases (never in the repo; app data lives in the home directory)
+*.log
+*.db
+*.db-journal
+*.db-wal
+
+# Compiled native helper (rebuilt by scripts/bootstrap-deps.mjs)
+native/vision-ocr/bin/
+
+# Package locks (fresh resolve per machine, matches dev repo policy)
+package-lock.json

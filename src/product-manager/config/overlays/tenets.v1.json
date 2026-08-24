@@ -1,0 +1,41 @@
+{
+  "schema_version": "writing-overlay.v1",
+  "overlay_id": "tenets.v1",
+  "version": "1.0.0",
+  "overlay_type": "module",
+  "purpose": "Create and validate a short prioritized set of durable principles that helps a team choose among plausible options.",
+  "rules": [
+    "Start each tenet with a short phrase that is easy to remember.",
+    "Express one primary belief or decision principle per tenet.",
+    "Explain the belief and its customer or business rationale.",
+    "Identify a real tradeoff or tie-break that the tenet resolves.",
+    "State scope and a meaningful boundary or counterexample.",
+    "Use positive present-tense language that guides action without becoming a command.",
+    "Make each tenet specific enough to identify the relevant team or domain.",
+    "Avoid acronyms, jargon, idioms, slogans, roadmap items, goals, and restatements of broad company principles.",
+    "Exclude statements that no reasonable team would contest.",
+    "Order tenets by priority and use stable identifiers.",
+    "Prefer seven or fewer tenets; record a rationale when the set is larger.",
+    "Assign an owner, version, and review date so learning can update the set."
+  ],
+  "hard_fail_rules": [
+    "Reject a tenet that combines unrelated principles.",
+    "Reject a tenet that does not resolve a choice or tradeoff.",
+    "Reject a tenet that only names a customer group, future project, goal, or slogan.",
+    "Reject a tenet that duplicates another tenet in the active set.",
+    "Reject a tenet that lacks rationale, scope, boundary, priority, version, owner, or review date.",
+    "Reject a set above seven tenets when no rationale is recorded."
+  ],
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "amazon.writing_hub.tenets",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Tenets/"
+    }
+  ]
+}

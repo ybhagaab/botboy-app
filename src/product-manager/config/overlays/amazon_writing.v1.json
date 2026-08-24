@@ -1,0 +1,94 @@
+{
+  "schema_version": "writing-overlay.v1",
+  "overlay_id": "amazon_writing.v1",
+  "version": "1.1.0",
+  "overlay_type": "writing",
+  "purpose": "Apply the Amazon writing register — sentence-level style, Global English, and reader voice — plus audience-first narrative, evidence, editing, review, and formatting guidance, while allowing the selected document profile and current organization template to control structure.",
+  "rules": [
+    "Sentence-level register defines Amazon writing. Apply the register rules below to every sentence of narrative prose; when a generic style habit conflicts with them, the register wins.",
+    "Keep sentences under about 25 words with one idea each; break multi-clause sentences apart.",
+    "Make the paragraph the unit of composition: open with a topic sentence, support it, and close on the consequence; one topic per paragraph.",
+    "Write in the active voice (subject-verb-object). Use the passive only when the object is the true focus, the actor is unknown, or naming the actor would read as blame.",
+    "Replace hedging weasel words (should, might, could, often, generally, usually, significant, some, most, soon, better, faster) with data or a statement of intent: \"This affects 23% of sellers\", not \"a significant proportion of sellers may be affected\". Genuine obligations keep MUST or MUST NOT per the STE mode.",
+    "Prefer data and actuals over adjectives and adverbs: \"Sales grew 450bps from $X to $Y in Q4\", not \"sales grew quickly\". Use a comparative or superlative only with the underlying numbers shown.",
+    "Delete filler: redundant pairs (each and every), empty qualifiers (actually, really, very, basically, somewhat), and inflated phrases (\"in order to\" becomes \"to\"; \"due to the fact that\" becomes \"because\"; delete \"note that\", \"please\", and \"I want to point out that\").",
+    "Assert directly and in positive form: delete indirect openers such as \"I believe\" or \"we would like to\", and state what is true or what to do. Reserve negation for denial or antithesis (\"customer obsessed, not customer driven\").",
+    "Choose strong simple verbs: rewrite nominalizations (\"no redeployment occurs\" becomes \"does not redeploy\"), helper-verb chains (\"you have to enter\" becomes \"enter\"), and \"there are\" or \"it is\" openings.",
+    "Write Global English in American spelling: after (not once), might or can (not may), because (not since, as, or due to), although (not while), only (not just), through or by using (not via).",
+    "Avoid Latinisms: write \"for example\" (not e.g.), \"that is\" (not i.e.), \"and so on\" (not etc.), \"compared to\" (not vs. or versus). \"Per\" stays only in set units such as queries per second.",
+    "Replace jargon with plain words: use (not leverage or utilize), high-performing (not performant), environment (not ecosystem), start (not commence), get (not obtain), help (not facilitate); avoid best-in-class and similar overpromises.",
+    "Keep optional clarifying words — that, articles, and if/then pairs — even at the cost of a word or two; clarity for second-language readers outranks word-count economy.",
+    "Use one term per concept, defined at first use. Hyphenate compound adjectives before nouns (third-party sites, 30-day period). Never write \"(s)\" plurals; use the plural form or \"one or more\".",
+    "Speak to the reader in the second person and from the customer's point of view: \"With X, you can…\" or \"Use X to…\", never \"X allows/enables/lets you…\". Enable and disable apply to features and settings, never to people.",
+    "Put the goal before the task in instructions: \"To connect to your gateway, first get the IP address\", not \"Get the IP address as the first step in connecting\".",
+    "Prefer narrative prose over bullet lists; carry short enumerations inline as (a) …, (b) …, (c) … within the sentence, the way most Amazon documents do. Reserve a vertical numbered list for procedures where sequence or priority genuinely matters, and keep every item a complete sentence.",
+    "State the document's date near the title and use the required confidentiality handling; exports add the Amazon Confidential footer and page numbers automatically, so never hand-write page furniture in the body.",
+    "Lead with the decision, takeaway, recommendation, request, or purpose.",
+    "Build an outline and evidence plan before drafting prose.",
+    "Review authoritative prior documents before creating a new narrative.",
+    "Support material conclusions with traceable evidence or a clearly identified assumption.",
+    "Write for a busy reader who does not have prior topic context.",
+    "Explain important alternatives, tradeoffs, tensions, risks, and disagreement.",
+    "Close with actions, owners, decisions, or next steps.",
+    "Remove content that does not improve understanding or change a decision.",
+    "Unify multi-author contributions into one consistent voice.",
+    "Seek critique from reviewers with varied relevant perspectives.",
+    "Define acronyms at first use unless the audience glossary approves them.",
+    "Keep decision-critical reasoning in the narrative and supporting detail in appendices.",
+    "Make the narrative understandable without requiring an appendix.",
+    "Use a concise FAQ for difficult or unresolved stakeholder questions when the profile calls for one.",
+    "Answer a yes-or-no FAQ directly before explanation.",
+    "For an unresolved material question, state the owner, resolution method, and expected decision date.",
+    "Apply a current organization-specific template before generic page, typography, or layout defaults.",
+    "Use readable typography, reviewer space, page identifiers, required handling marks, and headings that remain with their following content when no stricter template applies."
+  ],
+  "hard_fail_rules": [
+    "Block publication when decision-critical reasoning exists only in an appendix.",
+    "Block publication when a material conclusion relies on fabricated evidence or an unlabeled assumption.",
+    "Block publication when the stated recommendation, ask, or purpose is absent from a decision-oriented artifact.",
+    "Block publication when an unresolved question that can change the decision is hidden rather than recorded with an owner and resolution path.",
+    "Block publication when a current organization template or required confidentiality marking is knowingly ignored."
+  ],
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "amazon.writing_style_guidelines.owner_copy",
+      "authority": "amazon_tier_a",
+      "reference": "Amazon Writing Style Guidelines (owner-provided DOCX, folded 2026-08-20): sentence-level register, Global English, customer-centric voice, document mechanics"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    },
+    {
+      "source_id": "amazon.writing_hub.operational_plans",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/OP/"
+    },
+    {
+      "source_id": "amazon.writing_hub.tenets",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Tenets/"
+    },
+    {
+      "source_id": "amazon.writing_hub.email",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Email/"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    },
+    {
+      "source_id": "amazon.writing_tips",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/EC2/ReservedInstances/SDETraining/TipsForWritingInAmazon/"
+    }
+  ]
+}

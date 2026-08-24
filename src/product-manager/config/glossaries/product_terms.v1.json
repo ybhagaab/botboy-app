@@ -1,0 +1,27 @@
+{
+  "schema_version": "product-glossary.v1",
+  "glossary_id": "product_terms.v1",
+  "version": "1.0.0",
+  "purpose": "Store owner-approved technical nouns and verbs for product-document language checks.",
+  "approval_required": true,
+  "allowed_term_types": [
+    "technical_noun",
+    "technical_verb"
+  ],
+  "required_entry_fields": [
+    "term",
+    "term_type",
+    "approved_definition",
+    "approved_forms",
+    "part_of_speech",
+    "subject_field",
+    "allowed_contexts",
+    "prohibited_synonyms",
+    "source",
+    "owner",
+    "approval_state",
+    "version",
+    "review_date"
+  ],
+  "terms": []
+}

@@ -1,0 +1,152 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "user_stories_workbook.v1",
+  "version": "1.0.0",
+  "family": "prd_artifact",
+  "variant": "user_stories_workbook",
+  "purpose": "Guide a clean, traceable user-story workbook with durable IDs, controlled fields, observable acceptance outcomes, and preserved ingestion provenance.",
+  "audience": [
+    "product owner",
+    "engineering and quality teams",
+    "delivery planners",
+    "stakeholder reviewers"
+  ],
+  "required_inputs": [
+    "authoritative_overview",
+    "source_requirements",
+    "controlled_workstreams",
+    "controlled_personas",
+    "stories",
+    "acceptance_criteria",
+    "source_provenance"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "number",
+      "title": "No.",
+      "requirement": "mandatory",
+      "purpose": "Store a unique, immutable positive-integer identifier as text."
+    },
+    {
+      "section_id": "workstream",
+      "title": "Workstream",
+      "requirement": "mandatory",
+      "purpose": "Classify the story with an approved workstream value."
+    },
+    {
+      "section_id": "feature",
+      "title": "Feature",
+      "requirement": "mandatory",
+      "purpose": "Name the capability with a concise noun phrase."
+    },
+    {
+      "section_id": "persona",
+      "title": "As a...",
+      "requirement": "mandatory",
+      "purpose": "Store an approved persona without an article."
+    },
+    {
+      "section_id": "want",
+      "title": "I want...",
+      "requirement": "mandatory",
+      "purpose": "State the desired behavior as a concise fragment."
+    },
+    {
+      "section_id": "outcome",
+      "title": "So that...",
+      "requirement": "mandatory",
+      "purpose": "State the intended customer or business outcome as a concise fragment."
+    },
+    {
+      "section_id": "priority",
+      "title": "Priority",
+      "requirement": "mandatory",
+      "purpose": "Record one approved priority value."
+    },
+    {
+      "section_id": "acceptance_criteria",
+      "title": "Acceptance Criteria",
+      "requirement": "mandatory",
+      "purpose": "Define observable success and applicable boundary, negative, or failure behavior."
+    },
+    {
+      "section_id": "notes",
+      "title": "Notes",
+      "requirement": "conditional",
+      "purpose": "Carry traceability, dependencies, evidence, telemetry, or source references when needed."
+    }
+  ],
+  "narrative_rules": [
+    "Keep each story focused on one persona, one desired behavior, and one outcome.",
+    "Store the persona without an article and let the renderer choose the correct article.",
+    "Write the desired behavior and outcome as fragments without terminal punctuation.",
+    "Use acceptance criteria that describe observable and falsifiable outcomes.",
+    "Include negative, boundary, and failure behavior when it applies.",
+    "Do not treat visual formatting, hidden rows, strike-through, comments, or undeclared markers as approved semantic truth.",
+    "Quarantine incomplete or ambiguous source rows and propose repairs without silently synthesizing content."
+  ],
+  "evidence_rules": [
+    "Preserve workbook, sheet, row, visibility, strike, style, formula, displayed value, undeclared columns, and review markers during ingestion.",
+    "Keep requirement IDs, dependencies, evidence, telemetry, and source references in Notes when present.",
+    "Do not renumber durable story IDs to close gaps.",
+    "Do not infer priority, acceptance, deletion, or delivery status from visual state alone.",
+    "Do not copy source-specific story facts into a new workbook."
+  ],
+  "terminology_rules": [
+    "Use controlled vocabularies for Workstream and persona.",
+    "Use only P0, P1, P2, or Decide for Priority.",
+    "Keep Feature as a concise noun phrase.",
+    "Use one stable term for each actor, behavior, outcome, and referenced requirement.",
+    "Treat the normalized tuple of Workstream, Feature, persona, desired behavior, and outcome as the duplicate key."
+  ],
+  "formatting_rules": [
+    "Export columns in this exact order: No., Workstream, Feature, As a..., I want..., So that..., Priority, Acceptance Criteria, Notes.",
+    "Require columns A through H and include Notes as the optional ninth column.",
+    "Use a dark-blue header with white wrapped text.",
+    "Top-align and wrap body cells, and emphasize IDs and feature names.",
+    "Freeze the pane at A2.",
+    "Preserve source column-width intent without copying source-specific data or status colors.",
+    "Do not export undeclared review columns in version 1."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "notes_traceability",
+    "ingestion_provenance",
+    "review_quarantine"
+  ],
+  "hard_fail_rules": [
+    "Block export when the column schema or order is wrong.",
+    "Block export when any required column from A through H is missing.",
+    "Block export when an ID is missing, duplicated, mutable, or not positive-integer text.",
+    "Block export when a hard duplicate key is present.",
+    "Block export when Priority is not P0, P1, P2, or Decide.",
+    "Block export when required acceptance criteria are missing or silently synthesized.",
+    "Block export when undeclared columns are silently interpreted or included in the version 1 output.",
+    "Block export when evidence or source provenance is fabricated or mislabeled.",
+    "Block export when source-specific sample facts appear in a new artifact.",
+    "Block export when language repair changes story or acceptance meaning.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "user_stories.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.user_stories_workbook",
+      "authority": "source_reference",
+      "fingerprint": "65dd687a4e9caaaebe100588f5244d37ad51fdf1f1ee2afbeabd89748488ca7e",
+      "reference": "Supplied user-story workbook reference"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    }
+  ]
+}

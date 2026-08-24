@@ -1,0 +1,166 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "prd/phase_iteration.v1",
+  "version": "1.0.0",
+  "family": "prd",
+  "variant": "phase_iteration",
+  "purpose": "Guide a phase specification that distinguishes inherited behavior from deliberate deltas and covers compatibility, regression, measurement, and safe release.",
+  "audience": [
+    "product owner",
+    "engineering and quality teams",
+    "data and operations partners",
+    "stakeholder approvers"
+  ],
+  "required_inputs": [
+    "document_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "stakeholder_source_requirements",
+    "phase_identity",
+    "prior_phase_baseline",
+    "phase_objective",
+    "prior_learning_or_exception",
+    "inherited_behavior_register",
+    "delta_register",
+    "changed_flows",
+    "added_or_modified_requirements",
+    "compatibility_and_regression_plan",
+    "delta_metrics_and_telemetry",
+    "rollout_and_rollback_plan"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "phase_identity_baseline",
+      "title": "Phase identity and inherited baseline",
+      "requirement": "mandatory",
+      "purpose": "Record document control, authoritative source requirements, terminology, prior-phase scope, and approval status."
+    },
+    {
+      "section_id": "phase_objective_rationale",
+      "title": "Phase objective and rationale",
+      "requirement": "mandatory",
+      "purpose": "Explain the intended outcome and connect prior learning or an explicit no-learning exception to the phase decision."
+    },
+    {
+      "section_id": "inherited_behavior_register",
+      "title": "Inherited-behavior register",
+      "requirement": "mandatory",
+      "purpose": "Identify behavior that remains authoritative and unchanged for this phase."
+    },
+    {
+      "section_id": "delta_register",
+      "title": "Delta register",
+      "requirement": "mandatory",
+      "purpose": "Classify each affected behavior as modified, added, deprecated, or removed and state its rationale."
+    },
+    {
+      "section_id": "changed_flows",
+      "title": "Changed flows",
+      "requirement": "mandatory",
+      "purpose": "Show how the phase changes observable customer, system, or operational flows."
+    },
+    {
+      "section_id": "changed_requirements",
+      "title": "Added and modified requirements",
+      "requirement": "mandatory",
+      "purpose": "Specify atomic, traceable, prioritized, and verifiable changes with acceptance and test scenarios."
+    },
+    {
+      "section_id": "compatibility_migration_regression",
+      "title": "Compatibility, migration, and regression behavior",
+      "requirement": "mandatory",
+      "purpose": "Define coexistence, transition, preserved behavior, failure handling, accessibility, and regression coverage."
+    },
+    {
+      "section_id": "delta_metrics_telemetry",
+      "title": "Delta metrics and telemetry",
+      "requirement": "mandatory",
+      "purpose": "Measure changed outcomes and verify that inherited behavior remains within guardrails."
+    },
+    {
+      "section_id": "rollout_rollback_decisions",
+      "title": "Rollout, rollback, operational ownership, and open decisions",
+      "requirement": "mandatory",
+      "purpose": "Define release control, recovery, verification, sign-off, owners, and unresolved choices."
+    }
+  ],
+  "narrative_rules": [
+    "Organize the document around inherited behavior and explicit deltas rather than restating the full prior specification.",
+    "Connect prior learning to the phase decision and then to each delta, or record an approved no-prior-learning exception.",
+    "Assign every affected behavior exactly one lifecycle state: inherited unchanged, modified, added, deprecated, or removed.",
+    "Derive added or modified requirements from authoritative source needs and numbered use cases.",
+    "Keep each changed requirement singular, observable, necessary or explicitly optional, prioritized, and verifiable.",
+    "Explain compatibility and regression consequences for both changed and inherited behavior.",
+    "Separate stakeholder-driven deltas from system-design implementation choices.",
+    "Include negative, boundary, accessibility, error, migration, and recovery behavior where applicable."
+  ],
+  "evidence_rules": [
+    "Trace each delta to a source need, learning, decision, use case, requirement, test, and measure as applicable.",
+    "Keep prior results, current observations, assumptions, targets, and commitments in separate evidence states.",
+    "For delta measures, retain definition, population, period, grain, comparator, source, freshness, and caveat.",
+    "Use explicit evidence to show whether inherited behavior remains within its guardrails.",
+    "Do not invent prior-phase learning when none is available; use the documented exception path."
+  ],
+  "terminology_rules": [
+    "Use stable identifiers for inherited behaviors, deltas, source needs, use cases, requirements, tests, metrics, and dependencies.",
+    "Use only the defined lifecycle states for affected behavior.",
+    "Distinguish inherited baseline, compatibility behavior, migration behavior, regression coverage, and new scope.",
+    "Expand acronyms at first use unless an approved glossary marks them as established."
+  ],
+  "formatting_rules": [
+    "Use separate registers for inherited behavior and deltas.",
+    "Show old and new behavior together when a comparison is required to understand a change.",
+    "Number requirements, acceptance criteria, tests, metrics, and dependencies for traceability.",
+    "Use tables for lifecycle state, traceability, compatibility, migration, and regression coverage.",
+    "Keep rationale and causal reasoning in prose.",
+    "Apply the current organization template before default product-document formatting."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "tenets.v1",
+    "migration_and_backfill",
+    "deprecation_and_removal",
+    "supporting_appendices"
+  ],
+  "hard_fail_rules": [
+    "Block publication when changed behavior lacks an inheritance or delta lifecycle state.",
+    "Block publication when neither a learning-to-decision-to-delta chain nor an approved no-prior-learning exception exists.",
+    "Block publication when an added or modified requirement is compound, ambiguous, unobservable, or unverifiable.",
+    "Block publication when traceability from source need through verification is missing for a changed behavior.",
+    "Block publication when rollout lacks rollback, compatibility, or regression coverage.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical context.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, fact, or commitment is silently introduced.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes a requirement, decision, or protected fact.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "prd.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.phase_iteration",
+      "authority": "source_reference",
+      "fingerprint": "9bb931cfb3d61f158e0a60f5e9a2775f1f2155be05e221a8a880952f98e35b58",
+      "reference": "Supplied phase-iteration reference"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    }
+  ]
+}

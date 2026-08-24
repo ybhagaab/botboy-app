@@ -1,0 +1,34 @@
+{
+  "schema_version": "writing-overlay.v1",
+  "overlay_id": "asd_ste100_issue9.v1",
+  "version": "1.0.0",
+  "overlay_type": "language",
+  "purpose": "Provide metadata for deterministic ASD-STE100 Issue 9 checking without embedding the protected standard or its dictionary.",
+  "rules": [
+    "implementation_status: metadata_only; machine-readable rule and dictionary indexes, deterministic checking, tests, exception handling, and human review remain prerequisites",
+    "source_issue: 9",
+    "source_issue_date: 2025-01-15",
+    "source_document_sha256: 40d66f0cea84d1fff67f36d560c04eab4034c6bcf64014d43bd6d4c19795f3f0",
+    "check_categories: words, multi-word nouns, verbs, sentences, procedural writing, descriptive writing, safety instructions, punctuation and word counting, writing practices, general recommendations",
+    "segment_classes: heading, descriptive prose, procedural instruction, safety instruction, requirement, acceptance criterion, table cell, label, code, identifier, citation, quoted source, proper name, unit or measure",
+    "enforcement_modes: off, advisory, enforced_sections, enforced_full",
+    "protected_segments: code, identifiers, citations, and exact quotations are classified and reported but are not subject to ordinary rewriting",
+    "source_handling: keep the official source and potentially redistributable derivatives outside committed source control until distribution rights are confirmed",
+    "approval_prerequisites: verified local source fingerprint, human-verified rule and dictionary indexes, versioned parser and checker, approved product glossary, approved exception register, configured applicability policy, passing tests, and required human review"
+  ],
+  "hard_fail_rules": [
+    "Do not claim ASD certification, ASD approval, or guaranteed conformance from generated text or metadata alone.",
+    "Do not report whole-document internal conformance unless enforced_full completed with an approved bundle, applicable checks, approved glossary and exceptions, and required human approval.",
+    "Do not report section-level conformance outside the configured enforced sections.",
+    "Do not mark human review approved while review is pending or absent.",
+    "Do not accept an automated rewrite that changes a protected fact, decision, requirement, target, owner, date, or commitment."
+  ],
+  "source_manifest": [
+    {
+      "source_id": "asd-ste100.issue9",
+      "authority": "official_standard",
+      "fingerprint": "40d66f0cea84d1fff67f36d560c04eab4034c6bcf64014d43bd6d4c19795f3f0",
+      "reference": "ASD-STE100 Issue 9; issue date 2025-01-15; verified local external source"
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "schema_version": "profile-validator-catalog.v1",
+  "validator_id": "profile_rules.v1",
+  "version": "1.0.0",
+  "checks": [
+    {
+      "code": "CFG001",
+      "category": "configuration",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "The selected profile and overlays satisfy their declared runtime schemas."
+    },
+    {
+      "code": "CTX001",
+      "category": "context",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Required authoritative overview context is present or an approved exception is recorded."
+    },
+    {
+      "code": "EVD001",
+      "category": "evidence",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Material claims are traceable and include required population, period, and source context."
+    },
+    {
+      "code": "EVD002",
+      "category": "evidence",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Evidence states are explicit and are not converted into a stronger state."
+    },
+    {
+      "code": "DOC001",
+      "category": "consistency",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Narrative, tables, registers, and appendices contain no unresolved material contradiction."
+    },
+    {
+      "code": "DOC002",
+      "category": "authority",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "No fact, owner, date, target, agreement, or commitment is introduced without authority."
+    },
+    {
+      "code": "SRC001",
+      "category": "source_fidelity",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "A new artifact contains no source-specific sample facts or accidental formatting artifacts."
+    },
+    {
+      "code": "SEM001",
+      "category": "semantic_integrity",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Automated repair preserves protected facts, decisions, requirements, targets, and commitments."
+    },
+    {
+      "code": "STE001",
+      "category": "language_status",
+      "severity": "block",
+      "profile_selector": "*",
+      "summary": "Any language-conformance status is limited to the configured scope and approved prerequisites."
+    },
+    {
+      "code": "OP001",
+      "category": "operating_plan",
+      "severity": "block",
+      "profile_selector": "op_roadmap_vision.v1",
+      "summary": "Themes connect to goals and initiatives, targets are explained, and resource asks state consequences."
+    },
+    {
+      "code": "BUS001",
+      "category": "business_decision",
+      "severity": "block",
+      "profile_selector": "business_document/business_decision.v1",
+      "summary": "The decision, invariants, comparable options, supported recommendation, and actions are present."
+    },
+    {
+      "code": "WRK001",
+      "category": "feature_workshop",
+      "severity": "block",
+      "profile_selector": "business_document/feature_workshop.v1",
+      "summary": "Every case connects evidence, outcome, mechanism, validation, and roadmap linkage."
+    },
+    {
+      "code": "PRD001",
+      "category": "requirements",
+      "severity": "block",
+      "profile_selector": "prd/*",
+      "summary": "Requirements are atomic, observable, traceable, prioritized, and verifiable, with rollback coverage."
+    },
+    {
+      "code": "EXP001",
+      "category": "experiment",
+      "severity": "block",
+      "profile_selector": "prd/feature_experiment.v1",
+      "summary": "Exposure, contamination controls, telemetry failure behavior, and data-quality gates are defined."
+    },
+    {
+      "code": "MVP001",
+      "category": "mvp_modules",
+      "severity": "block",
+      "profile_selector": "prd/new_product_mvp.v1",
+      "summary": "Each activated capability includes objective, flow, requirements, acceptance, telemetry, dependencies, failure behavior, and deferred scope."
+    },
+    {
+      "code": "PHS001",
+      "category": "phase_delta",
+      "severity": "block",
+      "profile_selector": "prd/phase_iteration.v1",
+      "summary": "Changed behavior has one lifecycle state and a learning-to-decision-to-delta chain or approved exception."
+    },
+    {
+      "code": "WBK001",
+      "category": "workbook",
+      "severity": "block",
+      "profile_selector": "user_stories_workbook.v1",
+      "summary": "Column order, required fields, durable IDs, duplicate keys, priorities, and acceptance criteria are valid."
+    },
+    {
+      "code": "EML001",
+      "category": "email",
+      "severity": "block",
+      "profile_selector": "communication/email.v1",
+      "summary": "The ask or answer, recipient roles, owners, deadlines, sensitivity handling, and explicit send approval are valid."
+    }
+  ]
+}

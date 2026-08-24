@@ -1,0 +1,191 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "op_roadmap_vision.v1",
+  "version": "1.0.0",
+  "family": "operating_plan",
+  "variant": "op_roadmap_vision",
+  "purpose": "Guide an operating plan, roadmap, or vision narrative that links direction, evidence, initiatives, goals, and resource choices.",
+  "audience": [
+    "executive decision-makers",
+    "planning stakeholders",
+    "initiative owners",
+    "finance and resource reviewers"
+  ],
+  "required_inputs": [
+    "plan_mode",
+    "planning_horizon",
+    "document_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "mission_or_vision",
+    "current_state_evidence",
+    "goals",
+    "strategy_themes",
+    "key_initiatives",
+    "decision_or_recommendation"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "document_control",
+      "title": "Document control",
+      "requirement": "mandatory",
+      "purpose": "Identify the plan mode, horizon, owner, version, and approval status."
+    },
+    {
+      "section_id": "purpose_mission_vision",
+      "title": "Purpose, mission, and vision",
+      "requirement": "mandatory",
+      "purpose": "State the team's purpose and the direction this plan supports."
+    },
+    {
+      "section_id": "background_context",
+      "title": "Background and operating context",
+      "requirement": "mandatory",
+      "purpose": "Give an unfamiliar reader the context needed to assess the plan."
+    },
+    {
+      "section_id": "business_summary",
+      "title": "Financial or business summary",
+      "requirement": "conditional",
+      "purpose": "Summarize business performance and economics when they affect the decision."
+    },
+    {
+      "section_id": "current_situation",
+      "title": "Current situation and learnings",
+      "requirement": "mandatory",
+      "purpose": "Compare current performance with relevant expectations and explain highlights, misses, and lessons."
+    },
+    {
+      "section_id": "goals_mental_model",
+      "title": "Goals and operating mental model",
+      "requirement": "mandatory",
+      "purpose": "Define measurable outcomes and the model used to organize the plan."
+    },
+    {
+      "section_id": "strategy_portfolio",
+      "title": "Strategy portfolio and themes",
+      "requirement": "mandatory",
+      "purpose": "Describe the limited set of strategic choices and how the themes relate."
+    },
+    {
+      "section_id": "initiatives_plans",
+      "title": "Key initiatives and plans",
+      "requirement": "mandatory",
+      "purpose": "Connect each priority to a customer or business problem, mechanism, measure, and dependency."
+    },
+    {
+      "section_id": "resource_elasticity",
+      "title": "Funding, headcount, and resource elasticity",
+      "requirement": "conditional",
+      "purpose": "Show resource choices and the outcomes gained or lost when funding is decision-relevant."
+    },
+    {
+      "section_id": "executive_faq",
+      "title": "Executive diligence FAQ",
+      "requirement": "mandatory",
+      "purpose": "Address difficult choices, underexamined risks, misses, opportunities, and tradeoffs."
+    },
+    {
+      "section_id": "tenets",
+      "title": "Tenets",
+      "requirement": "conditional",
+      "purpose": "Record prioritized principles that resolve recurring choices when the plan needs them."
+    },
+    {
+      "section_id": "evidence_appendices",
+      "title": "Evidence appendices and data tables",
+      "requirement": "conditional",
+      "purpose": "Provide supporting detail without moving essential reasoning out of the main narrative."
+    }
+  ],
+  "narrative_rules": [
+    "State the purpose, recommendation, and material planning choice near the beginning.",
+    "Connect mission to tenets, themes, initiatives, goals, and resource choices.",
+    "For context, move from observed state to evidence, interpretation, and planning implication.",
+    "For a performance gap, identify the result, comparator, gap, and consequence.",
+    "For a commitment, identify the owner, action, mechanism, outcome, measure, and dependency.",
+    "For a strategic bet, distinguish the assumption, supporting evidence, test, decision gate, and protection.",
+    "For an enabler, explain the constraint, affected themes, work, adoption or reliability outcome, and owner.",
+    "Be direct about misses, uncertainty, and strategic tradeoffs.",
+    "Explain customer or business consequence before implementation detail.",
+    "Cover a small set of material topics with sufficient depth instead of listing many thin themes.",
+    "Preserve executive argument density while using shorter sentences when a language overlay requires it."
+  ],
+  "evidence_rules": [
+    "Keep actuals, forecasts, assumptions, proposed targets, approved targets, and commitments distinct.",
+    "For every material measure, record its definition, population, period, unit, comparator, source, and caveat.",
+    "Align periods, populations, regions, and units before making a comparison.",
+    "A highlight must explain the result, its importance or comparison, the causal mechanism, and how the learning will be used.",
+    "A lowlight must explain the affected result, impact, root cause or uncertainty, corrective mechanism, owner, timing, and prevention or inspection method.",
+    "Before drafting, inventory every material source fact, value, qualifier, population, period, owner, timing, resource, dependency, gate, caveat, and evidence state in the server-provided source-unit ledger.",
+    "A source unit counts as covered only when an exact draft excerpt preserves all of its material anchors; record an explicit scope, duplication, or relevance reason for each review unit that is omitted.",
+    "Register every material statement in the claim ledger and keep semantic claim type separate from evidence state; missions, recommendations, decision gates, and dependencies are not targets or commitments.",
+    "Keep open dependencies, questions, proposals, and forecasts at their source modality; do not convert them into requirements or approval prerequisites.",
+    "Do not invent document-control metadata. If a required control field has no authoritative value, write ‘Not provided’ rather than creating a version, date, owner, approval, or classification.",
+    "Do not present an unexplained target or an invented baseline as established evidence."
+  ],
+  "terminology_rules": [
+    "Use one stable term for each goal, theme, initiative, metric, and planning state.",
+    "Classify every theme as a funnel stage, strategic bet, or horizontal enabler.",
+    "Use visible labels for any evidence state that is not an actual.",
+    "Expand acronyms at first use unless the authoritative audience glossary marks them as universally understood."
+  ],
+  "formatting_rules": [
+    "Keep essential reasoning in the main narrative and use appendices only for support.",
+    "Use tables for aligned comparisons, resource scenarios, and dense evidence when prose would obscure the relationship.",
+    "Number prioritized items and FAQ entries.",
+    "Apply the current organization template before default page and typography guidance.",
+    "Keep headings with their following content and include required page, title, and confidentiality controls."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "tenets.v1",
+    "financial_or_business_summary",
+    "funding_and_resource_elasticity",
+    "evidence_appendices"
+  ],
+  "hard_fail_rules": [
+    "Block publication when any theme is disconnected from goals, initiatives, or the rest of the strategy.",
+    "Block publication when a baseline is fabricated or a target lacks explanation and approval state.",
+    "Block publication when a resource request omits the customer or business consequence.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical population or period context.",
+    "Block publication when body text and tables conflict or another material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, fact, or commitment is introduced without authority.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when repair changes a decision, requirement, or protected fact.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "op.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.op_roadmap_vision",
+      "authority": "source_reference",
+      "fingerprint": "731bed3c6dc9774d774cdca3cfac20adc37228ed21432e8abb2f6f902f85beb3",
+      "reference": "Supplied OP, roadmap, and vision reference"
+    },
+    {
+      "source_id": "amazon.writing_hub.operational_plans",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/OP/"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    },
+    {
+      "source_id": "amazon.writing_hub.tenets",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Tenets/"
+    }
+  ]
+}

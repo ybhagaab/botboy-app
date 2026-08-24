@@ -1,0 +1,147 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "communication/email.v1",
+  "version": "1.0.0",
+  "family": "communication",
+  "variant": "email",
+  "purpose": "Guide a concise draft for an action, decision, information, input, or meeting follow-up email while preserving recipient semantics, sensitivity controls, and explicit send approval.",
+  "audience": [
+    "email author",
+    "action or decision recipients",
+    "information-only recipients",
+    "communication reviewer"
+  ],
+  "required_inputs": [
+    "purpose_type",
+    "sender",
+    "audience",
+    "to_recipients",
+    "cc_recipients",
+    "sensitivity_or_classification",
+    "subject_or_topic",
+    "answer_ask_decision_or_update",
+    "essential_context",
+    "actions",
+    "attachments_or_links",
+    "deadline_when_applicable"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "classification_marker",
+      "title": "Classification marker",
+      "requirement": "conditional",
+      "purpose": "Display the required classification or handling marker when policy calls for one."
+    },
+    {
+      "section_id": "subject",
+      "title": "Subject line",
+      "requirement": "mandatory",
+      "purpose": "Identify the topic and indicate whether action, decision, input, or information is expected."
+    },
+    {
+      "section_id": "opening",
+      "title": "Opening answer or ask",
+      "requirement": "mandatory",
+      "purpose": "Put the answer, request, decision, or update in the first one or two sentences."
+    },
+    {
+      "section_id": "essential_context",
+      "title": "Essential context and evidence",
+      "requirement": "mandatory",
+      "purpose": "Provide only the context needed to understand and act on the message."
+    },
+    {
+      "section_id": "actions_questions",
+      "title": "Actions or questions",
+      "requirement": "conditional",
+      "purpose": "List ordered actions or questions with an owner and deadline whenever either is required."
+    },
+    {
+      "section_id": "close",
+      "title": "Requested response or next event",
+      "requirement": "mandatory",
+      "purpose": "State the expected response or identify the next event."
+    },
+    {
+      "section_id": "links_attachments",
+      "title": "Links and attachments",
+      "requirement": "conditional",
+      "purpose": "Identify each included resource and explain why the recipient needs it."
+    }
+  ],
+  "narrative_rules": [
+    "Confirm that email is suitable before drafting; recommend a meeting, call, or approved secure channel for highly sensitive, emotionally charged, materially ambiguous, or overly complex subjects.",
+    "Put the answer, ask, decision, or update first.",
+    "Keep the core message readable on one mobile screen when practical.",
+    "Use active voice, plain language, short paragraphs, and useful white space.",
+    "Use numbered lists for actions or ordered questions.",
+    "State who must do what and by when.",
+    "Summarize a forwarded thread and explain the current purpose instead of forwarding without context.",
+    "Avoid emotive wording, vague urgency, and unnecessary jargon.",
+    "Draft only; treat approval of the draft and approval to send as separate actions."
+  ],
+  "evidence_rules": [
+    "Trace any material metric, prior agreement, owner, date, decision, or commitment to an approved source.",
+    "Label assumptions, forecasts, proposals, and approved commitments accurately.",
+    "Include only evidence necessary for the recipient to understand or act.",
+    "Do not claim that an attachment, link, agreement, or approval exists unless it is verified.",
+    "Do not create urgency unless delay has a documented consequence."
+  ],
+  "terminology_rules": [
+    "Use one stable subject while the thread topic remains the same.",
+    "Expand an acronym on first use unless it is approved for the audience.",
+    "Use To for people expected to act, decide, or respond and CC for information-only recipients.",
+    "Use an action or information marker only when it improves interpretation.",
+    "Avoid unsupported confidentiality or privilege labels."
+  ],
+  "formatting_rules": [
+    "Use a concise subject with a truthful purpose marker and due date when action has a real deadline.",
+    "Keep the opening answer or ask within the first two sentences.",
+    "Use short paragraphs and numbered actions or questions.",
+    "Prefer accessible links over large attachments when permissions allow.",
+    "Include a reason for every link or attachment.",
+    "Review final subject, body, recipients, classification, links, attachments, actions, owners, dates, and commitments before presenting the draft."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "classification_marker",
+    "actions_and_questions",
+    "links_and_attachments",
+    "channel_selection_warning"
+  ],
+  "hard_fail_rules": [
+    "Block an action or decision draft when the ask or answer is missing.",
+    "Block a draft when an action lacks an owner or a required deadline.",
+    "Block a draft when To and CC semantics conflict with the expected response or action.",
+    "Block a draft that uses an unsupported confidentiality or privilege claim.",
+    "Block a draft that fabricates a prior agreement, metric, attachment, link, owner, date, or commitment.",
+    "Block a draft that creates false urgency.",
+    "Block a draft while a sensitive-data or unsuitable-channel warning remains unresolved.",
+    "Block send execution unless the user explicitly approves the final subject, body, recipients, classification, links, attachments, actions, owners, dates, and commitments.",
+    "Block blind-copy use without explicit user approval.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes the ask, decision, commitment, or other protected meaning.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "email.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "amazon.writing_hub.email",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Email/"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    }
+  ]
+}

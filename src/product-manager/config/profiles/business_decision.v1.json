@@ -1,0 +1,180 @@
+{
+  "schema_version": "document-profile.v1",
+  "profile_id": "business_document/business_decision.v1",
+  "version": "1.0.0",
+  "family": "business_document",
+  "variant": "business_decision",
+  "purpose": "Guide a decision memo that makes the requested choice, viable options, tradeoffs, recommendation, and follow-through explicit.",
+  "audience": [
+    "decision owner",
+    "customer and business stakeholders",
+    "partner and capability owners",
+    "implementation leads"
+  ],
+  "required_inputs": [
+    "document_owner",
+    "decision_owner",
+    "lifecycle_status",
+    "authoritative_overview",
+    "requested_decision",
+    "scope",
+    "customer_and_business_jobs",
+    "current_state_evidence",
+    "decision_invariants",
+    "options",
+    "recommendation",
+    "success_measure"
+  ],
+  "ordered_sections": [
+    {
+      "section_id": "document_control",
+      "title": "Document control and decision owner",
+      "requirement": "mandatory",
+      "purpose": "Identify ownership, version, status, and the authority responsible for the decision."
+    },
+    {
+      "section_id": "decision_brief",
+      "title": "Purpose, scope, requested decision, and recommendation",
+      "requirement": "mandatory",
+      "purpose": "Make the decision and recommended direction clear before supporting detail."
+    },
+    {
+      "section_id": "customer_business_context",
+      "title": "Customer and business context",
+      "requirement": "mandatory",
+      "purpose": "Describe the jobs and outcomes that make the decision necessary."
+    },
+    {
+      "section_id": "current_state",
+      "title": "Current state",
+      "requirement": "mandatory",
+      "purpose": "Explain present behavior, capabilities, boundaries, and relevant evidence."
+    },
+    {
+      "section_id": "problem_consequence",
+      "title": "Problem and consequence chain",
+      "requirement": "mandatory",
+      "purpose": "Connect the job, current behavior, evidence, failure, consequence, and decision need."
+    },
+    {
+      "section_id": "decision_invariants",
+      "title": "Decision invariants",
+      "requirement": "mandatory",
+      "purpose": "State the conditions that every acceptable option must preserve."
+    },
+    {
+      "section_id": "partner_capability_boundaries",
+      "title": "Partner and capability boundaries",
+      "requirement": "conditional",
+      "purpose": "Clarify party roles, responsibilities, dependencies, and failure consequences when external or shared capabilities matter."
+    },
+    {
+      "section_id": "data_continuity",
+      "title": "Data continuity and control boundaries",
+      "requirement": "conditional",
+      "purpose": "Describe producers, consumers, identifiers, transfer, retention, quality, protection, and recovery when data continuity affects the choice."
+    },
+    {
+      "section_id": "options_tradeoffs",
+      "title": "Options, tensions, and tradeoffs",
+      "requirement": "mandatory",
+      "purpose": "Compare viable choices against common invariants, impacts, dependencies, risks, and reversibility."
+    },
+    {
+      "section_id": "recommendation",
+      "title": "Recommendation and success measure",
+      "requirement": "mandatory",
+      "purpose": "Name the choice, decisive reasons, accepted tradeoff, mitigation, and measure of success."
+    },
+    {
+      "section_id": "actions_open_decisions",
+      "title": "Actions, owners, dates, and open decisions",
+      "requirement": "mandatory",
+      "purpose": "Record authorized follow-through and unresolved decisions with accountable owners."
+    },
+    {
+      "section_id": "supporting_appendices",
+      "title": "Supporting appendices",
+      "requirement": "conditional",
+      "purpose": "Provide detailed evidence or analysis without displacing decision-critical reasoning."
+    }
+  ],
+  "narrative_rules": [
+    "Begin with customer or business intent rather than architecture.",
+    "Name the requested decision and recommended direction near the start.",
+    "Build the problem from job to current behavior, evidence, failure, consequence, and decision.",
+    "Describe each option by its operation, preserved invariants, impacts, dependencies, risks, and reversibility.",
+    "Explain the recommendation through decisive reasons, accepted tradeoff, mitigation, and next action.",
+    "Separate fact, interpretation, recommendation, proposed commitment, and approved commitment.",
+    "Make disagreement, tensions, and tradeoffs visible.",
+    "Do not imply that options are equally strong when the evidence differentiates them.",
+    "Use prose for causality and tables for comparable option attributes or responsibility boundaries."
+  ],
+  "evidence_rules": [
+    "Trace every material conclusion to an approved claim or an explicitly labeled assumption.",
+    "Give each metric a definition, population, period, unit, comparator, source, retrieval context, and caveat.",
+    "Do not convert correlation into causation or a recommendation into an approved commitment.",
+    "Use the same comparison basis across options.",
+    "State uncertainty and missing evidence when they could change the decision."
+  ],
+  "terminology_rules": [
+    "Use stable names for jobs, parties, capabilities, invariants, options, data objects, and success measures.",
+    "Define each acronym at first use unless an approved audience glossary permits it.",
+    "Distinguish responsibility, dependency, ownership, approval, and execution.",
+    "Use precise boundary terms instead of broad labels that hide which party acts."
+  ],
+  "formatting_rules": [
+    "Keep the decision and recommendation in the main narrative.",
+    "Use a common comparison table when multiple options share evaluation dimensions.",
+    "Use boundary or flow tables only when they improve accountability or continuity analysis.",
+    "Number actions and unresolved decisions.",
+    "Apply the current organization template before default narrative formatting."
+  ],
+  "overlays": [
+    "amazon_writing.v1",
+    "asd_ste100_issue9.v1"
+  ],
+  "conditional_modules": [
+    "partner_capability",
+    "data_continuity",
+    "tenets.v1",
+    "supporting_appendices"
+  ],
+  "hard_fail_rules": [
+    "Block publication when the requested decision is missing or ambiguous.",
+    "Block publication when decision invariants are absent.",
+    "Block publication when viable options are not compared on a common basis.",
+    "Block publication when the recommendation lacks evidence or decisive reasoning.",
+    "Block publication when evidence is fabricated, untraceable, mislabeled, or missing critical context.",
+    "Block publication when body text and tables conflict or a material contradiction remains unresolved.",
+    "Block publication when a date, owner, target, agreement, or commitment is silently introduced.",
+    "Block publication when required overview context is absent without an approved exception.",
+    "Block publication when source-specific sample facts appear in a new artifact.",
+    "Block publication when language repair changes the decision or another protected meaning.",
+    "Block any full-language-conformance status unless the configured bundle, checks, exceptions, and human review are approved."
+  ],
+  "rubric_id": "business_document.v1",
+  "source_manifest": [
+    {
+      "source_id": "botboy_document_profiles_and_ste100.v1.1.0",
+      "authority": "source_reference",
+      "reference": "BOTBOY_DOCUMENT_PROFILES_AND_STE100.md"
+    },
+    {
+      "source_id": "supplied.business_decision",
+      "authority": "source_reference",
+      "fingerprint": "5c79d39e493a16f3274f1487330477ebc2d7ed926f2e650627ccc3ac4a5008bf",
+      "reference": "Supplied business-decision reference"
+    },
+    {
+      "source_id": "amazon.writing_hub.narratives",
+      "authority": "amazon_tier_a",
+      "reference": "https://w.amazon.com/bin/view/WritingHub/Document_Repository/Narrative/"
+    },
+    {
+      "source_id": "amazon.writing_requirements",
+      "authority": "amazon_tier_b",
+      "reference": "https://w.amazon.com/bin/view/Vineeths/WritingRequirements/"
+    }
+  ]
+}
