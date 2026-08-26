@@ -27,9 +27,12 @@ import type { PromptManager } from '../../core/prompt-manager.js';
 import type { ConversationManager } from '../../core/conversation-manager.js';
 import type { McpManager } from '../../core/mcp-types.js';
 import type { GraspSync } from '../../monitors/grasp-sync.js';
+import type { SharePointSync } from '../../monitors/sharepoint-sync.js';
 import type { AnalyticsDashboardService, DashboardPublisherService } from '../../core/analytics-types.js';
 import type { ProductDocumentService, WritingConfigStore } from '../../product-manager/types.js';
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
+import type { ContentStore } from '../../core/content-store.js';
+import type { DocumentParser } from '../../core/document-parser.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -53,11 +56,16 @@ export interface RouterDeps {
   conversationManager?: ConversationManager;
   mcpManager?: McpManager;
   graspSync?: GraspSync;
+  sharePointSync?: SharePointSync;
   analyticsService?: AnalyticsDashboardService;
   dashboardPublisher?: DashboardPublisherService;
   productDocumentService?: ProductDocumentService;
   writingConfigStore?: WritingConfigStore;
   chatTerminal?: ChatTerminalService;
+  /** Evidence content reads (document workbench reader). */
+  contentStore?: ContentStore;
+  /** Sheet-scoped xlsx deep reads (xlsx-deep-reads X1). */
+  documentParser?: DocumentParser;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

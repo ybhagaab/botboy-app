@@ -8,8 +8,10 @@ disagree, the code is the bug or this file is — reconcile, never ignore.
 
 ## 1. Evidence (`work_items`)
 Definition: everything captured from the user's environment — Slack messages,
-browser visits, app window captures, clipboard, filesystem documents. Evidence
-is LOSSLESS and IMMUTABLE: full content lives in the content store (inline or
+browser visits, app window captures, clipboard, filesystem documents, GRASP-
+synced owner-addressed email and calendar events, and SharePoint/OneDrive
+documents with their Word review comments (section 8). Evidence is LOSSLESS
+and IMMUTABLE: full content lives in the content store (inline or
 file-backed, sha256-checksummed). Never delete a row; never rewrite captured
 content or summaries by hand.
 Lifecycle (`process_state`, monotonic, enforced by batcher):
@@ -131,7 +133,91 @@ Guards: pinned projects, manually edited brains, (class a) open tasks/blockers.
 Archival is reversible; a title-echo clipboard capture of the project's own
 title never shields a project.
 
-## 8. Analytical dashboards (`#/dashboards`)
+## 8. SharePoint & OneDrive documents (`#/connections/document-sync`)
+Definition: a background sync (managed MCP profile `sharepoint`) turns the
+owner's document world into evidence. Sources are user-selected: shared-with-
+me, personal OneDrive, team libraries — each with a baseline depth (90 days /
+30 newest / all) chosen at add time. Discovery every 30 min; a durable queue
+drains changed documents with backpressure (pipeline backlog and cache-size
+gates), so a busy pipeline pauses document ingestion, never the dashboard.
+Extraction tiers (stamped in `metadata.extractionTier`, disclosed by agents):
+- `full` — inline text (docx→Markdown, text files, Loop pages) ≤ 25 MB.
+- `truncated` — 25–150 MB Office/PDF: bounded extraction (row/slide/page
+  caps); `metadata.truncation` says exactly what was cut. NEVER present a
+  truncated document as fully read.
+- `metadata_only` — > 150 MB or oversize inline types: presence evidence
+  only ("listed only" chip). Content requires an on-demand chat read.
+Comments as signal (`type document_comment`): a changed docx also fetches its
+Word review comments. Each new comment is one evidence item — threaded via
+`metadata.parentCommentId`/`threadRoot`, deduped durably by URL fragment
+(`#comment=<id>`), resolved ones carry `metadata.resolved`. Deterministic
+owner matching stamps `direction='sent'` (owner authored) and `mentionedMe`
+(comment names the owner); those two make a comment ENGAGED — it counts
+toward Today's trust gate and adopts a project in demotion review, while
+other people's comments stay passive like the documents themselves. Comments
+route deterministically to their document's project (no model call) via
+`metadata.parentProjectId`.
+Revision diffs: each re-captured revision (`#rev=` url) is stamped with
+`metadata.changeSummary` — a section-attributed added/removed summary
+computed against the prior revision (and mirrored into the `summary` column
+when empty, so Today's change feed and evidence rows say WHAT changed).
+"What changed in X since Y" is answered from these stamps, never by
+re-reading documents.
+Awaiting your reply: Today surfaces comment threads whose LATEST comment is
+someone else's, unresolved, where the owner participated or is named.
+Deterministic; threads clear themselves when the owner replies (next sync
+captures it as `sent`) or the comment is resolved.
+UI surfaces: each project has a Documents tab (one row per document with
+tier chip, revision count, comment counts, latest change line) linking into
+the READER (`#/doc/<id>`) — BotBoy's copy of the document rendered with its
+threaded comments, revision timeline, live Refresh, and the approval lane
+below. The `#/documents` sidebar page is a DIFFERENT thing (BotBoy-authored
+writing artifacts).
+Pending edits (approval lane): every docx body edit is a ledgered row in
+`document_pending_edits` — old vs new, shown in the reader. The owner's
+edits (reader propose form) and BotBoy's chat proposals both land here as
+`pending`; the owner clicks Approve/Reject per edit, then one Sync applies
+ALL approved edits in a single upload (per-edit results: `synced`, or
+`conflicted` with a reason when the passage moved — the freshness guard
+working; re-create from current text). Chat edits stage by default
+(`mode=propose`); only a prompt that explicitly says to edit the source
+directly uses `mode=direct`. Terminal rows persist for audit.
+Answering from documents: stored evidence first (FTS over extracted content,
+`document_comment` rows for "what did X comment / what awaits me",
+`changeSummary` stamps for "what changed"); live MCP reads
+(`sharepoint_read_file`, `sharepoint_read_docx_comments`) only for current
+state or content beyond the stored tier.
+Writes (owner-gated, guided-only): raw SharePoint write tools are policy-
+blocked in every path — the block is correct behavior, never an error to
+work around. The guided tools re-verify LIVE state before writing and abort
+loudly when it drifted: `sharepoint_reply_comment` (re-reads the thread;
+target comment must still exist), `sharepoint_add_comment` (anchor passage
+must exist in the current document; for feedback/proposals), `sharepoint_
+update_document` (text-family .md/.txt/.csv; requires `baseContentSha` of
+the content the edit was based on; `createIfMissing` only for new files),
+and `sharepoint_edit_docx_body` (owner asks to edit document content:
+surgical replaceText/appendParagraphs on `word/document.xml` only —
+formatting, embedded comments, images, and tracked changes survive; the
+target passage must match the current document EXACTLY ONCE, which is the
+freshness guard; SharePoint version history keeps the pre-edit copy; the
+edit is verified by read-back). Comments and replies post under the owner's
+identity with a visible robot watermark — say so.
+MCP-level issues and their built-in fixes (do not fight these):
+- "Silent authorize did not return a code" (AADSTS50058): stale AAD cookie
+  jars. The sync self-heals — deletes `~/.amazon-sharepoint-mcp/cookies-*`,
+  restarts the profile (once per 10 min). After a BotBoy restart with stale
+  jars the FIRST discovery fails and heals; the next succeeds. Only escalate
+  if it persists past two cycles (then: `mwinit` freshness).
+- Midway expiry pauses everything losslessly (queue and cursors freeze);
+  the sentinel nudges the owner; nothing is lost or retried destructively.
+- Long downloads serialize the shared server: chat reads queue behind them
+  (picker routes use skipIfBusy and return "busy" instead of hanging).
+Probe order for "documents aren't appearing": `GET /api/sharepoint-sync/
+status` (gates, queue, failed rows) → profile state on Connections →
+`sharepoint_sync_queue.last_error` → capture logs. Full map for maintainers:
+`docs/maps/sharepoint.md`.
+
+## 9. Analytical dashboards (`#/dashboards`)
 Definition: durable, locally canonical analytical views stored in SQLite. Widgets
 (metric, table, bar, line, text) are definitions plus persisted refresh results;
 external SQL output is always untrusted and escaped before rendering.
@@ -149,7 +235,7 @@ external SQL output is always untrusted and escaped before rendering.
   copies are immutable snapshots; only an exact, short-lived UI confirmation
   may trigger S3 PutObject. The local dashboard remains canonical.
 
-## 9. Invariants (never violate)
+## 10. Invariants (never violate)
 1. Evidence is never deleted or content-mutated; curation detaches, never destroys.
 2. Every task/commitment traces to an exact quote or an explicit owner action.
 3. Passive observation proves viewing, not intent, ownership, or completion.
@@ -159,9 +245,11 @@ external SQL output is always untrusted and escaped before rendering.
 7. State machine transitions are monotonic; owner overrides use dedicated APIs that record project events.
 8. UI claims must be truthful: no invented owners, dates, or "top priority" labels without logic behind them.
 
-## 10. Key storage map
+## 11. Key storage map
 projects, areas, work_items (+ FTS), work_item_project_events (Today cursor),
 work_item_rejections, work_item_discards, slack_engagement, channel_digests,
-project_cross_links, app_settings (today.attention.v1, slack.*, relevance.*),
+project_cross_links, app_settings (today.attention.v1, slack.*, relevance.*,
+grasp_sync.*, sharepoint_sync.*), sharepoint_sync_queue / sharepoint_seen,
 pipeline_runs / pipeline_llm_audit / routing_decisions (audit),
 brains/*.md (human-editable). DB: ~/.personal-productivity-tracker/tracker.db.
+Document binaries cache: ~/.personal-productivity-tracker/sharepoint-cache/.

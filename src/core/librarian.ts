@@ -413,6 +413,33 @@ Return ONLY the JSON array.`;
               validationReason: 'ambient channel message reserved for channel digest',
             });
           }
+        } else if (item.source === 'sharepoint' && item.type === 'document_comment') {
+          // Comments follow their document. The sync stamps parentProjectId
+          // from the routed document_capture at emit time; when that project
+          // still exists and is active, routing is deterministic — no model
+          // call, no scope validation (the document already passed it).
+          // Comments without a resolvable hint fall through to the model,
+          // whose title carries the document name.
+          const hint = String(readMetadata(item.id).parentProjectId ?? '');
+          const project = hint
+            ? db.prepare('SELECT status FROM projects WHERE id = ?').get(hint) as { status: string } | undefined
+            : undefined;
+          if (project && project.status === 'active') {
+            if (batcher.transition(item.id, 'routed', { projectId: hint })) {
+              result.assigned++;
+              recordRoutingDecision(db, {
+                runId,
+                batchId: wave.batchId,
+                itemId: item.id,
+                modelDecision: 'not_called',
+                appliedDecision: 'assign',
+                appliedProjectId: hint,
+                validationReason: 'deterministic comment-follows-document rule',
+              });
+            }
+          } else {
+            modelItems.push(item);
+          }
         } else {
           modelItems.push(item);
         }
@@ -421,7 +448,7 @@ Return ONLY the JSON array.`;
       if (modelItems.length === 0) {
         db.prepare(
           "UPDATE pipeline_runs SET items_out=?, status='completed', completed_at=datetime('now') WHERE id=?",
-        ).run(result.noise + result.orphaned, runId);
+        ).run(result.noise + result.orphaned + result.assigned, runId);
         return result;
       }
 

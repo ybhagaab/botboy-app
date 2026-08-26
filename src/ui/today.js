@@ -58,6 +58,43 @@ function changeRow(item, context) {
   </article>`;
 }
 
+// Unicode-safe base64url — MUST match dashboard.js › encodeDocKey (the
+// reader route decodes with the same alphabet).
+function docKeyToReaderHash(docKey) {
+  if (!docKey) return '';
+  try {
+    return `#/doc/${btoa(unescape(encodeURIComponent(String(docKey)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`;
+  } catch { return ''; }
+}
+
+function awaitingReplyRow(item, context) {
+  const { icon, esc, relativeTime } = context;
+  const projectLink = item.projectId
+    ? `<a class="today-project" href="#/projects/${encodeURIComponent(item.projectId)}">${esc(item.projectTitle || 'project')}</a>`
+    : '';
+  // Two explicit destinations (owner ask 2026-08-25): the staged doc inside
+  // BotBoy (reader — shows thread, anchors, staged edits) and the live doc
+  // on SharePoint. Row click goes in-app; SharePoint is the escape hatch.
+  const readerHash = docKeyToReaderHash(item.docKey);
+  const copyBody = `
+      <strong>${esc(item.author)} on ${esc(item.docTitle)}</strong>
+      ${item.snippet ? `<span class="today-change-summary">${esc(item.snippet)}</span>` : ''}
+      <span class="today-reason"><b>Why here</b> latest comment in a thread you're part of — no reply from you yet</span>`;
+  return `<article class="today-item awaiting-reply-row">
+    <span class="source-icon">${icon('message', 15)}</span>
+    ${readerHash
+      ? `<a class="today-item-copy" href="${esc(readerHash)}">${copyBody}</a>`
+      : `<a class="today-item-copy" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">${copyBody}</a>`}
+    <div class="today-item-side">
+      <div class="today-change-meta">${projectLink}<span class="pill">${item.threadSize} in thread</span><time>${esc(relativeTime(item.commentedAt))}</time></div>
+      <div class="awaiting-reply-actions">
+        ${readerHash ? `<a class="button small" href="${esc(readerHash)}">${icon('file', 12)} Open in BotBoy</a>` : ''}
+        ${item.url ? `<a class="button small ghost" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer">${icon('globe', 12)} SharePoint</a>` : ''}
+      </div>
+    </div>
+  </article>`;
+}
+
 function deferredRow(item, context) {
   const { icon, esc, attr } = context;
   const disabled = isPending(context, item.id) ? ' disabled' : '';
@@ -96,6 +133,7 @@ export function renderTodayView(context) {
   const summary = data.summary || {};
   const attention = Array.isArray(data.attention) ? data.attention : [];
   const waiting = Array.isArray(data.waiting) ? data.waiting : [];
+  const awaitingReply = Array.isArray(data.awaitingReply) ? data.awaitingReply : [];
   const changes = Array.isArray(data.changes) ? data.changes : [];
   const recent = Array.isArray(data.recent) ? data.recent : [];
   const deferred = Array.isArray(data.deferred) ? data.deferred : [];
@@ -124,6 +162,9 @@ export function renderTodayView(context) {
       <article class="card briefing-card"><div class="briefing-label">${icon('sparkles')} BotBoy attention brief</div><h2>${esc(headline)}</h2><p>${esc(description)}</p><div class="briefing-actions">${lead ? `<a class="button primary" href="#/projects/${encodeURIComponent(lead.projectId)}">Open first action ${icon('arrow-right', 14)}</a>` : ''}<button class="button" type="button" data-action="plan-day">Show local plan</button></div><div class="briefing-foot">${icon('shield', 12)} Ranked from explicit tasks, task state, decision language, and your pins</div></article>
       <article class="card metrics-card"><div class="metric"><div class="metric-label">${icon('check', 14)} Needs attention</div><div class="metric-value">${number(summary.attentionCount)}</div><div class="metric-note good">${number(explicitActions)} tasks · ${number(pinnedProjects)} pinned projects</div></div><div class="metric"><div class="metric-label">${icon('alert', 14)} Waiting / blocked</div><div class="metric-value">${number(summary.waitingCount)}</div><div class="metric-note warn">Ownership not inferred</div></div><div class="metric"><div class="metric-label">${icon('activity', 14)} Meaningful changes</div><div class="metric-value">${number(summary.changeCount)}</div><div class="metric-note">${esc(changeWindow)}</div></div><div class="metric"><div class="metric-label">${icon('pin', 14)} Pinned</div><div class="metric-value">${number(summary.pinnedCount)}</div><div class="metric-note">All current pins stay visible</div></div></article>
     </section>
+
+    ${awaitingReply.length ? `<div class="section-heading"><div><h2>Awaiting your reply</h2><p>Document comment threads where the latest word is someone else's. Replying (via chat or SharePoint) clears them on the next sync.</p></div><span class="pill warn">${number(summary.awaitingReplyCount || awaitingReply.length)} thread${(summary.awaitingReplyCount || awaitingReply.length) === 1 ? '' : 's'}</span></div>
+    <section class="card today-list">${awaitingReply.map(item => awaitingReplyRow(item, context)).join('')}</section>` : ''}
 
     <div class="section-heading"><div><h2>Needs your attention</h2><p>Pinned items first, then task state and decision/response language; substantive evidence only breaks ties.</p></div><span class="pill accent">${esc(countLabel(summary.attentionShown, summary.attentionCount, number, 'eligible'))}</span></div>
     <section class="card today-list">${attention.length ? attention.map((item, index) => attentionRow(item, index, context)).join('') : emptySection('check', 'Nothing explicitly actionable', 'Projects with generic active status or no next action are intentionally excluded.', context)}</section>

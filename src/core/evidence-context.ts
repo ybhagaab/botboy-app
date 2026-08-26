@@ -105,7 +105,7 @@ function sourceWeight(item: EvidenceContextItem): number {
   const source = (item.source ?? '').toLowerCase();
   const type = (item.type ?? '').toLowerCase();
   if (source === 'manual' || type.includes('email')) return 3;
-  if (source === 'filesystem' || type.includes('document') || type.includes('file')) return 3;
+  if (source === 'filesystem' || source === 'sharepoint' || type.includes('document') || type.includes('file')) return 3;
   if (source === 'browser' || type.includes('website')) return 2.5;
   if (source === 'clipboard') return 1.5;
   if (source === 'slack') return 1;

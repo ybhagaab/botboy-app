@@ -137,9 +137,12 @@ export interface TodayView {
     deferredCount: number;
     deferredShown: number;
     pinnedCount: number;
+    awaitingReplyCount: number;
   };
   attention: TodayAttentionItem[];
   waiting: TodayAttentionItem[];
+  /** Document comment threads whose latest word is someone else's (signals R3). */
+  awaitingReply: TodayAwaitingReplyItem[];
   changes: TodayChangeItem[];
   recent: TodayRecentProject[];
   deferred: TodayDeferredItem[];
@@ -148,6 +151,114 @@ export interface TodayView {
     dueDates: false;
     evidenceCitations: false;
   };
+}
+
+export interface TodayAwaitingReplyItem {
+  /** `comment-thread:<latest work_item id>` — display identity only (no
+   * pin/snooze plumbing v1; the id grammar in isValidTodayItemId is untouched). */
+  id: string;
+  /** Corpus key — the UI builds the in-app reader link (#/doc/<b64url>) from it. */
+  docKey: string;
+  docTitle: string;
+  author: string;
+  snippet: string;
+  commentedAt: string;
+  /** The latest comment's SharePoint url (reader deep-link once the workbench lands). */
+  url: string;
+  projectId?: string;
+  projectTitle?: string;
+  threadSize: number;
+}
+
+/**
+ * Deterministic awaiting-your-reply rule (sharepoint-signals R3): group
+ * document_comment evidence by (docKey, threadRoot); a thread awaits the
+ * owner when its LATEST comment is someone else's (`direction='received'`),
+ * is not resolved, and either the owner participated earlier in the thread
+ * or the latest comment names the owner. Threads clear themselves: the
+ * owner's posted reply arrives as a `sent` comment on the next fetch.
+ */
+export function computeAwaitingReplyThreads(db: Database.Database, limit = 8): TodayAwaitingReplyItem[] {
+  const rows = db.prepare(`
+    SELECT w.id, w.title, w.url, w.captured_at AS capturedAt, w.project_id AS projectId,
+           p.title AS projectTitle, w.metadata
+    FROM work_items w LEFT JOIN projects p ON p.id = w.project_id
+    WHERE w.source = 'sharepoint' AND w.type = 'document_comment'
+  `).all() as Array<{ id: string; title: string | null; url: string | null; capturedAt: string; projectId: string | null; projectTitle: string | null; metadata: string | null }>;
+  if (rows.length === 0) return [];
+
+  interface CommentRow {
+    id: string; url: string; capturedAt: string; projectId: string | null; projectTitle: string | null;
+    docKey: string; docTitle: string; threadRoot: string; author: string; text: string;
+    commentedAt: string; direction: string; mentionedMe: string; resolved: string;
+  }
+  const threads = new Map<string, CommentRow[]>();
+  for (const row of rows) {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(row.metadata ?? '{}'); } catch { continue; }
+    const docKey = String(metadata.docKey ?? '');
+    if (!docKey) continue;
+    // Comments deleted from the document are history, not review load.
+    if (metadata.deletedFromDoc === 'true') continue;
+    const comment: CommentRow = {
+      id: row.id,
+      url: row.url ?? '',
+      capturedAt: row.capturedAt,
+      projectId: row.projectId,
+      projectTitle: row.projectTitle,
+      docKey,
+      docTitle: String(metadata.docTitle ?? row.title ?? 'document'),
+      threadRoot: String(metadata.threadRoot ?? metadata.commentId ?? row.id),
+      author: String(metadata.author ?? 'unknown'),
+      text: '',
+      commentedAt: String(metadata.commentedAt ?? row.capturedAt),
+      direction: String(metadata.direction ?? 'received'),
+      mentionedMe: String(metadata.mentionedMe ?? 'false'),
+      resolved: String(metadata.resolved ?? 'false'),
+    };
+    const key = `${docKey}\u0000${comment.threadRoot}`;
+    const list = threads.get(key);
+    if (list) list.push(comment); else threads.set(key, [comment]);
+  }
+
+  // Snippets only for the winners — read raw title? Comment text lives in the
+  // content store; the row TITLE carries author+doc. Use the item's summary
+  // fallback: not available here — snippet comes from the title-less raw_text
+  // column when inline. Keep it cheap: fetch raw_text for the latest ids only.
+  const awaiting: TodayAwaitingReplyItem[] = [];
+  const snippetStmt = db.prepare('SELECT COALESCE(raw_text, summary, title, \'\') AS text FROM work_items WHERE id = ?');
+  // Word stamps 1900-01-01 on comments without a real date (observed on the
+  // owner's own replies) — ordering by that would bury the true latest
+  // comment and mark an already-answered thread as awaiting. Pre-epoch or
+  // unparseable stamps fall back to capture time.
+  const effectiveTime = (c: CommentRow): string => {
+    const parsed = Date.parse(c.commentedAt);
+    return Number.isFinite(parsed) && parsed >= 0 ? c.commentedAt : c.capturedAt;
+  };
+  for (const list of threads.values()) {
+    list.sort((a, b) => effectiveTime(a).localeCompare(effectiveTime(b)));
+    const latest = list[list.length - 1];
+    if (latest.direction !== 'received') continue;
+    if (latest.resolved === 'true') continue;
+    const ownerParticipated = list.some(c => c.direction === 'sent');
+    if (!ownerParticipated && latest.mentionedMe !== 'true') continue;
+    const snippetRow = snippetStmt.get(latest.id) as { text: string } | undefined;
+    const snippet = (snippetRow?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    awaiting.push({
+      id: `comment-thread:${latest.id}`,
+      docKey: latest.docKey,
+      docTitle: latest.docTitle,
+      author: latest.author,
+      snippet,
+      commentedAt: effectiveTime(latest),
+      url: latest.url,
+      projectId: latest.projectId ?? undefined,
+      projectTitle: latest.projectTitle ?? undefined,
+      threadSize: list.length,
+    });
+  }
+  awaiting.sort((a, b) => b.commentedAt.localeCompare(a.commentedAt));
+  return awaiting.slice(0, limit);
 }
 
 export interface TodayActionTarget {
@@ -576,10 +687,14 @@ function trustedActionProjects(db: Database.Database): (projectId: string, itemC
         OR json_extract(metadata, '$.mentionedMe') = 'true'
         OR json_extract(metadata, '$.threadEngaged') = 'true'
         OR json_extract(metadata, '$.channelType') IN ('dm', 'group_dm')
-      ) THEN 1 ELSE 0 END) AS engagedSlack
+      ) THEN 1 ELSE 0 END) AS engagedSlack,
+      SUM(CASE WHEN source = 'sharepoint' AND type = 'document_comment' AND (
+        json_extract(metadata, '$.direction') = 'sent'
+        OR json_extract(metadata, '$.mentionedMe') = 'true'
+      ) THEN 1 ELSE 0 END) AS engagedComments
     FROM work_items WHERE project_id IS NOT NULL GROUP BY project_id
-  `).all() as { projectId: string; trusted: number; engagedSlack: number }[];
-  const strong = new Map(rows.map(row => [row.projectId, row.trusted > 0 || row.engagedSlack > 0]));
+  `).all() as { projectId: string; trusted: number; engagedSlack: number; engagedComments: number }[];
+  const strong = new Map(rows.map(row => [row.projectId, row.trusted > 0 || row.engagedSlack > 0 || row.engagedComments > 0]));
 
   // Received channel messages without flags still count when their channel is
   // currently engaged (the owner is active there).
@@ -854,6 +969,7 @@ export function buildTodayView(
   const attention = selectWithProjectDiversity(visibleActionable, ATTENTION_LIMIT);
   const waiting = selectWithProjectDiversity(visibleWaiting, WAITING_LIMIT);
   const visibleChanges = changes.slice(0, CHANGE_LIMIT);
+  const awaitingReply = computeAwaitingReplyThreads(db);
   const pinnedIds = new Set(
     [...allAttentionCandidates.values()].filter(item => item.pinned).map(item => item.id),
   );
@@ -875,9 +991,11 @@ export function buildTodayView(
       deferredCount: deferred.length,
       deferredShown: deferred.length,
       pinnedCount: pinnedIds.size,
+      awaitingReplyCount: awaitingReply.length,
     },
     attention,
     waiting,
+    awaitingReply,
     changes: visibleChanges,
     recent,
     deferred,

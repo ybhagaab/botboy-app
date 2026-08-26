@@ -178,6 +178,10 @@ function createSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_work_items_type ON work_items(type);
     CREATE INDEX IF NOT EXISTS idx_work_items_captured_at ON work_items(captured_at);
     CREATE INDEX IF NOT EXISTS idx_work_items_content_hash ON work_items(content_hash);
+    -- Capture-time URL dedup and the SharePoint sync's existence checks look
+    -- items up by exact url; without this index every URL-carrying capture
+    -- walked the table (validated 2026-08-24, sharepoint plan §17 #10).
+    CREATE INDEX IF NOT EXISTS idx_work_items_url ON work_items(url);
     CREATE INDEX IF NOT EXISTS idx_node_work_items_node ON node_work_items(node_id);
     CREATE INDEX IF NOT EXISTS idx_node_work_items_item ON node_work_items(work_item_id);
     CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
@@ -957,6 +961,9 @@ export function migrateLosslessCapture(db: Database.Database): void {
 
     -- Indexes for the pipeline hot queries
     CREATE INDEX IF NOT EXISTS idx_work_items_process_state ON work_items(process_state);
+    -- Composite for the batcher's extracted+unrouted selection and the
+    -- SharePoint drain's pipeline-backlog gate (state + project_id).
+    CREATE INDEX IF NOT EXISTS idx_work_items_state_project ON work_items(process_state, project_id);
     -- (pipeline_runs CHECK migration for pre-'organize' databases runs below,
     --  after this exec block — CREATE IF NOT EXISTS never upgrades a live table)
     CREATE INDEX IF NOT EXISTS idx_work_items_project_id ON work_items(project_id);

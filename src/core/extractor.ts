@@ -114,7 +114,7 @@ export function createExtractor(deps: {
   ): ExtractOutcome {
     const ref = contentStore.put(itemId, text);
     const cols = refToColumns(ref);
-    db.prepare(
+    const updateContent = () => db.prepare(
       `UPDATE work_items SET
          raw_text = ?, content_storage = ?, content_path = ?, content_sha256 = ?, content_bytes = ?,
          extraction_kind = ?, ocr_confidence = ?, process_state = 'extracted'
@@ -123,6 +123,23 @@ export function createExtractor(deps: {
       cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes,
       kind, ocrConfidence, itemId,
     );
+    // Refresh the FTS row alongside the content update. Capture wrote the FTS
+    // body BEFORE extraction, when binary documents (pdf/xlsx/pptx) had no
+    // text — so parsed/OCR'd content was invisible to search_evidence until
+    // this fix (product-wide gap, validated 2026-08-24; sharepoint plan §17
+    // #9). FTS stays best-effort: if it is unavailable the bare content
+    // update still lands, matching the capture path's semantics.
+    try {
+      const row = db.prepare('SELECT title FROM work_items WHERE id = ?').get(itemId) as { title: string | null } | undefined;
+      db.transaction(() => {
+        updateContent();
+        db.prepare('DELETE FROM work_items_fts WHERE item_id = ?').run(itemId);
+        db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)')
+          .run(itemId, row?.title ?? '', text);
+      })();
+    } catch {
+      updateContent();
+    }
     return { itemId, kind, bytes: ref.byteLength, ocrConfidence, state: 'extracted' };
   }
 

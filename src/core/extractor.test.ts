@@ -163,3 +163,71 @@ describe('Extractor', () => {
     expect(out.kind).toBe('none');
   });
 });
+
+describe('Extractor FTS refresh (product-wide search gap fix, 2026-08-24)', () => {
+  let storage: StorageLayer;
+  let dir: string;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    dir = mkdtempSync(path.join(os.tmpdir(), 'ppt-extract-fts-'));
+  });
+  afterEach(() => {
+    storage.close();
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('makes extracted document text FTS-searchable (capture wrote FTS before extraction)', async () => {
+    const db = storage.getDb();
+    const doc = path.join(dir, 'tracker.txt');
+    writeFileSync(doc, 'ignored — parser stub supplies text');
+
+    // Simulate the capture path: item inserted with EMPTY content and an FTS
+    // row carrying only the title (exactly what happens for binary docs).
+    db.prepare(
+      `INSERT INTO work_items (id, type, source, title, captured_at, metadata, process_state)
+       VALUES ('doc1', 'document_capture', 'sharepoint', 'FY26 tracker', '2026-08-24T10:00:00Z', ?, 'captured')`,
+    ).run(JSON.stringify({ filePath: doc }));
+    db.prepare("INSERT INTO work_items_fts (item_id, title, body) VALUES ('doc1', 'FY26 tracker', '')").run();
+
+    // Before the fix: searching extracted-only terms finds nothing.
+    const preRows = db.prepare(
+      "SELECT item_id FROM work_items_fts WHERE work_items_fts MATCH '\"quarterly\"'",
+    ).all();
+    expect(preRows.length).toBe(0);
+
+    const parser: DocumentParser = {
+      getSupportedFormats: () => ['.txt'],
+      parse: (fp) => ({ success: true, text: 'quarterly revenue rows for MX playback', filePath: fp, fileType: '.txt' }),
+    };
+    const ocr: OcrEngine = {
+      name: 'stub',
+      isAvailable: () => false,
+      async ocr(): Promise<OcrResult> { throw new OcrUnavailableError('n/a'); },
+      async ocrPdfPages(): Promise<OcrResult> { throw new OcrUnavailableError('n/a'); },
+    };
+    const ex = createExtractor({
+      db,
+      documentParser: parser,
+      ocrEngine: ocr,
+      contentStore: createContentStore(db, { contentDir: dir, inlineThresholdBytes: 64 }),
+      failures: createFailureRecorder(db),
+    });
+
+    const out = await ex.extract('doc1');
+    expect(out.state).toBe('extracted');
+
+    // After extraction the parsed text is searchable and the title survived.
+    const hits = db.prepare(
+      "SELECT item_id, title FROM work_items_fts WHERE work_items_fts MATCH '\"quarterly\"'",
+    ).all() as any[];
+    expect(hits.length).toBe(1);
+    expect(hits[0].item_id).toBe('doc1');
+    expect(hits[0].title).toBe('FY26 tracker');
+
+    // Exactly one FTS row per item — the refresh replaced, not duplicated.
+    const count = db.prepare("SELECT COUNT(*) AS c FROM work_items_fts WHERE item_id = 'doc1'").get() as any;
+    expect(count.c).toBe(1);
+  });
+});

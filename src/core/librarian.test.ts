@@ -54,6 +54,17 @@ describe('Librarian', () => {
     complete: async (p) => respFor(p),
   });
 
+  function insertComment(id: string, metadata: Record<string, string>) {
+    const db = storage.getDb();
+    const cs = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
+    const ref = cs.put(id, 'Please review the auth section.');
+    const cols = refToColumns(ref);
+    db.prepare(
+      `INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, metadata, raw_text, content_storage, content_path, content_sha256, content_bytes)
+       VALUES (?, 'document_comment', 'sharepoint', 'Comment by Ng, Hui Jun on HLD.docx', ?, '2026-07-08T10:00:00Z', 'extracted', ?, ?, ?, ?, ?, ?)`,
+    ).run(id, `https://example.sharepoint.com/hld#comment=${id}`, JSON.stringify(metadata), cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes);
+  }
+
   it('P9: when LLM unavailable, defers and changes no item state', async () => {
     insertExtracted('a', 'Livestream bug', 'prod 500');
     const down: PipelineLlm = { isAvailable: () => false, complete: async () => '' };
@@ -123,6 +134,47 @@ describe('Librarian', () => {
     const row = storage.getDb().prepare('SELECT process_state, project_id FROM work_items WHERE id = ?').get('a') as any;
     expect(row.process_state).toBe('routed');
     expect(row.project_id).toBe(projects[0].id);
+  });
+
+  it('routes document comments to their parent document project deterministically — no model call', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_hld', 'Catalog HLD review'), 'Catalog HLD review');
+    insertComment('c1', { docKey: 'example/hld.docx', parentProjectId: 'proj_hld' });
+    const { lib } = build(
+      mockLlm(() => { throw new Error('model must not be called for hinted comments'); }),
+    );
+    const res = await lib.runWave();
+    expect(res.status).toBe('completed');
+    expect(res.assigned).toBe(1);
+    const row = db.prepare('SELECT process_state, project_id FROM work_items WHERE id = ?').get('c1') as any;
+    expect(row.process_state).toBe('routed');
+    expect(row.project_id).toBe('proj_hld');
+    const audit = db.prepare('SELECT validation_reason AS r, model_decision AS m FROM routing_decisions WHERE item_id = ?').get('c1') as any;
+    expect(audit.r).toBe('deterministic comment-follows-document rule');
+    expect(audit.m).toBe('not_called');
+  });
+
+  it('comments without a resolvable project hint fall through to the model', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_gone', 'Archived effort'), 'Archived effort');
+    db.prepare("UPDATE projects SET status = 'archived' WHERE id = 'proj_gone'").run();
+    insertComment('c2', { docKey: 'example/hld.docx', parentProjectId: 'proj_gone' }); // archived → no shortcut
+    insertComment('c3', { docKey: 'example/other.docx' }); // no hint at all
+    let sawModel = false;
+    const { lib } = build(
+      mockLlm(() => {
+        sawModel = true;
+        return JSON.stringify([
+          { itemId: 'c2', decision: 'orphan' },
+          { itemId: 'c3', decision: 'orphan' },
+        ]);
+      }),
+    );
+    const res = await lib.runWave();
+    expect(sawModel).toBe(true);
+    expect(res.orphaned).toBe(2);
   });
 
   it('marks noise and orphans omitted/unplaceable items', async () => {

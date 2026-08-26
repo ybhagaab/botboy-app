@@ -16,6 +16,14 @@ import type { ChatTerminalService } from './chat-terminal.js';
 import type { ToolCall } from './llm-client.js';
 import { writeFileMaxChars } from './limits.js';
 import { getBuiltInMcpProfile } from './mcp-profiles.js';
+import {
+  applyDocxBodyEdits,
+  mapSharePointWriteTarget,
+} from './docx-body-editor.js';
+import { createPendingEdit, listPendingEdits, decidePendingEdit } from './pending-edits.js';
+import { listDocumentCorpus, buildDocumentView, docKeyForPath } from './document-corpus.js';
+import type { ContentStore } from './content-store.js';
+
 
 export interface ToolResult {
   toolCallId: string;
@@ -165,6 +173,7 @@ export function createToolExecutor(
     analyticsService?: AnalyticsDashboardService;
     dashboardPublisher?: DashboardPublisherService;
     chatTerminal?: ChatTerminalService;
+    contentStore?: ContentStore;
   } = {},
 ): ToolExecutor {
   const brainStore = extras.brainStore;
@@ -172,6 +181,7 @@ export function createToolExecutor(
   const analyticsService = extras.analyticsService;
   const dashboardPublisher = extras.dashboardPublisher;
   const chatTerminal = extras.chatTerminal;
+  const contentStore = extras.contentStore;
   const API_BASE = `http://localhost:${process.env.PPT_PORT || 7778}/api`;
   const normalizeTaskText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -264,6 +274,9 @@ export function createToolExecutor(
       ? null
       : `Error: ownerRequested must be true, and may only be set when the current user explicitly asked to ${action}`;
   }
+
+  // mapSharePointWriteTarget lives in docx-body-editor.ts (shared with the
+  // reader's Sync path since the pending-edits lane landed).
 
   const handlers: Record<string, (args: any) => Promise<string> | string> = {
     // ── Guarded canonical workspace control plane ──
@@ -654,6 +667,465 @@ export function createToolExecutor(
         description: tool.description,
         inputSchema: tool.inputSchema ?? {},
       }, null, 1);
+    },
+
+    // ── SharePoint guided writes (sharepoint-writes R2) ───────────────────
+    // The ONLY path to the three blocked write tools. Each guard re-reads
+    // live server state immediately before writing; stored evidence is never
+    // trusted for a write decision. guidedFlow is set here and nowhere else.
+
+    sharepoint_reply_comment: async (args) => {
+      if (!mcpManager) return 'Error: managed MCP runtime unavailable';
+      const gate = requireOwnerRequested(args, 'post this reply to the document comment thread');
+      if (gate) return gate;
+      const serverRelativeUrl = String(args.serverRelativeUrl ?? '').trim();
+      const commentId = String(args.commentId ?? '').trim();
+      const text = String(args.text ?? '').trim();
+      if (!serverRelativeUrl || !commentId || !text) return 'Error: serverRelativeUrl, commentId, and text are required';
+      const siteUrl = typeof args.siteUrl === 'string' && args.siteUrl.trim() ? { siteUrl: args.siteUrl.trim() } : {};
+
+      // Stale-thread guard: the comment must exist in the CURRENT thread.
+      // NOTE: callTool reports tool-level failures as isError results, not
+      // exceptions — every guard read must check it (live find, 2026-08-25).
+      const thread = await mcpManager.callTool('sharepoint', 'sharepoint_read_docx_comments',
+        { serverRelativeUrl, ...siteUrl }, { source: 'agent', timeoutMs: 60_000 });
+      if (thread.isError) return `Error: could not read the current comment thread (${thread.text.slice(0, 200)}); not replying blind`;
+      let comments: Array<{ id?: unknown; author?: unknown; text?: unknown }> = [];
+      try {
+        const parsed = JSON.parse(thread.text) as unknown;
+        if (Array.isArray(parsed)) comments = parsed as typeof comments;
+      } catch { return 'Error: could not read the current comment thread (non-JSON response); not replying blind'; }
+      if (!comments.some(c => String(c.id) === commentId)) {
+        const summary = comments.slice(0, 20).map(c => `${String(c.id)}: ${String(c.author ?? 'unknown')} — ${String(c.text ?? '').slice(0, 80)}`).join('\n');
+        return `Error: comment thread changed — comment ${commentId} no longer exists. Current thread:\n${summary || '(no comments)'}`;
+      }
+
+      const result = await mcpManager.callTool('sharepoint', 'sharepoint_reply_docx_comment',
+        { serverRelativeUrl, ...siteUrl, commentId, text },
+        { source: 'agent', timeoutMs: 90_000, ownerApproved: true, guidedFlow: true });
+      return JSON.stringify({
+        status: result.isError ? 'failed' : 'replied',
+        commentId,
+        note: 'Replies are watermarked by the server with the AmazonSharePointMCP robot prefix; the thread shows it came from BotBoy.',
+        result: result.text.slice(0, 4_000),
+      }, null, 1);
+    },
+
+    sharepoint_add_comment: async (args) => {
+      if (!mcpManager) return 'Error: managed MCP runtime unavailable';
+      const gate = requireOwnerRequested(args, 'add this comment to the document');
+      if (gate) return gate;
+      const serverRelativeUrl = String(args.serverRelativeUrl ?? '').trim();
+      const anchorText = String(args.anchorText ?? '').trim();
+      const text = String(args.text ?? '').trim();
+      if (!serverRelativeUrl || !anchorText || !text) return 'Error: serverRelativeUrl, anchorText, and text are required';
+      if (!serverRelativeUrl.toLowerCase().endsWith('.docx')) {
+        return 'Error: anchored comments are only supported on .docx files';
+      }
+      const siteUrl = typeof args.siteUrl === 'string' && args.siteUrl.trim() ? { siteUrl: args.siteUrl.trim() } : {};
+
+      // Stale-anchor guard: the anchor must appear in the CURRENT document
+      // (the server pins the comment to the first occurrence). Whitespace is
+      // normalized for the check only; the server receives the original.
+      const current = await mcpManager.callTool('sharepoint', 'sharepoint_read_file',
+        { serverRelativeUrl, ...siteUrl, inline: true, format: 'markdown', stripImages: true },
+        { source: 'agent', timeoutMs: 120_000 });
+      if (current.isError) return `Error: could not read the current document (${current.text.slice(0, 200)}); not commenting blind`;
+      const squash = (value: string) => value.replace(/\s+/g, ' ');
+      if (!squash(current.text).includes(squash(anchorText))) {
+        return 'Error: anchor text not found in the current document — it may have been edited since it was read. Re-read the document and pick an anchor from its current content.';
+      }
+
+      const result = await mcpManager.callTool('sharepoint', 'sharepoint_add_docx_comment',
+        { serverRelativeUrl, ...siteUrl, anchorText, text },
+        { source: 'agent', timeoutMs: 90_000, ownerApproved: true, guidedFlow: true });
+      return JSON.stringify({
+        status: result.isError ? 'failed' : 'commented',
+        note: 'Comments are watermarked by the server with the AmazonSharePointMCP robot prefix.',
+        result: result.text.slice(0, 4_000),
+      }, null, 1);
+    },
+
+    sharepoint_update_document: async (args) => {
+      if (!mcpManager) return 'Error: managed MCP runtime unavailable';
+      const gate = requireOwnerRequested(args, 'write this content to the document');
+      if (gate) return gate;
+      const serverRelativeUrl = String(args.serverRelativeUrl ?? '').trim();
+      const content = typeof args.content === 'string' ? args.content : '';
+      if (!serverRelativeUrl || content === '') return 'Error: serverRelativeUrl and non-empty content are required';
+      const ext = serverRelativeUrl.slice(serverRelativeUrl.lastIndexOf('.')).toLowerCase();
+      if (!['.md', '.txt', '.csv'].includes(ext)) {
+        return ext === '.docx'
+          ? 'Error: sharepoint_update_document is for text-family files only. To edit a Word document body, use sharepoint_edit_docx_body (surgical edit that preserves formatting and comments).'
+          : 'Error: direct content updates are supported for text-family files only (.md, .txt, .csv). For .docx use sharepoint_edit_docx_body; for other Office formats offer an anchored comment with the proposed change (sharepoint_add_comment).';
+      }
+
+      const target = mapSharePointWriteTarget(serverRelativeUrl, args.siteUrl);
+      if (typeof target === 'string') return target;
+      const { personal, folderPath, fileName, siteUrl } = target;
+
+      // Freshness guard: the write must be based on the CURRENT content.
+      // Read failures surface BOTH as isError results and as exceptions
+      // (transport vs tool errors) — treat them identically (live find,
+      // 2026-08-25: a not-found isError text was hashed as "content").
+      const baseContentSha = String(args.baseContentSha ?? '').trim();
+      let mode: 'updated' | 'created' = 'updated';
+      let readFailure: string | null = null;
+      try {
+        const current = await mcpManager.callTool('sharepoint', 'sharepoint_read_file',
+          { serverRelativeUrl, ...siteUrl, ...(personal ? {} : { personal: false }), inline: true },
+          { source: 'agent', timeoutMs: 60_000 });
+        if (current.isError) {
+          readFailure = current.text;
+        } else {
+          const currentSha = createHash('sha256').update(current.text).digest('hex');
+          if (!baseContentSha) {
+            return `Error: baseContentSha is required to update an existing document — read it first (current sha256 ${currentSha}) and pass that value so concurrent edits cannot be overwritten.`;
+          }
+          if (currentSha !== baseContentSha) {
+            return 'Error: document changed since it was read (content sha mismatch). Re-read the current content, re-apply the intended change, and call again with the fresh baseContentSha.';
+          }
+        }
+      } catch (error) {
+        readFailure = (error as Error).message ?? String(error);
+      }
+      if (readFailure !== null) {
+        const looksMissing = /not found|404|does not exist|no such file|file .* was not found/i.test(readFailure);
+        if (!(args.createIfMissing === true && looksMissing)) {
+          return `Error: could not verify the current document state (${readFailure.slice(0, 200)}); not writing blind. Pass createIfMissing=true only for a genuinely new document.`;
+        }
+        mode = 'created';
+      }
+
+      const result = await mcpManager.callTool('sharepoint', 'sharepoint_write_file',
+        {
+          libraryName: 'Documents',
+          fileName,
+          content,
+          ...(folderPath ? { folderPath } : {}),
+          ...(personal ? {} : { personal: false }),
+          ...siteUrl,
+          includeWebUrl: true,
+        },
+        { source: 'agent', timeoutMs: 120_000, ownerApproved: true, guidedFlow: true });
+      return JSON.stringify({
+        status: result.isError ? 'failed' : mode,
+        newContentSha: createHash('sha256').update(content).digest('hex'),
+        result: result.text.slice(0, 4_000),
+      }, null, 1);
+    },
+
+    sharepoint_edit_docx_body: async (args) => {
+      if (!mcpManager) return 'Error: managed MCP runtime unavailable';
+      const gate = requireOwnerRequested(args, 'edit this document body');
+      if (gate) return gate;
+      const serverRelativeUrl = String(args.serverRelativeUrl ?? '').trim();
+      if (!serverRelativeUrl.toLowerCase().endsWith('.docx')) {
+        return 'Error: sharepoint_edit_docx_body edits .docx files; use sharepoint_update_document for text-family files';
+      }
+      const operation = String(args.operation ?? '').trim();
+      const findText = String(args.findText ?? '');
+      const replaceWith = String(args.replaceWith ?? '');
+      const paragraphs: string[] = Array.isArray(args.paragraphs) ? args.paragraphs.map((p: unknown) => String(p)) : [];
+      if (operation === 'replaceText') {
+        if (!findText.trim()) return 'Error: replaceText needs findText — the exact current passage to replace';
+        if (findText.includes('\n')) return 'Error: findText must stay within one paragraph (no newlines); replace paragraph by paragraph';
+      } else if (operation === 'appendParagraphs') {
+        if (paragraphs.length === 0 || paragraphs.every(p => !p.trim())) return 'Error: appendParagraphs needs a non-empty paragraphs array';
+      } else {
+        return 'Error: operation must be replaceText or appendParagraphs';
+      }
+      // Fail unsupported paths before staging anything (propose or direct).
+      const mapped = mapSharePointWriteTarget(serverRelativeUrl, args.siteUrl);
+      if (typeof mapped === 'string') return mapped;
+
+      // Owner-decided routing (workbench R3.3): edits STAGE by default; only
+      // an explicit "directly edit / edit it on SharePoint now" in the user's
+      // request selects direct mode.
+      const mode = String(args.mode ?? 'propose');
+      if (mode !== 'direct') {
+        const docKeyRow = db.prepare(`
+          SELECT json_extract(metadata, '$.docKey') AS docKey, json_extract(metadata, '$.siteUrl') AS siteUrl
+          FROM work_items
+          WHERE source = 'sharepoint' AND type = 'document_capture'
+            AND json_extract(metadata, '$.serverRelativeUrl') = ?
+          ORDER BY captured_at DESC LIMIT 1
+        `).get(serverRelativeUrl) as { docKey: string | null; siteUrl: string | null } | undefined;
+        const docKey = docKeyRow?.docKey ?? `${(typeof args.siteUrl === 'string' && args.siteUrl ? new URL(args.siteUrl).hostname : 'sharepoint')}${serverRelativeUrl}`;
+        try {
+          const edit = createPendingEdit(db, {
+            docKey,
+            serverRelativeUrl,
+            siteUrl: typeof args.siteUrl === 'string' ? args.siteUrl : (docKeyRow?.siteUrl ?? undefined),
+            kind: 'botboy',
+            operation: operation as 'replaceText' | 'appendParagraphs',
+            findText,
+            replaceWith,
+            paragraphs,
+            originNote: String(args.purpose ?? 'proposed from chat').slice(0, 200),
+          });
+          return JSON.stringify({
+            status: 'staged',
+            pendingEditId: edit.id,
+            note: 'Edit STAGED for owner review, not written to SharePoint. The owner approves and syncs it in the document reader. Tell the owner where to find it; only re-call with mode="direct" if they explicitly asked to edit the source directly.',
+            readerLink: `#/doc/${Buffer.from(docKey, 'utf8').toString('base64url')}`,
+          }, null, 1);
+        } catch (error) {
+          return `Error: could not stage the edit (${(error as Error).message})`;
+        }
+      }
+
+      const result = await applyDocxBodyEdits(mcpManager, { serverRelativeUrl, siteUrl: typeof args.siteUrl === 'string' ? args.siteUrl : undefined }, [{
+        id: 'chat-direct',
+        operation: operation as 'replaceText' | 'appendParagraphs',
+        findText,
+        replaceWith,
+        paragraphs,
+      }]);
+      if (result.error) return `Error: ${result.error}; not editing blind`;
+      const editResult = result.perEdit[0];
+      if (!editResult?.applied) {
+        return `Error: ${editResult?.reason ?? 'edit could not be applied'} (this uniqueness check IS the freshness guard — re-read the document and quote the exact current text)`;
+      }
+      return JSON.stringify({
+        status: result.verifiedOnReadBack ? 'edited' : 'edited_unverified',
+        operation,
+        verifiedOnReadBack: result.verifiedOnReadBack,
+        note: 'Only the document body XML changed — formatting, embedded comments, and images are preserved. The pre-edit version remains restorable via SharePoint version history.',
+        result: (result.uploadResultText ?? '').slice(0, 4_000),
+      }, null, 1);
+    },
+
+    sharepoint_create_document: async (args) => {
+      const gate = requireOwnerRequested(args, 'create this document');
+      if (gate) return gate;
+      const format = String(args.format ?? '').replace(/^\./, '').toLowerCase();
+      if (format !== 'md' && format !== 'docx') return 'Error: format must be md or docx';
+      const title = String(args.title ?? '').trim();
+      if (title.length < 3 || title.length > 200) return 'Error: title must be 3-200 characters';
+      const projectId = String(args.projectId ?? '').trim();
+      if (!projectId) return "Error: projectId is required — the staged creation appears on that project's Documents tab for approval";
+      if (!db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) {
+        return `Error: unknown project '${projectId}' — find the id with list_projects`;
+      }
+      let serverRelativeUrl = String(args.serverRelativeUrl ?? '').trim();
+      if (!serverRelativeUrl) {
+        const folder = String(args.targetFolder ?? '').trim().replace(/\/+$/, '');
+        if (!folder) return 'Error: provide targetFolder (e.g. /personal/<alias>_amazon_com/Documents/Notes) or a full serverRelativeUrl';
+        const safeName = title.replace(/[\\/:*?"<>|#%]/g, '').replace(/\s+/g, ' ').trim();
+        serverRelativeUrl = `${folder}/${safeName}.${format}`;
+      }
+      if (!serverRelativeUrl.toLowerCase().endsWith(`.${format}`)) {
+        return `Error: the target path must end in .${format} to match the requested format`;
+      }
+      // Unsupported paths fail BEFORE staging (same rule as edits).
+      const mapped = mapSharePointWriteTarget(serverRelativeUrl, args.siteUrl);
+      if (typeof mapped === 'string') return mapped;
+      const docKey = docKeyForPath(db, serverRelativeUrl, typeof args.siteUrl === 'string' && args.siteUrl ? args.siteUrl : undefined);
+      const existing = db.prepare(`
+        SELECT 1 FROM work_items
+        WHERE source = 'sharepoint' AND type = 'document_capture'
+          AND json_extract(metadata, '$.docKey') = ? LIMIT 1
+      `).get(docKey);
+      if (existing) {
+        return JSON.stringify({
+          status: 'exists',
+          note: 'A document already lives at this target — EDIT it instead of creating a duplicate (sharepoint_edit_docx_body for .docx, sharepoint_update_document for text).',
+          readerLink: `#/doc/${Buffer.from(docKey, 'utf8').toString('base64url')}`,
+        }, null, 1);
+      }
+
+      // Owner-decided routing (mirrors sharepoint_edit_docx_body): creations
+      // STAGE by default; only explicit create-it-now wording goes direct.
+      const mode = String(args.mode ?? 'propose');
+      let editId: string;
+      try {
+        const edit = createPendingEdit(db, {
+          docKey,
+          serverRelativeUrl,
+          siteUrl: typeof args.siteUrl === 'string' && args.siteUrl ? args.siteUrl : undefined,
+          kind: 'botboy',
+          operation: 'createDocument',
+          createContent: String(args.content ?? ''),
+          projectId,
+          originNote: String(args.purpose ?? 'drafted from chat').slice(0, 200),
+        });
+        editId = edit.id;
+      } catch (error) {
+        return `Error: could not stage the creation (${(error as Error).message})`;
+      }
+      if (mode !== 'direct') {
+        return JSON.stringify({
+          status: 'staged',
+          pendingEditId: editId,
+          docKey,
+          note: 'Creation STAGED for owner review, nothing written to SharePoint. The owner approves and syncs it under "Staged creations" on the project Documents tab. Only re-call with mode="direct" if they explicitly asked to create it immediately.',
+          approveAt: `#/projects/${encodeURIComponent(projectId)}`,
+        }, null, 1);
+      }
+      // Direct mode: approve on the owner's explicit wording and publish
+      // through the same route the UI sync uses (guidedFlow set server-side).
+      decidePendingEdit(db, editId, 'approved');
+      const result = await selfApi('/documents/sync', { method: 'POST', body: JSON.stringify({ docKey }) });
+      return result.slice(0, 4_000);
+    },
+
+    read_spreadsheet: async (args) => {
+      const docKey = String(args.docKey ?? '').trim();
+      if (!docKey) return 'Error: docKey required — find it via list_documents';
+      const params = new URLSearchParams({ docKey });
+      const sheet = String(args.sheet ?? '').trim();
+      if (sheet) params.set('sheet', sheet);
+      if (Number(args.maxRows) > 0) params.set('maxRows', String(Math.floor(Number(args.maxRows))));
+      if (args.refresh === true) params.set('refresh', 'true');
+      let raw: string;
+      try {
+        raw = await selfApi(`/documents/sheet?${params.toString()}`);
+      } catch (error) {
+        return `Error: ${(error as Error).message}`;
+      }
+      let payload: Record<string, unknown>;
+      try { payload = JSON.parse(raw); } catch { return raw.slice(0, 2_000); }
+      if (payload.error) return `Error: ${String(payload.error)}`;
+      const header = `sheets: ${(payload.sheets as string[] ?? []).join(' | ')}\nasOf: ${payload.asOf} (fromCache: ${payload.fromCache === true})`;
+      const sheetData = payload.sheet as { name: string; rows: string[][]; rowsTotal: number | null; truncation: Record<string, boolean>; formulaCells: number } | undefined;
+      if (!sheetData) {
+        return `${header}\n\nNo sheet requested — re-call with sheet=<name> for cell data. The synced capture content is BOUNDED; never answer cell-level questions from it.`;
+      }
+      const lines = sheetData.rows.map(row => row.join('\t'));
+      const truncationNotes = [
+        sheetData.truncation.rowsCut ? `rows cut at ${sheetData.rows.length} of ${sheetData.rowsTotal ?? '?'} — narrow with maxRows or ask per-column` : '',
+        sheetData.truncation.charsCut ? 'char budget hit — later rows omitted' : '',
+        sheetData.truncation.sharedStringsBudgetHit ? 'some cell text blank: string table exceeded its budget' : '',
+        sheetData.formulaCells > 0 ? `${sheetData.formulaCells} formula cell(s) show their last-calculated value` : '',
+      ].filter(Boolean);
+      return [
+        header,
+        `sheet: ${sheetData.name} (${sheetData.rows.length} rows${sheetData.rowsTotal ? ` of ${sheetData.rowsTotal}` : ''})`,
+        truncationNotes.length ? `notes: ${truncationNotes.join('; ')}` : '',
+        '',
+        lines.join('\n'),
+      ].filter(Boolean).join('\n');
+    },
+
+    // ── Document corpus reads (workbench soak find 2026-08-25) ────────────
+    // BotBoy already syncs these documents; chat must consult THIS corpus —
+    // not ad-hoc SharePoint browsing, which found the wrong file and declared
+    // a fully-synced document missing.
+
+    list_documents: (args) => {
+      const query = String(args.query ?? '').trim() || undefined;
+      const projectId = String(args.projectId ?? '').trim() || undefined;
+      const docs = listDocumentCorpus(db, { query, projectId, limit: 30 });
+      if (docs.length === 0) {
+        return query
+          ? `No synced documents match "${query}". Try a shorter fragment of the title, or call list_documents without a query to see the whole corpus. Only conclude a document is not synced after checking the unfiltered list.`
+          : 'No SharePoint documents are synced yet.';
+      }
+      const lines = docs.map(doc => {
+        const edits = listPendingEdits(db, doc.docKey);
+        const openEdits = edits.filter(e => e.status === 'pending' || e.status === 'approved').length;
+        return {
+          title: String(doc.title ?? '(untitled)'),
+          docKey: doc.docKey,
+          fileType: doc.fileType ?? null,
+          extractionTier: doc.extractionTier ?? null,
+          revisions: doc.revisionCount,
+          comments: `${doc.commentCount} (${doc.commentCount - doc.resolvedCommentCount} open)`,
+          stagedEdits: openEdits,
+          ...(doc.suggestedChangeCount > 0 ? { unacceptedSuggestions: doc.suggestedChangeCount } : {}),
+          lastCapturedAt: doc.lastCapturedAt,
+          serverRelativeUrl: doc.serverRelativeUrl,
+          siteUrl: doc.siteUrl ?? null,
+          readerLink: `#/doc/${Buffer.from(doc.docKey, 'utf8').toString('base64url')}`,
+        };
+      });
+      return JSON.stringify({
+        documents: lines,
+        note: 'These are the synced copies BotBoy already maintains. Use read_document (docKey) for content, comments, and staged edits — no MCP call needed. To edit: quote the exact passage from read_document, then sharepoint_edit_docx_body with this serverRelativeUrl + siteUrl.',
+      }, null, 1);
+    },
+
+    read_document: async (args) => {
+      const docKey = String(args.docKey ?? '').trim();
+      if (!docKey) return 'Error: docKey required — find it via list_documents';
+      const part = String(args.part ?? 'all');
+      if (!['all', 'content', 'comments', 'pending_edits'].includes(part)) {
+        return 'Error: part must be one of all | content | comments | pending_edits';
+      }
+      // Optional live re-pull first (the reader Refresh button's path) — for
+      // "read the LATEST version" asks; the corpus copy is otherwise current
+      // to the sync engine's last pass.
+      if (args.refresh === true) {
+        try { await selfApi('/documents/refresh', { method: 'POST', body: JSON.stringify({ docKey }) }); }
+        catch (error) { return `Error: live refresh failed (${(error as Error).message}); re-call without refresh to read the stored copy`; }
+      }
+      const view = buildDocumentView(db, contentStore, docKey);
+      if (!view) {
+        return `Error: no synced document has docKey "${docKey}". Call list_documents (optionally with a query) to see what exists — do not conclude the document is missing without that.`;
+      }
+      const maxChars = Math.max(2_000, Math.min(60_000, Number(args.maxChars) || 20_000));
+      const out: Record<string, unknown> = {
+        doc: {
+          title: view.doc.title,
+          docKey,
+          fileType: view.doc.fileType,
+          serverRelativeUrl: view.doc.serverRelativeUrl,
+          siteUrl: view.doc.siteUrl,
+          webUrl: view.doc.webUrl,
+          project: view.doc.project,
+          readerLink: `#/doc/${Buffer.from(docKey, 'utf8').toString('base64url')}`,
+        },
+      };
+      if (part === 'all' || part === 'content') {
+        const truncated = view.content.length > maxChars;
+        out.content = truncated ? `${view.content.slice(0, maxChars)}\n…[truncated at ${maxChars} of ${view.content.length} chars — re-call with a larger maxChars or part=content]` : view.content;
+        out.contentAsOf = `${view.contentCapturedAt} (tier: ${view.contentTier || 'unknown'}${view.contentTier === 'truncated' ? ' — bounded extraction; pass refresh=true or ask for a deeper read if a section is missing' : ''})`;
+      }
+      if (view.suggestedChanges.length > 0 && part !== 'pending_edits') {
+        out.suggestedChanges = view.suggestedChanges.map(change => ({
+          kind: change.kind,
+          author: change.author,
+          ...(change.date ? { date: change.date } : {}),
+          text: change.text,
+        }));
+        out.suggestedChangesNote = 'UNACCEPTED Word suggestions (tracked changes). IMPORTANT: the content above renders suggested insertions as if they were final text — treat the listed passages as PROPOSED by their author, not part of the accepted document.';
+      }
+      if (view.related.length > 0 && part !== 'pending_edits') {
+        out.related = view.related.map(rel => ({
+          title: rel.title,
+          docKey: rel.docKey,
+          kind: rel.kind,
+          direction: rel.direction, // outgoing = this doc points there; incoming = that doc points here
+          evidence: rel.evidence.slice(0, 120),
+        }));
+      }
+      if (part === 'all' || part === 'comments') {
+        out.comments = view.comments.map(c => ({
+          id: c.commentId,
+          ...(c.parentCommentId ? { replyTo: c.parentCommentId } : {}),
+          author: c.author,
+          resolved: c.resolved,
+          ...(c.deletedFromDoc ? { deletedFromDoc: true } : {}),
+          ...(c.anchorText ? { anchor: c.anchorText.slice(0, 100) } : {}),
+          text: c.text.length > 300 ? `${c.text.slice(0, 300)}…` : c.text,
+        }));
+      }
+      if (part === 'all' || part === 'pending_edits') {
+        out.pendingEdits = view.pendingEdits.map(edit => ({
+          id: edit.id,
+          status: edit.status,
+          kind: edit.kind,
+          operation: edit.operation,
+          ...(edit.findText ? { findText: edit.findText } : {}),
+          ...(edit.replaceWith ? { replaceWith: edit.replaceWith } : {}),
+          ...(edit.paragraphs?.length ? { paragraphs: edit.paragraphs } : {}),
+          ...(edit.originNote ? { originNote: edit.originNote } : {}),
+          ...(edit.conflictReason ? { conflictReason: edit.conflictReason } : {}),
+        }));
+        out.pendingEditsNote = 'pending/approved edits are STAGED — visible here and in the reader, not yet in the SharePoint file. The owner approves and syncs them in the reader.';
+      }
+      return JSON.stringify(out, null, 1);
     },
 
     mcp_sql_list_presets: () => callMcpRead('list_presets', {}),

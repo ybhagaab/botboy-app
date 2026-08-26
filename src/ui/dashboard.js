@@ -23,6 +23,7 @@ const state = {
   slack: { configured: null, error: '' },
   folders: { items: null, error: '' },
   graspSync: { status: null, error: '', busy: '' },
+  sharepointSync: { status: null, error: '', busy: '', sites: [], libraries: [], pickedSite: '' },
   mcp: {
     servers: null,
     config: null,
@@ -80,6 +81,9 @@ const state = {
   rebuilding: new Set(),
   evidencePending: new Set(),
   discarded: { data: null, error: '' },
+  // Document workbench: per-project grouped documents + the reader view.
+  projectDocuments: new Map(), // projectId → { documents, error, loading }
+  docReader: { key: '', data: null, error: '', loading: false, refreshing: false },
   route: { view: 'today' },
   projectTab: 'brief',
   evidenceFilter: 'all',
@@ -147,6 +151,7 @@ function parseRoute() {
   if (parts[0] === 'areas') return { view: 'area', areaId: parts[1] || '' };
   if (parts[0] === 'connections' && parts[1] === 'sql-context') return { view: 'mcp-settings' };
   if (parts[0] === 'connections' && parts[1] === 'mail-calendar-sync') return { view: 'grasp-sync-settings' };
+  if (parts[0] === 'connections' && parts[1] === 'document-sync') return { view: 'sharepoint-sync-settings' };
   if (parts[0] === 'connections' && parts[1] === 'add') return { view: 'mcp-add' };
   if (parts[0] === 'connections' && parts[1] && parts[2] === 'edit') return { view: 'mcp-edit', profileId: parts[1] };
   // Every other managed MCP profile uses the generic settings page.
@@ -158,6 +163,9 @@ function parseRoute() {
     try { artifactId = decodeURIComponent(artifactId); } catch {}
     return { view: 'documents', artifactId };
   }
+  // Workbench reader: #/doc/<base64url(docKey)> — distinct from #/documents
+  // (the product-manager writing workspace).
+  if (parts[0] === 'doc' && parts[1]) return { view: 'doc-reader', docId: parts[1] };
   if (['inbox', 'channels', 'connections', 'pipeline', 'settings', 'nodes'].includes(parts[0])) return { view: parts[0] };
   return { view: 'not-found' };
 }
@@ -165,7 +173,7 @@ function parseRoute() {
 function go(hash) {
   closeIntegration();
   setMobileSidebarOpen(false);
-  if (location.hash === hash) renderRoute();
+  if (location.hash === hash) renderRoute({ userAction: true });
   else location.hash = hash;
 }
 
@@ -264,7 +272,7 @@ async function loadCore({ quiet = false } = {}) {
   // Sources panel needs it, and the panel fetches it on open (post-mortem
   // 2026-08-18: every navigation blanked for the slowest request, which was
   // always this one).
-  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult] = await Promise.allSettled([
+  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, sharepointSyncResult] = await Promise.allSettled([
     request('/areas'),
     request('/projects'),
     todayRequest,
@@ -274,6 +282,7 @@ async function loadCore({ quiet = false } = {}) {
     request('/local-folders'),
     request('/mcp/profiles'),
     request('/grasp-sync/status'),
+    request('/sharepoint-sync/status'),
   ]);
 
   const criticalErrors = [];
@@ -304,6 +313,8 @@ async function loadCore({ quiet = false } = {}) {
   else state.folders.error = foldersResult.reason.message;
   if (graspSyncResult.status === 'fulfilled') { state.graspSync.status = graspSyncResult.value.status || null; state.graspSync.error = ''; }
   else state.graspSync.error = graspSyncResult.reason.message;
+  if (sharepointSyncResult.status === 'fulfilled') { state.sharepointSync.status = sharepointSyncResult.value.status || null; state.sharepointSync.error = ''; }
+  else state.sharepointSync.error = sharepointSyncResult.reason.message;
   if (mcpResult.status === 'fulfilled') {
     state.mcp.servers = Array.isArray(mcpResult.value.profiles) ? mcpResult.value.profiles : [];
     state.mcp.profilesError = '';
@@ -317,7 +328,32 @@ async function loadCore({ quiet = false } = {}) {
   state.coreError = state.areas.length || state.projects.length ? '' : criticalErrors.join('; ');
   if (!state.expandedAreas.size) state.areas.slice(0, 3).forEach(area => state.expandedAreas.add(area.id));
   updateGlobalHealth();
-  renderRoute();
+  // Data refreshes must never yank the user's scroll position (owner
+  // report 2026-08-26: page "reloads" and jumps to top while reading).
+  // First paint has scrollTop 0 anyway. Unlabeled render = background:
+  // it also defers the repaint while the owner is typing.
+  renderRoute({ preserveScroll: true });
+  // One-shot scroll restore after a bootId hard reload (stashed by
+  // pollVersion just before location.reload). The route's content loads
+  // asynchronously (project detail, documents), so the page may not have
+  // enough height yet — retry until the target offset is reachable (or give
+  // up after 8s / the moment the owner scrolls themselves).
+  let savedScroll = null;
+  try { savedScroll = sessionStorage.getItem('botboy-reload-scroll'); } catch {}
+  if (savedScroll !== null) {
+    try { sessionStorage.removeItem('botboy-reload-scroll'); } catch {}
+    const target = Number(savedScroll) || 0;
+    if (target > 0) {
+      const startedAt = Date.now();
+      const tryRestore = () => {
+        const el = document.getElementById('workspace');
+        if (!el || el.scrollTop !== 0) return; // owner already scrolled — don't fight them
+        if (el.scrollHeight - el.clientHeight >= target) { el.scrollTop = target; return; }
+        if (Date.now() - startedAt < 8000) setTimeout(tryRestore, 250);
+      };
+      tryRestore();
+    }
+  }
 }
 
 async function openTodayVisit({ propagate = false } = {}) {
@@ -325,7 +361,7 @@ async function openTodayVisit({ propagate = false } = {}) {
   state.today.opening = true;
   state.today.data = null;
   state.today.error = '';
-  if (state.route.view === 'today') renderRoute();
+  if (state.route.view === 'today') renderRoute({ userAction: true });
   let failure = null;
   try {
     state.today.data = await request('/today/visit', { method: 'POST' });
@@ -334,7 +370,7 @@ async function openTodayVisit({ propagate = false } = {}) {
     failure = error;
   } finally {
     state.today.opening = false;
-    if (state.route.view === 'today') renderRoute();
+    if (state.route.view === 'today') renderRoute({ userAction: true });
   }
   if (failure && propagate) throw failure;
   return state.today.data;
@@ -351,7 +387,7 @@ async function refreshToday({ render = true, propagate = false } = {}) {
     state.today.error = error.message;
     failure = error;
   }
-  if (render && state.route.view === 'today') renderRoute();
+  if (render && state.route.view === 'today') renderRoute({ userAction: true });
   if (failure && propagate) throw failure;
   return state.today.data;
 }
@@ -405,7 +441,7 @@ async function updateTodayItem(itemId, action, expectedVersion) {
   } finally {
     state.today.pending.delete(itemId);
     if (state.route.view === 'today') {
-      renderRoute();
+      renderRoute({ userAction: true });
       if (succeeded) requestAnimationFrame(() => focusTodayControl(itemId, ['snooze', 'dismiss'].includes(action) ? 'today-restore' : 'today-pin'));
     } else {
       setTodayControlsDisabled(itemId, false);
@@ -455,8 +491,11 @@ function planDay() {
   toast('Local Today plan prepared');
 }
 
-async function loadProject(id, { renderAfter = true } = {}) {
-  if (!id || state.projectDetails.has(id)) return state.projectDetails.get(id);
+async function loadProject(id, { renderAfter = true, force = false } = {}) {
+  if (!id || (!force && state.projectDetails.has(id))) return state.projectDetails.get(id);
+  // Documents load in parallel so the tab shows its count on first paint
+  // (soak find: the count only appeared after clicking the tab).
+  void loadProjectDocuments(id);
   try {
     const [detail, crossLinksPayload] = await Promise.all([
       request(`/projects/${encodeURIComponent(id)}`),
@@ -604,11 +643,14 @@ function renderProject(projectId) {
   if (!detail) return errorView(state.projectErrors.get(projectId));
   const brain = detail.brain || {};
   const area = areaForProject(projectId);
-  const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['timeline', 'Timeline']];
+  const docsEntry = state.projectDocuments.get(projectId);
+  const docsCount = docsEntry?.documents?.length;
+  const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['documents', `Documents${typeof docsCount === 'number' ? ` ${docsCount}` : ''}`], ['timeline', 'Timeline']];
   let content = '';
   if (state.projectTab === 'brief') content = renderProjectBrief(project, detail, area);
   if (state.projectTab === 'tasks') content = renderProjectTasks(brain);
   if (state.projectTab === 'evidence') content = renderEvidence(project, detail.items || [], detail);
+  if (state.projectTab === 'documents') content = renderProjectDocuments(projectId);
   if (state.projectTab === 'timeline') content = renderTimeline(brain.activityLog || []);
   const fallbackHtml = `<div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${area ? `<a href="#/areas/${encodeURIComponent(area.id)}">${esc(area.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Project</span></div><header class="page-head"><div><div class="project-title-row"><h1 class="page-title">${esc(brain.title || project.title)}</h1><span class="pill ${projectTone(project, detail)}"><span class="status-dot ${projectTone(project, detail)}"></span>${esc(statusLabel(project))}</span></div><p class="project-status-line">${esc(brain.statusLine || project.oneLiner || 'No current status line has been synthesized.')}</p><div class="project-meta"><span>${icon('refresh', 13)} Updated ${esc(relativeTime(brain.updated || project.updatedAt))}</span><span>${icon('file', 13)} ${number(project.itemCount)} evidence items</span><span>${icon('shield', 13)} Local workspace</span>${detail.scopeAlertCount ? `<span class="pill warn" title="Evidence flagged by the brain pass because it also anchors another project's scope. Dominant foreign anchors are quarantined from synthesis; the rest are advisory. Review in the Evidence tab.">${icon('alert', 12)} Scope alerts: ${number(detail.scopeAlertCount)}</span>` : ''}</div></div><div class="head-actions"><button class="button" type="button" data-action="rebuild-brain" data-project="${attr(project.id)}" ${state.rebuilding.has(project.id) ? 'disabled' : ''}>${icon('refresh')} ${state.rebuilding.has(project.id) ? 'Rebuilding…' : 'Rebuild from evidence'}</button><button class="button primary" type="button" data-prompt="${attr(projectAskSeed(brain.title || project.title, project.id))}">${icon('sparkles')} Ask BotBoy</button></div></header><div class="tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${state.projectTab === id ? 'active' : ''}" type="button" role="tab" aria-selected="${state.projectTab === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div><div role="tabpanel">${content}</div>`;
   return window.BotBoyLayouts?.renderProject({
@@ -791,7 +833,18 @@ function evidenceRows(items, project) {
         ? `<span class="pill warn" title="This evidence is more strongly anchored to another project (${attr(item.scopeAlert.titles.join(' | '))}). The brain pass quarantined it from synthesis; reject it here or leave it for reference.">${icon('alert', 11)} mixed scope</span>`
         : `<span class="pill" title="This evidence also references another project's scope (${attr(item.scopeAlert.titles.join(' | '))}). It is still synthesized here; review if it feels misplaced.">${icon('alert', 11)} touches other scope</span>`)
       : '';
-    return `<article class="evidence-row"><span class="source-icon">${icon(sourceIcon(item.source, item.type), 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(item.title || '(untitled evidence)')}</div><p>${esc(item.summary || `${item.type || 'Evidence'} captured from ${item.source || 'an unknown source'}.`)}</p><div class="evidence-meta"><span class="pill">${esc((item.type || 'item').replaceAll('_', ' '))}</span><span class="pill">${esc(item.source || 'unknown')}</span>${scopeAlert}${item.url ? `<a class="text-link" href="${attr(item.url)}" target="_blank" rel="noopener">Open source</a>` : ''}${filePath ? `<a class="text-link" href="#" data-action="reveal" data-path="${attr(filePath)}">Reveal file</a>` : ''}</div></div><div class="today-item-side"><time>${esc(relativeTime(item.capturedAt || item.captured_at))}</time>${rejectControl}</div></article>`;
+    // Extraction-tier badge (sharepoint plan §11.5.2: truncation is never
+    // silent). Metadata may arrive parsed or as a JSON string depending on
+    // the route; both shapes are handled, absence renders nothing.
+    let itemMeta = item.metadata;
+    if (typeof itemMeta === 'string') { try { itemMeta = JSON.parse(itemMeta); } catch { itemMeta = {}; } }
+    const tier = itemMeta?.extractionTier;
+    const tierChip = tier === 'truncated'
+      ? `<span class="pill" title="Bounded extraction: structure and samples are synced with exact coverage recorded. Ask BotBoy for a deeper read of specific parts.">${icon('alert', 11)} partial content</span>`
+      : tier === 'metadata_only'
+        ? `<span class="pill" title="Presence only: BotBoy knows this document exists and who changed it, but its content is not synced. Open it in SharePoint for the full document.">${icon('alert', 11)} listed only</span>`
+        : '';
+    return `<article class="evidence-row"><span class="source-icon">${icon(sourceIcon(item.source, item.type), 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(item.title || '(untitled evidence)')}</div><p>${esc(item.summary || `${item.type || 'Evidence'} captured from ${item.source || 'an unknown source'}.`)}</p><div class="evidence-meta"><span class="pill">${esc((item.type || 'item').replaceAll('_', ' '))}</span><span class="pill">${esc(item.source || 'unknown')}</span>${tierChip}${scopeAlert}${item.url ? `<a class="text-link" href="${attr(item.url)}" target="_blank" rel="noopener">Open source</a>` : ''}${filePath ? `<a class="text-link" href="#" data-action="reveal" data-path="${attr(filePath)}">Reveal file</a>` : ''}</div></div><div class="today-item-side"><time>${esc(relativeTime(item.capturedAt || item.captured_at))}</time>${rejectControl}</div></article>`;
   }).join('');
 }
 
@@ -806,6 +859,431 @@ function renderEvidence(project, items, detail) {
   const filtered = state.evidenceFilter === 'all' ? items : items.filter(item => String(item.source || '').toLowerCase().includes(state.evidenceFilter));
   const sources = [...new Set(items.map(item => String(item.source || '').toLowerCase()).filter(Boolean))].slice(0, 6);
   return `<div class="section-heading" style="margin-top:0"><div><h2>Connected evidence</h2><p>Latest ${number(items.length)} loaded of ${number(project.itemCount)} connected items. Reject anything that does not belong — then rebuild the brain so the synthesis reflects it.</p></div></div><div class="filter-row"><button class="filter-chip ${state.evidenceFilter === 'all' ? 'active' : ''}" type="button" data-action="evidence-filter" data-filter="all">All sources</button>${sources.map(source => `<button class="filter-chip ${state.evidenceFilter === source ? 'active' : ''}" type="button" data-action="evidence-filter" data-filter="${attr(source)}">${esc(source)}</button>`).join('')}</div><section class="card evidence-list">${evidenceRows(filtered, project)}</section>${rejectedEvidenceSection(project, detail || {})}`;
+}
+
+// ── Document workbench: project Documents tab + reader (#/doc/<id>) ────────
+// Boundary: this is the SharePoint evidence world. The #/documents route and
+// state.documents belong to the product-manager writing workspace.
+
+// Unicode-safe base64url for docKeys in hashes.
+function encodeDocKey(key) {
+  return btoa(unescape(encodeURIComponent(String(key)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function decodeDocKey(id) {
+  try { return decodeURIComponent(escape(atob(String(id).replace(/-/g, '+').replace(/_/g, '/')))); } catch { return ''; }
+}
+
+function tierChip(tier) {
+  if (tier === 'truncated') return '<span class="pill warn" title="Bounded extraction — metadata.truncation records what was cut">partial content</span>';
+  if (tier === 'metadata_only') return '<span class="pill" title="Presence only — content not synced at this size tier">listed only</span>';
+  return '';
+}
+
+async function loadProjectDocuments(projectId, { force = false } = {}) {
+  const existing = state.projectDocuments.get(projectId);
+  if (existing?.loading || (existing?.documents && !force)) return;
+  state.projectDocuments.set(projectId, { documents: existing?.documents ?? null, loading: true, error: '' });
+  try {
+    const payload = await request(`/projects/${encodeURIComponent(projectId)}/documents`);
+    state.projectDocuments.set(projectId, { documents: payload.documents || [], stagedCreations: payload.stagedCreations || [], loading: false, error: '' });
+  } catch (error) {
+    state.projectDocuments.set(projectId, { documents: existing?.documents ?? null, stagedCreations: existing?.stagedCreations ?? [], loading: false, error: String(error?.message || error) });
+  }
+  if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ preserveScroll: true });
+}
+
+function renderProjectDocuments(projectId) {
+  const entry = state.projectDocuments.get(projectId);
+  if (!entry || (entry.loading && !entry.documents)) {
+    if (!entry) void loadProjectDocuments(projectId);
+    return '<section class="card"><div class="empty-state"><p>Loading documents…</p></div></section>';
+  }
+  if (entry.error && !entry.documents) {
+    return `<section class="card error-state"><span class="source-icon">${icon('alert', 18)}</span><h3>Documents could not be loaded</h3><p>${esc(entry.error)}</p></section>`;
+  }
+  const docs = entry.documents || [];
+  // Staged creations (authoring bridge): documents BotBoy drafted that
+  // publish to SharePoint only after Approve + Sync here.
+  const creations = entry.stagedCreations || [];
+  const creationBlock = creations.length ? `
+    <div class="section-heading"><div><h2>Staged creations</h2><p>Documents BotBoy drafted for this project. Nothing exists on SharePoint until you approve and sync.</p></div><span class="pill blue">${creations.length}</span></div>
+    <section class="card pad">${creations.map(creation => {
+    const statusTone = { pending: '', approved: 'blue', conflicted: 'warn' }[creation.status] || '';
+    const canRender = typeof window.formatMarkdownContent === 'function';
+    return `<article style="display:flex; flex-direction:column; gap:8px; padding:10px 0; border-bottom:1px solid var(--border);">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <strong>${esc(creation.fileName)}</strong>
+          <span class="pill ${statusTone}">${esc(creation.status)}</span>
+          ${creation.originNote ? `<span style="color:var(--muted); font-size:11.5px;">${esc(creation.originNote)}</span>` : ''}
+        </div>
+        <span style="color:var(--muted); font-size:11px;">→ ${esc(creation.serverRelativeUrl)}</span>
+        ${creation.conflictReason ? `<div class="mcp-alert warn">${icon('alert', 13)}<span>${esc(creation.conflictReason)}</span></div>` : ''}
+        <details class="document-findings"><summary>Preview draft</summary>
+          ${canRender ? `<div class="content-block fpv-md" style="padding:8px 2px;">${window.formatMarkdownContent(creation.createContent || '')}</div>` : `<pre class="fpv-pre">${esc(creation.createContent || '')}</pre>`}
+        </details>
+        <div style="display:flex; gap:6px;">
+          ${creation.status === 'pending' ? `
+            <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}">Approve</button>
+            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}">Reject</button>` : ''}
+          ${creation.status === 'approved' ? `
+            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}">${icon('refresh', 12)} Create on SharePoint</button>` : ''}
+        </div>
+      </article>`;
+  }).join('')}</section>` : '';
+
+  if (!docs.length && !creations.length) {
+    return `<section class="card"><div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No synced documents</h3><p>SharePoint documents routed to this project appear here, grouped with their revisions and comments.</p></div></section>`;
+  }
+  if (!docs.length) return creationBlock;
+  const rows = docs.map(doc => {
+    const readerHref = `#/doc/${encodeDocKey(doc.docKey)}`;
+    const ext = String(doc.fileType || '').replace('.', '').toLowerCase() || 'doc';
+    const extColor = { docx: '#4a8cd4', xlsx: '#3f9e6a', pptx: '#d47b3f', pdf: '#c95555', md: '#8b7fd4', txt: '#8b8f98', csv: '#3f9e6a' }[ext] || '#8b8f98';
+    const unresolved = Math.max(0, (doc.commentCount || 0) - (doc.resolvedCommentCount || 0));
+    const commentBits = doc.commentCount
+      ? `<span class="pill ${unresolved ? 'warn' : ''}" title="${doc.commentCount} comments, ${unresolved} open">${icon('message', 11)} ${doc.commentCount}${unresolved ? ` · ${unresolved} open` : ''}</span>`
+      : '<span class="pill" style="opacity:.55">no comments</span>';
+    return `<article class="evidence-row" style="align-items:flex-start; gap:12px;">
+      <span style="display:inline-flex; align-items:center; justify-content:center; min-width:42px; padding:4px 7px; margin-top:2px; border-radius:7px; background:${extColor}22; color:${extColor}; font-size:10px; font-weight:750; letter-spacing:.05em; text-transform:uppercase; border:1px solid ${extColor}44;">${esc(ext)}</span>
+      <a class="today-item-copy" href="${readerHref}" style="min-width:0; flex:1;">
+        <strong style="font-size:13px;">${esc(doc.title || doc.docKey)}</strong>
+        ${doc.latestChangeSummary ? `<span class="today-change-summary" style="font-style:italic;">${esc(String(doc.latestChangeSummary).slice(0, 160))}</span>` : ''}
+        <span class="evidence-meta" style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:3px;">
+          ${tierChip(doc.extractionTier)}
+          <span class="pill">${icon('activity', 10)} ${doc.revisionCount} rev${doc.revisionCount === 1 ? '' : 's'}</span>
+          ${commentBits}
+          ${doc.relatedCount ? `<span class="pill" title="${doc.relatedCount} related document(s) in the corpus">${icon('link', 10)} ${doc.relatedCount}</span>` : ''}
+          ${doc.sizeBytes ? `<span class="pill" style="opacity:.7">${doc.sizeBytes > 1024 * 1024 ? `${Math.round(doc.sizeBytes / 1024 / 1024)} MB` : `${Math.round(doc.sizeBytes / 1024)} KB`}</span>` : ''}
+          <time style="color:var(--muted); font-size:11px;">${esc(relativeTime(doc.lastModified || doc.lastCapturedAt))}</time>
+        </span>
+      </a>
+      <a class="button small" href="${esc(String(doc.webUrl || '#'))}" target="_blank" rel="noopener noreferrer" style="flex:0 0 auto;">SharePoint</a>
+    </article>`;
+  }).join('');
+  return `${creationBlock}
+    <div class="section-heading"><div><h2>Documents</h2><p>SharePoint documents routed here — one row per document; open for content, comments, and revision history.</p></div><span class="pill">${docs.length}</span></div>
+    <section class="card evidence-list">${rows}</section>`;
+}
+
+async function loadDocReader(docKey, { force = false } = {}) {
+  if (state.docReader.loading) return;
+  if (!force && state.docReader.key === docKey && state.docReader.data) return;
+  // Comment filter survives same-doc reloads (sync/refresh) but resets on a
+  // different document.
+  const commentFilter = state.docReader.key === docKey ? state.docReader.commentFilter : undefined;
+  state.docReader = { key: docKey, data: force ? state.docReader.data : null, error: '', loading: true, refreshing: state.docReader.refreshing, commentFilter };
+  try {
+    const payload = await request(`/documents/view?docKey=${encodeURIComponent(docKey)}`);
+    state.docReader = { key: docKey, data: payload, error: '', loading: false, refreshing: false, commentFilter };
+  } catch (error) {
+    state.docReader = { key: docKey, data: state.docReader.data, error: String(error?.message || error), loading: false, refreshing: false, commentFilter };
+  }
+  if (state.route.view === 'doc-reader') renderRoute({ preserveScroll: true });
+}
+
+// Live sheet reads for .xlsx docs (xlsx-deep-reads X2): chips above the
+// content switch between the bounded synced overview and per-sheet live
+// tables fetched on demand.
+async function loadDocSheet(docKey, sheet) {
+  state.docReader.sheetView = { name: sheet, loading: true, data: null, error: '' };
+  // Sheet chips are click-only entry points, so both paints are the user's.
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const payload = await request(`/documents/sheet?docKey=${encodeURIComponent(docKey)}${sheet ? `&sheet=${encodeURIComponent(sheet)}` : ''}`);
+    state.docReader.sheetView = { name: sheet, loading: false, data: payload, error: '' };
+  } catch (error) {
+    state.docReader.sheetView = { name: sheet, loading: false, data: null, error: String(error?.message || error) };
+  }
+  if (state.route.view === 'doc-reader') renderRoute({ preserveScroll: true, userAction: true });
+}
+
+function sheetTableHtml(view) {
+  if (view.loading) return `<div class="empty-state today-empty"><p>Reading “${esc(view.name)}” from SharePoint…</p></div>`;
+  if (view.error) return `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(view.error)}</span></div>`;
+  const sheet = view.data?.sheet;
+  if (!sheet) return `<div class="empty-state today-empty"><p>No cell data returned.</p></div>`;
+  const DISPLAY_CAP = 500;
+  const rows = sheet.rows.slice(0, DISPLAY_CAP);
+  const notes = [
+    `live sheet read — as of ${relativeTime(view.data.asOf)}${view.data.fromCache ? ' (cached for this version)' : ''}`,
+    sheet.truncation.rowsCut ? `showing first ${sheet.rows.length} of ${sheet.rowsTotal ?? '?'} rows` : '',
+    sheet.rows.length > DISPLAY_CAP ? `rendering first ${DISPLAY_CAP} fetched rows` : '',
+    sheet.truncation.sharedStringsBudgetHit ? 'some cells blank: string-table budget' : '',
+    sheet.formulaCells ? `${sheet.formulaCells} formula cell(s) show cached values` : '',
+  ].filter(Boolean).join(' · ');
+  const body = rows.map((row, index) => `<tr>${row.map(cell => index === 0
+    ? `<th style="position:sticky; top:0; background:var(--surface-2); text-align:left; padding:5px 9px; border-bottom:1px solid var(--border-strong); font-size:11px;">${esc(cell)}</th>`
+    : `<td style="padding:4px 9px; border-bottom:1px solid var(--border); font-size:11.5px; white-space:nowrap;">${esc(cell)}</td>`).join('')}</tr>`).join('');
+  return `<div style="display:flex; flex-direction:column; gap:8px;">
+    <span style="color:var(--muted); font-size:11px;">${esc(notes)}</span>
+    <div style="overflow:auto; max-height:70vh; border:1px solid var(--border); border-radius:9px;"><table style="border-collapse:collapse; width:max-content; min-width:100%;">${body}</table></div>
+  </div>`;
+}
+
+function readerCommentThreads(comments) {
+  const roots = new Map(); // threadRoot → comments in order
+  for (const comment of comments) {
+    const list = roots.get(comment.threadRoot);
+    if (list) list.push(comment); else roots.set(comment.threadRoot, [comment]);
+  }
+  // Newest thread activity first.
+  return [...roots.values()].sort((a, b) => String(b[b.length - 1].commentedAt).localeCompare(String(a[a.length - 1].commentedAt)));
+}
+
+function readerCommentHtml(comment) {
+  const who = comment.direction === 'sent' ? `<strong>${esc(comment.author)}</strong> <span class="pill accent">you</span>` : `<strong>${esc(comment.author)}</strong>`;
+  // Anchored passage (extracted from the docx comment ranges): quoted, and
+  // clickable — jumps to and highlights the passage in the content pane.
+  const anchor = comment.anchorText
+    ? `<blockquote data-action="doc-comment-jump" data-anchor="${attr(comment.anchorText)}" title="Jump to this passage in the document" style="margin:4px 0; padding:5px 9px; border-left:2px solid var(--accent); border-radius:0 7px 7px 0; background:var(--surface-2); font-size:11px; font-style:italic; cursor:pointer; color:var(--soft);">“${esc(String(comment.anchorText).slice(0, 120))}”</blockquote>`
+    : '';
+  return `<div class="doc-annotation ${comment.resolved ? 'resolved' : ''} ${comment.parentCommentId ? 'reply' : ''}" style="${comment.parentCommentId ? 'margin-left:18px;' : ''}${comment.deletedFromDoc ? 'opacity:.55;' : ''}">
+    <div class="doc-annotation-head">${who}${comment.mentionedMe ? ' <span class="pill warn">mentions you</span>' : ''}${comment.resolved ? ' <span class="pill">resolved</span>' : ''}${comment.deletedFromDoc ? ' <span class="pill" title="This comment no longer exists in the live document — kept as history">removed from doc</span>' : ''}</div>
+    ${comment.parentCommentId ? '' : anchor}
+    <p class="doc-annotation-summary">${esc(String(comment.text || '').slice(0, 500))}</p>
+    <span class="doc-annotation-meta">${esc(relativeTime(comment.commentedAt))}</span>
+  </div>`;
+}
+
+/** Scroll to and flash the comment's passage inside the reader content. */
+function jumpToDocPassage(anchorText) {
+  const container = document.querySelector('.document-preview-shell');
+  if (!container || !anchorText) return false;
+  // Probe ladder: try the fullest passage first, then progressively shorter
+  // prefixes — anchors cross block boundaries that render differently, but
+  // the passage START is almost always intact in the markdown.
+  const squashed = String(anchorText).replace(/…$/, '').replace(/\s+/g, ' ').trim();
+  const probes = [squashed.slice(0, 80), squashed.slice(0, 40), squashed.slice(0, 24)].filter(p => p.length >= 12);
+  if (!probes.length) return false;
+  // Walk text nodes with a squashed-offset map so passages split across
+  // inline elements still match.
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let joined = '';
+  let node;
+  while ((node = walker.nextNode())) {
+    nodes.push({ node, start: joined.length });
+    joined += String(node.nodeValue || '').replace(/\s+/g, ' ');
+  }
+  const haystack = joined.toLowerCase();
+  let at = -1;
+  for (const probe of probes) {
+    at = haystack.indexOf(probe.toLowerCase());
+    if (at !== -1) break;
+  }
+  if (at === -1) return false;
+  const hit = [...nodes].reverse().find(entry => entry.start <= at);
+  if (!hit) return false;
+  const el = hit.node.parentElement;
+  if (!el) return false;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const prev = el.style.transition;
+  el.style.transition = 'background-color .3s';
+  el.style.backgroundColor = 'rgba(157,140,255,.28)';
+  setTimeout(() => { el.style.backgroundColor = ''; el.style.transition = prev; }, 2200);
+  return true;
+}
+
+function pendingEditBlock(edit) {
+  const statusTone = { pending: '', approved: 'blue', synced: 'good', conflicted: 'warn', rejected: '' }[edit.status] || '';
+  const oldBlock = edit.operation === 'replaceText'
+    ? `<div style="border-left:3px solid var(--red,#e5484d); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">current text</small><div>${esc(edit.findText || '')}</div></div>`
+    : '';
+  const newBlock = edit.operation === 'replaceText'
+    ? `<div style="border-left:3px solid var(--green,#46a758); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">replacement</small><div>${esc(edit.replaceWith || '')}</div></div>`
+    : `<div style="border-left:3px solid var(--green,#46a758); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">append at end</small>${(edit.paragraphs || []).map(p => `<div>${esc(p)}</div>`).join('')}</div>`;
+  const controls = edit.status === 'pending'
+    ? `<div class="today-item-actions"><button class="button small primary" type="button" data-action="doc-edit-decide" data-id="${attr(edit.id)}" data-decision="approve">Approve</button><button class="button small" type="button" data-action="doc-edit-decide" data-id="${attr(edit.id)}" data-decision="reject">Reject</button></div>`
+    : '';
+  return `<article class="doc-annotation">
+    <div class="doc-annotation-head">
+      <strong>${edit.kind === 'botboy' ? 'BotBoy proposed' : 'You edited'}</strong>
+      <span class="pill ${statusTone}">${esc(edit.status)}</span>
+      ${edit.originNote ? `<span class="doc-annotation-meta">${esc(edit.originNote)}</span>` : ''}
+    </div>
+    ${oldBlock}${newBlock}
+    ${edit.conflictReason ? `<p class="doc-annotation-summary" style="color:var(--yellow,#f3ba63)">${esc(edit.conflictReason)}</p>` : ''}
+    ${controls}
+  </article>`;
+}
+
+function pendingEditsSection(data, docKey, syncing) {
+  const edits = Array.isArray(data.pendingEdits) ? data.pendingEdits : [];
+  const open = edits.filter(edit => edit.status === 'pending' || edit.status === 'approved' || edit.status === 'conflicted');
+  const settled = edits.filter(edit => edit.status === 'synced' || edit.status === 'rejected');
+  const approvedCount = edits.filter(edit => edit.status === 'approved').length;
+  const isDocx = String(data.doc?.fileType || '').toLowerCase() === '.docx';
+  if (!isDocx && edits.length === 0) return '';
+  const syncButton = approvedCount
+    ? `<button class="button primary" type="button" data-action="doc-sync" data-dockey="${attr(docKey)}" ${syncing ? 'disabled' : ''}>${icon('refresh', 14)} ${syncing ? 'Syncing…' : `Sync ${approvedCount} approved change${approvedCount === 1 ? '' : 's'} to SharePoint`}</button>`
+    : '';
+  // Background lock-retry active: the doc was locked (a teammate's editing
+  // session) when Sync ran; the server keeps retrying until it frees up.
+  const retryBanner = data.syncRetry?.retrying
+    ? `<div class="pill blue" style="margin-bottom:10px; display:inline-flex; align-items:center; gap:6px;">${icon('refresh', 12)} Document locked by an active editing session — auto-retrying sync (attempt ${Number(data.syncRetry.attempts) + 1}, since ${esc(relativeTime(data.syncRetry.startedAt))}). Approved edits publish when it frees up.</div>`
+    : '';
+  const proposeForm = isDocx ? `
+    <details class="document-findings"><summary>${icon('sparkles', 13)} Propose a change to this document</summary>
+      <div style="display:flex; flex-direction:column; gap:8px; padding:10px 2px;">
+        <label style="font-size:11px; color:var(--muted)">Exact current passage (one paragraph, ≥20 chars — select text in the document and paste)</label>
+        <textarea id="doc-propose-find" class="input" rows="2" placeholder="Current text to replace…"></textarea>
+        <label style="font-size:11px; color:var(--muted)">Replacement</label>
+        <textarea id="doc-propose-replace" class="input" rows="2" placeholder="New text…"></textarea>
+        <div><button class="button small primary" type="button" data-action="doc-propose-submit" data-dockey="${attr(docKey)}">Stage edit for approval</button>
+        <span style="font-size:11px; color:var(--muted)"> Nothing touches SharePoint until you approve and sync.</span></div>
+      </div>
+    </details>` : '';
+  return `<div class="section-heading"><div><h2>Proposed changes</h2><p>Old vs new, approved by you, applied in one upload. Conflicted edits mean the document moved — the guard working, not a failure.</p></div>${syncButton}</div>
+    ${retryBanner}
+    <section class="card pad">
+      ${open.length ? open.map(pendingEditBlock).join('') : '<p style="margin:2px 0; color:var(--muted); font-size:12px;">No open proposals — stage one below or ask BotBoy in chat.</p>'}
+      ${settled.length ? `<details class="document-findings"><summary>${settled.length} settled (synced or rejected)</summary>${settled.map(pendingEditBlock).join('')}</details>` : ''}
+      ${proposeForm}
+    </section>`;
+}
+
+function renderDocReader() {
+  const docId = state.route.docId || '';
+  const docKey = decodeDocKey(docId);
+  if (!docKey) return errorView('This document link is malformed.');
+  if (state.docReader.key !== docKey || (!state.docReader.data && !state.docReader.error)) {
+    void loadDocReader(docKey);
+    return loadingView();
+  }
+  const { data, error, refreshing } = state.docReader;
+  if (!data) return errorView(error || 'This document could not be loaded.');
+  const doc = data.doc || {};
+  const project = doc.project;
+  const canRender = typeof window.formatMarkdownContent === 'function';
+  // Preview-reflect (soak find): staged and approved edits apply to the
+  // PREVIEW text so the owner sees the document as it would read — the
+  // banner keeps it honest that SharePoint does not have them yet. Edits
+  // whose passage does not appear in the extracted markdown are simply not
+  // previewable here (the old/new blocks below stay authoritative).
+  let previewContent = data.content || '';
+  let previewApplied = 0;
+  for (const edit of (Array.isArray(data.pendingEdits) ? data.pendingEdits : [])) {
+    if (edit.status !== 'pending' && edit.status !== 'approved') continue;
+    if (edit.operation === 'replaceText' && edit.findText && previewContent.includes(edit.findText)) {
+      previewContent = previewContent.replace(edit.findText, edit.replaceWith || '');
+      previewApplied++;
+    } else if (edit.operation === 'appendParagraphs' && Array.isArray(edit.paragraphs) && edit.paragraphs.length) {
+      previewContent = `${previewContent}\n\n${edit.paragraphs.join('\n\n')}`;
+      previewApplied++;
+    }
+  }
+  const previewBanner = previewApplied
+    ? `<div class="mcp-alert">${icon('sparkles', 14)}<span>Preview includes ${previewApplied} staged change${previewApplied === 1 ? '' : 's'} not yet on SharePoint — approve and sync below to publish.</span></div>`
+    : '';
+  let contentHtml = previewContent
+    ? (canRender ? `<div class="content-block fpv-md">${window.formatMarkdownContent(previewContent)}</div>` : `<pre class="fpv-pre">${esc(previewContent)}</pre>`)
+    : `<div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No synced content</h3><p>${doc.extractionTier === 'metadata_only' ? 'This document is presence-only at its size tier — Refresh pulls a fresh snapshot within the same rules, or open it in SharePoint.' : 'Content has not been extracted yet.'}</p></div>`;
+
+  // xlsx: sheet chips switch between the bounded synced overview and live
+  // per-sheet reads (xlsx-deep-reads X2).
+  let sheetChips = '';
+  if (String(doc.fileType || '').toLowerCase() === '.xlsx') {
+    const sheetView = state.docReader.sheetView;
+    const captureSheets = Array.isArray(doc.truncation?.sheets) ? doc.truncation.sheets.map(s => s.name) : [];
+    const liveSheets = Array.isArray(sheetView?.data?.sheets) ? sheetView.data.sheets : [];
+    const names = [...new Set([...captureSheets, ...liveSheets])];
+    const activeSheet = sheetView && (sheetView.loading || sheetView.data?.sheet || sheetView.error) ? sheetView.name : '';
+    sheetChips = `<div class="doc-filter-row" style="margin-bottom:10px;">
+      <button class="doc-filter-chip ${activeSheet === '' ? 'active' : ''}" type="button" data-action="doc-sheet-overview">Synced overview</button>
+      ${names.map(name => `<button class="doc-filter-chip ${activeSheet === name ? 'active' : ''}" type="button" data-action="doc-sheet" data-dockey="${attr(docKey)}" data-sheet="${attr(name)}">${esc(name)}</button>`).join('')}
+      ${names.length === 0 ? `<button class="doc-filter-chip" type="button" data-action="doc-sheet" data-dockey="${attr(docKey)}" data-sheet="">${icon('refresh', 11)} List sheets</button>` : ''}
+    </div>`;
+    if (activeSheet !== '' || sheetView?.loading || sheetView?.error) {
+      contentHtml = sheetTableHtml(sheetView);
+    } else if (sheetView?.data && !sheetView.data.sheet && liveSheets.length) {
+      // Inventory loaded — chips above now list the sheets; keep the overview.
+    }
+  }
+  const tierNote = data.contentTier === 'truncated'
+    ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>Bounded extraction — this is a partial view; the truncation record says what was cut. "Open in SharePoint" always has the full document.</span></div>`
+    : '';
+  // Unaccepted Word suggestions (tracked changes): the converted content
+  // shows suggested insertions as if accepted — say so, and attribute them.
+  const suggestions = Array.isArray(data.suggestedChanges) ? data.suggestedChanges : [];
+  const stagedOpenCount = (data.pendingEdits || []).filter(edit => edit.status === 'pending' || edit.status === 'approved').length;
+  const suggestionsBanner = suggestions.length
+    ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>This document has ${suggestions.length} unaccepted suggested change${suggestions.length === 1 ? '' : 's'} — the preview below shows suggested text as if it were already accepted. See "Suggested changes" in the rail for who proposed what.</span></div>`
+    : '';
+  const suggestionsHtml = suggestions.map(change => `
+    <article class="activity-row">
+      <span class="source-icon">${icon(change.kind === 'deletion' ? 'alert' : 'sparkles', 14)}</span>
+      <div class="activity-copy">
+        <strong>${esc(change.author)} · ${change.kind === 'deletion' ? 'proposes removing' : 'proposes adding'}${change.date ? ` · ${esc(relativeTime(change.date))}` : ''}</strong>
+        <span style="${change.kind === 'deletion' ? 'text-decoration: line-through;' : ''}">${esc(change.text.slice(0, 260))}${change.text.length > 260 ? '…' : ''}</span>
+      </div>
+    </article>`).join('');
+  // Rail organization (UI pass 2026-08-25): threads build from LIVE comments;
+  // deleted-but-kept history collapses at the bottom. Open/resolved filter at
+  // THREAD level so replies never detach from their root.
+  const allComments = data.comments || [];
+  const liveComments = allComments.filter(c => !c.deletedFromDoc);
+  const deletedComments = allComments.filter(c => c.deletedFromDoc);
+  // Related documents (doc-link-graph L2): corpus-internal edges, both
+  // directions, each row deep-links into the reader.
+  const related = Array.isArray(data.related) ? data.related : [];
+  const relatedHtml = related.length ? `<div class="doc-annotation-group"><h3>Related documents <span class="doc-annotation-count">${related.length}</span></h3>${related.map(rel => `
+    <a class="doc-annotation" href="#/doc/${encodeDocKey(rel.docKey)}" title="${attr(rel.evidence || '')}" style="text-decoration:none;">
+      <div class="doc-annotation-head"><strong>${esc(rel.title)}</strong></div>
+      <span class="doc-annotation-meta">${rel.direction === 'outgoing' ? 'this doc links to it' : 'it links to this doc'} · ${esc(rel.kind)}</span>
+    </a>`).join('')}</div>` : '';
+  const threads = readerCommentThreads(liveComments);
+  const isOpenThread = thread => thread.some(c => !c.resolved);
+  const openThreads = threads.filter(isOpenThread);
+  const resolvedThreads = threads.filter(t => !isOpenThread(t));
+  const filter = state.docReader.commentFilter || (openThreads.length ? 'open' : 'all');
+  const visibleThreads = filter === 'open' ? openThreads : filter === 'resolved' ? resolvedThreads : threads;
+  const filterChip = (id, label, count) =>
+    `<button class="doc-filter-chip ${filter === id ? 'active' : ''}" type="button" data-action="doc-comment-filter" data-filter="${id}">${label} <span>${count}</span></button>`;
+  const commentFilters = threads.length
+    ? `<div class="doc-filter-row">${filterChip('open', 'Open', openThreads.length)}${filterChip('resolved', 'Resolved', resolvedThreads.length)}${filterChip('all', 'All', threads.length)}</div>`
+    : '';
+  const commentsHtml = visibleThreads.length
+    ? visibleThreads.map(thread => `<div class="doc-annotation-group">${thread.map(readerCommentHtml).join('')}</div>`).join('')
+    : `<div class="empty-state today-empty"><p>${threads.length ? `No ${filter} threads.` : 'No review comments captured.'}</p></div>`;
+  const deletedHtml = deletedComments.length
+    ? `<details class="document-findings"><summary>${deletedComments.length} removed from the document (kept as history)</summary>${deletedComments.map(readerCommentHtml).join('')}</details>`
+    : '';
+  const revisionsHtml = (data.revisions || []).map(rev => `
+    <article class="activity-row">
+      <span class="source-icon">${icon('activity', 14)}</span>
+      <div class="activity-copy"><strong>${esc(relativeTime(rev.capturedAt))}</strong><span>${esc(String(rev.changeSummary || (rev.extractionTier === 'metadata_only' ? 'listed only' : 'captured')).slice(0, 220))}</span></div>
+    </article>`).join('');
+
+  return `<div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${project ? `<a href="#/projects/${encodeURIComponent(project.id)}">${esc(project.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Document</span></div>
+    <header class="page-head"><div>
+      <h1 class="page-title">${esc(doc.title || docKey)}</h1>
+      <div class="project-meta">
+        <span>${icon('file', 13)} ${esc(String(doc.fileType || '').replace('.', '') || 'document')}</span>
+        ${tierChip(doc.extractionTier)}
+        <span>${icon('refresh', 13)} Modified ${esc(relativeTime(doc.lastModified))}</span>
+        <span>${icon('activity', 13)} ${data.revisions?.length || 0} revisions · ${liveComments.length} comments (${openThreads.length} open thread${openThreads.length === 1 ? '' : 's'})</span>
+        ${suggestions.length ? `<span class="pill warn">${suggestions.length} suggested change${suggestions.length === 1 ? '' : 's'}</span>` : ''}
+        ${stagedOpenCount ? `<span class="pill blue">${stagedOpenCount} staged edit${stagedOpenCount === 1 ? '' : 's'}</span>` : ''}
+      </div>
+    </div><div class="head-actions">
+      <button class="button" type="button" data-action="doc-refresh" data-dockey="${attr(docKey)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshing ? 'Refreshing…' : 'Refresh from SharePoint'}</button>
+      ${doc.webUrl ? `<a class="button primary" href="${esc(String(doc.webUrl))}" target="_blank" rel="noopener noreferrer">Open in SharePoint</a>` : ''}
+    </div></header>
+    ${error ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}
+    ${tierNote}
+    ${suggestionsBanner}
+    ${previewBanner}
+    ${pendingEditsSection(data, docKey, state.docReader.syncing === true)}
+    ${sheetChips}
+    <div class="document-annotated with-rail">
+      <section class="card pad document-preview-shell">${contentHtml}</section>
+      <aside class="document-annotations">
+        ${relatedHtml}
+        ${suggestions.length ? `<div class="doc-annotation-group"><h3>Suggested changes <span class="doc-annotation-count">${suggestions.length}</span></h3>${suggestionsHtml}</div>` : ''}
+        <div class="doc-annotation-group"><h3>Comments <span class="doc-annotation-count">${liveComments.length}</span></h3>${commentFilters}${commentsHtml}${deletedHtml}</div>
+        <div class="doc-annotation-group"><h3>Revisions <span class="doc-annotation-count">${data.revisions?.length || 0}</span></h3>${revisionsHtml || '<div class="empty-state today-empty"><p>No revisions captured.</p></div>'}</div>
+      </aside>
+    </div>`;
 }
 
 const ACTIVITY_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})\s+—\s+/;
@@ -876,7 +1354,7 @@ async function discardItem(itemId, projectId) {
     toast(`Could not discard item: ${error.message}`, 'bad');
   } finally {
     state.evidencePending.delete(key);
-    renderRoute();
+    renderRoute({ userAction: true });
   }
 }
 
@@ -895,7 +1373,7 @@ async function restoreDiscardedItem(itemId) {
     toast(`Could not restore item: ${error.message}`, 'bad');
   } finally {
     state.evidencePending.delete(key);
-    renderRoute();
+    renderRoute({ userAction: true });
   }
 }
 
@@ -907,7 +1385,7 @@ async function dismissRelation(projectId, otherId) {
     if (detail && Array.isArray(detail.relatedProjects)) {
       detail.relatedProjects = detail.relatedProjects.filter(rel => rel.id !== otherId);
     }
-    renderRoute();
+    renderRoute({ userAction: true });
     toast('Marked as not related — the link stays hidden. Ask BotBoy to restore it if needed.');
   } catch (error) {
     toast(`Could not dismiss the link: ${error.message}`, 'bad');
@@ -935,7 +1413,7 @@ async function rejectEvidence(projectId, itemId) {
     toast(`Could not reject evidence: ${error.message}`, 'bad');
   } finally {
     state.evidencePending.delete(key);
-    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute();
+    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ userAction: true });
   }
 }
 
@@ -953,14 +1431,14 @@ async function restoreEvidence(projectId, itemId) {
     toast(`Could not restore evidence: ${error.message}`, 'bad');
   } finally {
     state.evidencePending.delete(key);
-    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute();
+    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ userAction: true });
   }
 }
 
 async function rebuildProjectBrain(projectId) {
   if (!projectId || state.rebuilding.has(projectId)) return;
   state.rebuilding.add(projectId);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const result = await request('/pipeline/rebuild-brains', { method: 'POST', body: { projectId } });
     if (result?.status === 'rebuilt') toast(`Brain rebuilt from ${number(result.items)} evidence item(s)`);
@@ -970,7 +1448,7 @@ async function rebuildProjectBrain(projectId) {
     toast(`Rebuild failed: ${error.message}`, 'bad');
   } finally {
     state.rebuilding.delete(projectId);
-    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute();
+    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ userAction: true });
   }
 }
 
@@ -992,7 +1470,7 @@ async function loadChannels({ force = false } = {}) {
 async function runChannelDigests() {
   if (state.channels.running) return;
   state.channels.running = true;
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const result = await request('/channels/digests/run', { method: 'POST', body: {} });
     if (result?.status === 'deferred') toast('The model is unavailable — digest run deferred', 'bad');
@@ -1002,7 +1480,7 @@ async function runChannelDigests() {
     toast(`Digest run failed: ${error.message}`, 'bad');
   } finally {
     state.channels.running = false;
-    if (state.route.view === 'channels') renderRoute();
+    if (state.route.view === 'channels') renderRoute({ userAction: true });
   }
 }
 
@@ -1024,7 +1502,7 @@ async function reviewAmbientProjects() {
     state.projectDetails.clear();
     state.channels.data = null;
     await loadCore({ quiet: true });
-    renderRoute();
+    renderRoute({ userAction: true });
   } catch (error) {
     toast(`Ambient cleanup failed: ${error.message}`, 'bad');
   }
@@ -1176,7 +1654,7 @@ async function refreshGraspSyncStatus() {
 async function graspSyncAction(kind, work) {
   if (state.graspSync.busy) return;
   state.graspSync.busy = kind;
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     await work();
     state.graspSync.error = '';
@@ -1184,8 +1662,126 @@ async function graspSyncAction(kind, work) {
     toast(`Sync settings error: ${error.message}`);
   } finally {
     state.graspSync.busy = '';
-    renderRoute();
+    renderRoute({ userAction: true });
   }
+}
+
+async function sharepointSyncAction(kind, work) {
+  if (state.sharepointSync.busy) return;
+  state.sharepointSync.busy = kind;
+  renderRoute({ userAction: true });
+  try {
+    await work();
+    state.sharepointSync.error = '';
+  } catch (error) {
+    toast(`Document sync error: ${error.message}`);
+  } finally {
+    state.sharepointSync.busy = '';
+    renderRoute({ userAction: true });
+  }
+}
+
+/** Card status for the SharePoint document sync on the Connections grid. */
+function sharepointSyncCardModel() {
+  const sync = state.sharepointSync;
+  if (sync.error) return { status: 'Unavailable', tone: 'warn', detail: sync.error };
+  const status = sync.status;
+  if (!status) return { status: 'Checking', tone: '', detail: 'Loading sync status' };
+  if (!status.enabled) return { status: 'Off', tone: '', detail: 'Enable to sync documents from shared-with-me, OneDrive, and team libraries' };
+  const surging = (status.sources || []).some(s => s.surgePending);
+  if (surging) return { status: 'Needs review', tone: 'warn', detail: 'A source reports a mass change and is paused for your confirmation' };
+  const queued = status.queue?.queued ?? 0;
+  const failed = status.queue?.failed ?? 0;
+  const gatePaused = status.queue?.queued > 0 && status.gates && (!status.gates.backlog || !status.gates.cache);
+  const detail = queued > 0
+    ? `${number(queued)} document${queued === 1 ? '' : 's'} queued${gatePaused ? ' — drain paused for pipeline headroom' : ''}`
+    : `${number((status.sources || []).length)} source${(status.sources || []).length === 1 ? '' : 's'} synced${failed ? `, ${number(failed)} failed` : ''}`;
+  return { status: 'Connected', tone: failed ? 'warn' : 'good', detail };
+}
+
+const SHAREPOINT_SOURCE_LABELS = { shared_with_me: 'Shared with me', onedrive: 'My OneDrive', library: 'Team library' };
+const SHAREPOINT_BASELINE_LABELS = { recent30: 'Recent 30 documents', days90: 'Last 90 days', all: 'Everything' };
+
+function renderSharePointSyncSettings() {
+  const sync = state.sharepointSync;
+  const status = sync.status;
+  const card = sharepointSyncCardModel();
+  const busy = sync.busy;
+  const sources = status?.sources || [];
+  const hasKind = kind => sources.some(s => s.kind === kind);
+  const backoffs = Object.entries(status?.backoffs || {});
+  const queue = status?.queue || { queued: 0, failed: 0, live: 0, backfill: 0 };
+
+  const sourceRows = sources.map(source => {
+    const label = SHAREPOINT_SOURCE_LABELS[source.kind] || source.kind;
+    const scope = source.kind === 'library'
+      ? `${source.siteUrl || ''}${source.libraryName ? ` › ${source.libraryName}` : ''}${source.folderPath ? ` › ${source.folderPath}` : ''}`
+      : SHAREPOINT_BASELINE_LABELS[source.baseline] || source.baseline;
+    const surge = source.surgePending
+      ? `<div class="page-subtitle" style="color:var(--warn, #b45309)">Mass change detected: ${number(source.surgePending)} documents changed at once. Paused until you confirm.</div>
+         <button class="button small" type="button" data-action="sharepoint-surge-confirm" data-id="${attr(source.id)}" ${busy ? 'disabled' : ''}>Resume this source</button>`
+      : '';
+    return `<article class="card pad">
+      <div class="connection-head"><strong>${esc(label)}</strong>${source.paused && !source.surgePending ? '<span class="pill warn">Paused</span>' : ''}</div>
+      <p class="page-subtitle">${esc(scope)}</p>
+      <p class="page-subtitle">Baseline: ${esc(SHAREPOINT_BASELINE_LABELS[source.baseline] || source.baseline)}${source.baselineDone ? ' (done)' : ' (pending)'} · ${number(source.queued)} queued</p>
+      ${surge}
+      <div style="margin-top:8px"><button class="button small" type="button" data-action="sharepoint-source-remove" data-id="${attr(source.id)}" ${busy ? 'disabled' : ''}>Remove</button></div>
+    </article>`;
+  }).join('');
+
+  const siteOptions = (sync.sites || []).map(site => `<option value="${attr(site.Path || '')}">${esc(site.Title || site.Path || '')}</option>`).join('');
+  const libraryOptions = (sync.libraries || []).map(lib => `<option value="${attr(lib.Title || '')}">${esc(lib.Title || '')}</option>`).join('');
+
+  return `${pageHead('Connection settings', 'SharePoint documents', 'BotBoy syncs documents from the SharePoint sources you pick — shared with me, OneDrive, team libraries — and folds them into project synthesis. Large files are extracted with explicit coverage notes; anything BotBoy cannot fully read says so.', `<button class="button" type="button" data-action="sharepoint-sync-run" ${busy ? 'disabled' : ''}>${icon('refresh', 14)} ${busy === 'run' ? 'Checking…' : 'Check for changes'}</button><a class="button" href="#/connections/sharepoint">${icon('settings', 14)} SharePoint connection</a>`)}
+    <section class="card pad">
+      <div class="connection-head"><span class="source-icon">${icon('file', 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div>
+      <p class="page-subtitle">${esc(card.detail)}</p>
+      <div class="connection-details">
+        <span><span>Queued</span><strong>${number(queue.queued)} (${number(queue.live)} live, ${number(queue.backfill)} backfill)</strong></span>
+        <span><span>Failed</span><strong>${number(queue.failed)}</strong></span>
+        <span><span>Pipeline gate</span><strong>${status?.gates?.backlog === false ? 'Holding (pipeline busy)' : 'Open'}</strong></span>
+        <span><span>Cache gate</span><strong>${status?.gates?.cache === false ? 'Holding (cache full)' : 'Open'}</strong></span>
+      </div>
+      ${backoffs.length ? `<p class="page-subtitle" style="margin-top:8px">SharePoint asked BotBoy to slow down: ${backoffs.map(([domain, until]) => `${esc(domain)} until ${esc(new Date(until).toLocaleTimeString())}`).join(', ')}.</p>` : ''}
+      <p class="page-subtitle" style="margin-top:8px">Read-only: BotBoy never edits, uploads, or deletes anything in SharePoint. Documents flow through the same local evidence pipeline as every other source.</p>
+      <button class="button" type="button" data-action="sharepoint-sync-toggle" ${busy ? 'disabled' : ''}>${status?.enabled ? 'Pause document sync' : 'Enable document sync'}</button>
+      ${status?.enabled ? `<button class="button small" type="button" data-action="sharepoint-purge" ${busy ? 'disabled' : ''} style="margin-left:8px">Purge synced data…</button>` : ''}
+    </section>
+    <div class="section-heading"><div><h2>Sources</h2><p>Nothing syncs unless you pick it. Baseline depth is chosen when a source is added; changes arrive on the half-hour discovery cycle.</p></div></div>
+    <section class="grid two-col">
+      ${sourceRows || '<article class="card pad"><p class="page-subtitle">No sources yet. Enable sync to start with your shared-with-me documents, or add a source below.</p></article>'}
+    </section>
+    <div class="section-heading"><div><h2>Add a source</h2></div></div>
+    <section class="grid two-col">
+      <article class="card pad">
+        <h3 class="card-title">Personal</h3>
+        <p class="page-subtitle">Documents other people shared with you, and your own OneDrive files.</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap">
+          ${hasKind('shared_with_me') ? '' : `<button class="button small" type="button" data-action="sharepoint-add-source" data-kind="shared_with_me" ${busy ? 'disabled' : ''}>Add "Shared with me"</button>`}
+          ${hasKind('onedrive') ? '' : `<button class="button small" type="button" data-action="sharepoint-add-source" data-kind="onedrive" ${busy ? 'disabled' : ''}>Add "My OneDrive"</button>`}
+          ${hasKind('shared_with_me') && hasKind('onedrive') ? '<p class="page-subtitle">Both personal sources are configured.</p>' : ''}
+        </div>
+        <p class="page-subtitle" style="margin-top:8px">Baseline for new sources: <select id="sharepoint-baseline"><option value="recent30">Recent 30 documents</option><option value="days90" selected>Last 90 days</option><option value="all">Everything</option></select></p>
+      </article>
+      <article class="card pad">
+        <h3 class="card-title">Team library</h3>
+        <p class="page-subtitle">Search for a site, load its libraries, optionally scope to a folder.</p>
+        <div style="display:flex; gap:8px; margin-bottom:8px">
+          <input id="sharepoint-site-query" type="text" placeholder="Site name (e.g. mx-team)" style="flex:1">
+          <button class="button small" type="button" data-action="sharepoint-site-search" ${busy ? 'disabled' : ''}>${busy === 'sites' ? 'Searching…' : 'Search'}</button>
+        </div>
+        ${sync.sites?.length ? `<div style="display:flex; gap:8px; margin-bottom:8px">
+          <select id="sharepoint-site-pick" style="flex:1">${siteOptions}</select>
+          <button class="button small" type="button" data-action="sharepoint-load-libraries" ${busy ? 'disabled' : ''}>${busy === 'libraries' ? 'Loading…' : 'Load libraries'}</button>
+        </div>` : ''}
+        ${sync.libraries?.length ? `<div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap">
+          <select id="sharepoint-library-pick" style="flex:1">${libraryOptions}</select>
+          <input id="sharepoint-folder-path" type="text" placeholder="Folder (optional)" style="flex:1">
+          <button class="button small" type="button" data-action="sharepoint-add-library" ${busy ? 'disabled' : ''}>Add library</button>
+        </div>` : ''}
+      </article>
+    </section>`;
 }
 
 function renderConnections() {
@@ -1205,15 +1801,17 @@ function renderConnections() {
       profileId: '',
     }];
   const graspSyncCard = graspSyncCardModel();
+  const sharepointSyncCard = sharepointSyncCardModel();
   const captureCards = [
     ['message', 'Slack', state.slack.error ? 'Unavailable' : slackCount == null ? 'Checking' : 'Connected', state.slack.error ? 'warn' : 'good', slackCount == null ? 'Configuration unavailable' : `${number(slackCount)} conversations configured`, 'slack'],
     ['folder', 'Local folders', state.folders.error ? 'Unavailable' : folderCount == null ? 'Checking' : 'Connected', state.folders.error ? 'warn' : 'good', folderCount == null ? 'Configuration unavailable' : `${number(folderCount)} enabled folders`, 'folders'],
     ['clock', 'Outlook mail & calendar', graspSyncCard.status, graspSyncCard.tone, graspSyncCard.detail, 'grasp-sync'],
+    ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
     ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
   ];
   const connectionsAsk = 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
   return `${pageHead('Sources', 'Connections', 'Manage where evidence and analytical context come from, and verify each local connection.', `<button class="button" type="button" data-prompt="${attr(connectionsAsk)}">${icon('sparkles')} Ask BotBoy to add one</button><a class="button primary" href="#/connections/add">${icon('plus', 14)} Add MCP server</a>`)}
-    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${state.health?.totalFailures ? 'Needs review' : 'Healthy'}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
+    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${state.health?.totalFailures ? 'Needs review' : 'Healthy'}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
     ${managedCards.map(card => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(card.icon, 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div><h3>${esc(card.name)}</h3><p>${esc(card.detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>${esc(card.handling)}</strong></span><span><span>Lifecycle</span><strong>Managed by BotBoy</strong></span></div>${card.profileId ? `<button class="button small" type="button" data-action="manage-connection" data-connection="managed" data-profile="${attr(card.profileId)}">Manage ${icon('chevron-right', 12)}</button>` : ''}</article>`).join('')}</section>
     <div class="section-heading"><div><h2>Connection principles</h2><p>Captured sources stay durable; external analytical content remains untrusted until BotBoy applies its local policy.</p></div></div><section class="grid three-col"><article class="card pad"><div class="eyebrow">${icon('database', 14)} Preserve</div><h3 class="card-title">Raw content stays intact</h3><p class="page-subtitle">Project brains can evolve while original evidence remains unchanged.</p></article><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Restrict</div><h3 class="card-title">Writes need your explicit request</h3><p class="page-subtitle">BotBoy calls read tools freely and runs mutating operations only when you ask for them in chat.</p></article><article class="card pad"><div class="eyebrow">${icon('link', 14)} Explain</div><h3 class="card-title">Analysis stays traceable</h3><p class="page-subtitle">MCP calls are audited locally without storing credentials or query results in the audit log.</p></article></section>`;
 }
@@ -1439,7 +2037,7 @@ async function startTerminalCommand(profileId, commandId) {
   terminal.starting = true;
   terminal.profileId = profileId;
   terminal.output = '';
-  renderRoute({ preserveScroll: true });
+  renderRoute({ preserveScroll: true, userAction: true });
   try {
     const payload = await request(`/mcp/profiles/${encodeURIComponent(profileId)}/terminal`, {
       method: 'POST',
@@ -1452,7 +2050,7 @@ async function startTerminalCommand(profileId, commandId) {
     toast(`Could not start the command: ${error.message}`, 'bad');
   } finally {
     terminal.starting = false;
-    if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+    if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -1536,7 +2134,7 @@ async function runProfileAction(profileId, action) {
 
   pending.add(action);
   state.mcp.profileNotice[profileId] = { action, tone: '', message: copy.pending };
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/mcp/profiles/${encodeURIComponent(profileId)}/actions/${encodeURIComponent(action)}`, { method: 'POST', body: {} });
     storeProfile(payload.profile);
@@ -1552,7 +2150,7 @@ async function runProfileAction(profileId, action) {
     toast(message, 'bad');
   } finally {
     pending.delete(action);
-    if (state.route.view === 'profile-settings') renderRoute();
+    if (state.route.view === 'profile-settings') renderRoute({ userAction: true });
   }
 }
 
@@ -1648,12 +2246,12 @@ async function saveMcpServer(mode, profileId) {
   } catch (error) {
     state.mcp.serverForm.error = error.message;
     toast(error.message, 'bad');
-    renderRoute();
+    renderRoute({ userAction: true });
     return;
   }
   state.mcp.serverForm.saving = true;
   state.mcp.serverForm.error = '';
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const response = mode === 'edit'
       ? await request(`/mcp/servers/${encodeURIComponent(profileId)}/config`, { method: 'PUT', body: payload })
@@ -1667,7 +2265,7 @@ async function saveMcpServer(mode, profileId) {
     toast(`Could not save the server: ${error.message}`, 'bad');
   } finally {
     state.mcp.serverForm.saving = false;
-    if (state.route.view === 'mcp-add' || state.route.view === 'mcp-edit') renderRoute();
+    if (state.route.view === 'mcp-add' || state.route.view === 'mcp-edit') renderRoute({ userAction: true });
   }
 }
 
@@ -1862,14 +2460,14 @@ async function saveMcpConfig() {
     toast(`Could not save SQL connection: ${error.message}`, 'bad');
   } finally {
     state.mcp.saving = false;
-    if (state.route.view === 'mcp-settings') renderRoute();
+    if (state.route.view === 'mcp-settings') renderRoute({ userAction: true });
   }
 }
 
 async function testMcpConnection() {
   if (state.mcp.testing) return;
   state.mcp.testing = true;
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request('/mcp/sql-context/test', { method: 'POST', body: {} });
     mergeServerSnapshot(payload.server);
@@ -1879,14 +2477,14 @@ async function testMcpConnection() {
     toast(`Connection test failed: ${error.message}`, 'bad');
   } finally {
     state.mcp.testing = false;
-    if (state.route.view === 'mcp-settings') renderRoute();
+    if (state.route.view === 'mcp-settings') renderRoute({ userAction: true });
   }
 }
 
 async function restartMcpConnection() {
   if (state.mcp.restarting) return;
   state.mcp.restarting = true;
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request('/mcp/servers/sql-context/restart', { method: 'POST', body: {} });
     mergeServerSnapshot(payload.server);
@@ -1895,7 +2493,7 @@ async function restartMcpConnection() {
     toast(`Could not restart connection: ${error.message}`, 'bad');
   } finally {
     state.mcp.restarting = false;
-    if (state.route.view === 'mcp-settings') renderRoute();
+    if (state.route.view === 'mcp-settings') renderRoute({ userAction: true });
   }
 }
 
@@ -1937,7 +2535,7 @@ async function savePublisherConfig() {
     cloudFrontBaseUrl: form.elements.cloudFrontBaseUrl?.value,
   };
   state.publisher.saving = true;
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const response = await request('/analytics/publisher', { method: 'PUT', body: payload });
     state.publisher.config = response.publisher;
@@ -1947,7 +2545,7 @@ async function savePublisherConfig() {
     toast(`Could not save publisher: ${error.message}`, 'bad');
   } finally {
     state.publisher.saving = false;
-    if (state.route.view === 'publisher-settings') renderRoute();
+    if (state.route.view === 'publisher-settings') renderRoute({ userAction: true });
   }
 }
 
@@ -1959,7 +2557,7 @@ async function prepareDashboardShare(id) {
     return;
   }
   state.publisher.preparing.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/share-request`, { method: 'POST', body: {} });
     state.publisher.pending.set(id, payload.shareRequest);
@@ -1968,20 +2566,20 @@ async function prepareDashboardShare(id) {
     toast(`Could not prepare snapshot: ${error.message}`, 'bad');
   } finally {
     state.publisher.preparing.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
 function cancelDashboardShare(id) {
   state.publisher.pending.delete(id);
-  renderRoute();
+  renderRoute({ userAction: true });
 }
 
 async function publishDashboardShare(id) {
   const pending = state.publisher.pending.get(id);
   if (!pending || state.publisher.publishing.has(id)) return;
   state.publisher.publishing.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/publish`, {
       method: 'POST',
@@ -1998,7 +2596,7 @@ async function publishDashboardShare(id) {
     toast(`Snapshot was not published: ${error.message}`, 'bad');
   } finally {
     state.publisher.publishing.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
@@ -2430,7 +3028,7 @@ async function saveAnalyticsSchedule(form) {
     timezone: form.elements.timezone?.value,
   };
   state.analytics.scheduling.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/schedule`, {
       method: 'PUT',
@@ -2442,7 +3040,7 @@ async function saveAnalyticsSchedule(form) {
     toast(`Could not save schedule: ${error.message}`, 'bad');
   } finally {
     state.analytics.scheduling.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
@@ -2451,7 +3049,7 @@ async function saveAnalyticsProjectLinks(form) {
   if (!id || state.analytics.linkingProjects.has(id)) return;
   const projectIds = new FormData(form).getAll('projectIds').map(value => String(value));
   state.analytics.linkingProjects.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -2464,7 +3062,7 @@ async function saveAnalyticsProjectLinks(form) {
     toast(`Could not save project links: ${error.message}`, 'bad');
   } finally {
     state.analytics.linkingProjects.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
@@ -2477,7 +3075,7 @@ async function deleteAnalyticsDashboard(id) {
   const confirmed = window.confirm(`Permanently delete "${dashboard.title}" and all of its local widgets, refresh history, schedule, and project links?\n\nThis cannot be undone.${remoteWarning}`);
   if (!confirmed) return;
   state.analytics.deleting.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     await request(`/analytics/dashboards/${encodeURIComponent(id)}`, { method: 'DELETE' });
     state.analytics.details.delete(id);
@@ -2491,7 +3089,7 @@ async function deleteAnalyticsDashboard(id) {
     toast(`Could not delete dashboard: ${error.message}`, 'bad');
   } finally {
     state.analytics.deleting.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
@@ -2499,7 +3097,7 @@ async function refreshAnalyticsDashboard(id) {
   const current = state.analytics.details.get(id);
   if (!id || state.analytics.refreshing.has(id) || analyticsActiveRun(current)) return;
   state.analytics.refreshing.add(id);
-  renderRoute();
+  renderRoute({ userAction: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/refresh`, { method: 'POST', body: {} });
     state.analytics.details.set(id, payload.dashboard);
@@ -2511,7 +3109,7 @@ async function refreshAnalyticsDashboard(id) {
     toast(`Could not queue dashboard refresh: ${error.message}`, 'bad');
   } finally {
     state.analytics.refreshing.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute();
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
 
@@ -2722,7 +3320,7 @@ async function refreshDocuments() {
   if (state.documents.refreshing) return;
   const artifactId = state.route.view === 'documents' ? state.route.artifactId : '';
   state.documents.refreshing = true;
-  if (state.route.view === 'documents') renderRoute({ preserveScroll: true });
+  if (state.route.view === 'documents') renderRoute({ preserveScroll: true, userAction: true });
   try {
     await Promise.all([
       loadDocuments({ force: true, renderAfter: false }),
@@ -2730,7 +3328,7 @@ async function refreshDocuments() {
     ]);
   } finally {
     state.documents.refreshing = false;
-    if (state.route.view === 'documents') renderRoute({ preserveScroll: true });
+    if (state.route.view === 'documents') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -3052,12 +3650,12 @@ async function saveDocumentRevision(artifactId) {
   const draft = (documents.editDraft ?? '').trim();
   if (!artifactId || !draft) {
     documents.actionError = 'The edited document cannot be empty.';
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
     return;
   }
   documents.saving = true;
   documents.actionError = '';
-  renderRoute({ preserveScroll: true });
+  renderRoute({ preserveScroll: true, userAction: true });
   try {
     const payload = await request(`/product-documents/${encodeURIComponent(artifactId)}/revision`, {
       method: 'POST',
@@ -3073,7 +3671,7 @@ async function saveDocumentRevision(artifactId) {
   } catch (error) {
     documents.saving = false;
     documents.actionError = `Saving the new version failed: ${error?.message || 'unknown error'}`;
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -3083,7 +3681,7 @@ function sendDocumentAnswers(artifactId) {
   const answers = (documents.answersDraft || '').trim();
   if (!artifact || !answers) {
     documents.actionError = 'Type your answers before sending them to BotBoy.';
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
     return;
   }
   const questions = (Array.isArray(artifact.openQuestions) ? artifact.openQuestions : [])
@@ -3097,7 +3695,7 @@ function sendDocumentAnswers(artifactId) {
   const input = document.getElementById('chatInput');
   if (!input || typeof window.submitChat !== 'function') {
     documents.actionError = 'The chat panel is unavailable in this session.';
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
     return;
   }
   documents.answersDraft = '';
@@ -3105,7 +3703,7 @@ function sendDocumentAnswers(artifactId) {
   input.value = message;
   if (document.getElementById('chat-panel')?.classList.contains('hidden')) window.toggleChat?.();
   void window.submitChat();
-  renderRoute({ preserveScroll: true });
+  renderRoute({ preserveScroll: true, userAction: true });
 }
 
 async function downloadDocument(artifactId, format) {
@@ -3113,7 +3711,7 @@ async function downloadDocument(artifactId, format) {
   if (!artifactId || documents.downloading) return;
   documents.downloading = format;
   documents.actionError = '';
-  renderRoute({ preserveScroll: true });
+  renderRoute({ preserveScroll: true, userAction: true });
   try {
     // The server runs the local conversion tool (pandoc/weasyprint) and
     // streams the file back; the browser then saves it like any download.
@@ -3139,7 +3737,7 @@ async function downloadDocument(artifactId, format) {
     documents.actionError = `Download failed: ${error?.message || 'unknown error'}`;
   } finally {
     documents.downloading = null;
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -3152,7 +3750,7 @@ async function deleteDocument(artifactId) {
   if (!confirmed) return;
   documents.deleting = true;
   documents.actionError = '';
-  renderRoute({ preserveScroll: true });
+  renderRoute({ preserveScroll: true, userAction: true });
   try {
     await request(`/product-documents/${encodeURIComponent(artifactId)}`, { method: 'DELETE' });
     documents.deleting = false;
@@ -3166,7 +3764,7 @@ async function deleteDocument(artifactId) {
   } catch (error) {
     documents.deleting = false;
     documents.actionError = `Deleting failed: ${error?.message || 'unknown error'}`;
-    renderRoute({ preserveScroll: true });
+    renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -3187,15 +3785,64 @@ function renderSettings() {
     <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
-function renderRoute({ preserveScroll = false } = {}) {
+// Repaints rebuild #app-view from scratch, which destroys any text the
+// owner is mid-typing — MCP config fields, doc-reader propose forms,
+// filter boxes (owner report 2026-08-26: "text disappears if I don't save
+// before the next flicker"). In-progress input is detected two ways: a
+// focused text control inside the routed view, or a field whose value
+// differs from its rendered default (typed, then blurred without saving).
+// Checkboxes/radios are exempt from the dirty check — toggles apply
+// immediately and a lingering mismatch would suppress refreshes forever.
+function hasUnsavedUserInput() {
+  const view = document.getElementById('app-view');
+  if (!view || view.style.display === 'none') return false;
+  const active = document.activeElement;
+  if (active && view.contains(active)
+    && active.matches('input:not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return true;
+  for (const el of view.querySelectorAll('input, textarea')) {
+    // Dirty-scan only textual controls: for types like time/number the
+    // browser-sanitized .value can diverge from the raw defaultValue without
+    // any user action, which would suppress refreshes forever. Non-textual
+    // controls are still protected by the focus check above while in use.
+    if (el.tagName === 'INPUT' && !['text', 'search', 'url', 'email', 'password', 'tel'].includes(el.type)) continue;
+    if (el.value !== el.defaultValue) return true;
+  }
+  return false;
+}
+
+// INVERTED DEFAULT (2026-08-26): every render is treated as background
+// unless the call site declares `userAction: true`. Background renders
+// yield to in-progress typing; user-action renders always paint. A
+// mislabeled new call site therefore fails LOUD (a button that seems dead
+// while a field is dirty) instead of QUIET (destroyed input). When adding
+// a render call inside a user event handler or its async tail, pass
+// `userAction: true`; timers, polls, SSE handlers, and fetch-completion
+// loaders pass nothing.
+function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   const workspace = document.getElementById('workspace');
   const previousScrollTop = workspace?.scrollTop || 0;
+  const previousRouteKey = JSON.stringify(state.route ?? {});
   state.route = parseRoute();
+  const routeChanged = JSON.stringify(state.route) !== previousRouteKey;
+  // Non-user repaints yield to the owner's in-progress typing: state is
+  // already fresh in memory, and the next user-driven render (save, action,
+  // navigation) paints it. Real navigation always renders.
+  if (!userAction && !routeChanged && hasUnsavedUserInput()) return;
+  // The Slack channel picker and Local-folders panels are OVERLAYS shown
+  // imperatively (showIntegration), invisible to the router. A background
+  // re-render (version-bump poll) must not slam them shut mid-selection
+  // (owner report 2026-08-26: "the channel selection page reloads and I'm
+  // back at the top" — every capture closed the overlay). Real navigation
+  // (routeChanged) still closes them.
+  const overlayOpen = !routeChanged && ['slack-sources', 'local-folders'].some(id => {
+    const panel = document.getElementById(id);
+    return panel && panel.style.display === 'block';
+  });
   const analyticsRoute = state.route.view === 'dashboards' || state.route.view === 'analytics-dashboard';
   window.setAmbientChatContext?.(analyticsRoute ? { mode: 'analytics_dashboard' } : null);
   syncAnalyticsPolling();
   renderSidebar();
-  closeIntegration({ keepLegacy: state.route.view === 'nodes' });
+  if (!overlayOpen) closeIntegration({ keepLegacy: state.route.view === 'nodes' });
   updateMobileNav();
   updateAssistantContext();
   const view = document.getElementById('app-view');
@@ -3222,6 +3869,8 @@ function renderRoute({ preserveScroll = false } = {}) {
   if (state.route.view === 'connections') html = renderConnections();
   if (state.route.view === 'mcp-settings') html = renderMcpSettings();
   if (state.route.view === 'grasp-sync-settings') html = renderGraspSyncSettings();
+  if (state.route.view === 'sharepoint-sync-settings') html = renderSharePointSyncSettings();
+  if (state.route.view === 'doc-reader') html = renderDocReader();
   if (state.route.view === 'mcp-add') html = renderMcpServerForm();
   if (state.route.view === 'mcp-edit') html = renderMcpServerForm({ editing: true, profileId: state.route.profileId });
   if (state.route.view === 'profile-settings') html = renderProfileSettings(state.route.profileId);
@@ -3241,7 +3890,13 @@ function renderRoute({ preserveScroll = false } = {}) {
     requestAnimationFrame(() => void hydrateAnalyticsVisualizations(state.route.dashboardId, visualizationEpoch));
   }
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
-  if (workspace) workspace.scrollTop = preserveScroll ? previousScrollTop : 0;
+  // Scroll ownership: only USER-INITIATED renders may reset to top (real
+  // navigation). Background renders — polls, loader completions, SSE — always
+  // restore the previous position, whether or not preserveScroll was threaded
+  // through. Found live 2026-08-26: on project pages every capture cleared the
+  // detail cache, and the re-fetch completion render (bare renderRoute()) was
+  // yanking the owner to the top even though the poll render preserved scroll.
+  if (workspace) workspace.scrollTop = (preserveScroll || overlayOpen || !userAction) ? previousScrollTop : 0;
 }
 
 function closeIntegration({ keepLegacy = false } = {}) {
@@ -3296,7 +3951,7 @@ function toggleTheme() {
   localStorage.setItem('botboy-theme', next);
   document.querySelectorAll('[data-action="toggle-theme"] use').forEach(use => use.setAttribute('href', next === 'dark' ? '#i-sun' : '#i-moon'));
   if (state.route.view === 'settings' || state.route.view === 'analytics-dashboard') {
-    renderRoute({ preserveScroll: state.route.view === 'analytics-dashboard' });
+    renderRoute({ preserveScroll: state.route.view === 'analytics-dashboard', userAction: true });
   }
 }
 
@@ -3441,10 +4096,153 @@ function bindEvents() {
     if (action === 'toggle-people') {
       const id = target.dataset.project;
       state.expandedPeople.has(id) ? state.expandedPeople.delete(id) : state.expandedPeople.add(id);
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
-    if (action === 'project-tab') { state.projectTab = target.dataset.tab; renderRoute(); }
-    if (action === 'evidence-filter') { state.evidenceFilter = target.dataset.filter; renderRoute(); }
+    if (action === 'project-tab') {
+      state.projectTab = target.dataset.tab;
+      if (state.projectTab === 'documents' && state.route.view === 'project') void loadProjectDocuments(state.route.projectId);
+      renderRoute({ userAction: true });
+    }
+    if (action === 'doc-comment-jump') {
+      const found = jumpToDocPassage(target.dataset.anchor || '');
+      if (!found) toast('Passage not found in the current preview (the document may have changed)', 'warn');
+    }
+    if (action === 'doc-propose-submit') {
+      const docKey = target.dataset.dockey || '';
+      const findText = document.getElementById('doc-propose-find')?.value ?? '';
+      const replaceWith = document.getElementById('doc-propose-replace')?.value ?? '';
+      const doc = state.docReader.data?.doc;
+      if (docKey && doc) {
+        void (async () => {
+          try {
+            await request('/documents/pending-edits', { method: 'POST', body: {
+              docKey, serverRelativeUrl: doc.serverRelativeUrl, siteUrl: doc.siteUrl || undefined,
+              operation: 'replaceText', findText, replaceWith,
+            } });
+            toast('Edit staged — approve it, then sync');
+            await loadDocReader(docKey, { force: true });
+          } catch (error) {
+            toast(String(error?.message || error), 'warn');
+          }
+        })();
+      }
+    }
+    if (action === 'doc-edit-decide') {
+      const id = target.dataset.id || '';
+      const decision = target.dataset.decision || '';
+      const docKey = state.docReader.key;
+      if (id && decision) {
+        void (async () => {
+          try {
+            await request(`/documents/pending-edits/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: {} });
+            await loadDocReader(docKey, { force: true });
+          } catch (error) {
+            toast(String(error?.message || error), 'warn');
+          }
+        })();
+      }
+    }
+    if (action === 'doc-sync') {
+      const docKey = target.dataset.dockey || '';
+      if (docKey && !state.docReader.syncing) {
+        state.docReader.syncing = true;
+        renderRoute({ preserveScroll: true, userAction: true });
+        void (async () => {
+          try {
+            const result = await request('/documents/sync', { method: 'POST', body: { docKey } });
+            if (result.retrying) {
+              // 202: someone (a teammate's Word/browser session) holds the
+              // SharePoint editing lock — the server retries in background.
+              toast(result.note || 'Document is locked — BotBoy will retry automatically and publish when it frees up.');
+            } else {
+              const synced = (result.results || []).filter(r => r.applied).length;
+              const conflicted = (result.results || []).length - synced;
+              toast(result.uploaded
+                ? `Synced ${synced} change${synced === 1 ? '' : 's'} to SharePoint${conflicted ? `; ${conflicted} conflicted` : ''}${result.verifiedOnReadBack ? ' (verified)' : ''}`
+                : 'Nothing uploaded — all approved edits conflicted with the current document', result.uploaded ? undefined : 'warn');
+            }
+          } catch (error) {
+            toast(`Sync failed: ${String(error?.message || error)}`, 'warn');
+          } finally {
+            state.docReader.syncing = false;
+            await loadDocReader(docKey, { force: true });
+          }
+        })();
+      }
+    }
+    if (action === 'creation-decide') {
+      const id = target.dataset.id || '';
+      const decision = target.dataset.decision === 'approve' ? 'approve' : 'reject';
+      const projectId = target.dataset.project || '';
+      if (id) {
+        void (async () => {
+          try {
+            await request(`/documents/pending-edits/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: {} });
+            toast(decision === 'approve' ? 'Creation approved — press "Create on SharePoint" to publish.' : 'Creation rejected.');
+          } catch (error) {
+            toast(`Could not ${decision}: ${String(error?.message || error)}`, 'warn');
+          } finally {
+            if (projectId) await loadProjectDocuments(projectId, { force: true });
+          }
+        })();
+      }
+    }
+    if (action === 'creation-sync') {
+      const docKey = target.dataset.dockey || '';
+      const projectId = target.dataset.project || '';
+      if (docKey && !state.docReader.syncing) {
+        state.docReader.syncing = true;
+        target.disabled = true;
+        void (async () => {
+          try {
+            const result = await request('/documents/sync', { method: 'POST', body: { docKey } });
+            if (result.uploaded) {
+              toast(`Document created on SharePoint${result.verifiedOnReadBack ? ' (verified)' : ''} — ingesting; it appears under Documents shortly.`);
+            } else {
+              toast(result.results?.[0]?.reason || 'Creation could not be published — see the staged row for the reason.', 'warn');
+            }
+          } catch (error) {
+            toast(`Create failed: ${String(error?.message || error)}`, 'warn');
+          } finally {
+            state.docReader.syncing = false;
+            if (projectId) await loadProjectDocuments(projectId, { force: true });
+          }
+        })();
+      }
+    }
+    if (action === 'doc-comment-filter') {
+      state.docReader.commentFilter = target.dataset.filter || 'open';
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'doc-sheet') {
+      const docKey = target.dataset.dockey || '';
+      if (docKey && !state.docReader.sheetView?.loading) void loadDocSheet(docKey, target.dataset.sheet || '');
+    }
+    if (action === 'doc-sheet-overview') {
+      state.docReader.sheetView = state.docReader.sheetView?.data?.sheets
+        ? { name: '', loading: false, data: { sheets: state.docReader.sheetView.data.sheets }, error: '' }
+        : undefined;
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'doc-refresh') {
+      const docKey = target.dataset.dockey || '';
+      if (docKey && !state.docReader.refreshing) {
+        state.docReader.refreshing = true;
+        renderRoute({ preserveScroll: true, userAction: true });
+        void (async () => {
+          try {
+            await request('/documents/refresh', { method: 'POST', body: { docKey } });
+            toast('Document refreshed from SharePoint');
+          } catch (error) {
+            toast(`Refresh failed: ${String(error?.message || error)}`, 'warn');
+          } finally {
+            state.docReader.refreshing = false;
+            await loadDocReader(docKey, { force: true });
+          }
+        })();
+      }
+    }
+    if (action === 'evidence-filter') { state.evidenceFilter = target.dataset.filter; renderRoute({ userAction: true }); }
     if (action === 'run-digests') void runChannelDigests();
     if (action === 'review-ambient') void reviewAmbientProjects();
     if (action === 'reject-evidence') void rejectEvidence(target.dataset.project, target.dataset.item);
@@ -3459,20 +4257,20 @@ function bindEvents() {
     if (action === 'documents-retry-detail') void loadDocument(target.dataset.artifact, { force: true });
     if (action === 'documents-preview-mode') {
       state.documents.previewMode = target.dataset.mode === 'plain' ? 'plain' : 'rendered';
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
     if (action === 'documents-edit') {
       const artifact = state.documents.details.get(target.dataset.artifact);
       state.documents.editing = true;
       state.documents.editDraft = typeof artifact?.content === 'string' ? artifact.content : '';
       state.documents.actionError = '';
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
     if (action === 'documents-cancel-edit') {
       state.documents.editing = false;
       state.documents.editDraft = null;
       state.documents.actionError = '';
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
     if (action === 'documents-save-revision') void saveDocumentRevision(target.dataset.artifact);
     if (action === 'documents-send-answers') sendDocumentAnswers(target.dataset.artifact);
@@ -3480,7 +4278,7 @@ function bindEvents() {
     if (action === 'documents-delete') void deleteDocument(target.dataset.artifact);
     if (action === 'documents-fullscreen') {
       state.documents.fullscreen = !state.documents.fullscreen;
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
     if (action === 'manage-connection') {
       if (target.dataset.connection === 'managed' && target.dataset.profile) go(`#/connections/${target.dataset.profile}`);
@@ -3511,6 +4309,89 @@ function bindEvents() {
         const payload = await request('/grasp-sync/config', { method: 'PUT', body: { ownerEmail: value.trim() } });
         state.graspSync.status = payload.status;
         toast(value.trim() ? 'Owner address saved' : 'Owner address cleared — re-detected on the next sync');
+      });
+    }
+    if (action === 'sharepoint-sync-run') {
+      void sharepointSyncAction('run', async () => {
+        const payload = await request('/sharepoint-sync/run', { method: 'POST', body: {} });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+        const totals = Object.values(payload.result?.perSource || {}).reduce((acc, c) => acc + (c.enqueued || 0), 0);
+        toast(payload.result?.status === 'skipped'
+          ? `Sync skipped: ${payload.result?.reason || 'not ready'}`
+          : `Discovery complete — ${totals} document${totals === 1 ? '' : 's'} queued`);
+      });
+    }
+    if (action === 'sharepoint-sync-toggle') {
+      void sharepointSyncAction('toggle', async () => {
+        const next = !(state.sharepointSync.status?.enabled ?? false);
+        const payload = await request('/sharepoint-sync/config', { method: 'PUT', body: { enabled: next } });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+      });
+    }
+    if (action === 'sharepoint-source-remove') {
+      const id = target.dataset.id;
+      void sharepointSyncAction('remove', async () => {
+        const remaining = (state.sharepointSync.status?.sources || []).filter(s => s.id !== id)
+          .map(({ id: _id, queued: _q, surgePending: _s, ...rest }) => rest);
+        const payload = await request('/sharepoint-sync/config', { method: 'PUT', body: { sources: remaining } });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+      });
+    }
+    if (action === 'sharepoint-add-source') {
+      const kind = target.dataset.kind;
+      void sharepointSyncAction('add', async () => {
+        const baseline = document.getElementById('sharepoint-baseline')?.value || 'days90';
+        const current = (state.sharepointSync.status?.sources || []).map(({ id: _id, queued: _q, surgePending: _s, ...rest }) => rest);
+        const payload = await request('/sharepoint-sync/config', { method: 'PUT', body: { sources: [...current, { kind, baseline }] } });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+      });
+    }
+    if (action === 'sharepoint-surge-confirm') {
+      const id = target.dataset.id;
+      void sharepointSyncAction('surge', async () => {
+        const payload = await request('/sharepoint-sync/confirm-surge', { method: 'POST', body: { sourceId: id } });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+      });
+    }
+    if (action === 'sharepoint-purge') {
+      if (!window.confirm('Remove ALL synced SharePoint documents from BotBoy? This deletes their evidence items, search entries, and cached files. Documents in SharePoint itself are untouched.')) return;
+      void sharepointSyncAction('purge', async () => {
+        const payload = await request('/sharepoint-sync/purge', { method: 'POST', body: {} });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+        toast(`Purged ${payload.result?.items ?? 0} synced documents`);
+      });
+    }
+    if (action === 'sharepoint-site-search') {
+      void sharepointSyncAction('sites', async () => {
+        const query = document.getElementById('sharepoint-site-query')?.value?.trim() || '';
+        const payload = await request(`/sharepoint/sites?query=${encodeURIComponent(query)}`);
+        state.sharepointSync.sites = Array.isArray(payload.sites) ? payload.sites : [];
+        state.sharepointSync.libraries = [];
+        if (!state.sharepointSync.sites.length) toast('No sites matched — try a different name');
+      });
+    }
+    if (action === 'sharepoint-load-libraries') {
+      void sharepointSyncAction('libraries', async () => {
+        const siteUrl = document.getElementById('sharepoint-site-pick')?.value || '';
+        state.sharepointSync.pickedSite = siteUrl;
+        const payload = await request(`/sharepoint/libraries?siteUrl=${encodeURIComponent(siteUrl)}`);
+        state.sharepointSync.libraries = Array.isArray(payload.libraries) ? payload.libraries : [];
+        if (!state.sharepointSync.libraries.length) toast('No document libraries found on that site');
+      });
+    }
+    if (action === 'sharepoint-add-library') {
+      void sharepointSyncAction('add', async () => {
+        const libraryName = document.getElementById('sharepoint-library-pick')?.value || '';
+        const folderPath = document.getElementById('sharepoint-folder-path')?.value?.trim() || '';
+        const baseline = document.getElementById('sharepoint-baseline')?.value || 'days90';
+        const siteUrl = state.sharepointSync.pickedSite;
+        const current = (state.sharepointSync.status?.sources || []).map(({ id: _id, queued: _q, surgePending: _s, ...rest }) => rest);
+        const source = { kind: 'library', siteUrl, libraryName, baseline, ...(folderPath ? { folderPath } : {}) };
+        const payload = await request('/sharepoint-sync/config', { method: 'PUT', body: { sources: [...current, source] } });
+        state.sharepointSync.status = payload.status || state.sharepointSync.status;
+        state.sharepointSync.libraries = [];
+        state.sharepointSync.sites = [];
+        toast(`Added library "${libraryName}"`);
       });
     }
     if (action === 'grasp-sync-save-noise') {
@@ -3577,7 +4458,7 @@ function bindEvents() {
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape' && state.documents.fullscreen && state.route.view === 'documents') {
       state.documents.fullscreen = false;
-      renderRoute({ preserveScroll: true });
+      renderRoute({ preserveScroll: true, userAction: true });
     }
   });
 
@@ -3636,8 +4517,12 @@ async function pollVersion() {
     state.lastBootId = payload.bootId ?? null;
 
     // Server restarted (possibly with new UI code): a stale tab must not keep
-    // running old JavaScript against the new server. Reload once, hard.
+    // running old JavaScript against the new server. Reload once, hard — but
+    // stash the scroll position so the reload lands the owner back where they
+    // were instead of at the top (restart reloads were reading as "the page
+    // randomly refreshes and I lose my place", owner report 2026-08-26).
     if (previousBootId && payload.bootId && payload.bootId !== previousBootId) {
+      try { sessionStorage.setItem('botboy-reload-scroll', String(document.getElementById('workspace')?.scrollTop || 0)); } catch {}
       location.reload();
       return;
     }
@@ -3646,9 +4531,27 @@ async function pollVersion() {
       // Project details are cached separately from the core read models.
       // Drop them before rendering a capture/assignment revision so the
       // active project fetches its newly connected evidence as well.
+      // STALE-WHILE-REVALIDATE for the project ON SCREEN: a bare clear made
+      // the poll render paint a loading skeleton, and the collapsed height
+      // clamped workspace.scrollTop to 0 in the browser itself — no scroll
+      // logic can undo that (owner report 2026-08-26: project page "jumps to
+      // top randomly without any click"). Keep the stale detail painted,
+      // then refetch and swap in place: both paints are full-height, so the
+      // background-render scroll preservation actually holds.
+      const activeProjectId = state.route.view === 'project' ? state.route.projectId : '';
+      const staleDetail = activeProjectId ? state.projectDetails.get(activeProjectId) : undefined;
+      const staleDocs = activeProjectId ? state.projectDocuments.get(activeProjectId) : undefined;
       state.projectDetails.clear();
+      state.projectDocuments.clear();
       state.projectErrors.clear();
+      if (staleDetail) state.projectDetails.set(activeProjectId, staleDetail);
+      if (staleDocs) state.projectDocuments.set(activeProjectId, staleDocs);
       await loadCore({ quiet: true });
+      // Refetch WITHOUT deleting first — the stale detail stays painted for
+      // the whole fetch, so no render (this one or a racing poll tick) can
+      // ever see a missing detail and collapse the view.
+      if (staleDetail) void loadProject(activeProjectId, { force: true });
+      if (staleDocs) void loadProjectDocuments(activeProjectId, { force: true });
     }
 
     if (previousAnalyticsVersion !== null && state.lastAnalyticsVersion !== previousAnalyticsVersion) {
@@ -3696,11 +4599,11 @@ function initialize() {
     if (nextRoute.view === 'today' && previousView !== 'today') {
       state.today.data = null;
       state.today.error = '';
-      renderRoute();
+      renderRoute({ userAction: true });
       void openTodayVisit();
       return;
     }
-    renderRoute();
+    renderRoute({ userAction: true });
   });
   renderRoute();
   void loadCore();

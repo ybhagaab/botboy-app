@@ -538,12 +538,14 @@ function renderBreadcrumb() {
 function renderGrid() {
   const el = document.getElementById('grid-view');
   const detail = document.getElementById('detail-view');
-  const slackPanel = document.getElementById('slack-sources');
-  const lfPanel = document.getElementById('local-folders');
+  // Only toggle elements INSIDE the legacy-browser panel. This function runs
+  // from app.js's 3s version poll on every capture, so it must never touch
+  // sibling integration panels (slack-sources / local-folders) — doing so
+  // slammed the Slack channel picker shut mid-selection (owner report
+  // 2026-08-26). Panel exclusivity is owned by dashboard.js
+  // showIntegration/closeIntegration.
   el.style.display = 'block';
   detail.style.display = 'none';
-  if (slackPanel) slackPanel.style.display = 'none';
-  if (lfPanel) lfPanel.style.display = 'none';
 
   const visible = state.nodes.filter(n => state.showNoise || !isNoise(n.title));
   const sorted = [...visible].sort((a, b) => b.itemCount - a.itemCount);
@@ -646,12 +648,10 @@ function renderBrainBriefing(brain) {
 function renderDetail() {
   const el = document.getElementById('detail-view');
   const grid = document.getElementById('grid-view');
-  const slackPanel = document.getElementById('slack-sources');
-  const lfPanel = document.getElementById('local-folders');
+  // Same rule as renderGrid: background poll renders must never hide the
+  // slack-sources / local-folders overlays. dashboard.js owns panel switching.
   grid.style.display = 'none';
   el.style.display = 'block';
-  if (slackPanel) slackPanel.style.display = 'none';
-  if (lfPanel) lfPanel.style.display = 'none';
 
   const n = state.currentNode;
   if (!n) return;
@@ -2389,8 +2389,28 @@ function fpvTableHtml(rows) {
   return `<div class="fpv-table-wrap"><table class="fpv-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>${note}`;
 }
 
-window.previewFile = async (href) => {
-  if (typeof href !== 'string' || !href.startsWith('/api/files/')) return;
+/**
+ * Normalize a candidate file href to its /api/files/<rel> form. The model
+ * regularly writes ABSOLUTE links (http://localhost:7778/api/files/x.md) in
+ * chat — those must preview in-app exactly like relative ones (soak find,
+ * 2026-08-25: absolute links escaped to browser tabs). Non-file and
+ * cross-origin URLs return null.
+ */
+function normalizeApiFilesHref(href) {
+  if (typeof href !== 'string' || !href) return null;
+  if (href.startsWith('/api/files/')) return href;
+  try {
+    const url = new URL(href, location.origin);
+    if (url.origin === location.origin && url.pathname.startsWith('/api/files/')) {
+      return url.pathname + url.search;
+    }
+  } catch { /* not a URL */ }
+  return null;
+}
+
+window.previewFile = async (rawHref) => {
+  const href = normalizeApiFilesHref(rawHref);
+  if (!href) return;
   // One preview at a time — replace any open overlay instead of stacking.
   document.querySelectorAll('.file-preview-expand').forEach(el => el.remove());
   const rel = href.slice('/api/files/'.length);
@@ -2484,17 +2504,19 @@ document.addEventListener('click', (e) => {
     }
     return;
   }
-  // /api/files/<rel> hrefs — open the in-app preview overlay instead of a raw
-  // new tab. The open/reveal action shims share the prefix but are not files.
-  // Anchors INSIDE the preview overlay (the "Open in tab" button) must pass
-  // through untouched, otherwise we'd re-preview instead of opening the tab.
-  const previewAnchor = e.target.closest && e.target.closest('a[href^="/api/files/"]');
-  if (previewAnchor && !previewAnchor.closest('.file-preview-expand')) {
-    const href = previewAnchor.getAttribute('href') || '';
-    const slug = href.slice('/api/files/'.length);
+  // File hrefs — open the in-app preview overlay instead of a raw new tab.
+  // Matches RELATIVE (/api/files/x) and ABSOLUTE same-origin
+  // (http://localhost:7778/api/files/x) links: the model writes both forms
+  // in chat. The open/reveal action shims share the prefix but are not
+  // files. Only the header actions ("Open in tab") pass through untouched:
+  // file links INSIDE a previewed document re-preview in place.
+  const anyAnchor = e.target.closest && e.target.closest('a[href]');
+  const normalizedHref = anyAnchor ? normalizeApiFilesHref(anyAnchor.getAttribute('href') || '') : null;
+  if (anyAnchor && normalizedHref && !anyAnchor.closest('.fpv-actions')) {
+    const slug = normalizedHref.slice('/api/files/'.length);
     if (slug && slug !== 'open' && slug !== 'reveal' && !slug.startsWith('open?') && !slug.startsWith('reveal?')) {
       e.preventDefault();
-      window.previewFile(href);
+      window.previewFile(normalizedHref);
       return;
     }
   }
@@ -2579,7 +2601,15 @@ document.addEventListener('click', (e) => {
         lastVersion = version;
         await loadRoots();
         if (state.currentNode) await loadNodeDetail(state.currentNode.id);
-        render();
+        // Same rule as dashboard.js hasUnsavedUserInput: a background render
+        // rebuilds grid/detail innerHTML and would destroy text the owner is
+        // typing inside the legacy panel. State is fresh; the next
+        // user-driven render paints it.
+        const legacy = document.getElementById('legacy-browser');
+        const active = document.activeElement;
+        const typingInLegacy = legacy && active && legacy.contains(active)
+          && active.matches('input, textarea, select, [contenteditable="true"]');
+        if (!typingInLegacy) render();
       }
     } catch {}
   }, 3000);

@@ -11,12 +11,13 @@ export type WorkItemType =
   | 'calendar_event'
   | 'document_online'
   | 'document_capture'
+  | 'document_comment'
   | 'call_summary'
   | 'app_activity'
   | 'clipboard_capture'
   | 'generic_browser';
 
-export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp';
+export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp' | 'sharepoint';
 
 // ── Raw Work Item (emitted by monitors before storage) ──
 

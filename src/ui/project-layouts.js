@@ -118,6 +118,7 @@
       ['brief', 'Roadmap'],
       ['tasks', `Tasks ${Array.isArray(brain?.tasks) ? brain.tasks.length : 0}`],
       ['evidence', `Evidence ${Number(project?.itemCount || 0)}`],
+      ['documents', 'Documents'], // mirror of dashboard.js renderProject tabs (map: duplicate list)
       ['timeline', 'Timeline'],
     ];
     return `<div class="tabs native-layout-tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${active === id ? 'active' : ''}" type="button" role="tab" aria-selected="${active === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div>`;

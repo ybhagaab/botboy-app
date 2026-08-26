@@ -350,6 +350,13 @@ describe('read_file handler', () => {
 // run_command uses async exec (callback style); execSync stays mocked for any
 // legacy import in the module graph.
 vi.mock('child_process', () => ({
+  // tool-executor's module graph now also pulls in docx-body-editor, which
+  // promisifies execFile at load time — the mock must export it or the whole
+  // graph fails to collect.
+  execFile: vi.fn((_cmd: unknown, _args: unknown, _opts: unknown, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+    if (typeof cb === 'function') cb(new Error('mocked command failure'), '', '');
+    return undefined as never;
+  }),
   execSync: vi.fn(() => { throw new Error('mocked command failure'); }),
   exec: vi.fn((_cmd: unknown, _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
     cb(new Error('mocked command failure'), '', '');

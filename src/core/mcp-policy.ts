@@ -170,6 +170,78 @@ const SLACK_READ_TOOLS = new Set([
   'lists_items_info',
 ]);
 
+/**
+ * SharePoint MCP read operations (server v1.18+). CRITICAL: every tool on
+ * that server is prefixed `sharepoint_`, so the generic READ_NAME_PATTERN
+ * below never matches — without this set ALL SharePoint tools would classify
+ * as write and the background document sync would be blocked on its first
+ * listing call (plan §8.5 build blocker, validated 2026-08-24).
+ */
+const SHAREPOINT_READ_TOOLS = new Set([
+  'sharepoint_list_sites',
+  'sharepoint_list_libraries',
+  'sharepoint_list_files',
+  'sharepoint_list_shared_with_me',
+  'sharepoint_read_file',
+  'sharepoint_read_loop',
+  'sharepoint_search',
+  'sharepoint_resolve_url',
+  // Phase-2 comment reads — read-classified from day one (harmless reads).
+  'sharepoint_read_docx_comments',
+  'sharepoint_list_item_comments',
+]);
+
+/**
+ * SharePoint tools that are never callable in any phase of the integration
+ * plan — destructive operations, structure mutations, site administration —
+ * plus the three phase-3 write tools, blocked until their guided approval
+ * flows ship (stale-thread and freshness guards live in those flows, so a
+ * raw call would bypass them). Enforcement is unconditional: ownerApproved
+ * does NOT override this set. The delivered policy had only read/write
+ * tiers; this set adds the "never" tier the plan's §8.4 requires.
+ */
+const SHAREPOINT_BLOCKED_TOOLS = new Set([
+  // Destructive
+  'sharepoint_delete_file',
+  'sharepoint_delete_list',
+  'sharepoint_delete_item',
+  'sharepoint_delete_field',
+  // Structure mutations
+  'sharepoint_create_folder',
+  'sharepoint_rename_folder',
+  'sharepoint_create_list',
+  'sharepoint_create_field',
+  'sharepoint_update_field',
+  'sharepoint_create_item',
+  'sharepoint_update_item',
+  'sharepoint_set_view_fields',
+  'sharepoint_remove_view_field',
+  'sharepoint_add_item_comment',
+  // Site administration
+  'sharepoint_set_homepage',
+  'sharepoint_rename_page',
+  // Phase-3 writes — callable ONLY through the guided flows (reply / add
+  // comment / incorporate edits), which carry the freshness + stale-thread
+  // guards. Raw calls (chat mcp_call_tool) stay blocked; see
+  // SHAREPOINT_GUIDED_WRITE_TOOLS and the guidedFlow option below.
+  'sharepoint_write_file',
+  'sharepoint_reply_docx_comment',
+  'sharepoint_add_docx_comment',
+]);
+
+/**
+ * The only blocked tools the guided flows may invoke (phase 3, spec R1.2).
+ * The waiver requires ALL of: options.guidedFlow (set exclusively by
+ * BotBoy's own purpose-built tool handlers — the model-facing mcp_call_tool
+ * never forwards it), membership here, and ownerApproved. Everything else
+ * in SHAREPOINT_BLOCKED_TOOLS rejects unconditionally.
+ */
+const SHAREPOINT_GUIDED_WRITE_TOOLS = new Set([
+  'sharepoint_write_file',
+  'sharepoint_reply_docx_comment',
+  'sharepoint_add_docx_comment',
+]);
+
 /** Name patterns that indicate a read-only operation on any MCP server. */
 const READ_NAME_PATTERN = /^(get|list|search|read|describe|query|fetch|show|status|check|find|count|view|inspect|preview|lookup|resolve|download)([_\-.]|$)/i;
 
@@ -189,6 +261,14 @@ export function classifyMcpTool(serverKind: string, toolName: string): McpToolRi
     if (SLACK_READ_TOOLS.has(toolName)) return 'read';
     return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
   }
+  if (serverKind === 'sharepoint') {
+    // Deliberately NO name-pattern fallback: an unknown sharepoint_* tool
+    // (added by a future server version) classifies as write, never as a
+    // silent free read. Remaining read-only tools outside the curated set
+    // (Lists/pages reads, "later review" in the plan) are therefore callable
+    // only with an explicit owner request.
+    return SHAREPOINT_READ_TOOLS.has(toolName) ? 'read' : 'write';
+  }
   return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
 }
 
@@ -196,8 +276,23 @@ export function validateMcpToolCall(
   serverKind: string,
   toolName: string,
   args: Record<string, unknown>,
-  options: { ownerApproved?: boolean } = {},
+  options: { ownerApproved?: boolean; guidedFlow?: boolean } = {},
 ): Record<string, unknown> {
+  // The "never" tier: unconditional for raw calls, regardless of
+  // ownerApproved. The word "blocked" in the message is load-bearing —
+  // mcp-manager's error classifier records these calls with audit status
+  // 'blocked'. Sole waiver (phase 3): BotBoy's own guided write flows,
+  // which re-verify live server state before writing.
+  if (serverKind === 'sharepoint' && SHAREPOINT_BLOCKED_TOOLS.has(toolName)) {
+    const guidedWaiver = options.guidedFlow === true
+      && SHAREPOINT_GUIDED_WRITE_TOOLS.has(toolName)
+      && options.ownerApproved === true;
+    if (!guidedWaiver) {
+      throw new Error(
+        `MCP tool '${toolName}' is blocked for the SharePoint profile (destructive, structural, or reserved for its guided flow) — an owner request cannot override this; guided writes go through the sharepoint_reply_comment / sharepoint_add_comment / sharepoint_update_document tools`,
+      );
+    }
+  }
   const risk = classifyMcpTool(serverKind, toolName);
   if (risk !== 'read' && options.ownerApproved !== true) {
     throw new Error(

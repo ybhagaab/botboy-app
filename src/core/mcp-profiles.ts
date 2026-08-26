@@ -29,6 +29,24 @@ import type {
 export const SQL_CONTEXT_PROFILE_ID = 'sql-context' as const;
 export const GRASP_PROFILE_ID = 'grasp-m365' as const;
 export const SLACK_MCP_PROFILE_ID = 'slack' as const;
+export const SHAREPOINT_MCP_PROFILE_ID = 'sharepoint' as const;
+
+/**
+ * The SharePoint read tools BotBoy's own code paths use: the background
+ * document sync (sharepoint-docs-brain R1.2) plus URL resolution and search
+ * for chat. Compatibility requires these; the two phase-2 comment-read tools
+ * are deliberately NOT required so a slightly older server still passes —
+ * they are simply read-classified in mcp-policy when present.
+ */
+export const SHAREPOINT_MCP_REQUIRED_TOOLS = Object.freeze([
+  'sharepoint_list_sites',
+  'sharepoint_list_libraries',
+  'sharepoint_list_files',
+  'sharepoint_list_shared_with_me',
+  'sharepoint_read_file',
+  'sharepoint_resolve_url',
+  'sharepoint_search',
+] as const);
 
 /**
  * The Slack read tools BotBoy's own code paths use (ingestion transport,
@@ -502,6 +520,118 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
         notInstalledDetail: 'Install through Toolbox: aim mcp install ai-community-slack-mcp',
         needsSetupDetail: 'Install the Slack MCP, then start the managed server',
         readyDetail: 'Slack capture, channel picker, and chat lookups through your Amazon session',
+      },
+    }),
+  }),
+  sharepoint: Object.freeze({
+    id: SHAREPOINT_MCP_PROFILE_ID,
+    kind: SHAREPOINT_MCP_PROFILE_ID,
+    displayName: 'Amazon SharePoint & OneDrive',
+    shortName: 'SharePoint MCP',
+    packageVersion: 'built-in',
+    launch: Object.freeze({
+      type: 'local-executable' as const,
+      executableName: 'amazon-sharepoint-mcp',
+      args: Object.freeze([] as const),
+    }),
+    setupActions: Object.freeze([]),
+    // Same dependency order as the Slack profile: AIM CLI first, then the
+    // server install, then Midway freshness.
+    terminalCommands: Object.freeze([
+      Object.freeze({
+        id: 'update-toolbox',
+        title: 'Install/update Toolbox + AIM',
+        description: 'Installs the AIM CLI through Amazon Toolbox (or updates it). Required before the SharePoint MCP can be installed.',
+        argv: Object.freeze(['toolbox', 'install', 'aim']),
+        timeoutMs: 10 * 60_000,
+        requiresStopped: false,
+      }),
+      Object.freeze({
+        id: 'install',
+        title: 'Install the SharePoint MCP',
+        description: 'Installs amazon-sharepoint-mcp through the AIM CLI (Amazon Toolbox).',
+        argv: Object.freeze(['aim', 'mcp', 'install', 'amazon-sharepoint-mcp']),
+        timeoutMs: 10 * 60_000,
+        requiresStopped: false,
+      }),
+      Object.freeze({
+        id: 'midway',
+        title: 'Refresh Midway',
+        description: 'Prompts for your Midway PIN and your security-key touch. The SharePoint MCP authenticates with your Amazon session.',
+        argv: Object.freeze(['mwinit']),
+        timeoutMs: 5 * 60_000,
+        requiresStopped: false,
+      }),
+    ]),
+    requiredTools: SHAREPOINT_MCP_REQUIRED_TOOLS,
+    policy: Object.freeze({
+      exposeToolDescriptors: true,
+      redactErrors: true,
+      discardStderr: true,
+      allowGenericToolCalls: true,
+      allowGenericRestart: true,
+    }),
+    seedConfigJson: '{}',
+    ui: Object.freeze({
+      breadcrumb: 'SharePoint',
+      pageSubtitle: 'The Amazon SharePoint MCP authenticates with your local Midway session. BotBoy stores no SharePoint credentials.',
+      setupHeading: { title: 'Local setup', subtitle: 'Install once through Toolbox, keep Midway fresh, and BotBoy manages the server process.' },
+      steps: Object.freeze([
+        {
+          title: 'Install the SharePoint MCP',
+          description: 'Run the approved AIM install command. It registers the amazon-sharepoint-mcp executable through Amazon Toolbox.',
+          command: 'aim mcp install amazon-sharepoint-mcp',
+        },
+        {
+          title: 'Refresh Midway',
+          description: 'The server authenticates with your Amazon session. Run this when SharePoint tools report an expired session.',
+          command: 'mwinit',
+        },
+        {
+          title: 'Start and test',
+          description: 'BotBoy starts the fixed amazon-sharepoint-mcp process. The test checks the read tools the document sync and chat use. It does not call a SharePoint data tool.',
+          lifecycle: true,
+        },
+      ]),
+      nextActions: {
+        default: 'Install the SharePoint MCP through Toolbox, then start the server.',
+        notInstalled: 'Run the approved install command in a terminal. Then select Check installation.',
+        starting: 'Wait for the local MCP server to start.',
+        failed: 'Stop the server, refresh Midway, and start it again.',
+        runningUnchecked: 'Test compatibility. The test uses MCP protocol operations only.',
+        runningIncompatible: 'Stop the server and update the local SharePoint MCP installation before you test again.',
+        runningCompatible: 'The connection is ready. Pick sync sources below, or ask BotBoy about your SharePoint documents in chat.',
+      },
+      sidePanels: Object.freeze([
+        {
+          icon: 'shield',
+          eyebrow: 'Data boundary',
+          title: 'Reads are free, changes are locked',
+          body: 'BotBoy reads sites, libraries, documents, and comments through audited tools. Deleting, restructuring, and site administration are blocked outright, and document writes stay locked until their guided approval flows ship.',
+        },
+        {
+          icon: 'refresh',
+          eyebrow: 'Continuity',
+          title: 'No tokens to rotate',
+          body: 'Authentication rides your Amazon Midway session. When it expires, the document sync pauses losslessly and resumes after mwinit — nothing is missed, and BotBoy stores no SharePoint credential.',
+        },
+      ]),
+      actionCopy: Object.freeze({
+        check: { pending: 'Checking the SharePoint MCP installation…', success: 'SharePoint MCP installation check completed.', failure: 'Could not check the SharePoint MCP installation' },
+        start: { pending: 'Starting the SharePoint MCP server…', success: 'The SharePoint MCP server started.', failure: 'Could not start the SharePoint MCP server' },
+        test: {
+          pending: 'Testing MCP compatibility…',
+          success: 'SharePoint MCP compatibility passed.',
+          failure: 'The SharePoint MCP compatibility test did not pass',
+          incompatible: 'The SharePoint MCP server is running, but required read tools are absent.',
+        },
+        stop: { pending: 'Stopping the SharePoint MCP server…', success: 'The SharePoint MCP server stopped.', failure: 'Could not stop the SharePoint MCP server' },
+      }),
+      card: {
+        dataHandling: 'Reads free, writes locked',
+        notInstalledDetail: 'Install through Toolbox: aim mcp install amazon-sharepoint-mcp',
+        needsSetupDetail: 'Install the SharePoint MCP, then start the managed server',
+        readyDetail: 'Document sync from shared-with-me, OneDrive, and team libraries through your Amazon session',
       },
     }),
   }),

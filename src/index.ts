@@ -35,6 +35,7 @@ import { createSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
+import { createSharePointSync } from './monitors/sharepoint-sync.js';
 import { createRouter } from './api/routes.js';
 import { createProfileRegistry } from './product-manager/profile-registry.js';
 import { createWritingConfigStore } from './product-manager/writing-config.js';
@@ -360,12 +361,17 @@ async function main() {
       console.warn(`[ChatTerminal] Could not post session-end notification: ${e?.message ?? e}`);
     }
   });
+  // Content store constructed before the executor so document tools can read
+  // stored document content (it only needs the db; the capture pipeline that
+  // also uses it is wired further down).
+  const contentStore = createContentStore(db);
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     brainStore,
     mcpManager,
     analyticsService,
     dashboardPublisher,
     chatTerminal,
+    contentStore,
   });
   const toolExecutor = withProductDocumentChatTools(baseToolExecutor, productDocumentService);
 
@@ -417,7 +423,7 @@ async function main() {
   );
 
   // ── lossless-capture-brain-pipeline: evidence + interpretation planes ──
-  const contentStore = createContentStore(db);
+  // (contentStore constructed above, before the tool executor.)
   const failures = createFailureRecorder(db);
   const ocrEngine = createVisionOcrEngine();
   const extractor = createExtractor({ db, documentParser, ocrEngine, contentStore, failures });
@@ -807,6 +813,13 @@ async function main() {
   // as every monitor and reach brain synthesis on the interpretation tick.
   const graspSync = createGraspSync({ db, mcpManager, emit: item => eventBus.emit(item) });
 
+  // ── SharePoint document sync (user-selected sources, discovery + drain) ──
+  // Read-only MCP calls; documents flow through the same capture handler.
+  // The parser powers the large-file lane (self-parsed in the drain).
+  const sharePointSync = createSharePointSync({
+    db, mcpManager, documentParser, contentStore, emit: item => eventBus.emit(item),
+  });
+
   // R12.3: one-time ingestion of pre-existing files per enabled folder. A
   // persistent per-folder marker prevents re-flooding on every boot.
   for (const folder of listLocalFolders(db, { enabledOnly: true })) {
@@ -842,6 +855,9 @@ async function main() {
     channelDigester,
     mcpManager,
     graspSync,
+    sharePointSync,
+    contentStore,
+    documentParser,
     analyticsService,
     dashboardPublisher,
     productDocumentService,
@@ -889,6 +905,9 @@ async function main() {
   graspSync.start();
   console.log('✅ GRASP sync scheduled (Outlook mail + calendar every 30 min)');
 
+  sharePointSync.start();
+  console.log('✅ SharePoint sync scheduled (discovery every 30 min, drain every 20 s)');
+
   if (process.env.PPT_MIDWAY_SENTINEL !== '0') {
     midwaySentinel.start();
     console.log('✅ Midway sentinel active (auto re-auth flow for session-backed MCPs)');
@@ -904,6 +923,7 @@ async function main() {
     shutdownPromise = (async () => {
       console.log(`\n🔍 Shutting down after ${signal}...`);
       graspSync.stop();
+      sharePointSync.stop();
       pipelineOrchestrator.stop();
       analyticsScheduler.stop();
       const serverClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));

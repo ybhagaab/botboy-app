@@ -233,14 +233,17 @@ open_dashboard_window() {
     DASH_TARGET=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
       | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d).filter(x=>String(x.url||'').includes('localhost:7778'));process.stdout.write(t.length?t[0].id:'')}catch{}})" 2>/dev/null)
     if [ -n "$DASH_TARGET" ]; then
-      # Already open — just bring it forward.
-      curl -s --max-time 3 "http://127.0.0.1:9222/json/activate/$DASH_TARGET" >/dev/null
-    else
-      "$CHROME" \
-        --user-data-dir="$DEBUG_PROFILE" \
-        --app="http://localhost:7778" >/dev/null 2>&1 &
-      sleep 2
+      # A reused window keeps running whatever app.js it loaded at open time —
+      # potentially weeks old (recurring gotcha: AGENT_FIX_LEARNINGS #1/#17/#18;
+      # bit again 2026-08-25 as a "broken overlay"). ./start.sh means new code:
+      # close the stale window and open a fresh one so the UI is current.
+      curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$DASH_TARGET" >/dev/null
+      sleep 1
     fi
+    "$CHROME" \
+      --user-data-dir="$DEBUG_PROFILE" \
+      --app="http://localhost:7778" >/dev/null 2>&1 &
+    sleep 2
     echo "✅ Dashboard window ready: http://localhost:7778"
   else
     echo "⚠️  Debug Chrome not reachable on :9222 — open http://localhost:7778 manually"
@@ -361,6 +364,13 @@ if [ "$DOCTOR" = "1" ]; then
   # watched FOLDER, independent of file count. A low limit here no longer
   # implicates watched-folder size — look at sockets/subprocesses instead.
   echo "fd limit: $(ulimit -n) (folder watching costs ~1 fd per folder)"
+  # Managed MCP executables (installed via aim; searched the same way BotBoy
+  # resolves them — PATH plus the AIM wrapper directory).
+  if command -v amazon-sharepoint-mcp >/dev/null 2>&1 || [ -x "$HOME/.aim/mcp-servers/amazon-sharepoint-mcp" ]; then
+    echo "sharepoint-mcp: installed"
+  else
+    echo "sharepoint-mcp: not installed (optional — install from Connections → SharePoint)"
+  fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
   if [ -f "$DOCTOR_ENV" ] && grep -q '^BOTBOY_INFERENCE_OAUTH_CLIENT_ID=' "$DOCTOR_ENV" 2>/dev/null; then
     echo "llm-credentials: present"

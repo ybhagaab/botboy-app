@@ -87,7 +87,10 @@ export function demoteAmbientProjects(
     const items = itemsFor.all(project.id) as EvidenceRow[];
     if (items.length === 0) continue;
 
-    const PASSIVE_SOURCES = new Set(['app', 'browser', 'clipboard', 'filesystem']);
+    // 'sharepoint' is passive here by design: background document sync must
+    // not fake owner engagement. Phase 2 document_comment items get a
+    // type-aware engagement exception (see docs/maps/sharepoint.md).
+    const PASSIVE_SOURCES = new Set(['app', 'browser', 'clipboard', 'filesystem', 'sharepoint']);
     const channels = new Set<string>();
     let ambientSlackOnly = false;
     let purePassive = false;
@@ -109,6 +112,14 @@ export function demoteAmbientProjects(
           const channelName = typeof metadata.channelName === 'string' ? metadata.channelName : 'unknown';
           channels.add(channelName);
           ambientSlackCount++;
+        } else if (item.source === 'sharepoint' && item.type === 'document_comment') {
+          // Engaged document comments (the owner wrote one, or one names the
+          // owner) are real adoption; other people's comments stay passive
+          // like the synced document content itself (map: comments exception).
+          let metadata: Record<string, unknown> = {};
+          try { metadata = JSON.parse(item.metadata ?? '{}'); } catch { /* legacy rows */ }
+          if (metadata.direction === 'sent' || metadata.mentionedMe === 'true') { adopted = true; break; }
+          passiveCount++;
         } else if (PASSIVE_SOURCES.has(item.source)) {
           passiveCount++;
         } else {

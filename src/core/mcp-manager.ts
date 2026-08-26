@@ -755,6 +755,7 @@ export function createMcpManager(options: {
     try {
       const validatedArgs = validateMcpToolCall(profile.kind, toolName, args, {
         ownerApproved: options.ownerApproved === true,
+        guidedFlow: options.guidedFlow === true,
       });
       const runtime = options.expectedRuntime ?? await ensureReady(serverId);
       if (runtime.expectedClose || runtimes.get(serverId) !== runtime) {

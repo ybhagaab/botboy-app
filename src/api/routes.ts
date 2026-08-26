@@ -21,10 +21,12 @@ import { createAgentRouter } from './routers/agent.js';
 import { createSlackRouter } from './routers/slack.js';
 import { createLocalFoldersRouter } from './routers/local-folders.js';
 import { createGraspSyncRouter } from './routers/grasp-sync.js';
+import { createSharePointSyncRouter } from './routers/sharepoint-sync.js';
 import { createMcpRouter } from './routers/mcp.js';
 import { createAnalyticsRouter } from './routers/analytics.js';
 import { createWorkspaceRouter } from './routers/workspace.js';
 import { createProductDocumentsRouter } from './routers/product-documents.js';
+import { createDocumentsRouter } from './routers/documents.js';
 
 export type { RouterDeps } from './routers/deps.js';
 
@@ -45,10 +47,14 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createSlackRouter(deps));
   router.use(createLocalFoldersRouter(deps));
   router.use(createGraspSyncRouter(deps));
+  router.use(createSharePointSyncRouter(deps));
   router.use(createMcpRouter(deps));
   router.use(createAnalyticsRouter(deps));
   router.use(createWorkspaceRouter(deps));
   router.use(createProductDocumentsRouter(deps));
+  // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from
+  // /product-documents — the writing workspace stays untouched.
+  router.use(createDocumentsRouter(deps));
 
   return router;
 }

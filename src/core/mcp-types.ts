@@ -12,7 +12,7 @@ export type McpServerState =
  * registry entry there; storage seeding, manager lifecycle, API routes,
  * agent policy, and the Connections UI all read the registry.
  */
-export const BUILT_IN_MCP_PROFILE_IDS = ['sql-context', 'grasp-m365', 'slack'] as const;
+export const BUILT_IN_MCP_PROFILE_IDS = ['sql-context', 'grasp-m365', 'slack', 'sharepoint'] as const;
 export type BuiltInMcpProfileId = (typeof BUILT_IN_MCP_PROFILE_IDS)[number];
 export type McpInstallationState = 'unchecked' | 'not_installed' | 'installed';
 export type McpCompatibilityState = 'unchecked' | 'compatible' | 'incompatible';
@@ -162,10 +162,26 @@ export interface McpCallOptions {
   source?: 'api' | 'agent' | 'dashboard' | 'health';
   timeoutMs?: number;
   /**
+   * Fail fast with a busy error instead of queueing behind an in-flight call
+   * on the same serialized server. Used by dashboard picker routes so a
+   * long-running download (e.g. a SharePoint large-file transfer) surfaces
+   * as "sync busy, try again" rather than a hung request.
+   */
+  skipIfBusy?: boolean;
+  /**
    * Confirms an explicit owner request for a write-classified tool call.
    * Read-classified calls do not require it.
    */
   ownerApproved?: boolean;
+  /**
+   * INTERNAL ONLY: set exclusively by BotBoy's purpose-built guided write
+   * flows (tool-executor SharePoint tools), which re-verify live server
+   * state before writing. Never populated from model-supplied arguments —
+   * the model-facing mcp_call_tool constructs its options without it.
+   * Waives the SharePoint blocked-set for the three guided write tools
+   * only, and only together with ownerApproved.
+   */
+  guidedFlow?: boolean;
 }
 
 export interface McpManager {

@@ -30,6 +30,12 @@ const spawnMocks = vi.hoisted(() => {
 
 vi.mock('child_process', () => ({
   spawn: spawnMocks.spawn,
+  // routes.ts now reaches docx-body-editor (documents router), which
+  // promisifies execFile at module load — the mock must export it.
+  execFile: vi.fn((_cmd: unknown, _args: unknown, _opts: unknown, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+    if (typeof cb === 'function') cb(new Error('mocked command failure'), '', '');
+    return undefined as never;
+  }),
 }));
 
 // Static imports — vi.mock is hoisted above this so routes.ts picks up the
