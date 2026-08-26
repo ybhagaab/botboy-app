@@ -72,6 +72,11 @@ describe('computeAwaitingReplyThreads', () => {
     insertComment('g1', { docKey: 'k/hld', threadRoot: 'g1', author: 'Bhagat, AB', direction: 'sent', commentedAt: '2026-08-25T08:00:00Z' });
     insertComment('g2', { docKey: 'k/hld', threadRoot: 'g1', author: 'Ng, Hui Jun', direction: 'received', commentedAt: '2026-08-25T09:00:00Z' });
     storage.getDb().prepare("UPDATE work_items SET metadata = json_set(metadata,'$.deletedFromDoc','true') WHERE id='g2'").run();
+    // Thread H (owner report 2026-08-26): resolution is THREAD-scoped and
+    // Word stamps the done flag on the ROOT only — the latest reply never
+    // carries it. Root resolved ⇒ the whole thread is settled.
+    insertComment('h1', { docKey: 'k/hld', threadRoot: 'h1', author: 'Bhagat, AB', direction: 'sent', commentedAt: '2026-08-25T13:00:00Z', resolved: true });
+    insertComment('h2', { docKey: 'k/hld', threadRoot: 'h1', author: 'Zhuo, Wei', direction: 'received', commentedAt: '2026-08-25T16:51:00Z' });
 
     const threads = computeAwaitingReplyThreads(storage.getDb());
     expect(threads.map(t => t.id).sort()).toEqual(['comment-thread:a2', 'comment-thread:b1']);

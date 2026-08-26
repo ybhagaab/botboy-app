@@ -222,12 +222,16 @@ describe('native docx extraction (tables + headings)', () => {
   const CELL = (text: string) => `<w:tc><w:tcPr/>${P(text)}</w:tc>`;
   const ROW = (...cells: string[]) => `<w:tr>${cells.map(CELL).join('')}</w:tr>`;
 
-  function makeDocx(name: string, bodyXml: string): string {
+  function makeDocx(name: string, bodyXml: string, numberingXml?: string): string {
     const src = path.join(dir, `${name}-src`);
     mkdirSync(path.join(src, 'word'), { recursive: true });
     writeFileSync(path.join(src, '[Content_Types].xml'), '<Types/>');
     writeFileSync(path.join(src, 'word', 'document.xml'),
       `<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${bodyXml}<w:sectPr/></w:body></w:document>`);
+    if (numberingXml) {
+      writeFileSync(path.join(src, 'word', 'numbering.xml'),
+        `<?xml version="1.0"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${numberingXml}</w:numbering>`);
+    }
     const out = path.join(dir, `${name}.docx`);
     execFileSync('zip', ['-X', '-q', '-r', out, '.'], { cwd: src });
     return out;
@@ -255,6 +259,45 @@ describe('native docx extraction (tables + headings)', () => {
     expect(result.text!.indexOf('lists every gap')).toBeLessThan(result.text!.indexOf('| # |'));
     expect(result.text!.indexOf('After the table')).toBeGreaterThan(result.text!.indexOf('| 2 |'));
     expect(result.text).toContain('- first bullet');
+  });
+
+  it('REGRESSION (owner 2026-08-26): heading-styled body text (explicit bold-off) demotes to plain text; numbered lists keep their numbers via numbering.xml', async () => {
+    // The real HLD shape: authors wrote body text in Heading2 paragraphs and
+    // manually un-bolded them (Word leaves <w:b w:val="0"/> on the paragraph
+    // mark), and the "customer outcomes" list is numId 3 → decimal.
+    const NUMBERING = '<w:abstractNum w:abstractNumId="8">'
+      + '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/></w:lvl>'
+      + '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/></w:lvl>'
+      + '</w:abstractNum>'
+      + '<w:abstractNum w:abstractNumId="9"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>'
+      + '<w:num w:numId="3"><w:abstractNumId w:val="8"/></w:num>'
+      + '<w:num w:numId="4"><w:abstractNumId w:val="9"/></w:num>';
+    const HP = (text: string, opts: { boldOff?: boolean; numId?: string; ilvl?: number } = {}) =>
+      `<w:p><w:pPr><w:pStyle w:val="Heading2"/>`
+      + (opts.numId !== undefined ? `<w:numPr><w:ilvl w:val="${opts.ilvl ?? 0}"/><w:numId w:val="${opts.numId}"/></w:numPr>` : '')
+      + (opts.boldOff ? '<w:rPr><w:b w:val="0"/><w:bCs w:val="0"/></w:rPr>' : '')
+      + `</w:pPr><w:r>${opts.boldOff ? '<w:rPr><w:b w:val="0"/></w:rPr>' : ''}<w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+    const file = makeDocx('disguised', [
+      HP('6.2 Phase 2 customer outcomes and non-goals'),                       // real heading — stays a heading
+      HP('Phase 2 moves feed construction into PV Autobot.', { boldOff: true }), // disguised body — plain text
+      HP('Customers continue to receive personalized feeds.', { boldOff: true, numId: '3' }),
+      HP('Fatafat remains available.', { boldOff: true, numId: '3' }),
+      HP('Search behavior does not change.', { boldOff: true, numId: '3' }),
+      HP('sub item under three', { boldOff: true, numId: '3', ilvl: 1 }),      // nested level
+      HP('a plain bullet', { boldOff: true, numId: '4' }),                     // bullet numId
+    ].join(''), NUMBERING);
+    const parser = createDocumentParser();
+    const result = await parser.parseAsync!(file);
+    expect(result.success).toBe(true);
+    const text = result.text!;
+    expect(text).toContain('## 6.2 Phase 2 customer outcomes and non-goals'); // real heading intact
+    expect(text).toContain('\n\nPhase 2 moves feed construction into PV Autobot.'); // demoted, no ##
+    expect(text).not.toContain('## Phase 2 moves feed construction');
+    expect(text).toContain('1. Customers continue to receive personalized feeds.');
+    expect(text).toContain('2. Fatafat remains available.');
+    expect(text).toContain('3. Search behavior does not change.');
+    expect(text).toContain('  1. sub item under three'); // nested ordered level, indented within renderer margin
+    expect(text).toContain('- a plain bullet');
   });
 
   it('nested tables fall back to flattened text instead of a broken grid; single-column tables read as paragraphs', async () => {

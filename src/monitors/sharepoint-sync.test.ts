@@ -742,6 +742,35 @@ describe('SharePointSync engine', () => {
     expect(again[0].metadata.commentId).toBe('3');
   });
 
+  it('REGRESSION (owner 2026-08-26): a resolution toggle on an UNCHANGED comment id updates the stored row — dedup skips the emit, never the state', async () => {
+    setOwner('Bhagat, AB');
+    const doc = sharedDoc();
+    const live: Array<Record<string, unknown>> = [
+      { id: '1', author: 'Bhagat, AB', initials: 'BA', date: '2026-08-20T09:00:00Z', text: 'Please review the tenets wording in section II before Friday.' },
+      { id: '2', author: 'Zhuo, Wei', initials: 'ZW', date: '2026-08-20T10:00:00Z', text: 'Left one concern on tenet #2 — it reads like a description.', parentId: '1' },
+    ];
+    const { sync } = build(commentsHandler([doc], live));
+    enableSharedWithMe(sync);
+    await sync.runNow();
+    await sync.drainNow();
+    persistEmittedComments();
+    emitted.length = 0;
+
+    // The owner resolves the thread in Word Online: same ids, same URLs —
+    // the done flag lands on the ROOT only. Doc modified → comments lane
+    // re-enqueued → re-drain hits the durable-dedup branch.
+    live[0].done = true;
+    doc.LastModifiedTime = '2026-08-22T09:00:00Z';
+    await sync.runNow();
+    await sync.drainNow();
+
+    expect(emitted.filter(i => i.type === 'document_comment')).toHaveLength(0); // dedup held — no re-emission
+    const metaOf = (id: string) => JSON.parse((storage.getDb().prepare('SELECT metadata FROM work_items WHERE url = ?')
+      .get(`${doc.WebUrl}#comment=${id}`) as { metadata: string }).metadata) as Record<string, string>;
+    expect(metaOf('1').resolved).toBe('true');  // the resolution reached the stored row
+    expect(metaOf('2').resolved).toBe('false'); // live state stamped on the reply too
+  });
+
   // ── Renumbered comment ids (soak find 2026-08-25) ─────────────────────────
   // Word renumbers comment ids under co-authoring; the same comment must not
   // re-emit under its new id — the stored row is remapped in place instead.

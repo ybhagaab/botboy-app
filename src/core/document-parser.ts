@@ -210,14 +210,68 @@ export function createDocumentParser(): DocumentParser {
     return pieces.join('').replace(/\s+/g, ' ').trim();
   }
 
-  function docxParagraphToMarkdown(pXml: string): string {
+  /** numId:ilvl → list level (ordered? starting where?) from word/numbering.xml. */
+  interface DocxNumLevel { ordered: boolean; start: number }
+  function parseDocxNumbering(numberingXml: string): Map<string, DocxNumLevel> {
+    const map = new Map<string, DocxNumLevel>();
+    if (!numberingXml) return map;
+    const abstract = new Map<string, Map<string, DocxNumLevel>>();
+    for (const m of numberingXml.matchAll(/<w:abstractNum w:abstractNumId="(\d+)"[\s\S]*?<\/w:abstractNum>/g)) {
+      const levels = new Map<string, DocxNumLevel>();
+      for (const lvl of m[0].matchAll(/<w:lvl w:ilvl="(\d+)"[\s\S]*?<\/w:lvl>/g)) {
+        const fmt = /<w:numFmt w:val="([^"]+)"/.exec(lvl[0])?.[1] ?? 'bullet';
+        const start = Number(/<w:start w:val="(\d+)"/.exec(lvl[0])?.[1] ?? '1');
+        levels.set(lvl[1], { ordered: fmt !== 'bullet' && fmt !== 'none', start: Number.isFinite(start) && start > 0 ? start : 1 });
+      }
+      abstract.set(m[1], levels);
+    }
+    for (const m of numberingXml.matchAll(/<w:num w:numId="(\d+)"[^>]*>[\s\S]*?<w:abstractNumId w:val="(\d+)"/g)) {
+      const levels = abstract.get(m[2]);
+      if (!levels) continue;
+      for (const [ilvl, def] of levels) map.set(`${m[1]}:${ilvl}`, def);
+    }
+    return map;
+  }
+
+  function docxParagraphToMarkdown(pXml: string, numbering: Map<string, DocxNumLevel>, counters: Map<string, number>): string {
     const text = docxParagraphText(pXml);
     if (!text) return '';
-    const style = /<w:pStyle[^>]*w:val="([^"]*)"/.exec(pXml)?.[1] ?? '';
+    const pPr = /<w:pPr>[\s\S]*?<\/w:pPr>/.exec(pXml)?.[0] ?? '';
+    const style = /<w:pStyle[^>]*w:val="([^"]*)"/.exec(pPr)?.[1] ?? '';
     const headingLevel = /^Heading([1-6])$/i.exec(style)?.[1];
-    if (headingLevel) return `${'#'.repeat(Number(headingLevel))} ${text}`;
-    if (/^Title$/i.test(style)) return `# ${text}`;
-    if (pXml.includes('<w:numPr>')) return `- ${text}`;
+    // Word can disguise BODY TEXT as a heading: authors write in a
+    // Heading-styled paragraph and manually un-bold it, leaving an explicit
+    // bold-off override on the paragraph mark (<w:b w:val="0"/> in pPr's
+    // rPr). Word renders it as normal text; emitting a #-heading rendered
+    // whole sections bold and swallowed their list numbering (owner report
+    // 2026-08-26: the HLD carries 19 such paragraphs, 9 of them numbered).
+    // Trust the visual truth over the style name.
+    const disguisedBody = /<w:b w:val="(?:0|false|none)"/.test(pPr);
+    if (headingLevel && !disguisedBody) return `${'#'.repeat(Number(headingLevel))} ${text}`;
+    if (/^Title$/i.test(style) && !disguisedBody) return `# ${text}`;
+    const numPr = /<w:numPr>[\s\S]*?<\/w:numPr>/.exec(pPr)?.[0];
+    if (numPr) {
+      const numId = /<w:numId w:val="(\d+)"/.exec(numPr)?.[1] ?? '';
+      const ilvl = Number(/<w:ilvl w:val="(\d+)"/.exec(numPr)?.[1] ?? '0');
+      // Two-space indent for nested levels stays within the renderer's
+      // list-detection margin (^\s{0,3}); deeper nesting flattens to one level.
+      const indent = ilvl > 0 ? '  ' : '';
+      const level = numbering.get(`${numId}:${ilvl}`);
+      if (level?.ordered) {
+        const key = `${numId}:${ilvl}`;
+        const n = (counters.get(key) ?? level.start - 1) + 1;
+        counters.set(key, n);
+        // Word restarts deeper levels when a shallower one advances.
+        for (const existing of [...counters.keys()]) {
+          const [kNum, kLvl] = existing.split(':');
+          if (kNum === numId && Number(kLvl) > ilvl) counters.delete(existing);
+        }
+        return `${indent}${n}. ${text}`;
+      }
+      // Bullet formats — and unknown numIds (no numbering.xml): a dash keeps
+      // the list structure without inventing numbers.
+      return `${indent}- ${text}`;
+    }
     return text;
   }
 
@@ -264,32 +318,56 @@ export function createDocumentParser(): DocumentParser {
   }
 
   /** document.xml body → markdown (exported for tests via parser instance). */
-  function docxXmlToMarkdown(documentXml: string): string {
+  function docxXmlToMarkdown(documentXml: string, numberingXml = ''): string {
     const body = documentXml.match(/<w:body(?:\s[^>]*)?>([\s\S]*)<\/w:body>/)?.[1] ?? documentXml;
+    const numbering = parseDocxNumbering(numberingXml);
+    const counters = new Map<string, number>();
     const tables = docxTableRanges(body);
     const blocks: Array<{ at: number; text: string }> = [];
     for (const range of tables) {
       const text = docxTableToMarkdown(body.slice(range.start, range.end));
       if (text) blocks.push({ at: range.start, text });
     }
-    for (const p of body.matchAll(/<w:p(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g)) {
-      if (tables.some(range => p.index! >= range.start && p.index! < range.end)) continue;
-      const text = docxParagraphToMarkdown(p[0]);
+    // Paragraph order matters: ordered-list counters advance in document order.
+    const paragraphs = [...body.matchAll(/<w:p(?:\s[^>]*)?>([\s\S]*?)<\/w:p>/g)]
+      .filter(p => !tables.some(range => p.index! >= range.start && p.index! < range.end))
+      .sort((a, b) => a.index! - b.index!);
+    for (const p of paragraphs) {
+      const text = docxParagraphToMarkdown(p[0], numbering, counters);
       if (text) blocks.push({ at: p.index!, text });
     }
-    return blocks.sort((a, b) => a.at - b.at).map(block => block.text).join('\n\n');
+    // Consecutive list items join with a SINGLE newline: the UI renderer
+    // (and standard markdown) treats a blank line as a list break, so
+    // "1.\n\n2." would render as two lists that each restart at 1.
+    const sorted = blocks.sort((a, b) => a.at - b.at).map(block => block.text);
+    const isListLine = (t: string) => /^\s{0,3}(?:-|\d+[.)])\s/.test(t);
+    let out = '';
+    for (let i = 0; i < sorted.length; i++) {
+      if (i === 0) { out = sorted[i]; continue; }
+      const prevLast = sorted[i - 1].split('\n').pop() ?? '';
+      out += isListLine(prevLast) && isListLine(sorted[i]) ? '\n' : '\n\n';
+      out += sorted[i];
+    }
+    return out;
+  }
+
+  /** word/numbering.xml is optional — docs without lists don't carry it. */
+  function readNumberingXml(filePath: string): string {
+    try { return run('unzip', ['-p', filePath, 'word/numbering.xml'], 60000); } catch { return ''; }
   }
 
   function parseDocxNative(filePath: string): string {
     const xml = run('unzip', ['-p', filePath, 'word/document.xml'], 60000);
-    const text = docxXmlToMarkdown(xml);
+    const text = docxXmlToMarkdown(xml, readNumberingXml(filePath));
     if (!text.trim()) throw new Error('docx native extraction produced no text');
     return text;
   }
 
   async function parseDocxNativeAsync(filePath: string): Promise<string> {
     const xml = await runAsync('unzip', ['-p', filePath, 'word/document.xml'], 60000);
-    const text = docxXmlToMarkdown(xml);
+    let numberingXml = '';
+    try { numberingXml = await runAsync('unzip', ['-p', filePath, 'word/numbering.xml'], 60000); } catch { /* no lists */ }
+    const text = docxXmlToMarkdown(xml, numberingXml);
     if (!text.trim()) throw new Error('docx native extraction produced no text');
     return text;
   }

@@ -1366,6 +1366,22 @@ export function createSharePointSync(deps: {
     const remapDateStmt = db.prepare(`
       UPDATE work_items SET metadata = json_set(COALESCE(metadata, '{}'), '$.commentedAt', ?) WHERE id = ?
     `);
+    // Live state for URL-STABLE comments. Dedup rightly skips re-emitting a
+    // comment whose id never changed — but its MUTABLE state (resolution
+    // toggles, thread root) still moves in Word, and the plain `continue`
+    // was silently dropping it: the owner resolved a thread online, pressed
+    // Refresh, and the awaiting-reply row survived because the stored row
+    // kept resolved='' forever (owner report 2026-08-26). Every fetch now
+    // re-stamps the live state on the matched row.
+    const syncStateByUrlStmt = db.prepare(`
+      UPDATE work_items
+      SET metadata = json_set(COALESCE(metadata, '{}'), '$.resolved', ?, '$.threadRoot', ?)
+      WHERE url = ? AND source = 'sharepoint' AND type = 'document_comment'
+    `);
+    const remapDateByUrlStmt = db.prepare(`
+      UPDATE work_items SET metadata = json_set(COALESCE(metadata, '{}'), '$.commentedAt', ?)
+      WHERE url = ? AND source = 'sharepoint' AND type = 'document_comment'
+    `);
 
     for (const { comments, fragment } of groups) {
       const byId = new Map(comments.map(c => [c.id, c]));
@@ -1397,6 +1413,10 @@ export function createSharePointSync(deps: {
               consumeEntry(atUrl);
               if (atUrl.wasDeleted) clearDeletedStmt.run(atUrl.id);
             }
+            // Dedup skips the EMIT, never the state: resolution and date
+            // re-stamps land on unchanged ids too.
+            syncStateByUrlStmt.run(comment.resolved ? 'true' : 'false', threadRootOf(comment, byId), url);
+            if (comment.date) remapDateByUrlStmt.run(comment.date, url);
             continue; // durable dedup (spec R2.1)
           }
           // GHOST SQUAT (soak find 2026-08-25): the row at this URL is a

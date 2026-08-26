@@ -239,7 +239,11 @@ export function computeAwaitingReplyThreads(db: Database.Database, limit = 8): T
     list.sort((a, b) => effectiveTime(a).localeCompare(effectiveTime(b)));
     const latest = list[list.length - 1];
     if (latest.direction !== 'received') continue;
-    if (latest.resolved === 'true') continue;
+    // Resolution is THREAD-scoped in Word, and the done flag can land on the
+    // root comment only — the latest reply may never carry it. A thread with
+    // ANY resolved member is settled (owner report 2026-08-26: resolved a
+    // thread online, the row survived because only the root was stamped).
+    if (list.some(c => c.resolved === 'true')) continue;
     const ownerParticipated = list.some(c => c.direction === 'sent');
     if (!ownerParticipated && latest.mentionedMe !== 'true') continue;
     const snippetRow = snippetStmt.get(latest.id) as { text: string } | undefined;
