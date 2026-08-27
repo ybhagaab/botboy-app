@@ -325,3 +325,109 @@ describe('buildDocxFromMarkdown', () => {
     expect(xml).toContain('Ampersand &amp; angle &lt;brackets&gt; stay literal.');
   });
 });
+
+describe('replaceParagraphRangeInDocumentXml (doc editor E1)', () => {
+  const texts = (xml: string) => [...xml.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g)].map(m => m[1]);
+
+  it('replaces a contiguous multi-paragraph run in the middle of the document', async () => {
+    const { replaceParagraphRangeInDocumentXml, markdownToDocxParagraphs } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('Intro stays.')), p(r('Old alpha.')), p(r('Old beta.')), p(r('Outro stays.')));
+    const result = replaceParagraphRangeInDocumentXml(xml, ['Old alpha.', 'Old beta.'], markdownToDocxParagraphs('New unified paragraph.'));
+    expect(result.status).toBe('replaced');
+    const joined = texts(result.xml!).join('|');
+    expect(joined).toContain('Intro stays.');
+    expect(joined).toContain('New unified paragraph.');
+    expect(joined).toContain('Outro stays.');
+    expect(joined).not.toContain('Old alpha.');
+    expect(joined).not.toContain('Old beta.');
+  });
+
+  it('replaces at document start and end (before sectPr)', async () => {
+    const { replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('First para.')), p(r('Middle.')), p(r('Last para.')));
+    const atStart = replaceParagraphRangeInDocumentXml(xml, ['First para.'], ['<w:p><w:r><w:t>New first.</w:t></w:r></w:p>']);
+    expect(atStart.status).toBe('replaced');
+    expect(texts(atStart.xml!)[0]).toBe('New first.');
+    const atEnd = replaceParagraphRangeInDocumentXml(xml, ['Last para.'], ['<w:p><w:r><w:t>New last.</w:t></w:r></w:p>']);
+    expect(atEnd.status).toBe('replaced');
+    expect(atEnd.xml!.indexOf('New last.')).toBeLessThan(atEnd.xml!.indexOf('<w:sectPr'));
+  });
+
+  it('deletes the run when the replacement is empty', async () => {
+    const { replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('Keep one.')), p(r('Drop me.')), p(r('Keep two.')));
+    const result = replaceParagraphRangeInDocumentXml(xml, ['Drop me.'], []);
+    expect(result.status).toBe('replaced');
+    const joined = texts(result.xml!).join('|');
+    expect(joined).toBe('Keep one.|Keep two.');
+  });
+
+  it('inserts via a range-of-one that re-includes the anchor', async () => {
+    const { replaceParagraphRangeInDocumentXml, markdownToDocxParagraphs } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('Anchor paragraph.')), p(r('Tail.')));
+    const result = replaceParagraphRangeInDocumentXml(xml, ['Anchor paragraph.'], markdownToDocxParagraphs('Anchor paragraph.\n\nInserted after.'));
+    expect(result.status).toBe('replaced');
+    const joined = texts(result.xml!).join('|');
+    expect(joined).toContain('Anchor paragraph.');
+    expect(joined).toContain('Inserted after.');
+    expect(joined.indexOf('Inserted after.')).toBeLessThan(joined.indexOf('Tail.'));
+  });
+
+  it('matches across run splits and skips empty spacer paragraphs, consuming spacers inside the span', async () => {
+    const { replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const xml = doc(
+      p(r('Head.')),
+      p(r('Split '), r('alpha.')),
+      '<w:p><w:pPr></w:pPr></w:p>', // empty spacer INSIDE the span
+      p(r('Split beta.')),
+      p(r('Tail.')),
+    );
+    const result = replaceParagraphRangeInDocumentXml(xml, ['Split alpha.', 'Split beta.'], ['<w:p><w:r><w:t>Merged.</w:t></w:r></w:p>']);
+    expect(result.status).toBe('replaced');
+    const joined = texts(result.xml!).join('|');
+    expect(joined).toBe('Head.|Merged.|Tail.');
+  });
+
+  it('reports not_found and ambiguous without xml', async () => {
+    const { replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const dupXml = doc(p(r('Repeated row.')), p(r('Spacer.')), p(r('Repeated row.')));
+    expect(replaceParagraphRangeInDocumentXml(dupXml, ['No such paragraph.'], []).status).toBe('not_found');
+    const dup = replaceParagraphRangeInDocumentXml(dupXml, ['Repeated row.'], []);
+    expect(dup.status).toBe('ambiguous');
+    expect(dup.occurrences).toBe(2);
+    expect(dup.xml).toBeUndefined();
+  });
+
+  it('refuses runs that live inside a table (in_table) and non-contiguous anchors bridging a table', async () => {
+    const { replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const table = `<w:tbl><w:tblPr/><w:tr><w:tc>${p(r('Cell only text.'))}</w:tc></w:tr></w:tbl>`;
+    const xml = doc(p(r('Before table.')), table, p(r('After table.')));
+    const inTable = replaceParagraphRangeInDocumentXml(xml, ['Cell only text.'], []);
+    expect(inTable.status).toBe('in_table');
+    // Anchors that are only "contiguous" if you ignore the table between them
+    // must NOT splice (the table would be destroyed) — not_found instead.
+    const bridge = replaceParagraphRangeInDocumentXml(xml, ['Before table.', 'After table.'], []);
+    expect(bridge.status).toBe('not_found');
+    expect(xml).toContain('Cell only text.'); // untouched
+  });
+
+  it('composes with replaceText inside applyDocxBodyEdits semantics (later range sees earlier text edit)', async () => {
+    const { replaceTextInDocumentXml, replaceParagraphRangeInDocumentXml } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('The rollout starts in EU.')), p(r('Second section line.')));
+    const first = replaceTextInDocumentXml(xml, 'starts in EU', 'starts in NA');
+    expect(first.status).toBe('replaced');
+    const second = replaceParagraphRangeInDocumentXml(first.xml!, ['The rollout starts in NA.'], ['<w:p><w:r><w:t>Rewritten rollout.</w:t></w:r></w:p>']);
+    expect(second.status).toBe('replaced');
+    expect(texts(second.xml!).join('|')).toBe('Rewritten rollout.|Second section line.');
+  });
+
+  it('produces styled replacement paragraphs from markdown (heading + bold)', async () => {
+    const { replaceParagraphRangeInDocumentXml, markdownToDocxParagraphs } = await import('./docx-body-editor.js');
+    const xml = doc(p(r('Plain target.')));
+    const result = replaceParagraphRangeInDocumentXml(xml, ['Plain target.'], markdownToDocxParagraphs('## New Heading\n\nBody with **bold** text.'));
+    expect(result.status).toBe('replaced');
+    expect(result.xml).toContain('<w:sz w:val="32"/>'); // H2 sizing from markdownToDocxParagraphs
+    expect(result.xml).toContain('<w:b/>');
+    expect(texts(result.xml!).join(' ')).toContain('New Heading');
+  });
+});

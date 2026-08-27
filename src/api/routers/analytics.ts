@@ -140,5 +140,23 @@ export function createAnalyticsRouter(deps: RouterDeps): Router {
     }
   });
 
+  // Stop an active refresh. Queued runs cancel immediately ('cancelled');
+  // running runs are flagged and stop after the in-flight widget query
+  // ('stopping') — a warehouse query cannot be aborted mid-call.
+  router.post('/analytics/dashboards/:id/refresh/cancel', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    try {
+      const id = paramStr(req.params.id);
+      if (!deps.analyticsService.getDashboard(id)) return res.status(404).json({ error: `Dashboard ${id} not found` });
+      const outcome = deps.analyticsService.cancelActiveRun(id);
+      res.json({
+        ...outcome,
+        dashboard: deps.analyticsService.getDashboard(id),
+      });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message ?? String(error) });
+    }
+  });
+
   return router;
 }

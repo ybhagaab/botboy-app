@@ -428,6 +428,7 @@ export function createAnalyticsDashboardService(options: {
       widgetsCompleted: Number(row.widgets_completed || 0),
       widgetsSucceeded: Number(row.widgets_succeeded || 0),
       currentWidgetId: row.current_widget_id || undefined,
+      cancelRequested: Boolean(row.cancel_requested),
       queuedAt: row.queued_at,
       startedAt: row.started_at || undefined,
       heartbeatAt: row.heartbeat_at || undefined,
@@ -835,6 +836,122 @@ export function createAnalyticsDashboardService(options: {
     })();
   }
 
+  /**
+   * Stop the dashboard's active refresh (owner-initiated, 2026-08-27).
+   * Queued runs cancel immediately in one transaction. Running runs are only
+   * FLAGGED — the owning worker finalizes at its next between-widgets stop
+   * point, because the in-flight MCP SQL call cannot be aborted and status
+   * transitions belong to the run's owner (lease invariant).
+   */
+  function cancelActiveRun(dashboardId: string): { result: 'cancelled' | 'stopping' | 'none'; run: AnalyticsRun | null } {
+    const outcome = db.transaction((): { result: 'cancelled' | 'stopping' | 'none'; runId: string | null } => {
+      const active = db.prepare(`
+        SELECT id, status FROM analytics_runs
+        WHERE dashboard_id = ? AND status IN ('queued','running')
+        ORDER BY queued_at LIMIT 1
+      `).get(dashboardId) as { id: string; status: string } | undefined;
+      if (!active) return { result: 'none', runId: null };
+      const completedAt = new Date().toISOString();
+      if (active.status === 'queued') {
+        const cancelled = db.prepare(`
+          UPDATE analytics_runs SET status = 'cancelled', current_widget_id = NULL,
+            heartbeat_at = ?, lease_expires_at = NULL, worker_id = NULL,
+            worker_pid = NULL, error = NULL, completed_at = ?
+          WHERE id = ? AND status = 'queued'
+        `).run(completedAt, completedAt, active.id);
+        if (cancelled.changes !== 1) {
+          // A worker claimed it between our read and update — fall through
+          // to the cooperative path.
+          db.prepare(`
+            UPDATE analytics_runs SET cancel_requested = 1
+            WHERE id = ? AND status = 'running'
+          `).run(active.id);
+          return { result: 'stopping', runId: active.id };
+        }
+        db.prepare(`
+          UPDATE analytics_run_widgets SET status = 'cancelled', completed_at = ?
+          WHERE run_id = ? AND status IN ('queued','running')
+        `).run(completedAt, active.id);
+        const hasWidgetErrors = db.prepare(`
+          SELECT 1 FROM analytics_widgets WHERE dashboard_id = ? AND last_error IS NOT NULL LIMIT 1
+        `).get(dashboardId);
+        db.prepare(`
+          UPDATE analytics_dashboards SET status = ?, updated_at = datetime('now')
+          WHERE id = ? AND status = 'refreshing'
+        `).run(hasWidgetErrors ? 'degraded' : 'ready', dashboardId);
+        return { result: 'cancelled', runId: active.id };
+      }
+      db.prepare(`
+        UPDATE analytics_runs SET cancel_requested = 1
+        WHERE id = ? AND status = 'running'
+      `).run(active.id);
+      return { result: 'stopping', runId: active.id };
+    })();
+    return { result: outcome.result, run: outcome.runId ? getRun(outcome.runId) : null };
+  }
+
+  /**
+   * Worker-side terminalization of a cancel request, at a between-widgets
+   * stop point. Completed widget results stay persisted; untouched widgets
+   * are marked cancelled, not failed — and schedules never count a cancel
+   * as a failure.
+   */
+  function finalizeCancelledRun(runId: string): void {
+    const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
+    if (!run || run.status !== 'running' || run.worker_id !== workerId || run.worker_pid !== process.pid) return;
+    const completedAt = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE analytics_run_widgets SET status = 'cancelled', completed_at = ?
+        WHERE run_id = ? AND status IN ('queued','running')
+      `).run(completedAt, runId);
+      const progress = db.prepare(`
+        SELECT COUNT(*) AS widget_count,
+          SUM(CASE WHEN status IN ('completed','failed') THEN 1 ELSE 0 END) AS widgets_completed,
+          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS widgets_succeeded,
+          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS widgets_failed
+        FROM analytics_run_widgets WHERE run_id = ?
+      `).get(runId) as any;
+      const failures = db.prepare(`
+        SELECT title, error FROM analytics_run_widgets
+        WHERE run_id = ? AND status = 'failed' ORDER BY position
+      `).all(runId) as Array<{ title: string; error: string | null }>;
+      const errorSummary = failures.length
+        ? failures.map(item => `${item.title}: ${item.error || 'Unknown widget failure'}`).join('\n').slice(0, 4000)
+        : null;
+      const finalized = db.prepare(`
+        UPDATE analytics_runs SET status = 'cancelled', widget_count = ?,
+          widgets_completed = ?, widgets_succeeded = ?, current_widget_id = NULL,
+          heartbeat_at = ?, lease_expires_at = NULL, worker_id = NULL,
+          worker_pid = NULL, error = ?, completed_at = ?
+        WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+      `).run(
+        Number(progress.widget_count || 0),
+        Number(progress.widgets_completed || 0),
+        Number(progress.widgets_succeeded || 0),
+        completedAt,
+        errorSummary,
+        completedAt,
+        runId,
+        workerId,
+        process.pid,
+      );
+      if (finalized.changes !== 1) throw new Error(`Run ${runId} ownership changed while cancelling`);
+      // last_refreshed_at stays untouched: the dashboard as a whole was not
+      // refreshed — each completed widget carries its own timestamp.
+      db.prepare(`
+        UPDATE analytics_dashboards SET status = ?, last_error = ?,
+          updated_at = datetime('now') WHERE id = ?
+      `).run(failures.length ? 'degraded' : 'ready', errorSummary, run.dashboard_id);
+      if (run.schedule_id) {
+        db.prepare(`
+          UPDATE analytics_schedules SET last_run_at = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(completedAt, run.schedule_id);
+      }
+    })();
+  }
+
   function failClaimedRun(runId: string, failure: unknown): void {
     const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
     if (!run || run.status !== 'running' || run.worker_id !== workerId || run.worker_pid !== process.pid) return;
@@ -893,6 +1010,19 @@ export function createAnalyticsDashboardService(options: {
 
   async function processClaimedRun(runId: string): Promise<void> {
     while (true) {
+      // Cooperative stop point: the owner's cancel flag is honored BETWEEN
+      // widgets — the widget query already in flight ran to completion and
+      // its result persisted. Only this worker transitions the run's status
+      // (ownership guard), so cancel never steals a live run.
+      const ownedRun = db.prepare(`
+        SELECT cancel_requested FROM analytics_runs
+        WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+      `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
+      if (!ownedRun) return;
+      if (ownedRun.cancel_requested) {
+        finalizeCancelledRun(runId);
+        return;
+      }
       const widget = db.prepare(`
         SELECT rw.*, r.dashboard_id
         FROM analytics_run_widgets rw
@@ -1030,6 +1160,7 @@ export function createAnalyticsDashboardService(options: {
     enqueueRefresh,
     getRun,
     recoverInterruptedRuns,
+    cancelActiveRun,
     processQueuedRuns,
   };
 }

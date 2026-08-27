@@ -258,29 +258,10 @@ const ROLE_TOOLS: Record<AgentRole, string[]> = {
   product_manager: [], // server-side context/generation only — no model-call tools
 };
 
-const ANALYTICS_DASHBOARD_TOOLS = [
-  'list_projects',
-  'list_analytics_dashboards',
-  'get_analytics_dashboard',
-  'create_analytics_dashboard',
-  'update_analytics_dashboard',
-  'configure_analytics_schedule',
-  'refresh_analytics_dashboard',
-  'get_dashboard_sharing_status',
-  'mcp_status',
-  'mcp_sql_list_presets',
-  'mcp_sql_get_schema_context',
-  'mcp_sql_list_schemas',
-  'mcp_sql_list_tables',
-  'mcp_sql_describe_table',
-  'mcp_sql_sample_data',
-  'mcp_sql_query',
-];
-
 function analyticsDashboardPrompt(context: PromptContext): string {
   const intent = context.analyticsIntent === 'create'
     ? 'The owner explicitly asked to design/create a canonical dashboard. Create it once its queries and visual encodings are grounded.'
-    : 'The owner is having an analytics-related conversation. Answer analytically with the focused read-only tools, but do not create or update a dashboard unless the owner explicitly asks.';
+    : 'The owner is having an analytics-related conversation. Your full toolset stays available — capture tasks, read documents, or search evidence when the owner asks — but ground the analysis itself in the governed read-only SQL tools, and do not create or update a dashboard unless the owner explicitly asks.';
   const briefing = context.analyticsSchemaBriefing?.trim() || 'Schema preflight did not return a briefing.';
   return `## ACTIVE WORKFLOW: SCHEMA-FIRST ANALYTICS AND DASHBOARDS
 You are BotBoy's general analytics specialist. Business domains are supplied dynamically by the owner's configured context provider; never assume a built-in business, schema, metric, or table.
@@ -732,9 +713,12 @@ export function createPromptManager(): PromptManager {
     },
 
     getToolDefinitions(role: AgentRole, context?: PromptContext): ToolDefinition[] {
-      const analyticsOnly = role === 'chat'
-        && context?.conversationMode === 'analytics_dashboard';
-      const names = analyticsOnly ? ANALYTICS_DASHBOARD_TOOLS : ROLE_TOOLS[role] || [];
+      // Analytics mode gets the SAME toolset as general chat (owner decision
+      // 2026-08-27: "same tools everywhere" — a restricted analytics-only
+      // list made BotBoy honestly refuse "add this as a task" mid-analysis).
+      // Analytical discipline lives in the analytics system prompt, not in
+      // tool removal; write tools keep their own ownerRequested/policy gates.
+      const names = ROLE_TOOLS[role] || [];
       return names
         .map(name => name === 'write_file' ? createWriteFileToolDefinition() : TOOL_DEFS[name])
         .filter(Boolean);

@@ -88,7 +88,7 @@ export interface AnalyticsPublication {
   publishedAt?: string;
 }
 
-export type AnalyticsRunStatus = 'queued' | 'running' | 'completed' | 'failed';
+export type AnalyticsRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface AnalyticsRun {
   id: string;
@@ -99,6 +99,8 @@ export interface AnalyticsRun {
   widgetsCompleted: number;
   widgetsSucceeded: number;
   currentWidgetId?: string;
+  /** Owner asked to stop; the worker honors it between widgets. */
+  cancelRequested: boolean;
   queuedAt: string;
   startedAt?: string;
   heartbeatAt?: string;
@@ -183,6 +185,12 @@ export interface AnalyticsDashboardService {
   setSchedule(id: string, input: UpdateAnalyticsScheduleInput): AnalyticsSchedule;
   enqueueRefresh(id: string, trigger?: AnalyticsRefreshTrigger): AnalyticsRun;
   getRun(id: string): AnalyticsRun | null;
+  /**
+   * Stop the dashboard's active refresh. A queued run cancels immediately;
+   * a running run is flagged and the worker stops after the widget query
+   * already in flight (an MCP SQL call cannot be aborted mid-call).
+   */
+  cancelActiveRun(dashboardId: string): { result: 'cancelled' | 'stopping' | 'none'; run: AnalyticsRun | null };
   recoverInterruptedRuns(): number;
   processQueuedRuns(limit?: number): Promise<number>;
 }

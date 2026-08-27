@@ -99,6 +99,50 @@ export function detectAnalyticsCreateIntent(message: string): boolean {
   return DASHBOARD_ARTIFACT_RE.test(message) && DASHBOARD_CREATE_RE.test(message);
 }
 
+/**
+ * On-page references that only make sense as "the thing I am looking at":
+ * artifact nouns with a determiner ("this chart", "the query") or refresh /
+ * re-run wording. Deliberately excludes generic nouns (results, data, items)
+ * so unrelated questions asked while a dashboard happens to be open stay in
+ * general mode (owner report 2026-08-27).
+ */
+const PAGE_DEIXIS_RE = /\b(?:this|these|that|those|the)\s+(?:dashboards?|reports?|charts?|graphs?|widgets?|tables?|numbers?|figures?|metrics?|views?|pages?|queries|query|runs?)\b|\brefresh(?:ing|es)?\b|\bre-?run(?:ning)?\b/i;
+
+/**
+ * Detection when an analytics view is OPEN (ambient page hint). The open page
+ * is a bias, not a command: the message itself must still corroborate —
+ * either the strict detector, a dashboard-artifact word, or a deictic
+ * reference to what's on screen. The implementation-vs-business guard still
+ * applies ("this chart component throws" is a software question).
+ */
+export function detectAnalyticsConversationWithPageHint(message: string): boolean {
+  const text = message.trim();
+  if (!text) return false;
+  if (SOFTWARE_IMPLEMENTATION_RE.test(text) && !BUSINESS_ANALYTICS_RE.test(text)) return false;
+  return detectAnalyticsConversation(text) || DASHBOARD_ARTIFACT_RE.test(text) || PAGE_DEIXIS_RE.test(text);
+}
+
+export interface ConversationModeResolution {
+  mode: 'general' | 'analytics_dashboard';
+  via: 'explicit' | 'page-hint' | 'detected' | 'default';
+}
+
+/**
+ * Single place the chat router decides the conversation mode.
+ * Precedence: explicit mode (CTA buttons / API callers) is a command;
+ * a page hint (analytics route merely open) is advisory and needs the
+ * message to corroborate; otherwise strict message-only detection.
+ */
+export function resolveConversationMode(input: { requestedMode?: unknown; modeHint?: unknown; message: string }): ConversationModeResolution {
+  if (input.requestedMode === 'general') return { mode: 'general', via: 'explicit' };
+  if (input.requestedMode === 'analytics_dashboard') return { mode: 'analytics_dashboard', via: 'explicit' };
+  if (input.modeHint === 'analytics_dashboard' && detectAnalyticsConversationWithPageHint(input.message)) {
+    return { mode: 'analytics_dashboard', via: 'page-hint' };
+  }
+  if (detectAnalyticsConversation(input.message)) return { mode: 'analytics_dashboard', via: 'detected' };
+  return { mode: 'general', via: 'default' };
+}
+
 function unavailable(
   text: string,
   selectionStatus: AnalyticsSchemaBriefing['selectionStatus'] = 'unavailable',

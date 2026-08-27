@@ -45,6 +45,7 @@ const state = {
     error: '',
     loading: false,
     refreshing: new Set(),
+    cancelling: new Set(),
     scheduling: new Set(),
     linkingProjects: new Set(),
     deleting: new Set(),
@@ -968,15 +969,21 @@ function renderProjectDocuments(projectId) {
 async function loadDocReader(docKey, { force = false } = {}) {
   if (state.docReader.loading) return;
   if (!force && state.docReader.key === docKey && state.docReader.data) return;
-  // Comment filter survives same-doc reloads (sync/refresh) but resets on a
-  // different document.
+  // Comment filter and assist state survive same-doc reloads (sync/refresh)
+  // but reset on a different document. editMode is deliberately DROPPED — a
+  // same-doc force reload means content may have changed under the draft;
+  // the edit-save baseSha guard makes a stale save fail loud anyway
+  // (DOC_EDITOR_UX_PLAN.md second-pass carry policy). The assist proposal's
+  // approve payload is content-anchored (editShape from assist time), so
+  // carrying it across a reload stays safe — apply-time matching is final.
   const commentFilter = state.docReader.key === docKey ? state.docReader.commentFilter : undefined;
-  state.docReader = { key: docKey, data: force ? state.docReader.data : null, error: '', loading: true, refreshing: state.docReader.refreshing, commentFilter };
+  const assist = state.docReader.key === docKey ? state.docReader.assist : undefined;
+  state.docReader = { key: docKey, data: force ? state.docReader.data : null, error: '', loading: true, refreshing: state.docReader.refreshing, commentFilter, assist };
   try {
     const payload = await request(`/documents/view?docKey=${encodeURIComponent(docKey)}`);
-    state.docReader = { key: docKey, data: payload, error: '', loading: false, refreshing: false, commentFilter };
+    state.docReader = { key: docKey, data: payload, error: '', loading: false, refreshing: false, commentFilter, assist };
   } catch (error) {
-    state.docReader = { key: docKey, data: state.docReader.data, error: String(error?.message || error), loading: false, refreshing: false, commentFilter };
+    state.docReader = { key: docKey, data: state.docReader.data, error: String(error?.message || error), loading: false, refreshing: false, commentFilter, assist };
   }
   if (state.route.view === 'doc-reader') renderRoute({ preserveScroll: true });
 }
@@ -1084,17 +1091,177 @@ function jumpToDocPassage(anchorText) {
   return true;
 }
 
+// Markdown → blank-line blocks, ``` fences respected. DUPLICATE of core
+// markdown-anchor.ts › markdownBlocksOf (dashboard.js cannot import core TS;
+// the workbench map pairs the implementations). Used for per-block render
+// stamping (E3 selection mapping) and range preview splicing.
+function mdBlocksUi(markdown) {
+  const lines = String(markdown ?? '').replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let current = [];
+  let inFence = false;
+  const flush = () => {
+    while (current.length && current[current.length - 1].trim() === '') current.pop();
+    if (current.length) blocks.push(current.join('\n'));
+    current = [];
+  };
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) inFence = !inFence;
+    if (!inFence && line.trim() === '') { flush(); continue; }
+    current.push(line);
+  }
+  flush();
+  return blocks;
+}
+
+// Markdown line → docx paragraph text (strip heading/list/inline markers,
+// squash whitespace). DUPLICATE of core markdown-anchor.ts ›
+// markdownLineToDocxText — dashboard.js cannot import core TS; the workbench
+// map pairs the two implementations as an invariant.
+function mdLineToDocxTextUi(line) {
+  let text = String(line ?? '');
+  text = text.replace(/^\s{0,3}#{1,6}\s+/, '');
+  text = text.replace(/^\s{0,3}(?:[-*•]|\d+[.)])\s+/, '');
+  text = text.replace(/\*\*([^*]+)\*\*/g, '$1');
+  text = text.replace(/__([^_]+)__/g, '$1');
+  text = text.replace(/\*([^*]+)\*/g, '$1');
+  text = text.replace(/(^|[^\w\\])_([^_]+)_(?=\W|$)/g, '$1$2');
+  text = text.replace(/`([^`]+)`/g, '$1');
+  text = text.replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1');
+  text = text.replace(/\\([\\`*_{}[\]()#+\-.!>~|])/g, '$1');
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+// Staged-preview content for the reader (E2/E3): the synced extraction with
+// pending+approved edits applied. ONE implementation shared by render and
+// the selection handler so block indexes always agree.
+function docPreviewContent(data) {
+  let previewContent = (data && data.content) || '';
+  let previewApplied = 0;
+  for (const edit of (Array.isArray(data?.pendingEdits) ? data.pendingEdits : [])) {
+    if (edit.status !== 'pending' && edit.status !== 'approved') continue;
+    if (edit.operation === 'replaceText' && edit.findText && previewContent.includes(edit.findText)) {
+      previewContent = previewContent.replace(edit.findText, edit.replaceWith || '');
+      previewApplied++;
+    } else if (edit.operation === 'appendParagraphs' && Array.isArray(edit.paragraphs) && edit.paragraphs.length) {
+      previewContent = `${previewContent}\n\n${edit.paragraphs.join('\n\n')}`;
+      previewApplied++;
+    } else if (edit.operation === 'replaceParagraphRange' && Array.isArray(edit.paragraphs) && edit.paragraphs.length) {
+      const spliced = spliceParagraphRangePreview(previewContent, edit.paragraphs, edit.replaceWith || '');
+      if (spliced !== null) { previewContent = spliced; previewApplied++; }
+    }
+  }
+  return { previewContent, previewApplied };
+}
+
+// Preview-reflect for replaceParagraphRange: anchors are docx-text form, so
+// match against marker-STRIPPED lines; splice the replacement markdown over
+// the matched line span. Null = not previewable here (anchor drifted or
+// ambiguous) — the old/new blocks in the lane stay authoritative.
+function spliceParagraphRangePreview(markdown, anchorParagraphs, replacementMarkdown) {
+  const anchors = anchorParagraphs.map(a => String(a).replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (!anchors.length) return null;
+  const lines = String(markdown).split('\n');
+  const candidates = [];
+  for (let i = 0; i < lines.length; i++) {
+    const stripped = mdLineToDocxTextUi(lines[i]);
+    if (stripped) candidates.push({ lineIdx: i, stripped });
+  }
+  const hits = [];
+  for (let i = 0; i + anchors.length <= candidates.length; i++) {
+    if (anchors.every((anchor, k) => candidates[i + k].stripped === anchor)) {
+      hits.push({ from: candidates[i].lineIdx, to: candidates[i + anchors.length - 1].lineIdx });
+    }
+  }
+  if (hits.length !== 1) return null;
+  const { from, to } = hits[0];
+  const replacementLines = replacementMarkdown.trim() ? replacementMarkdown.split('\n') : [];
+  const before = lines.slice(0, from);
+  let after = lines.slice(to + 1);
+  if (replacementLines.length === 0 && after.length && after[0].trim() === '') after = after.slice(1);
+  return [...before, ...replacementLines, ...after].join('\n');
+}
+
+// Inline proposal card (E3): rendered INSIDE the content flow, after the
+// selection's last block. Approve stages pre-approved; Reject is ephemeral.
+function assistProposalCardHtml(assist) {
+  const rendered = typeof window.formatMarkdownContent === 'function' && assist.replacementMarkdown
+    ? `<div class="fpv-md">${window.formatMarkdownContent(assist.replacementMarkdown)}</div>`
+    : (assist.replacementMarkdown ? `<pre class="fpv-pre">${esc(assist.replacementMarkdown)}</pre>` : '');
+  const body = assist.replacementMarkdown
+    ? `<div class="doc-assist-card-body${assist.expanded ? ' expanded' : ''}">${rendered}</div>`
+    : `<div class="doc-assist-card-body"><p style="color:var(--muted); margin:4px 0;">BotBoy proposes REMOVING the selected passage.</p></div>`;
+  return `<div class="doc-assist-card">
+    <div class="doc-assist-card-head">${icon('sparkles', 13)} <strong>BotBoy — proposed replacement</strong><span class="doc-annotation-meta">${esc(String(assist.instruction || '').slice(0, 80))}</span></div>
+    ${body}
+    <div class="doc-assist-card-actions">
+      <button class="button small primary" type="button" data-action="assist-approve">Approve — stage for sync</button>
+      <button class="button small" type="button" data-action="assist-reject">Reject</button>
+      ${assist.replacementMarkdown && String(assist.replacementMarkdown).split('\n').length > 14 ? `<button class="button small" type="button" data-action="assist-expand">${assist.expanded ? 'Collapse' : 'Expand'}</button>` : ''}
+      <span style="font-size:11px; color:var(--muted)">Approving replaces the highlighted passage in the staged copy.</span>
+    </div>
+  </div>`;
+}
+
+// Floating pill + anchored dialog (E3), fixed-positioned from the selection
+// rect captured at mouseup. State-driven — survives background repaints.
+function assistOverlayHtml(assist) {
+  if (!assist || !assist.rect) return '';
+  const rect = assist.rect;
+  const top = Math.max(8, rect.bottom + 6);
+  const left = Math.max(8, Math.min(rect.left, (window.innerWidth || 1200) - 380));
+  if (assist.phase === 'pill') {
+    return `<button class="doc-assist-pill" type="button" data-action="assist-pill" style="top:${top}px; left:${left}px;">${icon('sparkles', 12)} Ask BotBoy to edit</button>`;
+  }
+  if (assist.phase === 'dialog' || assist.phase === 'running' || assist.phase === 'error') {
+    const running = assist.phase === 'running';
+    return `<div class="doc-assist-dialog" style="top:${top}px; left:${left}px;">
+      <div class="doc-assist-dialog-head">${icon('sparkles', 13)} <strong>Ask BotBoy to edit</strong><span class="doc-annotation-meta">${assist.blockEnd > assist.blockStart ? `${assist.blockEnd - assist.blockStart + 1} blocks selected` : 'selection'}</span></div>
+      <blockquote class="doc-assist-quote">${esc(String(assist.selectedText || '').slice(0, 160))}${String(assist.selectedText || '').length > 160 ? '…' : ''}</blockquote>
+      <textarea id="doc-assist-instruction" class="input" rows="3" placeholder="What should BotBoy do with this text? (e.g. make it crisper, expand with rollout details, turn into bullets)" ${running ? 'disabled' : ''}>${esc(assist.instruction || '')}</textarea>
+      ${assist.phase === 'error' ? `<div class="mcp-alert warn" style="margin:6px 0;">${icon('alert', 13)}<span>${esc(assist.error || 'something went wrong')}</span></div>` : ''}
+      <div class="doc-assist-dialog-actions">
+        ${running
+          ? `<span class="doc-assist-running">${icon('refresh', 13)} BotBoy is reading the project and drafting… this can take a minute or two.</span>`
+          : `<button class="button small primary" type="button" data-action="assist-send">Send to BotBoy</button>`}
+        <button class="button small" type="button" data-action="assist-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+  return '';
+}
+
 function pendingEditBlock(edit) {
   const statusTone = { pending: '', approved: 'blue', synced: 'good', conflicted: 'warn', rejected: '' }[edit.status] || '';
-  const oldBlock = edit.operation === 'replaceText'
-    ? `<div style="border-left:3px solid var(--red,#e5484d); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">current text</small><div>${esc(edit.findText || '')}</div></div>`
+  const blockShell = (tone, label, inner) =>
+    `<div style="border-left:3px solid ${tone}; padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">${label}</small>${inner}</div>`;
+  const red = 'var(--red,#e5484d)';
+  const green = 'var(--green,#46a758)';
+  const isRange = edit.operation === 'replaceParagraphRange';
+  const rangeAnchors = isRange ? (edit.paragraphs || []) : [];
+  const rangeOld = isRange
+    ? blockShell(red, `current paragraph${rangeAnchors.length === 1 ? '' : 's'} (${rangeAnchors.length})`,
+        rangeAnchors.slice(0, 2).map(a => `<div>${esc(a)}</div>`).join('')
+        + (rangeAnchors.length > 2 ? `<div style="color:var(--muted); font-size:11px;">… ${rangeAnchors.length - 2} more paragraph${rangeAnchors.length - 2 === 1 ? '' : 's'}</div>` : ''))
     : '';
-  const newBlock = edit.operation === 'replaceText'
-    ? `<div style="border-left:3px solid var(--green,#46a758); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">replacement</small><div>${esc(edit.replaceWith || '')}</div></div>`
-    : `<div style="border-left:3px solid var(--green,#46a758); padding:6px 10px; margin:6px 0; background:var(--surface-2); border-radius:0 8px 8px 0;"><small style="color:var(--muted)">append at end</small>${(edit.paragraphs || []).map(p => `<div>${esc(p)}</div>`).join('')}</div>`;
+  const rangeNew = isRange
+    ? (String(edit.replaceWith || '').trim()
+        ? blockShell(green, 'replacement', typeof window.formatMarkdownContent === 'function'
+            ? `<div class="fpv-md">${window.formatMarkdownContent(String(edit.replaceWith))}</div>`
+            : `<div>${esc(String(edit.replaceWith))}</div>`)
+        : blockShell(red, 'removal', `<div style="color:var(--muted)">removes ${rangeAnchors.length} paragraph${rangeAnchors.length === 1 ? '' : 's'} — no replacement</div>`))
+    : '';
+  const oldBlock = isRange ? rangeOld : edit.operation === 'replaceText'
+    ? blockShell(red, 'current text', `<div>${esc(edit.findText || '')}</div>`)
+    : '';
+  const newBlock = isRange ? rangeNew : edit.operation === 'replaceText'
+    ? blockShell(green, 'replacement', `<div>${esc(edit.replaceWith || '')}</div>`)
+    : blockShell(green, 'append at end', (edit.paragraphs || []).map(p => `<div>${esc(p)}</div>`).join(''));
   const controls = edit.status === 'pending'
     ? `<div class="today-item-actions"><button class="button small primary" type="button" data-action="doc-edit-decide" data-id="${attr(edit.id)}" data-decision="approve">Approve</button><button class="button small" type="button" data-action="doc-edit-decide" data-id="${attr(edit.id)}" data-decision="reject">Reject</button></div>`
-    : '';
+    : edit.status === 'conflicted'
+      ? `<div class="today-item-actions"><button class="button small" type="button" data-action="doc-edit-decide" data-id="${attr(edit.id)}" data-decision="reject" title="Acknowledge and move to settled history — the conflict reason is kept">Dismiss</button></div>`
+      : '';
   return `<article class="doc-annotation">
     <div class="doc-annotation-head">
       <strong>${edit.kind === 'botboy' ? 'BotBoy proposed' : 'You edited'}</strong>
@@ -1122,23 +1289,13 @@ function pendingEditsSection(data, docKey, syncing) {
   const retryBanner = data.syncRetry?.retrying
     ? `<div class="pill blue" style="margin-bottom:10px; display:inline-flex; align-items:center; gap:6px;">${icon('refresh', 12)} Document locked by an active editing session — auto-retrying sync (attempt ${Number(data.syncRetry.attempts) + 1}, since ${esc(relativeTime(data.syncRetry.startedAt))}). Approved edits publish when it frees up.</div>`
     : '';
-  const proposeForm = isDocx ? `
-    <details class="document-findings"><summary>${icon('sparkles', 13)} Propose a change to this document</summary>
-      <div style="display:flex; flex-direction:column; gap:8px; padding:10px 2px;">
-        <label style="font-size:11px; color:var(--muted)">Exact current passage (one paragraph, ≥20 chars — select text in the document and paste)</label>
-        <textarea id="doc-propose-find" class="input" rows="2" placeholder="Current text to replace…"></textarea>
-        <label style="font-size:11px; color:var(--muted)">Replacement</label>
-        <textarea id="doc-propose-replace" class="input" rows="2" placeholder="New text…"></textarea>
-        <div><button class="button small primary" type="button" data-action="doc-propose-submit" data-dockey="${attr(docKey)}">Stage edit for approval</button>
-        <span style="font-size:11px; color:var(--muted)"> Nothing touches SharePoint until you approve and sync.</span></div>
-      </div>
-    </details>` : '';
+  // Propose-a-change form retired (E2/D9): Edit mode and selection-assist
+  // replaced it. The lane remains the review/audit surface.
   return `<div class="section-heading"><div><h2>Proposed changes</h2><p>Old vs new, approved by you, applied in one upload. Conflicted edits mean the document moved — the guard working, not a failure.</p></div>${syncButton}</div>
     ${retryBanner}
     <section class="card pad">
-      ${open.length ? open.map(pendingEditBlock).join('') : '<p style="margin:2px 0; color:var(--muted); font-size:12px;">No open proposals — stage one below or ask BotBoy in chat.</p>'}
+      ${open.length ? open.map(pendingEditBlock).join('') : '<p style="margin:2px 0; color:var(--muted); font-size:12px;">No open proposals — press Edit, select text and ask BotBoy, or ask in chat.</p>'}
       ${settled.length ? `<details class="document-findings"><summary>${settled.length} settled (synced or rejected)</summary>${settled.map(pendingEditBlock).join('')}</details>` : ''}
-      ${proposeForm}
     </section>`;
 }
 
@@ -1154,30 +1311,49 @@ function renderDocReader() {
   if (!data) return errorView(error || 'This document could not be loaded.');
   const doc = data.doc || {};
   const project = doc.project;
+  const editMode = state.docReader.editMode && state.docReader.editMode.active ? state.docReader.editMode : null;
   const canRender = typeof window.formatMarkdownContent === 'function';
   // Preview-reflect (soak find): staged and approved edits apply to the
   // PREVIEW text so the owner sees the document as it would read — the
   // banner keeps it honest that SharePoint does not have them yet. Edits
   // whose passage does not appear in the extracted markdown are simply not
   // previewable here (the old/new blocks below stay authoritative).
-  let previewContent = data.content || '';
-  let previewApplied = 0;
-  for (const edit of (Array.isArray(data.pendingEdits) ? data.pendingEdits : [])) {
-    if (edit.status !== 'pending' && edit.status !== 'approved') continue;
-    if (edit.operation === 'replaceText' && edit.findText && previewContent.includes(edit.findText)) {
-      previewContent = previewContent.replace(edit.findText, edit.replaceWith || '');
-      previewApplied++;
-    } else if (edit.operation === 'appendParagraphs' && Array.isArray(edit.paragraphs) && edit.paragraphs.length) {
-      previewContent = `${previewContent}\n\n${edit.paragraphs.join('\n\n')}`;
-      previewApplied++;
-    }
-  }
+  // Shared with the selection mouseup handler (E3): both must see the SAME
+  // preview text or block indexes drift.
+  const { previewContent, previewApplied } = docPreviewContent(data);
   const previewBanner = previewApplied
     ? `<div class="mcp-alert">${icon('sparkles', 14)}<span>Preview includes ${previewApplied} staged change${previewApplied === 1 ? '' : 's'} not yet on SharePoint — approve and sync below to publish.</span></div>`
     : '';
+  // Per-block rendering (E3): each markdown block gets data-md-block="i" so
+  // DOM selections map back to source blocks; the assist proposal card
+  // renders INLINE after the selection's last block; target blocks carry a
+  // state-driven highlight (the browser selection dies on repaints — the
+  // class doesn't).
+  const assist = state.docReader.assist || null;
+  const isDocxFile = String(doc.fileType || '').toLowerCase() === '.docx';
   let contentHtml = previewContent
-    ? (canRender ? `<div class="content-block fpv-md">${window.formatMarkdownContent(previewContent)}</div>` : `<pre class="fpv-pre">${esc(previewContent)}</pre>`)
+    ? (canRender
+      ? `<div class="content-block fpv-md">${mdBlocksUi(previewContent).map((blockText, i) => {
+          const isTarget = assist && Number.isInteger(assist.blockStart) && i >= assist.blockStart && i <= assist.blockEnd;
+          let html = `<div class="doc-block${isTarget ? ' doc-assist-target' : ''}" data-md-block="${i}">${window.formatMarkdownContent(blockText)}</div>`;
+          if (assist && assist.phase === 'proposal' && i === assist.blockEnd) html += assistProposalCardHtml(assist);
+          return html;
+        }).join('')}</div>`
+      : `<pre class="fpv-pre">${esc(previewContent)}</pre>`)
     : `<div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No synced content</h3><p>${doc.extractionTier === 'metadata_only' ? 'This document is presence-only at its size tier — Refresh pulls a fresh snapshot within the same rules, or open it in SharePoint.' : 'Content has not been extracted yet.'}</p></div>`;
+  // Edit mode (E2): the content pane becomes an editable draft of the SYNCED
+  // extraction. State-driven (D10); the input listener syncs the draft so
+  // user-action repaints never lose typed text.
+  if (editMode) {
+    contentHtml = `<div class="mcp-alert">${icon('sparkles', 14)}<span>You are editing the extracted text. Untouched paragraphs keep their exact Word formatting; edited paragraphs are rewritten with clean formatting. Tables can't be edited yet — table changes are skipped at save.</span></div>
+      <textarea id="doc-edit-draft" class="input doc-edit-draft" spellcheck="false">${esc(editMode.draft)}</textarea>
+      <div style="display:flex; gap:8px; margin-top:10px; align-items:center; flex-wrap:wrap;">
+        <button class="button primary" type="button" data-action="doc-edit-save" data-dockey="${attr(docKey)}" ${editMode.saving ? 'disabled' : ''}>${editMode.saving ? 'Saving…' : 'Save changes'}</button>
+        <button class="button" type="button" data-action="doc-edit-cancel" ${editMode.saving ? 'disabled' : ''}>Cancel</button>
+        <span style="font-size:11px; color:var(--muted)">Saved changes stage pre-approved — review them below, then Sync.</span>
+        ${editMode.error ? `<span style="color:var(--yellow,#f3ba63); font-size:12px;">${esc(editMode.error)}</span>` : ''}
+      </div>`;
+  }
 
   // xlsx: sheet chips switch between the bounded synced overview and live
   // per-sheet reads (xlsx-deep-reads X2).
@@ -1266,15 +1442,26 @@ function renderDocReader() {
         ${stagedOpenCount ? `<span class="pill blue">${stagedOpenCount} staged edit${stagedOpenCount === 1 ? '' : 's'}</span>` : ''}
       </div>
     </div><div class="head-actions">
-      <button class="button" type="button" data-action="doc-refresh" data-dockey="${attr(docKey)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshing ? 'Refreshing…' : 'Refresh from SharePoint'}</button>
+      ${(() => {
+        // Edit mode gate (E2/D8): docx, FULL extraction, no open staged edits.
+        const isDocxDoc = String(doc.fileType || '').toLowerCase() === '.docx';
+        if (!isDocxDoc || !data.content || editMode) return '';
+        const reason = data.contentTier !== 'full'
+          ? "Refresh first — partial extractions can't be edited safely"
+          : stagedOpenCount > 0
+            ? 'Resolve staged edits first — approve & sync or reject them'
+            : '';
+        return `<button class="button" type="button" data-action="doc-edit-enter" ${reason ? `disabled title="${attr(reason)}"` : 'title="Edit the document text; changes stage for sync"'}>${icon('file')} Edit</button>`;
+      })()}
+      <button class="button" type="button" data-action="doc-refresh" data-dockey="${attr(docKey)}" ${refreshing || editMode ? 'disabled' : ''}>${icon('refresh')} ${refreshing ? 'Refreshing…' : 'Refresh from SharePoint'}</button>
       ${doc.webUrl ? `<a class="button primary" href="${esc(String(doc.webUrl))}" target="_blank" rel="noopener noreferrer">Open in SharePoint</a>` : ''}
     </div></header>
     ${error ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}
-    ${tierNote}
-    ${suggestionsBanner}
-    ${previewBanner}
-    ${pendingEditsSection(data, docKey, state.docReader.syncing === true)}
-    ${sheetChips}
+    ${editMode ? '' : tierNote}
+    ${editMode ? '' : suggestionsBanner}
+    ${editMode ? '' : previewBanner}
+    ${editMode ? '' : pendingEditsSection(data, docKey, state.docReader.syncing === true)}
+    ${editMode ? '' : sheetChips}
     <div class="document-annotated with-rail">
       <section class="card pad document-preview-shell">${contentHtml}</section>
       <aside class="document-annotations">
@@ -1283,7 +1470,8 @@ function renderDocReader() {
         <div class="doc-annotation-group"><h3>Comments <span class="doc-annotation-count">${liveComments.length}</span></h3>${commentFilters}${commentsHtml}${deletedHtml}</div>
         <div class="doc-annotation-group"><h3>Revisions <span class="doc-annotation-count">${data.revisions?.length || 0}</span></h3>${revisionsHtml || '<div class="empty-state today-empty"><p>No revisions captured.</p></div>'}</div>
       </aside>
-    </div>`;
+    </div>
+    ${editMode ? '' : assistOverlayHtml(assist)}`;
 }
 
 const ACTIVITY_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})\s+—\s+/;
@@ -2674,12 +2862,17 @@ function renderAnalyticsProgress(dashboard, run) {
   const total = Number(run.widgetCount || 0);
   const percent = total ? Math.max(0, Math.min(100, completed / total * 100)) : 0;
   const current = analyticsCurrentWidget(dashboard, run);
-  const detail = run.status === 'queued'
-    ? 'Waiting for the background analytics worker'
-    : current
-      ? `Running ${current.title}`
-      : 'Finishing durable refresh state';
-  return `<section class="analytics-run-progress" aria-live="polite"><div><span class="status-dot accent"></span><span><strong>${run.status === 'queued' ? 'Refresh queued' : 'Refresh running'}</strong><small>${esc(detail)}</small></span><b>${number(completed)} / ${number(total)}</b></div><div class="analytics-progress-track" aria-label="${attr(`${completed} of ${total} widgets completed`)}"><i style="width:${percent.toFixed(2)}%"></i></div></section>`;
+  const detail = run.cancelRequested
+    ? current
+      ? `Stopping — waiting for "${current.title}" to finish (a running query cannot be aborted)`
+      : 'Stopping — no further widgets will run'
+    : run.status === 'queued'
+      ? 'Waiting for the background analytics worker'
+      : current
+        ? `Running ${current.title}`
+        : 'Finishing durable refresh state';
+  const heading = run.cancelRequested ? 'Refresh stopping' : run.status === 'queued' ? 'Refresh queued' : 'Refresh running';
+  return `<section class="analytics-run-progress" aria-live="polite"><div><span class="status-dot accent"></span><span><strong>${heading}</strong><small>${esc(detail)}</small></span><b>${number(completed)} / ${number(total)}</b></div><div class="analytics-progress-track" aria-label="${attr(`${completed} of ${total} widgets completed`)}"><i style="width:${percent.toFixed(2)}%"></i></div></section>`;
 }
 
 function syncAnalyticsPolling() {
@@ -2710,8 +2903,9 @@ async function pollActiveAnalyticsDashboard() {
   try {
     const runPayload = await request(`/analytics/runs/${encodeURIComponent(previousRun.id)}`);
     const persistedRun = runPayload.run;
-    const progressChanged = Number(persistedRun.widgetsCompleted || 0) !== Number(previousRun.widgetsCompleted || 0);
-    const terminal = persistedRun.status === 'completed' || persistedRun.status === 'failed';
+    const progressChanged = Number(persistedRun.widgetsCompleted || 0) !== Number(previousRun.widgetsCompleted || 0)
+      || Boolean(persistedRun.cancelRequested) !== Boolean(previousRun.cancelRequested);
+    const terminal = persistedRun.status === 'completed' || persistedRun.status === 'failed' || persistedRun.status === 'cancelled';
     let dashboard;
     if (progressChanged || terminal) {
       const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}`);
@@ -2728,6 +2922,8 @@ async function pollActiveAnalyticsDashboard() {
       state.analytics.announcedRuns.add(persistedRun.id);
       if (persistedRun.status === 'completed') {
         toast(`Dashboard refresh completed: ${number(persistedRun.widgetsSucceeded)} widgets updated`, 'good');
+      } else if (persistedRun.status === 'cancelled') {
+        toast(`Refresh stopped: ${number(persistedRun.widgetsSucceeded)} of ${number(persistedRun.widgetCount)} widgets updated before the stop`);
       } else {
         const failed = Math.max(0, Number(persistedRun.widgetCount || 0) - Number(persistedRun.widgetsSucceeded || 0));
         toast(`Dashboard refresh finished with ${number(failed)} widget error${failed === 1 ? '' : 's'}`, 'bad');
@@ -2753,9 +2949,9 @@ function analyticsStatusTone(status) {
 }
 
 function analyticsCell(value) {
-  if (value == null) return '<span class="analytics-null">null</span>';
-  if (typeof value === 'number') return `<span class="analytics-number">${esc(value.toLocaleString())}</span>`;
-  return esc(String(value));
+  if (value == null) return '<td class="analytics-cell-null"><span class="analytics-null">null</span></td>';
+  if (typeof value === 'number') return `<td class="analytics-cell-number"><span class="analytics-number">${esc(value.toLocaleString())}</span></td>`;
+  return `<td>${esc(String(value))}</td>`;
 }
 
 function analyticsColumnIndex(result, configured, fallback) {
@@ -2774,14 +2970,93 @@ function renderAnalyticsMetric(widget, result) {
     const precision = Math.max(0, Math.min(8, Number(widget.config?.precision ?? 0)));
     rendered = value.toLocaleString(undefined, { minimumFractionDigits: precision, maximumFractionDigits: precision });
   }
-  return `<div class="analytics-metric-value"><span>${esc(prefix)}</span>${esc(rendered)}<span>${esc(suffix)}</span></div><div class="analytics-metric-foot">${number(result.rowCount)} source row${result.rowCount === 1 ? '' : 's'} · refreshed ${esc(relativeTime(result.refreshedAt))}</div>`;
+  // Digit-aware sizing keeps short and long values on a shared visual
+  // weight — "35" must not dwarf "97,855,892" (owner report: giant,
+  // non-uniform numerals).
+  const size = rendered.length <= 5 ? 'xl' : rendered.length <= 10 ? 'lg' : rendered.length <= 14 ? 'md' : 'sm';
+  return `<div class="analytics-metric-value analytics-metric-${size}"><span>${esc(prefix)}</span>${esc(rendered)}<span>${esc(suffix)}</span></div><div class="analytics-metric-foot">Refreshed ${esc(relativeTime(result.refreshedAt))}</div>`;
+}
+
+/**
+ * Grid packer: every row of the 12-column widget grid must land exactly on
+ * 12 (owner report: ragged rows with huge dead zones). Natural spans —
+ * metric 4, chart/text 6, table 12 — then each row's leftover columns are
+ * spread across that row's widgets, right side first.
+ */
+function analyticsWidgetSpans(widgets) {
+  const natural = kind => kind === 'metric' ? 4 : kind === 'table' ? 12 : 6;
+  const spans = new Map();
+  let row = [];
+  let used = 0;
+  const closeRow = () => {
+    if (!row.length) { used = 0; return; }
+    const extra = 12 - used;
+    const base = Math.floor(extra / row.length);
+    let remainder = extra % row.length;
+    for (let i = row.length - 1; i >= 0; i--) {
+      spans.set(row[i], spans.get(row[i]) + base + (remainder > 0 ? 1 : 0));
+      if (remainder > 0) remainder--;
+    }
+    row = [];
+    used = 0;
+  };
+  for (const widget of widgets) {
+    const span = natural(widget.kind);
+    if (used + span > 12) closeRow();
+    row.push(widget.id);
+    spans.set(widget.id, span);
+    used += span;
+    if (used === 12) { row = []; used = 0; }
+  }
+  if (row.length) closeRow();
+  return spans;
+}
+
+/**
+ * Text widgets get real typography instead of a <br>-joined wall: short
+ * ALL-CAPS-ish or colon-terminated lines become subheads, bullet lines
+ * become lists, blank lines split paragraphs. Content stays escaped —
+ * query results are untrusted.
+ */
+function renderAnalyticsText(raw) {
+  const lines = String(raw ?? '').replace(/\r/g, '').split('\n');
+  const blocks = [];
+  let list = null;
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) { blocks.push(`<p>${paragraph.map(esc).join('<br>')}</p>`); paragraph = []; }
+  };
+  const flushList = () => {
+    if (list?.length) blocks.push(`<ul>${list.map(item => `<li>${esc(item)}</li>`).join('')}</ul>`);
+    list = null;
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) { flushList(); flushParagraph(); continue; }
+    const bullet = trimmed.match(/^[-•·*]\s+(.*)$/);
+    if (bullet) { flushParagraph(); (list ??= []).push(bullet[1]); continue; }
+    flushList();
+    const letters = trimmed.replace(/[^A-Za-z]/g, '');
+    const capsy = letters.length >= 3 && letters === letters.toUpperCase();
+    if (trimmed.length <= 72 && (capsy || /:$/.test(trimmed))) {
+      flushParagraph();
+      blocks.push(`<h3>${esc(trimmed.replace(/:$/, ''))}</h3>`);
+      continue;
+    }
+    paragraph.push(trimmed);
+  }
+  flushList();
+  flushParagraph();
+  return blocks.join('') || '<p>—</p>';
 }
 
 function renderAnalyticsTable(result) {
   const columns = Array.isArray(result.columns) ? result.columns : [];
   const rows = Array.isArray(result.rows) ? result.rows : [];
   if (!columns.length) return `<pre class="analytics-raw">${esc(result.rawPreview || 'The query returned no tabular data.')}</pre>`;
-  return `<div class="analytics-table-wrap"><table class="analytics-table"><thead><tr>${columns.map(column => `<th>${esc(column)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map((_, index) => `<td>${analyticsCell(row[index])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>${result.rowCount > rows.length ? `<div class="analytics-truncated">Showing ${number(rows.length)} of ${number(result.rowCount)} rows returned by the connector.</div>` : ''}`;
+  // Numeric columns (any numeric cell) right-align header and body together.
+  const numericColumn = columns.map((_, index) => rows.some(row => typeof row?.[index] === 'number'));
+  return `<div class="analytics-table-wrap"><table class="analytics-table"><thead><tr>${columns.map((column, index) => `<th${numericColumn[index] ? ' class="analytics-cell-number"' : ''}>${esc(column)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map((_, index) => analyticsCell(row[index])).join('')}</tr>`).join('')}</tbody></table></div>${result.rowCount > rows.length ? `<div class="analytics-truncated">Showing ${number(rows.length)} of ${number(result.rowCount)} rows returned by the connector.</div>` : ''}`;
 }
 
 function analyticsSeries(widget, result) {
@@ -2814,7 +3089,12 @@ function renderAnalyticsLine(widget, result) {
   }).join(' ');
   const first = series[0];
   const last = series[series.length - 1];
-  return `<div class="analytics-line"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Line chart for ${attr(widget.title)}"><defs><linearGradient id="line-fill-${attr(widget.id)}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".32"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs><polyline class="analytics-line-shadow" points="${points}"/><polyline class="analytics-line-path" points="${points}"/></svg><div class="analytics-line-legend"><span>${esc(first.label)} · <strong>${esc(first.value.toLocaleString())}</strong></span><span>${esc(last.label)} · <strong>${esc(last.value.toLocaleString())}</strong></span></div></div>`;
+  // Data labels are often raw timestamps — legend shows a compact date.
+  const shortLabel = raw => {
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  };
+  return `<div class="analytics-line-chart"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="Line chart for ${attr(widget.title)}"><defs><linearGradient id="line-fill-${attr(widget.id)}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".32"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs><polyline class="analytics-line-shadow" points="${points}"/><polyline class="analytics-line-path" points="${points}"/></svg><div class="analytics-line-legend"><span>${esc(shortLabel(first.label))} · <strong>${esc(first.value.toLocaleString())}</strong></span><span>${esc(shortLabel(last.label))} · <strong>${esc(last.value.toLocaleString())}</strong></span></div></div>`;
 }
 
 function analyticsVisualizationRows(result) {
@@ -2825,34 +3105,62 @@ function analyticsVisualizationRows(result) {
 
 function analyticsVegaConfig(specConfig) {
   const styles = getComputedStyle(document.documentElement);
+  const v = name => styles.getPropertyValue(name).trim();
   const authored = specConfig && typeof specConfig === 'object' && !Array.isArray(specConfig) ? specConfig : {};
   const authoredSection = key => authored[key] && typeof authored[key] === 'object' && !Array.isArray(authored[key]) ? authored[key] : {};
+  const font = 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
   const theme = {
     background: 'transparent',
+    font,
     view: { stroke: 'transparent' },
+    // App palette so authored charts match the shell in both themes.
+    range: {
+      category: [v('--accent'), v('--blue'), v('--green'), v('--yellow'), v('--red'), v('--accent-strong'), v('--soft')].filter(Boolean),
+      heatmap: { scheme: 'purples' },
+    },
     axis: {
-      labelColor: styles.getPropertyValue('--muted').trim(),
-      titleColor: styles.getPropertyValue('--soft').trim(),
-      domainColor: styles.getPropertyValue('--border-strong').trim(),
-      gridColor: styles.getPropertyValue('--border').trim(),
-      tickColor: styles.getPropertyValue('--border-strong').trim(),
+      labelColor: v('--muted'),
+      titleColor: v('--soft'),
+      domainColor: v('--border-strong'),
+      gridColor: v('--border'),
+      tickColor: v('--border-strong'),
+      labelFont: font,
+      titleFont: font,
+      labelFontSize: 11,
+      titleFontSize: 11,
+      titleFontWeight: 600,
+      gridDash: [2, 3],
     },
     legend: {
-      labelColor: styles.getPropertyValue('--muted').trim(),
-      titleColor: styles.getPropertyValue('--soft').trim(),
+      labelColor: v('--muted'),
+      titleColor: v('--soft'),
+      labelFont: font,
+      titleFont: font,
+      labelFontSize: 11,
+      titleFontSize: 11,
     },
     title: {
-      color: styles.getPropertyValue('--text').trim(),
-      subtitleColor: styles.getPropertyValue('--muted').trim(),
+      color: v('--text'),
+      subtitleColor: v('--muted'),
+      font,
+      fontSize: 13,
+      fontWeight: 650,
     },
+    line: { strokeWidth: 2.5 },
+    bar: { cornerRadiusEnd: 3 },
+    point: { filled: true, size: 55 },
   };
   return {
     ...theme,
     ...authored,
     view: { ...theme.view, ...authoredSection('view') },
+    range: { ...theme.range, ...authoredSection('range') },
     axis: { ...theme.axis, ...authoredSection('axis') },
     legend: { ...theme.legend, ...authoredSection('legend') },
     title: { ...theme.title, ...authoredSection('title') },
+    line: { ...theme.line, ...authoredSection('line') },
+    bar: { ...theme.bar, ...authoredSection('bar') },
+    point: { ...theme.point, ...authoredSection('point') },
   };
 }
 
@@ -2908,9 +3216,16 @@ async function hydrateAnalyticsVisualizations(dashboardId, expectedEpoch) {
   }
 }
 
-function renderAnalyticsWidget(widget, currentWidgetId = '') {
+function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0) {
   const result = widget.result;
-  const tone = widget.id === currentWidgetId ? 'accent' : widget.lastError ? 'warn' : result ? 'good' : '';
+  const running = widget.id === currentWidgetId;
+  const chip = running
+    ? '<span class="analytics-chip accent"><span class="status-dot accent"></span>running</span>'
+    : widget.lastError
+      ? `<span class="analytics-chip warn" title="${attr(widget.lastError)}"><span class="status-dot warn"></span>${result ? 'stale' : 'error'}</span>`
+      : result
+        ? `<span class="analytics-chip good" title="Refreshed ${attr(relativeTime(result.refreshedAt))}"><span class="status-dot good"></span>fresh</span>`
+        : '<span class="analytics-chip"><span class="status-dot"></span>not run</span>';
   let body = '<div class="analytics-empty">Run a refresh to load this widget.</div>';
   if (result) {
     if (widget.kind === 'metric') body = renderAnalyticsMetric(widget, result);
@@ -2918,9 +3233,13 @@ function renderAnalyticsWidget(widget, currentWidgetId = '') {
     if (widget.kind === 'bar') body = renderAnalyticsBars(widget, result);
     if (widget.kind === 'line') body = renderAnalyticsLine(widget, result);
     if (widget.kind === 'visualization') body = `<div class="analytics-vega" data-analytics-visualization="${attr(widget.id)}" role="img" aria-label="${attr(widget.title)}"><span>Preparing interactive visualization…</span></div>`;
-    if (widget.kind === 'text') body = `<div class="analytics-text">${esc(String(result.rows?.[0]?.[0] ?? widget.config?.text ?? '')).replaceAll('\n', '<br>')}</div>`;
+    if (widget.kind === 'text') body = `<div class="analytics-text">${renderAnalyticsText(result.rows?.[0]?.[0] ?? widget.config?.text ?? '')}</div>`;
   }
-  return `<article class="card analytics-widget analytics-${attr(widget.kind)}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><span class="status-dot ${tone}"></span></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 14)}<span>${esc(widget.lastError)}</span>${result ? '<small>Showing the last successful result.</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div><details class="analytics-provenance"><summary>${icon('database', 13)} Query & provenance</summary><div><span>Trust</span><strong>${esc(result?.trust || 'not refreshed')}</strong></div>${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : '<div><span>Source</span><strong>Local static text</strong></div>'}</details></article>`;
+  const spanClass = span ? ` analytics-span-${span}` : '';
+  const wideMetric = widget.kind === 'metric' && span >= 8 ? ' analytics-metric-wide' : '';
+  // Text widgets have no query — a provenance strip under a guide is noise.
+  const provenance = widget.kind === 'text' && !widget.sql ? '' : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc(String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase())}</b></summary>${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
+  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div>${chip}</div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${provenance}</article>`;
 }
 
 function renderAnalyticsList() {
@@ -2939,7 +3258,7 @@ function renderAnalyticsRuns(dashboard) {
   const runs = dashboard.recentRuns || [];
   return `<article class="card analytics-runs"><div class="card-header"><div><h2 class="card-title">Refresh history</h2><div class="card-meta">Persisted local execution record</div></div></div>${runs.map(run => {
     const active = run.status === 'queued' || run.status === 'running';
-    const tone = run.status === 'completed' ? 'good' : run.status === 'failed' ? 'bad' : 'accent';
+    const tone = run.status === 'completed' ? 'good' : run.status === 'failed' ? 'bad' : run.status === 'cancelled' ? 'warn' : 'accent';
     const timestamp = run.startedAt || run.queuedAt;
     const progress = active
       ? `${number(run.widgetsCompleted)} of ${number(run.widgetCount)} processed · ${number(run.widgetsSucceeded)} succeeded`
@@ -3014,9 +3333,13 @@ function renderAnalyticsDashboard(id) {
       : state.analytics.refreshing.has(id)
         ? 'Queueing…'
         : 'Refresh data';
-  const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
+  const stopping = Boolean(activeRun?.cancelRequested) || state.analytics.cancelling.has(id);
+  const stopAction = activeRun
+    ? `<button class="button" type="button" data-action="analytics-cancel-refresh" data-dashboard="${attr(id)}" ${stopping ? 'disabled' : ''} title="${attr(activeRun.status === 'running' ? 'Stops after the query currently running — an in-flight warehouse query cannot be aborted' : 'Cancels the queued refresh before it starts')}">${icon('x', 14)} ${stopping ? 'Stopping…' : 'Stop refresh'}</button>`
+    : '';
+  const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const schedule = dashboard.schedule;
-  return `<div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div>${pageHead('Analytical dashboard', dashboard.title, dashboard.description, actions)}<div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${dashboard.latestPublication?.status === 'published' ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(dashboard.latestPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}<section class="analytics-widget-grid">${dashboard.widgets.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId)).join('')}</section><section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
+  return `<div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div>${pageHead('Analytical dashboard', dashboard.title, dashboard.description, actions)}<div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${dashboard.latestPublication?.status === 'published' ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(dashboard.latestPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}<section class="analytics-widget-grid">${(spans => dashboard.widgets.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, spans.get(widget.id))).join(''))(analyticsWidgetSpans(dashboard.widgets))}</section><section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
 }
 
 async function saveAnalyticsSchedule(form) {
@@ -3109,6 +3432,34 @@ async function refreshAnalyticsDashboard(id) {
     toast(`Could not queue dashboard refresh: ${error.message}`, 'bad');
   } finally {
     state.analytics.refreshing.delete(id);
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
+  }
+}
+
+async function cancelAnalyticsRefresh(id) {
+  const current = state.analytics.details.get(id);
+  const active = analyticsActiveRun(current);
+  if (!id || !active || active.cancelRequested || state.analytics.cancelling.has(id)) return;
+  state.analytics.cancelling.add(id);
+  renderRoute({ userAction: true });
+  try {
+    const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/refresh/cancel`, { method: 'POST', body: {} });
+    if (payload.dashboard) {
+      state.analytics.details.set(id, payload.dashboard);
+      updateAnalyticsSummary(payload.dashboard);
+    }
+    if (payload.result === 'cancelled') {
+      if (payload.run) state.analytics.announcedRuns.add(payload.run.id);
+      toast('Dashboard refresh stopped');
+    } else if (payload.result === 'stopping') {
+      toast('Stopping after the current query — a running warehouse query cannot be aborted');
+    } else {
+      toast('The refresh already finished');
+    }
+  } catch (error) {
+    toast(`Could not stop the refresh: ${error.message}`, 'bad');
+  } finally {
+    state.analytics.cancelling.delete(id);
     if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
   }
 }
@@ -3988,10 +4339,19 @@ async function updateCommandResults(query = '') {
   if (normalized.length >= 2) {
     try {
       const result = await request(`/search?q=${encodeURIComponent(query.trim())}&limit=12`);
-      const evidenceItems = (result.results || []).map(entry => ({
-        title: entry.item?.title || '(untitled evidence)', meta: entry.snippet || entry.item?.summary || 'Evidence',
-        icon: sourceIcon(entry.item?.source, entry.item?.type), url: entry.item?.url || '', nodeId: entry.node?.id || '', kind: 'Evidence',
-      }));
+      // Synced documents route to the STAGED reader (#/doc/…), grouped under
+      // their own label; runCommand prefers route over url, so these never
+      // pop an external tab (owner report 2026-08-27).
+      const evidenceItems = (result.results || []).map(entry => (entry.item?.docKey
+        ? {
+            title: entry.item?.title || '(untitled document)',
+            meta: `Staged copy in BotBoy${entry.item?.collapsedCount ? ` · ${entry.item.collapsedCount} more capture${entry.item.collapsedCount === 1 ? '' : 's'} collapsed` : ''}${entry.snippet ? ` — ${entry.snippet}` : ''}`,
+            icon: 'file', route: `#/doc/${encodeDocKey(entry.item.docKey)}`, kind: 'Documents',
+          }
+        : {
+            title: entry.item?.title || '(untitled evidence)', meta: entry.snippet || entry.item?.summary || 'Evidence',
+            icon: sourceIcon(entry.item?.source, entry.item?.type), url: entry.item?.url || '', nodeId: entry.node?.id || '', kind: 'Evidence',
+          }));
       items = [...items.slice(0, 12), ...evidenceItems];
     } catch {}
   }
@@ -4107,22 +4467,123 @@ function bindEvents() {
       const found = jumpToDocPassage(target.dataset.anchor || '');
       if (!found) toast('Passage not found in the current preview (the document may have changed)', 'warn');
     }
-    if (action === 'doc-propose-submit') {
-      const docKey = target.dataset.dockey || '';
-      const findText = document.getElementById('doc-propose-find')?.value ?? '';
-      const replaceWith = document.getElementById('doc-propose-replace')?.value ?? '';
+    if (action === 'assist-pill') {
+      const assist = state.docReader.assist;
+      if (assist && assist.phase === 'pill') {
+        assist.phase = 'dialog';
+        renderRoute({ preserveScroll: true, userAction: true });
+        setTimeout(() => document.getElementById('doc-assist-instruction')?.focus(), 30);
+      }
+    }
+    if (action === 'assist-cancel') {
+      state.docReader.assist = null;
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'assist-expand') {
+      const assist = state.docReader.assist;
+      if (assist) { assist.expanded = !assist.expanded; renderRoute({ preserveScroll: true, userAction: true }); }
+    }
+    if (action === 'assist-send') {
+      const assist = state.docReader.assist;
+      const docKey = state.docReader.key;
+      if (assist && assist.phase === 'dialog' && docKey) {
+        assist.instruction = document.getElementById('doc-assist-instruction')?.value ?? assist.instruction ?? '';
+        if (!assist.instruction.trim()) { toast('Tell BotBoy what to do with the selection first', 'warn'); return; }
+        const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        assist.phase = 'running';
+        assist.error = '';
+        assist.nonce = nonce;
+        renderRoute({ preserveScroll: true, userAction: true });
+        void (async () => {
+          try {
+            const result = await request('/documents/assist-edit', { method: 'POST', body: {
+              docKey, selectedText: assist.selectedText, blockTexts: assist.blockTexts, instruction: assist.instruction,
+            } });
+            const current = state.docReader.assist;
+            if (!current || current.nonce !== nonce) return; // cancelled/superseded — discard
+            current.phase = 'proposal';
+            current.replacementMarkdown = String(result.replacementMarkdown ?? '');
+            current.editShape = result.editShape || null;
+            current.expanded = false;
+          } catch (error) {
+            const current = state.docReader.assist;
+            if (!current || current.nonce !== nonce) return;
+            current.phase = 'error';
+            current.error = String(error?.message || error);
+          }
+          renderRoute({ preserveScroll: true });
+        })();
+      }
+    }
+    if (action === 'assist-approve') {
+      const assist = state.docReader.assist;
+      const docKey = state.docReader.key;
       const doc = state.docReader.data?.doc;
-      if (docKey && doc) {
+      if (assist && assist.phase === 'proposal' && assist.editShape && docKey && doc && !assist.approving) {
+        assist.approving = true;
+        renderRoute({ preserveScroll: true, userAction: true });
         void (async () => {
           try {
             await request('/documents/pending-edits', { method: 'POST', body: {
               docKey, serverRelativeUrl: doc.serverRelativeUrl, siteUrl: doc.siteUrl || undefined,
-              operation: 'replaceText', findText, replaceWith,
+              kind: 'botboy', preApproved: true,
+              originNote: String(assist.instruction || 'BotBoy selection edit').slice(0, 300),
+              ...assist.editShape,
             } });
-            toast('Edit staged — approve it, then sync');
+            state.docReader.assist = null;
+            toast('Approved — the staged copy shows the new text. Press Sync to publish.');
             await loadDocReader(docKey, { force: true });
           } catch (error) {
-            toast(String(error?.message || error), 'warn');
+            const current = state.docReader.assist;
+            if (current) { current.approving = false; current.phase = 'error'; current.error = String(error?.message || error); }
+            renderRoute({ preserveScroll: true, userAction: true });
+          }
+        })();
+      }
+    }
+    if (action === 'assist-reject') {
+      state.docReader.assist = null;
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'doc-edit-enter') {
+      const data = state.docReader.data;
+      if (data && typeof data.contentSha256 === 'string' && data.contentSha256) {
+        state.docReader.assist = null; // hygiene (E3): entering edit mode discards transient assist state
+        state.docReader.editMode = { active: true, draft: data.content || '', baseSha: data.contentSha256, saving: false, error: '' };
+        renderRoute({ userAction: true });
+      } else {
+        toast('The document is still loading — try again in a moment', 'warn');
+      }
+    }
+    if (action === 'doc-edit-cancel') {
+      state.docReader.editMode = null;
+      renderRoute({ userAction: true });
+    }
+    if (action === 'doc-edit-save') {
+      const docKey = target.dataset.dockey || '';
+      const em = state.docReader.editMode;
+      if (docKey && em && !em.saving) {
+        em.draft = document.getElementById('doc-edit-draft')?.value ?? em.draft;
+        em.saving = true;
+        em.error = '';
+        renderRoute({ preserveScroll: true, userAction: true });
+        void (async () => {
+          try {
+            const result = await request('/documents/edit-save', { method: 'POST', body: { docKey, draft: em.draft, baseSha: em.baseSha } });
+            const staged = (result.staged || []).length;
+            const skipped = (result.unsupported || []).length;
+            state.docReader.editMode = null;
+            toast(staged
+              ? `Saved — ${staged} change${staged === 1 ? '' : 's'} staged pre-approved. Review below, then Sync.${skipped ? ` (${skipped} table change${skipped === 1 ? '' : 's'} skipped.)` : ''}`
+              : (skipped ? "Only table changes detected — tables can't be edited yet" : 'No changes to save'), staged ? undefined : 'warn');
+            await loadDocReader(docKey, { force: true });
+          } catch (error) {
+            const current = state.docReader.editMode;
+            if (current) {
+              current.saving = false;
+              current.error = String(error?.message || error);
+            }
+            renderRoute({ preserveScroll: true, userAction: true });
           }
         })();
       }
@@ -4227,6 +4688,9 @@ function bindEvents() {
     if (action === 'doc-refresh') {
       const docKey = target.dataset.dockey || '';
       if (docKey && !state.docReader.refreshing) {
+        // Hygiene (E3): a refresh discards transient assist phases; a
+        // reviewed proposal survives (its approve payload is content-anchored).
+        if (state.docReader.assist && state.docReader.assist.phase !== 'proposal') state.docReader.assist = null;
         state.docReader.refreshing = true;
         renderRoute({ preserveScroll: true, userAction: true });
         void (async () => {
@@ -4416,6 +4880,7 @@ function bindEvents() {
     if (action === 'terminal-send' && target.dataset.profile) void sendTerminalInput(target.dataset.profile);
     if (action === 'terminal-stop' && target.dataset.profile) void stopTerminalCommand(target.dataset.profile);
     if (action === 'analytics-refresh') void refreshAnalyticsDashboard(target.dataset.dashboard);
+    if (action === 'analytics-cancel-refresh') void cancelAnalyticsRefresh(target.dataset.dashboard);
     if (action === 'analytics-delete') void deleteAnalyticsDashboard(target.dataset.dashboard);
     if (action === 'share-prepare') void prepareDashboardShare(target.dataset.dashboard);
     if (action === 'share-cancel') cancelDashboardShare(target.dataset.dashboard);
@@ -4463,6 +4928,14 @@ function bindEvents() {
   });
 
   document.addEventListener('input', event => {
+    if (event.target?.id === 'doc-edit-draft' && state.docReader.editMode) {
+      state.docReader.editMode.draft = event.target.value;
+      return;
+    }
+    if (event.target?.id === 'doc-assist-instruction' && state.docReader.assist) {
+      state.docReader.assist.instruction = event.target.value;
+      return;
+    }
     if (event.target?.matches('[data-document-editor]')) {
       state.documents.editDraft = event.target.value;
       return;
@@ -4477,6 +4950,51 @@ function bindEvents() {
     form?.querySelectorAll('.analytics-project-option').forEach(option => {
       option.hidden = Boolean(query) && !(option.textContent || '').toLowerCase().includes(query);
     });
+  });
+  // Selection → Ask BotBoy (E3): mouseup inside the reader content captures
+  // the selection as block indexes + texts (preview-space; the server
+  // re-anchors against the synced base). Only null/pill phases react —
+  // dialog, running, and proposal persist until resolved.
+  document.addEventListener('mouseup', event => {
+    if (state.route.view !== 'doc-reader' || state.docReader.editMode) return;
+    const phase = state.docReader.assist?.phase;
+    if (phase && phase !== 'pill') return;
+    if (event.target?.closest?.('.doc-assist-pill, .doc-assist-dialog, .doc-assist-card')) return;
+    setTimeout(() => {
+      if (state.route.view !== 'doc-reader' || state.docReader.editMode) return;
+      const current = state.docReader.assist?.phase;
+      if (current && current !== 'pill') return;
+      const clearPill = () => {
+        if (state.docReader.assist) { state.docReader.assist = null; renderRoute({ preserveScroll: true, userAction: true }); }
+      };
+      const sel = window.getSelection();
+      const shell = document.querySelector('.document-preview-shell');
+      if (!sel || sel.isCollapsed || !shell || sel.rangeCount === 0) return clearPill();
+      const text = String(sel.toString() || '').trim();
+      if (!text) return clearPill();
+      const range = sel.getRangeAt(0);
+      const blockOf = node => (node?.nodeType === 1 ? node : node?.parentElement)?.closest?.('[data-md-block]');
+      const startBlock = blockOf(range.startContainer);
+      const endBlock = blockOf(range.endContainer);
+      if (!startBlock || !endBlock || !shell.contains(startBlock) || !shell.contains(endBlock)) return clearPill();
+      const blockStart = Number(startBlock.dataset.mdBlock);
+      const blockEnd = Number(endBlock.dataset.mdBlock);
+      if (!Number.isInteger(blockStart) || !Number.isInteger(blockEnd) || blockEnd < blockStart) return clearPill();
+      const blocks = mdBlocksUi(docPreviewContent(state.docReader.data).previewContent);
+      const blockTexts = blocks.slice(blockStart, blockEnd + 1);
+      if (!blockTexts.length) return clearPill();
+      const rect = range.getBoundingClientRect();
+      state.docReader.assist = {
+        phase: 'pill',
+        blockStart,
+        blockEnd,
+        selectedText: text,
+        blockTexts,
+        rect: { top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right },
+        instruction: state.docReader.assist?.instruction || '',
+      };
+      renderRoute({ preserveScroll: true, userAction: true });
+    }, 0);
   });
   document.addEventListener('change', event => {
     if (event.target?.id === 'mcp-auth-method' || event.target?.id === 'mcp-context-source') {

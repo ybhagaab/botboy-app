@@ -421,11 +421,12 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
       dashboard_id TEXT NOT NULL REFERENCES analytics_dashboards(id) ON DELETE CASCADE,
       schedule_id TEXT REFERENCES analytics_schedules(id) ON DELETE SET NULL,
       trigger TEXT NOT NULL CHECK(trigger IN ('manual','scheduled','agent')),
-      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed','cancelled')),
       widget_count INTEGER NOT NULL DEFAULT 0,
       widgets_completed INTEGER NOT NULL DEFAULT 0,
       widgets_succeeded INTEGER NOT NULL DEFAULT 0,
       current_widget_id TEXT,
+      cancel_requested INTEGER NOT NULL DEFAULT 0,
       queued_at TEXT NOT NULL DEFAULT (datetime('now')),
       started_at TEXT,
       heartbeat_at TEXT,
@@ -556,6 +557,100 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
   );
   if (!migratedRunColumns.has('worker_id')) db.exec('ALTER TABLE analytics_runs ADD COLUMN worker_id TEXT;');
   if (!migratedRunColumns.has('worker_pid')) db.exec('ALTER TABLE analytics_runs ADD COLUMN worker_pid INTEGER;');
+  if (!migratedRunColumns.has('cancel_requested')) db.exec('ALTER TABLE analytics_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;');
+
+  // Stop-refresh support (2026-08-27) added a terminal 'cancelled' status to
+  // runs and their widget rows. SQLite cannot widen a CHECK in place, so
+  // tables whose CHECK predates 'cancelled' are rebuilt with a faithful
+  // column-for-column copy — no data munging: running rows stay running (the
+  // lease/pid recovery machinery owns them), schedule links are preserved.
+  // Pattern: create-new → copy → drop-old → rename, with foreign keys OFF so
+  // the child/parent swap never rewrites or enforces mid-transaction.
+  const cancelledRunSql = String((db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'analytics_runs'
+  `).get() as { sql?: string } | undefined)?.sql || '');
+  const cancelledWidgetSql = String((db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'analytics_run_widgets'
+  `).get() as { sql?: string } | undefined)?.sql || '');
+  const runNeedsCancelRebuild = Boolean(cancelledRunSql) && !cancelledRunSql.includes("'cancelled'");
+  // On a fresh database analytics_run_widgets does not exist yet at this
+  // point (its CREATE lives in the index block below) — empty sqlite_master
+  // text means "nothing to rebuild", not "rebuild".
+  const widgetsNeedCancelRebuild = Boolean(cancelledWidgetSql) && !cancelledWidgetSql.includes("'cancelled'");
+  if (runNeedsCancelRebuild || widgetsNeedCancelRebuild) {
+    db.pragma('foreign_keys = OFF');
+    try {
+      db.transaction(() => {
+        if (runNeedsCancelRebuild) {
+          db.exec(`
+            DROP INDEX IF EXISTS idx_analytics_runs_dashboard;
+            DROP INDEX IF EXISTS idx_analytics_runs_queue;
+            DROP INDEX IF EXISTS idx_analytics_runs_active_dashboard;
+            CREATE TABLE analytics_runs_cancelable (
+              id TEXT PRIMARY KEY,
+              dashboard_id TEXT NOT NULL REFERENCES analytics_dashboards(id) ON DELETE CASCADE,
+              schedule_id TEXT REFERENCES analytics_schedules(id) ON DELETE SET NULL,
+              trigger TEXT NOT NULL CHECK(trigger IN ('manual','scheduled','agent')),
+              status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed','cancelled')),
+              widget_count INTEGER NOT NULL DEFAULT 0,
+              widgets_completed INTEGER NOT NULL DEFAULT 0,
+              widgets_succeeded INTEGER NOT NULL DEFAULT 0,
+              current_widget_id TEXT,
+              cancel_requested INTEGER NOT NULL DEFAULT 0,
+              queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+              started_at TEXT,
+              heartbeat_at TEXT,
+              lease_expires_at TEXT,
+              worker_id TEXT,
+              worker_pid INTEGER,
+              error TEXT,
+              completed_at TEXT
+            );
+            INSERT INTO analytics_runs_cancelable
+              (id, dashboard_id, schedule_id, trigger, status, widget_count,
+               widgets_completed, widgets_succeeded, current_widget_id,
+               cancel_requested, queued_at, started_at, heartbeat_at,
+               lease_expires_at, worker_id, worker_pid, error, completed_at)
+            SELECT id, dashboard_id, schedule_id, trigger, status, widget_count,
+               widgets_completed, widgets_succeeded, current_widget_id,
+               COALESCE(cancel_requested, 0), queued_at, started_at, heartbeat_at,
+               lease_expires_at, worker_id, worker_pid, error, completed_at
+            FROM analytics_runs;
+            DROP TABLE analytics_runs;
+            ALTER TABLE analytics_runs_cancelable RENAME TO analytics_runs;
+          `);
+        }
+        if (widgetsNeedCancelRebuild) {
+          db.exec(`
+            DROP INDEX IF EXISTS idx_analytics_run_widgets_progress;
+            CREATE TABLE analytics_run_widgets_cancelable (
+              run_id TEXT NOT NULL REFERENCES analytics_runs(id) ON DELETE CASCADE,
+              widget_id TEXT NOT NULL,
+              position INTEGER NOT NULL,
+              kind TEXT NOT NULL CHECK(kind IN ('metric','table','bar','line','text','visualization')),
+              title TEXT NOT NULL,
+              sql_query TEXT,
+              config_json TEXT NOT NULL DEFAULT '{}',
+              status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed','cancelled')),
+              error TEXT,
+              started_at TEXT,
+              completed_at TEXT,
+              PRIMARY KEY (run_id, widget_id),
+              UNIQUE (run_id, position)
+            );
+            INSERT INTO analytics_run_widgets_cancelable
+            SELECT run_id, widget_id, position, kind, title, sql_query,
+                   config_json, status, error, started_at, completed_at
+            FROM analytics_run_widgets;
+            DROP TABLE analytics_run_widgets;
+            ALTER TABLE analytics_run_widgets_cancelable RENAME TO analytics_run_widgets;
+          `);
+        }
+      })();
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+  }
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_analytics_runs_dashboard
@@ -573,7 +668,7 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
       title TEXT NOT NULL,
       sql_query TEXT,
       config_json TEXT NOT NULL DEFAULT '{}',
-      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed','cancelled')),
       error TEXT,
       started_at TEXT,
       completed_at TEXT,

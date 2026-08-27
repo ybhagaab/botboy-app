@@ -34,6 +34,8 @@ import {
   DOCUMENT_XML_ENTRY,
 } from '../../core/docx-body-editor.js';
 import { listDocumentCorpus, buildDocumentView } from '../../core/document-corpus.js';
+import { decomposeEditedMarkdown } from '../../core/edit-decompose.js';
+import { markdownBlocksOf, markdownLineToDocxText, blockToAnchorParagraphs } from '../../core/markdown-anchor.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -87,6 +89,9 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
 
     res.json({
       ...view,
+      // Edit-mode optimistic-concurrency token (E2): sha of the content the
+      // reader shows; edit-save echoes it and 409s when the base moved.
+      contentSha256: createHash('sha256').update(String(view.content ?? ''), 'utf8').digest('hex'),
       // Lock-retry state (declared below; closures evaluate at request time).
       syncRetry: (() => {
         const entry = lockRetries.get(docKey);
@@ -194,20 +199,84 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     if (!deps.db) return res.status(503).json({ error: 'database unavailable' });
     const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
     try {
-      const edit = createPendingEdit(deps.db, {
-        docKey: String(body.docKey ?? ''),
-        serverRelativeUrl: String(body.serverRelativeUrl ?? ''),
-        siteUrl: typeof body.siteUrl === 'string' ? body.siteUrl : undefined,
-        kind: 'manual', // this endpoint is the reader UI; chat proposals insert via the tool
-        operation: String(body.operation ?? '') as 'replaceText' | 'appendParagraphs' | 'createDocument',
-        findText: typeof body.findText === 'string' ? body.findText : undefined,
-        replaceWith: typeof body.replaceWith === 'string' ? body.replaceWith : undefined,
-        paragraphs: Array.isArray(body.paragraphs) ? body.paragraphs.map(p => String(p)) : undefined,
-        createContent: typeof body.createContent === 'string' ? body.createContent : undefined,
-        projectId: typeof body.projectId === 'string' ? body.projectId : undefined,
-        originNote: typeof body.originNote === 'string' ? body.originNote : 'edited in the reader',
-      });
+      const db = deps.db;
+      // Reader-originated staging. kind 'botboy' is allowed ONLY for the
+      // selection-assist approve (E3) — the owner reviewed the proposal
+      // inline, so preApproved rides the existing status machine
+      // (create + decide in one transaction; approvedAt stamped normally).
+      const kind = body.kind === 'botboy' ? 'botboy' as const : 'manual' as const;
+      const preApproved = body.preApproved === true;
+      const stage = () => {
+        const edit = createPendingEdit(db, {
+          docKey: String(body.docKey ?? ''),
+          serverRelativeUrl: String(body.serverRelativeUrl ?? ''),
+          siteUrl: typeof body.siteUrl === 'string' ? body.siteUrl : undefined,
+          kind,
+          operation: String(body.operation ?? '') as 'replaceText' | 'appendParagraphs' | 'createDocument' | 'replaceParagraphRange',
+          findText: typeof body.findText === 'string' ? body.findText : undefined,
+          replaceWith: typeof body.replaceWith === 'string' ? body.replaceWith : undefined,
+          paragraphs: Array.isArray(body.paragraphs) ? body.paragraphs.map(p => String(p)) : undefined,
+          createContent: typeof body.createContent === 'string' ? body.createContent : undefined,
+          projectId: typeof body.projectId === 'string' ? body.projectId : undefined,
+          originNote: typeof body.originNote === 'string' ? body.originNote : 'edited in the reader',
+        });
+        return preApproved ? decidePendingEdit(db, edit.id, 'approved') : edit;
+      };
+      const edit = preApproved ? db.transaction(stage)() : stage();
       res.json({ edit });
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  });
+
+  /**
+   * Edit-mode save (doc editor E2): decompose the owner's full-document
+   * draft against the current synced extraction and stage every change run
+   * PRE-APPROVED in one transaction (D1/option B — the owner typed these;
+   * the lane shows the decomposition, each row rejectable until sync).
+   * `baseSha` is optimistic concurrency: the draft must have been opened
+   * from the content the server still has, or the save 409s with the draft
+   * preserved client-side.
+   */
+  router.post('/documents/edit-save', (req: Request, res: Response) => {
+    const db = deps.db;
+    if (!db) return res.status(503).json({ error: 'database unavailable' });
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const docKey = String(body.docKey ?? '').trim();
+    const draft = typeof body.draft === 'string' ? body.draft : null;
+    const baseSha = String(body.baseSha ?? '').trim();
+    if (!docKey || draft === null || !baseSha) return res.status(400).json({ error: 'docKey, draft, and baseSha are required' });
+
+    const view = buildDocumentView(db, deps.contentStore, docKey);
+    if (!view) return res.status(404).json({ error: 'unknown document' });
+    if (String(view.doc.fileType ?? '').toLowerCase() !== '.docx') return res.status(400).json({ error: 'edit mode covers .docx documents' });
+    if (view.contentTier !== 'full') return res.status(409).json({ error: 'this document is not fully extracted — Refresh first; truncated content cannot be edited safely' });
+    if (!view.doc.serverRelativeUrl) return res.status(409).json({ error: 'the synced capture carries no SharePoint address — Refresh and retry' });
+    const openEdits = (view.pendingEdits ?? []).filter(edit => edit.status === 'pending' || edit.status === 'approved');
+    if (openEdits.length > 0) return res.status(409).json({ error: 'staged edits already exist for this document — approve & sync or reject them before editing' });
+    const currentSha = createHash('sha256').update(String(view.content ?? ''), 'utf8').digest('hex');
+    if (currentSha !== baseSha) return res.status(409).json({ error: 'the document changed while you were editing — copy your draft, refresh, and re-apply' });
+
+    const { edits, unsupported } = decomposeEditedMarkdown(String(view.content ?? ''), draft);
+    if (edits.length === 0) {
+      return res.json({ staged: [], unsupported, message: unsupported.length ? 'no stageable changes' : 'no changes' });
+    }
+    try {
+      const staged = db.transaction(() => edits.map(edit => {
+        const created = createPendingEdit(db, {
+          docKey,
+          serverRelativeUrl: String(view.doc.serverRelativeUrl),
+          siteUrl: view.doc.siteUrl ? String(view.doc.siteUrl) : undefined,
+          kind: 'manual',
+          operation: edit.operation,
+          findText: edit.findText,
+          replaceWith: edit.replaceWith,
+          paragraphs: edit.paragraphs,
+          originNote: 'edit mode save',
+        });
+        return decidePendingEdit(db, created.id, 'approved');
+      }))();
+      res.json({ staged, unsupported });
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }
@@ -223,6 +292,136 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }
+  });
+
+  /**
+   * Selection → Ask BotBoy (doc editor E3). Derives the edit shape from the
+   * CURRENT synced content at ASSIST time (second-pass rule: the approve
+   * echoes this shape verbatim — block indexes never cross a content
+   * boundary), runs the full-toolset agent loop, and returns ONLY the
+   * proposal + shape. Nothing persists until the owner approves inline.
+   *
+   * The client renders the STAGED PREVIEW, so it sends the selected blocks'
+   * TEXTS (not indexes): we locate them in the synced base by squashed
+   * equality — exactly once → proceed; otherwise the selection sits on
+   * staged-only or ambiguous text → honest 409.
+   */
+  router.post('/documents/assist-edit', async (req: Request, res: Response) => {
+    const db = deps.db;
+    if (!db) return res.status(503).json({ error: 'database unavailable' });
+    if (!deps.agent) return res.status(503).json({ error: 'agent unavailable' });
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const docKey = String(body.docKey ?? '').trim();
+    const selectedText = String(body.selectedText ?? '').trim();
+    const instruction = String(body.instruction ?? '').trim();
+    const blockTexts = Array.isArray(body.blockTexts) ? body.blockTexts.map(x => String(x)) : [];
+    if (!docKey || !selectedText || !instruction || blockTexts.length === 0) {
+      return res.status(400).json({ error: 'docKey, selectedText, blockTexts, and instruction are required' });
+    }
+
+    const view = buildDocumentView(db, deps.contentStore, docKey);
+    if (!view) return res.status(404).json({ error: 'unknown document' });
+    if (String(view.doc.fileType ?? '').toLowerCase() !== '.docx') return res.status(400).json({ error: 'BotBoy selection edits cover .docx documents' });
+    if (!view.doc.serverRelativeUrl) return res.status(409).json({ error: 'the synced capture carries no SharePoint address — Refresh and retry' });
+    const content = String(view.content ?? '');
+    if (!content.trim()) return res.status(409).json({ error: 'no synced content to edit — Refresh first' });
+
+    const squashText = (value: string) => value.replace(/\s+/g, ' ').trim();
+    const blocks = markdownBlocksOf(content);
+    const wanted = blockTexts.map(squashText);
+    const hits: number[] = [];
+    for (let i = 0; i + wanted.length <= blocks.length; i++) {
+      if (wanted.every((text, k) => squashText(blocks[i + k].text) === text)) hits.push(i);
+    }
+    if (hits.length === 0) return res.status(409).json({ error: 'this passage has staged changes not yet on SharePoint — sync or reject them first, then ask BotBoy' });
+    if (hits.length > 1) return res.status(409).json({ error: 'this passage appears more than once — select a longer stretch to make it unique' });
+    const blockStart = hits[0];
+    const blockEnd = blockStart + wanted.length - 1;
+    const selected = blocks.slice(blockStart, blockEnd + 1);
+    if (selected.some(block => block.kind === 'table')) {
+      return res.status(400).json({ error: "tables can't be edited yet — select text outside tables" });
+    }
+
+    // Shape derivation (pre-LLM): sub-line replaceText when the selection is
+    // a proper fragment of ONE single-line plain block, else paragraph range.
+    const anchorLists = selected.map(blockToAnchorParagraphs);
+    if (anchorLists.some(list => list === null || list.length === 0)) {
+      return res.status(400).json({ error: 'this selection could not be anchored — select whole paragraphs' });
+    }
+    const anchors = anchorLists.flatMap(list => list ?? []);
+    const squashedSelection = squashText(selectedText);
+    let subLine: { findText: string; prefix: string; suffix: string } | null = null;
+    if (selected.length === 1 && selected[0].kind === 'plain' && selected[0].lines.length === 1) {
+      const blockDocxText = markdownLineToDocxText(selected[0].lines[0]);
+      const at = blockDocxText.indexOf(squashedSelection);
+      const unique = at !== -1 && blockDocxText.indexOf(squashedSelection, at + 1) === -1;
+      if (unique && squashedSelection.length < blockDocxText.length && blockDocxText.length >= 20) {
+        subLine = { findText: blockDocxText, prefix: blockDocxText.slice(0, at), suffix: blockDocxText.slice(at + squashedSelection.length) };
+      }
+    }
+
+    // Overlap guard: an open staged edit already targets these paragraphs.
+    const openEdits = (view.pendingEdits ?? []).filter(edit => edit.status === 'pending' || edit.status === 'approved');
+    const overlaps = openEdits.some(edit => {
+      if (edit.operation === 'replaceText' && edit.findText) {
+        return anchors.some(anchor => anchor.includes(squashText(edit.findText!)));
+      }
+      if (edit.operation === 'replaceParagraphRange' && Array.isArray(edit.paragraphs)) {
+        const staged = new Set(edit.paragraphs.map(squashText));
+        return anchors.some(anchor => staged.has(anchor));
+      }
+      return false;
+    });
+    if (overlaps) return res.status(409).json({ error: 'this passage already has a staged edit — approve & sync or reject it first' });
+
+    // Context: ±20 lines around the selection in the extracted markdown.
+    const contentLines = content.split('\n');
+    const probeLine = contentLines.findIndex(line => squashText(line).includes(squashText(selected[0].lines[0] ?? selected[0].text.slice(0, 80))));
+    const ctxStart = Math.max(0, (probeLine === -1 ? 0 : probeLine) - 20);
+    const context = contentLines.slice(ctxStart, ctxStart + 40 + selected.reduce((n, block) => n + block.lines.length, 0)).join('\n');
+
+    const projectBit = view.doc.project ? `It belongs to project "${view.doc.project.title}" (id ${view.doc.project.id}) — use that project's brain and evidence for context.` : '';
+    const task = [
+      "You are editing one passage of a synced SharePoint document at the owner's request.",
+      `Document: "${view.doc.title}" (docKey ${docKey}, .docx). ${projectBit}`,
+      'The passage to edit (verbatim, from the extracted document text):',
+      '<<<SELECTION', selectedText, 'SELECTION>>>',
+      'Surrounding document context:',
+      '<<<CONTEXT', context, 'CONTEXT>>>',
+      `Owner's instruction: ${instruction}`,
+      'Rules:',
+      '- Use your tools when the instruction needs facts you do not have (read_document for the full doc, get_project_brain, search_items, MCP reads). Do NOT call any write or staging tool — the reader stages your text after the owner approves it.',
+      '- Your FINAL message must be ONLY the replacement text for the passage, as plain markdown. No preamble, no explanation, no code fences. It replaces the passage verbatim.',
+      "- Match the document's tone and heading/list conventions.",
+      '- If the instruction implies removing the passage entirely, reply with exactly: [DELETE]',
+    ].join('\n');
+
+    const startedAt = Date.now();
+    let out: string;
+    try {
+      out = await deps.agent.executeAction(task);
+    } catch (error) {
+      return res.status(502).json({ error: `BotBoy could not complete the edit: ${(error as Error).message}` });
+    }
+    console.log(`[Documents] assist-edit ${docKey} ${Date.now() - startedAt}ms`);
+    let proposal = String(out ?? '').trim();
+    const fenced = /^```[a-zA-Z]*\n([\s\S]*?)\n?```$/.exec(proposal);
+    if (fenced) proposal = fenced[1].trim();
+    if (!proposal || proposal.startsWith('Error:')) {
+      return res.status(502).json({ error: proposal || 'BotBoy returned an empty proposal — try rephrasing the instruction' });
+    }
+
+    const isDelete = proposal === '[DELETE]';
+    let editShape: Record<string, unknown>;
+    if (subLine) {
+      const spliced = squashText(`${subLine.prefix}${isDelete ? '' : markdownLineToDocxText(proposal)}${subLine.suffix}`);
+      editShape = spliced
+        ? { operation: 'replaceText', findText: subLine.findText, replaceWith: spliced }
+        : { operation: 'replaceParagraphRange', paragraphs: anchors, replaceWith: '' };
+    } else {
+      editShape = { operation: 'replaceParagraphRange', paragraphs: anchors, replaceWith: isDelete ? '' : proposal };
+    }
+    res.json({ replacementMarkdown: isDelete ? '' : proposal, editShape });
   });
 
   /**
@@ -252,7 +451,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const bodyEdits = approved.filter(edit => edit.operation !== 'createDocument');
     const result = await applyDocxBodyEdits(deps.mcpManager, target, bodyEdits.map(edit => ({
       id: edit.id,
-      operation: edit.operation as 'replaceText' | 'appendParagraphs',
+      operation: edit.operation as 'replaceText' | 'appendParagraphs' | 'replaceParagraphRange',
       findText: edit.findText,
       replaceWith: edit.replaceWith,
       paragraphs: edit.paragraphs,

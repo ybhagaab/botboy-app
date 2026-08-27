@@ -160,6 +160,113 @@ export function replaceTextInDocumentXml(documentXml: string, findText: string, 
   return { status: 'replaced', xml, occurrences: 1 };
 }
 
+export interface ReplaceRangeResult {
+  status: 'replaced' | 'not_found' | 'ambiguous' | 'in_table';
+  xml?: string;
+  occurrences: number;
+}
+
+/** Squashed paragraph text, matching document-parser › docxParagraphText
+ * (w:t text; tabs and breaks count as spaces; whitespace squashed). Anchors
+ * derived from extracted markdown compare against exactly this form. */
+function paragraphSquashedText(paragraphXml: string): string {
+  const pieces: string[] = [];
+  for (const m of paragraphXml.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>|<w:tab\/>|<w:br\/>/g)) {
+    pieces.push(m[1] !== undefined ? decodeXml(m[1]) : ' ');
+  }
+  return pieces.join('').replace(/\s+/g, ' ').trim();
+}
+
+/** Outer <w:tbl> spans via depth scan (tables nest inside cells) — mirrors
+ * document-parser › docxTableRanges. Paragraphs inside these spans are
+ * invisible to the parser's markdown, so range anchors must not bind them. */
+function tableRangesOf(documentXml: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  let depth = 0;
+  let start = -1;
+  for (const m of documentXml.matchAll(/<w:tbl(?=[\s>])|<\/w:tbl>/g)) {
+    if (m[0] === '</w:tbl>') {
+      depth--;
+      if (depth === 0 && start >= 0) { ranges.push({ start, end: m.index! + m[0].length }); start = -1; }
+    } else {
+      if (depth === 0) start = m.index!;
+      depth++;
+    }
+  }
+  return ranges;
+}
+
+/**
+ * Replace a CONTIGUOUS run of paragraphs (matched by their squashed text, in
+ * order) with pre-built paragraph XML blocks (doc editor E1). Empty
+ * `replacementBlocksXml` deletes the run. Matching skips text-empty spacer
+ * paragraphs (the parser never emitted them into the markdown the anchors
+ * came from); spacers INSIDE the matched span are replaced with it. The
+ * anchor sequence must match exactly once among non-table paragraphs;
+ * a sequence that exists only inside a table reports `in_table` (splicing
+ * table internals would corrupt the package).
+ */
+/**
+ * Anchor comparison normalization: leading list markers are AMBIGUOUS across
+ * markdown dialects — the local parser INJECTS "1. "/"- " for real Word
+ * lists (marker NOT in w:t text), while BotBoy-built docs carry literal
+ * "1. "/"• " IN the text (and the MCP converter escapes them as "1\\.").
+ * Stripping the marker from BOTH sides makes every dialect meet in the
+ * middle; sequence matching + the exactly-once rule keep it safe.
+ */
+function anchorComparableText(value: string): string {
+  return value.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').replace(/\s+/g, ' ').trim();
+}
+
+export function replaceParagraphRangeInDocumentXml(
+  documentXml: string,
+  anchorParagraphs: string[],
+  replacementBlocksXml: string[],
+): ReplaceRangeResult {
+  const anchors = anchorParagraphs.map(a => anchorComparableText(String(a))).filter(a => a.length > 0);
+  if (anchors.length === 0) return { status: 'not_found', occurrences: 0 };
+
+  const tables = tableRangesOf(documentXml);
+  const inTable = (offset: number) => tables.some(range => offset >= range.start && offset < range.end);
+
+  interface Para { start: number; end: number; text: string; table: boolean }
+  const paras: Para[] = [];
+  for (const m of documentXml.matchAll(/<w:p\b[\s\S]*?<\/w:p>/g)) {
+    const text = anchorComparableText(paragraphSquashedText(m[0]));
+    if (!text) continue; // parser-invisible spacers never anchor
+    paras.push({ start: m.index!, end: m.index! + m[0].length, text, table: inTable(m.index!) });
+  }
+
+  const matchesAt = (list: Para[], from: number): boolean =>
+    anchors.every((anchor, i) => list[from + i] && list[from + i].text === anchor);
+
+  const bodyParas = paras.filter(p => !p.table);
+  const hits: Array<{ first: Para; last: Para }> = [];
+  for (let i = 0; i + anchors.length <= bodyParas.length; i++) {
+    if (matchesAt(bodyParas, i)) hits.push({ first: bodyParas[i], last: bodyParas[i + anchors.length - 1] });
+  }
+  if (hits.length === 0) {
+    // Distinguish "moved/changed" from "only lives inside a table".
+    for (let i = 0; i + anchors.length <= paras.length; i++) {
+      if (matchesAt(paras, i)) return { status: 'in_table', occurrences: 1 };
+    }
+    return { status: 'not_found', occurrences: 0 };
+  }
+  if (hits.length > 1) return { status: 'ambiguous', occurrences: hits.length };
+
+  const hit = hits[0];
+  // Guard: the span between first and last must not cross INTO a table
+  // (anchors matched outside tables, but a table could sit between them —
+  // that means the anchors were not truly contiguous in the document).
+  if (tables.some(range => range.start >= hit.first.end && range.end <= hit.last.start)) {
+    return { status: 'not_found', occurrences: 0 };
+  }
+  const xml = documentXml.slice(0, hit.first.start)
+    + replacementBlocksXml.join('')
+    + documentXml.slice(hit.last.end);
+  return { status: 'replaced', xml, occurrences: 1 };
+}
+
 /**
  * Extract each comment's anchored passage from the document body. Word
  * marks comment ranges with <w:commentRangeStart w:id="N"/> …
@@ -293,6 +400,7 @@ export const DOCUMENT_XML_ENTRY = 'word/document.xml';
 // Used by BOTH the chat guided tool (direct mode) and the reader's Sync.
 
 import type { McpManager } from './mcp-types.js';
+import { markdownLineToDocxText } from './markdown-anchor.js';
 
 /**
  * Map a SharePoint server-relative URL onto sharepoint_write_file's
@@ -437,9 +545,10 @@ export function markdownToDocxParagraphs(markdown: string): string[] {
 
 export interface DocxBodyEdit {
   id: string;
-  operation: 'replaceText' | 'appendParagraphs';
+  operation: 'replaceText' | 'appendParagraphs' | 'replaceParagraphRange';
   findText?: string | null;
   replaceWith?: string | null;
+  /** appendParagraphs: plain paragraph texts. replaceParagraphRange: docx-text anchors (one per paragraph). */
   paragraphs?: string[] | null;
 }
 
@@ -492,6 +601,33 @@ export async function applyDocxBodyEdits(
           perEdit.push({ id: edit.id, applied: false, reason: `passage matches ${result.occurrences} places — add surrounding text to make it unique` });
         } else {
           perEdit.push({ id: edit.id, applied: false, reason: 'passage not found in the current document — it changed since this edit was written; re-create the edit from current text' });
+        }
+      } else if (edit.operation === 'replaceParagraphRange') {
+        const anchors = (edit.paragraphs ?? []).map(a => String(a)).filter(a => a.trim());
+        if (anchors.length === 0) {
+          perEdit.push({ id: edit.id, applied: false, reason: 'no anchor paragraphs for the range' });
+          continue;
+        }
+        const replacementMarkdown = String(edit.replaceWith ?? '');
+        const blocks = replacementMarkdown.trim() ? markdownToDocxParagraphs(replacementMarkdown) : [];
+        const result = replaceParagraphRangeInDocumentXml(xml, anchors, blocks);
+        if (result.status === 'replaced') {
+          xml = result.xml!;
+          // Read-back probe: the longest replacement line in docx-text form
+          // (read-back is converter markdown; block markers may differ, so
+          // probe the marker-stripped text — same form the converter's text
+          // carries). Deletions probe nothing (same as empty-probe skip).
+          const probe = replacementMarkdown.trim()
+            ? replacementMarkdown.split('\n').map(markdownLineToDocxText).reduce((a, b) => (b.length > a.length ? b : a), '')
+            : '';
+          if (probe) probes.push(probe);
+          perEdit.push({ id: edit.id, applied: true });
+        } else if (result.status === 'ambiguous') {
+          perEdit.push({ id: edit.id, applied: false, reason: `the paragraph run matches ${result.occurrences} places — extend the range to make it unique` });
+        } else if (result.status === 'in_table') {
+          perEdit.push({ id: edit.id, applied: false, reason: "the passage is inside a table — table edits aren't supported yet" });
+        } else {
+          perEdit.push({ id: edit.id, applied: false, reason: 'the paragraph run was not found in the current document — it changed since this edit was written; re-create the edit from current text' });
         }
       } else {
         const paragraphs = (edit.paragraphs ?? []).filter(p => p.trim());

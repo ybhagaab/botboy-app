@@ -15,11 +15,20 @@ import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
 import {
   createAnalyticsSchemaBriefingLoader,
-  detectAnalyticsConversation,
+  resolveConversationMode,
   detectAnalyticsCreateIntent,
   isAnalyticsReplyGrounded,
   type AnalyticsSchemaBriefing,
 } from '../../core/analytics-chat-context.js';
+
+/**
+ * Chat-panel thinking dropdown values. Absent/empty means 'off' (the
+ * pre-dropdown default: fastest answers); unknown values are rejected (null).
+ */
+export function normalizeThinkingLevel(value: unknown): 'off' | 'low' | 'high' | 'max' | null {
+  if (value === undefined || value === null || value === '') return 'off';
+  return value === 'off' || value === 'low' || value === 'high' || value === 'max' ? value : null;
+}
 
 export function createChatRouter(deps: RouterDeps, dashboardState: DashboardState): Router {
   const router = Router();
@@ -97,13 +106,18 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     if (body.intent !== undefined && body.intent !== 'create') {
       return res.status(400).json({ error: 'intent must be create when provided' });
     }
-    const automaticallyDetected = requestedMode === undefined
-      && detectAnalyticsConversation(message);
-    const conversationMode: 'general' | 'analytics_dashboard' = requestedMode === 'general'
-      ? 'general'
-      : requestedMode === 'analytics_dashboard' || automaticallyDetected
-        ? 'analytics_dashboard'
-        : 'general';
+    // Thinking-effort dropdown (chat panel, 2026-08-27). 'off' preserves the
+    // pre-dropdown behavior; low/high/max enable thinking at that effort.
+    const thinkingLevel = normalizeThinkingLevel(body.thinking);
+    if (thinkingLevel === null) {
+      return res.status(400).json({ error: 'thinking must be off, low, high, or max when provided' });
+    }
+    // modeHint is ambient page context (an analytics route being open). It is
+    // advisory — the message must corroborate — unlike mode, which commands.
+    // Owner report 2026-08-27: an unrelated message sent while a dashboard was
+    // open+refreshing got forced into analytics mode and queued behind the
+    // refresh's MCP calls.
+    const conversationMode = resolveConversationMode({ requestedMode, modeHint: body.modeHint, message }).mode;
     const analyticsIntent = conversationMode === 'analytics_dashboard' && (
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
@@ -447,10 +461,15 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               // tool definitions entirely so the model must answer in text.
               tools: toolsDisabled ? [] : tools,
               maxTokens: CHAT_MAX_COMPLETION_TOKENS,
-              // Max reasoning for the document-writing iterations of a turn
-              // (armed by get_document_writing_guide); normal chat stays fast.
-              think: documentAuthoringThink,
-              ...(documentAuthoringThink ? { reasoningEffort: 'max' as const } : {}),
+              // Document-writing iterations (armed by get_document_writing_guide)
+              // always think at max — the owner's dropdown cannot lower that
+              // designed floor. Otherwise the dropdown decides: off = no
+              // thinking (pre-dropdown default), low/high/max = think at
+              // that effort.
+              think: documentAuthoringThink || thinkingLevel !== 'off',
+              ...(documentAuthoringThink
+                ? { reasoningEffort: 'max' as const }
+                : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
             });
             let iterResult = await gen.next();
             while (!iterResult.done) {

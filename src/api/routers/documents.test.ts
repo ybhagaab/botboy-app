@@ -447,3 +447,302 @@ describe('documents router', () => {
     expect(unwired.status).toBe(503);
   });
 });
+
+/**
+ * Edit-mode save endpoint (doc editor E2): full-draft decomposition staged
+ * PRE-APPROVED in one transaction, guarded by baseSha optimistic
+ * concurrency, the open-edits gate, and the full-extraction tier gate.
+ */
+describe('POST /api/documents/edit-save', () => {
+  let storage: StorageLayer;
+  let dir: string;
+  let cs: ContentStore;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    dir = mkdtempSync(path.join(os.tmpdir(), 'ppt-edit-save-'));
+    cs = createContentStore(storage.getDb(), { contentDir: dir });
+  });
+  afterEach(() => {
+    storage.close();
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  function appWith(extra: Partial<RouterDeps> = {}) {
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createDocumentsRouter({ db: storage.getDb(), contentStore: cs, ...extra } as RouterDeps));
+    return app;
+  }
+
+  const DOC_KEY = 'amazon.sharepoint.com/sites/t/Shared Documents/HLD.docx';
+  const CONTENT = '## Overview\n\nThe system captures evidence continuously.\n\nClosing remarks paragraph for the doc.';
+
+  function insertCapture(id: string, content: string, tier = 'full') {
+    const cols = refToColumns(cs.put(id, content));
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, project_id, metadata, summary,
+                              raw_text, content_storage, content_path, content_sha256, content_bytes)
+      VALUES (?, 'document_capture', 'sharepoint', 'HLD.docx', ?, ?, 'routed', 'p1', ?, NULL, ?, ?, ?, ?, ?)
+    `).run(
+      id, 'https://x/hld', '2026-08-25T10:00:00Z',
+      JSON.stringify({
+        docKey: DOC_KEY, webUrl: 'https://x/hld',
+        serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx', siteUrl: 'https://amazon.sharepoint.com/sites/t',
+        fileType: '.docx', extractionTier: tier, sizeBytes: '2048', lastModified: '2026-08-25T10:00:00Z',
+      }),
+      cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes,
+    );
+  }
+
+  async function shaOf(app: express.Express): Promise<string> {
+    const view = await request(app).get('/api/documents/view').query({ docKey: DOC_KEY });
+    expect(view.status).toBe(200);
+    return view.body.contentSha256;
+  }
+
+  it('stages decomposed runs pre-approved and reports unsupported runs', async () => {
+    insertCapture('c1', CONTENT);
+    const app = appWith();
+    const baseSha = await shaOf(app);
+    const draft = CONTENT
+      .replace('The system captures evidence continuously.', 'The system records evidence continuously and losslessly.')
+      + '\n\nA new plain closing addendum.';
+    const res = await request(app).post('/api/documents/edit-save').send({ docKey: DOC_KEY, draft, baseSha });
+    expect(res.status).toBe(200);
+    expect(res.body.staged).toHaveLength(2);
+    for (const row of res.body.staged) {
+      expect(row.status).toBe('approved');
+      expect(row.kind).toBe('manual');
+      expect(row.approvedAt).toBeTruthy();
+      expect(row.originNote).toBe('edit mode save');
+    }
+    const ops = res.body.staged.map((row: any) => row.operation).sort();
+    expect(ops).toEqual(['appendParagraphs', 'replaceText']);
+  });
+
+  it('409s on baseSha mismatch and stages NOTHING', async () => {
+    insertCapture('c1', CONTENT);
+    const app = appWith();
+    const res = await request(app).post('/api/documents/edit-save').send({ docKey: DOC_KEY, draft: `${CONTENT}\n\nNew tail.`, baseSha: 'deadbeef' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/changed while you were editing/);
+    const edits = await request(app).get('/api/documents/pending-edits').query({ docKey: DOC_KEY });
+    expect(edits.body.edits).toHaveLength(0);
+  });
+
+  it('409s while open staged edits exist (D8 gate)', async () => {
+    insertCapture('c1', CONTENT);
+    const app = appWith();
+    const baseSha = await shaOf(app);
+    await request(app).post('/api/documents/pending-edits').send({
+      docKey: DOC_KEY, serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx',
+      operation: 'replaceText', findText: 'Closing remarks paragraph for the doc.', replaceWith: 'Closing.',
+    }).expect(200);
+    const res = await request(app).post('/api/documents/edit-save').send({ docKey: DOC_KEY, draft: `${CONTENT} x`, baseSha });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/staged edits already exist/);
+  });
+
+  it('rejects truncated extractions and non-docx targets', async () => {
+    insertCapture('c1', CONTENT, 'truncated');
+    const app = appWith();
+    const res = await request(app).post('/api/documents/edit-save').send({ docKey: DOC_KEY, draft: CONTENT, baseSha: 'x' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/not fully extracted/);
+  });
+
+  it('no changes → friendly no-op with zero rows', async () => {
+    insertCapture('c1', CONTENT);
+    const app = appWith();
+    const baseSha = await shaOf(app);
+    const res = await request(app).post('/api/documents/edit-save').send({ docKey: DOC_KEY, draft: CONTENT, baseSha });
+    expect(res.status).toBe(200);
+    expect(res.body.staged).toEqual([]);
+    expect(res.body.message).toBe('no changes');
+  });
+
+  it('preApproved staging via POST /documents/pending-edits (E3 approve path)', async () => {
+    insertCapture('c1', CONTENT);
+    const app = appWith();
+    const res = await request(app).post('/api/documents/pending-edits').send({
+      docKey: DOC_KEY, serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx',
+      kind: 'botboy', preApproved: true,
+      operation: 'replaceParagraphRange', paragraphs: ['Closing remarks paragraph for the doc.'],
+      replaceWith: 'Rewritten closing.', originNote: 'make it crisper',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.edit.status).toBe('approved');
+    expect(res.body.edit.kind).toBe('botboy');
+    expect(res.body.edit.approvedAt).toBeTruthy();
+  });
+});
+
+/**
+ * Selection → Ask BotBoy endpoint (doc editor E3): shape derived at ASSIST
+ * time from the synced base (client sends block TEXTS — the rendered view is
+ * the staged preview), full task framing to the agent, fence stripping,
+ * [DELETE] mapping, overlap/table/staged-only guards.
+ */
+describe('POST /api/documents/assist-edit', () => {
+  let storage: StorageLayer;
+  let dir: string;
+  let cs: ContentStore;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    dir = mkdtempSync(path.join(os.tmpdir(), 'ppt-assist-'));
+    cs = createContentStore(storage.getDb(), { contentDir: dir });
+  });
+  afterEach(() => {
+    storage.close();
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  const DOC_KEY = 'amazon.sharepoint.com/sites/t/Shared Documents/HLD.docx';
+  const CONTENT = '## Overview\n\nThe system captures evidence continuously across sources.\n\n1. enable capture\n2. review projects\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nClosing remarks paragraph for the doc.';
+
+  function insertCapture(content = CONTENT) {
+    const cols = refToColumns(cs.put('c1', content));
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, project_id, metadata, summary,
+                              raw_text, content_storage, content_path, content_sha256, content_bytes)
+      VALUES ('c1', 'document_capture', 'sharepoint', 'HLD.docx', 'https://x/hld', '2026-08-25T10:00:00Z', 'routed', 'p1', ?, NULL, ?, ?, ?, ?, ?)
+    `).run(
+      JSON.stringify({
+        docKey: DOC_KEY, webUrl: 'https://x/hld',
+        serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx',
+        fileType: '.docx', extractionTier: 'full', sizeBytes: '2048', lastModified: '2026-08-25T10:00:00Z',
+      }),
+      cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes,
+    );
+  }
+
+  function appWithAgent(reply: string | ((task: string) => string)) {
+    const tasks: string[] = [];
+    const agent = {
+      executeAction: async (task: string) => {
+        tasks.push(task);
+        return typeof reply === 'function' ? reply(task) : reply;
+      },
+    };
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createDocumentsRouter({ db: storage.getDb(), contentStore: cs, agent, ...( {} as Partial<RouterDeps>) } as RouterDeps));
+    return { app, tasks };
+  }
+
+  it('derives a range shape, frames the task, strips fences, and persists NOTHING', async () => {
+    insertCapture();
+    const { app, tasks } = appWithAgent('```markdown\nThe system records evidence continuously, without loss.\n```');
+    const res = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY,
+      selectedText: 'The system captures evidence continuously across sources.',
+      blockTexts: ['The system captures evidence continuously across sources.'],
+      instruction: 'make this crisper',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.replacementMarkdown).toBe('The system records evidence continuously, without loss.');
+    // Sub-line rule NOT triggered (selection == whole block) → range shape.
+    expect(res.body.editShape.operation).toBe('replaceParagraphRange');
+    expect(res.body.editShape.paragraphs).toEqual(['The system captures evidence continuously across sources.']);
+    expect(res.body.editShape.replaceWith).toBe('The system records evidence continuously, without loss.');
+    // Task framing carried selection, context, instruction, and the rules.
+    expect(tasks[0]).toContain('<<<SELECTION');
+    expect(tasks[0]).toContain('make this crisper');
+    expect(tasks[0]).toContain('[DELETE]');
+    expect(tasks[0]).toContain('Do NOT call any write or staging tool');
+    // Nothing staged.
+    const edits = await request(app).get('/api/documents/pending-edits').query({ docKey: DOC_KEY });
+    expect(edits.body.edits).toHaveLength(0);
+  });
+
+  it('sub-line selection inside a long plain block → replaceText with spliced replacement', async () => {
+    insertCapture();
+    const { app } = appWithAgent('captures every signal');
+    const res = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY,
+      selectedText: 'captures evidence',
+      blockTexts: ['The system captures evidence continuously across sources.'],
+      instruction: 'stronger verb',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.editShape.operation).toBe('replaceText');
+    expect(res.body.editShape.findText).toBe('The system captures evidence continuously across sources.');
+    expect(res.body.editShape.replaceWith).toBe('The system captures every signal continuously across sources.');
+  });
+
+  it('multi-block selection over list items anchors per item; [DELETE] maps to empty range replacement', async () => {
+    insertCapture();
+    const { app } = appWithAgent('[DELETE]');
+    const res = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY,
+      selectedText: 'enable capture review projects',
+      blockTexts: ['1. enable capture\n2. review projects'],
+      instruction: 'remove this list',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.replacementMarkdown).toBe('');
+    expect(res.body.editShape.operation).toBe('replaceParagraphRange');
+    expect(res.body.editShape.paragraphs).toEqual(['enable capture', 'review projects']);
+    expect(res.body.editShape.replaceWith).toBe('');
+  });
+
+  it('guards: table selection 400, staged-only text 409, overlap 409, agent error 502', async () => {
+    insertCapture();
+    const { app } = appWithAgent('irrelevant');
+    const table = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY, selectedText: 'a b', blockTexts: ['| a | b |\n| --- | --- |\n| 1 | 2 |'], instruction: 'x',
+    });
+    expect(table.status).toBe(400);
+    expect(table.body.error).toMatch(/table/i);
+
+    const stagedOnly = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY, selectedText: 'nope', blockTexts: ['Text that only exists in a staged preview.'], instruction: 'x',
+    });
+    expect(stagedOnly.status).toBe(409);
+    expect(stagedOnly.body.error).toMatch(/staged changes|more than once|staged/i);
+
+    await request(app).post('/api/documents/pending-edits').send({
+      docKey: DOC_KEY, serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx',
+      operation: 'replaceParagraphRange', paragraphs: ['Closing remarks paragraph for the doc.'], replaceWith: 'X',
+    }).expect(200);
+    const overlap = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY, selectedText: 'Closing remarks', blockTexts: ['Closing remarks paragraph for the doc.'], instruction: 'x',
+    });
+    expect(overlap.status).toBe(409);
+    expect(overlap.body.error).toMatch(/already has a staged edit/);
+
+    const { app: errApp } = appWithAgent('Error: model unavailable');
+    const err = await request(errApp).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY, selectedText: 'The system captures evidence continuously across sources.', blockTexts: ['The system captures evidence continuously across sources.'], instruction: 'x',
+    });
+    expect(err.status).toBe(502);
+  });
+
+  it('index-drift regression: shape echoed at approve targets the ORIGINAL text even after content moves', async () => {
+    insertCapture();
+    const { app } = appWithAgent('Sharper closing.');
+    const res = await request(app).post('/api/documents/assist-edit').send({
+      docKey: DOC_KEY,
+      selectedText: 'Closing remarks paragraph for the doc.',
+      blockTexts: ['Closing remarks paragraph for the doc.'],
+      instruction: 'sharpen',
+    });
+    expect(res.status).toBe(200);
+    const shape = res.body.editShape;
+    // Content shifts (a refresh lands a new revision) — the shape still
+    // carries the anchor TEXT, so approving stages the right target; apply
+    // time remains the final guard.
+    const approve = await request(app).post('/api/documents/pending-edits').send({
+      docKey: DOC_KEY, serverRelativeUrl: '/sites/t/Shared Documents/HLD.docx',
+      kind: 'botboy', preApproved: true, originNote: 'sharpen', ...shape,
+    });
+    expect(approve.status).toBe(200);
+    expect(approve.body.edit.status).toBe('approved');
+    expect(approve.body.edit.paragraphs).toEqual(['Closing remarks paragraph for the doc.']);
+    expect(approve.body.edit.replaceWith).toBe('Sharper closing.');
+  });
+});

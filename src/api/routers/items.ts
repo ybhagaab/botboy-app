@@ -24,6 +24,7 @@ export function createItemsRouter(deps: RouterDeps): Router {
     const rows = db.prepare(`
       SELECT wi.id, wi.type, wi.source, wi.source_app, wi.title, wi.summary,
              wi.url, wi.parsed_text, wi.captured_at,
+             json_extract(wi.metadata, '$.docKey') AS doc_key,
              n.id as node_id, n.title as node_title
       FROM work_items wi
       LEFT JOIN node_work_items nwi ON wi.id = nwi.work_item_id
@@ -33,7 +34,44 @@ export function createItemsRouter(deps: RouterDeps): Router {
       LIMIT ?
     `).all(pattern, pattern, pattern, limit) as any[];
 
-    const results = rows.map((r: any) => {
+    // Collapse duplicates (owner report 2026-08-27: one SharePoint doc
+    // showed once PER REVISION/COMMENT and every hit opened the browser).
+    // Three dupe sources, three rules — all presentation-side, evidence rows
+    // stay intact in the store:
+    //   1. node join fans one item into a row per node → first row per id;
+    //   2. synced docs: every revision/comment shares a docKey → ONE entry
+    //      per docKey carrying it (UI routes to the staged reader). The
+    //      representative prefers the newest document_CAPTURE title — a
+    //      comment row being newest must not retitle the document entry;
+    //   3. ambient look-alikes: repeat browser visits / notifications with
+    //      the SAME source+type+title (viewing the doc five times) → newest
+    //      wins, count collapsed.
+    const seenIds = new Set<string>();
+    const seen = new Map<string, any>();
+    for (const r of rows) {
+      if (seenIds.has(r.id)) continue; // node fan-out
+      seenIds.add(r.id);
+      const key = r.doc_key
+        ? `doc:${r.doc_key}`
+        : `t:${r.source}\u0000${r.type}\u0000${String(r.title || '').replace(/\s+/g, ' ').trim().toLowerCase()}`;
+      const existing = seen.get(key);
+      if (!existing) {
+        seen.set(key, r);
+        continue;
+      }
+      existing.collapsed_count = (existing.collapsed_count || 0) + 1;
+      // Rows arrive newest-first, so the representative is already the
+      // newest — EXCEPT a docKey group repped by a comment when an older
+      // CAPTURE exists: swap the identity fields, keep the count.
+      if (r.doc_key && existing.type !== 'document_capture' && r.type === 'document_capture') {
+        existing.id = r.id; existing.type = r.type; existing.title = r.title;
+        existing.summary = r.summary; existing.url = r.url;
+        existing.source_app = r.source_app;
+      }
+    }
+    const deduped = [...seen.values()];
+
+    const results = deduped.map((r: any) => {
       // Determine which field matched and extract snippet
       const lq = q.toLowerCase();
       let matchField = 'title';
@@ -47,7 +85,12 @@ export function createItemsRouter(deps: RouterDeps): Router {
       const snippet = (start > 0 ? '...' : '') + source.slice(start, end) + (end < source.length ? '...' : '');
 
       return {
-        item: { id: r.id, type: r.type, source: r.source, sourceApp: r.source_app, title: r.title, summary: r.summary, url: r.url, capturedAt: r.captured_at },
+        item: {
+          id: r.id, type: r.type, source: r.source, sourceApp: r.source_app, title: r.title,
+          summary: r.summary, url: r.url, capturedAt: r.captured_at,
+          ...(r.doc_key ? { docKey: r.doc_key } : {}),
+          ...(r.doc_key || r.collapsed_count ? { collapsedCount: r.collapsed_count || 0 } : {}),
+        },
         node: r.node_id ? { id: r.node_id, title: r.node_title } : null,
         matchField,
         snippet,

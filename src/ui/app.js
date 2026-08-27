@@ -34,11 +34,40 @@ function setChatRequestContext(context) {
 }
 
 function setAmbientChatRequestContext(context) {
-  ambientChatRequestContext = normalizeChatRequestContext(context);
+  // Ambient context (a route merely being open) is sent as an advisory HINT,
+  // never a hard mode — the server only honors it when the message itself
+  // corroborates. Explicit CTA buttons still send mode (a command).
+  const normalized = normalizeChatRequestContext(context);
+  ambientChatRequestContext = normalized?.mode === 'analytics_dashboard'
+    ? { modeHint: 'analytics_dashboard' }
+    : null;
 }
 
 function clearChatRequestContext() {
   chatRequestContext = null;
+}
+
+// Thinking-effort preference (chat panel dropdown). Off = fastest answers
+// (the pre-dropdown default); low/high/max map to the provider-neutral
+// reasoning contract server-side. Persisted per browser.
+const CHAT_THINKING_KEY = 'botboy.chat.thinking';
+const CHAT_THINKING_LEVELS = ['off', 'low', 'high', 'max'];
+
+function chatThinkingLevel() {
+  try {
+    const stored = localStorage.getItem(CHAT_THINKING_KEY);
+    return CHAT_THINKING_LEVELS.includes(stored) ? stored : 'off';
+  } catch { return 'off'; }
+}
+
+function initChatThinkingControl() {
+  const select = document.getElementById('chat-effort');
+  if (!select) return;
+  select.value = chatThinkingLevel();
+  select.addEventListener('change', () => {
+    const value = CHAT_THINKING_LEVELS.includes(select.value) ? select.value : 'off';
+    try { localStorage.setItem(CHAT_THINKING_KEY, value); } catch {}
+  });
 }
 
 function activeChatRequestContext() {
@@ -182,7 +211,7 @@ async function sendChat(msg) {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, stream: true, ...(activeChatRequestContext() || {}) }),
+      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), ...(activeChatRequestContext() || {}) }),
     });
 
     if (!resp.ok) {
@@ -2567,6 +2596,7 @@ document.addEventListener('click', (e) => {
     });
   }
 
+  initChatThinkingControl();
   await Promise.all([
     loadRoots(),
     loadChatHistory(),

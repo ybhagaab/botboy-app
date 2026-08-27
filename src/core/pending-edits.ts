@@ -16,7 +16,7 @@ import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 
 export type PendingEditKind = 'manual' | 'botboy';
-export type PendingEditOperation = 'replaceText' | 'appendParagraphs' | 'createDocument';
+export type PendingEditOperation = 'replaceText' | 'appendParagraphs' | 'createDocument' | 'replaceParagraphRange';
 export type PendingEditStatus = 'pending' | 'approved' | 'rejected' | 'synced' | 'conflicted';
 
 export interface PendingEdit {
@@ -61,7 +61,7 @@ const TABLE_SCHEMA = `(
       server_relative_url TEXT NOT NULL,
       site_url TEXT,
       kind TEXT NOT NULL CHECK(kind IN ('manual','botboy')),
-      operation TEXT NOT NULL CHECK(operation IN ('replaceText','appendParagraphs','createDocument')),
+      operation TEXT NOT NULL CHECK(operation IN ('replaceText','appendParagraphs','createDocument','replaceParagraphRange')),
       find_text TEXT,
       replace_with TEXT,
       paragraphs_json TEXT,
@@ -103,6 +103,32 @@ export function ensurePendingEditsTable(db: Database.Database): void {
       COMMIT;
     `);
     console.log('[PendingEdits] table rebuilt for createDocument support (rows preserved)');
+  }
+  // Migration (doc editor E1): admit replaceParagraphRange. ⚠️ Unlike the
+  // branch above, the copy list MUST carry create_content and project_id —
+  // this table version already has them (staged creations would silently
+  // lose their content otherwise; second-pass find, DOC_EDITOR_UX_PLAN.md).
+  const schema2 = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_pending_edits'",
+  ).get() as { sql: string } | undefined;
+  if (schema2 && !schema2.sql.includes('replaceParagraphRange')) {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE document_pending_edits_new ${TABLE_SCHEMA};
+      INSERT INTO document_pending_edits_new
+        (id, doc_key, server_relative_url, site_url, kind, operation, find_text, replace_with,
+         paragraphs_json, create_content, project_id, status, conflict_reason, origin_note,
+         created_at, approved_at, synced_at)
+      SELECT id, doc_key, server_relative_url, site_url, kind, operation, find_text, replace_with,
+             paragraphs_json, create_content, project_id, status, conflict_reason, origin_note,
+             created_at, approved_at, synced_at
+      FROM document_pending_edits;
+      DROP TABLE document_pending_edits;
+      ALTER TABLE document_pending_edits_new RENAME TO document_pending_edits;
+      CREATE INDEX IF NOT EXISTS idx_pending_edits_dockey ON document_pending_edits(doc_key, status);
+      COMMIT;
+    `);
+    console.log('[PendingEdits] table rebuilt for replaceParagraphRange support (rows preserved)');
   }
 }
 
@@ -173,8 +199,22 @@ export function createPendingEdit(db: Database.Database, input: CreatePendingEdi
   } else if (input.operation === 'appendParagraphs') {
     const paragraphs = (input.paragraphs ?? []).filter(p => p.trim());
     if (paragraphs.length === 0) throw new Error('appendParagraphs needs at least one non-empty paragraph');
+  } else if (input.operation === 'replaceParagraphRange') {
+    // Anchors are docx-text paragraphs (one per entry, markdown markers
+    // stripped). No 20-char floor: uniqueness is enforced at APPLY time
+    // (exactly-once contiguous match; short unique headings are legitimate).
+    // Empty replaceWith is a DELETION — the key difference from replaceText.
+    const anchors = (input.paragraphs ?? []).map(a => String(a).replace(/\s+/g, ' ').trim());
+    if (anchors.length === 0 || anchors.every(a => !a)) {
+      throw new Error('replaceParagraphRange needs at least one anchor paragraph');
+    }
+    if (anchors.some(a => !a)) throw new Error('anchor paragraphs cannot be empty');
+    if (anchors.some(a => a.length < 3)) throw new Error('each anchor paragraph must be at least 3 characters');
+    if ((input.paragraphs ?? []).some(a => String(a).includes('\n'))) {
+      throw new Error('each anchor entry is ONE paragraph (no newlines) — pass one entry per paragraph');
+    }
   } else {
-    throw new Error('operation must be replaceText, appendParagraphs, or createDocument');
+    throw new Error('operation must be replaceText, appendParagraphs, replaceParagraphRange, or createDocument');
   }
 
   const edit: PendingEdit = {
@@ -185,8 +225,16 @@ export function createPendingEdit(db: Database.Database, input: CreatePendingEdi
     kind: input.kind,
     operation: input.operation,
     findText: input.operation === 'replaceText' ? String(input.findText) : null,
-    replaceWith: input.operation === 'replaceText' ? String(input.replaceWith) : null,
-    paragraphs: input.operation === 'appendParagraphs' ? (input.paragraphs ?? []).filter(p => p.trim()) : null,
+    replaceWith: input.operation === 'replaceText'
+      ? String(input.replaceWith)
+      : input.operation === 'replaceParagraphRange'
+        ? String(input.replaceWith ?? '')
+        : null,
+    paragraphs: input.operation === 'appendParagraphs'
+      ? (input.paragraphs ?? []).filter(p => p.trim())
+      : input.operation === 'replaceParagraphRange'
+        ? (input.paragraphs ?? []).map(a => String(a).replace(/\s+/g, ' ').trim()).filter(Boolean)
+        : null,
     createContent: input.operation === 'createDocument' ? String(input.createContent) : null,
     projectId: input.projectId?.trim() || null,
     status: 'pending',
@@ -238,7 +286,14 @@ export function getPendingEdit(db: Database.Database, id: string): PendingEdit |
 export function decidePendingEdit(db: Database.Database, id: string, decision: 'approved' | 'rejected', nowIso = new Date().toISOString()): PendingEdit {
   const edit = getPendingEdit(db, id);
   if (!edit) throw new Error(`unknown pending edit '${id}'`);
-  if (edit.status !== 'pending') throw new Error(`edit is already ${edit.status}`);
+  // Approval moves ONLY pending rows. Rejection additionally accepts
+  // CONFLICTED rows (owner ask 2026-08-27: a conflicted row had no way off
+  // the open lane) — the dismissal keeps conflict_reason for audit and the
+  // row settles as rejected. Synced/rejected rows never move.
+  const rejectable = edit.status === 'pending' || (decision === 'rejected' && edit.status === 'conflicted');
+  if (decision === 'approved' ? edit.status !== 'pending' : !rejectable) {
+    throw new Error(`edit is already ${edit.status}`);
+  }
   db.prepare('UPDATE document_pending_edits SET status = ?, approved_at = ? WHERE id = ?')
     .run(decision, decision === 'approved' ? nowIso : null, id);
   return getPendingEdit(db, id)!;
