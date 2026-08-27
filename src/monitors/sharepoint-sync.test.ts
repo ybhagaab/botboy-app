@@ -1424,3 +1424,127 @@ describe('link sweep', () => {
     expect(after).toEqual([{ f: NOTES, t: HLD }]);
   });
 });
+
+/**
+ * Comment-email trigger (owner design 2026-08-27). SharePoint's Modified
+ * bump can lag an open co-authoring session by hours (measured: 128 min),
+ * but every comment produces a notification mail that GRASP captures within
+ * minutes. A captured mail announcing comment activity on a KNOWN document
+ * refreshes that document immediately — content + comments rows enqueued —
+ * without waiting for discovery to observe a version change.
+ */
+import { extractCommentNotificationDocName } from './sharepoint-sync.js';
+
+describe('comment-email trigger', () => {
+  it('extracts the quoted document name from real notification subjects', () => {
+    // Shapes observed in the owner's captured mail (2026-08-25..27).
+    expect(extractCommentNotificationDocName(
+      'Zhuo, Wei mentioned you in "MX Android Catalog & Backend Unification High Level Design - Final".',
+    )).toBe('MX Android Catalog & Backend Unification High Level Design - Final');
+    expect(extractCommentNotificationDocName(
+      'Bhagat, AB left a comment in "Phase 2 Status Update"',
+    )).toBe('Phase 2 Status Update');
+    expect(extractCommentNotificationDocName(
+      'Zhuo, Wei replied to a comment in "MX Android Catalog & Backend Unification High Level Design - Final".',
+    )).toBe('MX Android Catalog & Backend Unification High Level Design - Final');
+  });
+
+  it('ignores non-comment mail', () => {
+    expect(extractCommentNotificationDocName('Zhuo, Wei shared "MX Android Catalog" with you')).toBeNull();
+    expect(extractCommentNotificationDocName('Weekly metrics digest')).toBeNull();
+    expect(extractCommentNotificationDocName('')).toBeNull();
+  });
+});
+
+describe('mailTriggerSweep through the drain tick', () => {
+  let storage: StorageLayer;
+  let dir: string;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    dir = mkdtempSync(path.join(os.tmpdir(), 'ppt-sp-mail-'));
+  });
+  afterEach(() => {
+    storage.close();
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  });
+
+  function buildEngine() {
+    const calls: Array<{ tool: string }> = [];
+    const manager = {
+      getProfile: async () => ({ id: 'sharepoint', kind: 'sharepoint', enabled: true, state: 'running', compatibilityState: 'compatible', installationState: 'installed' }),
+      // Connection gates fail fast — the sweep must have already enqueued.
+      callTool: async (_id: string, tool: string) => { calls.push({ tool }); return { text: 'Error: offline', isError: true }; },
+      restart: async () => ({}),
+    } as unknown as McpManager;
+    const engine = createSharePointSync({
+      db: storage.getDb(),
+      mcpManager: manager,
+      emit: () => {},
+      cacheDir: path.join(dir, 'cache'),
+    } as any);
+    return engine;
+  }
+
+  const DOC_KEY = 'amazon-my.sharepoint.com/personal/tanweeh_amazon_com/Documents/HLD Final.docx';
+
+  function insertCapture(): void {
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, metadata, raw_text)
+      VALUES ('cap1', 'document_capture', 'sharepoint', 'HLD Final.docx', 'https://x/doc', '2026-08-26T10:00:00Z', 'routed', ?, 'body')
+    `).run(JSON.stringify({
+      docKey: DOC_KEY,
+      serverRelativeUrl: '/personal/tanweeh_amazon_com/Documents/HLD Final.docx',
+      webUrl: 'https://amazon-my.sharepoint.com/personal/tanweeh_amazon_com/Documents/HLD%20Final.docx',
+      fileType: '.docx',
+      sizeBytes: 12345,
+    }));
+    setSetting(storage.getDb(), 'sharepoint_sync.sources', [
+      { id: 'src1', kind: 'onedrive', label: 'OneDrive', paused: false },
+    ]);
+    setSetting(storage.getDb(), 'sharepoint_sync.enabled', 'true');
+  }
+
+  function insertMail(id: string, title: string, createdAt: string): void {
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, created_at, process_state, raw_text)
+      VALUES (?, 'email_read', 'grasp', ?, 'https://outlook/x', ?, ?, 'routed', 'mail body')
+    `).run(id, title, createdAt, createdAt);
+  }
+
+  it('first tick arms the cursor; a NEW comment mail enqueues content + comments for the named doc', async () => {
+    insertCapture();
+    const engine = buildEngine();
+
+    // Tick 1: cursor arms at the current high-water mark, nothing enqueued.
+    insertMail('m0', 'Zhuo, Wei mentioned you in "HLD Final".', '2026-08-27T03:00:00Z');
+    await engine.drainNow();
+    let queued = storage.getDb().prepare('SELECT doc_key FROM sharepoint_sync_queue').all() as any[];
+    expect(queued).toHaveLength(0);
+
+    // NEW mail after the cursor → both rows enqueued for the matched doc.
+    insertMail('m1', 'Zhuo, Wei mentioned you in "HLD Final".', '2026-08-27T03:34:00Z');
+    await engine.drainNow();
+    queued = storage.getDb().prepare('SELECT doc_key, kind FROM sharepoint_sync_queue ORDER BY doc_key').all() as any[];
+    expect(queued.map((row: any) => row.kind).sort()).toEqual(['comments', 'content']);
+    expect(queued[0].doc_key).toBe(DOC_KEY);
+    expect(queued[1].doc_key).toBe(`${DOC_KEY}#comments`);
+
+    // Re-drain: cursor advanced, no duplicate churn (rows unchanged).
+    await engine.drainNow();
+    const again = storage.getDb().prepare('SELECT COUNT(*) AS n FROM sharepoint_sync_queue').get() as any;
+    expect(again.n).toBe(2);
+  });
+
+  it('mail naming an unknown document or without a comment shape enqueues nothing', async () => {
+    insertCapture();
+    const engine = buildEngine();
+    await engine.drainNow(); // arm cursor
+    insertMail('m2', 'Someone mentioned you in "Completely Unknown Doc".', '2026-08-27T04:00:00Z');
+    insertMail('m3', 'Zhuo, Wei shared "HLD Final" with you', '2026-08-27T04:00:01Z');
+    await engine.drainNow();
+    const queued = storage.getDb().prepare('SELECT COUNT(*) AS n FROM sharepoint_sync_queue').get() as any;
+    expect(queued.n).toBe(0);
+  });
+});

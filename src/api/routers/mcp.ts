@@ -5,6 +5,7 @@ import {
   getBuiltInMcpProfile,
 } from '../../core/mcp-profiles.js';
 import { paramStr, type RouterDeps } from './deps.js';
+import { sqlToolTimeoutMs } from '../../core/tool-executor.js';
 
 /** Lifecycle actions every managed profile supports through the generic route. */
 const PROFILE_LIFECYCLE_ACTIONS = new Set(['check', 'start', 'stop', 'test']);
@@ -527,7 +528,13 @@ export function createMcpRouter(deps: RouterDeps): Router {
         serverId,
         paramStr(req.params.tool),
         args,
-        { source: 'api', ownerApproved: req.body?.ownerRequested === true },
+        {
+          source: 'api',
+          ownerApproved: req.body?.ownerRequested === true,
+          // SQL data tools get the same long warehouse budget as chat and
+          // dashboard refreshes (10-15 min queries are legitimate).
+          ...(serverId === 'sql-context' ? { timeoutMs: sqlToolTimeoutMs(paramStr(req.params.tool)) } : {}),
+        },
       );
       res.status(result.isError ? 502 : 200).json({ result });
     } catch (error: any) {

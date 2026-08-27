@@ -30,7 +30,7 @@
     "better-sqlite3": "^11.10.0",
     "express": "^4.22.1",
     "node-pty": "1.0.0",
-    "sql-context-presets-mcp": "1.3.1",
+    "sql-context-presets-mcp": "^1.4.0",
     "uuid": "^10.0.0",
     "vega": "6.3.1",
     "vega-embed": "7.1.0",

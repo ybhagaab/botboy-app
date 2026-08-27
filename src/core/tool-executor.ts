@@ -10,6 +10,7 @@ import * as os from 'os';
 import { createHash } from 'crypto';
 import type { NodeManager } from './node-manager.js';
 import type { BrainStore } from './brain-store.js';
+import { setBrainTaskState } from './brain-tasks.js';
 import type { McpManager } from './mcp-types.js';
 import type { AnalyticsDashboardService, DashboardPublisherService } from './analytics-types.js';
 import type { ChatTerminalService } from './chat-terminal.js';
@@ -164,6 +165,25 @@ export function readFileHandler(filesDir: string, args: { filename: string; star
   }
 }
 
+/**
+ * Per-tool budget for the managed SQL connector. Warehouse queries
+ * legitimately run for many minutes (owner: 10-15 min is normal; Kiro
+ * applies no cap — a flat 90s ceiling here made identical queries "time
+ * out" only in BotBoy chat, diagnosed 2026-08-27). Data-bearing tools share
+ * the analytics refresh budget, including its env override; catalog and
+ * status tools stay on a short leash so a wedged call cannot hold the
+ * serialized per-server lane for half an hour.
+ */
+const SQL_DATA_TOOLS = new Set(['run_query', 'get_sample_data']);
+export function sqlToolTimeoutMs(toolName: string): number {
+  if (!SQL_DATA_TOOLS.has(toolName)) return 90_000;
+  const fallback = 35 * 60_000; // parity with analytics-dashboard.ts defaultQueryTimeoutMs (owner: 35 min, 2026-08-27)
+  const configured = Number(process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? fallback);
+  return Number.isFinite(configured)
+    ? Math.max(30_000, Math.min(60 * 60_000, Math.floor(configured)))
+    : fallback;
+}
+
 export function createToolExecutor(
   db: Database.Database,
   nodeManager: NodeManager,
@@ -242,7 +262,7 @@ export function createToolExecutor(
 
   async function callMcpRead(toolName: string, args: Record<string, unknown>): Promise<string> {
     if (!mcpManager) return 'Error: managed MCP runtime unavailable';
-    const result = await mcpManager.callTool('sql-context', toolName, args, { source: 'agent', timeoutMs: 90_000 });
+    const result = await mcpManager.callTool('sql-context', toolName, args, { source: 'agent', timeoutMs: sqlToolTimeoutMs(toolName) });
     const citation = {
       serverId: result.serverId,
       toolName: result.toolName,
@@ -408,20 +428,14 @@ export function createToolExecutor(
 
     set_task_state: (args) => {
       if (!brainStore) return 'Error: brain store unavailable';
-      const projectId = String(args.projectId ?? '').trim();
-      const taskText = String(args.taskText ?? '').trim();
-      const state = String(args.state ?? '').trim();
-      if (!['todo', 'doing', 'blocked', 'done'].includes(state)) return 'Error: state must be todo|doing|blocked|done';
-      const brain = brainStore.read(projectId);
-      if (!brain) return `Error: project ${projectId} not found`;
-      const wanted = normalizeTaskText(taskText);
-      const matches = brain.tasks.filter((task) =>
-        normalizeTaskText(task.text) === wanted || normalizeTaskText(task.text).includes(wanted));
-      if (matches.length === 0) return `Error: no task matching "${taskText.slice(0, 80)}" in ${brain.title}. Tasks: ${brain.tasks.map((t) => t.text.slice(0, 60)).join(' | ') || '(none)'}`;
-      if (matches.length > 1) return `Error: ${matches.length} tasks match — be more specific. Matches: ${matches.map((t) => t.text.slice(0, 70)).join(' | ')}`;
-      matches[0].state = state as typeof matches[0]['state'];
-      brainStore.write({ ...brain, updated: new Date().toISOString() }, brainStore.getProject(projectId)?.one_liner ?? undefined);
-      return `OK: task "${matches[0].text.slice(0, 80)}" in ${brain.title} → ${state}`;
+      // Shared with the project-page task buttons (brain-tasks.ts) — one
+      // matching rule for chat and UI.
+      return setBrainTaskState(
+        brainStore,
+        String(args.projectId ?? '').trim(),
+        String(args.taskText ?? '').trim(),
+        String(args.state ?? '').trim(),
+      ).message;
     },
 
     add_task: (args) => {

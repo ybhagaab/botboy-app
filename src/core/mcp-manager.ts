@@ -83,9 +83,21 @@ interface RuntimeState {
   expectedClose: boolean;
   tools: McpToolDescriptor[];
   stderrTail: string[];
-  callQueue: Promise<void>;
+  /** Wake-ups for calls waiting on the concurrency gate (woken en masse; each re-checks its lane). */
+  callWaiters: Array<() => void>;
   pendingCalls: number;
   inFlightCalls: number;
+  /** In-flight counts per call source, for per-source lane caps. */
+  inFlightBySource: Map<string, number>;
+}
+
+/**
+ * Pure lane check for the per-server concurrency gate: blocked when the
+ * server-wide limit is reached OR the caller's source lane is at its cap.
+ */
+export function callLaneBlocked(input: { inFlight: number; limit: number; sourceInFlight: number; sourceLimit?: number }): boolean {
+  if (input.inFlight >= input.limit) return true;
+  return input.sourceLimit !== undefined && input.sourceInFlight >= input.sourceLimit;
 }
 
 interface InternalMcpCallOptions extends McpCallOptions {
@@ -509,6 +521,9 @@ export function createMcpManager(options: {
     if (!runtime) return;
     runtime.expectedClose = true;
     runtimes.delete(serverId);
+    // Wake every gated waiter so it re-checks and fails fast with the
+    // runtime-changed error instead of hanging on a dead gate.
+    runtime.callWaiters.splice(0).forEach(release => release());
     try { await runtime.client.close(); } catch { /* process may already be gone */ }
   }
 
@@ -614,9 +629,10 @@ export function createMcpManager(options: {
         expectedClose: false,
         tools: [],
         stderrTail: [],
-        callQueue: Promise.resolve(),
+        callWaiters: [],
         pendingCalls: 0,
         inFlightCalls: 0,
+        inFlightBySource: new Map(),
       };
       runtimes.set(serverId, runtime);
 
@@ -710,30 +726,61 @@ export function createMcpManager(options: {
     return runtime.pendingCalls > 0 || runtime.inFlightCalls > 0;
   }
 
+  function concurrencyLimitFor(serverId: string): number {
+    const limit = definitionFor(serverId)?.policy?.maxConcurrentCalls;
+    return Number.isInteger(limit) && (limit as number) >= 1 ? Math.min(limit as number, 16) : 1;
+  }
+  function sourceLimitFor(serverId: string, source: string): number | undefined {
+    const limit = definitionFor(serverId)?.policy?.sourceLimits?.[source];
+    return Number.isInteger(limit) && (limit as number) >= 1 ? (limit as number) : undefined;
+  }
+
+  /**
+   * Per-server concurrency gate with per-source lanes (owner decisions
+   * 2026-08-27): sql-context allows 8 concurrent calls total, of which
+   * `dashboard`-sourced refresh work may hold at most 6 — interactive chat
+   * always finds slots regardless of a running refresh. Everything else
+   * stays strictly serialized at 1 — the safe assumption for servers of
+   * unknown quality. Limits live in the profile registry, never in
+   * user-editable config. Releases wake EVERY waiter: each re-checks its
+   * own lane, so a capped-lane waiter can never absorb the wake-up an
+   * open-lane waiter needed.
+   */
   async function queueRuntimeCall<T>(
     serverId: string,
     runtime: RuntimeState,
     operation: () => Promise<T>,
+    source = 'system',
   ): Promise<T> {
-    const previousCall = runtime.callQueue;
-    let releaseCall!: () => void;
+    const limit = concurrencyLimitFor(serverId);
+    const sourceLimit = sourceLimitFor(serverId, source);
     runtime.pendingCalls += 1;
-    runtime.callQueue = new Promise<void>((resolve) => { releaseCall = resolve; });
-
     try {
-      await previousCall;
+      while (
+        callLaneBlocked({
+          inFlight: runtime.inFlightCalls,
+          limit,
+          sourceInFlight: runtime.inFlightBySource.get(source) ?? 0,
+          sourceLimit,
+        })
+        && !runtime.expectedClose && runtimes.get(serverId) === runtime
+      ) {
+        await new Promise<void>((resolve) => runtime.callWaiters.push(resolve));
+      }
       if (runtime.expectedClose || runtimes.get(serverId) !== runtime) {
         throw new Error(`MCP server '${serverId}' runtime changed before the queued call could start`);
       }
       runtime.inFlightCalls += 1;
+      runtime.inFlightBySource.set(source, (runtime.inFlightBySource.get(source) ?? 0) + 1);
       try {
         return await operation();
       } finally {
         runtime.inFlightCalls -= 1;
+        runtime.inFlightBySource.set(source, Math.max(0, (runtime.inFlightBySource.get(source) ?? 1) - 1));
+        runtime.callWaiters.splice(0).forEach(release => release());
       }
     } finally {
       runtime.pendingCalls -= 1;
-      releaseCall();
     }
   }
 
@@ -775,7 +822,7 @@ export function createMcpManager(options: {
         { name: toolName, arguments: validatedArgs },
         undefined,
         { timeout: options.timeoutMs ?? 60_000 },
-      ));
+      ), options.source ?? 'api');
       const extracted = extractResult(response);
       const durationMs = Date.now() - started;
       db.prepare(`
@@ -840,7 +887,14 @@ export function createMcpManager(options: {
       return true;
     } catch (error) {
       if (error instanceof RuntimeBusyError) return false;
-      throw error;
+      // A failed or timed-out WAREHOUSE check must not kill a live MCP
+      // process — ping succeeded seconds ago, so the child is healthy; the
+      // database behind it is unreachable (VPN down, laptop just woke,
+      // endpoint blip). Restart-storm evidence 2026-08-27: 8,199 restarts /
+      // 8,312 timed-out health probes on sql-context. Mark degraded and let
+      // the next tick recover state once the warehouse answers again.
+      updateState(serverId, 'degraded', { error: describeProfileError(definitionFor(serverId), error) });
+      return true;
     }
   }
 
@@ -856,7 +910,7 @@ export function createMcpManager(options: {
           checkedRuntime = runtime;
           if (runtimeBusy(runtime)) continue;
 
-          await queueRuntimeCall(server.id, runtime, () => runtime.client.ping({ timeout: 10_000 }));
+          await queueRuntimeCall(server.id, runtime, () => runtime.client.ping({ timeout: 10_000 }), 'health');
           if (runtimes.get(server.id) !== runtime || runtime.expectedClose || runtimeBusy(runtime)) continue;
 
           if (server.id === SQL_SERVER_ID) {

@@ -172,6 +172,25 @@ export type McpLaunchDefinition =
   };
 
 export interface McpServerPolicy {
+  /**
+   * How many tool calls may run concurrently against this server's child
+   * process. Default 1 (strict serialization) — the safe assumption for
+   * servers of unknown quality. Raise ONLY for servers proven to multiplex
+   * (owner decision 2026-08-27: sql-context runs a node-postgres pool and
+   * handles concurrent queries; JSON-RPC ids keep responses separable).
+   * Caution: "has a pool" is not proof — sql-context <=1.3.x owned a Pool
+   * yet routed every query through ONE cached client, silently serializing
+   * all lanes. True pooled execution (pool.query) landed in 1.4.0.
+   */
+  maxConcurrentCalls?: number;
+  /**
+   * Optional per-source caps WITHIN maxConcurrentCalls, keyed by the call's
+   * `source` (e.g. dashboard 6 of 8 total) so background refresh load can
+   * never occupy every slot — interactive chat always finds total minus the
+   * capped lane free (owner decision 2026-08-27: chat queries must not wait
+   * behind dashboards).
+   */
+  sourceLimits?: Readonly<Record<string, number>>;
   /** Expose server-authored tool descriptors through generic status APIs. */
   exposeToolDescriptors: boolean;
   /** Replace raw process/protocol errors with fixed safe messages. */
@@ -227,12 +246,22 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
     kind: SQL_CONTEXT_PROFILE_ID,
     displayName: 'SQL / Redshift',
     shortName: 'SQL MCP',
-    packageVersion: '1.3.1',
+    packageVersion: '1.4.0',
     launch: Object.freeze({ type: 'sql-context-package' as const }),
     setupActions: Object.freeze([]),
     terminalCommands: Object.freeze([]),
     requiredTools: Object.freeze(['connection_status']),
     policy: Object.freeze({
+      // Sized by MEASUREMENT (2026-08-27). Historical note: the 6-wide
+      // "collapse" (completions staircased 6→31 min) was later shown to be
+      // the 1.3.x server serializing on ONE cached pg connection — the
+      // warehouse never queued (stl_wlm_query queue_s=0 throughout). 1.4.0
+      // executes via pool.query, so lanes now translate to real warehouse
+      // concurrency. 4 total (owner's number) with dashboards capped at 3
+      // keeps one slot always reachable for chat. Re-measure with 1.4.0
+      // before raising: warehouse behavior at true 4+ wide is unproven.
+      maxConcurrentCalls: 4,
+      sourceLimits: Object.freeze({ dashboard: 3 }),
       exposeToolDescriptors: true,
       redactErrors: false,
       discardStderr: false,

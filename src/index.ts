@@ -808,10 +808,18 @@ async function main() {
 
   await filesystemMonitor.start();
 
-  // ── GRASP background sync (canonical Outlook mail + calendar every 30 min) ──
+  // ── GRASP background sync (canonical Outlook mail + calendar every 5 min) ──
   // Read-only MCP calls; emitted items flow through the same capture handler
   // as every monitor and reach brain synthesis on the interpretation tick.
-  const graspSync = createGraspSync({ db, mcpManager, emit: item => eventBus.emit(item) });
+  // 5-min cadence (owner decision 2026-08-27): mail is now a TRIGGER — the
+  // SharePoint comment-email sweep reacts to captured notification mail, so
+  // mail poll latency bounds comment latency. 5 min is the knee of the cost
+  // curve: ~288 light incremental cycles/day, while below 5 min SharePoint's
+  // own notification-delivery lag (1-4 min) dominates any further gain.
+  const graspSync = createGraspSync({
+    db, mcpManager, emit: item => eventBus.emit(item),
+    config: { intervalMs: 5 * 60 * 1000 },
+  });
 
   // ── SharePoint document sync (user-selected sources, discovery + drain) ──
   // Read-only MCP calls; documents flow through the same capture handler.

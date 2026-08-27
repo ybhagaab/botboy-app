@@ -85,6 +85,7 @@ const state = {
   // Document workbench: per-project grouped documents + the reader view.
   projectDocuments: new Map(), // projectId → { documents, error, loading }
   docReader: { key: '', data: null, error: '', loading: false, refreshing: false },
+  taskActions: { expandedKey: '', discardArmedKey: '', busyKey: '' },
   route: { view: 'today' },
   projectTab: 'brief',
   evidenceFilter: 'all',
@@ -649,7 +650,7 @@ function renderProject(projectId) {
   const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['documents', `Documents${typeof docsCount === 'number' ? ` ${docsCount}` : ''}`], ['timeline', 'Timeline']];
   let content = '';
   if (state.projectTab === 'brief') content = renderProjectBrief(project, detail, area);
-  if (state.projectTab === 'tasks') content = renderProjectTasks(brain);
+  if (state.projectTab === 'tasks') content = renderProjectTasks(project, brain);
   if (state.projectTab === 'evidence') content = renderEvidence(project, detail.items || [], detail);
   if (state.projectTab === 'documents') content = renderProjectDocuments(projectId);
   if (state.projectTab === 'timeline') content = renderTimeline(brain.activityLog || []);
@@ -805,7 +806,7 @@ function renderProjectBrief(project, detail, area) {
   const blockers = Array.isArray(brain.blockers) ? brain.blockers : [];
   const people = Array.isArray(brain.people) ? brain.people : [];
   return `<section class="grid brain-grid"><article class="card brain-card"><div class="brain-kicker"><strong>${icon('sparkles', 15)} Project brain</strong><span class="pill accent">Synthesized context</span></div><h2>${esc(brain.statusLine || project.oneLiner || project.title)}</h2><div class="brain-summary content-block">${renderBrainSummary(brain.summary)}</div><div class="brain-source">${icon('database', 13)} Synthesized from the project’s connected evidence · source items remain intact</div></article><aside class="side-rail">${renderProjectFactsCard(project, detail, brain, area, people)}${renderRelatedProjectsCard(project, detail)}</aside></section>
-    <div class="section-heading"><div><h2>Next actions</h2><p>Explicit open tasks from the project brain, newest evidence first.</p></div></div><section class="grid two-col"><article class="card task-list">${tasks.length ? tasks.slice(0, 8).map(task => `<div class="task-row"><span class="task-state ${task.state === 'done' ? 'done' : ''}">${task.state === 'done' ? icon('check', 12) : ''}</span><span class="task-copy"><strong>${esc(task.text)}</strong><span>${esc(taskDateLabel(task))}</span></span><span class="pill ${task.state === 'blocked' ? 'warn' : ''}">${esc(task.state)}</span></div>`).join('') : '<div class="empty-state"><h3>No open actions</h3><p>The current brain has no open task recorded.</p></div>'}</article><article class="card blocker"><div class="eyebrow">${icon(blockers.length ? 'alert' : 'check', 14)} ${blockers.length ? 'Current blockers' : 'Clear path'}</div>${blockers.length ? blockers.map(blocker => `<div><h3>${esc(blocker)}</h3></div>`).join('') : '<h3>No active blocker is recorded.</h3>'}</article></section>
+    <div class="section-heading"><div><h2>Next actions</h2><p>Explicit open tasks from the project brain, newest evidence first.</p></div></div><section class="grid two-col"><article class="card task-list">${tasks.length ? tasks.slice(0, 8).map(task => projectTaskRow(project, task)).join('') : '<div class="empty-state"><h3>No open actions</h3><p>The current brain has no open task recorded.</p></div>'}</article><article class="card blocker"><div class="eyebrow">${icon(blockers.length ? 'alert' : 'check', 14)} ${blockers.length ? 'Current blockers' : 'Clear path'}</div>${blockers.length ? blockers.map(blocker => `<div><h3>${esc(blocker)}</h3></div>`).join('') : '<h3>No active blocker is recorded.</h3>'}</article></section>
     ${renderAmbientSignals(detail)}
     <div class="section-heading"><div><h2>Recent evidence</h2><p>The source layer underneath this synthesis.</p></div><button class="text-link" type="button" data-action="project-tab" data-tab="evidence">View all ${icon('arrow-right', 13)}</button></div><section class="card evidence-list">${evidenceRows((detail.items || []).slice(0, 5), project)}</section>`;
 }
@@ -817,9 +818,77 @@ function renderAmbientSignals(detail) {
     <section class="card evidence-list">${crossLinks.slice(0, 6).map(link => `<article class="evidence-row"><span class="source-icon">${icon('hash', 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(link.topic)}</div><p>Recently discussed in #${esc(link.channelName)}.</p><div class="evidence-meta"><span class="pill">ambient</span><span class="pill">${esc(relativeTime(link.createdAt))}</span><a class="text-link" href="#/channels">Open channel digests</a></div></div></article>`).join('')}</section>`;
 }
 
-function renderProjectTasks(brain) {
+function renderProjectTasks(project, brain) {
   const tasks = sortTasksForDisplay(Array.isArray(brain.tasks) ? brain.tasks : []);
-  return `<div class="section-heading" style="margin-top:0"><div><h2>Project actions</h2><p>Tasks are read from the current project brain — active first, newest evidence first.</p></div></div><section class="card task-list">${tasks.length ? tasks.map(task => `<div class="task-row"><span class="task-state ${task.state === 'done' ? 'done' : ''}">${task.state === 'done' ? icon('check', 12) : ''}</span><span class="task-copy"><strong>${esc(task.text)}</strong><span>${esc(taskDateLabel(task))}</span></span><span class="pill ${task.state === 'blocked' ? 'warn' : task.state === 'done' ? 'good' : task.state === 'doing' ? 'accent' : ''}">${esc(task.state)}</span></div>`).join('') : '<div class="empty-state"><h3>No tasks recorded</h3><p>BotBoy will show explicit tasks here when the project brain contains them.</p></div>'}</section>`;
+  return `<div class="section-heading" style="margin-top:0"><div><h2>Project actions</h2><p>Tasks are read from the current project brain — active first, newest evidence first. Click a task for actions.</p></div></div><section class="card task-list">${tasks.length ? tasks.map(task => projectTaskRow(project, task)).join('') : '<div class="empty-state"><h3>No tasks recorded</h3><p>BotBoy will show explicit tasks here when the project brain contains them.</p></div>'}</section>`;
+}
+
+// ── Clickable task rows (owner feature 2026-08-27): expand for Done/Reopen,
+// Discard (two-step arm), and an "Ask BotBoy to help" CTA that seeds the
+// chat input with task + project context via the existing data-prompt path.
+const taskKeyB64 = text => btoa(unescape(encodeURIComponent(text)));
+const taskKeyFromB64 = b64 => decodeURIComponent(escape(atob(b64)));
+
+function projectTaskRow(project, task) {
+  const key = `${project.id}::${task.text}`;
+  const expanded = state.taskActions.expandedKey === key;
+  const busy = state.taskActions.busyKey === key;
+  const armed = state.taskActions.discardArmedKey === key;
+  const b64 = taskKeyB64(task.text);
+  const helpPrompt = `Help me complete this task from project "${project.title}" (${project.id}): "${task.text}". Pull the project brain and related evidence first, lay out the concrete path, then do what you can with your tools — and ask me only for the decisions you can't make yourself.`;
+  const actions = expanded ? `<div class="task-actions">${task.state === 'done'
+    ? `<button class="button" type="button" data-action="task-set-state" data-project="${attr(project.id)}" data-task-b64="${attr(b64)}" data-state="todo" ${busy ? 'disabled' : ''}>${icon('refresh', 13)} Reopen</button>`
+    : `<button class="button" type="button" data-action="task-set-state" data-project="${attr(project.id)}" data-task-b64="${attr(b64)}" data-state="done" ${busy ? 'disabled' : ''}>${icon('check', 13)} Mark done</button>
+       <button class="button ${armed ? 'danger' : ''}" type="button" data-action="task-discard" data-project="${attr(project.id)}" data-task-b64="${attr(b64)}" ${busy ? 'disabled' : ''}>${icon('x', 13)} ${armed ? 'Really discard?' : 'Discard'}</button>`}
+    <button class="button primary" type="button" data-prompt="${attr(helpPrompt)}">${icon('bot', 13)} Ask BotBoy to help</button>
+  </div>` : '';
+  return `<div class="task-row ${expanded ? 'expanded' : ''}" data-action="task-toggle" data-task-key="${attr(key)}" role="button" tabindex="0" aria-expanded="${expanded}"><span class="task-state ${task.state === 'done' ? 'done' : ''}">${task.state === 'done' ? icon('check', 12) : ''}</span><span class="task-copy"><strong>${esc(task.text)}</strong><span>${esc(taskDateLabel(task))}</span></span><span class="pill ${task.state === 'blocked' ? 'warn' : task.state === 'done' ? 'good' : task.state === 'doing' ? 'accent' : ''}">${esc(task.state)}</span>${actions}</div>`;
+}
+
+async function projectTaskSetState(projectId, taskB64, nextState) {
+  const text = taskKeyFromB64(taskB64);
+  const key = `${projectId}::${text}`;
+  if (state.taskActions.busyKey) return;
+  state.taskActions.busyKey = key;
+  renderRoute({ preserveScroll: true });
+  try {
+    const payload = await request(`/projects/${encodeURIComponent(projectId)}/tasks/state`, { method: 'POST', body: { text, state: nextState } });
+    toast(payload.message || (nextState === 'done' ? 'Task marked done' : 'Task reopened'), 'good');
+    state.taskActions.expandedKey = '';
+    state.taskActions.discardArmedKey = '';
+    await loadProject(projectId, { renderAfter: false, force: true });
+  } catch (error) {
+    toast(`Could not update the task: ${error.message}`, 'bad');
+  } finally {
+    state.taskActions.busyKey = '';
+    renderRoute({ preserveScroll: true });
+  }
+}
+
+async function projectTaskDiscard(projectId, taskB64) {
+  const text = taskKeyFromB64(taskB64);
+  const key = `${projectId}::${text}`;
+  if (state.taskActions.busyKey) return;
+  if (state.taskActions.discardArmedKey !== key) {
+    // First click arms; the second click within the expanded row confirms.
+    state.taskActions.discardArmedKey = key;
+    renderRoute({ preserveScroll: true });
+    return;
+  }
+  state.taskActions.busyKey = key;
+  renderRoute({ preserveScroll: true });
+  try {
+    const payload = await request(`/projects/${encodeURIComponent(projectId)}/tasks/remove`, { method: 'POST', body: { text } });
+    toast(payload.message || 'Task discarded');
+    state.taskActions.expandedKey = '';
+    state.taskActions.discardArmedKey = '';
+    await loadProject(projectId, { renderAfter: false, force: true });
+  } catch (error) {
+    toast(`Could not discard the task: ${error.message}`, 'bad');
+  } finally {
+    state.taskActions.busyKey = '';
+    renderRoute({ preserveScroll: true });
+  }
 }
 
 function evidenceRows(items, project) {
@@ -2861,16 +2930,24 @@ function renderAnalyticsProgress(dashboard, run) {
   const completed = Number(run.widgetsCompleted || 0);
   const total = Number(run.widgetCount || 0);
   const percent = total ? Math.max(0, Math.min(100, completed / total * 100)) : 0;
+  const runningTitles = (run.runningWidgetIds || [])
+    .map(id => (dashboard.widgets || []).find(widget => widget.id === id)?.title)
+    .filter(Boolean);
   const current = analyticsCurrentWidget(dashboard, run);
-  const detail = run.cancelRequested
-    ? current
-      ? `Stopping — waiting for "${current.title}" to finish (a running query cannot be aborted)`
-      : 'Stopping — no further widgets will run'
-    : run.status === 'queued'
-      ? 'Waiting for the background analytics worker'
+  const runningLabel = runningTitles.length > 1
+    ? `Running ${runningTitles.length} queries in parallel — ${runningTitles.slice(0, 2).join(', ')}${runningTitles.length > 2 ? ` +${runningTitles.length - 2} more` : ''}`
+    : runningTitles.length === 1
+      ? `Running ${runningTitles[0]}`
       : current
         ? `Running ${current.title}`
         : 'Finishing durable refresh state';
+  const detail = run.cancelRequested
+    ? runningTitles.length || current
+      ? `Stopping — ${runningTitles.length > 1 ? `${runningTitles.length} running queries` : 'the running query'} will finish (they cannot be aborted); nothing new starts`
+      : 'Stopping — no further widgets will run'
+    : run.status === 'queued'
+      ? 'Waiting for the background analytics worker'
+      : runningLabel;
   const heading = run.cancelRequested ? 'Refresh stopping' : run.status === 'queued' ? 'Refresh queued' : 'Refresh running';
   return `<section class="analytics-run-progress" aria-live="polite"><div><span class="status-dot accent"></span><span><strong>${heading}</strong><small>${esc(detail)}</small></span><b>${number(completed)} / ${number(total)}</b></div><div class="analytics-progress-track" aria-label="${attr(`${completed} of ${total} widgets completed`)}"><i style="width:${percent.toFixed(2)}%"></i></div></section>`;
 }
@@ -3335,7 +3412,7 @@ function renderAnalyticsDashboard(id) {
         : 'Refresh data';
   const stopping = Boolean(activeRun?.cancelRequested) || state.analytics.cancelling.has(id);
   const stopAction = activeRun
-    ? `<button class="button" type="button" data-action="analytics-cancel-refresh" data-dashboard="${attr(id)}" ${stopping ? 'disabled' : ''} title="${attr(activeRun.status === 'running' ? 'Stops after the query currently running — an in-flight warehouse query cannot be aborted' : 'Cancels the queued refresh before it starts')}">${icon('x', 14)} ${stopping ? 'Stopping…' : 'Stop refresh'}</button>`
+    ? `<button class="button" type="button" data-action="analytics-cancel-refresh" data-dashboard="${attr(id)}" ${stopping ? 'disabled' : ''} title="${attr(activeRun.status === 'running' ? 'Stops the refresh — queries already running finish, no new ones start; an in-flight warehouse query cannot be aborted' : 'Cancels the queued refresh before it starts')}">${icon('x', 14)} ${stopping ? 'Stopping…' : 'Stop refresh'}</button>`
     : '';
   const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const schedule = dashboard.schedule;
@@ -3452,7 +3529,7 @@ async function cancelAnalyticsRefresh(id) {
       if (payload.run) state.analytics.announcedRuns.add(payload.run.id);
       toast('Dashboard refresh stopped');
     } else if (payload.result === 'stopping') {
-      toast('Stopping after the current query — a running warehouse query cannot be aborted');
+      toast('Stopping — queries already running will finish (they cannot be aborted); nothing new starts');
     } else {
       toast('The refresh already finished');
     }
@@ -4407,6 +4484,14 @@ function bindEvents() {
       void sendTerminalInput(event.target.dataset.terminalInput);
     }
   });
+  // Keyboard access for task rows (role=button): Enter/Space toggles.
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const row = event.target.closest?.('[data-action="task-toggle"]');
+    if (!row || event.target !== row) return;
+    event.preventDefault();
+    row.click();
+  });
   document.addEventListener('click', event => {
     const command = event.target.closest('[data-command-index]');
     if (command) return runCommand(Number(command.dataset.commandIndex));
@@ -4879,6 +4964,14 @@ function bindEvents() {
     }
     if (action === 'terminal-send' && target.dataset.profile) void sendTerminalInput(target.dataset.profile);
     if (action === 'terminal-stop' && target.dataset.profile) void stopTerminalCommand(target.dataset.profile);
+    if (action === 'task-toggle') {
+      const key = target.dataset.taskKey || '';
+      state.taskActions.expandedKey = state.taskActions.expandedKey === key ? '' : key;
+      state.taskActions.discardArmedKey = '';
+      renderRoute({ preserveScroll: true });
+    }
+    if (action === 'task-set-state') void projectTaskSetState(target.dataset.project, target.dataset.taskB64, target.dataset.state);
+    if (action === 'task-discard') void projectTaskDiscard(target.dataset.project, target.dataset.taskB64);
     if (action === 'analytics-refresh') void refreshAnalyticsDashboard(target.dataset.dashboard);
     if (action === 'analytics-cancel-refresh') void cancelAnalyticsRefresh(target.dataset.dashboard);
     if (action === 'analytics-delete') void deleteAnalyticsDashboard(target.dataset.dashboard);

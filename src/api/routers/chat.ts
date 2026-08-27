@@ -322,6 +322,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
         ]);
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked)\b)/i;
+        // Read-only SQL tools that may run as a concurrent batch (the
+        // connector's profile allows 4 in-flight calls; the manager's
+        // per-server gate arbitrates anything beyond that).
+        const PARALLEL_SQL_TOOLS = new Set([
+          'mcp_sql_query', 'mcp_sql_sample_data', 'mcp_sql_describe_table',
+          'mcp_sql_list_tables', 'mcp_sql_list_schemas', 'mcp_sql_get_schema_context', 'mcp_sql_list_presets',
+        ]);
         let writeToolCalled = false;
         let integrityRetryUsed = false;
         let analyticsGroundingRetryUsed = false;
@@ -632,6 +639,40 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // message — so we can decide how to shrink oversized args (e.g. rejected write_file
           // with a 25KB content string) before they bloat future iterations' context.
           const toolResults: Array<{ tc: any; result: any }> = [];
+          // Parallel SQL batch (owner decision 2026-08-27): the managed SQL
+          // connector runs up to 4 concurrent queries, so when the model
+          // emits several DISTINCT, well-formed sql-read calls in one turn,
+          // execute them together instead of serially — warehouse queries
+          // are the slow part of an analysis. Everything else (writes,
+          // terminals, repeats, repaired args) keeps the sequential path
+          // with its full guard rails.
+          const sqlBatchKeys = sanitizedToolCalls.map((tc: any) => `${tc.function.name}:${tc.function.arguments}`);
+          const sqlParallelBatch = sanitizedToolCalls.length > 1
+            && sanitizedToolCalls.every((tc: any) => PARALLEL_SQL_TOOLS.has(tc.function.name))
+            && sanitizedToolCalls.every((tc: any) => !unrecoverableArgs.has(tc.id) && !repairedArgs.has(tc.id))
+            && new Set(sqlBatchKeys).size === sqlBatchKeys.length
+            && sqlBatchKeys.every((key: string) => !seenToolCalls.has(key));
+          if (sqlParallelBatch) {
+            for (const [index, tc] of sanitizedToolCalls.entries()) {
+              seenToolCalls.set(sqlBatchKeys[index], 1);
+              res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: tc.function.arguments.slice(0, 100) })}\n\n`);
+            }
+            res.write(`data: ${JSON.stringify({ type: 'status', text: `🗄️ Running ${sanitizedToolCalls.length} queries in parallel...` })}\n\n`);
+            const sqlKeepalive = setInterval(() => {
+              try { res.write(`: sql-wait ${Date.now()}\n\n`); } catch {}
+            }, 10_000);
+            try {
+              const settled = await Promise.all(sanitizedToolCalls.map((tc: any) =>
+                toolExecutor.executeTool(tc as any, { currentUserMessage: message })
+                  .catch((error: any) => ({ content: `Error: ${error?.message ?? String(error)}` }))));
+              for (const [index, tc] of sanitizedToolCalls.entries()) {
+                toolResults.push({ tc, result: settled[index] });
+                res.write(`data: ${JSON.stringify({ type: 'tool_result', name: tc.function.name, preview: String(settled[index]?.content ?? '').slice(0, 200) })}\n\n`);
+              }
+            } finally {
+              clearInterval(sqlKeepalive);
+            }
+          } else
           for (const tc of sanitizedToolCalls) {
             res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: tc.function.arguments.slice(0, 100) })}\n\n`);
             // Repeat-call breaker: a byte-identical call can only return the
@@ -678,6 +719,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 } catch {}
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: terminal-wait ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (PARALLEL_SQL_TOOLS.has(tc.function.name)) {
+                // Warehouse queries now run on a 35-minute budget — the SSE
+                // stream must not go silent for that long or the browser
+                // drops it.
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: sql-wait ${Date.now()}\n\n`); } catch {}
                 }, 10000);
               }
               try {

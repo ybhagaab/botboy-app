@@ -48,7 +48,24 @@ const KEYS = {
   surgePrefix: 'sharepoint_sync.surge.',
   /** Optional override; falls back to grasp_sync.owner_name / owner_email. */
   ownerName: 'sharepoint_sync.owner_name',
+  /** work_items.created_at high-water mark for the comment-email trigger. */
+  mailTriggerCursor: 'sharepoint_sync.mail_trigger.cursor',
 } as const;
+
+/**
+ * SharePoint notification-mail subjects that announce comment activity on a
+ * document (owner design 2026-08-27: every comment produces a mail, and mail
+ * lands via GRASP minutes after the comment — while the document's Modified
+ * bump can lag HOURS behind an open co-authoring session, which is what
+ * gated the old discovery-only path). The document name arrives quoted,
+ * without its file extension. Exported for tests.
+ */
+const COMMENT_MAIL_RE = /(?:mentioned you in|left a comment (?:in|on)|replied to a comment in|commented (?:in|on))\s+["\u201c]([^"\u201d]+)["\u201d]/i;
+export function extractCommentNotificationDocName(title: string): string | null {
+  const match = COMMENT_MAIL_RE.exec(String(title || ''));
+  const name = match?.[1]?.trim();
+  return name || null;
+}
 
 // ── Size tiers and pacing (spec design constants) ──────────────────────────
 const FULL_PARSE_MAX = 25 * 1024 * 1024;
@@ -753,6 +770,9 @@ export function createSharePointSync(deps: {
       // even while SharePoint itself is unreachable.
       try { linkSweep(); } catch (error) {
         console.warn(`[SharePointSync] link sweep failed: ${(error as Error).message}`);
+      }
+      try { mailTriggerSweep(); } catch (error) {
+        console.warn(`[SharePointSync] mail trigger sweep failed: ${(error as Error).message}`);
       }
       try { stampRevisionDiffs(); } catch (error) {
         console.warn(`[SharePointSync] revision diff sweep failed: ${(error as Error).message}`);
@@ -1815,6 +1835,66 @@ export function createSharePointSync(deps: {
       }
     })();
     return { queued: true, docKey };
+  }
+
+  /**
+   * Comment-email trigger (owner design 2026-08-27): when a captured mail
+   * announces comment activity on a known document, refresh that document
+   * NOW — content and comments both — instead of waiting for the doc's
+   * Modified bump to surface through discovery. Measured case that motivated
+   * this: comment authored 03:30Z, notification mail ingested 03:34Z, but
+   * the Modified bump (held by an open co-authoring session) reached
+   * discovery at 05:39Z — 128 minutes. This sweep turns that into ~4 minutes
+   * (mail poll cadence + one drain tick). Pure-local: it only ENQUEUES; the
+   * drain's own gates govern the actual MCP work. The comments fetch reads
+   * the live autosaved file, so mid-session comments are usually visible —
+   * the content capture may still trail until SharePoint flushes.
+   */
+  function mailTriggerSweep(): void {
+    const cursor = getSetting<string>(db, KEYS.mailTriggerCursor);
+    if (!cursor) {
+      // First run: arm at the current high-water mark; only NEW mail reacts.
+      const latest = db.prepare(`
+        SELECT MAX(created_at) AS ts FROM work_items WHERE type LIKE 'email%'
+      `).get() as { ts: string | null };
+      setSetting(db, KEYS.mailTriggerCursor, latest?.ts ?? new Date(now()).toISOString());
+      return;
+    }
+    const rows = db.prepare(`
+      SELECT id, title, created_at FROM work_items
+      WHERE type LIKE 'email%' AND created_at > ?
+      ORDER BY created_at LIMIT 25
+    `).all(cursor) as Array<{ id: string; title: string | null; created_at: string }>;
+    if (!rows.length) return;
+    let advanced = cursor;
+    for (const row of rows) {
+      if (row.created_at > advanced) advanced = row.created_at;
+      const docName = extractCommentNotificationDocName(row.title ?? '');
+      if (!docName) continue;
+      for (const docKey of resolveDocKeysByName(docName)) {
+        const outcome = refreshDocument(docKey);
+        console.log(`[SharePointSync] comment mail → refresh ${docKey}: ${outcome.queued ? 'queued' : outcome.reason}`);
+      }
+    }
+    setSetting(db, KEYS.mailTriggerCursor, advanced);
+  }
+
+  /** Known docKeys whose file name (extension stripped) matches the quoted name from a notification mail. */
+  function resolveDocKeysByName(docName: string): string[] {
+    const wanted = docName.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!wanted) return [];
+    const rows = db.prepare(`
+      SELECT DISTINCT json_extract(metadata, '$.docKey') AS doc_key
+      FROM work_items
+      WHERE source = 'sharepoint' AND type = 'document_capture'
+        AND json_extract(metadata, '$.docKey') IS NOT NULL
+    `).all() as Array<{ doc_key: string }>;
+    const matches = rows.filter(row => {
+      const base = decodeURIComponent(String(row.doc_key).split('/').pop() ?? '');
+      const stem = base.replace(/\.[a-z0-9]+$/i, '');
+      return stem.toLowerCase().replace(/\s+/g, ' ').trim() === wanted;
+    }).map(row => row.doc_key);
+    return matches.slice(0, 3);
   }
 
   function refreshDocument(docKey: string): { queued: boolean; reason?: string } {

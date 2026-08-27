@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import { listAreasWithProjects } from '../../core/project-organizer.js';
+import { setBrainTaskState, removeBrainTask } from '../../core/brain-tasks.js';
 import { getChannelConfig } from '../../core/slack-config.js';
 import { createChannelTierResolver } from '../../core/engagement.js';
 import { demoteAmbientProjects } from '../../core/ambient-demotion.js';
@@ -375,6 +376,35 @@ export function createPipelineRouter(deps: RouterDeps): Router {
       };
     });
     res.json({ projects, count: projects.length });
+  });
+
+  // Project-page task actions (owner feature 2026-08-27): Done/Reopen and
+  // Discard buttons on task rows. Same matching rule as the chat tools
+  // (brain-tasks.ts) — exact normalized text or unique substring; ambiguity
+  // and misses return the actionable error message as a 4xx.
+  router.post('/projects/:id/tasks/state', (req: Request, res: Response) => {
+    const bs = deps.brainStore;
+    if (!bs) return res.status(503).json({ error: 'projects not available' });
+    const outcome = setBrainTaskState(
+      bs,
+      paramStr(req.params.id),
+      String(req.body?.text ?? '').trim(),
+      String(req.body?.state ?? '').trim(),
+    );
+    if (!outcome.ok) {
+      return res.status(/not found/i.test(outcome.message) ? 404 : 400).json({ error: outcome.message });
+    }
+    res.json({ ok: true, message: outcome.message });
+  });
+
+  router.post('/projects/:id/tasks/remove', (req: Request, res: Response) => {
+    const bs = deps.brainStore;
+    if (!bs) return res.status(503).json({ error: 'projects not available' });
+    const outcome = removeBrainTask(bs, paramStr(req.params.id), String(req.body?.text ?? '').trim());
+    if (!outcome.ok) {
+      return res.status(/not found/i.test(outcome.message) ? 404 : 400).json({ error: outcome.message });
+    }
+    res.json({ ok: true, message: outcome.message });
   });
 
   router.get('/projects/:id', (req: Request, res: Response) => {

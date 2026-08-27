@@ -86,44 +86,62 @@ describe('analytics stop-refresh', () => {
     expect(again.id).not.toBe(run.id);
   });
 
-  it('flags a RUNNING run and the worker stops between widgets, keeping the finished result', async () => {
-    const dashboard = createTwoWidgetDashboard();
+  it('runs widgets through the 3-wide pool; cancel stops CLAIMS while in-flight queries finish', async () => {
+    // Five widgets: the pool claims 3 immediately (the dashboard lane cap,
+    // sized by warehouse measurement); cancel lands while those are in
+    // flight; widgets 4-5 must never start and end 'cancelled'.
+    const dashboard = service.createDashboard({
+      title: 'Funnel health',
+      widgets: [1, 2, 3, 4, 5].map(n => ({ kind: 'metric', title: `W${n}`, sql: `SELECT ${n}` })),
+    } as any);
     const run = service.enqueueRefresh(dashboard.id, 'manual');
 
-    // Hold the first widget query open; request the stop while it is in flight.
+    let inFlight = 0;
+    let maxInFlight = 0;
     let release!: () => void;
     gate = { resolve: () => {}, promise: new Promise<void>(r => { release = r; }) };
     let midFlight: { result: string; cancelRequested?: boolean } | null = null;
+    let callsSeen = 0;
     onCall = () => {
-      const outcome = service.cancelActiveRun(dashboard.id);
-      midFlight = { result: outcome.result, cancelRequested: outcome.run?.cancelRequested };
-      onCall = null; // only on the first call
-      release();
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      callsSeen += 1;
+      gate!.promise.then(() => { inFlight -= 1; });
+      if (callsSeen === 3) {
+        // All three pool workers are mid-query — the run payload must name
+        // all three running widgets (UI shows "N queries in parallel").
+        expect(service.getRun(run.id)?.runningWidgetIds).toHaveLength(3);
+        // Request the stop now.
+        const outcome = service.cancelActiveRun(dashboard.id);
+        midFlight = { result: outcome.result, cancelRequested: outcome.run?.cancelRequested };
+        release();
+      }
     };
 
     const processed = await service.processQueuedRuns(1);
     expect(processed).toBe(1);
     expect(midFlight).toEqual({ result: 'stopping', cancelRequested: true });
 
-    // Only the first widget's SQL ever ran.
-    expect(sqlCalls).toEqual(['SELECT 1']);
+    // The pool genuinely parallelized (3 concurrent) and never started 4-5.
+    expect(maxInFlight).toBe(3);
+    expect(sqlCalls.sort()).toEqual(['SELECT 1', 'SELECT 2', 'SELECT 3']);
 
     const finalRun = service.getRun(run.id)!;
     expect(finalRun.status).toBe('cancelled');
-    expect(finalRun.widgetsSucceeded).toBe(1);
+    expect(finalRun.widgetsSucceeded).toBe(3);
     expect(finalRun.error).toBeUndefined();
 
     const rw = storage.getDb().prepare(
       'SELECT widget_id, status FROM analytics_run_widgets WHERE run_id = ? ORDER BY position',
     ).all(run.id) as Array<{ status: string }>;
-    expect(rw.map(r => r.status)).toEqual(['completed', 'cancelled']);
+    expect(rw.map(r => r.status)).toEqual(['completed', 'completed', 'completed', 'cancelled', 'cancelled']);
 
     const dash = service.getDashboard(dashboard.id)!;
     expect(dash.status).toBe('ready');
     // The whole-dashboard refresh timestamp is NOT claimed by a partial run;
-    // the completed widget carries its own.
+    // completed widgets carry their own.
     expect(dash.lastRefreshedAt).toBeFalsy();
-    const finished = dash.widgets.find(w => w.title === 'Visitors')!;
+    const finished = dash.widgets.find(w => w.title === 'W1')!;
     expect(finished.lastRefreshedAt).toBeTruthy();
   });
 

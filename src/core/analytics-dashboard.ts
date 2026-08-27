@@ -320,7 +320,7 @@ export function createAnalyticsDashboardService(options: {
 }): AnalyticsDashboardService {
   const db = options.db;
   const mcpManager = options.mcpManager;
-  const defaultQueryTimeoutMs = 25 * 60_000;
+  const defaultQueryTimeoutMs = 35 * 60_000; // owner decision 2026-08-27: 35-min queries are real
   const configuredQueryTimeoutMs = Number(
     options.queryTimeoutMs ?? process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? defaultQueryTimeoutMs,
   );
@@ -419,7 +419,17 @@ export function createAnalyticsDashboardService(options: {
   }
 
   function mapRun(row: any): AnalyticsRun {
+    // The pool runs several widgets at once; the UI names them all instead
+    // of pretending one widget is "current" (owner confusion 2026-08-27:
+    // "running L1 Discovery Sources … 0/10" while six queries were mid-flight).
+    const runningWidgetIds = row.status === 'running'
+      ? (db.prepare(`
+          SELECT widget_id FROM analytics_run_widgets
+          WHERE run_id = ? AND status = 'running' ORDER BY position
+        `).all(row.id) as any[]).map(widget => String(widget.widget_id))
+      : undefined;
     return {
+      ...(runningWidgetIds?.length ? { runningWidgetIds } : {}),
       id: row.id,
       dashboardId: row.dashboard_id,
       trigger: row.trigger,
@@ -1008,47 +1018,66 @@ export function createAnalyticsDashboardService(options: {
     })();
   }
 
+  /**
+   * Widgets refresh through a concurrent pool: the sql-context profile
+   * reserves a 3-wide `dashboard` lane (of 4 total server slots), so up to
+   * 3 widget queries run at once while interactive chat always keeps a
+   * slot. Lane size is measured against the warehouse (2026-08-27: 3
+   * concurrent scans run at solo speed; 6 collapsed it) — see
+   * mcp-profiles.ts sql-context policy before changing.
+   * Safety unchanged: every DB step below is a synchronous better-sqlite3
+   * transaction (never interleaved), widget claims are row-guarded so two
+   * pool workers can never take the same widget, and the cooperative cancel
+   * check happens at each CLAIM — in-flight queries finish, nothing new
+   * starts.
+   */
+  const WIDGET_REFRESH_CONCURRENCY = 3;
+
   async function processClaimedRun(runId: string): Promise<void> {
-    while (true) {
-      // Cooperative stop point: the owner's cancel flag is honored BETWEEN
-      // widgets — the widget query already in flight ran to completion and
-      // its result persisted. Only this worker transitions the run's status
-      // (ownership guard), so cancel never steals a live run.
-      const ownedRun = db.prepare(`
-        SELECT cancel_requested FROM analytics_runs
-        WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
-      `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
-      if (!ownedRun) return;
-      if (ownedRun.cancel_requested) {
-        finalizeCancelledRun(runId);
-        return;
-      }
-      const widget = db.prepare(`
-        SELECT rw.*, r.dashboard_id
-        FROM analytics_run_widgets rw
-        JOIN analytics_runs r ON r.id = rw.run_id
-        WHERE rw.run_id = ? AND rw.status = 'queued'
-          AND r.status = 'running' AND r.worker_id = ? AND r.worker_pid = ?
-        ORDER BY rw.position LIMIT 1
-      `).get(runId, workerId, process.pid) as any;
-      if (!widget) break;
+    let ownershipLost = false;
+    let cancelSeen = false;
 
-      const startedAt = new Date().toISOString();
-      const claimed = db.transaction(() => {
-        const result = db.prepare(`
-          UPDATE analytics_run_widgets SET status = 'running', started_at = ?, error = NULL
-          WHERE run_id = ? AND widget_id = ? AND status = 'queued'
-        `).run(startedAt, runId, widget.widget_id);
-        if (result.changes !== 1) return false;
-        const parent = db.prepare(`
-          UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
+    const claimNextWidget = (): any | 'stop' | null => {
+      while (true) {
+        // Cooperative stop point: the owner's cancel flag is honored at each
+        // claim — queries already in flight run to completion and their
+        // results persist. Only this worker transitions the run's status
+        // (ownership guard), so cancel never steals a live run.
+        const ownedRun = db.prepare(`
+          SELECT cancel_requested FROM analytics_runs
           WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
-        `).run(widget.widget_id, startedAt, leaseExpiresAt(), runId, workerId, process.pid);
-        if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed before widget claim`);
-        return true;
-      })();
-      if (!claimed) continue;
+        `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
+        if (!ownedRun) { ownershipLost = true; return 'stop'; }
+        if (ownedRun.cancel_requested) { cancelSeen = true; return 'stop'; }
+        const widget = db.prepare(`
+          SELECT rw.*, r.dashboard_id
+          FROM analytics_run_widgets rw
+          JOIN analytics_runs r ON r.id = rw.run_id
+          WHERE rw.run_id = ? AND rw.status = 'queued'
+            AND r.status = 'running' AND r.worker_id = ? AND r.worker_pid = ?
+          ORDER BY rw.position LIMIT 1
+        `).get(runId, workerId, process.pid) as any;
+        if (!widget) return null;
+        const startedAt = new Date().toISOString();
+        const claimed = db.transaction(() => {
+          const result = db.prepare(`
+            UPDATE analytics_run_widgets SET status = 'running', started_at = ?, error = NULL
+            WHERE run_id = ? AND widget_id = ? AND status = 'queued'
+          `).run(startedAt, runId, widget.widget_id);
+          if (result.changes !== 1) return false;
+          const parent = db.prepare(`
+            UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+          `).run(widget.widget_id, startedAt, leaseExpiresAt(), runId, workerId, process.pid);
+          if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed before widget claim`);
+          return true;
+        })();
+        if (claimed) return widget;
+        // Another pool worker claimed it between select and update — retry.
+      }
+    };
 
+    const runWidgetToCompletion = async (widget: any): Promise<void> => {
       try {
         const result = await executeRunWidget(widget);
         const completedAt = new Date().toISOString();
@@ -1073,7 +1102,7 @@ export function createAnalyticsDashboardService(options: {
           if (updated.changes !== 1) throw new Error('Widget definition disappeared while its refresh was running');
         })();
       } catch (error: any) {
-        if (!ownsRun(runId)) return;
+        if (!ownsRun(runId)) { ownershipLost = true; return; }
         const message = String(error?.message ?? error).slice(0, 2000);
         const completedAt = new Date().toISOString();
         db.transaction(() => {
@@ -1094,6 +1123,21 @@ export function createAnalyticsDashboardService(options: {
           `).run(message, widget.widget_id, widget.dashboard_id);
         })();
       }
+    };
+
+    const poolWorker = async (): Promise<void> => {
+      while (!ownershipLost && !cancelSeen) {
+        const next = claimNextWidget();
+        if (next === 'stop' || next === null) return;
+        await runWidgetToCompletion(next);
+      }
+    };
+    await Promise.all(Array.from({ length: WIDGET_REFRESH_CONCURRENCY }, () => poolWorker()));
+
+    if (ownershipLost) return;
+    if (cancelSeen) {
+      finalizeCancelledRun(runId);
+      return;
     }
     finalizeRun(runId);
   }

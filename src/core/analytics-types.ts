@@ -101,6 +101,8 @@ export interface AnalyticsRun {
   currentWidgetId?: string;
   /** Owner asked to stop; the worker honors it between widgets. */
   cancelRequested: boolean;
+  /** Widget ids currently executing (populated for running runs; the pool runs up to 6). */
+  runningWidgetIds?: string[];
   queuedAt: string;
   startedAt?: string;
   heartbeatAt?: string;
