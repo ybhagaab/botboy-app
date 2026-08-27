@@ -190,7 +190,12 @@ Be concise, helpful, proactive. You have full authority.`;
           // model's own get_document_writing_guide call (mirrors the SSE
           // chat route). Normal turns think only on the first call.
           let documentAuthoringThink = false;
-          for (let i = 0; i < 8; i++) {
+          // 15 (was 8, raised 2026-08-28 alongside the chat-loop uncap).
+          // Background executions stay CAPPED by design: this path runs
+          // unattended (background jobs, reader assist, sentinel composing)
+          // with nobody watching and no Stop button — bounded autonomy here,
+          // unbounded work only in interactive chat where the owner presides.
+          for (let i = 0; i < 15; i++) {
             const resp = await llmClient.chatCompletion({
               messages,
               tools,

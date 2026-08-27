@@ -242,6 +242,73 @@ const SHAREPOINT_GUIDED_WRITE_TOOLS = new Set([
   'sharepoint_add_docx_comment',
 ]);
 
+/**
+ * a2-analytics (Datanet ETL) read operations — curated, no name-pattern
+ * fallback, same discipline as SharePoint: an unknown tool added by a future
+ * server release classifies as write, never as a silent free read.
+ */
+const A2_ANALYTICS_READ_TOOLS = new Set([
+  'datanet_get_job_run',
+  'datanet_get_job_run_status',
+  'datanet_get_job_run_error',
+  'datanet_get_latest_run',
+  'datanet_get_runs_for_job',
+  'datanet_list_runs_by_date',
+  'datanet_list_active_runs',
+  'datanet_get_successful_runs_count',
+  'datanet_get_job',
+  'datanet_get_profile',
+  'datanet_get_profile_sql',
+  'datanet_detect_profile_type',
+  'datanet_diagnose_run',
+  'datanet_get_execution_timing',
+  'datanet_get_run_events',
+  'datanet_list_run_logs',
+  'datanet_get_run_log_content',
+  'datanet_search',
+  'datanet_resolve_metrics_profile',
+  'datanet_resolve_metrics_jobs',
+  // Fetches a completed run's OUTPUT to a local file — read-only against
+  // Datanet (nothing mutates), and the reason this integration exists.
+  'datanet_download_results',
+  // Cradle read surface (Spark ETL on DataCentral) — same platform family.
+  'cradle_get_profile',
+  'cradle_get_job',
+  'cradle_get_run',
+  'cradle_list_jobs',
+  'cradle_list_runs',
+  'cradle_search_profiles',
+  'cradle_search_runs',
+  // Server self-diagnostics.
+  'server_health',
+  'config_check',
+]);
+
+/**
+ * a2-analytics tools that are never callable from BotBoy, in any flow.
+ * Three families:
+ *  - redshift_query: SQL PRIMACY — warehouse SQL belongs to the sql-context
+ *    profile exclusively (owner decision 2026-08-27). Routing guidance says
+ *    it; this set enforces it structurally.
+ *  - batch_* / force_deps: bulk or irreversible pipeline mutations. The a2
+ *    team's own agent gates each write on individual approval; a batch call
+ *    collapses N approvals into one opaque action, and force-deps can load
+ *    incomplete data irreversibly.
+ *  - config mutations of the shared ~/.a2data setup.
+ * ownerApproved does NOT override this set.
+ */
+const A2_ANALYTICS_BLOCKED_TOOLS = new Set([
+  'redshift_query',
+  'datanet_batch_submit',
+  'datanet_batch_restart',
+  'datanet_batch_force',
+  'datanet_force_deps',
+  'datanet_unschedule_job',
+  'cradle_batch_backfill',
+  'cradle_cancel_wfd_runs',
+  'config_discover',
+]);
+
 /** Name patterns that indicate a read-only operation on any MCP server. */
 const READ_NAME_PATTERN = /^(get|list|search|read|describe|query|fetch|show|status|check|find|count|view|inspect|preview|lookup|resolve|download)([_\-.]|$)/i;
 
@@ -269,6 +336,13 @@ export function classifyMcpTool(serverKind: string, toolName: string): McpToolRi
     // only with an explicit owner request.
     return SHAREPOINT_READ_TOOLS.has(toolName) ? 'read' : 'write';
   }
+  if (serverKind === 'a2-analytics') {
+    // Same no-fallback discipline as SharePoint: the server exposes 90
+    // tools including production pipeline mutations, so only the curated
+    // set reads freely; everything else needs an explicit owner request
+    // (and the blocked set above never runs at all).
+    return A2_ANALYTICS_READ_TOOLS.has(toolName) ? 'read' : 'write';
+  }
   return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
 }
 
@@ -292,6 +366,14 @@ export function validateMcpToolCall(
         `MCP tool '${toolName}' is blocked for the SharePoint profile (destructive, structural, or reserved for its guided flow) — an owner request cannot override this; guided writes go through the sharepoint_reply_comment / sharepoint_add_comment / sharepoint_update_document tools`,
       );
     }
+  }
+  if (serverKind === 'a2-analytics' && A2_ANALYTICS_BLOCKED_TOOLS.has(toolName)) {
+    // No waiver exists for this set. redshift_query carries its own message
+    // so the model is redirected instead of retrying.
+    throw new Error(toolName === 'redshift_query'
+      ? "MCP tool 'redshift_query' is blocked on the ETL profile — warehouse SQL always runs through the dedicated SQL connection (mcp_sql_query); this cannot be overridden"
+      : `MCP tool '${toolName}' is blocked for the ETL profile (bulk or irreversible pipeline mutation) — an owner request cannot override this; act on individual runs instead`,
+    );
   }
   const risk = classifyMcpTool(serverKind, toolName);
   if (risk !== 'read' && options.ownerApproved !== true) {

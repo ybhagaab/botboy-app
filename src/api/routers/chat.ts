@@ -93,6 +93,24 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.json(chat.getHistory(limit));
   });
 
+  // ── Cooperative stop for the in-flight chat turn ──
+  // One SSE turn runs at a time in practice (single-owner app); the registry
+  // still keys by turn id so a stale stop cannot cancel a NEWER turn. The
+  // stop is cooperative: the loop checks at iteration boundaries, lets the
+  // current LLM/tool call finish, then closes the turn honestly with
+  // whatever was gathered. Stopping is a user decision, not a failure —
+  // mirrors the dashboard refresh cancel semantics (2026-08-27).
+  const activeChatTurns = new Map<string, { stopRequested: boolean; startedAt: number }>();
+  let chatTurnCounter = 0;
+
+  router.post('/chat/stop', (_req: Request, res: Response) => {
+    let stopped = 0;
+    for (const turn of activeChatTurns.values()) {
+      if (!turn.stopRequested) { turn.stopRequested = true; stopped++; }
+    }
+    res.json({ ok: true, stopped, active: activeChatTurns.size });
+  });
+
   router.post('/chat/messages', async (req: Request, res: Response) => {
     if (!chat) return res.status(503).json({ error: 'Chat not available' });
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
@@ -132,6 +150,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       const db = deps.db;
       if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(`user-${Date.now()}`, 'user', message);
 
+      const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
+      activeChatTurns.set(turnId, { stopRequested: false, startedAt: Date.now() });
       try {
         const llmClient = deps.llmClient;
         const toolExecutor = deps.toolExecutor;
@@ -340,7 +360,37 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // review inside save_product_document always max-thinks regardless.
         let documentAuthoringThink = false;
 
-        for (let i = 0; i < 15; i++) {
+        // The tool loop is UNCAPPED for real work (owner decision
+        // 2026-08-28, replacing the 15-iteration cap sized for a weaker
+        // model): long multi-source tasks — fetch N ETL outputs, read them,
+        // assemble a report — legitimately need dozens of round-trips. What
+        // actually protects the turn now:
+        //   • the repeat-breaker above (identical call blocked, 3rd strike
+        //     kill-switches tools) — targets pathological loops directly;
+        //   • the owner's Stop button (cooperative, iteration-boundary);
+        //   • checkpoint self-summaries every 40 iterations, so a very long
+        //     turn narrates durable progress as it goes;
+        //   • this ceiling — not a working limit, a runaway fuse.
+        const HARD_ITERATION_CEILING = 500;
+        const CHECKPOINT_EVERY = 40;
+        let stoppedByUser = false;
+
+        for (let i = 0; i < HARD_ITERATION_CEILING; i++) {
+          if (activeChatTurns.get(turnId)?.stopRequested) {
+            stoppedByUser = true;
+            console.log(`[Chat] Stop requested — ending turn at iteration ${i}`);
+            break;
+          }
+          if (i > 0 && i % CHECKPOINT_EVERY === 0) {
+            // Keeps the turn's narration durable: chat_messages only persists
+            // final assistant text, so on a very long turn the model banks a
+            // progress line the owner (and any post-restart resume) can use.
+            messages.push({
+              role: 'user',
+              content: `SYSTEM CHECKPOINT (internal — the owner cannot see this; do not mention it): you are ${i} tool iterations into this turn. Begin your next reply with one short progress line — what is done and what remains — then CONTINUE the task with tool calls as needed. Do not stop unless the task is actually complete.`,
+            });
+            console.log(`[Chat] Checkpoint self-summary injected at iteration ${i}`);
+          }
           res.write(`data: ${JSON.stringify({ type: 'status', text: i === 0 ? '🤔 Thinking...' : `🔧 Tool iteration ${i}...` })}\n\n`);
 
           // Better token estimator: count content + tool_calls args + tool_call_id.
@@ -816,17 +866,21 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           }
         }
 
-        // Iteration cap reached. Instead of the old stock "Reached max tool
-        // iterations." dead-end, make ONE final tools-off call so the model
-        // synthesizes an answer from whatever it gathered. No tool defs are
-        // sent, so this cannot loop further; on any failure we fall back to
-        // the stock message.
-        res.write(`data: ${JSON.stringify({ type: 'status', text: '📝 Wrapping up with what I found...' })}\n\n`);
-        let finalContent = 'Reached max tool iterations.';
+        // Loop exited without a final answer: either the owner pressed Stop
+        // or the runaway ceiling tripped. Either way, make ONE final
+        // tools-off call so the model synthesizes honestly from whatever it
+        // gathered (no tool defs are sent, so this cannot loop further); on
+        // any failure fall back to a plain deterministic line.
+        res.write(`data: ${JSON.stringify({ type: 'status', text: stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
+        let finalContent = stoppedByUser
+          ? '⏹️ Stopped at your request. The work done so far is preserved above; tell me when to continue.'
+          : `Reached the runaway ceiling of ${HARD_ITERATION_CEILING} tool iterations — stopping to be safe.`;
         try {
           messages.push({
             role: 'user',
-            content: 'You have reached the tool-call limit for this turn. Do not request any more tools. Using ONLY the information gathered above, answer my original question now as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
+            content: stoppedByUser
+              ? 'SYSTEM (internal): the user pressed Stop. Do not request any more tools. Briefly and honestly report: what you completed, what is in progress or unverified, and the natural next step if they want you to continue. Keep it short.'
+              : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
           });
           const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false });
           let iterResult = await gen.next();
@@ -856,6 +910,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
         try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
         try { res.end(); } catch {}
+      } finally {
+        activeChatTurns.delete(turnId);
       }
       return;
     }

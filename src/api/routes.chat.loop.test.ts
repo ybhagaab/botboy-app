@@ -125,7 +125,7 @@ describe('chat streaming loop safety', () => {
     expect(lastMsg.content).toBe('final answer after nudges');
   });
 
-  it('synthesizes a tools-off answer when the 15-iteration cap is hit', async () => {
+  it('UNCAPPED LOOP: runs far past the old 15 cap, checkpoints every 40 iterations, and synthesizes at the 500 runaway ceiling', async () => {
     const seenRequests: any[] = [];
     let n = 0;
     const llmClient = {
@@ -154,19 +154,83 @@ describe('chat streaming loop safety', () => {
       .post('/api/chat/messages')
       .send({ message: 'weblab question', stream: true });
 
-    // 15 tool iterations + 1 synthesis call.
-    expect(toolExecutor.executeTool).toHaveBeenCalledTimes(15);
-    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(16);
-    const synthesisReq = seenRequests[15];
+    // 500 tool iterations (the runaway ceiling — NOT a working limit) + 1 synthesis call.
+    expect(toolExecutor.executeTool).toHaveBeenCalledTimes(500);
+    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(501);
+    const synthesisReq = seenRequests[500];
     expect(synthesisReq.tools).toBeUndefined();
     const lastPromptMsg = synthesisReq.messages[synthesisReq.messages.length - 1];
     expect(lastPromptMsg.role).toBe('user');
-    expect(lastPromptMsg.content).toContain('tool-call limit');
-    // The user gets the synthesis, not the stock dead-end line.
+    expect(lastPromptMsg.content).toContain('runaway safety ceiling');
+    // Checkpoint self-summaries were injected at 40, 80, … 480 → 12 of them.
+    const checkpoints = synthesisReq.messages.filter((m: any) =>
+      typeof m.content === 'string' && m.content.includes('SYSTEM CHECKPOINT'));
+    expect(checkpoints.length).toBe(12);
+    // The user gets the synthesis, not a stock dead-end line.
     expect(res.text).toContain('best-effort summary of findings');
     const lastMsg = db.prepare("SELECT content FROM chat_messages WHERE role='assistant' ORDER BY created_at DESC LIMIT 1").get() as any;
     expect(lastMsg.content).toBe('best-effort summary of findings');
     expect(lastMsg.content).not.toContain('Reached max tool iterations');
+  });
+
+  it('STOP BUTTON: /chat/stop ends the in-flight turn at the next iteration boundary with an honest progress summary', async () => {
+    const seenRequests: any[] = [];
+    let n = 0;
+    const llmClient = {
+      getActiveEndpoint: () => 'ecs',
+      chatCompletionStream: vi.fn((req: any) => {
+        seenRequests.push(req);
+        return (async function* () {
+          if (!req.tools || req.tools.length === 0) {
+            yield { type: 'content', text: 'stopped: fetched 2 of 5 outputs so far' };
+            return streamResult({ content: 'stopped: fetched 2 of 5 outputs so far' });
+          }
+          n++;
+          yield { type: 'tool_call_start', toolCall: { index: 0, id: `c${n}`, name: 'search_items' } };
+          return streamResult({
+            toolCalls: [{ id: `c${n}`, type: 'function', function: { name: 'search_items', arguments: `{"query":"variant ${n}"}` } }],
+            finishReason: 'tool_calls',
+          });
+        })();
+      }),
+    };
+    // The 3rd tool execution presses Stop mid-turn (in-process, same app).
+    let appRef: express.Express | null = null;
+    const toolExecutor = {
+      executeTool: vi.fn(async () => {
+        if (toolExecutor.executeTool.mock.calls.length === 3 && appRef) {
+          const stopRes = await request(appRef).post('/api/chat/stop');
+          expect(stopRes.body.ok).toBe(true);
+          expect(stopRes.body.stopped).toBe(1);
+        }
+        return { content: 'partial evidence' };
+      }),
+    };
+    const app = buildApp(makeDeps(db, llmClient, toolExecutor));
+    appRef = app;
+
+    const res = await request(app)
+      .post('/api/chat/messages')
+      .send({ message: 'long fetch task', stream: true });
+
+    // Stopped at the boundary after iteration 3 — nowhere near the ceiling.
+    expect(toolExecutor.executeTool).toHaveBeenCalledTimes(3);
+    // 3 tool iterations + 1 stop-synthesis call.
+    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(4);
+    const synthesisReq = seenRequests[3];
+    const lastPromptMsg = synthesisReq.messages[synthesisReq.messages.length - 1];
+    expect(lastPromptMsg.content).toContain('pressed Stop');
+    expect(res.text).toContain('⏹️ Stopping');
+    // Cancel ≠ failure: the turn closes with the model's honest summary.
+    const lastMsg = db.prepare("SELECT content FROM chat_messages WHERE role='assistant' ORDER BY created_at DESC LIMIT 1").get() as any;
+    expect(lastMsg.content).toBe('stopped: fetched 2 of 5 outputs so far');
+  });
+
+  it('STOP endpoint with no in-flight turn is a harmless no-op', async () => {
+    const app = buildApp(makeDeps(db, { getActiveEndpoint: () => 'ecs', chatCompletionStream: vi.fn() }, { executeTool: vi.fn() }));
+    const res = await request(app).post('/api/chat/stop');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, stopped: 0, active: 0 });
   });
 
   it('integrity gate: false "saved" claim with no write tool forces a corrective pass', async () => {
@@ -332,8 +396,8 @@ describe('chat streaming loop safety', () => {
       .post('/api/chat/messages')
       .send({ message: 'weblab question', stream: true });
 
-    expect(res.text).toContain('Reached max tool iterations.');
+    expect(res.text).toContain('runaway ceiling');
     const lastMsg = db.prepare("SELECT content FROM chat_messages WHERE role='assistant' ORDER BY created_at DESC LIMIT 1").get() as any;
-    expect(lastMsg.content).toBe('Reached max tool iterations.');
+    expect(lastMsg.content).toContain('runaway ceiling of 500');
   });
 });

@@ -12,7 +12,7 @@ export type McpServerState =
  * registry entry there; storage seeding, manager lifecycle, API routes,
  * agent policy, and the Connections UI all read the registry.
  */
-export const BUILT_IN_MCP_PROFILE_IDS = ['sql-context', 'grasp-m365', 'slack', 'sharepoint'] as const;
+export const BUILT_IN_MCP_PROFILE_IDS = ['sql-context', 'grasp-m365', 'slack', 'sharepoint', 'a2-analytics'] as const;
 export type BuiltInMcpProfileId = (typeof BUILT_IN_MCP_PROFILE_IDS)[number];
 export type McpInstallationState = 'unchecked' | 'not_installed' | 'installed';
 export type McpCompatibilityState = 'unchecked' | 'compatible' | 'incompatible';

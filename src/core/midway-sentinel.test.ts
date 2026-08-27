@@ -1,8 +1,26 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createStorage, StorageLayer } from './storage.js';
+
+// Partial mock: the silent Sentry prime spawns curl against the real
+// Datanet service — tests control its outcome instead. The pure helpers
+// (isSentryAuthShapedError, cookie inspection) stay real.
+const primeState = vi.hoisted(() => ({
+  result: { ok: true } as { ok: true } | { ok: false; reason: 'no_kerberos' | 'curl_failed' | 'timeout' },
+  calls: [] as string[],
+}));
+vi.mock('./sentry-session.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('./sentry-session.js')>();
+  return {
+    ...original,
+    primeDatanetSentrySession: async (cookiePath?: string) => {
+      primeState.calls.push(String(cookiePath ?? ''));
+      return primeState.result;
+    },
+  };
+});
 import {
   createMidwaySentinel,
   isAuthLikeError,
@@ -176,6 +194,8 @@ describe('midway sentinel flow', () => {
     terminalCurrent = null;
     openedTerminals = [];
     lifecycle = [];
+    primeState.result = { ok: true };
+    primeState.calls = [];
     // Default: the owner is still at the terminal — the wait never settles
     // within the test, exactly like a blocked real waitForEnd call.
     waitForEndResult = () => new Promise(() => {});
@@ -235,7 +255,7 @@ describe('midway sentinel flow', () => {
     await sentinel.tick();
     const messages = chatMessages();
     expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain('Midway session has expired');
+    expect(messages[0]).toContain('needs re-authentication');
     expect(messages[0]).toContain('Amazon Slack through AI Community MCP');
   });
 
@@ -305,5 +325,79 @@ describe('midway sentinel flow', () => {
     await sentinel.tick();
     expect(openedTerminals).toHaveLength(0);
     expect(chatMessages()).toHaveLength(1);
+  });
+
+  // ── Datanet (a2-analytics) Sentry branch ──
+
+  it('SENTRY SELF-HEAL: a2 auth failure with a VALID Midway cookie primes silently and restarts — no owner interruption', async () => {
+    writeCookie(3600); // Midway itself is fine
+    profiles.push(snapshot({
+      id: 'a2-analytics',
+      state: 'failed',
+      lastError: '{"__type":"com.amazon.sentry.sso#SentryRedirectException","Location":"https://sentry.amazon.com/SSO/redirect?..."}',
+    }));
+    const sentinel = makeSentinel();
+    await sentinel.tick();
+    expect(primeState.calls).toHaveLength(1);
+    expect(lifecycle).toEqual(['stop:a2-analytics', 'start:a2-analytics', 'test:a2-analytics']);
+    expect(chatMessages()).toHaveLength(0);
+    expect(openedTerminals).toHaveLength(0);
+  });
+
+  it('SENTRY ESCALATION: when the silent prime fails (no Kerberos), the owner gets a terminal running mwinit -o -s', async () => {
+    writeCookie(3600);
+    primeState.result = { ok: false, reason: 'no_kerberos' };
+    profiles.push(snapshot({
+      id: 'a2-analytics',
+      state: 'failed',
+      lastError: 'Non-JSON response: <!doctype html>… HTTP Status 401 – Unauthorized',
+    }));
+    const sentinel = makeSentinel();
+    await sentinel.tick();
+    expect(primeState.calls).toHaveLength(1);
+    expect(lifecycle).toHaveLength(0); // no blind restart on dead auth
+    expect(openedTerminals).toHaveLength(1);
+    expect(openedTerminals[0].command).toBe('mwinit -o -s');
+    expect(chatMessages()).toHaveLength(1);
+  });
+
+  it('NON-AUTH a2 failure with a valid cookie stays the manager\'s problem: no prime, no restart, no message', async () => {
+    writeCookie(3600);
+    profiles.push(snapshot({
+      id: 'a2-analytics',
+      state: 'failed',
+      lastError: 'FATAL no Python >=3.10',
+    }));
+    const sentinel = makeSentinel();
+    await sentinel.tick();
+    expect(primeState.calls).toHaveLength(0);
+    expect(lifecycle).toHaveLength(0);
+    expect(chatMessages()).toHaveLength(0);
+    expect(openedTerminals).toHaveLength(0);
+  });
+
+  it('FULL MIDWAY EXPIRY with a2 among the affected upgrades the terminal command to mwinit -o -s', async () => {
+    writeCookie(-3600); // Midway expired — the generic episode path
+    profiles[0] = snapshot({ id: 'slack', state: 'failed' });
+    profiles.push(snapshot({ id: 'a2-analytics', state: 'failed', lastError: 'HTTP 401' }));
+    const sentinel = makeSentinel();
+    await sentinel.tick();
+    expect(openedTerminals).toHaveLength(1);
+    expect(openedTerminals[0].command).toBe('mwinit -o -s');
+    expect(chatMessages()).toHaveLength(1);
+  });
+
+  it('SILENT PRIME COOLDOWN: a persistently auth-failing a2 does not re-prime every tick', async () => {
+    writeCookie(3600);
+    profiles.push(snapshot({
+      id: 'a2-analytics',
+      state: 'failed',
+      lastError: 'NotAuthorizedException',
+    }));
+    const sentinel = makeSentinel();
+    await sentinel.tick();
+    clock.value += 45_000; // next poll, inside the 10-min cooldown
+    await sentinel.tick();
+    expect(primeState.calls).toHaveLength(1);
   });
 });

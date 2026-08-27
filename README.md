@@ -1,11 +1,21 @@
 # BotBoy
 
-Your local, private productivity brain for macOS. BotBoy watches the work you
-choose to share with it — Slack, Outlook mail and calendar, SharePoint
-documents, local folders, your browser — organizes everything into projects
-with living, synthesized briefs, and gives you a chat assistant that actually
-knows your work. Everything runs and stays on your Mac: captures, database,
-and documents never leave your machine.
+**Stop assembling your own context. Start every day already caught up.**
+
+BotBoy is a private productivity brain that lives on your Mac. It watches the
+work you choose to share with it — Slack, Outlook, SharePoint, DataCentral
+ETL jobs, local folders, your browser — and turns the noise into organized
+projects, living briefs, and a chat assistant that genuinely knows what you
+are working on. Nothing leaves your machine: captures, database, and
+documents stay local, always.
+
+## Why teams use it
+
+**The context tax is real.** Every week you re-read threads to remember where
+a decision landed, re-open documents to check what changed, and re-download
+the same report outputs to build the same deck. BotBoy pays that tax for you:
+it captures as work happens, files evidence into the right project, keeps
+each project's brief current, and hands you the receipts when you ask.
 
 ## Product tour
 
@@ -14,19 +24,31 @@ workspace content, private messages, or personal data.
 
 ### Your day, prioritized
 
-Open BotBoy and start from one screen: what needs your attention, who is
-waiting on a reply from you, and what changed while you were away.
+One screen to start from: what needs your attention, who is waiting on a
+reply from you, and what changed while you were away — ranked, sourced, and
+current.
 
 ![BotBoy Today overview with a prioritized attention brief](docs/screenshots/today-overview.png)
 
 ### Documents that know your projects
 
-BotBoy syncs the SharePoint documents you work in (revisions, comments, open
-threads), renders them in a built-in reader, and can draft or edit documents
-for you — every change staged for your explicit approval before anything
-touches SharePoint.
+BotBoy syncs the SharePoint documents you work in — revisions, comments, open
+threads — renders them in a built-in reader, and drafts or edits documents on
+request. Every change is staged for your explicit approval before anything
+touches SharePoint. When someone comments on your doc, BotBoy surfaces it in
+minutes, not hours.
 
 ![BotBoy document workspace](docs/screenshots/documents.png)
+
+### Your ETL jobs, without the tab-juggling
+
+Analysts live in DataCentral. BotBoy speaks it natively: ask about a Datanet
+job run, paste a run URL, or just say "grab this week's report cuts" — BotBoy
+checks the run, diagnoses failures, downloads the output, and assembles the
+final report file. The weekly ritual of downloading each SQL output by hand
+is over. Submitting, restarting, or creating ETL work happens only when you
+explicitly ask — and heavyweight warehouse SQL always runs on its dedicated,
+read-only analytics connection.
 
 ### Connections and pipeline, in the open
 
@@ -36,7 +58,7 @@ touches SharePoint.
     <td width="50%"><img src="docs/screenshots/pipeline-health.png" alt="BotBoy pipeline health" /></td>
   </tr>
   <tr>
-    <td align="center"><strong>Connections</strong><br />Slack channels, Outlook/SharePoint, local folders, and browser capture — each one opt-in, configured from the dashboard.</td>
+    <td align="center"><strong>Connections</strong><br />Slack channels, Outlook/SharePoint, Datanet ETL, warehouse SQL, local folders, and browser capture — each one opt-in, configured from the dashboard with guided setup.</td>
     <td align="center"><strong>Pipeline health</strong><br />Read-only visibility into capture, extraction, organization, and synthesis, so you always know what BotBoy is doing.</td>
   </tr>
 </table>
@@ -44,16 +66,24 @@ touches SharePoint.
 ## What you get
 
 - **Capture without note-taking** — Slack messages in channels you pick,
-  Outlook mail and calendar, SharePoint document revisions and comments,
-  files in watched folders, and pages you visit. All opt-in, all local.
-- **Projects that assemble themselves** — captured evidence is routed into
-  project briefs that stay current as work happens, with the receipts one
-  click away.
-- **A chat assistant with context** — ask "what needs my attention?", "what
-  changed in the HLD?", or "draft a status update" and get answers grounded
-  in your own evidence, with links back to sources.
-- **Approval-gated writes** — BotBoy never edits a SharePoint document or
-  publishes anything without a staged change you explicitly approve first.
+  Outlook mail and calendar, SharePoint revisions and comments, files in
+  watched folders, pages you visit. All opt-in, all local.
+- **Projects that assemble themselves** — captured evidence routes itself
+  into project briefs that stay current as work happens, receipts one click
+  away.
+- **A chat assistant with your context** — "what needs my attention?",
+  "what changed in the HLD?", "check my ETL jobs and pull yesterday's
+  output", "draft the status update" — answered from your own evidence,
+  with links back to sources.
+- **Analytics on tap** — governed, read-only SQL against your team's
+  warehouse, dashboards you can refresh and share deliberately, and Datanet
+  job outputs fetched straight into your workspace.
+- **Writes you approve, always** — BotBoy never edits a document, posts
+  anything, or touches a production pipeline without your explicit request.
+  Reads are free; changes are yours to authorize.
+- **Authentication that heals itself** — Amazon sessions expire; BotBoy
+  notices, silently re-establishes what it can, and when it truly needs you,
+  opens a terminal card with the one command to run.
 
 ## Prerequisites
 

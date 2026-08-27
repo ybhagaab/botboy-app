@@ -150,3 +150,57 @@ describe('Existing kinds unchanged (regressions)', () => {
     expect(classifyMcpTool('sql-context', 'drop_table')).toBe('write');
   });
 });
+
+describe('a2-analytics (Datanet ETL) classification', () => {
+  it('classifies curated reads as read, including the download tool', () => {
+    for (const tool of [
+      'datanet_get_job_run', 'datanet_get_latest_run', 'datanet_list_runs_by_date',
+      'datanet_get_job', 'datanet_get_profile_sql', 'datanet_search',
+      'datanet_diagnose_run', 'datanet_download_results', 'server_health',
+    ]) {
+      expect(classifyMcpTool('a2-analytics', tool), tool).toBe('read');
+    }
+  });
+
+  it('classifies every non-curated tool as write — no name-pattern fallback', () => {
+    // get_-prefixed names would pass the generic READ_NAME_PATTERN; the
+    // curated set must be the only read authority for this kind.
+    expect(classifyMcpTool('a2-analytics', 'get_some_future_tool')).toBe('write');
+    expect(classifyMcpTool('a2-analytics', 'datanet_submit_run')).toBe('write');
+    expect(classifyMcpTool('a2-analytics', 'datanet_alter_run')).toBe('write');
+    expect(classifyMcpTool('a2-analytics', 'datanet_create_profile')).toBe('write');
+    expect(classifyMcpTool('a2-analytics', 'datanet_update_profile_sql')).toBe('write');
+  });
+
+  it('write tools pass only with ownerApproved', () => {
+    expect(() => validateMcpToolCall('a2-analytics', 'datanet_submit_run', {}, {})).toThrow(/explicit owner request/);
+    expect(validateMcpToolCall('a2-analytics', 'datanet_submit_run', { job_id: '1' }, { ownerApproved: true }))
+      .toEqual({ job_id: '1' });
+  });
+});
+
+describe('a2-analytics blocked tier (unconditional)', () => {
+  it('blocks redshift_query with the SQL-primacy redirect, even with ownerApproved', () => {
+    expect(() => validateMcpToolCall('a2-analytics', 'redshift_query', {}, { ownerApproved: true }))
+      .toThrow(/dedicated SQL connection.*mcp_sql_query/);
+  });
+
+  it('blocks bulk and irreversible pipeline mutations regardless of flags', () => {
+    for (const tool of [
+      'datanet_batch_submit', 'datanet_batch_restart', 'datanet_batch_force',
+      'datanet_force_deps', 'datanet_unschedule_job', 'cradle_batch_backfill',
+    ]) {
+      expect(() => validateMcpToolCall('a2-analytics', tool, {}, { ownerApproved: true, guidedFlow: true }), tool)
+        .toThrow(/blocked for the ETL profile/);
+    }
+  });
+
+  it('records blocked wording so mcp-manager audits these as status=blocked', () => {
+    try {
+      validateMcpToolCall('a2-analytics', 'datanet_batch_force', {}, { ownerApproved: true });
+      expect.unreachable('should have thrown');
+    } catch (error: any) {
+      expect(String(error.message)).toContain('blocked');
+    }
+  });
+});

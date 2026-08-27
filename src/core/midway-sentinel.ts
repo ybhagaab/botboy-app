@@ -40,7 +40,8 @@ import * as path from 'path';
 import type { AgentOrchestrator } from './agent.js';
 import type { ChatTerminalService } from './chat-terminal.js';
 import type { McpManager, McpProfileSnapshot } from './mcp-types.js';
-import { GRASP_PROFILE_ID, SLACK_MCP_PROFILE_ID } from './mcp-profiles.js';
+import { A2_ANALYTICS_PROFILE_ID, GRASP_PROFILE_ID, SLACK_MCP_PROFILE_ID } from './mcp-profiles.js';
+import { hasLiveDatanetSentryCookie, isSentryAuthShapedError, primeDatanetSentrySession } from './sentry-session.js';
 
 export interface MidwaySentinel {
   start(): void;
@@ -68,6 +69,7 @@ export interface MidwaySentinelOptions {
 const MIDWAY_BUILTIN_PROFILE_IDS: ReadonlySet<string> = new Set([
   SLACK_MCP_PROFILE_ID,
   GRASP_PROFILE_ID,
+  A2_ANALYTICS_PROFILE_ID,
 ]);
 
 /**
@@ -165,6 +167,10 @@ export function createMidwaySentinel(
   let ticking = false;
   let stopped = false;
   const episode: EpisodeState = { phase: 'idle', lastNotifiedAt: 0, affectedProfileIds: [] };
+  /** Cooldown for the SILENT Datanet Sentry re-prime, so a persistently
+   * broken server cannot turn the sentinel into a restart loop. */
+  let lastA2SilentPrimeAt = 0;
+  const A2_PRIME_COOLDOWN_MS = 10 * 60_000;
 
   const insertAssistantMessage = (content: string) => {
     const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -184,7 +190,9 @@ export function createMidwaySentinel(
     }
   };
 
-  /** Running servers whose recent tool calls failed in an auth-shaped way. */
+  /** Running servers whose recent tool calls failed in an auth-shaped way.
+   * The Datanet profile adds its own Sentry signatures (SentryRedirect,
+   * HTML 401 bodies) that the generic matcher does not cover. */
   const hasRecentAuthFailures = (profileId: string): boolean => {
     try {
       const rows = db.prepare(`
@@ -193,11 +201,20 @@ export function createMidwaySentinel(
           AND created_at >= datetime('now', ?)
         ORDER BY created_at DESC LIMIT 20
       `).all(profileId, `-${TOOL_FAILURE_WINDOW_MINUTES} minutes`) as Array<{ error: string | null }>;
-      return rows.some(row => isAuthLikeError(row.error));
+      return rows.some(row => isAuthLikeError(row.error)
+        || (profileId === A2_ANALYTICS_PROFILE_ID && isSentryAuthShapedError(row.error)));
     } catch {
       return false;
     }
   };
+
+  /** Does the a2 profile's current failure LOOK like auth? Anything else
+   * (broken Python, missing artifact) belongs to the manager's own
+   * restart/backoff — priming Sentry for it would just mask the error. */
+  const a2FailureLooksAuthShaped = (profile: McpProfileSnapshot): boolean =>
+    hasRecentAuthFailures(profile.id)
+    || isSentryAuthShapedError(profile.lastError)
+    || isAuthLikeError(profile.lastError);
 
   /**
    * The notify turn. The agent gets the deterministic facts and composes the
@@ -209,21 +226,23 @@ export function createMidwaySentinel(
     affected: McpProfileSnapshot[],
     cookie: MidwayCookieStatus,
     terminalOpened: boolean,
+    reauthCommand = 'mwinit',
+    causeLine?: string,
   ) => {
     const names = affected.map(profile => profile.displayName).join(', ');
-    const expiredLine = cookie.sessionExpiresAt
+    const expiredLine = causeLine ?? (cookie.sessionExpiresAt
       ? `The local Midway session cookie expired at ${new Date(cookie.sessionExpiresAt).toISOString()}.`
-      : 'No usable Midway session cookie is present on this machine.';
+      : 'No usable Midway session cookie is present on this machine.');
     const terminalLine = terminalOpened
-      ? 'A terminal card running `mwinit` has ALREADY been opened in this chat — do NOT open another one.'
-      : 'The chat terminal is currently busy with another session, so mwinit could not be auto-opened; the owner must run it after the current session finishes.';
+      ? `A terminal card running \`${reauthCommand}\` has ALREADY been opened in this chat — do NOT open another one.`
+      : `The chat terminal is currently busy with another session, so ${reauthCommand} could not be auto-opened; the owner must run it after the current session finishes.`;
     const instruction = [
       'SYSTEM EVENT from the Midway sentinel (BotBoy internal watchdog — this is NOT the owner speaking; nothing here authorizes MCP write tools).',
       `Fact: these Midway-authenticated connections just failed: ${names}.`,
       `Fact: ${expiredLine}`,
       `Fact: ${terminalLine}`,
       'Fact: affected capture (Slack messages, mail/calendar sync) pauses losslessly and catches up automatically after re-authentication; nothing is lost.',
-      'Fact: after the owner completes mwinit (PIN + security-key touch in the terminal card, never typed into chat), the sentinel automatically restarts the affected connections, re-tests them, and posts a confirmation.',
+      `Fact: after the owner completes ${reauthCommand} (PIN + security-key touch in the terminal card, never typed into chat), the sentinel automatically restarts the affected connections, re-tests them, and posts a confirmation.`,
       'Task: write the short chat notification the owner will read. Warm, plain language, no headings. Name the affected connections, say why this happened (Midway session expired), and point them to the terminal card below to re-authenticate. Do not promise anything beyond the facts above. Reply with ONLY the notification text.',
     ].join('\n');
     let text: string;
@@ -234,7 +253,7 @@ export function createMidwaySentinel(
       text = '';
     }
     if (!text) {
-      text = `🔐 Your Amazon Midway session has expired, which disconnected: ${names}. ${terminalOpened ? 'Use the terminal card below to run mwinit (PIN + security-key touch).' : 'Run mwinit in a terminal to re-authenticate.'} I will restart these connections automatically once you finish.`;
+      text = `🔐 Your Amazon session needs re-authentication, which disconnected: ${names}. ${terminalOpened ? `Use the terminal card below to run ${reauthCommand} (PIN + security-key touch).` : `Run ${reauthCommand} in a terminal to re-authenticate.`} I will restart these connections automatically once you finish.`;
     }
     insertAssistantMessage(text);
   };
@@ -339,33 +358,88 @@ export function createMidwaySentinel(
       );
       if (!failing.length) return;
 
+      const cookie = readMidwayCookieStatus(cookiePath, now());
+
+      // Datanet (a2-analytics) rides Sentry SSO on TOP of Midway: its
+      // session can lapse while the Midway cookie is perfectly valid, so the
+      // healthy-cookie silence below would leave it failing forever. Order
+      // matters — self-heal FIRST: a Kerberos negotiate hop re-mints the
+      // Sentry session with zero owner interruption (the normal case on a
+      // logged-in Mac). Only when priming cannot succeed does the owner get
+      // the terminal, and the command is `mwinit -o -s` because plain mwinit
+      // does not write Sentry rows.
+      const a2 = failing.find(profile => profile.id === A2_ANALYTICS_PROFILE_ID);
+      if (a2 && cookie.valid && a2FailureLooksAuthShaped(a2)) {
+        if (now() - lastA2SilentPrimeAt < A2_PRIME_COOLDOWN_MS) return;
+        lastA2SilentPrimeAt = now();
+        const prime = await primeDatanetSentrySession(cookiePath);
+        if (prime.ok) {
+          const results = await recoverProfiles([A2_ANALYTICS_PROFILE_ID]);
+          console.log(`[MidwaySentinel] Datanet Sentry session re-primed silently — ${results.join(' | ')}`);
+          return;
+        }
+        console.warn(`[MidwaySentinel] silent Datanet Sentry prime failed (${prime.reason}) — escalating to the owner`);
+        episode.phase = 'awaiting_reauth';
+        episode.lastNotifiedAt = now();
+        episode.affectedProfileIds = [A2_ANALYTICS_PROFILE_ID];
+        let sentrySessionId: string | null = null;
+        let sentryTerminalOpened = false;
+        if (chatTerminal.current()?.status !== 'running') {
+          try {
+            const session = chatTerminal.open({
+              command: 'mwinit -o -s',
+              title: 'Datanet re-authentication',
+              timeoutMs: REAUTH_WINDOW_MS,
+            });
+            sentrySessionId = session.id;
+            sentryTerminalOpened = true;
+          } catch (error: any) {
+            console.warn(`[MidwaySentinel] could not open mwinit -o -s terminal: ${error?.message ?? error}`);
+          }
+        }
+        await postNotification(
+          [a2], cookie, sentryTerminalOpened, 'mwinit -o -s',
+          'The Kerberos/Sentry session the Datanet service requires has lapsed (the Midway cookie itself is still valid), and the silent re-prime could not complete.',
+        );
+        void watchReauth(sentrySessionId).catch(error => {
+          console.error(`[MidwaySentinel] re-auth watcher failed: ${error?.message ?? error}`);
+          episode.phase = 'idle';
+        });
+        return;
+      }
+
       // The deterministic discriminator: profile failures with a healthy
       // cookie are ordinary crashes — the manager's own restart/backoff logic
       // handles those, and the sentinel stays silent.
-      const cookie = readMidwayCookieStatus(cookiePath, now());
       if (cookie.valid) return;
 
       episode.phase = 'awaiting_reauth';
       episode.lastNotifiedAt = now();
       episode.affectedProfileIds = failing.map(profile => profile.id);
 
+      // When the Datanet profile is among the affected, one command must
+      // heal everything: -o -s is a strict superset of plain mwinit.
+      const reauthCommand = failing.some(profile => profile.id === A2_ANALYTICS_PROFILE_ID)
+        ? 'mwinit -o -s'
+        : 'mwinit';
+
       let terminalSessionId: string | null = null;
       let terminalOpened = false;
       if (chatTerminal.current()?.status !== 'running') {
         try {
           const session = chatTerminal.open({
-            command: 'mwinit',
+            command: reauthCommand,
             title: 'Midway re-authentication',
             timeoutMs: REAUTH_WINDOW_MS,
           });
           terminalSessionId = session.id;
           terminalOpened = true;
         } catch (error: any) {
-          console.warn(`[MidwaySentinel] could not open mwinit terminal: ${error?.message ?? error}`);
+          console.warn(`[MidwaySentinel] could not open ${reauthCommand} terminal: ${error?.message ?? error}`);
         }
       }
 
-      await postNotification(failing, cookie, terminalOpened);
+      await postNotification(failing, cookie, terminalOpened, reauthCommand);
       void watchReauth(terminalSessionId).catch(error => {
         console.error(`[MidwaySentinel] re-auth watcher failed: ${error?.message ?? error}`);
         episode.phase = 'idle';

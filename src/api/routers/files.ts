@@ -15,9 +15,48 @@ import path from 'path';
 import { spawn } from 'child_process';
 import { Router, Request, Response } from 'express';
 import { paramStr, type RouterDeps } from './deps.js';
+import { createDocumentParser } from '../../core/document-parser.js';
 
 export function createFilesRouter(_deps: RouterDeps): Router {
   const router = Router();
+
+  // ── Spreadsheet preview (xlsx/xlsm) for the in-app file overlay ──
+  // The overlay renders text formats client-side, but a workbook is a zip —
+  // dumping its bytes as text produced the garbage-preview bug (owner report
+  // 2026-08-28). This endpoint reuses the same bounded sheet reader the
+  // document workbench uses (document-parser › parseXlsxSheet: sheet by
+  // NAME, row/char budgets, shared strings, formula cached values).
+  // Deliberately NOT under /files/* so the wildcard serve stays untouched
+  // (same reasoning as /files-list above).
+  router.get('/files-sheet', async (req: Request, res: Response) => {
+    const rel = paramStr(req.query.rel as any);
+    if (!rel) return res.status(400).json({ error: 'rel query parameter is required' });
+    const filesDir = path.resolve(path.join(os.homedir(), '.personal-productivity-tracker', 'files'));
+    const resolved = path.resolve(filesDir, rel);
+    if (!resolved.startsWith(filesDir + path.sep)) return res.status(403).json({ error: 'Access denied' });
+    if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'File not found' });
+    if (!/\.(xlsx|xlsm)$/i.test(resolved)) return res.status(415).json({ error: 'Only .xlsx/.xlsm files have sheet previews' });
+    const parser = createDocumentParser();
+    if (!parser.parseXlsxSheet) return res.status(501).json({ error: 'Sheet reader unavailable' });
+    try {
+      const requestedSheet = paramStr(req.query.sheet as any) ?? '';
+      // Preview budget: the overlay caps tables at 1000 rows; 500 keeps the
+      // modal snappy and the payload small. "Open in tab"/Finder remain the
+      // full-fidelity escape hatches.
+      const options = { maxRows: 500, ...(requestedSheet ? { sheet: requestedSheet } : {}) };
+      let result = await parser.parseXlsxSheet(resolved, options);
+      // No explicit sheet → auto-load the first one so the overlay renders
+      // data on open instead of a bare inventory (one server-side hop, not
+      // a second browser round-trip).
+      if (!requestedSheet && !result.sheet && result.sheets.length > 0) {
+        result = await parser.parseXlsxSheet(resolved, { ...options, sheet: result.sheets[0].name });
+      }
+      res.set('Cache-Control', 'no-store');
+      res.json({ sheets: result.sheets.map(sheet => sheet.name), sheet: result.sheet ?? null });
+    } catch (error: any) {
+      res.status(422).json({ error: `Could not read workbook: ${String(error?.message ?? error).slice(0, 300)}` });
+    }
+  });
 
   // ── File listing (for the in-app preview/browser UI) ──
   // Deliberately NOT under /files/* so the wildcard serve stays untouched.

@@ -9,6 +9,7 @@ import type { McpSecretStore } from './mcp-secret-store.js';
 import { createMcpSecretStore } from './mcp-secret-store.js';
 import { classifyMcpTool, validateMcpToolCall } from './mcp-policy.js';
 import {
+  A2_ANALYTICS_PROFILE_ID,
   buildCustomServerDefinition,
   CUSTOM_MCP_ID_PREFIX,
   CUSTOM_MCP_KIND,
@@ -25,6 +26,7 @@ import {
   SQL_CONTEXT_PROFILE_ID,
   type McpServerDefinition,
 } from './mcp-profiles.js';
+import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-session.js';
 import { createMcpTerminalEngine } from './mcp-terminal.js';
 import type {
   BuiltInMcpProfileId,
@@ -495,7 +497,7 @@ export function createMcpManager(options: {
     const profile = definitionFor(server.id);
     if (!profile) throw new Error(`Unknown MCP profile: ${server.id}`);
     const base = await snapshot(server);
-    const installationState = profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command'
+    const installationState = profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script'
       ? await resolveDefinitionExecutable(profile) ? 'installed' : 'not_installed'
       : 'installed';
     const toolNames = new Set(base.tools.map(tool => tool.name));
@@ -600,9 +602,12 @@ export function createMcpManager(options: {
         // AIM launch wrappers exec `aim …` from the child, so the child PATH
         // must resolve the toolchain even under a minimal-PATH launch.
         childEnv.PATH = pathValueWithFallbackDirectories(childEnv.PATH ?? process.env.PATH);
+        // aim-package-script launchers take no argv; both other branches
+        // carry their registry/user-declared args.
+        const launchArgs = profile.launch.type === 'aim-package-script' ? [] : [...profile.launch.args];
         transport = new StdioClientTransport({
           command: executable,
-          args: [...profile.launch.args],
+          args: launchArgs,
           env: childEnv,
           stderr: 'pipe',
         });
@@ -951,7 +956,7 @@ export function createMcpManager(options: {
   async function checkProfileInternal(profileId: string): Promise<McpProfileSnapshot> {
     const server = requireProfileRow(profileId);
     const profile = definitionFor(profileId);
-    if (profile && (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command')) {
+    if (profile && (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script')) {
       const executable = await resolveDefinitionExecutable(profile);
       const absenceReason = profile.launch.type === 'custom-command'
         ? `Command not found: ${profile.launch.command}`
@@ -1022,7 +1027,7 @@ export function createMcpManager(options: {
         throw new Error('This server configuration needs your review. Open its connection page and press Start.');
       }
     }
-    if (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command') {
+    if (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script') {
       const executable = await resolveDefinitionExecutable(profile);
       if (stopping || !active) throw new Error('The managed MCP runtime is shutting down.');
       if (!executable) {
@@ -1038,6 +1043,15 @@ export function createMcpManager(options: {
       }
     }
     if (stopping || !active) throw new Error('The managed MCP runtime is shutting down.');
+    // Datanet sits behind Sentry SSO (Kerberos acr): the a2 server's own
+    // bootstrap only reads the shared cookie jar, so BotBoy primes the
+    // Sentry session from the local Kerberos ticket before launch when the
+    // jar has no live row. Best-effort and silent: a failed prime still
+    // starts the server — per-call auth handling owns the user-facing path.
+    if (profileId === A2_ANALYTICS_PROFILE_ID && !hasLiveDatanetSentryCookie()) {
+      const prime = await primeDatanetSentrySession();
+      console.log(`[MCP] a2-analytics pre-start Sentry prime: ${prime.ok ? 'ok' : prime.reason}`);
+    }
     db.prepare(`
       UPDATE mcp_servers SET enabled = 1, state = 'stopped',
         last_error = NULL, updated_at = datetime('now') WHERE id = ?

@@ -66,12 +66,41 @@ BotBoy ships with managed connections on the **Connections** page. Two are
 worth setting up on day one:
 
 - **Amazon Microsoft 365 through GRASP** (Outlook mail + calendar, read-only,
-  synced every 30 min). This is per-person by design — GRASP uses your own
+  synced every 5 min). This is per-person by design — GRASP uses your own
   Amazon account (Midway + browser login), and BotBoy stores no GRASP
   credentials. Open the connection and follow the guided steps on the page:
   Install (Toolbox command), Initialize, `mwinit`, Authorize, then Start &
   test. One-time, about 5 minutes.
 - **Slack** — same idea: open the connection and follow the on-page steps.
+
+### Datanet ETL (DataCentral) — for anyone who runs ETL jobs
+
+If your reports come out of Datanet/DataCentral, set up the **Datanet ETL**
+connection. Once it's running you can ask BotBoy things like "check my ETL
+job", "why did run 128… fail?", or "download this week's report outputs and
+build the summary Excel" — no more downloading each SQL output by hand.
+
+Open **Connections → Datanet ETL** and run the guided steps on the page:
+
+1. **Install Toolbox + AIM** (skip if you have the `aim` CLI already).
+2. **Install the A2 Analytics package** — `aim agents install A2AnalyticsAgent`
+   (this carries the MCP server BotBoy talks to; it's built and maintained by
+   the Amazon Access BIE team).
+3. **Install the Python MCP library** — one-time; the page runs the exact
+   command that works around macOS Homebrew Python's install protections.
+4. **Refresh Midway + Sentry** — `mwinit -o -s`. The `-s` matters: Datanet
+   sits behind Sentry SSO, and plain `mwinit` isn't enough for it.
+5. **Start & test** on the page.
+
+Prerequisites beyond the page: Python 3.10+ (macOS ships it) and membership
+in your team's Datanet group (you have this if you can use DataCentral).
+
+Day-to-day auth is mostly invisible: when the Datanet session lapses, BotBoy
+silently re-establishes it from your logged-in Mac session. If it ever truly
+needs you, it opens a terminal card in chat with `mwinit -o -s` — run it
+there and BotBoy reconnects on its own. Reads and output downloads are free;
+anything that changes a pipeline (submit, restart, new profile) happens only
+when you explicitly ask in chat.
 
 If a connection card is missing, `git pull` and restart — your clone predates
 it.

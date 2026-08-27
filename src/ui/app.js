@@ -156,6 +156,7 @@ async function sendChat(msg) {
   const msgEl = document.createElement('div');
   msgEl.className = 'chat-msg assistant streaming-live';
   chatEl.appendChild(msgEl);
+  setChatStreaming(true);
 
   function autoScroll() {
     const isNearBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 100;
@@ -419,8 +420,38 @@ async function sendChat(msg) {
     renderSegments();
     msgEl.classList.remove('streaming-live');
     msgEl.classList.add('streaming-frozen');
+  } finally {
+    setChatStreaming(false);
   }
 }
+
+// ── Stop button for the in-flight chat turn ──
+// Cooperative: the server lets the current model/tool step finish, then the
+// turn closes with an honest progress summary (cancel ≠ failure). Visually
+// it SWAPS INTO the send button's slot (identical base styling, stop glyph)
+// so the composer keeps one action button — send when idle, stop while a
+// turn streams. The button disables itself after the click so a slow step
+// cannot collect repeats.
+function setChatStreaming(active) {
+  const stopBtn = document.getElementById('chat-stop');
+  const sendBtn = document.getElementById('chat-send');
+  if (!stopBtn || !sendBtn) return;
+  stopBtn.hidden = !active;
+  sendBtn.hidden = active;
+  stopBtn.disabled = false;
+  stopBtn.classList.remove('stopping');
+  stopBtn.title = 'Stop — BotBoy finishes the current step, then summarizes progress';
+}
+window.stopChatTurn = async () => {
+  const btn = document.getElementById('chat-stop');
+  if (btn) { btn.disabled = true; btn.classList.add('stopping'); btn.title = 'Stopping — finishing the current step…'; }
+  try {
+    await fetch(`${API}/chat/stop`, { method: 'POST' });
+  } catch (e) {
+    console.warn('[stopChatTurn] stop request failed:', e);
+    if (btn) { btn.disabled = false; btn.classList.remove('stopping'); }
+  }
+};
 async function processInbox() {
   state.processing = true; render();
   try {
@@ -2413,7 +2444,10 @@ function fpvTableHtml(rows) {
   const shown = truncated ? rows.slice(0, FPV_ROW_CAP) : rows;
   const [head, ...body] = shown;
   const th = head.map(c => `<th>${escHtml(c)}</th>`).join('');
-  const trs = body.map(r => `<tr>${r.map(c => `<td>${escHtml(c)}</td>`).join('')}</tr>`).join('');
+  // Cells never wrap (a squeezed grid shattered text into vertical letters —
+  // owner report 2026-08-28); long values ellipsize with the full text on
+  // hover, and the wrap container scrolls horizontally like a spreadsheet.
+  const trs = body.map(r => `<tr>${r.map(c => `<td${String(c).length > 24 ? ` title="${escAttr(c)}"` : ''}>${escHtml(c)}</td>`).join('')}</tr>`).join('');
   const note = truncated ? `<div class="fpv-note">Showing first ${FPV_ROW_CAP} rows — use “Open in tab” for the full file.</div>` : '';
   return `<div class="fpv-table-wrap"><table class="fpv-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>${note}`;
 }
@@ -2480,6 +2514,57 @@ window.previewFile = async (rawHref) => {
   }
   if (ext === 'html' || ext === 'htm') {
     body.innerHTML = `<iframe class="fpv-frame" src="${escAttr(href)}" sandbox="allow-scripts" title="${escAttr(displayName)}"></iframe>`;
+    return;
+  }
+  if (ext === 'pdf') {
+    // Chrome's built-in viewer handles PDFs; no sandbox needed (no scripts).
+    body.innerHTML = `<iframe class="fpv-frame" src="${escAttr(href)}" title="${escAttr(displayName)}"></iframe>`;
+    return;
+  }
+
+  // Workbooks — a zip on the wire, so the text path below would dump bytes
+  // (the garbage-preview bug, 2026-08-28). Server-side bounded sheet reads
+  // instead, with a tab per sheet.
+  if (ext === 'xlsx' || ext === 'xlsm') {
+    const loadSheet = async (sheetName) => {
+      body.innerHTML = '<div class="fpv-note">Reading workbook…</div>';
+      let data;
+      try {
+        const query = sheetName ? `&sheet=${encodeURIComponent(sheetName)}` : '';
+        const res = await fetch(`/api/files-sheet?rel=${encodeURIComponent(rel)}${query}`);
+        data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      } catch (err) {
+        body.innerHTML = `<div class="fpv-error">Could not preview this workbook (${escHtml(String(err && err.message || err))}). Use “Open in tab” or “Reveal in Finder” to view it in Excel.</div>`;
+        return;
+      }
+      const active = data.sheet ? data.sheet.name : '';
+      const tabs = (data.sheets || []).map(name =>
+        `<button type="button" class="fpv-tab ${name === active ? 'active' : ''}" data-fpv-sheet="${escAttr(name)}">${escHtml(name)}</button>`).join('');
+      const tabsBar = (data.sheets || []).length > 1 ? `<div class="fpv-tabs">${tabs}</div>` : '';
+      let table = '<div class="fpv-note">Empty workbook</div>';
+      let notes = '';
+      if (data.sheet) {
+        table = fpvTableHtml(data.sheet.rows || []);
+        const parts = [
+          data.sheet.truncation && data.sheet.truncation.rowsCut ? `showing first ${(data.sheet.rows || []).length} rows${data.sheet.rowsTotal ? ` of ${data.sheet.rowsTotal}` : ''}` : '',
+          data.sheet.formulaCells > 0 ? `${data.sheet.formulaCells} formula cell(s) show last-calculated values` : '',
+        ].filter(Boolean);
+        if (parts.length) notes = `<div class="fpv-note">${escHtml(parts.join(' · '))} — “Open in tab” downloads the full workbook.</div>`;
+      }
+      body.innerHTML = `${tabsBar}${table}${notes}`;
+      body.querySelectorAll('[data-fpv-sheet]').forEach(el => {
+        el.onclick = () => loadSheet(el.getAttribute('data-fpv-sheet'));
+      });
+    };
+    await loadSheet('');
+    return;
+  }
+
+  // Known binary formats with no inline renderer: a clean hand-off card
+  // beats a wall of zip bytes.
+  if (['xls', 'docx', 'doc', 'pptx', 'ppt', 'zip', 'gz', 'numbers', 'key', 'bin', 'db', 'sqlite'].includes(ext)) {
+    body.innerHTML = `<div class="fpv-binary"><span class="fpv-binary-icon">📄</span><div><strong>No inline preview for .${escHtml(ext)} files.</strong><br>Use “Open in tab” to download it, or “Reveal in Finder” to open it in its app.</div></div>`;
     return;
   }
 
