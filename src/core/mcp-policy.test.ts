@@ -185,14 +185,25 @@ describe('a2-analytics blocked tier (unconditional)', () => {
       .toThrow(/dedicated SQL connection.*mcp_sql_query/);
   });
 
-  it('blocks bulk and irreversible pipeline mutations regardless of flags', () => {
+  it('blocks bulk pipeline mutations regardless of flags', () => {
     for (const tool of [
       'datanet_batch_submit', 'datanet_batch_restart', 'datanet_batch_force',
-      'datanet_force_deps', 'datanet_unschedule_job', 'cradle_batch_backfill',
+      'datanet_unschedule_job', 'cradle_batch_backfill',
     ]) {
       expect(() => validateMcpToolCall('a2-analytics', tool, {}, { ownerApproved: true, guidedFlow: true }), tool)
         .toThrow(/blocked for the ETL profile/);
     }
+  });
+
+  it('force_deps is an attested write, NOT blocked (owner decision 2026-08-27)', () => {
+    // Moved out of the never tier after the first live incident: caution-tier
+    // write, gated on the ownerRequested attestation like every other single-run
+    // mutation. No server-side evidence verification by owner decision.
+    expect(classifyMcpTool('a2-analytics', 'datanet_force_deps')).toBe('write');
+    expect(() => validateMcpToolCall('a2-analytics', 'datanet_force_deps', {}, {}))
+      .toThrow(/explicit owner request/);
+    expect(validateMcpToolCall('a2-analytics', 'datanet_force_deps', { run_id: '1' }, { ownerApproved: true }))
+      .toEqual({ run_id: '1' });
   });
 
   it('records blocked wording so mcp-manager audits these as status=blocked', () => {

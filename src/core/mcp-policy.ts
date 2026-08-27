@@ -290,19 +290,24 @@ const A2_ANALYTICS_READ_TOOLS = new Set([
  *  - redshift_query: SQL PRIMACY — warehouse SQL belongs to the sql-context
  *    profile exclusively (owner decision 2026-08-27). Routing guidance says
  *    it; this set enforces it structurally.
- *  - batch_* / force_deps: bulk or irreversible pipeline mutations. The a2
- *    team's own agent gates each write on individual approval; a batch call
- *    collapses N approvals into one opaque action, and force-deps can load
- *    incomplete data irreversibly.
+ *  - batch_*: bulk pipeline mutations — a batch call collapses N approvals
+ *    into one opaque action.
  *  - config mutations of the shared ~/.a2data setup.
  * ownerApproved does NOT override this set.
+ *
+ * datanet_force_deps was in this set until 2026-08-27: after the first live
+ * incident (mis-windowed ad-hoc run, data verifiably loaded, owner sent
+ * clicking through DataCentral for a provably safe force) the owner moved it
+ * to the ordinary attested-write tier — callable, marked use-with-caution,
+ * gated on explicit owner confirmation like every other single-run write.
+ * Deliberately NO server-side evidence verification (owner decision: the
+ * confirmation conversation is the gate).
  */
 const A2_ANALYTICS_BLOCKED_TOOLS = new Set([
   'redshift_query',
   'datanet_batch_submit',
   'datanet_batch_restart',
   'datanet_batch_force',
-  'datanet_force_deps',
   'datanet_unschedule_job',
   'cradle_batch_backfill',
   'cradle_cancel_wfd_runs',

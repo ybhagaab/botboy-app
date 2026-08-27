@@ -1304,6 +1304,17 @@ export function createToolExecutor(
         ...(String(args.reason ?? '').trim() ? { reason: String(args.reason).trim() } : {}),
       }, { ownerApproved: true });
     },
+    mcp_etl_force_deps: (args) => {
+      const intentError = requireOwnerRequested(args, 'force dependencies on this ETL job run');
+      if (intentError) return intentError;
+      const runId = String(args.runId ?? '').trim();
+      if (!/^\d+$/.test(runId)) return 'Error: runId must be the numeric Datanet job run id';
+      // Datanet rejects reasons over 256 chars (live finding 2026-08-27) —
+      // truncate rather than bounce the whole force on a verbose reason.
+      const reason = String(args.reason ?? '').trim().slice(0, 256);
+      if (!reason) return 'Error: reason required — it lands in the Datanet audit trail';
+      return callEtlTool('datanet_force_deps', { run_id: runId, reason }, { ownerApproved: true });
+    },
     mcp_etl_create_profile: (args) => {
       const intentError = requireOwnerRequested(args, 'create this ETL profile');
       if (intentError) return intentError;
