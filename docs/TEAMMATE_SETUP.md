@@ -131,6 +131,19 @@ output to the owner. It checks your Node, Xcode CLT, build, native modules,
 credentials, port, and the served UI, and includes the last log lines —
 almost every issue is identifiable from that one paste.
 
+### Getting logs
+
+```bash
+./start.sh --doctor | pbcopy        # support report straight to your clipboard — paste into Slack
+tail -n 200 /tmp/ppt.log | pbcopy   # just the recent raw log
+tail -f /tmp/ppt.log                # watch the log live while reproducing a problem
+```
+
+BotBoy's runtime log lives at `/tmp/ppt.log`. The doctor report is the
+better first paste (it includes environment checks plus the log tail), and
+it's safe to share — the credentials check prints only an HTTP status code,
+never your secrets.
+
 Also useful: `./start.sh --stop` stops every BotBoy process cleanly (use it
 if you started BotBoy several times or things look stuck), then `./start.sh`
 starts one fresh instance.

@@ -220,6 +220,21 @@ esac
 #    Without `-n`, Chrome's singleton hands the command line to the ALREADY
 #    RUNNING instance, which opens the app window in-process. (2026-08-05.)
 open_dashboard_window() {
+  # $1 = "focus": reactivation path (--open-window — Dock icon, Spotlight,
+  # Launchpad while BotBoy is already running). Nothing changed, the user
+  # just wants their window back: focus the existing window instead of
+  # closing+respawning it. The old respawn here silently threw away the
+  # user's current page (fresh window = bare root URL = homepage) — first
+  # teammate-reported bug, 2026-08-28.
+  #
+  # No argument = real start/restart: close any old window and spawn fresh.
+  # That path keeps the stale-JS protection (a reused window runs whatever
+  # app.js it loaded at open time — AGENT_FIX_LEARNINGS #1/#17/#18): a
+  # start/restart can mean new code, so the window must reload it. Focus
+  # reuse is safe from staleness because the bootId poll hard-reloads every
+  # open tab whenever the server restarts — a live window is never older
+  # than the running server.
+  local mode="${1:-fresh}"
   # Tolerate a still-warming Chrome: retry the DevTools endpoint briefly
   # rather than deciding from a single probe.
   local devtools_up=1
@@ -229,22 +244,37 @@ open_dashboard_window() {
   done
   if [ "$devtools_up" = "0" ]; then
     # Parse with node (always present — it runs the server); python3 is not a
-    # BotBoy prerequisite and may be missing on a fresh machine.
-    DASH_TARGET=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
-      | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d).filter(x=>String(x.url||'').includes('localhost:7778'));process.stdout.write(t.length?t[0].id:'')}catch{}})" 2>/dev/null)
+    # BotBoy prerequisite and may be missing on a fresh machine. Emits
+    # "<targetId>\t<url>" so the respawn below can preserve the user's place.
+    DASH_INFO=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
+      | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d).filter(x=>String(x.url||'').includes('localhost:7778'));process.stdout.write(t.length?(t[0].id+'\t'+String(t[0].url||'')):'')}catch{}})" 2>/dev/null)
+    DASH_TARGET="${DASH_INFO%%$'\t'*}"
+    DASH_URL="${DASH_INFO#*$'\t'}"
+    if [ -n "$DASH_TARGET" ] && [ "$mode" = "focus" ]; then
+      # Target.activateTarget: raises the existing app window, page state
+      # (route, scroll, drafts) intact.
+      curl -s --max-time 3 "http://127.0.0.1:9222/json/activate/$DASH_TARGET" >/dev/null
+      echo "✅ Dashboard window focused"
+      return 0
+    fi
+    # Real start/restart: the fresh window must load current code, but the
+    # user's PLACE should survive — reopen at the old window's URL (the route
+    # lives in the hash; a since-removed route degrades to the not-found view
+    # via parseRoute). Guard: only genuine dashboard URLs are reused, so a
+    # connection-error page (chrome-error://…) is never resurrected.
+    REOPEN_URL="http://localhost:7778"
+    case "$DASH_URL" in
+      "http://localhost:7778"*) REOPEN_URL="$DASH_URL" ;;
+    esac
     if [ -n "$DASH_TARGET" ]; then
-      # A reused window keeps running whatever app.js it loaded at open time —
-      # potentially weeks old (recurring gotcha: AGENT_FIX_LEARNINGS #1/#17/#18;
-      # bit again 2026-08-25 as a "broken overlay"). ./start.sh means new code:
-      # close the stale window and open a fresh one so the UI is current.
       curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$DASH_TARGET" >/dev/null
       sleep 1
     fi
     "$CHROME" \
       --user-data-dir="$DEBUG_PROFILE" \
-      --app="http://localhost:7778" >/dev/null 2>&1 &
+      --app="$REOPEN_URL" >/dev/null 2>&1 &
     sleep 2
-    echo "✅ Dashboard window ready: http://localhost:7778"
+    echo "✅ Dashboard window ready: $REOPEN_URL"
   else
     echo "⚠️  Debug Chrome not reachable on :9222 — open http://localhost:7778 manually"
   fi
@@ -323,7 +353,7 @@ stop_existing_server() {
 cd "$PROJ_DIR" || exit 1
 
 if [ "$OPEN_WINDOW_ONLY" = "1" ]; then
-  open_dashboard_window
+  open_dashboard_window focus
   exit 0
 fi
 
