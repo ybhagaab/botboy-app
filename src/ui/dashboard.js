@@ -5101,6 +5101,14 @@ function bindEvents() {
       window.submitChat?.();
     }
   });
+  // Mobile: the bottom nav stays visible under the chat panel (2026-08-28),
+  // so a route tap while the panel covers the workspace would change the page
+  // invisibly behind it — close the panel so the navigation is seen. The
+  // BotBoy button in the nav keeps its own toggle behavior.
+  document.querySelector('.mobile-nav')?.addEventListener('click', event => {
+    if (!event.target.closest('a[href]')) return;
+    if (window.matchMedia('(max-width:820px)').matches && document.body.classList.contains('assistant-open')) toggleAssistant(false);
+  });
   document.getElementById('command-input').addEventListener('input', event => {
     clearTimeout(state.commandTimer);
     state.commandIndex = 0;

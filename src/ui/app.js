@@ -70,6 +70,51 @@ function initChatThinkingControl() {
   });
 }
 
+// Chat panel width preset (teammate request 2026-08-28). A body class
+// redefines --assistant — the same variable the workspace push-aside reads
+// (dashboard.css; the --sidebar expanded/collapsed pattern). 'default' = no
+// class. Persisted per browser like the thinking level; restored during init
+// so the panel never visibly jumps on load. ≤820px the mobile rules pin the
+// panel width directly and the control is hidden — presets are inert there.
+const CHAT_WIDTH_KEY = 'botboy.chat.width';
+const CHAT_WIDTH_MODES = ['default', 'wide', 'expand'];
+
+function chatWidthMode() {
+  try {
+    const stored = localStorage.getItem(CHAT_WIDTH_KEY);
+    return CHAT_WIDTH_MODES.includes(stored) ? stored : 'default';
+  } catch { return 'default'; }
+}
+
+function applyChatWidthMode(mode) {
+  document.body.classList.toggle('chat-width-wide', mode === 'wide');
+  document.body.classList.toggle('chat-width-expand', mode === 'expand');
+  document.querySelectorAll('#chat-panel .chat-width [data-width-mode]').forEach(btn => {
+    const active = btn.dataset.widthMode === mode;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
+  });
+  // If the user was reading the newest message, keep them pinned to it
+  // through the reflow (width change rewraps every bubble).
+  const messages = document.getElementById('chat-messages');
+  if (messages && messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80) {
+    requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
+  }
+}
+
+function initChatWidthControl() {
+  const group = document.querySelector('#chat-panel .chat-width');
+  if (!group) return;
+  applyChatWidthMode(chatWidthMode());
+  group.addEventListener('click', (event) => {
+    const btn = event.target.closest('[data-width-mode]');
+    if (!btn) return;
+    const value = CHAT_WIDTH_MODES.includes(btn.dataset.widthMode) ? btn.dataset.widthMode : 'default';
+    try { localStorage.setItem(CHAT_WIDTH_KEY, value); } catch {}
+    applyChatWidthMode(value);
+  });
+}
+
 function activeChatRequestContext() {
   return chatRequestContext || ambientChatRequestContext;
 }
@@ -2682,6 +2727,7 @@ document.addEventListener('click', (e) => {
   }
 
   initChatThinkingControl();
+  initChatWidthControl();
   await Promise.all([
     loadRoots(),
     loadChatHistory(),
