@@ -78,6 +78,9 @@ const state = {
     questionsOpen: true,
     downloading: null,
     deleting: false,
+    // Guided pandoc install (blocked Word/PDF/HTML download):
+    // { artifactId, format, state: 'offer'|'installing'|'failed'|'homebrew_missing', error }
+    pandocPrompt: null,
   },
   rebuilding: new Set(),
   evidencePending: new Set(),
@@ -3873,7 +3876,7 @@ function renderDocumentDetailPane(artifactId) {
       ? `${icon('shield', 13)} Markdown rendered with escape-first formatting`
       : `${icon('shield', 13)} Content is rendered as plain text only`;
 
-  return `<article class="card document-detail-pane"><div class="document-detail-toolbar">${back}<span class="pill ${stateTone}">${esc(documentStateLabel(artifact.state))}</span>${modeButtons}<div class="document-toolbar-actions">${downloadMenu}${deleteButton}${fullscreenButton}</div></div><header class="document-detail-header"><div><div class="eyebrow">${icon('file', 14)} Product document</div><h2>${esc(artifact.title)}</h2><p><code>${esc(artifact.artifactId)}</code></p>${parentLine}</div><button class="button small" type="button" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)} ${loading ? 'Refreshing…' : 'Refresh document'}</button></header><div class="document-detail-meta"><span>${esc(`${artifact.profileId || 'Unknown profile'}${profileVersion}`)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span>${extraMetadata.map(value => `<span>${esc(value)}</span>`).join('')}</div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${advisoriesBlock}<div class="document-preview-shell">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
+  return `<article class="card document-detail-pane"><div class="document-detail-toolbar">${back}<span class="pill ${stateTone}">${esc(documentStateLabel(artifact.state))}</span>${modeButtons}<div class="document-toolbar-actions">${downloadMenu}${deleteButton}${fullscreenButton}</div></div><header class="document-detail-header"><div><div class="eyebrow">${icon('file', 14)} Product document</div><h2>${esc(artifact.title)}</h2><p><code>${esc(artifact.artifactId)}</code></p>${parentLine}</div><button class="button small" type="button" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)} ${loading ? 'Refreshing…' : 'Refresh document'}</button></header><div class="document-detail-meta"><span>${esc(`${artifact.profileId || 'Unknown profile'}${profileVersion}`)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span>${extraMetadata.map(value => `<span>${esc(value)}</span>`).join('')}</div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}${advisoriesBlock}<div class="document-preview-shell">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
 }
 
 function renderDocuments() {
@@ -3892,6 +3895,9 @@ function renderDocuments() {
     documents.questionsOpen = true;
     documents.downloading = null;
     documents.deleting = false;
+    // Keep an in-flight install alive across artifact switches — the retry
+    // targets the artifact that started it; only clear a resting card.
+    if (documents.pandocPrompt && documents.pandocPrompt.state !== 'installing') documents.pandocPrompt = null;
     if (!artifactId) documents.fullscreen = false;
   }
   if (documents.items === null && !documents.loading && !documents.error) void loadDocuments();
@@ -4145,10 +4151,18 @@ async function downloadDocument(artifactId, format) {
     // streams the file back; the browser then saves it like any download.
     const response = await fetch(`${API}/product-documents/${encodeURIComponent(artifactId)}/export?format=${encodeURIComponent(format)}`);
     if (!response.ok) {
-      let detail = '';
-      try { detail = (await response.json())?.error || ''; } catch {}
-      throw new Error(detail || `HTTP ${response.status}`);
+      let payload = null;
+      try { payload = await response.json(); } catch {}
+      if (payload?.code === 'pandoc_missing') {
+        // Not a dead end: offer the guided install right where the click
+        // happened. The card owns the rest of the flow (install → retry).
+        documents.pandocPrompt = { artifactId, format, state: 'offer', error: '' };
+        return;
+      }
+      throw new Error(payload?.error || `HTTP ${response.status}`);
     }
+    // A successful conversion clears any resting install card.
+    if (documents.pandocPrompt && documents.pandocPrompt.state !== 'installing') documents.pandocPrompt = null;
     const blob = await response.blob();
     const disposition = response.headers.get('Content-Disposition') || '';
     const filename = /filename="([^"]+)"/.exec(disposition)?.[1]
@@ -4167,6 +4181,95 @@ async function downloadDocument(artifactId, format) {
     documents.downloading = null;
     renderRoute({ preserveScroll: true, userAction: true });
   }
+}
+
+// ── Guided pandoc install (owner request 2026-08-28) ──
+// A blocked Word/PDF/HTML download offers a one-click Homebrew install that
+// runs in BotBoy's chat terminal dock: output streams live, and if brew asks
+// anything the user types straight into the PTY (the secret toggle hides
+// passwords). When the session completes, the download that started the flow
+// retries automatically. The server owns the command; this code only clicks.
+
+const PANDOC_FORMAT_LABELS = { docx: 'Word', pdf: 'PDF', html: 'HTML', markdown: 'Markdown' };
+
+async function startPandocInstall() {
+  const prompt = state.documents.pandocPrompt;
+  if (!prompt || prompt.state === 'installing') return;
+  prompt.state = 'installing';
+  prompt.error = '';
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const res = await fetch(`${API}/product-documents/export-tools/install`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (res.ok && payload.alreadyInstalled) {
+      // Installed outside BotBoy in the meantime — just finish the download.
+      const { artifactId, format } = prompt;
+      state.documents.pandocPrompt = null;
+      renderRoute({ preserveScroll: true, userAction: true });
+      void downloadDocument(artifactId, format);
+      return;
+    }
+    if (!res.ok) {
+      prompt.state = payload?.code === 'homebrew_missing' ? 'homebrew_missing' : 'failed';
+      prompt.error = payload?.error || `HTTP ${res.status}`;
+      renderRoute({ preserveScroll: true, userAction: true });
+      return;
+    }
+    // Surface the terminal immediately (the version poll would also catch it
+    // within a few seconds and auto-open the panel once per session).
+    if (document.getElementById('chat-panel')?.classList.contains('hidden')) window.toggleChat?.();
+    window.checkChatTerminal?.();
+    watchPandocInstall(payload.session?.id);
+    renderRoute({ preserveScroll: true, userAction: true });
+  } catch (error) {
+    prompt.state = 'failed';
+    prompt.error = error?.message || 'unknown error';
+    renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+function watchPandocInstall(sessionId) {
+  const timer = setInterval(async () => {
+    const prompt = state.documents.pandocPrompt;
+    if (!prompt || prompt.state !== 'installing') { clearInterval(timer); return; }
+    try {
+      const res = await fetch(`${API}/chat/terminal/active`);
+      if (!res.ok) return;
+      const session = (await res.json())?.session;
+      if (!session || (sessionId && session.id !== sessionId)) return;
+      if (session.status === 'running') return;
+      clearInterval(timer);
+      if (session.status === 'completed') {
+        // Clean exit — pick the download back up where the user left it. If
+        // pandoc is somehow still missing, downloadDocument brings the offer
+        // card straight back (no silent loop).
+        const { artifactId, format } = prompt;
+        state.documents.pandocPrompt = null;
+        renderRoute({ preserveScroll: true, userAction: true });
+        void downloadDocument(artifactId, format);
+      } else {
+        prompt.state = 'failed';
+        prompt.error = 'The install did not finish — the terminal output in the BotBoy panel has the details.';
+        renderRoute({ preserveScroll: true, userAction: true });
+      }
+    } catch { /* transient poll failure — next tick retries */ }
+  }, 2000);
+}
+
+function renderPandocInstallCard(prompt) {
+  const formatLabel = PANDOC_FORMAT_LABELS[prompt.format] || prompt.format;
+  if (prompt.state === 'installing') {
+    return `<div class="pandoc-install-card" role="status">${icon('activity', 14)}<div><strong>Installing pandoc…</strong><span>Watch the terminal in the BotBoy panel — if it asks anything, type right into it. Your ${esc(formatLabel)} download starts automatically when it finishes.</span></div></div>`;
+  }
+  if (prompt.state === 'homebrew_missing') {
+    return `<div class="pandoc-install-card is-warn" role="alert">${icon('alert', 14)}<div><strong>Homebrew isn't installed on this Mac</strong><span>Install it from <a href="https://brew.sh" target="_blank" rel="noreferrer">brew.sh</a> first, then run <code>brew install pandoc</code> in your terminal — or ask BotBoy in chat to walk you through it.</span><span class="pandoc-actions"><button class="button small" type="button" data-action="documents-pandoc-copy">Copy command</button><button class="button small" type="button" data-action="documents-pandoc-dismiss">Dismiss</button></span></div></div>`;
+  }
+  if (prompt.state === 'failed') {
+    return `<div class="pandoc-install-card is-warn" role="alert">${icon('alert', 14)}<div><strong>The pandoc install didn't finish</strong><span>${esc(prompt.error || '')}</span><span class="pandoc-actions"><button class="button small primary" type="button" data-action="documents-pandoc-install">Try again</button><button class="button small" type="button" data-action="documents-pandoc-copy">Copy command</button><button class="button small" type="button" data-action="documents-pandoc-dismiss">Dismiss</button></span></div></div>`;
+  }
+  return `<div class="pandoc-install-card" role="alert">${icon('download', 14)}<div><strong>One-time setup for ${esc(formatLabel)} downloads</strong><span>BotBoy converts documents locally with pandoc, which isn't installed yet. Install it with Homebrew (about a minute)? The install runs in a terminal inside BotBoy — output streams live, and if it asks anything you type right into it. Markdown downloads already work without it.</span><span class="pandoc-actions"><button class="button small primary" type="button" data-action="documents-pandoc-install">Install pandoc</button><button class="button small" type="button" data-action="documents-pandoc-copy">Copy command instead</button><button class="button small" type="button" data-action="documents-pandoc-dismiss">Not now</button></span></div></div>`;
 }
 
 async function deleteDocument(artifactId) {
@@ -4824,6 +4927,14 @@ function bindEvents() {
     if (action === 'documents-save-revision') void saveDocumentRevision(target.dataset.artifact);
     if (action === 'documents-send-answers') sendDocumentAnswers(target.dataset.artifact);
     if (action === 'documents-download') void downloadDocument(target.dataset.artifact, target.dataset.format);
+    if (action === 'documents-pandoc-install') void startPandocInstall();
+    if (action === 'documents-pandoc-dismiss') { state.documents.pandocPrompt = null; renderRoute({ preserveScroll: true, userAction: true }); }
+    if (action === 'documents-pandoc-copy') {
+      void navigator.clipboard?.writeText('brew install pandoc').then(() => {
+        target.textContent = 'Copied';
+        setTimeout(() => { target.textContent = 'Copy command'; }, 1600);
+      });
+    }
     if (action === 'documents-delete') void deleteDocument(target.dataset.artifact);
     if (action === 'documents-fullscreen') {
       state.documents.fullscreen = !state.documents.fullscreen;

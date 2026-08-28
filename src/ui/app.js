@@ -988,6 +988,9 @@ function attachChatTerminalStream(session) {
   source.onerror = () => { /* keep-alive gaps are normal; end closes cleanly */ };
 }
 
+// Exposed for dashboard.js flows that open terminal sessions server-side
+// (guided pandoc install): instant dock pickup instead of waiting a poll.
+window.checkChatTerminal = checkChatTerminal;
 async function checkChatTerminal() {
   try {
     const res = await fetch(`${API}/chat/terminal/active`);

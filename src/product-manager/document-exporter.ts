@@ -38,9 +38,15 @@ export function isDocumentExportFormat(value: unknown): value is DocumentExportF
   return typeof value === 'string' && value in DOCUMENT_EXPORT_FORMATS;
 }
 
-/** Conversion failed because a local tool is missing or errored. */
+/**
+ * Conversion failed because a local tool is missing or errored. `code`
+ * distinguishes the actionable "install pandoc" case (the export route maps
+ * it to HTTP 424 and the UI offers the guided install) from ordinary tool
+ * failures (502).
+ */
+export type DocumentExportErrorCode = 'pandoc_missing' | 'tool_failed';
 export class DocumentExportError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly code: DocumentExportErrorCode = 'tool_failed') {
     super(message);
     this.name = 'DocumentExportError';
   }
@@ -59,9 +65,16 @@ function extraBinDirs(): string[] {
 
 const resolvedBinaries = new Map<string, string | null>();
 
-/** Verify candidate executables by running them; cache the first that works. */
+/**
+ * Verify candidate executables by running them; cache the first that works.
+ * Only SUCCESSES are cached: a missing tool can be installed mid-session (the
+ * guided pandoc install flow), and a cached null would keep every download
+ * failing until a server restart. Probing absent binaries costs nothing —
+ * spawn fails instantly with ENOENT.
+ */
 async function resolveExecutable(cacheKey: string, candidates: string[]): Promise<string | null> {
-  if (resolvedBinaries.has(cacheKey)) return resolvedBinaries.get(cacheKey) ?? null;
+  const cached = resolvedBinaries.get(cacheKey);
+  if (cached) return cached;
   for (const candidate of candidates) {
     try {
       await execFileAsync(candidate, ['--version'], { timeout: 10_000 });
@@ -71,13 +84,26 @@ async function resolveExecutable(cacheKey: string, candidates: string[]): Promis
       // Try the next candidate.
     }
   }
-  resolvedBinaries.set(cacheKey, null);
   return null;
 }
 
 /** Find an executable by name on PATH or in common local install dirs. */
 function resolveBinary(name: string): Promise<string | null> {
   return resolveExecutable(name, [name, ...extraBinDirs().map((dir) => path.join(dir, name))]);
+}
+
+/**
+ * Homebrew, for the guided pandoc install (the install endpoint needs the
+ * absolute path — the terminal runs a fixed server-side command, and PATH on
+ * a login shell may still miss a fresh Homebrew).
+ */
+export function resolveBrewExecutable(): Promise<string | null> {
+  return resolveExecutable('brew', ['brew', ...extraBinDirs().map((dir) => path.join(dir, 'brew'))]);
+}
+
+/** True when Word/HTML/PDF exports can convert (markdown always works). */
+export async function isPandocInstalled(): Promise<boolean> {
+  return (await resolveBinary('pandoc')) !== null;
 }
 
 /** Headless-capable Chrome/Chromium for printing HTML to PDF. */
@@ -123,12 +149,85 @@ const buildExportStyle = (dateText: string) => `
   pre code { background: transparent; padding: 0; }
   table { border-collapse: collapse; margin: 1em 0; }
   th, td { border: 1px solid #ccd0d7; padding: 6px 11px; text-align: left; vertical-align: top; }
-  th { background: #f1f2f5; }
+  th { background: #000; color: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   blockquote { border-left: 3px solid #ccd0d7; margin-left: 0; padding-left: 14px; color: #4c515a; }
   hr { border: 0; border-top: 1px solid #d8dbe1; margin: 2em 0; }
   a { color: #2456c4; }
   h1, h2, h3, h4, tr, pre { break-inside: avoid; }
 `;
+
+/**
+ * Print-only additions for the Chrome-printed PDF (owner request 2026-08-28):
+ * Amazon document sizes (10pt body, 11pt headings, 12pt title — the content's
+ * own H1 is the title now that the metadata title block is gone) and margin
+ * line numbers, which Amazon docs carry almost always. CSS cannot number
+ * visual lines, so a small script measures each block's line boxes after layout
+ * (Range.getClientRects) and absolutely positions continuous numbers in a
+ * left gutter; headless Chrome runs scripts before printing. Tables are not
+ * line-numbered, matching Word's own line-numbering behavior. The on-screen
+ * HTML download never includes any of this.
+ */
+const buildPrintExtras = () => `
+<style>
+  html { font-size: 10pt; }
+  h1 { font-size: 12pt; }
+  h2, h3, h4, h5, h6 { font-size: 11pt; }
+  /* The numbering script measures line positions in the loaded page (screen
+     media) but Chrome prints under print media — the two layouts MUST be
+     identical or the numbers drift off their lines. Lock BOTH to the same
+     absolute geometry: pin the paper (the print default follows the system
+     locale — A4 here — and A4 vs Letter wraps text differently) and give the
+     body a fixed mm width equal to the printable area, so the wrap points
+     stop depending on viewport or paper defaults entirely. */
+  @page { size: 8.5in 11in; }
+  /* font-size 1rem !important: pandoc's embedded defaults set body to 12pt
+     UNDER PRINT MEDIA ONLY — the exact screen-vs-print reflow this geometry
+     exists to prevent (found 2026-08-28: 2 lines measured, 3 printed). */
+  body { box-sizing: border-box; width: 190.5mm; max-width: none !important;
+    font-size: 1rem !important; margin: 0 !important; padding: 0 0 0 9mm !important; }
+  /* Numbered blocks must never split across pages: each line's number is
+     positioned INSIDE its block, so a fragmenting block would leave numbers
+     on the wrong page. Amazon-length paragraphs fit comfortably on a page. */
+  p, li { break-inside: avoid; }
+  /* overflow-x would clip the absolutely positioned numbers that hang left
+     of the code block; wrapped lines get numbered like any other line. */
+  pre { overflow-x: visible; white-space: pre-wrap; }
+  .amzn-line-no { position: absolute; width: 6.5mm; text-align: right;
+    font: 7pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #9aa0a8; }
+</style>
+<script>
+window.addEventListener('load', () => {
+  const blocks = document.querySelectorAll('p, h1, h2, h3, h4, h5, h6, li, pre');
+  const seen = [];
+  let lineNumber = 0;
+  for (const el of blocks) {
+    if (el.closest('table')) continue;                     // Word skips tables
+    if (el.tagName === 'LI' && el.querySelector('p')) continue; // loose list: the inner p is the line container
+    const blockRect = el.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const tops = [];
+    for (const rect of range.getClientRects()) {
+      if (rect.width < 1 || rect.height < 1) continue;
+      const top = Math.round(rect.top);
+      if (seen.some((t) => Math.abs(t - top) < 3)) continue; // nested lists: parent li already counted this line
+      if (!tops.some((t) => Math.abs(t - top) < 3)) { tops.push(top); seen.push(top); }
+    }
+    if (!tops.length) continue;
+    el.style.position = 'relative';
+    for (const top of tops) {
+      lineNumber += 1;
+      const marker = document.createElement('span');
+      marker.className = 'amzn-line-no';
+      marker.textContent = String(lineNumber);
+      // Block-relative placement; page x = 0 (left edge of the 9mm gutter).
+      marker.style.top = (top - blockRect.top - el.clientTop) + 'px';
+      marker.style.left = (-blockRect.left - el.clientLeft) + 'px';
+      el.appendChild(marker);
+    }
+  }
+});
+</script>`;
 
 /** ASCII-safe attachment filename derived from the document title. */
 export function exportFilename(title: string, format: DocumentExportFormat): string {
@@ -205,15 +304,73 @@ async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: 
     const relsPath = path.join(extractDir, 'word', '_rels', 'document.xml.rels');
     const pgMar = '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0" />';
 
+    // Continuous margin line numbers (owner request 2026-08-28 — Amazon docs
+    // carry them almost always). Schema order: lnNumType follows pgMar inside
+    // sectPr, so it rides the same insertion points.
+    const lnNum = '<w:lnNumType w:countBy="1" w:restart="continuous" w:distance="240" />';
     let documentXml = await fs.readFile(documentPath, 'utf8');
     if (!documentXml.includes('<w:sectPr')) {
       documentXml = documentXml.replace('</w:body>', '<w:sectPr></w:sectPr></w:body>');
     }
+    const pgMarWithLn = documentXml.includes('<w:lnNumType') ? pgMar : `${pgMar}${lnNum}`;
     if (documentXml.includes('<w:pgMar')) {
-      documentXml = documentXml.replace(/<w:pgMar[^/]*\/>/g, pgMar);
+      documentXml = documentXml.replace(/<w:pgMar[^/]*\/>/g, pgMarWithLn);
     } else {
-      documentXml = documentXml.replace(/<\/w:sectPr>/, `${pgMar}</w:sectPr>`);
+      documentXml = documentXml.replace(/<\/w:sectPr>/, `${pgMarWithLn}</w:sectPr>`);
     }
+
+    // Header-row conditional formatting only fires when the table's tblLook
+    // enables firstRow — make sure every table asks for it. tblLook is the
+    // LAST child in the tblPr sequence, so it goes just before the close.
+    documentXml = documentXml
+      .replace(/(<w:tblLook [^>]*w:firstRow=")0(")/g, '$11$2')
+      .replace(/<w:tblPr>[\s\S]*?<\/w:tblPr>/g, (block) => block.includes('<w:tblLook')
+        ? block
+        : block.replace('</w:tblPr>', '<w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="1" w:noVBand="1" /></w:tblPr>'));
+
+    // Belt AND braces for the black header row: conditional table styling is
+    // ignored by several real viewers (Quick Look, Pages) even when perfectly
+    // formed — so the first row of every table ALSO gets DIRECT formatting:
+    // cell shading + white bold runs. Direct props win in every renderer.
+    documentXml = documentXml.replace(/<w:tbl>[\s\S]*?<\/w:tbl>/g, (table) =>
+      table.replace(/<w:tr[ >][\s\S]*?<\/w:tr>/, (headerRow) =>
+        headerRow.replace(/<w:tc>([\s\S]*?)<\/w:tc>/g, (cellMatch, cellInner) => {
+          let inner = cellInner;
+          const shd = '<w:shd w:val="clear" w:color="auto" w:fill="000000" />';
+          // Cell shading. THREE tcPr shapes exist: pandoc emits EMPTY
+          // SELF-CLOSING `<w:tcPr />` per cell (an `includes('<w:tcPr>')`
+          // check misses it — the double-tcPr bug, 2026-08-28); expanded
+          // tcPr gets shd after the leading cnfStyle/tcW/gridSpan/tcBorders
+          // group (CT_TcPr sequence); no tcPr gets a fresh one as the cell's
+          // first child.
+          if (/<w:tcPr\s*\/>/.test(inner)) {
+            inner = inner.replace(/<w:tcPr\s*\/>/, `<w:tcPr>${shd}</w:tcPr>`);
+          } else if (inner.includes('<w:tcPr>')) {
+            if (!/<w:tcPr>[\s\S]*?<w:shd /.test(inner)) {
+              inner = inner.replace(
+                /<w:tcPr>((?:<w:cnfStyle[^>]*\/>)?(?:<w:tcW[^>]*\/>)?(?:<w:gridSpan[^>]*\/>)?(?:<w:tcBorders>[\s\S]*?<\/w:tcBorders>)?)/,
+                `<w:tcPr>$1${shd}`,
+              );
+            }
+          } else {
+            inner = `<w:tcPr>${shd}</w:tcPr>${inner}`;
+          }
+          // White bold runs. Existing rPr: strip any b/bCs/color first (no
+          // duplicates), then insert after the leading rStyle/rFonts group so
+          // the rPr child sequence stays valid. Bare runs: fresh rPr as the
+          // run's first child.
+          inner = inner.replace(/<w:r><w:rPr>([\s\S]*?)<\/w:rPr>/g, (_runMatch: string, props: string) => {
+            const cleaned = props.replace(/<w:b \/>|<w:b\/>|<w:bCs \/>|<w:bCs\/>|<w:color [^>]*\/>/g, '');
+            const merged = cleaned.replace(
+              /^((?:<w:rStyle[^>]*\/>)?(?:<w:rFonts[^>]*\/>)?)/,
+              '$1<w:b /><w:bCs /><w:color w:val="FFFFFF" />',
+            );
+            return `<w:r><w:rPr>${merged}</w:rPr>`;
+          });
+          inner = inner.replace(/<w:r>(?!<w:rPr>)/g, '<w:r><w:rPr><w:b /><w:bCs /><w:color w:val="FFFFFF" /></w:rPr>');
+          return `<w:tc>${inner}</w:tc>`;
+        }),
+      ));
 
     // Footer wiring: part + content type + relationship + section reference.
     // Skipped safely if the r namespace is missing or a footer already exists.
@@ -247,21 +404,79 @@ async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: 
     await fs.writeFile(documentPath, documentXml, 'utf8');
 
     let stylesXml = await fs.readFile(stylesPath, 'utf8');
+    // Amazon document sizes and ink (owner request 2026-08-28): 10pt body,
+    // 11pt bold black headings, 12pt bold black title — pandoc's reference
+    // styles ship Word's blue (2F5496-family) headings and larger sizes.
+    // Color/size edits are IN PLACE where the elements already exist so the
+    // rPr child order pandoc emitted stays schema-valid; bold is inserted
+    // directly after rFonts (its legal slot) only when the style lacks it.
     stylesXml = stylesXml.replace(
-      /(<w:rPrDefault>[\s\S]{0,600}?)<w:sz w:val="24" \/>(\s*)<w:szCs w:val="24" \/>/,
-      '$1<w:sz w:val="22" />$2<w:szCs w:val="22" />',
+      /(<w:rPrDefault>[\s\S]{0,600}?)<w:sz w:val="2\d" \/>(\s*)<w:szCs w:val="2\d" \/>/,
+      '$1<w:sz w:val="20" />$2<w:szCs w:val="20" />',
     );
+    const restyleHeading = (styleId: string, halfPoints: number) => {
+      stylesXml = stylesXml.replace(
+        new RegExp(`<w:style [^>]*w:styleId="${styleId}"[\\s\\S]*?</w:style>`),
+        (styleBlock) => {
+          let block = styleBlock
+            // Replace the whole color element: theme attributes (w:themeColor/
+            // w:themeShade) outrank a rewritten w:val in Word's rendering.
+            .replace(/<w:color [^>]*\/>/g, '<w:color w:val="000000" />')
+            .replace(/<w:sz w:val="\d+"\s*\/>/g, `<w:sz w:val="${halfPoints}" />`)
+            .replace(/<w:szCs w:val="\d+"\s*\/>/g, `<w:szCs w:val="${halfPoints}" />`);
+          if (!/<w:b\s*\/>/.test(block)) {
+            block = block.replace(/(<w:rPr>(?:<w:rFonts[^>]*\/>)?)/, '$1<w:b /><w:bCs />');
+          }
+          return block;
+        },
+      );
+    };
+    restyleHeading('Title', 24);
+    for (let level = 1; level <= 9; level += 1) restyleHeading(`Heading${level}`, 22);
     const border = (edge: string) => `<w:${edge} w:val="single" w:sz="4" w:space="0" w:color="000000" />`;
     const tblBorders = `<w:tblBorders>${['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map(border).join('')}</w:tblBorders>`;
     stylesXml = stylesXml.replace(
       /(<w:style [^>]*w:styleId="Table"[\s\S]*?)<\/w:style>/,
       (styleBlock) => {
-        if (styleBlock.includes('<w:tblBorders>')) return styleBlock;
-        // OOXML tblPr sequence places tblBorders after tblInd, before tblCellMar.
-        if (styleBlock.includes('<w:tblInd')) {
-          return styleBlock.replace(/(<w:tblInd[^/]*\/>)/, `$1${tblBorders}`);
+        let block = styleBlock;
+        if (!block.includes('<w:tblBorders>')) {
+          // OOXML tblPr sequence places tblBorders after tblInd, before tblCellMar.
+          block = block.includes('<w:tblInd')
+            ? block.replace(/(<w:tblInd[^/]*\/>)/, `$1${tblBorders}`)
+            : block.replace('<w:tblPr>', `<w:tblPr>${tblBorders}`);
         }
-        return styleBlock.replace('<w:tblPr>', `<w:tblPr>${tblBorders}`);
+        // Amazon table convention (owner request 2026-08-28): header row gets
+        // a black fill with white bold text. Pandoc's Table style SHIPS a
+        // firstRow tblStylePr of its own (bottom border + vAlign only) — the
+        // first version of this pass guarded on the block's mere presence and
+        // silently skipped the fill (owner-reported regression 2026-08-28).
+        // Merge into the existing block; only append a fresh one when a
+        // future pandoc drops it.
+        if (!block.includes('w:fill="000000"')) {
+          if (block.includes('w:type="firstRow"')) {
+            // rPr leads inside tblStylePr (before tblPr/trPr/tcPr)…
+            block = block.replace(
+              /(<w:tblStylePr w:type="firstRow">)/,
+              '$1<w:rPr><w:b /><w:bCs /><w:color w:val="FFFFFF" /></w:rPr>',
+            );
+            // …and shd follows tcBorders inside its tcPr (CT_TcPr order).
+            block = /<w:tblStylePr w:type="firstRow">[\s\S]*?<\/w:tcBorders>/.test(block)
+              ? block.replace(
+                  /(<w:tblStylePr w:type="firstRow">[\s\S]*?<\/w:tcBorders>)/,
+                  '$1<w:shd w:val="clear" w:color="auto" w:fill="000000" />',
+                )
+              : block.replace(
+                  /(<w:tblStylePr w:type="firstRow">[\s\S]*?<w:tcPr>)/,
+                  '$1<w:shd w:val="clear" w:color="auto" w:fill="000000" />',
+                );
+          } else {
+            block = block.replace(
+              /<\/w:style>$/,
+              '<w:tblStylePr w:type="firstRow"><w:rPr><w:b /><w:bCs /><w:color w:val="FFFFFF" /></w:rPr><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="000000" /></w:tcPr></w:tblStylePr></w:style>',
+            );
+          }
+        }
+        return block;
       },
     );
     await fs.writeFile(stylesPath, stylesXml, 'utf8');
@@ -293,6 +508,7 @@ export async function exportDocument(input: {
   if (!pandoc) {
     throw new DocumentExportError(
       'pandoc is not installed. Install it (for example: brew install pandoc) to export HTML, DOCX, or PDF.',
+      'pandoc_missing',
     );
   }
 
@@ -303,7 +519,12 @@ export async function exportDocument(input: {
     const headerPath = path.join(workDir, 'header.html');
     await fs.writeFile(inputPath, content, 'utf8');
     await fs.writeFile(headerPath, `<style>${buildExportStyle(dateText)}</style>`, 'utf8');
-    const baseArgs = ['--from=gfm', `--metadata=title:${title || 'Document'}`];
+    // No `--metadata=title`: pandoc renders that as a visible title block in
+    // standalone HTML and a Title paragraph in DOCX, duplicating the H1 the
+    // document content already opens with (owner report 2026-08-28 — markdown
+    // was the only clean export). `pagetitle` below fills the HTML <title>
+    // tag only, without entering the document body.
+    const baseArgs = ['--from=gfm'];
 
     const runPandoc = async (args: string[]) => {
       try {
@@ -316,6 +537,7 @@ export async function exportDocument(input: {
     const renderHtml = async (outputPath: string) => {
       await runPandoc([
         ...baseArgs,
+        `--metadata=pagetitle:${title || 'Document'}`,
         '--to=html', '--standalone', '--embed-resources', `--include-in-header=${headerPath}`,
         '--output', outputPath, inputPath,
       ]);
@@ -341,6 +563,16 @@ export async function exportDocument(input: {
     if (chrome) {
       const htmlPath = path.join(workDir, 'print.html');
       await renderHtml(htmlPath);
+      // Print-only pass: Amazon sizes + margin line numbers (see
+      // buildPrintExtras). Injected before </body> so the numbering script
+      // runs after the content it measures.
+      const printHtml = await fs.readFile(htmlPath, 'utf8');
+      const extras = buildPrintExtras();
+      await fs.writeFile(
+        htmlPath,
+        printHtml.includes('</body>') ? printHtml.replace('</body>', `${extras}</body>`) : printHtml + extras,
+        'utf8',
+      );
       try {
         await execFileAsync(chrome, [
           '--headless',
@@ -348,6 +580,10 @@ export async function exportDocument(input: {
           '--no-first-run',
           `--user-data-dir=${path.join(workDir, 'chrome-profile')}`,
           '--no-pdf-header-footer',
+          // Match the print content width so the line-number measurement
+          // layout equals the printed layout (see buildPrintExtras).
+          '--window-size=720,1000',
+          '--force-device-scale-factor=1',
           `--print-to-pdf=${outputPath}`,
           `file://${htmlPath}`,
         ], { timeout: EXPORT_TIMEOUT_MS });

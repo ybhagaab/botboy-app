@@ -3,6 +3,8 @@ import {
   DocumentExportError,
   exportDocument,
   isDocumentExportFormat,
+  isPandocInstalled,
+  resolveBrewExecutable,
 } from '../../product-manager/document-exporter.js';
 import {
   ProductDocumentGenerationError,
@@ -283,8 +285,66 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       res.set('Content-Disposition', `attachment; filename="${exported.filename}"`);
       return res.send(exported.data);
     } catch (error) {
-      if (error instanceof DocumentExportError) return res.status(502).json({ error: error.message });
+      if (error instanceof DocumentExportError) {
+        // 424 Failed Dependency for the actionable case: the UI offers the
+        // guided pandoc install instead of a dead-end error line.
+        return res
+          .status(error.code === 'pandoc_missing' ? 424 : 502)
+          .json({ error: error.message, code: error.code });
+      }
       return handleError(res, error);
+    }
+  });
+
+  /**
+   * Guided pandoc install (owner request 2026-08-28): the first blocked
+   * Word/PDF/HTML download offers a one-click install that runs inside
+   * BotBoy's chat terminal dock — streaming output, any interactive prompt
+   * typed by the USER into the PTY (never through the model or this API).
+   * Safety model, mirroring the MCP setup terminals: the command is FIXED
+   * server-side (the browser sends nothing but the click), the endpoint is
+   * loopback-only like every terminal control path, and the session runs on
+   * the same chat-terminal engine, so the dock UI, SSE stream, stop button,
+   * and the auto-open-panel behavior are all inherited.
+   */
+  router.post('/product-documents/export-tools/install', async (req: Request, res: Response) => {
+    const chatTerminal = deps.chatTerminal;
+    if (!chatTerminal) return res.status(503).json({ error: 'Terminal sessions are unavailable.' });
+    const isLoopback = (address: string | undefined) =>
+      address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+    if (!isLoopback(req.socket.remoteAddress) || !isLoopback(req.socket.localAddress)) {
+      return res.status(403).json({ error: 'Terminal control is local-only.' });
+    }
+    if (await isPandocInstalled()) {
+      // Already there (installed outside BotBoy, or a stale card) — no
+      // session needed; the UI just retries the download.
+      return res.json({ alreadyInstalled: true });
+    }
+    const running = chatTerminal.current();
+    if (running && running.status === 'running') {
+      return res.status(409).json({
+        error: 'Another terminal session is already running in BotBoy — finish it first.',
+        code: 'terminal_busy',
+      });
+    }
+    const brew = await resolveBrewExecutable();
+    if (!brew) {
+      return res.status(409).json({
+        error: 'Homebrew is not installed on this Mac. Install it from https://brew.sh, then run: brew install pandoc',
+        code: 'homebrew_missing',
+      });
+    }
+    try {
+      const session = chatTerminal.open({
+        command: `"${brew}" install pandoc`,
+        title: 'Install pandoc (document downloads)',
+        // Bottle installs take ~a minute; source builds on no-bottle setups
+        // can take much longer (same headroom as the chat terminal default).
+        timeoutMs: 30 * 60_000,
+      });
+      return res.status(201).json({ session: { id: session.id, status: session.status, title: session.title } });
+    } catch (error) {
+      return res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 

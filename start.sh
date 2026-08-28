@@ -401,6 +401,13 @@ if [ "$DOCTOR" = "1" ]; then
   else
     echo "sharepoint-mcp: not installed (optional — install from Connections → SharePoint)"
   fi
+  # Document downloads: Word/PDF/HTML convert through a local pandoc install
+  # (markdown export needs nothing). Same lookup paths as the exporter.
+  if command -v pandoc >/dev/null 2>&1 || [ -x /opt/homebrew/bin/pandoc ] || [ -x /usr/local/bin/pandoc ] || [ -x "$HOME/homebrew/bin/pandoc" ]; then
+    echo "pandoc: installed (Word/PDF/HTML document downloads available)"
+  else
+    echo "pandoc: not installed (optional — brew install pandoc; needed only for Word/PDF/HTML downloads, Markdown works without it)"
+  fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
   if [ -f "$DOCTOR_ENV" ] && grep -q '^BOTBOY_INFERENCE_OAUTH_CLIENT_ID=' "$DOCTOR_ENV" 2>/dev/null; then
     echo "llm-credentials: present"

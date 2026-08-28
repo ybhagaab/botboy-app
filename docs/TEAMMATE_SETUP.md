@@ -11,6 +11,11 @@ id/secret pair the owner sends you privately.
 - Node.js 20+ (`node --version`)
 - Google Chrome installed
 - git
+- Optional: pandoc (`brew install pandoc`) — needed only to download
+  BotBoy-authored documents as Word/PDF/HTML; Markdown downloads work
+  without it. You can skip this: the first time you try such a download,
+  BotBoy offers to install it for you and streams the install right in
+  the app (it uses Homebrew)
 
 ## Install
 

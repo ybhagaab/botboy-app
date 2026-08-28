@@ -441,6 +441,15 @@ body.chat-width-expand.assistant-open .workspace { margin-right:0; }
 .document-pane-state h2 { margin:0 0 6px; color:var(--soft); font-size:15px; }
 .document-pane-state p { max-width:440px; margin:0 0 17px; font-size:11px; }
 .document-inline-error { flex:0 0 auto; display:flex; align-items:flex-start; gap:7px; padding:9px 12px; border-bottom:1px solid color-mix(in srgb,var(--yellow) 25%,var(--border)); color:var(--yellow); background:var(--yellow-soft); font-size:10px; overflow-wrap:anywhere; }
+.pandoc-install-card { display:flex; align-items:flex-start; gap:10px; margin:0 0 12px; padding:12px 14px; border:1px solid color-mix(in srgb,var(--accent) 35%,var(--border)); border-radius:11px; color:var(--soft); background:var(--accent-soft); font-size:11px; }
+.pandoc-install-card.is-warn { border-color:color-mix(in srgb,var(--yellow) 45%,var(--border)); background:var(--yellow-soft); }
+.pandoc-install-card > svg { flex:0 0 auto; margin-top:1px; color:var(--accent); }
+.pandoc-install-card.is-warn > svg { color:var(--yellow); }
+.pandoc-install-card strong { display:block; margin-bottom:3px; color:var(--text); font-size:12px; }
+.pandoc-install-card span { display:block; line-height:1.5; }
+.pandoc-install-card code { padding:1px 5px; border:1px solid var(--border); border-radius:5px; background:var(--surface); font-size:10px; }
+.pandoc-install-card a { color:var(--accent); }
+.pandoc-install-card .pandoc-actions { display:flex; gap:7px; margin-top:9px; }
 .document-inline-error svg { flex:0 0 auto; margin-top:1px; }
 .document-detail-toolbar { flex:0 0 auto; min-height:45px; display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:8px 9px; padding:8px 15px; border-bottom:1px solid var(--border); background:var(--surface-2); }
 .document-back { display:none; }
