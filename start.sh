@@ -406,7 +406,15 @@ if [ "$DOCTOR" = "1" ]; then
   if command -v pandoc >/dev/null 2>&1 || [ -x /opt/homebrew/bin/pandoc ] || [ -x /usr/local/bin/pandoc ] || [ -x "$HOME/homebrew/bin/pandoc" ]; then
     echo "pandoc: installed (Word/PDF/HTML document downloads available)"
   else
-    echo "pandoc: not installed (optional — brew install pandoc; needed only for Word/PDF/HTML downloads, Markdown works without it)"
+    echo "pandoc: not installed (optional — BotBoy offers an in-app install on first Word/PDF/HTML download; Markdown works without it)"
+  fi
+  # Homebrew is never REQUIRED (node/Chrome/git all arrive without it), but
+  # the in-app pandoc install and several setup suggestions lean on it —
+  # support should see its absence in one glance.
+  if command -v brew >/dev/null 2>&1 || [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ] || [ -x "$HOME/homebrew/bin/brew" ]; then
+    echo "homebrew: installed"
+  else
+    echo "homebrew: not installed (optional — the in-app pandoc install needs it; https://brew.sh)"
   fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
   if [ -f "$DOCTOR_ENV" ] && grep -q '^BOTBOY_INFERENCE_OAUTH_CLIENT_ID=' "$DOCTOR_ENV" 2>/dev/null; then
