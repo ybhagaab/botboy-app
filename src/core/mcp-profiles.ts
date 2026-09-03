@@ -731,8 +731,28 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
       Object.freeze({
         id: 'python-deps',
         title: 'Install Python MCP library',
-        description: "One-time: installs the Python 'mcp' library the server needs. Uses the user site so your system Python is untouched.",
-        argv: Object.freeze(['python3', '-m', 'pip', 'install', '--user', '--break-system-packages', 'mcp<2']),
+        description: "One-time: installs the Python 'mcp' library into the SAME Python the server launches with (first 3.10+ found). Uses the user site so your system Python is untouched.",
+        // Teammate install failure (2026-09-03), two stacked traps on stock
+        // Macs where `python3` = Xcode CommandLineTools 3.9:
+        //   1. CLT pip 21.x REJECTS --break-system-packages ("no such
+        //      option") — the flag exists only on pip ≥ 22.3 (PEP 668).
+        //   2. The mcp library has no 3.9 wheels at all — and the a2
+        //      mcp-run.sh launcher refuses < 3.10 anyway.
+        // So this step mirrors the launcher's interpreter pick
+        // (a2_runtime_pick_python: ~/venv, python3.13..3.10, python3) and
+        // installs into THAT interpreter, with a pip-version-agnostic flag
+        // fallback. Code-owned constant — no user input reaches this shell.
+        argv: Object.freeze(['bash', '-lc', [
+          'for p in "$HOME/venv/bin/python" python3.13 python3.12 python3.11 python3.10 python3; do',
+          '  command -v "$p" >/dev/null 2>&1 || [ -x "$p" ] || continue;',
+          '  "$p" -c \'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)\' 2>/dev/null || continue;',
+          '  echo "Installing the mcp library into: $p";',
+          '  "$p" -m pip install --user --break-system-packages \'mcp<2\' || "$p" -m pip install --user \'mcp<2\';',
+          '  exit $?;',
+          'done;',
+          'echo "No Python 3.10+ found — the ETL server needs one. Install it first (e.g. brew install python@3.12), then rerun this step." >&2;',
+          'exit 1',
+        ].join(' ')]),
         timeoutMs: 10 * 60_000,
         requiresStopped: false,
       }),
@@ -775,8 +795,8 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
         },
         {
           title: 'Install the Python MCP library',
-          description: "One-time on Macs with Homebrew Python: the server's own bootstrap cannot install past PEP 668.",
-          command: "python3 -m pip install --user --break-system-packages 'mcp<2'",
+          description: "One-time, via the button above (it targets the same Python 3.10+ the server launches with and handles both pip generations). Needs a Python 3.10+ on the machine — stock Xcode python3 is 3.9 and cannot run this server; install one with: brew install python@3.12",
+          command: "use the 'Install Python MCP library' action above",
         },
         {
           title: 'Refresh Midway + Sentry',

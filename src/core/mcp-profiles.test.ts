@@ -122,10 +122,21 @@ describe('aim-package-script resolution (a2-analytics launch)', () => {
     expect(profile.requiredTools).toContain('datanet_download_results');
     expect(profile.requiredTools).toContain('datanet_get_job_run');
     // The setup terminal must carry the Sentry-aware Midway command and the
-    // PEP 668 pip workaround — both were live findings, not decoration.
+    // pip install — both were live findings, not decoration. The pip step
+    // must survive BOTH stock-Mac traps (teammate failure 2026-09-03):
+    // (1) it targets the same 3.10+ interpreter the a2 launcher picks —
+    // stock Xcode python3 is 3.9, which has no mcp wheels and old pip;
+    // (2) it works on both pip generations: --break-system-packages first
+    // (pip ≥ 22.3 / PEP 668), plain-form fallback after || (pip 21.x
+    // rejects the flag with "no such option").
     const argvs = profile.terminalCommands.map(command => command.argv.join(' '));
     expect(argvs.some(argv => argv === 'mwinit -o -s')).toBe(true);
-    expect(argvs.some(argv => argv.includes('--break-system-packages'))).toBe(true);
+    const pip = argvs.find(argv => argv.includes('pip install'));
+    expect(pip).toBeDefined();
+    expect(pip).toContain('sys.version_info >= (3,10)');       // launcher-matching interpreter pick
+    expect(pip).toContain('--break-system-packages');
+    expect(pip).toContain("|| \"$p\" -m pip install --user 'mcp<2'"); // old-pip fallback
+    expect(pip).toContain('No Python 3.10+ found');            // actionable dead-end message
     expect(argvs.some(argv => argv === 'aim agents install A2AnalyticsAgent')).toBe(true);
   });
 });
