@@ -33,6 +33,7 @@ import type { ProductDocumentService, WritingConfigStore } from '../../product-m
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
 import type { ContentStore } from '../../core/content-store.js';
 import type { DocumentParser } from '../../core/document-parser.js';
+import type { EtlOnboardingService } from '../../core/etl-onboarding.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -66,6 +67,8 @@ export interface RouterDeps {
   contentStore?: ContentStore;
   /** Sheet-scoped xlsx deep reads (xlsx-deep-reads X1). */
   documentParser?: DocumentParser;
+  /** ETL preset onboarding (etl-analytics A3): status + generate trigger. */
+  etlOnboarding?: EtlOnboardingService;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

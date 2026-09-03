@@ -17,6 +17,13 @@ function jarWith(lines: string[]): string {
 }
 
 describe('isSentryAuthShapedError', () => {
+  it('REGRESSION (live 2026-09-02): a lapsed session answering tool calls with a 307 HTML page — wrapped as SUCCESSFUL data — is auth-shaped', () => {
+    expect(isSentryAuthShapedError('{\n  "_raw": "<html>\\n<head><title>307 Temporary Redirect</title></head>\\n<body>\\n<center><h1>307 Temporary Redirect</h1></center>\\n</body>\\n</html>\\n"\n}')).toBe(true);
+    expect(isSentryAuthShapedError('<html><head><title>307 Temporary Redirect</title></head></html>')).toBe(true);
+    // Real data mentioning redirects in prose stays data.
+    expect(isSentryAuthShapedError('{"status":"SUCCESS","rows":[["redirect","307"]]}')).toBe(false);
+  });
+
   it('matches the live signatures observed against datanet-service', () => {
     // Each of these appeared verbatim during the 2026-08-27 spike.
     expect(isSentryAuthShapedError('{"__type":"com.amazon.sentry.sso#SentryRedirectException","Location":"https://sentry.amazon.com/SSO/redirect?..."}')).toBe(true);

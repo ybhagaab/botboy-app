@@ -47,6 +47,19 @@ describe('computeAwaitingReplyThreads', () => {
     );
   }
 
+  it('REGRESSION (owner 2026-09-01): a MID-THREAD mention still awaits when someone replies after the summons', () => {
+    // Nitin asks, mentions the owner in a reply, then replies AGAIN without
+    // the mention. The owner never commented. The latest comment carries no
+    // mention — but the thread summoned the owner and must surface.
+    insertComment('m1', { docKey: 'k/pv', threadRoot: 'm1', author: 'Kalyankar, Nitin', direction: 'received', commentedAt: '2026-09-01T07:06:08Z' });
+    insertComment('m2', { docKey: 'k/pv', threadRoot: 'm1', author: 'Kalyankar, Nitin', direction: 'received', commentedAt: '2026-09-01T07:07:32Z', mentionedMe: true, text: '@Wang, Zeng @Bhagat, ABWhat is the expected latency here?' });
+    insertComment('m3', { docKey: 'k/pv', threadRoot: 'm1', author: 'Kalyankar, Nitin', direction: 'received', commentedAt: '2026-09-01T07:17:13Z', text: 'can you also add sample data payload' });
+    const awaiting = computeAwaitingReplyThreads(storage.getDb());
+    expect(awaiting).toHaveLength(1);
+    expect(awaiting[0].threadSize).toBe(3);
+    expect(awaiting[0].docKey).toBe('k/pv');
+  });
+
   it('flags threads whose latest word is someone else\'s — participation or mention', () => {
     // Thread A: owner participated, teammate replied last → awaiting.
     insertComment('a1', { docKey: 'k/hld', threadRoot: 'a1', author: 'Bhagat, AB', direction: 'sent', commentedAt: '2026-08-24T10:00:00Z' });

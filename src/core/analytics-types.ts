@@ -37,6 +37,8 @@ export interface AnalyticsWidgetResult {
   executionTimeMs?: number;
   rawPreview?: string;
   refreshedAt: string;
+  /** Which data lane produced this result (etl-analytics A4). Absent on pre-A4 results = sql-mcp. */
+  lane?: 'sql-mcp' | 'etl';
 }
 
 export interface AnalyticsWidget {

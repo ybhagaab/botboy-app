@@ -174,9 +174,10 @@ export interface TodayAwaitingReplyItem {
  * Deterministic awaiting-your-reply rule (sharepoint-signals R3): group
  * document_comment evidence by (docKey, threadRoot); a thread awaits the
  * owner when its LATEST comment is someone else's (`direction='received'`),
- * is not resolved, and either the owner participated earlier in the thread
- * or the latest comment names the owner. Threads clear themselves: the
- * owner's posted reply arrives as a `sent` comment on the next fetch.
+ * is not resolved, and the owner is IN the thread — they commented earlier
+ * OR any comment @-mentions them (2026-09-01: a mid-thread mention followed
+ * by another reply must not bury the summons). Threads clear themselves:
+ * the owner's posted reply arrives as a `sent` comment on the next fetch.
  */
 export function computeAwaitingReplyThreads(db: Database.Database, limit = 8): TodayAwaitingReplyItem[] {
   const rows = db.prepare(`
@@ -244,8 +245,8 @@ export function computeAwaitingReplyThreads(db: Database.Database, limit = 8): T
     // ANY resolved member is settled (owner report 2026-08-26: resolved a
     // thread online, the row survived because only the root was stamped).
     if (list.some(c => c.resolved === 'true')) continue;
-    const ownerParticipated = list.some(c => c.direction === 'sent');
-    if (!ownerParticipated && latest.mentionedMe !== 'true') continue;
+    const ownerInThread = list.some(c => c.direction === 'sent' || c.mentionedMe === 'true');
+    if (!ownerInThread) continue;
     const snippetRow = snippetStmt.get(latest.id) as { text: string } | undefined;
     const snippet = (snippetRow?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 140);
     awaiting.push({

@@ -33,6 +33,7 @@ import path from 'path';
 import type { McpManager } from '../core/mcp-types.js';
 import type { RawWorkItem } from '../core/types.js';
 import { getSetting, setSetting } from '../core/storage.js';
+import { createOwnerMatcher, resolveOwnerIdentity, type OwnerIdentity } from '../core/owner-identity.js';
 import { diffDocumentTexts } from '../core/document-diff.js';
 import { readZipEntry, extractCommentAnchors, extractTrackedChanges, DOCUMENT_XML_ENTRY } from '../core/docx-body-editor.js';
 import { suggestionSettingKey, docKeyForPath, buildCorpusLinkIndex, extractDocumentLinks, replaceOutgoingLinks } from '../core/document-corpus.js';
@@ -166,6 +167,8 @@ export interface SharePointSyncStatusView {
   gates: { backlog: boolean; cache: boolean; connection: boolean };
   backoffs: Record<string, string>; // domain → until ISO
   lastRun: Record<string, unknown> | null;
+  /** Who comment direction/mention matching identifies as the owner. */
+  ownerIdentity: OwnerIdentity;
 }
 
 /** Structural forward-declaration of the parser's large lane (task 5 lands
@@ -996,50 +999,10 @@ export function createSharePointSync(deps: {
     parentId?: string;
   }
 
-  /** Owner identity for direction/mention checks. Explicit sharepoint_sync
-   * override wins; otherwise the GRASP-detected identity. Owner unknown →
-   * matcher matches nothing (fail-quiet, spec R3.3). */
-  function buildOwnerMatcher(): { isOwner(author: string): boolean; mentionsOwner(text: string): boolean } {
-    const name = (getSetting<string>(db, KEYS.ownerName) ?? getSetting<string>(db, 'grasp_sync.owner_name') ?? '').trim();
-    const email = (getSetting<string>(db, 'grasp_sync.owner_email') ?? '').trim().toLowerCase();
-    const localPart = email.includes('@') ? email.split('@')[0] : '';
-
-    const normalize = (value: string): string[] =>
-      value.toLowerCase().replace(/[.,;:'"()]/g, ' ').split(/\s+/).filter(Boolean);
-    const nameTokens = normalize(name).sort();
-
-    // Word-boundary phrase variants for mention detection: "Last, First",
-    // "First Last", "Last First" all reduce to token sequences; single-token
-    // names and the email local part are matched as standalone words.
-    const parts = normalize(name);
-    const phrases = new Set<string>();
-    if (parts.length >= 2) {
-      phrases.add(parts.join(' '));
-      phrases.add([...parts].reverse().join(' '));
-    } else if (parts.length === 1) {
-      phrases.add(parts[0]);
-    }
-    if (localPart) phrases.add(localPart);
-
-    return {
-      isOwner(author: string): boolean {
-        if (nameTokens.length === 0 && !localPart) return false;
-        const authorTokens = normalize(author).sort();
-        if (nameTokens.length > 0 && authorTokens.length > 0
-          && nameTokens.length === authorTokens.length
-          && nameTokens.every((t, i) => t === authorTokens[i])) return true;
-        return localPart !== '' && authorTokens.length === 1 && authorTokens[0] === localPart;
-      },
-      mentionsOwner(text: string): boolean {
-        if (phrases.size === 0) return false;
-        const haystack = ` ${text.toLowerCase().replace(/[.,;:'"()@]/g, ' ').replace(/\s+/g, ' ')} `;
-        for (const phrase of phrases) {
-          if (haystack.includes(` ${phrase} `)) return true;
-        }
-        return false;
-      },
-    };
-  }
+  // Owner identity for direction/mention checks now lives in
+  // core/owner-identity.ts (determination precedence: owner_identity.*
+  // overrides → sharepoint_sync.owner_name → GRASP-detected). Owner unknown
+  // → matcher matches nothing (fail-quiet, spec R3.3) and getStatus() warns.
 
   /** Defensive parse of a comments payload: accepts a flat array (probed
    * docx shape: {id, author, initials, date, text, done?, parentId?}) or an
@@ -1301,7 +1264,7 @@ export function createSharePointSync(deps: {
       }
     }
 
-    const matcher = buildOwnerMatcher();
+    const matcher = createOwnerMatcher(db);
     const existsStmt = db.prepare('SELECT 1 FROM work_items WHERE url = ?');
     const parentProjectStmt = db.prepare(`
       SELECT project_id AS projectId FROM work_items
@@ -1402,6 +1365,32 @@ export function createSharePointSync(deps: {
       UPDATE work_items SET metadata = json_set(COALESCE(metadata, '{}'), '$.commentedAt', ?)
       WHERE url = ? AND source = 'sharepoint' AND type = 'document_comment'
     `);
+    // Mention classification is re-stamped on every fetch (like resolution),
+    // so matcher improvements and identity fixes REPAIR history instead of
+    // freezing the verdict from whatever the rules were at first capture
+    // (2026-09-01: a fused @-mention was stamped false forever). Gated on a
+    // KNOWN identity — an identity outage must never wipe true flags.
+    const syncMentionByUrlStmt = db.prepare(`
+      UPDATE work_items SET metadata = json_set(COALESCE(metadata, '{}'), '$.mentionedMe', ?)
+      WHERE url = ? AND source = 'sharepoint' AND type = 'document_comment'
+    `);
+    const syncMentionByIdStmt = db.prepare(`
+      UPDATE work_items SET metadata = json_set(COALESCE(metadata, '{}'), '$.mentionedMe', ?) WHERE id = ?
+    `);
+    const restampMention = (text: string, commentId: string, target: { url: string } | { rowId: string }): void => {
+      if (!matcher.identity.known) return;
+      const mentioned = matcher.mentionsOwner(text);
+      // A positive is always safe to write. A NEGATIVE is only trustworthy
+      // when the identity carries a NAME — mention detection is name-driven,
+      // so an alias-only identity (e.g. grasp name temporarily cleared) can
+      // add mentions but must never deny ones stamped under a fuller identity.
+      if (!mentioned && matcher.identity.nameTokens.length === 0) return;
+      if (!mentioned && matcher.nearMiss(text)) {
+        console.log(`[SharePointSync] mention near-miss on comment ${commentId} of ${payload.docKey} — text names the owner but no rule matched`);
+      }
+      if ('url' in target) syncMentionByUrlStmt.run(mentioned ? 'true' : 'false', target.url);
+      else syncMentionByIdStmt.run(mentioned ? 'true' : 'false', target.rowId);
+    };
 
     for (const { comments, fragment } of groups) {
       const byId = new Map(comments.map(c => [c.id, c]));
@@ -1433,10 +1422,11 @@ export function createSharePointSync(deps: {
               consumeEntry(atUrl);
               if (atUrl.wasDeleted) clearDeletedStmt.run(atUrl.id);
             }
-            // Dedup skips the EMIT, never the state: resolution and date
-            // re-stamps land on unchanged ids too.
+            // Dedup skips the EMIT, never the state: resolution, date and
+            // mention re-stamps land on unchanged ids too.
             syncStateByUrlStmt.run(comment.resolved ? 'true' : 'false', threadRootOf(comment, byId), url);
             if (comment.date) remapDateByUrlStmt.run(comment.date, url);
+            restampMention(comment.text, comment.id, { url });
             continue; // durable dedup (spec R2.1)
           }
           // GHOST SQUAT (soak find 2026-08-25): the row at this URL is a
@@ -1460,6 +1450,7 @@ export function createSharePointSync(deps: {
           if (comment.parentId !== undefined) remapParentStmt.run(comment.parentId, stored.id);
           if (comment.date) remapDateStmt.run(comment.date, stored.id);
           if (stored.wasDeleted) clearDeletedStmt.run(stored.id);
+          restampMention(comment.text, comment.id, { rowId: stored.id });
           continue;
         }
 
@@ -1468,6 +1459,10 @@ export function createSharePointSync(deps: {
           ? `↪ replying to ${parent.author}: "${parent.text.slice(0, 120)}${parent.text.length > 120 ? '…' : ''}"\n\n`
           : '';
 
+        const mentioned = matcher.mentionsOwner(comment.text);
+        if (!mentioned && matcher.nearMiss(comment.text)) {
+          console.log(`[SharePointSync] mention near-miss on comment ${comment.id} of ${payload.docKey} — text names the owner but no rule matched`);
+        }
         const metadata: Record<string, string> = {
           docKey: payload.docKey,
           serverRelativeUrl: payload.serverRelativeUrl,
@@ -1476,7 +1471,7 @@ export function createSharePointSync(deps: {
           commentId: comment.id,
           threadRoot: threadRootOf(comment, byId),
           author: comment.author,
-          mentionedMe: matcher.mentionsOwner(comment.text) ? 'true' : 'false',
+          mentionedMe: mentioned ? 'true' : 'false',
           direction: matcher.isOwner(comment.author) ? 'sent' : 'received',
           sharePointSource: payload.sourceKind,
         };
@@ -1754,6 +1749,7 @@ export function createSharePointSync(deps: {
       gates: { backlog: backlogGateGreen(), cache: cacheGateGreen(), connection: getSetting<boolean>(db, KEYS.enabled) === true },
       backoffs,
       lastRun: getSetting<Record<string, unknown>>(db, KEYS.lastRun) ?? null,
+      ownerIdentity: resolveOwnerIdentity(db),
     };
   }
 

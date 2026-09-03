@@ -38,6 +38,9 @@ const state = {
     serverForm: { saving: false, error: '', config: null, loadingConfig: false, deleting: false },
     // Embedded setup-terminal state: one session at a time.
     terminal: { profileId: '', session: null, output: '', starting: false, sending: false, source: null },
+    // Analytics knowledge directory (a2-analytics page card).
+    analyticsContext: null,
+    analyticsContextPending: false,
   },
   analytics: {
     items: null,
@@ -2004,6 +2007,9 @@ function renderSharePointSyncSettings() {
         <span><span>Cache gate</span><strong>${status?.gates?.cache === false ? 'Holding (cache full)' : 'Open'}</strong></span>
       </div>
       ${backoffs.length ? `<p class="page-subtitle" style="margin-top:8px">SharePoint asked BotBoy to slow down: ${backoffs.map(([domain, until]) => `${esc(domain)} until ${esc(new Date(until).toLocaleTimeString())}`).join(', ')}.</p>` : ''}
+      ${status?.ownerIdentity ? (status.ownerIdentity.known
+        ? `<p class="page-subtitle" style="margin-top:8px">Matching you in document comments as <strong>${esc(status.ownerIdentity.displayName || '(no name)')}</strong>${status.ownerIdentity.alias ? ` · <strong>${esc(status.ownerIdentity.alias)}</strong>` : ''} <span style="opacity:.7">(${esc(status.ownerIdentity.nameSource === 'grasp' ? 'detected from mail profile' : status.ownerIdentity.nameSource === 'none' ? 'alias only' : 'configured override')})</span>. Wrong? Set <code>owner_identity.name</code> / <code>owner_identity.alias</code> in settings.</p>`
+        : `<p class="page-subtitle" style="margin-top:8px;color:var(--warn, #b45309)">Owner identity unknown — BotBoy cannot tell which comments are yours or mention you until mail sync detects your profile (or you set <code>owner_identity.name</code> / <code>owner_identity.alias</code>).</p>`) : ''}
       <p class="page-subtitle" style="margin-top:8px">Read-only: BotBoy never edits, uploads, or deletes anything in SharePoint. Documents flow through the same local evidence pipeline as every other source.</p>
       <button class="button" type="button" data-action="sharepoint-sync-toggle" ${busy ? 'disabled' : ''}>${status?.enabled ? 'Pause document sync' : 'Enable document sync'}</button>
       ${status?.enabled ? `<button class="button small" type="button" data-action="sharepoint-purge" ${busy ? 'disabled' : ''} style="margin-left:8px">Purge synced data…</button>` : ''}
@@ -2229,12 +2235,78 @@ function renderProfileSettings(profileId) {
       </article>
       <aside class="mcp-side">
         <article class="card pad"><div class="eyebrow">${icon('chevron-right', 14)} Next safe action</div><h3 class="card-title">Continue in order</h3><p class="page-subtitle">${esc(nextAction)}</p></article>
+        ${renderAnalyticsContextCard(profileId)}
         ${sidePanels}
         ${requiredTools.length
     ? `<article class="card pad"><div class="eyebrow">${icon('activity', 14)} Required tools</div><h3 class="card-title">${number(requiredTools.length - missingTools.length)} of ${number(requiredTools.length)} found</h3><p class="page-subtitle">${missingTools.length ? `Missing: ${missingTools.map(name => esc(name)).join(', ')}` : profile.compatibilityState === 'compatible' ? 'All fixed tool names are present.' : 'Start and test the server to check tool names.'}</p>${profile.lastHealthyAt ? `<div class="mcp-fact"><span>Last healthy</span><strong>${esc(relativeTime(profile.lastHealthyAt))}</strong></div>` : ''}</article>`
     : `<article class="card pad"><div class="eyebrow">${icon('activity', 14)} Discovered tools</div><h3 class="card-title">${number((profile.tools || []).length)} available</h3><p class="page-subtitle">${(profile.tools || []).length ? 'Tool names and descriptions are listed on this page for your review.' : 'Start the server, then run Test to discover tools.'}</p>${profile.lastHealthyAt ? `<div class="mcp-fact"><span>Last healthy</span><strong>${esc(relativeTime(profile.lastHealthyAt))}</strong></div>` : ''}</article>`}
       </aside>
     </section>`;
+}
+
+/** Analytics knowledge directory card — a2-analytics connection page only.
+ * BotBoy loads .md/.txt files from this local directory on demand to ground
+ * data questions (generated presets under presets/, user notes at the root). */
+function renderAnalyticsContextCard(profileId) {
+  if (profileId !== 'a2-analytics') return '';
+  const ctx = state.mcp.analyticsContext;
+  if (!ctx && !state.mcp.analyticsContextPending) void loadAnalyticsContextConfig();
+  return `<article class="card pad"><div class="eyebrow">${icon('file', 14)} Analytics knowledge</div>
+    <h3 class="card-title">${ctx ? `${number(ctx.fileCount)} knowledge file${ctx.fileCount === 1 ? '' : 's'}` : 'Loading…'}</h3>
+    <p class="page-subtitle">BotBoy grounds data questions in local .md/.txt files from this directory — drop your schema or methodology notes at the root; generated business presets land under presets/. Loaded on demand, one file per task.</p>
+    ${ctx ? `<div class="mcp-fact"><span>Directory</span><strong style="word-break:break-all">${esc(ctx.dir)}</strong></div>
+    <label class="page-subtitle" for="analytics-context-dir" style="display:block;margin-top:8px">Use a different directory (leave empty for the default)</label>
+    <input id="analytics-context-dir" type="text" value="${attr(ctx.configured || '')}" placeholder="${attr(ctx.dir)}" style="width:100%"/>
+    <div style="margin-top:8px"><button class="button small" type="button" data-action="analytics-context-save">Save directory</button></div>
+    ${renderEtlOnboardingSection(ctx.onboarding)}` : ''}
+  </article>`;
+}
+
+/** ETL preset generation (etl-analytics A3) — status line + manual trigger.
+ * Refresh is manual-only by design; a run in flight polls every 5s. */
+function renderEtlOnboardingSection(onboarding) {
+  const ob = onboarding || { state: 'idle' };
+  let statusLine = 'BotBoy can scan your team\'s Datanet profiles and generate one knowledge preset per business.';
+  if (ob.state === 'running') {
+    const p = ob.progress || {};
+    const bits = [];
+    if (p.profilesTotal) bits.push(`${number(p.profilesFetched || 0)}/${number(p.profilesTotal)} profiles`);
+    if (p.businessesTotal) bits.push(`${number(p.businessesDone || 0)}/${number(p.businessesTotal)} briefs${p.currentBusiness ? ` — ${esc(p.currentBusiness)}` : ''}`);
+    statusLine = `Generating (${esc(ob.phase || 'working')})${bits.length ? ` · ${bits.join(' · ')}` : ''}…`;
+  } else if (ob.state === 'failed') {
+    statusLine = `Last run failed: ${esc(ob.error || 'unknown error')}${ob.nextAction ? ` ${esc(ob.nextAction)}` : ''}`;
+  } else if (ob.lastResult) {
+    const r = ob.lastResult;
+    statusLine = `Last generated ${esc(String(r.finishedAt || '').slice(0, 10))}: ${number(r.presetsWritten)} preset${r.presetsWritten === 1 ? '' : 's'} from ${number(r.profiles)} profiles${(r.businesses || []).length ? ` (${esc(r.businesses.join(', '))})` : ''}.`;
+  }
+  return `<div style="margin-top:14px;border-top:1px solid var(--line, #333);padding-top:10px">
+    <div class="eyebrow">${icon('sparkles', 14)} Preset generation</div>
+    <p class="page-subtitle">${statusLine}</p>
+    ${ob.state === 'running' ? '' : `<div style="margin-top:8px;display:flex;gap:8px">
+      <button class="button small" type="button" data-action="analytics-context-generate">Generate presets</button>
+      ${ob.lastResult ? `<button class="button small ghost" type="button" data-action="analytics-context-regenerate">Regenerate all</button>` : ''}
+    </div>`}
+  </div>`;
+}
+
+let analyticsOnboardingPollTimer = null;
+function scheduleAnalyticsOnboardingPoll() {
+  clearTimeout(analyticsOnboardingPollTimer);
+  const running = state.mcp.analyticsContext?.onboarding?.state === 'running';
+  if (!running || state.route.view !== 'profile-settings') return;
+  analyticsOnboardingPollTimer = setTimeout(() => void loadAnalyticsContextConfig(), 5000);
+}
+
+async function loadAnalyticsContextConfig() {
+  state.mcp.analyticsContextPending = true;
+  try {
+    state.mcp.analyticsContext = await request('/mcp/analytics-context');
+  } catch (error) {
+    state.mcp.analyticsContext = { dir: '', configured: '', fileCount: 0, error: String(error?.message || error) };
+  }
+  state.mcp.analyticsContextPending = false;
+  if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+  scheduleAnalyticsOnboardingPoll();
 }
 
 // ── Embedded setup terminal ──
@@ -3318,7 +3390,9 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0) {
   const spanClass = span ? ` analytics-span-${span}` : '';
   const wideMetric = widget.kind === 'metric' && span >= 8 ? ' analytics-metric-wide' : '';
   // Text widgets have no query — a provenance strip under a guide is noise.
-  const provenance = widget.kind === 'text' && !widget.sql ? '' : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc(String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase())}</b></summary>${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
+  // Data lane (etl-analytics A4): absent on pre-A4 results = managed SQL.
+  const laneLabel = result?.lane === 'etl' ? 'via Datanet ETL' : '';
+  const provenance = widget.kind === 'text' && !widget.sql ? '' : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc([String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase(), laneLabel].filter(Boolean).join(' · '))}</b></summary>${laneLabel ? `<div><span>Data lane</span><strong>Datanet ETL (SQL warehouse connection was down)</strong></div>` : ''}${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
   return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div>${chip}</div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${provenance}</article>`;
 }
 
@@ -4954,6 +5028,34 @@ function bindEvents() {
         else toast(`Sync ${result.status || 'failed'}${result.reason ? `: ${result.reason}` : ''}`, 'bad');
         await refreshGraspSyncStatus();
       });
+    }
+    if (action === 'analytics-context-save') {
+      const dir = document.getElementById('analytics-context-dir')?.value ?? '';
+      void (async () => {
+        try {
+          const saved = await request('/mcp/analytics-context', { method: 'POST', body: { dir } });
+          // The config write response has no onboarding block — keep the one we have.
+          state.mcp.analyticsContext = { ...saved, onboarding: state.mcp.analyticsContext?.onboarding ?? null };
+          toast('Analytics knowledge directory saved');
+        } catch (error) {
+          toast(error?.message || 'Could not save the analytics knowledge directory', 'bad');
+        }
+        if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+      })();
+    }
+    if (action === 'analytics-context-generate' || action === 'analytics-context-regenerate') {
+      const regenerate = action === 'analytics-context-regenerate';
+      void (async () => {
+        try {
+          const payload = await request('/mcp/analytics-context/generate', { method: 'POST', body: { regenerate } });
+          if (state.mcp.analyticsContext) state.mcp.analyticsContext.onboarding = payload.onboarding;
+          toast(regenerate ? 'Regenerating all presets — this runs for a while' : 'Preset generation started — this runs for a while');
+        } catch (error) {
+          toast(error?.message || 'Could not start preset generation', 'bad');
+        }
+        if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+        scheduleAnalyticsOnboardingPoll();
+      })();
     }
     if (action === 'grasp-sync-toggle') {
       void graspSyncAction('toggle', async () => {

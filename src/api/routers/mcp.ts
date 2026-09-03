@@ -6,6 +6,12 @@ import {
 } from '../../core/mcp-profiles.js';
 import { paramStr, type RouterDeps } from './deps.js';
 import { sqlToolTimeoutMs } from '../../core/tool-executor.js';
+import { getSetting } from '../../core/storage.js';
+import {
+  ANALYTICS_CONTEXT_DIR_KEY,
+  listAnalyticsContext,
+  setAnalyticsContextDir,
+} from '../../core/analytics-context.js';
 
 /** Lifecycle actions every managed profile supports through the generic route. */
 const PROFILE_LIFECYCLE_ACTIONS = new Set(['check', 'start', 'stop', 'test']);
@@ -541,6 +547,63 @@ export function createMcpRouter(deps: RouterDeps): Router {
       const message = error?.message ?? String(error);
       res.status(/explicit owner request/i.test(message) ? 403 : 400).json({ error: message });
     }
+  });
+
+  // ── Analytics knowledge directory (etl-analytics A2) ─────────────────────
+  // The local directory served by mcp_analytics_list_context /
+  // mcp_analytics_load_context. Read shows the active dir + file count for
+  // the a2-analytics connection page; the write (configure a different
+  // directory) is loopback-only like every config mutation here.
+  router.get('/mcp/analytics-context', (_req: Request, res: Response) => {
+    if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
+    try {
+      const { dir, files } = listAnalyticsContext(deps.db);
+      const configured = (getSetting<string>(deps.db, ANALYTICS_CONTEXT_DIR_KEY) ?? '').trim();
+      res.json({
+        dir,
+        configured,
+        fileCount: files.length,
+        onboarding: deps.etlOnboarding?.getStatus() ?? null,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  router.post('/mcp/analytics-context', (req: Request, res: Response) => {
+    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsJsonObjectBody(req, res)) return;
+    if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
+    try {
+      const dir = setAnalyticsContextDir(deps.db, String(req.body?.dir ?? ''));
+      const { files } = listAnalyticsContext(deps.db);
+      const configured = (getSetting<string>(deps.db, ANALYTICS_CONTEXT_DIR_KEY) ?? '').trim();
+      res.json({ dir, configured, fileCount: files.length });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  // Trigger ETL preset onboarding (etl-analytics A3). Loopback-only like the
+  // config write above — the button on the a2-analytics connection page is
+  // the same explicit owner action the chat tool's ownerRequested gate
+  // asserts. start() is idempotent: posting while a run is active returns
+  // that run's progress rather than erroring.
+  router.post('/mcp/analytics-context/generate', (req: Request, res: Response) => {
+    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsJsonObjectBody(req, res)) return;
+    if (!deps.etlOnboarding) return res.status(503).json({ error: 'ETL onboarding service unavailable' });
+    const group = String(req.body?.group ?? '').trim();
+    const businesses = Array.isArray(req.body?.businesses)
+      ? (req.body.businesses as unknown[]).map(b => String(b)).filter(b => b.trim())
+      : [];
+    res.json({
+      onboarding: deps.etlOnboarding.start({
+        ...(group ? { group } : {}),
+        ...(businesses.length ? { businesses } : {}),
+        regenerate: req.body?.regenerate === true,
+      }),
+    });
   });
 
   return router;

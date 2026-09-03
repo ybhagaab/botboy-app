@@ -771,6 +771,57 @@ describe('SharePointSync engine', () => {
     expect(metaOf('2').resolved).toBe('false'); // live state stamped on the reply too
   });
 
+  it('REGRESSION (owner 2026-09-01): mention re-stamps on re-fetch — identity fixes REPAIR stored rows', async () => {
+    // First fetch happens with NO owner identity: the fused mention chip
+    // ("@Bhagat, ABWhat…") is stamped mentionedMe=false.
+    const doc = sharedDoc();
+    const live: Array<Record<string, unknown>> = [
+      { id: '1', author: 'Kalyankar, Nitin', initials: 'KN', date: '2026-09-01T07:06:08Z', text: '@Wang, Zeng: Exactly what data are we sending to the third party ?' },
+      { id: '2', author: 'Kalyankar, Nitin', initials: 'KN', date: '2026-09-01T07:07:32Z', text: '@Wang, Zeng @Bhagat, ABWhat is the expected latency here?', parentId: '1' },
+    ];
+    const { sync } = build(commentsHandler([doc], live));
+    enableSharedWithMe(sync);
+    await sync.runNow();
+    await sync.drainNow();
+    persistEmittedComments();
+    emitted.length = 0;
+    const metaOf = (id: string) => JSON.parse((storage.getDb().prepare('SELECT metadata FROM work_items WHERE url = ?')
+      .get(`${doc.WebUrl}#comment=${id}`) as { metadata: string }).metadata) as Record<string, string>;
+    expect(metaOf('2').mentionedMe).toBe('false'); // unknown identity → not flagged
+
+    // Identity arrives (GRASP profile detection); the doc changes; the
+    // durable-dedup branch must re-stamp mentions with the CURRENT rules.
+    setOwner('Bhagat, AB');
+    doc.LastModifiedTime = '2026-09-02T09:00:00Z';
+    const { sync: sync2 } = build(commentsHandler([doc], live));
+    enableSharedWithMe(sync2);
+    await sync2.runNow();
+    await sync2.drainNow();
+    expect(emitted.filter(i => i.type === 'document_comment')).toHaveLength(0); // dedup held
+    expect(metaOf('2').mentionedMe).toBe('true');  // fused chip now recognized
+    expect(metaOf('1').mentionedMe).toBe('false'); // non-mention stays false
+
+    // Identity DEGRADES to alias-only (name cleared, email still present):
+    // an alias-only identity can't confidently DENY name-based mentions —
+    // the repaired flag must survive.
+    setOwner('');
+    doc.LastModifiedTime = '2026-09-03T09:00:00Z';
+    const { sync: sync3 } = build(commentsHandler([doc], live));
+    enableSharedWithMe(sync3);
+    await sync3.runNow();
+    await sync3.drainNow();
+    expect(metaOf('2').mentionedMe).toBe('true'); // preserved through the degraded identity
+
+    // Full identity OUTAGE (name AND email gone): same preservation.
+    setOwner('', '');
+    doc.LastModifiedTime = '2026-09-04T09:00:00Z';
+    const { sync: sync4 } = build(commentsHandler([doc], live));
+    enableSharedWithMe(sync4);
+    await sync4.runNow();
+    await sync4.drainNow();
+    expect(metaOf('2').mentionedMe).toBe('true'); // unknown identity never destroys state
+  });
+
   // ── Renumbered comment ids (soak find 2026-08-25) ─────────────────────────
   // Word renumbers comment ids under co-authoring; the same comment must not
   // re-emit under its new id — the stored row is remapped in place instead.

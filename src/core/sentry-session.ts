@@ -43,7 +43,13 @@ export type SentryPrimeOutcome =
  */
 export function isSentryAuthShapedError(text: string | null | undefined): boolean {
   if (!text) return false;
-  return /SentryRedirectException|sentry\.amazon\.com\/SSO\/redirect|HTTP Status 401|Non-JSON response.{0,40}(401|<!doctype)|NotAuthorizedException|mwinit/i.test(text);
+  // The 307 branch: a lapsed Sentry session mid-flight makes the service
+  // answer tool calls with a bare HTML redirect page, which the a2 server
+  // wraps as {"_raw": "<html>…307 Temporary Redirect…"} with isError:FALSE —
+  // auth failure dressed as data (live 2026-09-02: polls read status
+  // "undefined"/"DELETED" through that window). An HTML redirect page is
+  // never legitimate Datanet data.
+  return /SentryRedirectException|sentry\.amazon\.com\/SSO\/redirect|HTTP Status 401|Non-JSON response.{0,40}(401|<!doctype)|NotAuthorizedException|mwinit|307 Temporary Redirect|"_raw":\s*"<html/i.test(text);
 }
 
 /** True when the shared Midway jar already holds an unexpired Sentry session

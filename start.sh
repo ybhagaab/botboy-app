@@ -1,6 +1,16 @@
 #!/bin/bash
 # BotBoy — Personal Productivity Tracker Launcher
 #
+# BASH REQUIRED: this script uses bashisms (BASH_REMATCH, printf -v). Running
+# it as `zsh ./start.sh` ignores the shebang and SILENTLY breaks the .env
+# loader — zsh's =~ does not populate BASH_REMATCH, so zero keys load, and
+# provider derivation falls back to defaults (live incident 2026-09-02: chat
+# flipped gateway→bedrock and died overnight with the aws login session).
+# Re-exec under bash when any other shell sourced or invoked us.
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /bin/bash "$0" "$@"
+fi
+#
 # Modes:
 #   ./start.sh               background: start server detached, open the
 #                            dashboard window, exit (CLI use)

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
 import { createMcpManager } from './core/mcp-manager.js';
 import { createAnalyticsDashboardService } from './core/analytics-dashboard.js';
+import { createDashboardEtlRunner } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
 import { createNodeManager } from './core/node-manager.js';
@@ -26,6 +27,8 @@ import { createInferenceProviderFromEnv } from './core/inference-provider.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
 import { createToolExecutor } from './core/tool-executor.js';
+import { createEtlToolCall } from './core/etl-adhoc.js';
+import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
 import { createMidwaySentinel } from './core/midway-sentinel.js';
 import { createBrowserMonitor } from './monitors/browser-monitor.js';
@@ -271,7 +274,13 @@ async function main() {
 
   // Dashboards remain canonical in local SQLite. MCP query results are
   // persisted through this single service for API, agent, and scheduler use.
-  const analyticsService = createAnalyticsDashboardService({ db, mcpManager });
+  // The ETL runner is the A4 fallback lane: used only when sql-context is
+  // not running at refresh time (availability switch inside the service).
+  const analyticsService = createAnalyticsDashboardService({
+    db,
+    mcpManager,
+    etlRunner: createDashboardEtlRunner({ db, mcpManager }),
+  });
   const dashboardPublisher = createDashboardPublisherService({ db, analyticsService });
   const analyticsScheduler = createAnalyticsScheduler({ db, analyticsService });
 
@@ -365,6 +374,15 @@ async function main() {
   // stored document content (it only needs the db; the capture pipeline that
   // also uses it is wired further down).
   const contentStore = createContentStore(db);
+  // ETL onboarding (etl-analytics A3): background preset generation over the
+  // user's own Datanet group. Shares the Sentry-self-healing ETL call from
+  // etl-adhoc and the chat LLM client for classification/synthesis; exposed
+  // to chat (mcp_etl_generate_presets) and the connection page (status/POST).
+  const etlOnboarding = createEtlOnboardingService({
+    db,
+    call: createEtlToolCall(mcpManager),
+    llm: llmClient,
+  });
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     brainStore,
     mcpManager,
@@ -372,6 +390,7 @@ async function main() {
     dashboardPublisher,
     chatTerminal,
     contentStore,
+    etlOnboarding,
   });
   const toolExecutor = withProductDocumentChatTools(baseToolExecutor, productDocumentService);
 
@@ -871,6 +890,7 @@ async function main() {
     productDocumentService,
     writingConfigStore,
     chatTerminal,
+    etlOnboarding,
   };
   app.use('/api', createRouter(routerDeps));
 

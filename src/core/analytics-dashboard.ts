@@ -2,6 +2,8 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { McpManager } from './mcp-types.js';
 import { validateReadOnlySql } from './mcp-policy.js';
+import { selectDashboardLane, type DashboardLaneId } from './analytics-runners.js';
+import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type {
   AnalyticsDashboard,
   AnalyticsDashboardService,
@@ -288,6 +290,25 @@ export function parseSqlMcpResult(text: string, refreshedAt = new Date().toISOSt
   };
 }
 
+/** Convert a Datanet ETL composite outcome (parsed TSV, string cells) into
+ * the widget result shape — same cell coercion as the sql-mcp lane so a
+ * widget renders identically regardless of which lane produced it. */
+export function etlResultToWidgetResult(outcome: QueryRunResult, elapsedMs?: number): AnalyticsWidgetResult {
+  const columns = outcome.columns ?? [];
+  const rows = (outcome.rows ?? []).map(row => row.map(coerceCell));
+  return {
+    trust: 'external_untrusted_data',
+    columns,
+    rows,
+    rowCount: outcome.rowCount ?? rows.length,
+    displayedRowCount: rows.length,
+    executionTimeMs: elapsedMs,
+    rawPreview: columns.length ? undefined : 'The ETL run completed without tabular output.',
+    refreshedAt: new Date().toISOString(),
+    lane: 'etl',
+  };
+}
+
 function normalizeWidget(input: AnalyticsWidgetInput, position: number): AnalyticsWidgetInput {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error(`Widget ${position + 1} must be an object`);
   if (!WIDGET_KINDS.has(input.kind)) throw new Error(`Widget ${position + 1} has invalid kind`);
@@ -317,9 +338,14 @@ export function createAnalyticsDashboardService(options: {
   db: Database.Database;
   mcpManager: McpManager;
   queryTimeoutMs?: number;
+  /** Fallback data lane (etl-analytics A4): the Datanet ETL composite. When
+   * present AND sql-context is not running at run start, widget queries run
+   * through it — serially (one scratch pair), minutes-scale budgets. */
+  etlRunner?: QueryRunner;
 }): AnalyticsDashboardService {
   const db = options.db;
   const mcpManager = options.mcpManager;
+  const etlRunner = options.etlRunner;
   const defaultQueryTimeoutMs = 35 * 60_000; // owner decision 2026-08-27: 35-min queries are real
   const configuredQueryTimeoutMs = Number(
     options.queryTimeoutMs ?? process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? defaultQueryTimeoutMs,
@@ -757,7 +783,7 @@ export function createAnalyticsDashboardService(options: {
     `).get(runId, workerId, process.pid));
   }
 
-  async function executeRunWidget(row: any): Promise<AnalyticsWidgetResult> {
+  async function executeRunWidget(row: any, lane: DashboardLaneId = 'sql-mcp'): Promise<AnalyticsWidgetResult> {
     const storedWidget = db.prepare(`
       SELECT 1 FROM analytics_widgets WHERE id = ? AND dashboard_id = ?
     `).get(row.widget_id, row.dashboard_id);
@@ -778,6 +804,19 @@ export function createAnalyticsDashboardService(options: {
     }
 
     const sql = validateReadOnlySql(row.sql_query);
+
+    // ETL fallback lane (etl-analytics A4): the composite handles the whole
+    // Datanet dance; a non-ok outcome fails THIS widget with the runner's
+    // own actionable message (run machine semantics unchanged).
+    if (lane === 'etl' && etlRunner) {
+      const startedAtMs = Date.now();
+      const outcome = await etlRunner.runQuery({ sql });
+      if (!outcome.ok) {
+        throw new Error([outcome.error, outcome.nextAction].filter(Boolean).join(' — ') || 'Datanet ETL query failed');
+      }
+      return etlResultToWidgetResult(outcome, Date.now() - startedAtMs);
+    }
+
     const call = await mcpManager.callTool(
       'sql-context',
       'run_query',
@@ -785,7 +824,7 @@ export function createAnalyticsDashboardService(options: {
       { source: 'dashboard', timeoutMs: queryTimeoutMs },
     );
     if (call.isError) throw new Error(call.text || 'SQL MCP returned an error');
-    return parseSqlMcpResult(call.text);
+    return { ...parseSqlMcpResult(call.text), lane: 'sql-mcp' };
   }
 
   function finalizeRun(runId: string): void {
@@ -1033,9 +1072,25 @@ export function createAnalyticsDashboardService(options: {
    */
   const WIDGET_REFRESH_CONCURRENCY = 3;
 
+  /** The data lane for ONE run, decided at run start — never per widget, so
+   * a mid-run connector flip cannot mix lanes inside one refresh. Mirrors
+   * the chat prompt's DATA LANE NOTICE predicate (analytics-runners.ts). */
+  async function pickRunLane(): Promise<DashboardLaneId> {
+    if (!etlRunner) return 'sql-mcp';
+    try {
+      return selectDashboardLane(await mcpManager.listServers());
+    } catch {
+      return 'sql-mcp'; // unknowable state: keep pre-A4 behavior
+    }
+  }
+
   async function processClaimedRun(runId: string): Promise<void> {
     let ownershipLost = false;
     let cancelSeen = false;
+    const lane = await pickRunLane();
+    if (lane === 'etl') {
+      console.log(`[Analytics] run ${runId}: sql-context is down — refreshing through the Datanet ETL lane (widgets run one at a time, minutes-scale)`);
+    }
 
     const claimNextWidget = (): any | 'stop' | null => {
       while (true) {
@@ -1079,7 +1134,7 @@ export function createAnalyticsDashboardService(options: {
 
     const runWidgetToCompletion = async (widget: any): Promise<void> => {
       try {
-        const result = await executeRunWidget(widget);
+        const result = await executeRunWidget(widget, lane);
         const completedAt = new Date().toISOString();
         db.transaction(() => {
           const progressed = db.prepare(`
@@ -1132,7 +1187,11 @@ export function createAnalyticsDashboardService(options: {
         await runWidgetToCompletion(next);
       }
     };
-    await Promise.all(Array.from({ length: WIDGET_REFRESH_CONCURRENCY }, () => poolWorker()));
+    // The ETL lane executes widgets ONE at a time: every query rides the
+    // same per-user scratch pair, so concurrent SQL revisions would clobber
+    // each other (and the composite's in-flight guard would refuse anyway).
+    const poolWidth = lane === 'etl' ? 1 : WIDGET_REFRESH_CONCURRENCY;
+    await Promise.all(Array.from({ length: poolWidth }, () => poolWorker()));
 
     if (ownershipLost) return;
     if (cancelSeen) {
