@@ -74,14 +74,53 @@ export interface OpenAiCompatibleInferenceOptions extends Omit<SharedProviderOpt
 }
 
 const BEDROCK_ENDPOINT = 'https://bedrock-mantle.us-east-1.api.aws/openai/v1';
-const BEDROCK_MODEL = 'openai.gpt-5.6-luna';
+// Terra replaced Luna as the default model (owner decision 2026-09-03:
+// stronger at librarian/routing judgment and general work). Same gpt-5.6
+// Responses family and context profile — only the model id changes.
+const BEDROCK_MODEL = 'openai.gpt-5.6-terra';
+
+/**
+ * The blessed model choices (owner decision 2026-09-03): the gpt-5.6
+ * Responses family ONLY — identical API mode, dialect, parameter quirks,
+ * and 1M-token context profile, so switching between them is a pure
+ * request-body change. Terra is the default for EVERY lane (chat and
+ * background); the chat composer may override per message. Other gateway
+ * models (Kimi, DeepSeek, …) are deliberately NOT offered: each would need
+ * its own validated dialect/window profile (Claude models don't even speak
+ * an API this client implements).
+ */
+export const BLESSED_CHAT_MODELS = Object.freeze([
+  Object.freeze({ key: 'terra', label: 'Terra (default)', bareId: 'openai.gpt-5.6-terra' }),
+  Object.freeze({ key: 'luna', label: 'Luna', bareId: 'openai.gpt-5.6-luna' }),
+  Object.freeze({ key: 'sol', label: 'Sol', bareId: 'openai.gpt-5.6-sol' }),
+] as const);
+export type BlessedModelKey = (typeof BLESSED_CHAT_MODELS)[number]['key'];
+
+/**
+ * Resolve a blessed choice against the ACTIVE provider's default model id:
+ * gateway ids carry the deployment target prefix ('bedrock-mantle-luna/'),
+ * direct bedrock ids are bare — the prefix (everything through the last
+ * '/') is inherited from the default id, so the qualification rule can
+ * never drift from the provider. Unknown keys resolve to null: callers
+ * fall back to the default model rather than sending arbitrary ids.
+ */
+export function resolveBlessedModelId(providerDefaultModel: string, key: unknown): string | null {
+  const entry = BLESSED_CHAT_MODELS.find(candidate => candidate.key === key);
+  if (!entry) return null;
+  const slash = providerDefaultModel.lastIndexOf('/');
+  const prefix = slash >= 0 ? providerDefaultModel.slice(0, slash + 1) : '';
+  return `${prefix}${entry.bareId}`;
+}
 const BEDROCK_MAX_CONTEXT_TOKENS = 1_000_000;
 const LEGACY_BEDROCK_MODEL = 'moonshotai.kimi-k2.5';
 const LEGACY_BEDROCK_MAX_CONTEXT_TOKENS = 262_144;
 const OPENAI_COMPATIBLE_MODEL = '/app/models/qwen35-35b-a3b-fp8';
 const OPENAI_COMPATIBLE_MAX_CONTEXT_TOKENS = 32768;
 // AgentCore gateway model ids carry the gateway target name as a prefix.
-const GATEWAY_MODEL = 'bedrock-mantle-luna/openai.gpt-5.6-luna';
+// The 'bedrock-mantle-luna/' prefix is the DEPLOYMENT's target name (fixed
+// infrastructure, named when Luna was the default) — not the model. The
+// model segment after the slash is what actually selects Terra.
+const GATEWAY_MODEL = 'bedrock-mantle-luna/openai.gpt-5.6-terra';
 const GATEWAY_MAX_CONTEXT_TOKENS = BEDROCK_MAX_CONTEXT_TOKENS;
 // Team deployment defaults, baked in so a teammate's .env needs only their
 // personal client id/secret. None of these are secrets: the gateway rejects

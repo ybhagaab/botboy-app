@@ -70,6 +70,30 @@ function initChatThinkingControl() {
   });
 }
 
+// Model picker (chat panel dropdown, 2026-09-03). 'default' = Terra, the
+// team default every background lane also uses; luna/sol are same-family
+// alternates resolved server-side against the blessed registry. Persisted
+// per browser like the thinking level.
+const CHAT_MODEL_KEY = 'botboy.chat.model';
+const CHAT_MODEL_CHOICES = ['default', 'luna', 'sol'];
+
+function chatModelChoice() {
+  try {
+    const stored = localStorage.getItem(CHAT_MODEL_KEY);
+    return CHAT_MODEL_CHOICES.includes(stored) ? stored : 'default';
+  } catch { return 'default'; }
+}
+
+function initChatModelControl() {
+  const select = document.getElementById('chat-model');
+  if (!select) return;
+  select.value = chatModelChoice();
+  select.addEventListener('change', () => {
+    const value = CHAT_MODEL_CHOICES.includes(select.value) ? select.value : 'default';
+    try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
+  });
+}
+
 // Chat panel width preset (teammate request 2026-08-28). A body class
 // redefines --assistant — the same variable the workspace push-aside reads
 // (dashboard.css; the --sidebar expanded/collapsed pattern). 'default' = no
@@ -186,13 +210,111 @@ function clearSearch() {
 async function createNode(title, desc) { await api('/nodes', { method: 'POST', body: { title, description: desc } }); await loadRoots(); renderGrid(); }
 async function archiveNode(id) { await api(`/nodes/${id}/archive`, { method: 'POST' }); goHome(); }
 async function deleteNode(id) { if (!confirm('Delete this node and all its items?')) return; await api(`/nodes/${id}`, { method: 'DELETE' }); goHome(); }
+// ── Chat image attachments (2026-09-05) ──
+// Upload-first contract: every pasted/picked image is POSTed immediately to
+// /chat/attachments for an id; the send body carries IDS ONLY (never base64 —
+// keeps chat bodies small and history light). Pending thumbs render in
+// #chat-attach-strip with per-image remove until the next send consumes them.
+// NOTE api() gotcha: body must be an OBJECT — api() stringifies internally
+// (pre-stringified JSON becomes a double-encoded string primitive, which
+// express.json strict-rejects; see the lesson-card dead-button post-mortem).
+const pendingChatAttachments = []; // { id, mime, bytes }
+const CHAT_ATTACH_MAX = 4;
+const CHAT_ATTACH_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+
+function renderChatAttachStrip() {
+  const strip = document.getElementById('chat-attach-strip');
+  if (!strip) return;
+  strip.hidden = pendingChatAttachments.length === 0;
+  strip.innerHTML = pendingChatAttachments.map(att => `<span class="chat-attach-thumb"><img src="/api/chat/attachments/${escAttr(att.id)}" alt="Pending image attachment"><button type="button" data-remove-attachment="${escAttr(att.id)}" aria-label="Remove this image">×</button></span>`).join('');
+}
+
+function flashChatAttachError(text) {
+  const strip = document.getElementById('chat-attach-strip');
+  if (!strip) return;
+  strip.hidden = false;
+  const note = document.createElement('span');
+  note.className = 'chat-attach-error';
+  note.textContent = text;
+  strip.appendChild(note);
+  setTimeout(() => { note.remove(); renderChatAttachStrip(); }, 4000);
+}
+
+async function addChatAttachmentFile(file) {
+  if (!file || !CHAT_ATTACH_TYPES.includes(file.type)) return { ok: false, error: 'Only PNG, JPEG, WebP or GIF images can be attached.' };
+  if (pendingChatAttachments.length >= CHAT_ATTACH_MAX) return { ok: false, error: `At most ${CHAT_ATTACH_MAX} images per message.` };
+  if (file.size > 8 * 1024 * 1024) return { ok: false, error: 'Images are capped at 8MB.' };
+  let dataUrl;
+  try {
+    dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('could not read the image'));
+      reader.readAsDataURL(file);
+    });
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+  const resp = await api('/chat/attachments', { method: 'POST', body: { dataUrl } });
+  if (!resp || resp.error || !resp.id) return { ok: false, error: resp?.error || 'Upload failed.' };
+  pendingChatAttachments.push(resp);
+  renderChatAttachStrip();
+  return { ok: true };
+}
+
+function initChatAttachments() {
+  const input = document.getElementById('chatInput');
+  const fileInput = document.getElementById('chatAttachFile');
+  const strip = document.getElementById('chat-attach-strip');
+  if (fileInput) {
+    fileInput.addEventListener('change', async () => {
+      for (const file of Array.from(fileInput.files || [])) {
+        const res = await addChatAttachmentFile(file);
+        if (!res.ok) flashChatAttachError(res.error);
+      }
+      fileInput.value = '';
+    });
+  }
+  if (input) {
+    input.addEventListener('paste', async (e) => {
+      const images = Array.from(e.clipboardData?.items || [])
+        .filter(item => item.kind === 'file' && CHAT_ATTACH_TYPES.includes(item.type));
+      if (images.length === 0) return; // plain text paste — leave it alone
+      e.preventDefault();
+      for (const item of images) {
+        const res = await addChatAttachmentFile(item.getAsFile());
+        if (!res.ok) flashChatAttachError(res.error);
+      }
+    });
+  }
+  if (strip) {
+    strip.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-remove-attachment]');
+      if (!btn) return;
+      const id = btn.getAttribute('data-remove-attachment');
+      const idx = pendingChatAttachments.findIndex(a => a.id === id);
+      if (idx >= 0) { pendingChatAttachments.splice(idx, 1); renderChatAttachStrip(); }
+    });
+  }
+}
+
 async function sendChat(msg) {
   const chatEl = document.getElementById('chat-messages');
+
+  // Consume pending image attachments for THIS turn (already uploaded; the
+  // body carries their ids). Strip clears immediately — they now belong to
+  // the user bubble below.
+  const turnAttachments = pendingChatAttachments.splice(0, pendingChatAttachments.length);
+  renderChatAttachStrip();
 
   // Append user bubble directly to DOM (no full rebuild — that would wipe frozen assistant bubbles from prior turns)
   const userBubble = document.createElement('div');
   userBubble.className = 'chat-msg user';
-  userBubble.innerHTML = renderChatMsgInner({ role: 'user', content: msg });
+  userBubble.innerHTML = renderChatMsgInner({
+    role: 'user',
+    content: msg,
+    attachments: turnAttachments.map(a => ({ id: a.id, url: `/api/chat/attachments/${a.id}` })),
+  });
   chatEl.appendChild(userBubble);
   chatEl.scrollTop = chatEl.scrollHeight;
 
@@ -257,7 +379,7 @@ async function sendChat(msg) {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), ...(activeChatRequestContext() || {}) }),
+      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...(activeChatRequestContext() || {}) }),
     });
 
     if (!resp.ok) {
@@ -406,6 +528,7 @@ async function sendChat(msg) {
               }
             }
             renderSegments();
+            hydrateLessonCards(msgEl); // expand any [[lesson:…]] markers the finished turn produced
             // Mark the bubble as FROZEN so the 5s chat poll doesn't wipe the rich segment UI
             msgEl.classList.remove('streaming-live');
             msgEl.classList.add('streaming-frozen');
@@ -1295,7 +1418,7 @@ function renderChat() {
       if (existingSigs.has(sig(m.role, m.content))) return false;
       return true;
     });
-    if (newMessages.length === 0) return;
+    if (newMessages.length === 0) { hydrateLessonCards(el); return; }
     for (const m of newMessages) {
       const bubble = document.createElement('div');
       bubble.className = `chat-msg ${m.role}`;
@@ -1303,6 +1426,7 @@ function renderChat() {
       bubble.innerHTML = renderChatMsgInner(m);
       el.appendChild(bubble);
     }
+    hydrateLessonCards(el);
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
     if (nearBottom) el.scrollTop = el.scrollHeight;
     return;
@@ -1313,6 +1437,7 @@ function renderChat() {
     const idAttr = m.id ? ` data-msg-id="${m.id}"` : '';
     return `<div class="chat-msg ${m.role}"${idAttr}>${renderChatMsgInner(m)}</div>`;
   }).join('');
+  hydrateLessonCards(el);
   // Cold load / refresh: always scroll to bottom — newest messages should be visible.
   // Use rAF so DOM layout completes (image dims, thinking block rendering) before we measure scrollHeight.
   requestAnimationFrame(() => {
@@ -1321,6 +1446,85 @@ function renderChat() {
     requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
   });
 }
+
+// ── Lessons ledger: chat approval cards ──
+// propose_lesson replies and escalation messages carry [[lesson:<id>]]
+// markers (the raw id is never owner-facing prose). The marker survives the
+// escape-first markdown renderer as literal text; these helpers expand it
+// into a card — plain-language rule + evidence with Adopt/Dismiss buttons.
+// The button click IS the owner approval (POST /lessons/:id/adopt|retire),
+// the same trust model as the document workbench Approve buttons.
+const LESSON_MARKER_RE = /\[\[lesson:(lesson_[a-z0-9]{6,24})\]\]/g;
+
+function hydrateLessonCards(root) {
+  if (!root) return;
+  const bubbles = root.classList?.contains('chat-msg') ? [root] : root.querySelectorAll('.chat-msg');
+  for (const bubble of bubbles) {
+    LESSON_MARKER_RE.lastIndex = 0;
+    if (LESSON_MARKER_RE.test(bubble.innerHTML)) {
+      LESSON_MARKER_RE.lastIndex = 0;
+      bubble.innerHTML = bubble.innerHTML.replace(LESSON_MARKER_RE, (_, id) =>
+        `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`);
+    }
+  }
+  const scope = root.classList?.contains('chat-msg') ? root : root;
+  for (const card of scope.querySelectorAll('.lesson-card:not([data-hydrated])')) {
+    card.dataset.hydrated = '1';
+    void fillLessonCard(card);
+  }
+}
+
+async function fillLessonCard(card) {
+  try {
+    const payload = await api(`/lessons/${card.dataset.lessonId}`);
+    paintLessonCard(card, payload.lesson);
+  } catch {
+    card.innerHTML = '<em>Lesson unavailable.</em>';
+  }
+}
+
+function lessonEsc(value) {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function paintLessonCard(card, lesson) {
+  const seen = lesson.recurrenceCount > 1 ? ` · seen ×${lesson.recurrenceCount}` : '';
+  const head = `<div class="lesson-card-head"><span class="lesson-scope">${lessonEsc(lesson.scope)}</span><span class="lesson-kind">proposed operating lesson${seen}</span></div>`;
+  const body = `<div class="lesson-rule">${lessonEsc(lesson.rule)}</div><div class="lesson-evidence">${lessonEsc(lesson.evidence)}</div>`;
+  if (lesson.status === 'proposed') {
+    card.innerHTML = `${head}${body}<div class="lesson-actions"><button type="button" class="button small primary" data-lesson-action="adopt">Adopt</button><button type="button" class="button small ghost" data-lesson-action="retire">Dismiss</button></div>`;
+  } else if (lesson.status === 'adopted') {
+    card.innerHTML = `${head}${body}<div class="lesson-state adopted">✓ Adopted — BotBoy now applies this to ${lessonEsc(lesson.scope)} work</div>`;
+  } else {
+    card.innerHTML = `${head}${body}<div class="lesson-state">Dismissed — kept in the ledger for audit, never loads</div>`;
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-lesson-action]');
+  if (!button) return;
+  const card = button.closest('.lesson-card');
+  if (!card) return;
+  for (const other of card.querySelectorAll('button')) other.disabled = true;
+  try {
+    // No request body: the click itself is the whole action. (Live bug
+    // 2026-09-05: passing body '{}' here got double-stringified by api()
+    // into a JSON string primitive, which express.json strict mode 400s —
+    // and the old catch swallowed it, so Adopt visibly did nothing.)
+    const payload = await api(`/lessons/${card.dataset.lessonId}/${button.dataset.lessonAction}`, { method: 'POST' });
+    if (!payload || !payload.lesson) throw new Error(payload?.error || 'unexpected response');
+    paintLessonCard(card, payload.lesson);
+  } catch (error) {
+    for (const other of card.querySelectorAll('button')) other.disabled = false;
+    let note = card.querySelector('.lesson-error');
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'lesson-error';
+      card.appendChild(note);
+    }
+    note.textContent = `Could not save that — ${String(error?.message || error)}. Try again.`;
+  }
+});
 
 function renderChatMsgInner(m) {
   let raw = m.content || '';
@@ -1337,7 +1541,19 @@ function renderChatMsgInner(m) {
   const content = formatMarkdownContent(raw);
 
   const thinkHtml = reasoning ? `<div class="thinking-block collapsed" onclick="this.classList.toggle('collapsed')"><span class="thinking-label">💭 Thinking</span><div class="thinking-content">${reasoning.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div></div>` : '';
-  return `${thinkHtml}<div class="content-block">${content}</div>`;
+
+  // Image attachments (user messages): thumbnails above the text, served by
+  // the attachments route only — any other URL shape is dropped, so message
+  // data can never point an <img> at an arbitrary origin.
+  const attachmentsHtml = Array.isArray(m.attachments) && m.attachments.length
+    ? `<div class="chat-attachments">${m.attachments.map(a => {
+        const url = String(a?.url || '');
+        if (!url.startsWith('/api/chat/attachments/')) return '';
+        const safe = escAttr(url);
+        return `<a href="${safe}" target="_blank" rel="noopener noreferrer"><img src="${safe}" alt="Attached image" loading="lazy"></a>`;
+      }).join('')}</div>`
+    : '';
+  return `${attachmentsHtml}${thinkHtml}<div class="content-block">${content}</div>`;
 }
 
 // ── Safe Markdown renderer ──
@@ -1808,7 +2024,7 @@ window.submitNewNode = async () => {
   document.getElementById('newNodeDesc').value = '';
   hideModal();
 };
-window.submitChat = async () => { const el = document.getElementById('chatInput'); const msg = el?.value?.trim(); if (!msg) return; el.value = ''; await sendChat(msg); };
+window.submitChat = async () => { const el = document.getElementById('chatInput'); let msg = el?.value?.trim(); if (!msg && pendingChatAttachments.length) msg = '(image attached)'; if (!msg) return; el.value = ''; await sendChat(msg); };
 // Shared escape-first Markdown renderer, exposed for the Documents view
 // (dashboard.js). All text is escaped before any tags are produced, so
 // rendering hostile document content cannot inject markup.
@@ -2730,7 +2946,9 @@ document.addEventListener('click', (e) => {
   }
 
   initChatThinkingControl();
+  initChatModelControl();
   initChatWidthControl();
+  initChatAttachments();
   await Promise.all([
     loadRoots(),
     loadChatHistory(),

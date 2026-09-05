@@ -256,3 +256,34 @@ describe('etl-adhoc query runner', () => {
     expect(submits[1].args.dataset_date).toBe('2026-09-02');
   });
 });
+
+/**
+ * The managed a2-analytics call path (createEtlToolCall): structured-errors
+ * invariant — no raw transport error may leave it (live 2026-09-04: three
+ * dashboard widgets surfaced bare "MCP error -32001: Request timed out"
+ * with no next action while the VPN was down mid-run).
+ */
+describe('createEtlToolCall transport errors', () => {
+  it('wraps MCP timeouts as a structured error naming the next action', async () => {
+    const { createEtlToolCall } = await import('./etl-adhoc.js');
+    const mcp = {
+      callTool: async () => { throw new Error('MCP error -32001: Request timed out'); },
+    } as any;
+    const call = createEtlToolCall(mcp);
+    const result = await call('datanet_submit_run', {});
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('timed out');
+    expect(result.text).toContain('the transport, not the query');
+    expect(result.text).toContain('poll it');
+    expect(result.text).toContain('instead of resubmitting');
+  });
+
+  it('still rethrows non-timeout, non-auth transport errors raw', async () => {
+    const { createEtlToolCall } = await import('./etl-adhoc.js');
+    const mcp = {
+      callTool: async () => { throw new Error('spawn ENOENT: aim binary missing'); },
+    } as any;
+    const call = createEtlToolCall(mcp);
+    await expect(call('datanet_submit_run', {})).rejects.toThrow('spawn ENOENT');
+  });
+});

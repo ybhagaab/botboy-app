@@ -1,9 +1,10 @@
-# BotBoy — Teammate Setup (Luna, no AWS access needed)
+# BotBoy — Teammate Setup (no AWS access needed)
 
-BotBoy runs entirely on your Mac. LLM calls (Luna, `openai.gpt-5.6-luna`) go
-through an authenticated team gateway — you do not need an AWS account,
+BotBoy runs entirely on your Mac. LLM calls (Terra, `openai.gpt-5.6-terra`)
+go through an authenticated team gateway — you do not need an AWS account,
 `aws login`, or any cloud setup. Your only credential is a personal client
-id/secret pair the owner sends you privately.
+id/secret pair the owner sends you privately. (You may see "luna" in the
+gateway URL — that is the deployment's name, not the model.)
 
 ## Prerequisites
 

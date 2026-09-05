@@ -13,6 +13,7 @@ import { Router, Request, Response } from 'express';
 import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
+import { resolveBlessedModelId } from '../../core/inference-provider.js';
 import {
   createAnalyticsSchemaBriefingLoader,
   resolveConversationMode,
@@ -20,6 +21,32 @@ import {
   isAnalyticsReplyGrounded,
   type AnalyticsSchemaBriefing,
 } from '../../core/analytics-chat-context.js';
+import {
+  saveChatAttachment,
+  loadChatAttachment,
+  attachmentAsDataUrl,
+  validateAttachmentIds,
+} from '../../core/chat-attachments.js';
+
+/**
+ * Transient-error detector for the chat stream retry: network hiccups,
+ * laptop sleep, TCP resets, ALB blips, AND provider-side 5xx (the model
+ * service's own "server had an error" class — documented retry-safe; live
+ * incident 2026-09-03: a mid-turn provider 500 killed an 11-iteration
+ * debugging turn without retry). 4xx rejections (message carries "HTTP 4")
+ * never retry.
+ */
+export function isTransientStreamError(err: unknown): boolean {
+  const msg = String((err as any)?.message || err || '');
+  if (msg.includes('HTTP 4')) return false; // provider rejection — don't retry
+  const transientPatterns = [
+    'terminated', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN',
+    'ENOTFOUND', 'socket hang up', 'aborted', 'network', 'fetch failed',
+    'HTTP 5', 'the server had an error', 'internal server error', 'server_error',
+    'overloaded', 'service unavailable',
+  ];
+  return transientPatterns.some(p => msg.toLowerCase().includes(p.toLowerCase()));
+}
 
 /**
  * Chat-panel thinking dropdown values. Absent/empty means 'off' (the
@@ -34,6 +61,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   const router = Router();
   const chat = deps.chatInterface;
   const analyticsSchemaLoader = createAnalyticsSchemaBriefingLoader(deps.mcpManager, {
+    db: deps.db,
     contextWindowTokens: deps.llmClient?.getContextWindow?.(),
     selector: deps.llmClient?.chatCompletion
       ? async ({ message, catalog }) => {
@@ -93,6 +121,31 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.json(chat.getHistory(limit));
   });
 
+  // ── Chat image attachments (2026-09-05) ──
+  // Upload-first contract: the composer POSTs the data URL ONCE, gets an id,
+  // and the chat message body carries ids only — keeping message bodies, the
+  // DB, and prompt logs free of base64. GET serves the bytes back for
+  // transcript thumbnails (ids are content-addressed-ish and immutable).
+  router.post('/chat/attachments', (req: Request, res: Response) => {
+    const dataUrl = req.body?.dataUrl;
+    if (typeof dataUrl !== 'string' || !dataUrl) {
+      return res.status(400).json({ error: 'dataUrl (base64 image data URL) is required' });
+    }
+    try {
+      res.json(saveChatAttachment(dataUrl));
+    } catch (err: any) {
+      res.status(400).json({ error: String(err?.message ?? err) });
+    }
+  });
+
+  router.get('/chat/attachments/:id', (req: Request, res: Response) => {
+    const loaded = loadChatAttachment(String(req.params.id));
+    if (!loaded) return res.status(404).json({ error: 'attachment not found' });
+    res.setHeader('Content-Type', loaded.mime);
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.send(loaded.buffer);
+  });
+
   // ── Cooperative stop for the in-flight chat turn ──
   // One SSE turn runs at a time in practice (single-owner app); the registry
   // still keys by turn id so a stale stop cannot cancel a NEWER turn. The
@@ -130,6 +183,29 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     if (thinkingLevel === null) {
       return res.status(400).json({ error: 'thinking must be off, low, high, or max when provided' });
     }
+    // Image attachments (2026-09-05): the body carries ids from a prior
+    // POST /chat/attachments — never inline base64. Validated before any SSE
+    // headers so failures are a clean 400.
+    const attachmentsCheck = validateAttachmentIds(body.attachments);
+    if (!attachmentsCheck.ok) {
+      return res.status(400).json({ error: attachmentsCheck.error });
+    }
+    const attachmentIds = attachmentsCheck.ids;
+    // Model picker (chat panel, 2026-09-03): a blessed gpt-5.6 sibling per
+    // message. Absent/empty = the provider default (Terra everywhere,
+    // background lanes included). Unknown values are rejected, and the
+    // resolved id inherits the provider's gateway prefix — arbitrary model
+    // strings never reach the wire.
+    let modelOverride: string | undefined;
+    if (body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
+      const resolved = deps.llmClient
+        ? resolveBlessedModelId(deps.llmClient.getDefaultModel(), body.model)
+        : null;
+      if (!resolved) {
+        return res.status(400).json({ error: 'model must be terra, luna, or sol when provided' });
+      }
+      modelOverride = resolved;
+    }
     // modeHint is ambient page context (an analytics route being open). It is
     // advisory — the message must corroborate — unlike mode, which commands.
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
@@ -148,7 +224,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       res.flushHeaders();
 
       const db = deps.db;
-      if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(`user-${Date.now()}`, 'user', message);
+      if (db) db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json) VALUES (?, ?, ?, ?)').run(
+        `user-${Date.now()}`, 'user', message, attachmentIds.length ? JSON.stringify(attachmentIds) : null,
+      );
 
       const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
       activeChatTurns.set(turnId, { stopRequested: false, startedAt: Date.now() });
@@ -190,7 +268,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             analyticsBriefing = {
               ready: false,
               complete: false,
-              text: 'BotBoy could not load the connected schema knowledge. Open #/connections/sql-context and verify the managed connector before building a dashboard.',
+              text: 'BotBoy could not load business/schema knowledge from any source. Check the managed SQL connector (#/connections/sql-context) and the analytics knowledge directory (a2-analytics connection card) before building a dashboard.',
               groundingTerms: [],
               presets: [],
               files: [],
@@ -225,8 +303,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           ? promptManager.getSystemPrompt('chat', promptContext)
           : `You are BotBoy. Active nodes: ${nodes.slice(0, 15).map((n: any) => n.title).join(', ')}. Use tools for real data.`;
 
-        // Append user message to session
-        if (convManager && sessionId) convManager.appendUser(sessionId, message);
+        // Append user message to session. Attachment-bearing messages get a
+        // text note INTO SESSION HISTORY (future turns see the note, not the
+        // pixels — images are token-expensive and ride the current turn only);
+        // the current turn's window strips it back below when images attach.
+        const sessionContent = attachmentIds.length
+          ? `${message}\n\n[${attachmentIds.length} image(s) were attached to this message and shown to the model in that turn]`
+          : message;
+        if (convManager && sessionId) convManager.appendUser(sessionId, sessionContent);
 
         // ── Rolling Context Summary ──
         // Instead of dumping all history, use: summary + recent messages
@@ -302,6 +386,22 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           { role: 'system', content: fullSystemPrompt },
           ...(recentMessages.length > 0 ? recentMessages.filter((m: any) => m.role !== 'system') : [{ role: 'user', content: message }]),
         ];
+
+        // Attach current-turn images to the LAST user message only. Earlier
+        // attachment turns in the window already carry the session-history
+        // note instead of pixels (token discipline). Content resets to the
+        // raw message so the current turn is image + clean text, not both.
+        if (attachmentIds.length) {
+          const turnImages = attachmentIds
+            .map(id => attachmentAsDataUrl(id))
+            .filter((url): url is string => typeof url === 'string');
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') {
+              messages[i] = { ...messages[i], content: message, images: turnImages };
+              break;
+            }
+          }
+        }
 
         const tools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
 
@@ -495,17 +595,6 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             try { res.write(`: keepalive ${Date.now()}\n\n`); } catch {}
           }, 10000);
 
-          // Transient-error detector: network hiccups, laptop sleep, TCP resets, ALB blips.
-          // Distinguished from vLLM 4xx errors (those come with "HTTP 4" in the message).
-          const isTransientError = (err: any): boolean => {
-            const msg = String(err?.message || err || '');
-            if (msg.includes('HTTP 4')) return false; // vLLM rejection — don't retry
-            const transientPatterns = [
-              'terminated', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN',
-              'ENOTFOUND', 'socket hang up', 'aborted', 'network', 'fetch failed',
-            ];
-            return transientPatterns.some(p => msg.toLowerCase().includes(p.toLowerCase()));
-          };
 
           // Wrap the stream in a single-retry helper. On transient network errors we restart
           // the entire vLLM stream — model regenerates from the same history. Costs one extra
@@ -527,6 +616,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ...(documentAuthoringThink
                 ? { reasoningEffort: 'max' as const }
                 : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
+              // Blessed sibling override — same family/profile, body-only change.
+              ...(modelOverride ? { model: modelOverride } : {}),
             });
             let iterResult = await gen.next();
             while (!iterResult.done) {
@@ -551,7 +642,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             try {
               streamResult = await runStream(1);
             } catch (firstErr: any) {
-              if (isTransientError(firstErr)) {
+              if (isTransientStreamError(firstErr)) {
                 console.warn(`[Chat] Transient stream error on attempt 1, retrying once: ${firstErr?.message || firstErr}`);
                 // Notify frontend so it can reset any partial bubble state for this iteration
                 try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'network', message: 'Stream interrupted, retrying...' })}\n\n`); } catch {}
@@ -609,7 +700,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               }
               const loadedPresets = analyticsBriefing.presets.join(', ');
               console.warn('[Chat] Analytics grounding gate: second ungrounded reply — replacing it with an honest failure');
-              content = `I loaded the connected schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable schema-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check #/connections/sql-context and the BotBoy log.`;
+              content = `I loaded the selected business/schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable knowledge-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check the knowledge sources (#/connections/sql-context, analytics knowledge directory) and the BotBoy log.`;
             }
 
             // ── Action-integrity gate ──
@@ -882,7 +973,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ? 'SYSTEM (internal): the user pressed Stop. Do not request any more tools. Briefly and honestly report: what you completed, what is in progress or unverified, and the natural next step if they want you to continue. Keep it short.'
               : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
           });
-          const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false });
+          const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false, ...(modelOverride ? { model: modelOverride } : {}) });
           let iterResult = await gen.next();
           while (!iterResult.done) {
             const chunk = iterResult.value;
@@ -908,7 +999,19 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         res.end();
       } catch (err: any) {
         console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
-        try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
+        // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
+        // and the user saw pure silence after reload). Persist a visible
+        // assistant message so the failed turn exists in history — work done
+        // by earlier tool iterations (file edits, submitted runs) is real and
+        // survives even though the turn died.
+        try {
+          const failId = `asst-${Date.now()}`;
+          const failText = `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`;
+          if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(failId, 'assistant', failText);
+          try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: failId, role: 'assistant', content: failText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
+        } catch {
+          try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
+        }
         try { res.end(); } catch {}
       } finally {
         activeChatTurns.delete(turnId);
@@ -918,6 +1021,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
     // Non-streaming path: same simplified contract as SSE — no document
     // state machine; save_product_document handles official documents inline.
+    // Attachments are rejected here rather than silently dropped: this legacy
+    // path bypasses the LLM tool loop (chat.sendMessage → agent), so images
+    // would never reach the model. The UI always streams.
+    if (attachmentIds.length) {
+      return res.status(400).json({ error: 'image attachments require stream: true' });
+    }
     try {
       const result = await chat.sendMessage(message);
       res.json(result);

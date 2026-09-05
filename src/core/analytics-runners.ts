@@ -27,6 +27,47 @@ import { createEtlQueryRunner, createEtlToolCall, type QueryRunner } from './etl
 
 export type DashboardLaneId = 'sql-mcp' | 'etl';
 
+export type WidgetFailureClass = 'content' | 'infra';
+
+/**
+ * Failure classification for the post-run cross-lane retry (incident
+ * 2026-09-04: 5 Prime-dashboard widgets failed — 2 were SQL dialect bugs,
+ * 3 were mid-run network loss; only the latter class can possibly succeed
+ * on the other lane). Both lanes read the SAME warehouse, so SQL content
+ * errors fail identically everywhere — retrying them wastes minutes and
+ * muddies the error trail. Default is 'infra': a wasted retry is cheap and
+ * self-corrects (the retry fails with the same message and escalates with
+ * two data points); a skipped recoverable retry is a failed widget.
+ */
+export function classifyWidgetFailure(error: string | null | undefined): WidgetFailureClass {
+  const lower = String(error ?? '').toLowerCase();
+  const contentPatterns = [
+    'sql error', 'syntax error', 'does not exist', 'no function matches',
+    'invalid input syntax', 'permission denied', 'read-only', 'must be a single statement',
+    'ambiguous', 'out of range', 'division by zero', 'numeric value', 'overflow',
+    'column', 'relation', 'invalid operation',
+  ];
+  if (contentPatterns.some(pattern => lower.includes(pattern))) return 'content';
+  return 'infra';
+}
+
+/** The other lane, for the post-run retry pass. */
+export function otherDashboardLane(lane: DashboardLaneId): DashboardLaneId {
+  return lane === 'etl' ? 'sql-mcp' : 'etl';
+}
+
+/** Whether a SPECIFIC lane is usable right now (the retry pass asks about
+ * the non-primary lane; `selectDashboardLane` answers a different question —
+ * which lane to PREFER). `etlRunnerPresent` mirrors the service's own check. */
+export function laneUsable(lane: DashboardLaneId, servers: McpServerSnapshot[], etlRunnerPresent: boolean): boolean {
+  if (lane === 'sql-mcp') {
+    const sql = servers.find(server => server.id === 'sql-context');
+    return !!sql && sql.enabled && sql.state === 'running';
+  }
+  const etl = servers.find(server => server.id === 'a2-analytics');
+  return etlRunnerPresent && !!etl && etl.enabled && etl.configured;
+}
+
 /** Availability switch — sql-context primacy, ETL only when SQL is down AND the ETL connection is usable. */
 export function selectDashboardLane(servers: McpServerSnapshot[]): DashboardLaneId {
   const sql = servers.find(server => server.id === 'sql-context');

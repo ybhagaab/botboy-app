@@ -337,6 +337,54 @@ describe('etl-onboarding', () => {
     expect(manifest.files.filter((f: any) => f.business === 'fatafat')).toHaveLength(1);
   });
 
+  it('preset generation leaves lesson files and manifest entries untouched (separate knowledge lifecycles)', async () => {
+    // An adopted lesson rendered before onboarding runs.
+    fs.mkdirSync(path.join(tmpDir, 'lessons'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'lessons', 'ott.md'), '# Lessons — ott\n\nETLM rejects LIMIT.\n');
+    fs.writeFileSync(path.join(tmpDir, 'manifest.json'), JSON.stringify({
+      files: [{ file: 'lessons/ott.md', business: 'ott', source: 'lesson' }],
+    }));
+    const { call } = fakeDatanet({
+      docs: [doc('1', 'G', 'fatafat a'), doc('2', 'G', 'fatafat b')],
+      sqlById: { '1': FATAFAT_SQL, '2': FATAFAT_SQL },
+    });
+    const service = makeService(call, fakeLlm());
+    service.start({ group: 'G' });
+    const status = await untilDone(service);
+    expect(status.state).toBe('completed');
+
+    // Lesson file + entry survive; the generated preset entry joined them.
+    expect(fs.readFileSync(path.join(tmpDir, 'lessons', 'ott.md'), 'utf8')).toContain('ETLM rejects LIMIT');
+    const manifest = JSON.parse(fs.readFileSync(path.join(tmpDir, 'manifest.json'), 'utf8'));
+    expect(manifest.files.find((f: any) => f.file === 'lessons/ott.md')).toMatchObject({ source: 'lesson' });
+    expect(manifest.files.find((f: any) => f.file === 'presets/fatafat.md')).toBeDefined();
+  });
+
+  it('regenerate with a dead Datanet answer never clobbers the cached corpus (live 2026-09-04)', async () => {
+    // Good cache from a previous successful run.
+    const workDir = path.join(tmpDir, '.onboarding');
+    fs.mkdirSync(path.join(workDir, 'sql'), { recursive: true });
+    fs.writeFileSync(path.join(workDir, 'estate.json'), JSON.stringify({
+      group: 'G',
+      profiles: [{ profileId: '1', description: 'fatafat a', scheduleType: 'DAILY' }],
+    }));
+    fs.writeFileSync(path.join(workDir, 'sql', 'profile-1.txt'), 'SELECT 1;');
+    // Datanet answers searches with nothing (dead VPN/Sentry session).
+    const { call } = fakeDatanet({ docs: [], sqlById: {} });
+    const service = makeService(call, fakeLlm());
+    service.start({ group: 'G', regenerate: true });
+    const status = await untilDone(service);
+
+    expect(status.state).toBe('failed');
+    expect(status.error).toContain('No profiles found');
+    expect(status.nextAction).toContain('mwinit -o -s');
+    expect(status.nextAction).toContain('left untouched');
+    // The cache survived: estate still lists the profile, SQL still cached.
+    const estate = JSON.parse(fs.readFileSync(path.join(workDir, 'estate.json'), 'utf8'));
+    expect(estate.profiles).toHaveLength(1);
+    expect(fs.readFileSync(path.join(workDir, 'sql', 'profile-1.txt'), 'utf8')).toBe('SELECT 1;');
+  });
+
   it('regenerate still refuses to clobber an unowned user file sharing the slug', async () => {
     fs.mkdirSync(path.join(tmpDir, 'presets'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'presets', 'fatafat.md'), '# user file, not in manifest\n');
@@ -428,6 +476,41 @@ describe('etl-onboarding', () => {
     expect(aggregates.conventions.geoFilterIndia).toBe(2);
     expect(aggregates.conventions.playtimeCorruptionGuard).toBe(2);
     expect(aggregates.conventions.streamTypeGuard).toBe(2);
+  });
+
+  it('teaches column type traps: corpus-cast columns land as a code-appended section; mixed-usage columns and the LLM payload stay clean', async () => {
+    // Live incident 2026-09-04: eventts is varchar — production always casts
+    // it before date functions, the generated brief never said so, and two
+    // dashboard widgets fed it raw into DATEADD (Redshift refused).
+    const casterA = [
+      'select cast(dateadd(minute,330,cast(eventts as timestamp)) as date) as report_date',
+      'from public.events_v2 where eventts >= dateadd(minute,-330,current_date-28);',
+    ].join('\n');
+    const casterB = "select eventts::timestamp as ts, date_trunc('day', mixedcol) from public.events_v2;";
+    const mixed = 'select cast(mixedcol as date) from public.events_v2;';
+    const { call } = fakeDatanet({
+      docs: [doc('1', 'G', 'fatafat a'), doc('2', 'G', 'fatafat b'), doc('3', 'G', 'fatafat c')],
+      sqlById: { '1': casterA, '2': casterB, '3': mixed },
+    });
+    const llm = fakeLlm();
+    const service = makeService(call, llm);
+    service.start({ group: 'G' });
+    const status = await untilDone(service);
+    expect(status.state).toBe('completed');
+
+    // The LLM payload must NOT carry the trap table — code appends it verbatim
+    // with exact corpus counts (paraphrase risk is the reason).
+    const synthesis = llm.requests.find(r => r.kind === 'synthesize');
+    expect(synthesis).toBeDefined();
+    expect(synthesis!.input.aggregates.castDisciplines).toBeUndefined();
+
+    const preset = fs.readFileSync(path.join(tmpDir, 'presets', 'fatafat.md'), 'utf8');
+    expect(preset).toContain('## Column type traps (corpus-verified)');
+    // eventts: cast in 2 profiles (both idioms shown), never raw → a trap row.
+    expect(preset).toMatch(/\| eventts \| 2 \| .*CAST\(eventts AS TIMESTAMP\).*eventts::timestamp.* \| 0 \|/);
+    // mixedcol: cast once, used raw once (date_trunc) — mixed usage must NOT
+    // be taught as a discipline.
+    expect(preset).not.toMatch(/\| mixedcol \|/);
   });
 
   it('keeps writing other briefs when one synthesis fails, and reports the error', async () => {

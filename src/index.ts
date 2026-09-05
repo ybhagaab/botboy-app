@@ -11,7 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
 import { createMcpManager } from './core/mcp-manager.js';
-import { createAnalyticsDashboardService } from './core/analytics-dashboard.js';
+import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
 import { createDashboardEtlRunner } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
@@ -276,10 +276,22 @@ async function main() {
   // persisted through this single service for API, agent, and scheduler use.
   // The ETL runner is the A4 fallback lane: used only when sql-context is
   // not running at refresh time (availability switch inside the service).
+  // Run-failure escalation is late-bound: the analytics service exists
+  // before the agent (construction order), so the hook forwards to a holder
+  // that gets its implementation once the agent is up. Events before that
+  // moment (recovered runs finishing during boot) are logged and dropped.
+  let analyticsRunFailureHandler: ((event: AnalyticsRunFailureEvent) => Promise<void>) | null = null;
   const analyticsService = createAnalyticsDashboardService({
     db,
     mcpManager,
     etlRunner: createDashboardEtlRunner({ db, mcpManager }),
+    onRunFailure: async event => {
+      if (!analyticsRunFailureHandler) {
+        console.warn(`[Analytics] run ${event.runId} failed before the escalation agent was ready — not escalated`);
+        return;
+      }
+      await analyticsRunFailureHandler(event);
+    },
   });
   const dashboardPublisher = createDashboardPublisherService({ db, analyticsService });
   const analyticsScheduler = createAnalyticsScheduler({ db, analyticsService });
@@ -431,6 +443,54 @@ async function main() {
     console.log('ℹ️  Legacy classification plane disabled (set PPT_LEGACY=1 to enable)');
   }
   const chatInterface = createChatInterface(db, agent);
+
+  // ── Dashboard run-failure escalation (incident 2026-09-04) ──
+  // When a refresh finalizes with failed widgets after the cross-lane retry
+  // pass, BotBoy investigates in the background (same read-gated loop as
+  // chat; write tools stay attestation-gated) and its findings land in the
+  // chat panel via the agent-message route (version bump included, so open
+  // tabs repaint). One escalation per failed run; it must never throw into
+  // the run queue — maybeEscalateRunFailures already isolates it.
+  analyticsRunFailureHandler = async event => {
+    const failureLines = event.failures
+      .map(failure => `- ${failure.title}: ${failure.error.slice(0, 400)}`)
+      .join('\n');
+    const instruction = [
+      'A dashboard refresh finished with failed widgets and the automatic cross-lane retry did not recover them. Investigate and report.',
+      `Dashboard: "${event.dashboardTitle}" (${event.dashboardId}), run ${event.runId}, trigger ${event.trigger}, primary lane ${event.lane}.`,
+      'Failed widgets:',
+      failureLines,
+      '',
+      'FIRST check the lessons ledger (list_lessons, scopes: the dashboard\'s business if known, "etl-lane", "general") — if a failure matches an ADOPTED lesson, say so explicitly (the lesson was not followed or did not load; propose_lesson on the same rule will bump its recurrence counter, which is the right signal). Then diagnose the likely root cause per widget: SQL/content (name the exact broken expression and propose the corrected SQL — do NOT apply it), infrastructure (say what to restore and whether a plain re-refresh heals it), or auth (name the re-auth step). Check current lane availability if useful.',
+      'If a VERIFIED root cause is a durable, generalizable operating rule that nothing currently teaches (not the loaded preset, not the tooling guide, not an existing lesson), stage it with propose_lesson — the six criteria in the tool description gate what qualifies; transient states (auth, VPN, service slowness) never do. Mention any staged lesson id in your report so the owner can adopt it.',
+      'Keep the report under 20 lines, actionable, no headings.',
+    ].join('\n');
+    const escalationStartedAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const findings = await agent.executeAction(instruction);
+    // Deterministic approval-card markers for any lesson the diagnostic
+    // proposed (the model is also instructed to include them, but the owner
+    // must get the card even if it forgets). Time-window match: proposals
+    // created since this escalation began.
+    const proposedDuring = (db.prepare(
+      "SELECT id FROM lessons WHERE status = 'proposed' AND first_seen_at >= ?",
+    ).all(escalationStartedAt) as Array<{ id: string }>).map(row => `[[lesson:${row.id}]]`);
+    const findingsText = findings.trim();
+    const markerBlock = proposedDuring.filter(marker => !findingsText.includes(marker));
+    const message = [
+      `🔎 **Dashboard refresh diagnostics** — "${event.dashboardTitle}": ${event.failures.length} widget(s) still failed after the cross-lane retry.`,
+      '',
+      findingsText,
+      ...(markerBlock.length ? ['', ...markerBlock] : []),
+      '',
+      `_Automatic escalation from run ${event.runId} (${event.trigger}, ${event.lane} lane)._`,
+    ].join('\n');
+    const response = await fetch(`http://localhost:${PORT}/api/chat/agent-message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    if (!response.ok) throw new Error(`agent-message post failed: HTTP ${response.status}`);
+  };
   // Midway sentinel: when a Midway-backed MCP (Slack, GRASP, AIM customs)
   // fails and the local session cookie is expired, it notifies the owner in
   // chat, opens mwinit in the chat terminal, and restarts the affected
@@ -860,7 +920,10 @@ async function main() {
 
   // ── Express API ──
   const app = express();
-  app.use(express.json());
+  // 16mb: chat image attachments arrive as base64 data URLs (8MB binary cap
+  // in chat-attachments.ts ≈ 11MB base64). Localhost single-owner app — the
+  // parser limit is not a security boundary here; the store enforces its own.
+  app.use(express.json({ limit: '16mb' }));
   const routerDeps = {
     nodeManager,
     chatInterface,

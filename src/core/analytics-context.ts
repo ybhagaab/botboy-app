@@ -30,7 +30,7 @@ export const ANALYTICS_CONTEXT_DIR_KEY = 'analytics_context.dir';
 const ALLOWED_EXTENSIONS = new Set(['.md', '.txt']);
 const DEFAULT_MAX_CHARS = 60_000;
 
-export type AnalyticsContextSource = 'etl-derived' | 'user-dropped';
+export type AnalyticsContextSource = 'etl-derived' | 'user-dropped' | 'lesson';
 
 export interface AnalyticsContextEntry {
   /** Relative name within the directory, e.g. `agent-note.md` or `presets/fatafat.md`. */
@@ -124,7 +124,7 @@ export function listAnalyticsContext(db: Database.Database): { dir: string; file
       files.push({
         name: relative,
         title: titleOf(fullPath),
-        source: tagged?.source ?? (subdir === 'presets' ? 'etl-derived' : 'user-dropped'),
+        source: tagged?.source ?? (subdir === 'presets' ? 'etl-derived' : subdir === 'lessons' ? 'lesson' : 'user-dropped'),
         appliesTo: Array.isArray(tagged?.appliesTo) && tagged.appliesTo.length > 0
           ? tagged.appliesTo.map(String)
           : ['mcp_sql_*', 'mcp_etl_*'],
@@ -138,12 +138,14 @@ export function listAnalyticsContext(db: Database.Database): { dir: string; file
   };
   scan('');
   scan('presets');
+  scan('lessons');
   return { dir, files };
 }
 
 const SOURCE_LABEL: Record<AnalyticsContextSource, string> = {
   'etl-derived': 'generated from your team\'s production ETL profiles (Datanet)',
   'user-dropped': 'user-supplied warehouse/schema knowledge',
+  'lesson': 'BotBoy experiential lessons — owner-adopted operating rules from live incidents',
 };
 
 const ARBITRATION_LINE =
@@ -184,7 +186,9 @@ export function loadAnalyticsContext(
   const manifest = readManifest(dir);
   const tagged = manifest.get(path.normalize(cleaned));
   const source: AnalyticsContextSource = tagged?.source
-    ?? (cleaned.startsWith(`presets${path.sep}`) || cleaned.startsWith('presets/') ? 'etl-derived' : 'user-dropped');
+    ?? (cleaned.startsWith(`presets${path.sep}`) || cleaned.startsWith('presets/') ? 'etl-derived'
+      : cleaned.startsWith(`lessons${path.sep}`) || cleaned.startsWith('lessons/') ? 'lesson'
+        : 'user-dropped');
   const truncated = raw.length > maxChars;
   const body = truncated
     ? `${raw.slice(0, maxChars)}\n\n[Truncated at ${maxChars} of ${raw.length} characters — the full file is at ${fullPath}.]`

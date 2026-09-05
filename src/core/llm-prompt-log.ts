@@ -177,15 +177,33 @@ function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): 
 // Serialized writer chain: keeps directory creation + prune + writes ordered.
 let writeChain: Promise<void> = Promise.resolve();
 
+/**
+ * Image data URLs (chat attachments) would bloat log files by megabytes per
+ * request — elide the base64 payload, keep the shape and size visible.
+ */
+export function elideImageDataUrls<T>(request: T): T {
+  try {
+    const json = JSON.stringify(request);
+    if (!json.includes('data:image/')) return request;
+    return JSON.parse(json.replace(
+      /data:image\/[a-z]+;base64,([A-Za-z0-9+/=]{64})[A-Za-z0-9+/=]*/g,
+      (match, head) => `data:image-elided (${match.length} chars, starts ${head.slice(0, 24)}…)`,
+    ));
+  } catch {
+    return request;
+  }
+}
+
 /** Fire-and-forget: never throws, never blocks the request path. */
-export function logLlmPrompt(entry: LlmPromptLogEntry): void {
+export function logLlmPrompt(rawEntry: LlmPromptLogEntry): void {
   if (!enabled()) return;
+  const entry: LlmPromptLogEntry = { ...rawEntry, request: elideImageDataUrls(rawEntry.request) };
   const now = new Date();
   // Millisecond stamps can collide when pipeline calls fire together — a
   // short random suffix keeps every request its own file.
   const suffix = Math.random().toString(36).slice(2, 6);
   const stem = `${localStamp(now)}_${entry.apiMode}${entry.stream ? '-stream' : ''}_${suffix}`;
-  const bodyChars = JSON.stringify(entry.request).length;
+  const bodyChars = JSON.stringify(rawEntry.request).length;
   const jsonPayload = JSON.stringify(
     {
       ts: now.toISOString(),

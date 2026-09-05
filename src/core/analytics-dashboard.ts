@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { McpManager } from './mcp-types.js';
 import { validateReadOnlySql } from './mcp-policy.js';
-import { selectDashboardLane, type DashboardLaneId } from './analytics-runners.js';
+import { selectDashboardLane, classifyWidgetFailure, otherDashboardLane, laneUsable, type DashboardLaneId } from './analytics-runners.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type {
   AnalyticsDashboard,
@@ -334,6 +334,17 @@ function normalizeWidgets(value: unknown): AnalyticsWidgetInput[] {
   return value.map((widget, position) => normalizeWidget(widget as AnalyticsWidgetInput, position));
 }
 
+/** Payload for the run-failure escalation hook (one event per failed run). */
+export interface AnalyticsRunFailureEvent {
+  runId: string;
+  dashboardId: string;
+  dashboardTitle: string;
+  trigger: string;
+  /** Lane the run executed on (retry pass may have used the other one per widget — errors carry that trail). */
+  lane: DashboardLaneId;
+  failures: Array<{ widgetId: string; title: string; error: string }>;
+}
+
 export function createAnalyticsDashboardService(options: {
   db: Database.Database;
   mcpManager: McpManager;
@@ -342,6 +353,12 @@ export function createAnalyticsDashboardService(options: {
    * present AND sql-context is not running at run start, widget queries run
    * through it — serially (one scratch pair), minutes-scale budgets. */
   etlRunner?: QueryRunner;
+  /** Escalation hook (incident 2026-09-04): called once per run that
+   * finalizes with failed widgets AFTER the cross-lane retry pass. The
+   * composition root wires it to a background agent investigation whose
+   * findings land in BotBoy chat. Fire-and-forget: it must never block or
+   * fail the run queue. */
+  onRunFailure?: (event: AnalyticsRunFailureEvent) => Promise<void>;
 }): AnalyticsDashboardService {
   const db = options.db;
   const mcpManager = options.mcpManager;
@@ -823,7 +840,18 @@ export function createAnalyticsDashboardService(options: {
       { sql },
       { source: 'dashboard', timeoutMs: queryTimeoutMs },
     );
-    if (call.isError) throw new Error(call.text || 'SQL MCP returned an error');
+    if (call.isError) {
+      // A sql-context whose PROCESS is up but whose warehouse connection is
+      // dead answers with a bare "Error: " / "Not connected: " and no detail
+      // (live 2026-09-04: 12 widgets failed with a blank reason on the
+      // dashboard). Substance check, not truthiness: strip the error-prefix
+      // scaffolding and fall back to an actionable message when nothing is
+      // left. Classified infra → the cross-lane retry pass picks these up.
+      const detail = String(call.text ?? '').replace(/^\s*(Error|Not connected)\s*:?\s*/i, '').trim();
+      throw new Error(detail
+        ? call.text
+        : `SQL connector returned no error detail (likely "Not connected" — its warehouse connection is down while the process is up; check VPN and #/connections/sql-context). Original: "${String(call.text ?? '').slice(0, 60)}"`);
+    }
     return { ...parseSqlMcpResult(call.text), lane: 'sql-mcp' };
   }
 
@@ -1198,7 +1226,108 @@ export function createAnalyticsDashboardService(options: {
       finalizeCancelledRun(runId);
       return;
     }
+    await retryFailedWidgetsOnOtherLane(runId, lane);
+    if (ownershipLost || !ownsRun(runId)) return;
     finalizeRun(runId);
+    maybeEscalateRunFailures(runId, lane);
+  }
+
+  /**
+   * Post-run cross-lane retry (incident 2026-09-04): widgets that failed
+   * for INFRA reasons (timeouts, dropped connections, transport errors) get
+   * ONE retry on the other lane when it is usable — both lanes read the
+   * same warehouse, so only infrastructure failures are lane-transferable.
+   * SQL/content failures are skipped: they fail identically everywhere.
+   * Serialized regardless of lane (the retry set is small; the ETL lane
+   * requires it — one scratch pair). Counters need no correction here:
+   * finalizeRun recomputes them from the widget table.
+   */
+  async function retryFailedWidgetsOnOtherLane(runId: string, primaryLane: DashboardLaneId): Promise<void> {
+    const retryLane = otherDashboardLane(primaryLane);
+    let usable = false;
+    try {
+      usable = laneUsable(retryLane, await mcpManager.listServers(), !!etlRunner);
+    } catch {
+      usable = false;
+    }
+    if (!usable) return;
+    const failed = db.prepare(`
+      SELECT rw.*, r.dashboard_id
+      FROM analytics_run_widgets rw
+      JOIN analytics_runs r ON r.id = rw.run_id
+      WHERE rw.run_id = ? AND rw.status = 'failed'
+      ORDER BY rw.position
+    `).all(runId) as any[];
+    const retryable = failed.filter(widget => classifyWidgetFailure(widget.error) === 'infra');
+    if (!retryable.length) return;
+    console.log(`[Analytics] run ${runId}: retrying ${retryable.length} infra-failed widget(s) on the ${retryLane} lane`);
+    for (const widget of retryable) {
+      if (!ownsRun(runId)) return;
+      const heartbeat = new Date().toISOString();
+      db.prepare(`
+        UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
+        WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+      `).run(widget.widget_id, heartbeat, leaseExpiresAt(), runId, workerId, process.pid);
+      try {
+        const result = await executeRunWidget(widget, retryLane);
+        const completedAt = new Date().toISOString();
+        db.transaction(() => {
+          const runWidget = db.prepare(`
+            UPDATE analytics_run_widgets SET status = 'completed', error = NULL, completed_at = ?
+            WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+          `).run(completedAt, runId, widget.widget_id);
+          if (runWidget.changes !== 1) throw new Error('Widget progress changed while its cross-lane retry was running');
+          const updated = db.prepare(`
+            UPDATE analytics_widgets SET result_json = ?, last_error = NULL,
+              last_refreshed_at = ?, updated_at = datetime('now')
+            WHERE id = ? AND dashboard_id = ?
+          `).run(JSON.stringify(result), result.refreshedAt, widget.widget_id, widget.dashboard_id);
+          if (updated.changes !== 1) throw new Error('Widget definition disappeared while its cross-lane retry was running');
+        })();
+        console.log(`[Analytics] run ${runId}: widget "${widget.title}" recovered on the ${retryLane} lane`);
+      } catch (error: any) {
+        if (!ownsRun(runId)) return;
+        const message = `${String(widget.error ?? '').slice(0, 1200)} | ${retryLane} retry also failed: ${String(error?.message ?? error)}`.slice(0, 2000);
+        db.prepare(`
+          UPDATE analytics_run_widgets SET error = ? WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+        `).run(message, runId, widget.widget_id);
+        db.prepare(`
+          UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now') WHERE id = ? AND dashboard_id = ?
+        `).run(message, widget.widget_id, widget.dashboard_id);
+      }
+    }
+    db.prepare(`
+      UPDATE analytics_runs SET current_widget_id = NULL, heartbeat_at = ?, lease_expires_at = ?
+      WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+    `).run(new Date().toISOString(), leaseExpiresAt(), runId, workerId, process.pid);
+  }
+
+  /** One escalation per run that finalized with failures — fire-and-forget. */
+  function maybeEscalateRunFailures(runId: string, lane: DashboardLaneId): void {
+    const escalate = options.onRunFailure;
+    if (!escalate) return;
+    const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
+    if (!run || run.status !== 'failed') return;
+    const dashboard = db.prepare('SELECT title FROM analytics_dashboards WHERE id = ?').get(run.dashboard_id) as any;
+    const failures = (db.prepare(`
+      SELECT widget_id, title, error FROM analytics_run_widgets
+      WHERE run_id = ? AND status = 'failed' ORDER BY position
+    `).all(runId) as any[]).map(row => ({
+      widgetId: String(row.widget_id),
+      title: String(row.title ?? row.widget_id),
+      error: String(row.error ?? 'Unknown widget failure'),
+    }));
+    if (!failures.length) return;
+    void escalate({
+      runId,
+      dashboardId: String(run.dashboard_id),
+      dashboardTitle: String(dashboard?.title ?? run.dashboard_id),
+      trigger: String(run.trigger ?? 'manual'),
+      lane,
+      failures,
+    }).catch(error => {
+      console.warn(`[Analytics] run ${runId}: failure escalation itself failed: ${error?.message ?? error}`);
+    });
   }
 
   async function processQueuedRuns(limit = 1): Promise<number> {

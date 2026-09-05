@@ -2,6 +2,8 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   createInferenceProviderFromEnv,
   defaultInferenceMaxContextTokens,
+  BLESSED_CHAT_MODELS,
+  resolveBlessedModelId,
 } from './inference-provider.js';
 import { createLlmClient, type LlmRequestAuthorizer } from './llm-client.js';
 
@@ -21,12 +23,39 @@ const GATEWAY_ENV = {
   BOTBOY_INFERENCE_OAUTH_SCOPE: 'botboy-llm/invoke',
 } as NodeJS.ProcessEnv;
 
+describe('blessed model choices (chat model picker)', () => {
+  it('offers the gpt-5.6 family only, Terra first as the default', () => {
+    expect(BLESSED_CHAT_MODELS.map(m => m.key)).toEqual(['terra', 'luna', 'sol']);
+    expect(BLESSED_CHAT_MODELS.every(m => m.bareId.startsWith('openai.gpt-5.6-'))).toBe(true);
+    expect(BLESSED_CHAT_MODELS[0].bareId).toBe('openai.gpt-5.6-terra');
+  });
+
+  it('inherits the gateway target prefix from the provider default', () => {
+    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'luna'))
+      .toBe('bedrock-mantle-luna/openai.gpt-5.6-luna');
+    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'sol'))
+      .toBe('bedrock-mantle-luna/openai.gpt-5.6-sol');
+  });
+
+  it('resolves bare on direct bedrock (no prefix on the default)', () => {
+    expect(resolveBlessedModelId('openai.gpt-5.6-terra', 'luna')).toBe('openai.gpt-5.6-luna');
+  });
+
+  it('rejects unknown keys — callers fall back to the default model, arbitrary ids never reach the wire', () => {
+    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'gpt-4')).toBeNull();
+    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', '')).toBeNull();
+    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', undefined)).toBeNull();
+  });
+});
+
 describe('gateway inference provider from env', () => {
-  it('applies the gateway profile: responses mode, openai dialect, prefixed Luna model, 1M context', () => {
+  it('applies the gateway profile: responses mode, openai dialect, prefixed Terra model, 1M context', () => {
     const provider = createInferenceProviderFromEnv({ ...GATEWAY_ENV });
     expect(provider.id).toBe('gateway');
     expect(provider.apiMode).toBe('responses');
-    expect(provider.model).toBe('bedrock-mantle-luna/openai.gpt-5.6-luna');
+    // The bedrock-mantle-luna/ prefix is the gateway TARGET (deployment
+    // name); the model segment selects Terra (default since 2026-09-03).
+    expect(provider.model).toBe('bedrock-mantle-luna/openai.gpt-5.6-terra');
     expect(provider.maxContextTokens).toBe(1_000_000);
     expect(provider.endpoint).toBe('https://gw.test/inference/v1');
   });
@@ -69,7 +98,7 @@ describe('gateway inference provider from env', () => {
       'https://botboy-luna-gateway-tyagefrrnz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference/v1',
     );
     expect(provider.apiMode).toBe('responses');
-    expect(provider.model).toBe('bedrock-mantle-luna/openai.gpt-5.6-luna');
+    expect(provider.model).toBe('bedrock-mantle-luna/openai.gpt-5.6-terra');
     expect(provider.maxContextTokens).toBe(1_000_000);
   });
 
@@ -108,7 +137,7 @@ describe('llm-client 401 invalidate-and-retry', () => {
     return {
       ecs: {
         endpoint: 'https://gw.test/inference/v1',
-        model: 'bedrock-mantle-luna/openai.gpt-5.6-luna',
+        model: 'bedrock-mantle-luna/openai.gpt-5.6-terra',
         apiMode: 'responses' as const,
         dialect: 'openai' as const,
         maxContextTokens: 1_000_000,

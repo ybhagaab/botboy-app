@@ -62,6 +62,11 @@ writing your own variant.
   chains; the LAST statement's SELECT is the result set that downloads.
 - `{RUN_DATE_YYYYMMDD}` is substituted with the run's dataset date — use
   it for reproducible date windows.
+- `LIMIT` is NOT supported by the ETLM wrapper (the run fails with "Limit
+  Clause is not supported on ETLM"). Write top-N lane-portably instead:
+  `SELECT ... FROM (SELECT ..., ROW_NUMBER() OVER (ORDER BY metric DESC)
+  AS rn FROM ...) WHERE rn <= N ORDER BY metric DESC`. This matters for
+  dashboard widgets especially — they may execute on EITHER lane.
 - Non-temp DDL/DML is forbidden. You read and aggregate; you never
   create, update, or drop real tables.
 

@@ -20,6 +20,8 @@ import { getBuiltInMcpProfile } from './mcp-profiles.js';
 
 import { createEtlQueryRunner, createEtlToolCall, type QueryRunner } from './etl-adhoc.js';
 import { listAnalyticsContext, loadAnalyticsContext } from './analytics-context.js';
+import { proposeLesson, listLessons, adoptLesson, retireLesson } from './lessons-ledger.js';
+import { uiInspect, uiConsoleErrors, uiScreenshot } from './self-eyes.js';
 import type { EtlOnboardingService } from './etl-onboarding.js';
 import {
   applyDocxBodyEdits,
@@ -1316,6 +1318,95 @@ export function createToolExecutor(
       const outcome = loadAnalyticsContext(db, String(args.name ?? ''));
       if (!outcome.ok) return `Error: ${outcome.error}`;
       return outcome.content;
+    },
+
+    // ── Lessons ledger (LESSONS_LEDGER_PLAN.md) ──
+    propose_lesson: (args) => {
+      const result = proposeLesson(db, {
+        scope: String(args.scope ?? ''),
+        rule: String(args.rule ?? ''),
+        evidence: String(args.evidence ?? ''),
+        provenance: String(args.provenance ?? 'chat'),
+      });
+      if (!result.ok) return `Error: ${result.error}`;
+      if (result.kind === 'recurrence') {
+        const lesson = result.lesson;
+        return lesson.status === 'adopted'
+          ? `This rule is already ADOPTED (now seen ×${lesson.recurrenceCount}). Recurrence of an adopted lesson means it did not load into the failing work or was not followed — tell the owner; do not re-propose.`
+          : `This rule is already staged (now seen ×${lesson.recurrenceCount}) and still awaits the owner's approval. Re-surface its approval card by including this token EXACTLY, on its own line, in your reply: [[lesson:${lesson.id}]] — never quote the raw lesson id in prose.`;
+      }
+      return `Lesson staged for the owner's approval — it will NOT load into briefings until adopted. Show the owner the approval card by including this token EXACTLY, on its own line, in your reply: [[lesson:${result.lesson.id}]] — the card carries the rule and Adopt/Dismiss buttons; never quote the raw lesson id in prose.`;
+    },
+
+    list_lessons: (args) => {
+      const status = ['proposed', 'adopted', 'retired'].includes(String(args.status ?? '')) ? String(args.status) as 'proposed' | 'adopted' | 'retired' : undefined;
+      const scope = String(args.scope ?? '').trim() || undefined;
+      const lessons = listLessons(db, { scope, status });
+      if (!lessons.length) return JSON.stringify({ lessons: [], note: 'No matching lessons in the ledger.' });
+      return JSON.stringify({
+        lessons: lessons.map(lesson => ({
+          id: lesson.id,
+          scope: lesson.scope,
+          status: lesson.status,
+          rule: lesson.rule,
+          evidence: lesson.evidence,
+          seen: lesson.recurrenceCount,
+          firstSeen: lesson.firstSeenAt,
+          ...(lesson.adoptedAt ? { adopted: lesson.adoptedAt } : {}),
+        })),
+      }, null, 1);
+    },
+
+    adopt_lesson: (args) => {
+      const intentError = requireOwnerRequested(args, 'adopt this lesson into BotBoy\'s operating knowledge');
+      if (intentError) return intentError;
+      try {
+        const lesson = adoptLesson(db, String(args.id ?? ''));
+        return `Lesson ${lesson.id} ADOPTED for scope "${lesson.scope}" — rendered into the knowledge directory; future ${lesson.scope} data briefings will carry it.`;
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
+    },
+
+    retire_lesson: (args) => {
+      const intentError = requireOwnerRequested(args, 'retire this lesson from BotBoy\'s operating knowledge');
+      if (intentError) return intentError;
+      try {
+        const lesson = retireLesson(db, String(args.id ?? ''));
+        return `Lesson ${lesson.id} RETIRED (scope "${lesson.scope}") — removed from rendered knowledge.`;
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
+    },
+
+    // ── Self-eyes (SELF_EYES_PLAN.md): observe BotBoy's own rendered UI ──
+    ui_inspect: async (args) => {
+      try {
+        const result = await uiInspect(args.route, String(args.selector ?? ''), args.settleMs ? Number(args.settleMs) : undefined);
+        return JSON.stringify(result, null, 1);
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
+    },
+
+    ui_console_errors: async (args) => {
+      try {
+        const result = await uiConsoleErrors(args.route, args.settleMs ? Number(args.settleMs) : undefined);
+        return result.lines.length
+          ? JSON.stringify(result, null, 1)
+          : JSON.stringify({ route: result.route, lines: [], note: 'No console errors or warnings during a fresh load of this route.' });
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
+    },
+
+    ui_screenshot: async (args) => {
+      try {
+        const result = await uiScreenshot(args.route, args.settleMs ? Number(args.settleMs) : undefined);
+        return `Screenshot of ${result.route} saved to ${result.file} (${Math.round(result.bytes / 1024)} KB). Tell the owner the path — you cannot view the pixels yourself yet; for your own verification prefer ui_inspect geometry.`;
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
     },
     mcp_etl_generate_presets: (args) => {
       if (!etlOnboarding) return 'Error: ETL onboarding service unavailable';

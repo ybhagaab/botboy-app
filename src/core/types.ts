@@ -110,6 +110,8 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   actionsPerformed?: ChatAction[];
+  /** Image attachments on user messages: id + servable URL for thumbnails. */
+  attachments?: { id: string; url: string }[];
   createdAt: Date;
 }
 

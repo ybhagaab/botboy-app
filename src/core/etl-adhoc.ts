@@ -66,7 +66,19 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
       }
     } catch (error: any) {
       const message = String(error?.message ?? error);
-      if (!isSentryAuthShapedError(message)) throw error;
+      if (!isSentryAuthShapedError(message)) {
+        // Structured-errors invariant: no raw transport error may leave the
+        // managed path (live 2026-09-04: three dashboard widgets surfaced
+        // bare "MCP error -32001: Request timed out" — mid-run network loss
+        // with no next action named).
+        if (/timed?\s?out|-32001/i.test(message)) {
+          return {
+            isError: true,
+            text: `Error: the Datanet ETL call ${toolName} timed out after ${Math.round(ETL_TOOL_TIMEOUT_MS / 60_000)} min — the transport, not the query. Likely the corp network/VPN dropped or Datanet is unresponsive. Check connectivity, then retry ONCE. If a run was already submitted, poll it (mcp_etl_run_status / mcp_etl_latest_run) instead of resubmitting — Datanet collapses duplicate queued runs.`,
+          };
+        }
+        throw error;
+      }
       const prime = await primeDatanetSentrySession();
       if (!prime.ok) {
         return { isError: true, text: `Error: the Datanet ETL connection needs re-authentication and the silent Kerberos re-prime failed (${prime.reason}). Tell the owner to run \`mwinit -o -s\` (or use Connections → Datanet ETL → Refresh Midway + Sentry), then retry this tool.` };

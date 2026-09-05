@@ -20,10 +20,25 @@ export function createChatInterface(db: Database.Database, agent: AgentOrchestra
     'SELECT * FROM (SELECT * FROM chat_messages ORDER BY created_at DESC LIMIT ?) ORDER BY created_at ASC'
   );
 
+  // Image attachments (2026-09-05): attachments_json holds an id array; the
+  // UI renders thumbnails from the GET route. Parse failures degrade to a
+  // text-only message rather than breaking the whole history payload.
+  function toAttachments(json: string | null): { id: string; url: string }[] | undefined {
+    if (!json) return undefined;
+    try {
+      const ids = JSON.parse(json);
+      if (!Array.isArray(ids) || ids.length === 0) return undefined;
+      return ids.map((id: unknown) => ({ id: String(id), url: `/api/chat/attachments/${String(id)}` }));
+    } catch {
+      return undefined;
+    }
+  }
+
   function toMessage(row: any): ChatMessage {
     return {
       id: row.id, role: row.role, content: row.content,
       actionsPerformed: row.actions_performed ? JSON.parse(row.actions_performed) : undefined,
+      attachments: toAttachments(row.attachments_json ?? null),
       createdAt: new Date(row.created_at),
     };
   }

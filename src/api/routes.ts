@@ -24,6 +24,7 @@ import { createGraspSyncRouter } from './routers/grasp-sync.js';
 import { createSharePointSyncRouter } from './routers/sharepoint-sync.js';
 import { createMcpRouter } from './routers/mcp.js';
 import { createAnalyticsRouter } from './routers/analytics.js';
+import { createLessonsRouter } from './routers/lessons.js';
 import { createWorkspaceRouter } from './routers/workspace.js';
 import { createProductDocumentsRouter } from './routers/product-documents.js';
 import { createDocumentsRouter } from './routers/documents.js';
@@ -50,6 +51,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createSharePointSyncRouter(deps));
   router.use(createMcpRouter(deps));
   router.use(createAnalyticsRouter(deps));
+  router.use(createLessonsRouter(deps));
   router.use(createWorkspaceRouter(deps));
   router.use(createProductDocumentsRouter(deps));
   // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from

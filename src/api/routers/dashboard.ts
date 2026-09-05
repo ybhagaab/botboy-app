@@ -8,12 +8,50 @@
 
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import { readdirSync, statSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import type Database from 'better-sqlite3';
 import { getToolchainSnapshot, initToolchain, loadPersistedToolchain } from '../../core/toolchain.js';
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
 
 /** Identity of this server process — new on every restart. */
 const BOOT_ID = randomUUID();
+
+/** The directory express.static serves the SPA from (dist/ui at runtime, src/ui under tsx). */
+const UI_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../ui');
+
+/**
+ * UI-assets version stamp: file count + max mtime across the served UI
+ * directory. bootId only changes on server RESTART, but BotBoy edits and
+ * rebuilds UI files while the server keeps running — express.static serves
+ * the new files immediately, yet an open SPA tab keeps executing the old
+ * JavaScript until it reloads. Incident 2026-09-03: a correct chart fix
+ * produced two phantom "verification failed" rounds because the verifying
+ * tab never re-fetched. This stamp lets pollVersion detect new assets
+ * without a restart. Computed per request: ~30 statSync calls, sub-ms.
+ */
+export function computeUiAssetsVersion(dir: string = UI_DIR): string {
+  try {
+    let count = 0;
+    let maxMtime = 0;
+    const walk = (d: string): void => {
+      for (const entry of readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, entry.name);
+        if (entry.isDirectory()) walk(p);
+        else if (entry.isFile()) {
+          count++;
+          const m = statSync(p).mtimeMs;
+          if (m > maxMtime) maxMtime = m;
+        }
+      }
+    };
+    walk(dir);
+    return `${count}:${Math.round(maxMtime)}`;
+  } catch {
+    return '0';
+  }
+}
 
 export interface DashboardState {
   bump(): number;
@@ -97,6 +135,7 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
       version: currentVersion(),
       analyticsVersion: currentAnalyticsVersion(),
       bootId: BOOT_ID,
+      uiVersion: computeUiAssetsVersion(),
       terminal: terminalSession ? { id: terminalSession.id, status: terminalSession.status } : null,
     });
   });

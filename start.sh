@@ -181,7 +181,7 @@ case "$BOTBOY_INFERENCE_PROVIDER" in
     export BOTBOY_INFERENCE_API_MODE
     case "$BOTBOY_INFERENCE_API_MODE" in
       responses)
-        export BOTBOY_INFERENCE_MODEL="${BOTBOY_INFERENCE_MODEL:-${VLLM_MODEL:-openai.gpt-5.6-luna}}"
+        export BOTBOY_INFERENCE_MODEL="${BOTBOY_INFERENCE_MODEL:-${VLLM_MODEL:-openai.gpt-5.6-terra}}"
         export BOTBOY_INFERENCE_DIALECT="${BOTBOY_INFERENCE_DIALECT:-${VLLM_DIALECT:-openai}}"
         export BOTBOY_INFERENCE_REASONING_EFFORT="${BOTBOY_INFERENCE_REASONING_EFFORT:-${VLLM_REASONING_EFFORT:-low}}"
         export BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS="${BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS:-${VLLM_MAX_CONTEXT_TOKENS:-1000000}}"
@@ -212,7 +212,9 @@ case "$BOTBOY_INFERENCE_PROVIDER" in
     # Model ids carry the gateway target prefix.
     export BOTBOY_INFERENCE_ENDPOINT="${BOTBOY_INFERENCE_ENDPOINT:-https://botboy-luna-gateway-tyagefrrnz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/inference/v1}"
     export BOTBOY_INFERENCE_API_MODE="${BOTBOY_INFERENCE_API_MODE:-responses}"
-    export BOTBOY_INFERENCE_MODEL="${BOTBOY_INFERENCE_MODEL:-bedrock-mantle-luna/openai.gpt-5.6-luna}"
+    # Model default is Terra; the bedrock-mantle-luna/ prefix is the gateway
+    # TARGET name (fixed deployment id), not the model.
+    export BOTBOY_INFERENCE_MODEL="${BOTBOY_INFERENCE_MODEL:-bedrock-mantle-luna/openai.gpt-5.6-terra}"
     export BOTBOY_INFERENCE_DIALECT="${BOTBOY_INFERENCE_DIALECT:-openai}"
     export BOTBOY_INFERENCE_REASONING_EFFORT="${BOTBOY_INFERENCE_REASONING_EFFORT:-low}"
     export BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS="${BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS:-1000000}"

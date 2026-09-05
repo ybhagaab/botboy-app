@@ -462,6 +462,25 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_dashboard_publications_dashboard
       ON dashboard_publications(dashboard_id, created_at);
 
+    -- Lessons ledger (LESSONS_LEDGER_PLAN.md): BotBoy's experiential
+    -- operating rules — proposed by agents, adopted by the owner, rendered
+    -- into the analytics knowledge dir as retrieved knowledge. The table is
+    -- the ledger of record; lessons/<scope>.md files are projections.
+    CREATE TABLE IF NOT EXISTS lessons (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      rule TEXT NOT NULL,
+      evidence TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','adopted','retired')),
+      recurrence_count INTEGER NOT NULL DEFAULT 1,
+      provenance TEXT NOT NULL DEFAULT '',
+      first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      adopted_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_lessons_scope_status ON lessons(scope, status);
+
     CREATE TABLE IF NOT EXISTS dashboard_share_requests (
       id TEXT PRIMARY KEY,
       dashboard_id TEXT NOT NULL REFERENCES analytics_dashboards(id) ON DELETE CASCADE,
@@ -551,6 +570,13 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
       db.exec('DROP TABLE analytics_runs_legacy_queue;');
     })();
   }
+
+  // Chat image attachments (2026-09-05): refs to files in the chat
+  // attachments store, JSON array of {id, mime}. NULL = text-only message.
+  const chatMessageColumns = new Set(
+    (db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>).map(column => column.name),
+  );
+  if (!chatMessageColumns.has('attachments_json')) db.exec('ALTER TABLE chat_messages ADD COLUMN attachments_json TEXT;');
 
   const migratedRunColumns = new Set(
     (db.prepare('PRAGMA table_info(analytics_runs)').all() as Array<{ name: string }>).map(column => column.name),

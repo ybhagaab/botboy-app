@@ -164,13 +164,35 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
   }
 
   // ── phase: enumerate the own-group estate ─────────────────────────────────
-  async function enumerateEstate(group: string): Promise<EstateProfile[]> {
+  // `fresh` (full regenerate): SKIP the cache read, but the cached estate is
+  // only OVERWRITTEN by a non-empty enumeration — an empty result (dead
+  // Datanet/Sentry auth answers searches with empty/307 bodies) must never
+  // destroy a good corpus cache (live 2026-09-04: a regenerate during VPN
+  // loss clobbered the 424-profile cache with a 0-profile estate).
+  async function enumerateEstate(group: string, fresh = false): Promise<EstateProfile[]> {
     const estatePath = path.join(workDir(), 'estate.json');
+    if (fresh) {
+      const profiles = await enumerateEstateFromDatanet(group);
+      if (profiles.length > 0) {
+        fs.mkdirSync(workDir(), { recursive: true });
+        fs.writeFileSync(estatePath, JSON.stringify({ group, enumeratedAt: new Date(now()).toISOString(), profiles }, null, 1));
+      }
+      return profiles;
+    }
     try {
       const cached = JSON.parse(fs.readFileSync(estatePath, 'utf8')) as { group: string; profiles: EstateProfile[] };
       if (cached.group === group && Array.isArray(cached.profiles) && cached.profiles.length > 0) return cached.profiles;
     } catch { /* no cache — enumerate */ }
 
+    const profiles = await enumerateEstateFromDatanet(group);
+    if (profiles.length > 0) {
+      fs.mkdirSync(workDir(), { recursive: true });
+      fs.writeFileSync(estatePath, JSON.stringify({ group, enumeratedAt: new Date(now()).toISOString(), profiles }, null, 1));
+    }
+    return profiles;
+  }
+
+  async function enumerateEstateFromDatanet(group: string): Promise<EstateProfile[]> {
     const byProfile = new Map<string, EstateProfile>();
     let start = 0;
     let found = Number.POSITIVE_INFINITY;
@@ -196,10 +218,7 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
       }
       start += pageSize;
     }
-    const profiles = [...byProfile.values()];
-    fs.mkdirSync(workDir(), { recursive: true });
-    fs.writeFileSync(estatePath, JSON.stringify({ group, enumeratedAt: new Date(now()).toISOString(), profiles }, null, 1));
-    return profiles;
+    return [...byProfile.values()];
   }
 
   // ── phase: fetch every profile's SQL (disk-cached, resumable) ─────────────
@@ -309,6 +328,17 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
     const staging = new Map<string, number>();
     const events = new Map<string, number>();
     const eventFamilies = new Map<string, number>();
+    // 4. Column cast disciplines (live dashboard incident 2026-09-04): columns
+    //    like eventts are VARCHAR in the warehouse — production SQL ALWAYS
+    //    casts them before date functions (comparisons implicit-cast, function
+    //    arguments do not: Redshift "function pg_catalog.date_add(... character
+    //    varying) does not exist"). Count cast idioms and raw function-position
+    //    uses per column; a column the corpus casts but NEVER passes raw is a
+    //    type trap the brief must teach.
+    const castIdioms = new Map<string, Map<string, number>>(); // column → idiom → profiles
+    const castedProfiles = new Map<string, number>();          // column → profiles casting it
+    const rawFunctionUses = new Map<string, number>();         // column → profiles passing it raw to a date fn
+    const NON_COLUMNS = new Set(['current_date', 'current_timestamp', 'sysdate', 'getdate', 'trunc', 'interval']);
     let noDeps = 0; let etlm = 0; let runDate = 0; let tempTables = 0;
     let geoFilter = 0; let playtimeGuard = 0; let typeGuard = 0;
     for (const sql of stripped) {
@@ -337,6 +367,36 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
         for (const member of members) noteEvent(member);
         if (members.length > 1) count(eventFamilies, [...new Set(members)].sort().join(' + '));
       }
+      // Cast idioms and raw function-position uses, deduped per profile.
+      const profileCastIdioms = new Map<string, Set<string>>(); // column → idioms in THIS profile
+      const noteCast = (column: string, idiom: string) => {
+        const col = column.toLowerCase();
+        if (NON_COLUMNS.has(col)) return;
+        if (!profileCastIdioms.has(col)) profileCastIdioms.set(col, new Set());
+        profileCastIdioms.get(col)!.add(idiom);
+      };
+      for (const match of sql.matchAll(/\bcast\s*\(\s*([a-z_][\w]*)\s+as\s+(timestamp|datetime|date)\b/gi)) {
+        noteCast(match[1], `CAST(${match[1].toLowerCase()} AS ${match[2].toUpperCase()})`);
+      }
+      for (const match of sql.matchAll(/\b([a-z_][\w]*)\s*::\s*(timestamp|datetime|date)\b/gi)) {
+        noteCast(match[1], `${match[1].toLowerCase()}::${match[2].toLowerCase()}`);
+      }
+      for (const [col, idioms] of profileCastIdioms) {
+        count(castedProfiles, col);
+        if (!castIdioms.has(col)) castIdioms.set(col, new Map());
+        for (const idiom of idioms) count(castIdioms.get(col)!, idiom);
+      }
+      const profileRawUses = new Set<string>();
+      const noteRaw = (column: string) => {
+        const col = column.toLowerCase();
+        if (!NON_COLUMNS.has(col)) profileRawUses.add(col);
+      };
+      for (const match of sql.matchAll(/\b(?:dateadd|date_add)\s*\(\s*'?\w+'?\s*,\s*[^,()]+,\s*([a-z_][\w]*)\s*\)/gi)) noteRaw(match[1]);
+      for (const match of sql.matchAll(/\bdate_trunc\s*\(\s*'[^']+'\s*,\s*([a-z_][\w]*)\s*\)/gi)) noteRaw(match[1]);
+      for (const match of sql.matchAll(/\bdatediff\s*\(\s*'?\w+'?\s*,\s*([a-z_][\w]*)\s*,/gi)) noteRaw(match[1]);
+      for (const match of sql.matchAll(/\bdatediff\s*\(\s*'?\w+'?\s*,\s*[^,()]+,\s*([a-z_][\w]*)\s*\)/gi)) noteRaw(match[1]);
+      for (const match of sql.matchAll(/\bextract\s*\(\s*\w+\s+from\s+([a-z_][\w]*)\s*\)/gi)) noteRaw(match[1]);
+      for (const col of profileRawUses) count(rawFunctionUses, col);
       if (/\/\*\s*no dependencies/i.test(sql)) noDeps += 1;
       if (/\/\*\+?\s*etlm/i.test(sql)) etlm += 1;
       if (/\{RUN_DATE_YYYYMMDD\}/.test(sql)) runDate += 1;
@@ -347,12 +407,27 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
     }
     const top = (map: Map<string, number>, n: number) =>
       [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([name, uses]) => ({ name, profiles: uses }));
+    // A trap is emitted only on an unambiguous corpus discipline: ≥2 profiles
+    // cast the column AND none passes it raw to a date function. Worst case of
+    // a false positive is a redundant cast — harmless; a false negative is a
+    // failed dashboard widget.
+    const castDisciplines = [...castedProfiles.entries()]
+      .filter(([col, casted]) => casted >= 2 && !rawFunctionUses.has(col))
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([col, casted]) => ({
+        column: col,
+        castedProfiles: casted,
+        idioms: top(castIdioms.get(col) ?? new Map(), 4),
+        rawFunctionUses: 0,
+      }));
     return {
       profilesWithSql: clusterSql.length,
       topTables: top(tables, 15),
       stagingIdioms: top(staging, 8),
       topEvents: top(events, 20),
       eventFamilies: top(eventFamilies, 6),
+      castDisciplines,
       conventions: {
         noDependenciesHeader: noDeps,
         etlmDependencyHeader: etlm,
@@ -376,7 +451,7 @@ Write markdown with EXACTLY these sections, in order:
 5. "## Conventions and gotchas" — dependency headers, run-date templating, staging style, and the measurement regimes (geo filter, playtime corruption guards, stream-type guards) with their convention counts: when a large share of the corpus applies a filter, say plainly that omitting it changes results and it should be treated as required.
 6. "## What this brief cannot know" — honest limits: usage-derived columns, thin evidence, where to cross-check.
 
-Rules: attach the given corpus counts inline to claims; use confidence tags [STRONG] (many profiles agree) / [SINGLE-SOURCE] / [UNVERIFIED]; NEVER invent tables, columns, or events not present in the input; do NOT write a profile-inventory section (it is appended by code). Keep it under 200 lines.`;
+Rules: attach the given corpus counts inline to claims; use confidence tags [STRONG] (many profiles agree) / [SINGLE-SOURCE] / [UNVERIFIED]; NEVER invent tables, columns, or events not present in the input; do NOT write a profile-inventory section and do NOT write column-cast/type-trap guidance (both are appended by code with exact corpus counts). Keep it under 200 lines.`;
 
   async function synthesize(
     business: string,
@@ -387,7 +462,10 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
     const clusterSql = clusterProfiles
       .map(profile => sqlByProfile.get(profile.profileId) ?? '')
       .filter(sql => sql.trim().length > 0);
-    const aggregates = aggregate(clusterSql);
+    const { castDisciplines, ...aggregates } = aggregate(clusterSql) as {
+      castDisciplines: Array<{ column: string; castedProfiles: number; idioms: Array<{ name: string; profiles: number }>; rawFunctionUses: number }>;
+      [key: string]: unknown;
+    };
     const samples = clusterProfiles
       .filter(profile => (sqlByProfile.get(profile.profileId) ?? '').trim().length > 0)
       .sort((a, b) => {
@@ -436,6 +514,25 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
           : 'reference: read its SQL to ground new queries; resubmit its job for fresh data';
         return `| ${profile.profileId} | ${profile.scheduleType} | ${profile.description.slice(0, 80).replace(/\|/g, '/') || '(no description)'} | ${verdict} |`;
       });
+    // Column type traps are APPENDED BY CODE, like the inventory — corpus
+    // counts are facts. Emitted only when the corpus shows an unambiguous
+    // discipline (cast always, raw never). Live incident 2026-09-04: two
+    // dashboard widgets fed varchar eventts straight into DATEADD; 31 corpus
+    // profiles cast it, zero use it raw — the brief just never said so.
+    const typeTraps = castDisciplines.length ? [
+      '',
+      '## Column type traps (corpus-verified)',
+      '',
+      'These columns are ALWAYS explicitly cast before date/time functions in this corpus — never passed raw. Treat them as VARCHAR storage: comparisons implicit-cast, but function arguments do NOT (Redshift fails with `function pg_catalog.date_add(... character varying) does not exist`).',
+      '',
+      '| Column | Profiles casting it | Idioms seen (profiles) | Raw function-position uses |',
+      '|---|---|---|---|',
+      ...castDisciplines.map(discipline =>
+        `| ${discipline.column} | ${discipline.castedProfiles} | ${discipline.idioms.map(idiom => `\`${idiom.name}\` (${idiom.profiles})`).join(', ')} | ${discipline.rawFunctionUses} |`),
+      '',
+      'Rule: wrap these columns in `CAST(<column> AS TIMESTAMP)` (or `::timestamp`) inside DATEADD/DATE_ADD, DATE_TRUNC, DATEDIFF, and EXTRACT.',
+      '',
+    ].join('\n') : '';
     const inventory = [
       '',
       '## Profile inventory & reuse ladder',
@@ -449,7 +546,7 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
       ...inventoryRows,
       '',
     ].join('\n');
-    return `${body}\n${inventory}`;
+    return `${body}\n${typeTraps}${inventory}`;
   }
 
   // ── manifest merge (never touches user-dropped entries) ───────────────────
@@ -488,8 +585,11 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
   async function run(optionsIn: { group?: string; regenerate?: boolean; businesses?: string[] }): Promise<void> {
     const regenerate = optionsIn.regenerate === true;
     try {
-      if (regenerate) fs.rmSync(workDir(), { recursive: true, force: true });
-
+      // NOTE (2026-09-04): regenerate used to rm-rf the whole work dir HERE,
+      // before knowing Datanet was reachable — a regenerate during VPN loss
+      // clobbered the 424-profile corpus cache with a 0-profile estate.
+      // Fresh-ness now flows through enumerateEstate(group, fresh): the cache
+      // is only invalidated AFTER a successful fresh enumeration.
       update({ phase: 'discover' });
       const group = await discoverGroup(optionsIn.group);
       if (typeof group !== 'string') {
@@ -498,15 +598,21 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
       }
       update({ group, phase: 'enumerate' });
 
-      const profiles = await enumerateEstate(group);
+      const profiles = await enumerateEstate(group, regenerate);
       if (profiles.length === 0) {
         update({
           state: 'failed',
           error: `No profiles found for group "${group}".`,
-          nextAction: 'Confirm the group name on a DataCentral job page and start again with the group parameter.',
+          nextAction: 'If this group normally has profiles, the search likely answered through a dead auth/network session (VPN, Midway, Sentry) — restore connectivity (`mwinit -o -s`), then retry; any cached corpus was left untouched. Otherwise confirm the group name on a DataCentral job page and start again with the group parameter.',
           finishedAt: new Date(now()).toISOString(),
         });
         return;
+      }
+      if (regenerate) {
+        // Fresh estate in hand — NOW invalidate the derived SQL cache so
+        // fetchSql re-fetches current profile SQL (clusters are recomputed
+        // every run regardless).
+        fs.rmSync(sqlDir(), { recursive: true, force: true });
       }
       update({ phase: 'fetch', progress: { profilesTotal: profiles.length, profilesFetched: 0 } });
       const sqlByProfile = await fetchSql(profiles);

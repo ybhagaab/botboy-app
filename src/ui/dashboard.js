@@ -104,6 +104,7 @@ const state = {
   lastVersion: null,
   lastAnalyticsVersion: null,
   lastBootId: null,
+  lastUiVersion: null,
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -346,6 +347,16 @@ async function loadCore({ quiet = false } = {}) {
   // asynchronously (project detail, documents), so the page may not have
   // enough height yet — retry until the target offset is reachable (or give
   // up after 8s / the moment the owner scrolls themselves).
+  // Restore any chat draft stashed by the pre-reload handler in pollVersion —
+  // an auto-reload must never eat a half-typed message.
+  try {
+    const savedDraft = sessionStorage.getItem('botboy-reload-draft');
+    if (savedDraft !== null) {
+      sessionStorage.removeItem('botboy-reload-draft');
+      const input = document.getElementById('chatInput');
+      if (input && !input.value) input.value = savedDraft;
+    }
+  } catch {}
   let savedScroll = null;
   try { savedScroll = sessionStorage.getItem('botboy-reload-scroll'); } catch {}
   if (savedScroll !== null) {
@@ -3326,6 +3337,25 @@ function destroyAnalyticsVisualizations() {
   state.analytics.visualizationViews.clear();
 }
 
+function analyticsVisualizationPlotWidth(container) {
+  const measured = Math.floor(container.getBoundingClientRect().width || container.parentElement?.getBoundingClientRect().width || 0);
+  // Vega width is the inner plotting width; reserve room for axes while keeping
+  // composed views readable even when the assistant panel narrows the page.
+  return Math.max(720, measured - 96);
+}
+
+function materializeAnalyticsContainerWidths(value, plotWidth) {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    value.forEach(entry => materializeAnalyticsContainerWidths(entry, plotWidth));
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'width' && entry === 'container') value[key] = plotWidth;
+    else materializeAnalyticsContainerWidths(entry, plotWidth);
+  }
+}
+
 async function hydrateAnalyticsVisualizations(dashboardId, expectedEpoch) {
   if (expectedEpoch !== analyticsVisualizationEpoch || state.route.view !== 'analytics-dashboard') return;
   const dashboard = state.analytics.details.get(dashboardId);
@@ -3344,9 +3374,13 @@ async function hydrateAnalyticsVisualizations(dashboardId, expectedEpoch) {
       spec.config = analyticsVegaConfig(spec.config);
       if ((spec.mark || spec.layer) && spec.width == null) spec.width = 'container';
       if ((spec.mark || spec.layer) && spec.height == null) spec.height = 320;
-      if ((spec.mark || spec.layer) && spec.autosize == null) {
-        spec.autosize = { type: 'fit', contains: 'padding', resize: true };
-      }
+      const hasVegaView = spec.mark || spec.layer || spec.concat || spec.vconcat || spec.hconcat || spec.repeat || spec.facet;
+      const plotWidth = analyticsVisualizationPlotWidth(container);
+      // Container sizing inside concat/facet specs can resolve to the Vega 300px
+      // fallback before the embed wrapper is laid out. Compile from the real
+      // card width so the plot itself is large, not a stretched tiny SVG.
+      materializeAnalyticsContainerWidths(spec, plotWidth);
+      if (hasVegaView) spec.autosize = { type: 'pad', contains: 'padding', resize: false };
       container.replaceChildren();
       const embedded = await window.vegaEmbed(container, spec, {
         actions: false,
@@ -3401,11 +3435,11 @@ function renderAnalyticsList() {
     void loadAnalyticsDashboards();
     return loadingView();
   }
-  const actions = `<button class="button primary" type="button" data-action="analytics-ask-create" data-chat-mode="analytics_dashboard" data-chat-intent="create" data-prompt="Help me build an analytical dashboard from my connected schema knowledge. Inspect the available data first, recommend a useful schema-grounded dashboard, and ask only one targeted business question if a decision is genuinely ambiguous.">${icon('plus')} Build with BotBoy</button>`;
+  const actions = `<button class="button primary" type="button" data-action="analytics-ask-create" data-chat-mode="analytics_dashboard" data-chat-intent="create" data-prompt="Help me build an analytical dashboard from my available business and schema knowledge. Inspect the available data first, recommend a useful schema-grounded dashboard, and ask only one targeted business question if a decision is genuinely ambiguous.">${icon('plus')} Build with BotBoy</button>`;
   const head = pageHead('Analytics', 'Dashboards', 'Durable, locally canonical views refreshed through BotBoy’s managed read-only SQL connection.', actions);
   if (state.analytics.error && !state.analytics.items) return `${head}${errorView(state.analytics.error)}`;
   const dashboards = state.analytics.items || [];
-  return `${head}<section class="analytics-list-grid">${dashboards.map(dashboard => `<a class="card analytics-dashboard-card" href="#/dashboards/${encodeURIComponent(dashboard.id)}"><div class="analytics-card-top"><span class="source-icon">${icon('activity', 19)}</span><span class="pill ${analyticsStatusTone(dashboard.status)}"><span class="status-dot ${analyticsStatusTone(dashboard.status)}"></span>${esc(dashboard.status)}</span></div><h2>${esc(dashboard.title)}</h2><p>${esc(dashboard.description || 'An analytical dashboard managed by BotBoy.')}</p><div class="analytics-card-stats"><span><strong>${number(dashboard.widgetCount)}</strong> widgets</span><span><strong>${number(dashboard.projectCount)}</strong> projects</span></div><div class="analytics-card-foot"><span>${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span>${icon('arrow-right', 14)}</div></a>`).join('') || `<article class="card empty-state analytics-list-empty"><span class="source-icon">${icon('activity', 19)}</span><h3>No dashboards yet</h3><p>Ask BotBoy to turn a business question into a governed dashboard with metrics, tables, and charts.</p><button class="button primary" type="button" data-action="analytics-ask-create" data-chat-mode="analytics_dashboard" data-chat-intent="create" data-prompt="Help me build my first analytical dashboard from my connected schema knowledge. Inspect the available data first, recommend a useful schema-grounded dashboard, and ask only one targeted business question if a decision is genuinely ambiguous.">${icon('sparkles')} Design a dashboard</button></article>`}</section>`;
+  return `${head}<section class="analytics-list-grid">${dashboards.map(dashboard => `<a class="card analytics-dashboard-card" href="#/dashboards/${encodeURIComponent(dashboard.id)}"><div class="analytics-card-top"><span class="source-icon">${icon('activity', 19)}</span><span class="pill ${analyticsStatusTone(dashboard.status)}"><span class="status-dot ${analyticsStatusTone(dashboard.status)}"></span>${esc(dashboard.status)}</span></div><h2>${esc(dashboard.title)}</h2><p>${esc(dashboard.description || 'An analytical dashboard managed by BotBoy.')}</p><div class="analytics-card-stats"><span><strong>${number(dashboard.widgetCount)}</strong> widgets</span><span><strong>${number(dashboard.projectCount)}</strong> projects</span></div><div class="analytics-card-foot"><span>${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span>${icon('arrow-right', 14)}</div></a>`).join('') || `<article class="card empty-state analytics-list-empty"><span class="source-icon">${icon('activity', 19)}</span><h3>No dashboards yet</h3><p>Ask BotBoy to turn a business question into a governed dashboard with metrics, tables, and charts.</p><button class="button primary" type="button" data-action="analytics-ask-create" data-chat-mode="analytics_dashboard" data-chat-intent="create" data-prompt="Help me build my first analytical dashboard from my available business and schema knowledge. Inspect the available data first, recommend a useful schema-grounded dashboard, and ask only one targeted business question if a decision is genuinely ambiguous.">${icon('sparkles')} Design a dashboard</button></article>`}</section>`;
 }
 
 function renderAnalyticsRuns(dashboard) {
@@ -5338,25 +5372,64 @@ function bindEvents() {
   });
 }
 
+// Last moment the owner touched the page (pointer/keys/scroll). The reload
+// branch below defers while this is fresh — a self-reload must never yank
+// the page mid-read or mid-scroll (owner report 2026-09-03: reader flow
+// jumped to top; the post-reload scroll restore yields the moment the owner
+// scrolls, so a reload landing DURING reading loses the place by design of
+// the yield). Deferral is safe: trackers revert, the next 5s poll retries,
+// and the reload lands at the first quiet moment.
+let lastUserActivityAt = 0;
+for (const evt of ['pointerdown', 'keydown', 'wheel', 'touchstart', 'scroll']) {
+  window.addEventListener(evt, () => { lastUserActivityAt = Date.now(); }, { passive: true, capture: true });
+}
+const USER_QUIET_MS = 12000;
+
 async function pollVersion() {
   try {
     const payload = await request('/dashboard/version');
     const previousVersion = state.lastVersion;
     const previousAnalyticsVersion = state.lastAnalyticsVersion;
     const previousBootId = state.lastBootId;
+    const previousUiVersion = state.lastUiVersion;
     state.lastVersion = payload.version;
     state.lastAnalyticsVersion = payload.analyticsVersion ?? '0';
     state.lastBootId = payload.bootId ?? null;
+    state.lastUiVersion = payload.uiVersion ?? null;
 
-    // Server restarted (possibly with new UI code): a stale tab must not keep
-    // running old JavaScript against the new server. Reload once, hard — but
-    // stash the scroll position so the reload lands the owner back where they
-    // were instead of at the top (restart reloads were reading as "the page
-    // randomly refreshes and I lose my place", owner report 2026-08-26).
-    if (previousBootId && payload.bootId && payload.bootId !== previousBootId) {
-      try { sessionStorage.setItem('botboy-reload-scroll', String(document.getElementById('workspace')?.scrollTop || 0)); } catch {}
-      location.reload();
-      return;
+    // Reload the tab when the code it runs is stale. Two triggers:
+    //  - bootId change: the server restarted (possibly with new UI code).
+    //  - uiVersion change: UI assets on disk changed WITHOUT a restart —
+    //    BotBoy edits + rebuilds while the server keeps running, and
+    //    express.static serves the new files immediately, but this tab keeps
+    //    executing old JavaScript forever. Incident 2026-09-03: a correct
+    //    chart fix read as two "failed" verification rounds because the
+    //    verifying tab never re-fetched.
+    // Stash the scroll position so the reload lands the owner back where
+    // they were (owner report 2026-08-26: "the page randomly refreshes and
+    // I lose my place"), and stash any half-typed chat draft the same way.
+    const bootChanged = previousBootId && payload.bootId && payload.bootId !== previousBootId;
+    const uiChanged = previousUiVersion && payload.uiVersion && payload.uiVersion !== previousUiVersion;
+    if (bootChanged || uiChanged) {
+      const streamLive = document.querySelector('#chat-messages .streaming-live');
+      const ownerBusy = Date.now() - lastUserActivityAt < USER_QUIET_MS;
+      if (streamLive || ownerBusy) {
+        // Defer: a reload now would kill a live SSE consumer mid-turn
+        // (streamLive) or yank the page out from under active reading/
+        // typing/scrolling (ownerBusy). Revert the trackers so the next
+        // poll (5s) re-detects the change; the reload lands at the first
+        // quiet moment.
+        state.lastBootId = previousBootId;
+        state.lastUiVersion = previousUiVersion;
+      } else {
+        try { sessionStorage.setItem('botboy-reload-scroll', String(document.getElementById('workspace')?.scrollTop || 0)); } catch {}
+        try {
+          const draft = document.getElementById('chatInput')?.value || '';
+          if (draft.trim()) sessionStorage.setItem('botboy-reload-draft', draft);
+        } catch {}
+        location.reload();
+        return;
+      }
     }
 
     if (previousVersion !== null && payload.version !== previousVersion) {

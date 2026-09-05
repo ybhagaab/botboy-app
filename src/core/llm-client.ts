@@ -37,6 +37,8 @@ export interface StreamResult {
 export interface LlmClient {
   chatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse>;
   chatCompletionStream(request: ChatCompletionRequest): AsyncGenerator<StreamChunk, StreamResult, undefined>;
+  /** The primary (non-Ollama) endpoint's default model id — the anchor blessed overrides resolve against. */
+  getDefaultModel(): string;
   sendPrompt(prompt: string): Promise<AcpResponse>; // backward compat
   sendMessage(messages: AcpChatMessage[]): Promise<AcpResponse>; // backward compat
   initialize(): Promise<void>; // no-op for backward compat
@@ -75,6 +77,15 @@ export interface ChatCompletionRequest {
    * changing global chat latency. Ignored when think is not true.
    */
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Per-request model override (chat model picker, 2026-09-03). Must be a
+   * FULL provider-qualified id from the blessed registry
+   * (inference-provider › resolveBlessedModelId) — same family/profile as
+   * the endpoint's default, so budgets and dialects are unchanged. Applies
+   * to the OpenAI-compatible endpoint only; the Ollama fallback always
+   * keeps its own local model.
+   */
+  model?: string;
 }
 
 export interface ChatCompletionResponse {
@@ -105,6 +116,13 @@ export interface LlmMessage {
    * to be replayed alongside function_call_output items.
    */
   providerOutput?: unknown[];
+  /**
+   * Image data URLs riding a USER message (chat attachments 2026-09-05).
+   * Emitted as vision content parts on OpenAI-shape dialects; callers keep
+   * these on the CURRENT turn only — historical images are token-expensive
+   * and are replaced upstream by a text note.
+   */
+  images?: string[];
 }
 
 /** Which model-family conventions the remote endpoint uses. */
@@ -150,7 +168,7 @@ export interface ToolDefinition {
 export interface LlmConfig {
   ecs: {
     endpoint: string; model: string; maxContextTokens: number; requestTimeoutMs: number; apiKey?: string;
-    /** Chat Completions for vLLM/legacy Bedrock; Responses for Bedrock Mantle/Luna. */
+    /** Chat Completions for vLLM/legacy Bedrock; Responses for Bedrock Mantle gpt-5.6 models (Terra, previously Luna). */
     apiMode?: LlmApiMode;
     /**
      * 'qwen' (default): chat_template_kwargs.enable_thinking gating, wire shape
@@ -339,6 +357,110 @@ function parseProviderUsage(data: any): LlmUsage {
   };
 }
 
+/**
+ * Serialize messages for the Chat Completions wire. Module-scope and exported
+ * for direct unit testing (chat image attachments, 2026-09-05) — it is pure:
+ * everything it needs arrives as parameters.
+ *
+ * kimi: attach `reasoning_content` on assistant messages (K3 preserved-thinking
+ * mode requires replaying prior reasoning verbatim) and normalize any camelCase
+ * toolCalls/toolCallId leftovers to snake_case (see AGENT_FIX_LEARNINGS #3 —
+ * vLLM silently drops unknown keys, which breaks tool-call chaining).
+ * qwen: strip the client-side reasoningContent field so the wire shape stays
+ * byte-identical to the original deployment; camelCase normalization applies
+ * too (it fixes a latent agent.ts bug and matches what vLLM expects).
+ */
+export function toWireMessages(ep: Pick<Endpoint, 'dialect'>, messages: LlmMessage[]): any[] {
+  return messages.map((m: any) => {
+    const wire: any = { ...m };
+    // snake_case normalization (OpenAI spec)
+    if (wire.toolCalls && !wire.tool_calls) wire.tool_calls = wire.toolCalls;
+    if (wire.toolCallId && !wire.tool_call_id) wire.tool_call_id = wire.toolCallId;
+    delete wire.toolCalls;
+    delete wire.toolCallId;
+    // reasoning round-trip (kimi only)
+    if (ep.dialect === 'kimi' && m.role === 'assistant' && wire.reasoningContent && !wire.reasoning_content) {
+      wire.reasoning_content = wire.reasoningContent;
+    }
+    delete wire.reasoningContent;
+    // Responses-only opaque state is never a Chat Completions message field.
+    delete wire.providerOutput;
+    // Vision (chat attachments): user images become content parts on the
+    // Chat Completions wire; text-only messages keep the plain string.
+    if (m.role === 'user' && Array.isArray(m.images) && m.images.length) {
+      wire.content = [
+        { type: 'text', text: String(m.content ?? '') },
+        ...m.images.map((imageUrl: string) => ({ type: 'image_url', image_url: { url: imageUrl } })),
+      ];
+    }
+    delete wire.images;
+    return wire;
+  });
+}
+
+/**
+ * Serialize messages for the Responses API. Module-scope and exported for
+ * direct unit testing (pure function of its input).
+ */
+export function toResponsesInput(messages: LlmMessage[]): { instructions?: string; input: any[] } {
+  const instructions = messages
+    .filter(message => message.role === 'system' && message.content)
+    .map(message => message.content)
+    .join('\n\n');
+  const input: any[] = [];
+
+  for (const message of messages) {
+    if (message.role === 'system') continue;
+    if (message.role === 'tool') {
+      const callId = message.toolCallId ?? (message as any).tool_call_id;
+      if (!callId) throw new Error('Responses API tool messages require toolCallId');
+      input.push({
+        type: 'function_call_output',
+        call_id: callId,
+        output: message.content ?? '',
+      });
+      continue;
+    }
+
+    if (message.role === 'assistant' && Array.isArray(message.providerOutput) && message.providerOutput.length > 0) {
+      // Responses with store:false are stateless. Replay the provider's full
+      // output verbatim so encrypted reasoning remains bound to its function
+      // call before the following function_call_output item.
+      input.push(...message.providerOutput);
+      continue;
+    }
+
+    if (message.content !== null && (message.role === 'user' || message.content !== '')) {
+      // Vision (chat attachments): a user message carrying images becomes
+      // content PARTS — input_text + one input_image per attachment.
+      if (message.role === 'user' && message.images?.length) {
+        input.push({
+          role: 'user',
+          content: [
+            { type: 'input_text', text: message.content },
+            ...message.images.map(imageUrl => ({ type: 'input_image', image_url: imageUrl })),
+          ],
+        });
+      } else {
+        input.push({ role: message.role, content: message.content });
+      }
+    }
+    const toolCalls = message.toolCalls ?? (message as any).tool_calls;
+    if (message.role === 'assistant' && toolCalls?.length) {
+      for (const toolCall of toolCalls) {
+        input.push({
+          type: 'function_call',
+          call_id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+        });
+      }
+    }
+  }
+
+  return { ...(instructions ? { instructions } : {}), input };
+}
+
 export function createLlmClient(config: LlmConfig): LlmClient {
   const endpoints: Endpoint[] = [];
 
@@ -483,36 +605,6 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
   }
 
-  /**
-   * Serialize messages for the wire.
-   *
-   * kimi: attach `reasoning_content` on assistant messages (K3 preserved-thinking
-   * mode requires replaying prior reasoning verbatim) and normalize any camelCase
-   * toolCalls/toolCallId leftovers to snake_case (see AGENT_FIX_LEARNINGS #3 —
-   * vLLM silently drops unknown keys, which breaks tool-call chaining).
-   * qwen: strip the client-side reasoningContent field so the wire shape stays
-   * byte-identical to the original deployment; camelCase normalization applies
-   * too (it fixes a latent agent.ts bug and matches what vLLM expects).
-   */
-  function toWireMessages(ep: Endpoint, messages: LlmMessage[]): any[] {
-    return messages.map((m: any) => {
-      const wire: any = { ...m };
-      // snake_case normalization (OpenAI spec)
-      if (wire.toolCalls && !wire.tool_calls) wire.tool_calls = wire.toolCalls;
-      if (wire.toolCallId && !wire.tool_call_id) wire.tool_call_id = wire.toolCallId;
-      delete wire.toolCalls;
-      delete wire.toolCallId;
-      // reasoning round-trip (kimi only)
-      if (ep.dialect === 'kimi' && m.role === 'assistant' && wire.reasoningContent && !wire.reasoning_content) {
-        wire.reasoning_content = wire.reasoningContent;
-      }
-      delete wire.reasoningContent;
-      // Responses-only opaque state is never a Chat Completions message field.
-      delete wire.providerOutput;
-      return wire;
-    });
-  }
-
   /** Dialect-specific request fields shared by streaming and non-streaming bodies. */
   function dialectFields(ep: Endpoint, req: ChatCompletionRequest): any {
     if (ep.dialect === 'kimi') {
@@ -527,9 +619,14 @@ export function createLlmClient(config: LlmConfig): LlmClient {
   }
 
   // Build request body for OpenAI-compatible Chat Completions (vLLM).
+  /** Blessed per-request override beats the endpoint default; Ollama never overrides. */
+  function effectiveModel(ep: Endpoint, req: ChatCompletionRequest): string {
+    return !ep.useOllamaApi && req.model ? req.model : ep.model;
+  }
+
   function buildOpenAIBody(ep: Endpoint, req: ChatCompletionRequest): any {
     return {
-      model: ep.model,
+      model: effectiveModel(ep, req),
       messages: toWireMessages(ep, req.messages),
       temperature: req.temperature ?? config.defaults.temperature,
       max_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
@@ -546,57 +643,10 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     return effort === 'high' || effort === 'max' ? 'high' : 'low';
   }
 
-  function toResponsesInput(messages: LlmMessage[]): { instructions?: string; input: any[] } {
-    const instructions = messages
-      .filter(message => message.role === 'system' && message.content)
-      .map(message => message.content)
-      .join('\n\n');
-    const input: any[] = [];
-
-    for (const message of messages) {
-      if (message.role === 'system') continue;
-      if (message.role === 'tool') {
-        const callId = message.toolCallId ?? (message as any).tool_call_id;
-        if (!callId) throw new Error('Responses API tool messages require toolCallId');
-        input.push({
-          type: 'function_call_output',
-          call_id: callId,
-          output: message.content ?? '',
-        });
-        continue;
-      }
-
-      if (message.role === 'assistant' && Array.isArray(message.providerOutput) && message.providerOutput.length > 0) {
-        // Responses with store:false are stateless. Replay the provider's full
-        // output verbatim so encrypted reasoning remains bound to its function
-        // call before the following function_call_output item.
-        input.push(...message.providerOutput);
-        continue;
-      }
-
-      if (message.content !== null && (message.role === 'user' || message.content !== '')) {
-        input.push({ role: message.role, content: message.content });
-      }
-      const toolCalls = message.toolCalls ?? (message as any).tool_calls;
-      if (message.role === 'assistant' && toolCalls?.length) {
-        for (const toolCall of toolCalls) {
-          input.push({
-            type: 'function_call',
-            call_id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: toolCall.function.arguments,
-          });
-        }
-      }
-    }
-
-    return { ...(instructions ? { instructions } : {}), input };
-  }
-
   function buildResponsesBody(ep: Endpoint, req: ChatCompletionRequest, stream: boolean): any {
     const prompt = toResponsesInput(req.messages);
     return {
-      model: ep.model,
+      model: effectiveModel(ep, req),
       ...prompt,
       max_output_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
       reasoning: { effort: responsesReasoningEffort(ep, req) },
@@ -752,7 +802,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       ? buildOllamaBody(ep, req)
       : (isResponses ? buildResponsesBody(ep, req, false) : buildOpenAIBody(ep, req));
     const bodyStr = JSON.stringify(body);
-    logLlmPrompt({ url, model: ep.model, apiMode: isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions'), stream: false, request: body });
+    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions'), stream: false, request: body });
 
     const resp = await postWithAuthRetry(
       ep,
@@ -782,7 +832,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
   function buildOpenAIStreamBody(ep: Endpoint, req: ChatCompletionRequest): any {
     return {
-      model: ep.model,
+      model: effectiveModel(ep, req),
       messages: toWireMessages(ep, req.messages),
       temperature: req.temperature ?? config.defaults.temperature,
       max_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
@@ -799,7 +849,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     const url = remoteRequestUrl(ep);
     const responsesBody = buildResponsesBody(ep, req, true);
     const bodyStr = JSON.stringify(responsesBody);
-    logLlmPrompt({ url, model: ep.model, apiMode: 'responses', stream: true, request: responsesBody });
+    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: 'responses', stream: true, request: responsesBody });
 
     const idleMs = config.streamIdleTimeoutMs ?? 120000;
     const controller = new AbortController();
@@ -1059,7 +1109,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     // Serialize ONCE — sigv4 signs the payload hash (see callEndpoint).
     const openAiStreamBody = buildOpenAIStreamBody(ep, req);
     const bodyStr = JSON.stringify(openAiStreamBody);
-    logLlmPrompt({ url, model: ep.model, apiMode: 'chat-completions', stream: true, request: openAiStreamBody });
+    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: 'chat-completions', stream: true, request: openAiStreamBody });
     // Whether the caller opted into chain-of-thought. When false, Qwen3.5 emits
     // plain content with NO <think>/</think> tags — so we must NOT treat content
     // as "thinking" just because a </think> marker is absent.
@@ -1303,6 +1353,11 @@ export function createLlmClient(config: LlmConfig): LlmClient {
   }
 
   return {
+    getDefaultModel(): string {
+      const primary = endpoints.find(ep => !ep.useOllamaApi) ?? endpoints[0];
+      return primary?.model ?? '';
+    },
+
     async chatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
       const ordered = getOrderedEndpoints();
       let lastError: Error | null = null;
