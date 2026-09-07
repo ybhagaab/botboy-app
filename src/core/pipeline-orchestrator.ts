@@ -36,12 +36,55 @@ export interface OrchestratorConfig {
   organizeIntervalMs?: number; // default 30m (assign-only — places new projects)
   /**
    * Cadence of the FULL evolution pass (anchored recluster: growth-based
-   * promotions to primary areas, merges, renames). Default 24h. The 30-min
-   * tick stays assign-only so the hierarchy is stable within a working day.
+   * promotions to primary areas, merges, renames). Default 3h (owner decision
+   * 2026-09-05, down from 24h). The 30-min tick stays assign-only.
+   *
+   * Due-ness is PERSISTENT: derived from the newest completed 'organize'
+   * pipeline_runs row with batch_id='full', not from process uptime. The old
+   * boot-relative setInterval never fired on the owner's machine — restarts
+   * were always closer together than 24h, so the live tree had NEVER had a
+   * full pass until the manual 2026-09-05 trigger.
    */
-  fullOrganizeIntervalMs?: number; // default 24h
+  fullOrganizeIntervalMs?: number; // default 3h
+  /**
+   * Minimum spacing between full-organize ATTEMPTS (default 30m): when a due
+   * pass fails or skips (no completed row written), the checker waits this
+   * long before retrying instead of burning an LLM call every check tick.
+   */
+  fullOrganizeRetryBackoffMs?: number;
   /** Cadence of the ambient channel-digest pass (default 6h). */
   digestIntervalMs?: number;
+}
+
+/**
+ * Persistent due-check for the full organize pass. Reads the durable run
+ * ledger (pipeline_runs) so the schedule survives restarts; SQLite datetime()
+ * strings are space-separated UTC, normalized here before Date parsing.
+ * Exported for tests.
+ */
+export function isFullOrganizeDue(
+  db: Database.Database,
+  now: number,
+  intervalMs: number,
+  retryBackoffMs: number,
+): boolean {
+  const parseUtc = (value: string | null | undefined): number | null => {
+    if (!value) return null;
+    const ms = Date.parse(value.includes('T') ? value : `${value.replace(' ', 'T')}Z`);
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const row = db.prepare(`
+    SELECT
+      (SELECT MAX(completed_at) FROM pipeline_runs
+        WHERE pass='organize' AND batch_id='full' AND status='completed') AS last_completed,
+      (SELECT MAX(started_at) FROM pipeline_runs
+        WHERE pass='organize' AND batch_id='full') AS last_attempt
+  `).get() as { last_completed: string | null; last_attempt: string | null };
+  const lastCompleted = parseUtc(row.last_completed);
+  const lastAttempt = parseUtc(row.last_attempt);
+  if (lastAttempt !== null && now - lastAttempt < retryBackoffMs) return false;
+  if (lastCompleted === null) return true; // never ran — due immediately
+  return now - lastCompleted >= intervalMs;
 }
 
 export interface DrainResult {
@@ -116,7 +159,11 @@ export function createPipelineOrchestrator(deps: {
   const interpretationIntervalMs = deps.config?.interpretationIntervalMs ?? 60000;
   const reconcileIntervalMs = deps.config?.reconcileIntervalMs ?? 6 * 60 * 60 * 1000;
   const organizeIntervalMs = deps.config?.organizeIntervalMs ?? 30 * 60 * 1000;
-  const fullOrganizeIntervalMs = deps.config?.fullOrganizeIntervalMs ?? 24 * 60 * 60 * 1000;
+  const fullOrganizeIntervalMs = deps.config?.fullOrganizeIntervalMs ?? 3 * 60 * 60 * 1000;
+  const fullOrganizeRetryBackoffMs = deps.config?.fullOrganizeRetryBackoffMs ?? 30 * 60 * 1000;
+  // The due CHECK runs frequently and cheaply (one indexed SQL read); the
+  // pass itself fires only when the persistent ledger says it is due.
+  const fullOrganizeCheckMs = Math.min(10 * 60 * 1000, fullOrganizeIntervalMs);
   const digestIntervalMs = deps.config?.digestIntervalMs ?? 6 * 60 * 60 * 1000;
 
   const timers: ReturnType<typeof setInterval>[] = [];
@@ -302,7 +349,18 @@ export function createPipelineOrchestrator(deps: {
       timers.push(setInterval(() => { tickInterpretation().catch(() => {}); }, interpretationIntervalMs));
       timers.push(setInterval(() => { tickReconcile().catch(() => {}); }, reconcileIntervalMs));
       timers.push(setInterval(() => { tickOrganize().catch(() => {}); }, organizeIntervalMs));
-      timers.push(setInterval(() => { tickOrganize({ full: true }).catch(() => {}); }, fullOrganizeIntervalMs));
+      // Full organize: persistent schedule (survives restarts). The checker
+      // consults the pipeline_runs ledger; an overdue pass fires on the next
+      // check after boot instead of waiting a fresh interval from process
+      // start (the failure mode that kept the 24h timer from EVER firing).
+      timers.push(setInterval(() => {
+        try {
+          if (!isFullOrganizeDue(db, Date.now(), fullOrganizeIntervalMs, fullOrganizeRetryBackoffMs)) return;
+        } catch {
+          return; // ledger unreadable — skip this check, never crash the timer
+        }
+        tickOrganize({ full: true }).catch(() => {});
+      }, fullOrganizeCheckMs));
       if (digester) timers.push(setInterval(() => { tickDigest().catch(() => {}); }, digestIntervalMs));
     },
     stop(): void {

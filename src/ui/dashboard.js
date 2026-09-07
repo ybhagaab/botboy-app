@@ -4738,6 +4738,12 @@ function bindEvents() {
     if (action === 'close-command') document.getElementById('command-dialog').close();
     if (action === 'plan-day') planDay();
     if (action === 'today-refresh') void refreshToday();
+    // Overview tiles: jump to the matching section (long attention lists made
+    // Meaningful changes a deep scroll — owner ask 2026-09-05). Pinned items
+    // lead the attention section, so the Pinned tile shares its anchor.
+    if (action === 'today-jump') {
+      document.getElementById(target.dataset.target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
     if (action === 'today-pin') void updateTodayItem(target.dataset.item, target.dataset.pinned === 'true' ? 'unpin' : 'pin', target.dataset.version);
     if (action === 'today-done') void updateTodayItem(target.dataset.item, 'mark_done', target.dataset.version);
     if (action === 'today-snooze') void updateTodayItem(target.dataset.item, 'snooze', target.dataset.version);

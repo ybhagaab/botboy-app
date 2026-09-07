@@ -12,7 +12,7 @@ import { createLibrarian } from './librarian.js';
 import { createBrainUpdater } from './brain-updater.js';
 import { createReconciler } from './reconciler.js';
 import { createProjectOrganizer } from './project-organizer.js';
-import { createPipelineOrchestrator } from './pipeline-orchestrator.js';
+import { createPipelineOrchestrator, isFullOrganizeDue } from './pipeline-orchestrator.js';
 import type { DocumentParser } from './document-parser.js';
 import type { OcrEngine, OcrResult } from './ocr-engine.js';
 import type { PipelineLlm } from './pipeline-llm.js';
@@ -144,5 +144,86 @@ describe('PipelineOrchestrator', () => {
     expect(res.ran).toBe(false);
     const row = storage.getDb().prepare('SELECT process_state FROM work_items WHERE id = ?').get('a') as any;
     expect(row.process_state).toBe('extracted'); // not lost, awaiting LLM
+  });
+});
+
+describe('isFullOrganizeDue (persistent full-organize schedule)', () => {
+  let storage: StorageLayer;
+  const HOUR = 60 * 60 * 1000;
+  const INTERVAL = 3 * HOUR;
+  const BACKOFF = 30 * 60 * 1000;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+  });
+  afterEach(() => storage.close());
+
+  /** Insert a pipeline_runs row with explicit timestamps (ms since epoch). */
+  function insertRun(opts: {
+    batchId: 'full' | 'assign-only';
+    status: 'completed' | 'failed' | 'running';
+    startedAtMs: number;
+    completedAtMs?: number;
+    /** SQLite's native datetime('now') format is space-separated UTC. */
+    spaceSeparated?: boolean;
+  }): void {
+    const fmt = (ms: number) => {
+      const iso = new Date(ms).toISOString();
+      return opts.spaceSeparated ? iso.slice(0, 19).replace('T', ' ') : iso;
+    };
+    storage.getDb().prepare(
+      "INSERT INTO pipeline_runs (id, pass, batch_id, status, started_at, completed_at) VALUES (?, 'organize', ?, ?, ?, ?)",
+    ).run(
+      `run_${Math.random().toString(36).slice(2, 10)}`,
+      opts.batchId,
+      opts.status,
+      fmt(opts.startedAtMs),
+      opts.completedAtMs !== undefined ? fmt(opts.completedAtMs) : null,
+    );
+  }
+
+  it('is due immediately when no full pass has ever completed (the restart starvation fix)', () => {
+    expect(isFullOrganizeDue(storage.getDb(), Date.now(), INTERVAL, BACKOFF)).toBe(true);
+  });
+
+  it('is not due when a full pass completed within the interval', () => {
+    const now = Date.now();
+    insertRun({ batchId: 'full', status: 'completed', startedAtMs: now - HOUR, completedAtMs: now - HOUR });
+    expect(isFullOrganizeDue(storage.getDb(), now, INTERVAL, BACKOFF)).toBe(false);
+  });
+
+  it('is due when the last completed full pass is older than the interval', () => {
+    const now = Date.now();
+    insertRun({ batchId: 'full', status: 'completed', startedAtMs: now - 4 * HOUR, completedAtMs: now - 4 * HOUR });
+    expect(isFullOrganizeDue(storage.getDb(), now, INTERVAL, BACKOFF)).toBe(true);
+  });
+
+  it('parses SQLite space-separated UTC timestamps (datetime(\'now\') format)', () => {
+    const now = Date.now();
+    insertRun({ batchId: 'full', status: 'completed', startedAtMs: now - HOUR, completedAtMs: now - HOUR, spaceSeparated: true });
+    expect(isFullOrganizeDue(storage.getDb(), now, INTERVAL, BACKOFF)).toBe(false);
+    // Were the timestamp misread as LOCAL time (the classic trap), a
+    // UTC+ offset would make it look like the future or hours stale —
+    // an overdue row must still read as due.
+    const db2 = storage.getDb();
+    db2.prepare('DELETE FROM pipeline_runs').run();
+    insertRun({ batchId: 'full', status: 'completed', startedAtMs: now - 4 * HOUR, completedAtMs: now - 4 * HOUR, spaceSeparated: true });
+    expect(isFullOrganizeDue(db2, now, INTERVAL, BACKOFF)).toBe(true);
+  });
+
+  it('holds back while a recent attempt is inside the retry backoff (failed runs do not hot-loop)', () => {
+    const now = Date.now();
+    insertRun({ batchId: 'full', status: 'completed', startedAtMs: now - 4 * HOUR, completedAtMs: now - 4 * HOUR });
+    insertRun({ batchId: 'full', status: 'failed', startedAtMs: now - 5 * 60 * 1000 });
+    expect(isFullOrganizeDue(storage.getDb(), now, INTERVAL, BACKOFF)).toBe(false);
+    // …and retries once the backoff has elapsed.
+    expect(isFullOrganizeDue(storage.getDb(), now + BACKOFF, INTERVAL, BACKOFF)).toBe(true);
+  });
+
+  it('ignores assign-only runs entirely', () => {
+    const now = Date.now();
+    insertRun({ batchId: 'assign-only', status: 'completed', startedAtMs: now - HOUR, completedAtMs: now - HOUR });
+    expect(isFullOrganizeDue(storage.getDb(), now, INTERVAL, BACKOFF)).toBe(true);
   });
 });
