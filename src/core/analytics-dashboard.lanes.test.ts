@@ -131,7 +131,7 @@ describe('analytics dashboard lanes (A4)', () => {
     expect(widget.result.rows).toEqual([[7]]);
   });
 
-  it('sql-context down + ETL usable: widgets run through the composite, serialized, with lane provenance and coerced cells', async () => {
+  it('sql-context down + ETL usable: ALL widgets run through the composite in parallel, with lane provenance and coerced cells', async () => {
     const etl = fakeEtlRunner({ delayMs: 15 });
     const service = makeService(
       [server('sql-context', { state: 'stopped' }), server('a2-analytics', { state: 'stopped' })],
@@ -150,7 +150,7 @@ describe('analytics dashboard lanes (A4)', () => {
 
     expect(sqlLaneCalls).toEqual([]); // sql lane untouched
     expect(etl.stats().sqls.sort()).toEqual(['SELECT 1', 'SELECT 2', 'SELECT 3']);
-    expect(etl.stats().maxInFlight).toBe(1); // ONE scratch pair — never concurrent
+    expect(etl.stats().maxInFlight).toBe(3); // owner ruling 2026-09-09: pool width = the run's widget count
 
     for (const widget of widgetResults(dashboard.id)) {
       expect(widget.result.lane).toBe('etl');

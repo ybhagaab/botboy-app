@@ -37,10 +37,11 @@ and the scratch profile exists precisely so ad-hoc work leaves no litter.
 Ground the SQL in the loaded knowledge file (its cookbook shapes and
 table facts) — loaded via `mcp_analytics_list_context` →
 `mcp_analytics_load_context`. If no knowledge file covers the domain, say
-so in the answer and state which tables you used and why. ONE query at a time: the
-tool refuses while a previous ad-hoc run is still in flight (Datanet
-collapses duplicate queued runs) — poll the named run instead of
-submitting again.
+so in the answer and state which tables you used and why. Parallel queries are
+fine: each claims its own scratch pair from BotBoy's pool (Datanet's
+duplicate-collapse applies per JOB, and every pair is its own job). A run
+handed off alive keeps only its own pair busy — never resubmit that run;
+poll the named runId instead.
 
 **Step 2 — "Pull the report file" (rendered xlsx/pdf reports).**
 These are METRICS profiles. Find them via `mcp_etl_search`, then

@@ -37,8 +37,10 @@ describe('etl-adhoc query runner', () => {
     };
     // Defaults: the happy path.
     handlers.set('datanet_search', () => ({ isError: false, text: JSON.stringify({ found: 2, searchResults: [{ document: searchDoc }, { document: searchDoc }] }) }));
-    handlers.set('datanet_create_profile', () => ({ isError: false, text: JSON.stringify({ id: 101, type: 'TRANSFORM', revision: 1 }) }));
-    handlers.set('datanet_create_job', () => ({ isError: false, text: JSON.stringify({ id: 9001, owner: 'ybhagaab', schedule: { type: 'NOT_SCHEDULED' } }) }));
+    let profileSeq = 100;
+    let jobSeq = 9000;
+    handlers.set('datanet_create_profile', () => { profileSeq += 1; return { isError: false, text: JSON.stringify({ id: profileSeq, type: 'TRANSFORM', revision: 1 }) }; });
+    handlers.set('datanet_create_job', () => { jobSeq += 1; return { isError: false, text: JSON.stringify({ id: jobSeq, owner: 'ybhagaab', schedule: { type: 'NOT_SCHEDULED' } }) }; });
     handlers.set('datanet_update_profile_sql', () => ({ isError: false, text: JSON.stringify({ id: 101, revision: 2 }) }));
     handlers.set('datanet_submit_run', () => ({ isError: false, text: JSON.stringify({ jobRuns: [{ id: 555001 }] }) }));
     handlers.set('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'SUCCESS' }) }));
@@ -197,27 +199,91 @@ describe('etl-adhoc query runner', () => {
     expect(fake.countOf('datanet_submit_run')).toBe(1); // never restarted — queue position is sacred
   });
 
-  it('refuses to submit while a previous ad-hoc run is in flight — Datanet collapses duplicate queued runs (live 2026-09-02)', async () => {
+  it('a busy pair is SKIPPED, not waited on: the pool grows and the query runs on a fresh pair', async () => {
     const fake = fakeEtl();
     const q = runner(fake);
-    await q.runQuery({ sql: 'select 1' }); // pins the pair
-    fake.when('datanet_get_latest_run', () => ({ isError: false, text: JSON.stringify({ id: 555001, status: 'WAITING_FOR_RESOURCES' }) }));
-    const submits = fake.countOf('datanet_submit_run');
-    const blocked = await q.runQuery({ sql: 'select 2' });
-    expect(blocked.ok).toBe(false);
-    expect(blocked.runId).toBe('555001');
-    expect(blocked.error).toContain('in flight');
-    expect(blocked.nextAction).toContain('One ETL query at a time');
-    expect(fake.countOf('datanet_submit_run')).toBe(submits); // nothing submitted
-    expect(fake.countOf('datanet_update_profile_sql')).toBe(1); // SQL not re-staged under the queued run
+    await q.runQuery({ sql: 'select 1' }); // pins pair 1 (profile 101 / job 9001)
+    // Pair 1's job now has a live queued run (e.g. a chat query handed off alive).
+    fake.when('datanet_get_latest_run', (args) => String(args.job_id) === '9001'
+      ? { isError: false, text: JSON.stringify({ id: 555001, status: 'WAITING_FOR_RESOURCES' }) }
+      : { isError: false, text: JSON.stringify({ id: 554000, status: 'SUCCESS' }) });
+    const staged: Array<{ profile: string; sql: string }> = [];
+    fake.when('datanet_update_profile_sql', (args) => {
+      staged.push({ profile: String(args.profile_id), sql: String(args.sql) });
+      return { isError: false, text: JSON.stringify({ id: args.profile_id }) };
+    });
+    const result = await q.runQuery({ sql: 'select 2' });
+    expect(result.ok).toBe(true);
+    expect(fake.countOf('datanet_create_profile')).toBe(2); // pool grew by exactly one
+    expect(staged).toEqual([{ profile: '102', sql: expect.stringContaining('select 2') }]); // fresh pair, busy one untouched
+    const submitJobs = fake.calls.filter(c => c.tool === 'datanet_submit_run').map(c => String(c.args.job_id));
+    expect(submitJobs).toEqual(['9001', '9002']); // first query's job, then the new pair's
   });
 
-  it('the in-flight guard fails OPEN: an unreadable latest-run never bricks the tool', async () => {
+  it('parallel queries claim DISTINCT pairs: SQL never crosses pairs, both run concurrently', async () => {
+    const fake = fakeEtl();
+    const q = runner(fake);
+    const staged: Array<{ profile: string; sql: string }> = [];
+    fake.when('datanet_update_profile_sql', (args) => {
+      staged.push({ profile: String(args.profile_id), sql: String(args.sql) });
+      return { isError: false, text: JSON.stringify({ id: args.profile_id }) };
+    });
+    const [a, b] = await Promise.all([
+      q.runQuery({ sql: 'select aaa' }),
+      q.runQuery({ sql: 'select bbb' }),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(fake.countOf('datanet_create_profile')).toBe(2); // one pair per concurrent query
+    const submitJobs = fake.calls.filter(c => c.tool === 'datanet_submit_run').map(c => String(c.args.job_id)).sort();
+    expect(submitJobs).toEqual(['9001', '9002']);
+    // Each SQL landed on exactly one profile, and the profile↔job pairing held.
+    expect(new Set(staged.map(s => s.profile)).size).toBe(2);
+
+    // Both settle → the pool is reusable: a third query creates NOTHING new.
+    const third = await q.runQuery({ sql: 'select ccc' });
+    expect(third.ok).toBe(true);
+    expect(fake.countOf('datanet_create_profile')).toBe(2);
+  });
+
+  it('the legacy single-pair settings migrate into pool slot 1 (no re-create)', async () => {
+    const fake = fakeEtl();
+    setSetting(storage.getDb(), 'etl.adhoc.alias', 'ybhagaab');
+    setSetting(storage.getDb(), 'etl.adhoc.profile_id', 777);
+    setSetting(storage.getDb(), 'etl.adhoc.job_id', '8888');
+    const staged: string[] = [];
+    fake.when('datanet_update_profile_sql', (args) => {
+      staged.push(String(args.profile_id));
+      return { isError: false, text: JSON.stringify({ id: args.profile_id }) };
+    });
+    const q = runner(fake);
+    const result = await q.runQuery({ sql: 'select legacy' });
+    expect(result.ok).toBe(true);
+    expect(fake.countOf('datanet_create_profile')).toBe(0); // migrated, not recreated
+    expect(staged).toEqual(['777']);
+  });
+
+  it('the pool fuse is a runaway guard: at the cap with everything busy, a structured error names the state', async () => {
+    const fake = fakeEtl();
+    setSetting(storage.getDb(), 'etl.adhoc.alias', 'ybhagaab');
+    setSetting(storage.getDb(), 'etl.adhoc.pairs',
+      Array.from({ length: 32 }, (_, i) => ({ profileId: 200 + i, jobId: String(7000 + i), slot: i + 1 })));
+    fake.when('datanet_get_latest_run', () => ({ isError: false, text: JSON.stringify({ id: 1, status: 'EXECUTING' }) }));
+    const q = runner(fake);
+    const result = await q.runQuery({ sql: 'select overload' });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('runaway fuse');
+    expect(result.nextAction).toContain('mcp_etl_latest_run');
+    expect(fake.countOf('datanet_create_profile')).toBe(0); // the fuse means NO more creation
+  });
+
+  it('the busy check fails OPEN: an unreadable latest-run never bricks the tool (pair treated as free)', async () => {
     const fake = fakeEtl();
     fake.when('datanet_get_latest_run', () => ({ isError: true, text: 'Error: transient' }));
     const q = runner(fake);
     const result = await q.runQuery({ sql: 'select 1' });
     expect(result.ok).toBe(true);
+    expect(fake.countOf('datanet_create_profile')).toBe(1); // no spiral of replacements either
   });
 
   it('a DELETED run is terminal with a submit-once-then-stop next action', async () => {

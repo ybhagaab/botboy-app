@@ -7,10 +7,11 @@
  *   sql-mcp — the direct warehouse connector (sql-context). Primacy lane:
  *             whenever it is running, dashboards use it exactly as before.
  *   etl     — the Datanet ETL composite (etl-adhoc QueryRunner) over the
- *             per-user scratch pair. Fallback lane for machines with no
- *             SQL connector: minutes-scale budgets, widgets execute
- *             serially (ONE scratch pair — concurrent SQL revisions would
- *             clobber each other), lane recorded on every result.
+ *             per-user scratch-pair POOL. Fallback lane for machines with
+ *             no SQL connector: minutes-scale budgets, ALL widgets in
+ *             parallel (each claims its own pair — per-JOB serialization
+ *             is Datanet's only real constraint), lane recorded on every
+ *             result.
  *
  * Both lanes read the SAME warehouse (proven byte-exact 2026-09-03, run
  * 12862243234) and both enforce the same read-only SQL wall — widgets are

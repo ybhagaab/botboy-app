@@ -1117,7 +1117,7 @@ export function createAnalyticsDashboardService(options: {
     let cancelSeen = false;
     const lane = await pickRunLane();
     if (lane === 'etl') {
-      console.log(`[Analytics] run ${runId}: sql-context is down — refreshing through the Datanet ETL lane (widgets run one at a time, minutes-scale)`);
+      console.log(`[Analytics] run ${runId}: sql-context is down — refreshing through the Datanet ETL lane (all widgets in parallel over the scratch-pair pool; each is a minutes-scale Datanet run)`);
     }
 
     const claimNextWidget = (): any | 'stop' | null => {
@@ -1215,10 +1215,15 @@ export function createAnalyticsDashboardService(options: {
         await runWidgetToCompletion(next);
       }
     };
-    // The ETL lane executes widgets ONE at a time: every query rides the
-    // same per-user scratch pair, so concurrent SQL revisions would clobber
-    // each other (and the composite's in-flight guard would refuse anyway).
-    const poolWidth = lane === 'etl' ? 1 : WIDGET_REFRESH_CONCURRENCY;
+    // The ETL lane runs ALL widgets in parallel (owner ruling 2026-09-09):
+    // each widget claims its own scratch pair from the etl-adhoc pool, so
+    // there is no shared-SQL clobber and no per-job duplicate-collapse —
+    // Datanet's queue absorbs the concurrent runs. The sql lane keeps its
+    // measured connector-side cap.
+    const runRow = db.prepare('SELECT widget_count FROM analytics_runs WHERE id = ?').get(runId) as { widget_count: number } | undefined;
+    const poolWidth = lane === 'etl'
+      ? Math.max(1, Number(runRow?.widget_count ?? 1))
+      : WIDGET_REFRESH_CONCURRENCY;
     await Promise.all(Array.from({ length: poolWidth }, () => poolWorker()));
 
     if (ownershipLost) return;

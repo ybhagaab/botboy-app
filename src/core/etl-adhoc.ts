@@ -7,12 +7,15 @@
  * framework: composite over dance).
  *
  * Namespace hygiene: Datanet profiles are visible to the user's whole group.
- * BotBoy therefore keeps exactly ONE scratch pair per user —
- * `botboy_adhoc_<alias>` (TRANSFORM profile + NOT_SCHEDULED TRANSFORM job) —
- * created once, pinned in settings, and REUSED for every ad-hoc query via
- * SQL revisions. The TRANSFORM pair is load-bearing: the EXTRACT creation
- * path fails owner validation and its profiles are invisible to the type
- * detector (live-verified 2026-08-28, datanet-etl.md gotchas).
+ * BotBoy keeps a bounded named POOL of scratch pairs per user (TRANSFORM
+ * profile + NOT_SCHEDULED TRANSFORM job each) — created lazily on demand,
+ * pinned in settings, and REUSED forever via SQL revisions. Parallel
+ * queries claim distinct pairs: the only real Datanet constraint is per
+ * JOB (duplicate queued runs for one job+dataset-date get collapsed), so
+ * pool width = concurrency, all widgets of a dashboard at once (owner
+ * ruling 2026-09-09). The TRANSFORM pair is load-bearing: the EXTRACT
+ * creation path fails owner validation and its profiles are invisible to
+ * the type detector (live-verified 2026-08-28, datanet-etl.md gotchas).
  *
  * Environment discovery (zero manual inputs): group / logical DB / db user
  * come from the user's own Datanet footprint — search their alias, take the
@@ -113,13 +116,43 @@ export interface QueryRunner {
 }
 
 const KEYS = {
-  profileId: 'etl.adhoc.profile_id',
-  jobId: 'etl.adhoc.job_id',
+  /** The scratch-pair POOL (owner ruling 2026-09-09: dashboard widgets run
+   * all-parallel; Datanet's queue takes it — the per-JOB serialization is
+   * the only real constraint, so parallelism = more pairs). */
+  pool: 'etl.adhoc.pairs',
   alias: 'etl.adhoc.alias',
   env: 'etl.adhoc.env', // { group, logicalDb, dbUser }
+  /** Legacy single-pair keys — migrated into pool slot 1 on first acquire. */
+  legacyProfileId: 'etl.adhoc.profile_id',
+  legacyJobId: 'etl.adhoc.job_id',
 } as const;
 
 interface ScratchEnv { group: string; logicalDb: string; dbUser: string }
+
+export interface ScratchPair { profileId: number; jobId: string; slot: number }
+
+/**
+ * Runaway fuse, NOT capacity policy: Datanet handles enormous parallel run
+ * counts fine (owner ruling). This only stops a BotBoy bug from creating
+ * profiles in a loop — same spirit as the local-folders EMFILE fuse.
+ */
+export const SCRATCH_POOL_FUSE = 32;
+
+/** Claim ledgers shared across ALL runner instances on one db (chat runner
+ * and dashboard runner must never claim the same pair concurrently). */
+const claimLedgers = new WeakMap<Database.Database, Set<string>>();
+const creationLocks = new WeakMap<Database.Database, Promise<void>>();
+
+function ledgerFor(db: Database.Database): Set<string> {
+  let ledger = claimLedgers.get(db);
+  if (!ledger) { ledger = new Set(); claimLedgers.set(db, ledger); }
+  return ledger;
+}
+
+/** Run-states that occupy a pair's job (submitting under these risks
+ * Datanet's duplicate-collapse and SQL-revision clobber). */
+const IN_FLIGHT_STATES = new Set(['NEW', 'SUBMITTED', 'RUNNABLE', 'EXECUTING',
+  'WAITING_FOR_RESOURCES', 'WAITING_FOR_REQUIREMENTS', 'WAITING_FOR_DEPENDENCIES']);
 
 export interface EtlAdhocOptions {
   db: Database.Database;
@@ -197,16 +230,45 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     return best.env;
   }
 
-  async function ensureScratchPair(groupHint?: string): Promise<
-    { profileId: number; jobId: string } | { error: string; nextAction: string }
-  > {
+  /** Pool read with alias guard + one-time migration of the legacy single
+   * pair into slot 1. An alias change orphans the old pool (rare; the old
+   * pairs stay server-side as inert NOT_SCHEDULED jobs). */
+  function readPool(): ScratchPair[] {
     const alias = aliasForUser();
     const storedAlias = getSetting<string>(db, KEYS.alias);
-    const storedProfile = getSetting<number>(db, KEYS.profileId);
-    const storedJob = getSetting<string>(db, KEYS.jobId);
-    if (storedAlias === alias && storedProfile && storedJob) {
-      return { profileId: storedProfile, jobId: storedJob };
+    if (storedAlias && storedAlias !== alias) {
+      setSetting(db, KEYS.pool, []);
+      setSetting(db, KEYS.legacyProfileId, null);
+      setSetting(db, KEYS.legacyJobId, null);
+      setSetting(db, KEYS.alias, alias);
+      return [];
     }
+    let pool = getSetting<ScratchPair[]>(db, KEYS.pool) ?? [];
+    if (!Array.isArray(pool)) pool = [];
+    const legacyProfile = getSetting<number>(db, KEYS.legacyProfileId);
+    const legacyJob = getSetting<string>(db, KEYS.legacyJobId);
+    if (legacyProfile && legacyJob && !pool.some(pair => pair.jobId === String(legacyJob))) {
+      pool = [{ profileId: legacyProfile, jobId: String(legacyJob), slot: 1 }, ...pool];
+      setSetting(db, KEYS.pool, pool);
+      setSetting(db, KEYS.legacyProfileId, null);
+      setSetting(db, KEYS.legacyJobId, null);
+    }
+    return pool;
+  }
+
+  function writePool(pool: ScratchPair[]): void {
+    setSetting(db, KEYS.pool, pool);
+    setSetting(db, KEYS.alias, aliasForUser());
+  }
+
+  function prunePair(jobId: string): void {
+    writePool(readPool().filter(pair => pair.jobId !== jobId));
+  }
+
+  /** Create ONE new pair (TRANSFORM+TRANSFORM — the proven path; EXTRACT is
+   * broken server-side) and append it to the pool. */
+  async function createPair(slot: number, groupHint?: string): Promise<ScratchPair | { error: string; nextAction: string }> {
+    const alias = aliasForUser();
 
     // Environment: cached → hint → own-footprint discovery.
     let env = getSetting<ScratchEnv>(db, KEYS.env) ?? null;
@@ -222,10 +284,10 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       setSetting(db, KEYS.env, env);
     }
 
-    // TRANSFORM pair — the proven creation path (EXTRACT is broken server-side).
+    const slotLabel = slot > 1 ? ` (parallel slot ${slot})` : '';
     const profileResult = await call('datanet_create_profile', {
       sql: '/* NO DEPENDENCIES */\nselect 1 as botboy_scratch_init;',
-      description: `BotBoy ad-hoc scratch profile for ${alias}. Reused for one-off queries via SQL revisions — `
+      description: `BotBoy ad-hoc scratch profile for ${alias}${slotLabel}. Reused for one-off queries via SQL revisions — `
         + 'revision history is expected. Managed automatically; safe to ignore.',
       profile_type: 'TRANSFORM',
       group: env.group,
@@ -247,7 +309,7 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
 
     const jobResult = await call('datanet_create_job', {
       profile_id: profileId,
-      description: `BotBoy ad-hoc scratch job for ${alias} (NOT_SCHEDULED; runs only when asked).`,
+      description: `BotBoy ad-hoc scratch job for ${alias}${slotLabel} (NOT_SCHEDULED; runs only when asked).`,
       group: env.group,
       logical_db: env.logicalDb,
       db_user: env.dbUser,
@@ -277,16 +339,66 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       };
     }
 
-    setSetting(db, KEYS.alias, alias);
-    setSetting(db, KEYS.profileId, profileId);
-    setSetting(db, KEYS.jobId, jobId);
-    console.log(`[EtlAdhoc] scratch pair created for ${alias}: profile ${profileId}, job ${jobId} (group ${env.group})`);
-    return { profileId, jobId };
+    const pair: ScratchPair = { profileId, jobId, slot };
+    writePool([...readPool(), pair]);
+    console.log(`[EtlAdhoc] scratch pair created for ${alias} (slot ${slot}): profile ${profileId}, job ${jobId}`);
+    return pair;
   }
 
-  function clearPinnedPair(): void {
-    setSetting(db, KEYS.profileId, null);
-    setSetting(db, KEYS.jobId, null);
+  /** Is this pair's job occupied by a live run? Fails OPEN (an unreadable
+   * latest-run never bricks the tool — the DELETED terminal handling covers
+   * the rare wrong guess, exactly as before the pool). */
+  async function pairBusy(pair: ScratchPair): Promise<{ busy: boolean; runId?: string }> {
+    const latest = await call('datanet_get_latest_run', { job_id: pair.jobId });
+    if (latest.isError) return { busy: false };
+    const latestRun = parseJson(latest.text);
+    const status = String(latestRun.status ?? '').toUpperCase();
+    const runId = String(latestRun.id ?? '');
+    if (runId && IN_FLIGHT_STATES.has(status)) return { busy: true, runId };
+    return { busy: false };
+  }
+
+  interface PairHandle { pair: ScratchPair; release(): void }
+
+  /**
+   * Claim a free pair, growing the pool on demand (all widgets of a
+   * dashboard run in parallel — owner ruling 2026-09-09). Claim ledger is
+   * process-wide per db; busy pairs (e.g. a chat run handed off alive) are
+   * skipped, not waited on.
+   */
+  async function acquirePair(groupHint?: string): Promise<PairHandle | { error: string; nextAction: string }> {
+    const claimed = ledgerFor(db);
+    for (;;) {
+      const pool = readPool();
+      for (const pair of pool) {
+        if (claimed.has(pair.jobId)) continue;
+        claimed.add(pair.jobId); // synchronous claim — atomic between awaits
+        const occupancy = await pairBusy(pair);
+        if (!occupancy.busy) {
+          return { pair, release: () => { claimed.delete(pair.jobId); } };
+        }
+        claimed.delete(pair.jobId); // busy server-side (alive handoff) — leave it be
+      }
+      if (pool.length >= SCRATCH_POOL_FUSE) {
+        return {
+          error: `All ${pool.length} scratch pairs are occupied and the pool is at its runaway fuse (${SCRATCH_POOL_FUSE}).`,
+          nextAction: 'This many simultaneous ETL queries is almost certainly a bug — check for stuck runs with mcp_etl_latest_run on the scratch jobs, and report to the user.',
+        };
+      }
+      // Grow the pool by one, serialized so concurrent widgets never
+      // double-create the same slot.
+      const previous = creationLocks.get(db) ?? Promise.resolve();
+      let outcome: ScratchPair | { error: string; nextAction: string } | null = null;
+      const next = previous.then(async () => {
+        const fresh = readPool();
+        if (fresh.length > pool.length) return; // someone else already grew it
+        outcome = await createPair(fresh.length + 1, groupHint);
+      }).catch(() => undefined);
+      creationLocks.set(db, next);
+      await next;
+      if (outcome && 'error' in (outcome as any)) return outcome as { error: string; nextAction: string };
+      // Loop: re-read the pool and claim (the new pair, or any freed one).
+    }
   }
 
   async function runQuery(input: { sql: string; datasetDate?: string; group?: string }): Promise<QueryRunResult> {
@@ -297,61 +409,49 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       : `/* NO DEPENDENCIES */\n${sqlBody}`;
     const datasetDate = (input.datasetDate ?? '').trim() || new Date(now()).toISOString().slice(0, 10);
 
-    const pair = await ensureScratchPair(input.group);
-    if ('error' in pair) return { ok: false, error: pair.error, nextAction: pair.nextAction };
+    // Acquire a pair from the pool. Per-JOB serialization is the only real
+    // Datanet constraint (duplicate queued runs for one job + dataset date
+    // are collapsed — live 2026-09-02, first run came back DELETED; and a
+    // SQL revision under a queued run risks executing the wrong query).
+    // Parallelism across DIFFERENT pairs is unbounded by design (owner
+    // ruling 2026-09-09): busy pairs are skipped and the pool grows.
+    const handle = await acquirePair(input.group);
+    if ('error' in handle) return { ok: false, error: handle.error, nextAction: handle.nextAction };
 
-    // ONE query at a time: Datanet collapses duplicate queued runs for the
-    // same job + dataset date (live 2026-09-02: two back-to-back submissions
-    // both queued at peak → the first run came back DELETED), and staging a
-    // new SQL revision under a queued run risks it executing the wrong
-    // query. Fail-open on unknown states — only the known in-flight ones
-    // block, so a weird status can never brick the tool.
-    const inFlight = new Set(['NEW', 'SUBMITTED', 'RUNNABLE', 'EXECUTING',
-      'WAITING_FOR_RESOURCES', 'WAITING_FOR_REQUIREMENTS', 'WAITING_FOR_DEPENDENCIES']);
-    const latest = await call('datanet_get_latest_run', { job_id: pair.jobId });
-    if (!latest.isError) {
-      const latestRun = parseJson(latest.text);
-      const latestStatus = String(latestRun.status ?? '').toUpperCase();
-      const latestId = String(latestRun.id ?? '');
-      if (latestId && inFlight.has(latestStatus)) {
-        return {
-          ok: false,
-          runId: latestId,
-          error: `The ad-hoc job already has run ${latestId} in flight (${latestStatus}).`,
-          nextAction: `One ETL query at a time: poll mcp_etl_job_run with runId ${latestId} and download its results on SUCCESS — submitting another query now would make Datanet collapse the queued run.`,
-        };
-      }
-    }
-
-    // New revision on the scratch profile. A vanished profile (deleted
-    // server-side) re-creates the pair ONCE — self-heal, not a loop.
-    let update = await call('datanet_update_profile_sql', {
-      profile_id: String(pair.profileId),
-      sql,
-      profile_type: 'TRANSFORM',
-    }, { ownerApproved: true });
-    let profileId = pair.profileId;
-    let jobId = pair.jobId;
-    if (update.isError && /not.?found|does not exist/i.test(update.text)) {
-      console.log('[EtlAdhoc] pinned scratch pair missing server-side — recreating once');
-      clearPinnedPair();
-      const fresh = await ensureScratchPair(input.group);
-      if ('error' in fresh) return { ok: false, error: fresh.error, nextAction: fresh.nextAction };
-      profileId = fresh.profileId;
-      jobId = fresh.jobId;
-      update = await call('datanet_update_profile_sql', {
-        profile_id: String(profileId),
+    try {
+      // New revision on the claimed pair. A vanished profile (deleted
+      // server-side) prunes THIS pair and re-creates once — self-heal, not a loop.
+      let update = await call('datanet_update_profile_sql', {
+        profile_id: String(handle.pair.profileId),
         sql,
         profile_type: 'TRANSFORM',
       }, { ownerApproved: true });
-    }
-    if (update.isError) {
-      return {
-        ok: false,
-        error: `Could not stage the SQL on the scratch profile: ${firstLine(update.text)}`,
-        nextAction: 'Fix the reported issue (usually SQL syntax rejected by Datanet validation) and call again once.',
-      };
-    }
+      let profileId = handle.pair.profileId;
+      let jobId = handle.pair.jobId;
+      if (update.isError && /not.?found|does not exist/i.test(update.text)) {
+        console.log(`[EtlAdhoc] scratch pair (slot ${handle.pair.slot}) missing server-side — recreating once`);
+        prunePair(handle.pair.jobId);
+        handle.release();
+        const fresh = await acquirePair(input.group);
+        if ('error' in fresh) return { ok: false, error: fresh.error, nextAction: fresh.nextAction };
+        // Hand off to the replacement pair for the rest of the flow.
+        (handle as { pair: ScratchPair; release(): void }).pair = fresh.pair;
+        (handle as { pair: ScratchPair; release(): void }).release = fresh.release;
+        profileId = fresh.pair.profileId;
+        jobId = fresh.pair.jobId;
+        update = await call('datanet_update_profile_sql', {
+          profile_id: String(profileId),
+          sql,
+          profile_type: 'TRANSFORM',
+        }, { ownerApproved: true });
+      }
+      if (update.isError) {
+        return {
+          ok: false,
+          error: `Could not stage the SQL on the scratch profile: ${firstLine(update.text)}`,
+          nextAction: 'Fix the reported issue (usually SQL syntax rejected by Datanet validation) and call again once.',
+        };
+      }
 
     const submit = await call('datanet_submit_run', { job_id: jobId, dataset_date: datasetDate }, { ownerApproved: true });
     if (submit.isError) {
@@ -452,6 +552,12 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       truncated: body.length > maxRows,
       savedTo: output,
     };
+    } finally {
+      // Pair goes back to the pool whatever happened. A run handed off
+      // alive (budget exhausted) keeps its job busy SERVER-side — the next
+      // acquisition's pairBusy check skips it until the run terminalizes.
+      handle.release();
+    }
   }
 
   return { id: 'etl', runQuery };
