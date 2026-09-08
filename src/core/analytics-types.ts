@@ -135,27 +135,71 @@ export interface AnalyticsDashboard extends AnalyticsDashboardSummary {
   recentRuns: AnalyticsRun[];
 }
 
-export interface DashboardPublisherConfig {
-  id: 's3-cloudfront';
-  displayName: string;
-  enabled: boolean;
-  configured: boolean;
+/** Sharing providers (DASHBOARD_SHARING_PLAN §3). 'sftp' is announced but not wired yet. */
+export type PublisherProviderId = 'harmony' | 's3-cloudfront' | 'sftp';
+
+export interface S3PublisherSettings {
   bucket: string;
   prefix: string;
   region: string;
   awsProfile: string;
   cloudFrontBaseUrl: string;
+}
+
+export interface HarmonyPublisherSettings {
+  /** Team-owned software-app bindle (amzn1.bindle.resource.*) — first deploy binds it permanently. */
+  bindleId: string;
+  /** Harmony stage to deploy to (prod runs under a PTY; beta/gamma are non-interactive). */
+  stage: 'beta' | 'gamma' | 'prod';
+  /** Viewer audience, converged on every publish: everyone at Amazon, or only the publisher. */
+  visibility: 'everyone' | 'private';
+}
+
+/** Settings + derived display fields for the settings card. */
+export interface HarmonyPublisherView extends HarmonyPublisherSettings {
+  /** Derived (`<alias>-botboy-dashboard`) — never a user choice. */
+  appName: string;
+}
+
+export interface DashboardPublisherProviderSummary {
+  id: PublisherProviderId;
+  displayName: string;
+  enabled: boolean;
+  configured: boolean;
+  /** 'sftp' ships as a visible-but-disabled card in phase 1. */
+  available: boolean;
+  lastError?: string;
+  updatedAt: string;
+}
+
+export interface DashboardPublisherConfig {
+  /** The single active provider (enabled + configured), if any. */
+  id: PublisherProviderId | null;
+  displayName: string;
+  enabled: boolean;
+  configured: boolean;
+  providers: DashboardPublisherProviderSummary[];
+  /** Provider settings for the settings page forms. */
+  s3: S3PublisherSettings;
+  harmony: HarmonyPublisherView;
   lastError?: string;
   updatedAt: string;
 }
 
 export interface UpdateDashboardPublisherInput {
+  /** Which provider this update targets. Omitted = legacy S3 shape (back-compat). */
+  provider?: PublisherProviderId;
   enabled: boolean;
-  bucket: string;
+  // s3 fields (legacy flat shape kept for the existing form/API consumers)
+  bucket?: string;
   prefix?: string;
-  region: string;
-  awsProfile: string;
-  cloudFrontBaseUrl: string;
+  region?: string;
+  awsProfile?: string;
+  cloudFrontBaseUrl?: string;
+  // harmony fields (appName/appDir are DERIVED — not accepted as input)
+  bindleId?: string;
+  stage?: string;
+  visibility?: string;
 }
 
 export interface DashboardShareRequest {
@@ -173,11 +217,50 @@ export interface DashboardPublishResult {
   url: string;
 }
 
+export interface HarmonySetupProbe {
+  cliPresent: boolean;
+  cliVersion?: string;
+  bindleConfigured: boolean;
+  /** CLI deploys need a live ~/.midway jar — independent of browser Midway. */
+  midwayLive: boolean;
+  ready: boolean;
+  nextAction: 'install-cli' | 'configure-bindle' | 'ready';
+  detail: string;
+}
+
+export interface HarmonyProvisioningPlan {
+  alias: string;
+  teamName: string;
+  bindleName: string;
+  appName: string;
+  summary: string;
+}
+
+export interface HarmonyProvisionOutcome {
+  teamId: string;
+  bindleId: string;
+  teamName: string;
+  bindleName: string;
+  createdTeam: boolean;
+  createdBindle: boolean;
+  detail: string;
+  /** Config after the bindle ID was merged into the Harmony provider row. */
+  publisher: DashboardPublisherConfig;
+}
+
 export interface DashboardPublisherService {
   getConfig(): DashboardPublisherConfig;
   updateConfig(input: UpdateDashboardPublisherInput): DashboardPublisherConfig;
   createShareRequest(dashboardId: string): DashboardShareRequest;
   publish(dashboardId: string, confirmationToken: string): Promise<DashboardPublishResult>;
+  /** Harmony setup stepper: where is the owner in install-cli → bindle → ready? */
+  probeHarmonySetup(): Promise<HarmonySetupProbe>;
+  /** One-click `toolbox install harmonycli` (the 99% first-run path). */
+  installHarmonyCli(): Promise<{ ok: boolean; detail: string; probe: HarmonySetupProbe }>;
+  /** What automated provisioning WOULD create (the confirm card content). */
+  planHarmonyProvisioning(): HarmonyProvisioningPlan;
+  /** Create team + bindle (idempotent) and store the bindle ID in the Harmony config. */
+  provisionHarmonyIdentity(): Promise<HarmonyProvisionOutcome>;
 }
 
 export interface AnalyticsDashboardService {

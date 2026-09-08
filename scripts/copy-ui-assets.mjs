@@ -37,6 +37,9 @@ const vendorAssets = [
   ['vega/build/vega.min.js', 'vega.min.js'],
   ['vega-lite/build/vega-lite.min.js', 'vega-lite.min.js'],
   ['vega-embed/build/vega-embed.min.js', 'vega-embed.min.js'],
+  // CSP-safe expression interpreter (no eval) — published bundles run under
+  // Harmony's strict CSP, which blocks Vega's default expression compiler.
+  ['vega-interpreter/build/vega-interpreter.js', 'vega-interpreter.js'],
 ];
 for (const [modulePath, filename] of vendorAssets) {
   if (copyIfChanged(join(root, 'node_modules', modulePath), join(destinationVendor, filename))) copied++;

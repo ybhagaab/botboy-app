@@ -57,7 +57,7 @@ const state = {
     announcedRuns: new Set(),
     visualizationViews: new Map(),
   },
-  publisher: { config: null, error: '', loading: false, saving: false, preparing: new Set(), pending: new Map(), publishing: new Set() },
+  publisher: { config: null, error: '', loading: false, saving: false, preparing: new Set(), pending: new Map(), publishing: new Set(), harmonyProbe: null, probing: false, installingCli: false, provisionPlan: null, provisioning: false, expandedProvider: undefined, mwinitOpening: false },
   channels: { data: null, error: '', loading: false, running: false },
   documents: {
     items: null,
@@ -2856,6 +2856,85 @@ async function loadPublisherConfig({ force = false } = {}) {
   }
 }
 
+async function loadHarmonyProbe({ force = false } = {}) {
+  if (state.publisher.probing || (state.publisher.harmonyProbe && !force)) return;
+  state.publisher.probing = true;
+  if (force) renderRoute();
+  try {
+    const payload = await request('/analytics/publisher/harmony/probe');
+    state.publisher.harmonyProbe = payload.probe;
+  } catch (error) {
+    state.publisher.harmonyProbe = { cliPresent: false, bindleConfigured: false, midwayLive: true, ready: false, nextAction: 'install-cli', detail: `Could not check the Harmony CLI: ${error.message}` };
+  } finally {
+    state.publisher.probing = false;
+    if (state.route.view === 'publisher-settings') renderRoute();
+  }
+}
+
+async function openHarmonyMwinitTerminal() {
+  if (state.publisher.mwinitOpening) return;
+  state.publisher.mwinitOpening = true;
+  renderRoute({ userAction: true });
+  try {
+    const result = await request('/analytics/publisher/harmony/mwinit', { method: 'POST', body: {} });
+    if (result.alreadyLive) {
+      toast('Midway session is already live');
+      void loadHarmonyProbe({ force: true });
+    } else {
+      toast('Terminal opened in chat — enter your PIN and touch your security key, then re-check');
+    }
+  } catch (error) {
+    toast(`Could not open the terminal: ${error.message}`, 'bad');
+  } finally {
+    state.publisher.mwinitOpening = false;
+    if (state.route.view === 'publisher-settings') renderRoute({ userAction: true });
+  }
+}
+
+async function installHarmonyCliAction() {
+  if (state.publisher.installingCli) return;
+  state.publisher.installingCli = true;
+  renderRoute({ userAction: true });
+  try {
+    const result = await request('/analytics/publisher/harmony/install-cli', { method: 'POST', body: {} });
+    state.publisher.harmonyProbe = result.probe || state.publisher.harmonyProbe;
+    toast(result.detail || 'Harmony CLI installed', result.ok ? undefined : 'bad');
+  } catch (error) {
+    toast(`Install failed: ${error.message}`, 'bad');
+    void loadHarmonyProbe({ force: true });
+  } finally {
+    state.publisher.installingCli = false;
+    if (state.route.view === 'publisher-settings') renderRoute();
+  }
+}
+
+async function showHarmonyProvisionPlan() {
+  try {
+    const payload = await request('/analytics/publisher/harmony/provision-plan');
+    state.publisher.provisionPlan = payload.plan;
+  } catch (error) {
+    toast(`Could not build the setup plan: ${error.message}`, 'bad');
+  }
+  if (state.route.view === 'publisher-settings') renderRoute({ userAction: true });
+}
+
+async function confirmHarmonyProvision() {
+  if (state.publisher.provisioning) return;
+  state.publisher.provisioning = true;
+  renderRoute({ userAction: true });
+  try {
+    const result = await request('/analytics/publisher/harmony/provision', { method: 'POST', body: { confirmed: true } });
+    state.publisher.config = result.publisher;
+    state.publisher.provisionPlan = null;
+    toast(result.detail || 'Team and bindle ready');
+  } catch (error) {
+    toast(`Setup failed: ${error.message}`, 'bad');
+  } finally {
+    state.publisher.provisioning = false;
+    if (state.route.view === 'publisher-settings') renderRoute({ userAction: true });
+  }
+}
+
 function renderPublisherSettings() {
   if (!state.publisher.config && !state.publisher.error) {
     void loadPublisherConfig();
@@ -2863,20 +2942,67 @@ function renderPublisherSettings() {
   }
   const config = state.publisher.config;
   if (!config) return `${pageHead('Settings', 'Dashboard sharing', 'Configure a confirmation-gated snapshot publisher.')} ${errorView(state.publisher.error)}`;
-  return `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>Dashboard sharing</span></div>${pageHead('Publishing settings', 'Dashboard sharing', 'Publish fixed dashboard copies through an existing private S3 origin and CloudFront distribution.', '<a class="button" href="#/settings">Back</a>')}<section class="grid publisher-settings-grid"><form id="publisher-config-form" class="card mcp-form"><div class="card-header"><div><h2 class="card-title">S3 + CloudFront</h2><div class="card-meta">Configuration only · no upload occurs when saving</div></div><span class="pill ${config.enabled && config.configured ? 'good' : ''}">${config.enabled && config.configured ? 'Ready' : config.configured ? 'Paused' : 'Needs setup'}</span></div>${config.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(config.lastError)}</span></div>` : ''}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Enable snapshot publishing</strong><small>Every upload still requires a separate, expiring confirmation.</small></span><input name="enabled" type="checkbox" ${config.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Destination</h3><p>BotBoy uploads one unique HTML object and never modifies S3 or CloudFront configuration.</p><div class="mcp-field-grid">${mcpField('bucket', 'S3 bucket', config.bucket, { placeholder: 'company-dashboard-snapshots' })}${mcpField('prefix', 'Object prefix', config.prefix, { placeholder: 'botboy-dashboards' })}${mcpField('region', 'AWS region', config.region, { placeholder: 'us-east-1' })}${mcpField('awsProfile', 'Least-privilege AWS profile', config.awsProfile, { placeholder: 'BotBoyDashboardPublisher', help: 'Use a dedicated profile allowed to PutObject only under this prefix. Do not use AdministratorAccess.' })}</div>${mcpField('cloudFrontBaseUrl', 'CloudFront base URL', config.cloudFrontBaseUrl, { placeholder: 'https://dashboards.example.com', help: 'Use an existing distribution whose private origin can read the configured S3 prefix.' })}</div><div class="mcp-section"><h3>Safety boundary</h3><p>This publisher never changes ACLs, bucket policies, public-access blocks, distribution settings, deletion protection, versioning, or retention. Those controls remain externally managed.</p><div class="publisher-safety-list"><span>${icon('check', 14)} One PutObject per confirmation</span><span>${icon('check', 14)} Unique immutable snapshot key</span><span>${icon('check', 14)} No SQL or credentials in output</span><span>${icon('check', 14)} Local dashboard remains canonical</span></div></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Treat the destination as production</span><button class="button primary" type="submit" ${state.publisher.saving ? 'disabled' : ''}>${state.publisher.saving ? 'Saving…' : 'Save publisher'}</button></div></form><aside class="mcp-side"><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Credential scope</div><h3 class="card-title">Dedicated PutObject role</h3><p class="page-subtitle">The configured profile should only write to the chosen bucket prefix. CloudFront origin access should remain separate.</p></article><article class="card pad"><div class="eyebrow">${icon('file', 14)} Snapshot model</div><h3 class="card-title">A copy, never the source</h3><p class="page-subtitle">Published HTML contains current rendered values only. It has no scripts, live query access, project IDs, credentials, or SQL text.</p></article><article class="card pad"><div class="eyebrow">${icon('alert', 14)} Explicit impact</div><h3 class="card-title">Confirmation happens last</h3><p class="page-subtitle">The dashboard page shows the exact S3 destination, profile, content hash, and exposure warning before enabling upload.</p></article></aside></section>`;
+  const provider = id => (config.providers || []).find(p => p.id === id) || { enabled: false, configured: false };
+  const pill = p => `<span class="pill ${p.enabled && p.configured ? 'good' : ''}">${p.enabled && p.configured ? 'Active' : p.configured ? 'Paused' : 'Needs setup'}</span>`;
+  const harmony = provider('harmony');
+  const s3 = provider('s3-cloudfront');
+  const saving = state.publisher.saving;
+
+  const probe = state.publisher.harmonyProbe;
+  if (!probe && !state.publisher.probing) void loadHarmonyProbe();
+  const installing = state.publisher.installingCli;
+  const cliStep = !probe
+    ? `<p class="card-meta">Checking for the Harmony CLI…</p>`
+    : probe.cliPresent
+      ? `<p>${icon('check', 14)} CLI ready${probe.cliVersion ? ` — <code>${esc(probe.cliVersion)}</code>` : ''}</p>`
+      : `<button class="button primary" type="button" data-action="harmony-install-cli" ${installing ? 'disabled' : ''}>${installing ? 'Installing… (takes a minute)' : 'Install Harmony CLI'}</button><small class="card-meta">Not installed yet (normal on first setup). One click runs <code>toolbox install harmonycli</code>.</small>`;
+  const visibility = config.harmony?.visibility || 'everyone';
+
+  // Accordion: one provider open at a time — the active one, else Harmony (the recommended default).
+  const expanded = state.publisher.expandedProvider !== undefined
+    ? state.publisher.expandedProvider
+    : (config.id || 'harmony');
+  const shell = (id, title, meta, pillHtml, inner, { form = true } = {}) => {
+    const open = expanded === id;
+    const tag = form ? 'form' : 'article';
+    return `<${tag} class="card mcp-form publisher-card${open ? '' : ' publisher-collapsed'}"${form ? ` data-publisher-provider="${id}"` : ''}><div class="card-header publisher-card-toggle" data-action="publisher-toggle" data-provider="${id}" role="button" aria-expanded="${open}"><div><h2 class="card-title">${title}</h2><div class="card-meta">${meta}</div></div><div class="publisher-head-right">${pillHtml}<span class="publisher-chevron">${icon('chevron-right', 13)}</span></div></div>${inner}</${tag}>`;
+  };
+
+  const harmonyMeta = harmony.configured
+    ? `Amazon internal · ${esc(config.harmony?.stage || 'beta')} · ${visibility === 'everyone' ? 'everyone at Amazon' : 'only me'}`
+    : 'Amazon internal · interactive · recommended';
+  const midwayHint = probe && probe.cliPresent && probe.midwayLive === false
+    ? `<div class="mcp-alert">${icon('alert', 15)}<span>The Harmony CLI's Midway session is missing or expired (your browser's Midway is separate). </span><button class="button" type="button" data-action="harmony-mwinit" ${state.publisher.mwinitOpening ? 'disabled' : ''}>${state.publisher.mwinitOpening ? 'Opening terminal…' : 'Sign in (mwinit) in BotBoy terminal'}</button></div>`
+    : '';
+  const harmonyBody = `${harmony.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(harmony.lastError)}</span></div>` : ''}${midwayHint}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Use Harmony for dashboard sharing</strong><small>Publishes run <code>harmony app deploy</code> and apply your audience choice. Every publish keeps the expiring confirmation.</small></span><input name="enabled" type="checkbox" ${harmony.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Step 1 · CLI</h3>${cliStep}</div><div class="mcp-section"><h3>Step 2 · Team bindle</h3>${state.publisher.provisionPlan ? `<div class="mcp-alert" style="border-color:rgba(157,140,255,.35)">${icon('shield', 15)}<span><strong>Review before creating:</strong> ${esc(state.publisher.provisionPlan.summary)}</span></div><div class="publisher-inline-actions"><button class="button primary" type="button" data-action="harmony-provision-confirm" ${state.publisher.provisioning ? 'disabled' : ''}>${state.publisher.provisioning ? 'Creating…' : 'Create these for me'}</button><button class="button" type="button" data-action="harmony-provision-cancel" ${state.publisher.provisioning ? 'disabled' : ''}>Cancel</button></div>` : `<button class="button" type="button" data-action="harmony-provision-plan">Set up automatically</button><small class="card-meta">BotBoy creates a personal team + team bindle for you (you confirm the exact names first). Personal bindles are rejected by Harmony; the bindle binds permanently at first publish.</small>`}${mcpField('bindleId', 'Team bindle ID', config.harmony?.bindleId || '', { placeholder: 'amzn1.bindle.resource.…', help: 'Or paste one from bindles.amazon.com (a Software Application bindle of a team you belong to).' })}</div><div class="mcp-section"><h3>Step 3 · Target</h3><div class="mcp-field-grid"><label class="mcp-field"><span>Stage</span><select name="stage">${['beta', 'gamma', 'prod'].map(stage => `<option value="${stage}" ${config.harmony?.stage === stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><small>Start with beta. Prod = permanent URL; deploys run in a BotBoy-managed terminal.</small></label><label class="mcp-field"><span>Who can view</span><select name="visibility"><option value="everyone" ${visibility === 'everyone' ? 'selected' : ''}>Everyone at Amazon (Midway)</option><option value="private" ${visibility === 'private' ? 'selected' : ''}>Only me</option></select><small>App-wide, re-applied on every publish. Never publish Critical/Restricted data. "Only me" caveat: the classic console path bypasses it until the subdomain redirect is on.</small></label></div><small class="card-meta">App name is fixed: <code>${esc(config.harmony?.appName || '')}</code>; dashboards live under <code>/d/&lt;id&gt;/</code>.</small></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Deploys use your local Midway session (mwinit)</span><button class="button primary" type="submit" ${saving ? 'disabled' : ''}>${saving ? 'Saving…' : 'Save Harmony'}</button></div>`;
+
+  const s3Body = `${s3.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(s3.lastError)}</span></div>` : ''}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Use S3 + CloudFront for dashboard sharing</strong><small>Your admin provisions bucket + CDN; BotBoy only ever does one PutObject per confirmed publish.</small></span><input name="enabled" type="checkbox" ${s3.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Destination</h3><div class="mcp-field-grid">${mcpField('bucket', 'S3 bucket', config.s3?.bucket || '', { placeholder: 'company-dashboard-snapshots' })}${mcpField('prefix', 'Object prefix', config.s3?.prefix || '', { placeholder: 'botboy-dashboards' })}${mcpField('region', 'AWS region', config.s3?.region || '', { placeholder: 'us-east-1' })}${mcpField('awsProfile', 'Least-privilege AWS profile', config.s3?.awsProfile || '', { placeholder: 'BotBoyDashboardPublisher', help: 'A profile allowed to PutObject only under this prefix — never AdministratorAccess.' })}</div>${mcpField('cloudFrontBaseUrl', 'CloudFront base URL', config.s3?.cloudFrontBaseUrl || '', { placeholder: 'https://dashboards.example.com', help: 'An existing distribution whose private origin reads this bucket/prefix.' })}</div><div class="mcp-section"><h3>Safety boundary</h3><div class="publisher-safety-list"><span>${icon('check', 14)} One PutObject per confirmation</span><span>${icon('check', 14)} Never touches ACLs, policies, or CDN config</span><span>${icon('check', 14)} No SQL or credentials in output</span><span>${icon('check', 14)} Local dashboard remains canonical</span></div></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Treat the destination as production</span><button class="button primary" type="submit" ${saving ? 'disabled' : ''}>${saving ? 'Saving…' : 'Save S3'}</button></div>`;
+
+  const sftpBody = `<div class="mcp-form-body"><p class="page-subtitle">Push the dashboard bundle to any static host you already pay for (SFTP/FTPS). Viewing is whatever your host serves — often public. Not configurable yet.</p></div>`;
+
+  return `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>Dashboard sharing</span></div>${pageHead('Publishing settings', 'Dashboard sharing', 'Pick where BotBoy publishes shared dashboards. One provider is active at a time; every publish keeps the two-step confirmation.', '<a class="button" href="#/settings">Back</a>')}<section class="publisher-provider-stack">${shell('harmony', 'Amazon Harmony', harmonyMeta, pill(harmony), harmonyBody)}${shell('s3-cloudfront', 'S3 + CloudFront', s3.configured ? `Enterprise bucket + CDN · ${esc(config.s3?.bucket || '')}` : 'Enterprise bucket + CDN · single-file snapshot (legacy)', pill(s3), s3Body)}${shell('sftp', 'SFTP / static host', 'Individuals & simple teams · low security', '<span class="pill">Coming later</span>', sftpBody, { form: false })}</section>`;
 }
 
-async function savePublisherConfig() {
-  const form = document.getElementById('publisher-config-form');
+async function savePublisherConfig(form) {
   if (!form || state.publisher.saving) return;
-  const payload = {
-    enabled: Boolean(form.elements.enabled?.checked),
-    bucket: form.elements.bucket?.value,
-    prefix: form.elements.prefix?.value,
-    region: form.elements.region?.value,
-    awsProfile: form.elements.awsProfile?.value,
-    cloudFrontBaseUrl: form.elements.cloudFrontBaseUrl?.value,
-  };
+  const provider = form.dataset.publisherProvider || 's3-cloudfront';
+  const payload = provider === 'harmony'
+    ? {
+        provider,
+        enabled: Boolean(form.elements.enabled?.checked),
+        bindleId: form.elements.bindleId?.value,
+        stage: form.elements.stage?.value,
+        visibility: form.elements.visibility?.value,
+      }
+    : {
+        provider,
+        enabled: Boolean(form.elements.enabled?.checked),
+        bucket: form.elements.bucket?.value,
+        prefix: form.elements.prefix?.value,
+        region: form.elements.region?.value,
+        awsProfile: form.elements.awsProfile?.value,
+        cloudFrontBaseUrl: form.elements.cloudFrontBaseUrl?.value,
+      };
   state.publisher.saving = true;
   renderRoute({ userAction: true });
   try {
@@ -5229,6 +5355,19 @@ function bindEvents() {
     if (action === 'analytics-cancel-refresh') void cancelAnalyticsRefresh(target.dataset.dashboard);
     if (action === 'analytics-delete') void deleteAnalyticsDashboard(target.dataset.dashboard);
     if (action === 'share-prepare') void prepareDashboardShare(target.dataset.dashboard);
+    if (action === 'publisher-toggle') {
+      const id = target.dataset.provider;
+      const current = state.publisher.expandedProvider !== undefined
+        ? state.publisher.expandedProvider
+        : (state.publisher.config?.id || 'harmony');
+      state.publisher.expandedProvider = current === id ? null : id;
+      renderRoute({ userAction: true });
+    }
+    if (action === 'harmony-install-cli') void installHarmonyCliAction();
+    if (action === 'harmony-mwinit') void openHarmonyMwinitTerminal();
+    if (action === 'harmony-provision-plan') void showHarmonyProvisionPlan();
+    if (action === 'harmony-provision-confirm') void confirmHarmonyProvision();
+    if (action === 'harmony-provision-cancel') { state.publisher.provisionPlan = null; renderRoute({ userAction: true }); }
     if (action === 'share-cancel') cancelDashboardShare(target.dataset.dashboard);
     if (action === 'share-confirm') void publishDashboardShare(target.dataset.dashboard);
     if (action === 'close-integration') go(state.route.view === 'nodes' ? '#/settings' : '#/connections');
@@ -5248,9 +5387,9 @@ function bindEvents() {
       void saveAnalyticsSchedule(event.target);
       return;
     }
-    if (event.target?.id === 'publisher-config-form') {
+    if (event.target?.dataset?.publisherProvider) {
       event.preventDefault();
-      void savePublisherConfig();
+      void savePublisherConfig(event.target);
       return;
     }
     if (event.target?.id === 'mcp-config-form') {

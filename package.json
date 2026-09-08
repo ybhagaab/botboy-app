@@ -34,6 +34,7 @@
     "uuid": "^10.0.0",
     "vega": "6.3.1",
     "vega-embed": "7.1.0",
+    "vega-interpreter": "2.3.1",
     "vega-lite": "6.4.3",
     "ws": "^8.19.0"
   },

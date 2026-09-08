@@ -820,3 +820,19 @@ button.doc-annotation:hover, .doc-annotation.active { border-color:rgba(157,140,
 .chat-attachments { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:7px; }
 .chat-attachments img { display:block; max-width:200px; max-height:160px; border:1px solid var(--border-strong); border-radius:9px; }
 .chat-msg.user .chat-attachments img { max-width:160px; max-height:130px; }
+
+/* ── Dashboard sharing: provider accordion (2026-09-08, collapsible 2026-09-09) ── */
+.publisher-provider-stack { display:grid; gap:14px; max-width:960px; }
+.publisher-card-toggle { cursor:pointer; user-select:none; }
+.publisher-card-toggle:hover { background:color-mix(in srgb,var(--hover) 55%,var(--surface)); }
+.publisher-head-right { display:flex; align-items:center; gap:10px; }
+.publisher-chevron { display:grid; place-items:center; color:var(--muted); }
+.publisher-chevron svg { transition:transform .22s cubic-bezier(.2,.8,.2,1); }
+.publisher-card:not(.publisher-collapsed) .publisher-chevron svg { transform:rotate(90deg); }
+.publisher-collapsed .mcp-form-body,
+.publisher-collapsed .mcp-form-actions,
+.publisher-collapsed .mcp-alert { display:none; }
+.publisher-collapsed .card-header { border-radius:var(--radius-lg); }
+.publisher-inline-actions { display:flex; gap:8px; margin:8px 0; }
+.publisher-card .mcp-section h3 { margin-bottom:8px; }
+.publisher-card .mcp-section .card-meta { display:block; margin-top:7px; line-height:1.5; }

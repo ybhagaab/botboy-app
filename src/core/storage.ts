@@ -794,6 +794,18 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
   for (const profile of listBuiltInMcpProfiles()) {
     seedMcpServer.run(profile.id, profile.kind, profile.displayName, profile.seedConfigJson);
   }
+  // Provider portfolio (DASHBOARD_SHARING_PLAN §3): harmony is the phase-1
+  // build, sftp is announced but disabled until phase 3.
+  db.prepare(`
+    INSERT OR IGNORE INTO dashboard_publishers
+      (id, kind, display_name, enabled, config_json)
+    VALUES ('harmony', 'harmony', 'Amazon Harmony', 0, '{}')
+  `).run();
+  db.prepare(`
+    INSERT OR IGNORE INTO dashboard_publishers
+      (id, kind, display_name, enabled, config_json)
+    VALUES ('sftp', 'sftp', 'SFTP / static host', 0, '{}')
+  `).run();
   db.prepare(`
     INSERT OR IGNORE INTO dashboard_publishers
       (id, kind, display_name, enabled, config_json)
