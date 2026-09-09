@@ -24,9 +24,10 @@ workspace content, private messages, or personal data.
 
 ### Your day, prioritized
 
-One screen to start from: what needs your attention, who is waiting on a
-reply from you, and what changed while you were away — ranked, sourced, and
-current.
+BotBoy's redesigned Today view is cleaner, calmer, and easier to navigate than
+before. Priorities and blockers are grouped by project instead of repeated
+across long lists, while meaningful changes use concise, evidence-backed
+summaries. Less clutter, more context, faster action.
 
 ![BotBoy Today overview with a prioritized attention brief](docs/screenshots/today-overview.png)
 
