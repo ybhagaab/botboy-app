@@ -2,7 +2,7 @@
 // The legacy app.js remains loaded for its proven chat streaming and capture-settings
 // workflows; this module owns the new shell, routing, and read-model rendering.
 
-import { renderTodayView } from './today.js';
+import { nextTodayFocusIndex, renderTodayView, todayPaneHandoffDelta } from './today.js';
 
 const API = '/api';
 const DOCUMENT_LIST_LIMIT = 100;
@@ -17,7 +17,7 @@ const state = {
   projectDetails: new Map(),
   projectErrors: new Map(),
   health: null,
-  today: { data: null, error: '', opening: false, pending: new Set() },
+  today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
   slack: { configured: null, error: '' },
@@ -424,6 +424,47 @@ function setTodayControlsDisabled(itemId, disabled) {
   });
 }
 
+function todayProjectActionKey(section, projectId) {
+  return `today-project:${section}:${projectId}`;
+}
+
+function setTodayProjectControlsDisabled(projectId, section, disabled) {
+  document.querySelectorAll('[data-action="today-project-snooze"],[data-action="today-project-dismiss"],[data-action="today-project-restore"]').forEach(control => {
+    if (control.dataset.project === projectId && control.dataset.section === section) control.disabled = disabled;
+  });
+}
+
+function todayDeferredProjectIds(data = state.today.data) {
+  return [...new Set((data?.deferred || []).map(item => item.projectId).filter(Boolean))];
+}
+
+function reconcileTodayDeferredSelection(previousIds) {
+  const nextIds = todayDeferredProjectIds();
+  const selected = state.today.deferredProject;
+  if (!selected || nextIds.includes(selected)) return;
+  const previousIndex = Math.max(0, previousIds.indexOf(selected));
+  state.today.deferredProject = nextIds[Math.min(previousIndex, Math.max(0, nextIds.length - 1))] || '';
+}
+
+function revealTodayDeferredSelection(focus = false, projectId = state.today.deferredProject) {
+  requestAnimationFrame(() => {
+    const selected = projectId
+      ? document.querySelector(`.today-deferred-summary[data-project="${CSS.escape(projectId)}"]`)
+      : null;
+    const target = selected || document.getElementById('today-set-aside');
+    if (focus) target?.focus({ preventScroll: true });
+    target?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}
+
+function revealTodayFocus(section, focus = false) {
+  requestAnimationFrame(() => {
+    const selected = document.querySelector(`.today-focus-board[data-section="${section}"] .today-focus-tab.selected`);
+    if (focus) selected?.focus({ preventScroll: true });
+    selected?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}
+
 function focusTodayControl(itemId, preferredAction) {
   const controls = [...document.querySelectorAll('[data-item]')];
   const preferred = controls.find(control => control.dataset.item === itemId && control.dataset.action === preferredAction);
@@ -433,6 +474,7 @@ function focusTodayControl(itemId, preferredAction) {
 
 async function updateTodayItem(itemId, action, expectedVersion) {
   if (!itemId || state.today.pending.has(itemId)) return;
+  const deferredProjectsBefore = todayDeferredProjectIds();
   state.today.pending.add(itemId);
   setTodayControlsDisabled(itemId, true);
   let succeeded = false;
@@ -448,6 +490,7 @@ async function updateTodayItem(itemId, action, expectedVersion) {
     if (action === 'snooze') body.snoozedUntil = tomorrowMorningIso();
     await request(`/today/items/${encodeURIComponent(itemId)}`, { method: 'PATCH', body });
     await refreshToday({ render: false, propagate: true });
+    if (action === 'restore') reconcileTodayDeferredSelection(deferredProjectsBefore);
     succeeded = true;
     const messages = {
       pin: 'Pinned to Today', unpin: 'Removed pin', snooze: 'Snoozed until tomorrow morning',
@@ -460,34 +503,90 @@ async function updateTodayItem(itemId, action, expectedVersion) {
   } finally {
     state.today.pending.delete(itemId);
     if (state.route.view === 'today') {
-      renderRoute({ userAction: true });
-      if (succeeded) requestAnimationFrame(() => focusTodayControl(itemId, ['snooze', 'dismiss'].includes(action) ? 'today-restore' : 'today-pin'));
+      renderRoute({ userAction: true, preserveScroll: true });
+      if (succeeded) {
+        if (action === 'restore') revealTodayDeferredSelection(true);
+        else requestAnimationFrame(() => focusTodayControl(itemId, ['snooze', 'dismiss'].includes(action) ? 'today-restore' : 'today-pin'));
+      }
     } else {
       setTodayControlsDisabled(itemId, false);
     }
   }
 }
 
+async function updateTodayProject(projectId, section, action) {
+  const sectionAction = ['attention', 'waiting'].includes(section) && ['snooze', 'dismiss'].includes(action);
+  const deferredRestore = section === 'deferred' && action === 'restore';
+  if (!projectId || (!sectionAction && !deferredRestore)) return;
+  const deferredProjectsBefore = todayDeferredProjectIds();
+  const pendingKey = todayProjectActionKey(section, projectId);
+  if (state.today.pending.has(pendingKey)) return;
+  state.today.pending.add(pendingKey);
+  setTodayProjectControlsDisabled(projectId, section, true);
+  let succeeded = false;
+  try {
+    const session = todaySession();
+    if (!session) throw new Error('Today session is stale; refresh the page and try again');
+    const body = { section, action, ...session };
+    if (action === 'snooze') body.snoozedUntil = tomorrowMorningIso();
+    await request(`/today/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', body });
+    await refreshToday({ render: false, propagate: true });
+    if (deferredRestore) reconcileTodayDeferredSelection(deferredProjectsBefore);
+    succeeded = true;
+    toast(action === 'snooze'
+      ? `Snoozed current ${section} items until tomorrow morning`
+      : action === 'dismiss'
+        ? `Cleared current ${section} items`
+        : 'Restored this project’s current Set aside items');
+  } catch (error) {
+    toast(`Could not update this project: ${error.message}`, 'bad');
+  } finally {
+    state.today.pending.delete(pendingKey);
+    if (state.route.view === 'today') {
+      renderRoute({ userAction: true, preserveScroll: true });
+      if (succeeded) {
+        if (deferredRestore) revealTodayDeferredSelection(true);
+        else revealTodayFocus(section, true);
+      }
+    } else {
+      setTodayProjectControlsDisabled(projectId, section, false);
+    }
+  }
+}
+
 function planDay() {
   const data = state.today.data;
-  const actions = (data?.attention || []).slice(0, 8);
-  const waiting = (data?.waiting || []).slice(0, 5);
+  // Grouped per project like the page itself (one project = one entry).
+  const actionGroups = (data?.attentionGroups || []).slice(0, 6);
+  const waitingGroups = (data?.waitingGroups || []).slice(0, 4);
   const changes = (data?.changes || []).slice(0, 4);
   const lines = ['Today plan'];
+  const pushGroup = (group, index) => {
+    lines.push(`${index + 1}. ${group.projectTitle}`);
+    (group.items || []).forEach(item => lines.push(`    ◦ ${item.title}`));
+    if (!(group.items || []).length && group.focus) lines.push(`    ◦ ${group.focus}`);
+  };
 
-  if (actions.length) {
+  if (actionGroups.length) {
     lines.push('', 'Start with:');
-    actions.forEach((item, index) => lines.push(`${index + 1}. ${item.title} — ${item.projectTitle}`));
+    actionGroups.forEach(pushGroup);
   } else {
     lines.push('', 'No explicit action is currently ranked.');
   }
-  if (waiting.length) {
+  if (waitingGroups.length) {
     lines.push('', 'Waiting or blocked to review:');
-    waiting.forEach(item => lines.push(`• ${item.title} — ${item.projectTitle}`));
+    waitingGroups.forEach(pushGroup);
   }
   if (changes.length) {
     lines.push('', 'Meaningful changes to scan:');
-    changes.forEach(item => lines.push(`• ${item.projectTitle}: ${item.title}`));
+    // item.title is the headline gist; extra lines ride along so the plan
+    // reads as sentences, not subjects (TODAY_CHANGES_PLAN.md).
+    changes.forEach(item => {
+      const extra = Array.isArray(item.items) ? item.items.slice(1) : [];
+      lines.push(`• ${item.projectTitle}: ${item.title}`);
+      extra.forEach(line => lines.push(`    ◦ ${line.gist}`));
+      if (Number(item.hiddenCount) > 0) lines.push(`    ◦ +${item.hiddenCount} more`);
+    });
   }
   lines.push('', 'Built locally from the current Today ranking. No tools or workspace actions were run.');
 
@@ -617,11 +716,51 @@ function renderSidebar() {
     </div>${state.areas.length > 5 ? `<button class="show-more" type="button" data-action="toggle-all-areas">${state.showAllAreas ? 'Show fewer areas' : `Show ${state.areas.length - 5} more areas`}</button>` : ''}</section>`;
 }
 
+// Today focus boards (list-detail): one selected project per section. Only
+// owner selections persist; a background render keeps the selection while it
+// remains present and falls back to the first ranked project when it leaves.
+const TODAY_FOCUS_STORAGE_KEY = 'botboy.today.focus';
+function todayFocusState() {
+  if (state.today.focus) return state.today.focus;
+  let focus = {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TODAY_FOCUS_STORAGE_KEY) || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const section of ['attention', 'waiting', 'changes']) {
+        if (typeof parsed[section] === 'string') focus[section] = parsed[section];
+      }
+    }
+    // One-time retirement of the superseded accordion state.
+    localStorage.removeItem('botboy.today.stacks');
+  } catch { /* corrupt/private storage — ranked defaults win */ }
+  state.today.focus = focus;
+  return focus;
+}
+function todayFocusId(section, ids) {
+  const stored = todayFocusState()[section];
+  return ids.includes(stored) ? stored : (ids[0] || '');
+}
+function setTodayFocus(section, projectId) {
+  if (!['attention', 'waiting', 'changes'].includes(section) || !projectId) return;
+  const focus = todayFocusState();
+  focus[section] = projectId;
+  try { localStorage.setItem(TODAY_FOCUS_STORAGE_KEY, JSON.stringify(focus)); } catch { /* private mode */ }
+}
+function todayFocusContext(data = state.today.data) {
+  return {
+    attention: todayFocusId('attention', (data?.attentionGroups || []).map(group => group.projectId)),
+    waiting: todayFocusId('waiting', (data?.waitingGroups || []).map(group => group.projectId)),
+    changes: todayFocusId('changes', (data?.changes || []).map(item => item.projectId)),
+  };
+}
+
 function renderToday() {
   return renderTodayView({
     data: state.today.data,
     error: state.today.error,
     pending: state.today.pending,
+    focus: todayFocusContext(),
+    deferredProject: state.today.deferredProject,
     health: state.health,
     inbox: state.inbox,
     pageHead,
@@ -4814,7 +4953,62 @@ async function organizeInbox() {
   }
 }
 
+function handleTodayPaneWheel(event) {
+  if (event.ctrlKey || event.shiftKey) return;
+  const pane = event.target?.closest?.('.today-focus-rail, .today-focus-detail');
+  if (!pane) return;
+  const handoff = todayPaneHandoffDelta({
+    scrollTop: pane.scrollTop,
+    scrollHeight: pane.scrollHeight,
+    clientHeight: pane.clientHeight,
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+  });
+  if (handoff === 0) return;
+
+  // A nested scroller gets first refusal. This matters for future detail
+  // controls: reaching the pane boundary must not steal a gesture while an
+  // inner auto/scroll region still has room in that direction.
+  let current = event.target instanceof Element ? event.target : null;
+  while (current && current !== pane) {
+    const overflowY = getComputedStyle(current).overflowY;
+    if (/^(auto|scroll|overlay)$/.test(overflowY)) {
+      const nestedHandoff = todayPaneHandoffDelta({
+        scrollTop: current.scrollTop,
+        scrollHeight: current.scrollHeight,
+        clientHeight: current.clientHeight,
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+      });
+      if (nestedHandoff === 0) return;
+    }
+    current = current.parentElement;
+  }
+
+  const workspace = document.getElementById('workspace');
+  if (!workspace) return;
+  const workspaceHandoff = todayPaneHandoffDelta({
+    scrollTop: workspace.scrollTop,
+    scrollHeight: workspace.scrollHeight,
+    clientHeight: workspace.clientHeight,
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+  });
+  if (workspaceHandoff !== 0) return; // The page is also at its boundary.
+  const scale = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+    ? 16
+    : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+      ? workspace.clientHeight
+      : 1;
+  event.preventDefault();
+  workspace.scrollBy({ top: handoff * scale, left: 0, behavior: 'auto' });
+}
+
 function bindEvents() {
+  // Delegated + non-passive by design: native pane scrolling remains untouched
+  // until a vertical gesture reaches a pane boundary, then the same delta is
+  // explicitly handed to the workspace instead of trapping page movement.
+  document.addEventListener('wheel', handleTodayPaneWheel, { passive: false });
   document.addEventListener('keydown', event => {
     if (event.key === 'Enter' && event.target?.dataset?.terminalInput) {
       event.preventDefault();
@@ -4828,6 +5022,18 @@ function bindEvents() {
     if (!row || event.target !== row) return;
     event.preventDefault();
     row.click();
+  });
+  // Roving focus for the focus-board tablists. Both axes work so the same
+  // controls remain keyboard-complete when the narrow layout turns horizontal.
+  document.addEventListener('keydown', event => {
+    const current = event.target.closest?.('.today-focus-tab[role="tab"]');
+    const rail = current?.closest('.today-focus-rail[role="tablist"]');
+    if (!current || !rail) return;
+    const tabs = [...rail.querySelectorAll('.today-focus-tab[role="tab"]')];
+    const nextIndex = nextTodayFocusIndex(event.key, tabs.indexOf(current), tabs.length);
+    if (nextIndex === null) return;
+    event.preventDefault();
+    tabs[nextIndex]?.click();
   });
   document.addEventListener('click', event => {
     const command = event.target.closest('[data-command-index]');
@@ -4870,6 +5076,20 @@ function bindEvents() {
     if (action === 'today-jump') {
       document.getElementById(target.dataset.target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
+    if (action === 'today-focus') {
+      setTodayFocus(target.dataset.section, target.dataset.project);
+      renderRoute({ userAction: true, preserveScroll: true });
+      revealTodayFocus(target.dataset.section, true);
+    }
+    if (action === 'today-deferred-focus') {
+      const projectId = target.dataset.project;
+      state.today.deferredProject = state.today.deferredProject === projectId ? '' : projectId;
+      renderRoute({ userAction: true, preserveScroll: true });
+      revealTodayDeferredSelection(true, projectId);
+    }
+    if (action === 'today-project-snooze') void updateTodayProject(target.dataset.project, target.dataset.section, 'snooze');
+    if (action === 'today-project-dismiss') void updateTodayProject(target.dataset.project, target.dataset.section, 'dismiss');
+    if (action === 'today-project-restore') void updateTodayProject(target.dataset.project, target.dataset.section, 'restore');
     if (action === 'today-pin') void updateTodayItem(target.dataset.item, target.dataset.pinned === 'true' ? 'unpin' : 'pin', target.dataset.version);
     if (action === 'today-done') void updateTodayItem(target.dataset.item, 'mark_done', target.dataset.version);
     if (action === 'today-snooze') void updateTodayItem(target.dataset.item, 'snooze', target.dataset.version);

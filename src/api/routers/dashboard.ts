@@ -84,7 +84,13 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
         SELECT COALESCE(MAX(id), 0) AS eventId
         FROM work_item_project_events
       `).get() as { eventId: number };
-      return [state.current(), workItems.rowId, workItems.capturedAt, projectEvents.eventId].join(':');
+      // Evidence gists land AFTER routing (evidence-gist.ts sweeper); the Today
+      // changes cards must re-render as sentences arrive. Indexed column.
+      let gistAt = '';
+      try {
+        gistAt = (db.prepare('SELECT COALESCE(MAX(gist_at), \'\') AS gistAt FROM work_items').get() as { gistAt: string }).gistAt;
+      } catch { /* pre-migration schema — gists simply don't invalidate */ }
+      return [state.current(), workItems.rowId, workItems.capturedAt, projectEvents.eventId, gistAt].join(':');
     } catch {
       return state.current();
     }

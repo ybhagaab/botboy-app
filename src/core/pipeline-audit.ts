@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import type Database from 'better-sqlite3';
 import type { PipelineLlm } from './pipeline-llm.js';
 
-export type AuditedPipelinePass = 'librarian' | 'brain' | 'reconcile' | 'organize' | 'digest';
+export type AuditedPipelinePass = 'librarian' | 'brain' | 'reconcile' | 'organize' | 'digest' | 'gist';
 
 export interface ModelAuditContext {
   runId?: string;

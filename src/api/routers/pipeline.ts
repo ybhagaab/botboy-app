@@ -10,17 +10,24 @@ import { getChannelConfig } from '../../core/slack-config.js';
 import { createChannelTierResolver } from '../../core/engagement.js';
 import { demoteAmbientProjects } from '../../core/ambient-demotion.js';
 import {
+  applyTodayDeferredProjectRestore,
   applyTodayItemAction,
+  applyTodayProjectAction,
   buildTodayView,
   completeTodayTask,
   findTodayActionTarget,
   isValidTodayItemId,
   recordTodayVisit,
+  type TodayActionTarget,
   type TodayItemAction,
+  type TodayProjectAction,
+  type TodayProjectSection,
 } from '../../core/today.js';
 import { paramStr, type RouterDeps } from './deps.js';
 
 const TODAY_ACTIONS = new Set<TodayItemAction>(['pin', 'unpin', 'snooze', 'dismiss', 'restore']);
+const TODAY_PROJECT_ACTIONS = new Set<TodayProjectAction>(['snooze', 'dismiss']);
+const TODAY_PROJECT_SECTIONS = new Set<TodayProjectSection>(['attention', 'waiting']);
 
 function validSince(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -112,6 +119,60 @@ export function createPipelineRouter(deps: RouterDeps): Router {
       res.json(view);
     } catch (err: any) {
       res.status(500).json({ error: `Could not open Today view: ${err?.message ?? String(err)}` });
+    }
+  });
+
+  router.patch('/today/projects/:projectId', (req: Request, res: Response) => {
+    const db = deps.db;
+    const brainStore = deps.brainStore;
+    if (!db || !brainStore) return res.status(503).json({ error: 'Today preferences not available' });
+    if (!isSameOriginMutation(req)) return res.status(403).json({ error: 'Cross-origin Today mutation rejected' });
+    const projectId = paramStr(req.params.projectId);
+    const section = req.body?.section as string | undefined;
+    const action = req.body?.action as string | undefined;
+    const sectionAction = TODAY_PROJECT_SECTIONS.has(section as TodayProjectSection)
+      && TODAY_PROJECT_ACTIONS.has(action as TodayProjectAction);
+    const deferredRestore = section === 'deferred' && action === 'restore';
+    const session = parseTodaySession(req.body ?? {});
+    if (!sectionAction && !deferredRestore) {
+      return res.status(400).json({
+        error: 'Expected attention|waiting with snooze|dismiss, or deferred with restore',
+      });
+    }
+    if (session.error || !session.provided) {
+      return res.status(400).json({ error: session.error ?? 'A complete Today session cursor is required' });
+    }
+    try {
+      const view = buildTodayView(db, brainStore, session.options);
+      if (deferredRestore) {
+        const targets = view.deferred
+          .filter(item => item.projectId === projectId && item.kind !== 'project')
+          .map(item => findTodayActionTarget(view, item.id))
+          .filter((target): target is TodayActionTarget => target !== null && target.kind !== 'project');
+        if (targets.length === 0) {
+          return res.status(404).json({ error: 'This project has no current items in Set aside' });
+        }
+        const result = applyTodayDeferredProjectRestore(
+          db,
+          targets,
+          session.options.since as string,
+        );
+        return res.json({ projectId, section, action, itemIds: result.itemIds, updated: result.itemIds.length });
+      }
+
+      const typedSection = section as TodayProjectSection;
+      const typedAction = action as TodayProjectAction;
+      const groups = typedSection === 'attention' ? view.attentionGroups : view.waitingGroups;
+      const group = groups.find(candidate => candidate.projectId === projectId);
+      if (!group || group.items.length === 0) {
+        return res.status(404).json({ error: 'This project has no current items in this Today section' });
+      }
+      const result = applyTodayProjectAction(db, group, typedAction, {
+        snoozedUntil: req.body?.snoozedUntil,
+      });
+      return res.json({ projectId, section, action, itemIds: result.itemIds, updated: result.itemIds.length });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message ?? String(err) });
     }
   });
 

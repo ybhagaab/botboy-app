@@ -1002,6 +1002,15 @@ export function migrateLosslessCapture(db: Database.Database): void {
   // when an assigned item's evidence anchors multiple independent project
   // scopes. Advisory only — the owner decides placement; synthesis skips it.
   addWorkItemColumn('scope_alert', 'scope_alert TEXT');
+  // Evidence gist (2026-09-08, TODAY_CHANGES_PLAN.md): one readable sentence
+  // per routed item for the Today changes cards. `gist_kind` ∈
+  // derived|verbatim|model|excerpt; a written gist is terminal (the sweeper
+  // only visits `gist IS NULL`). Never shown as project truth.
+  addWorkItemColumn('gist', 'gist TEXT');
+  addWorkItemColumn('gist_kind', 'gist_kind TEXT');
+  addWorkItemColumn('gist_at', 'gist_at TEXT');
+  // MAX(gist_at) joins the dashboard version composite (one indexed read per poll).
+  db.exec('CREATE INDEX IF NOT EXISTS idx_work_items_gist_at ON work_items(gist_at)');
 
   // ── New tables ──
   db.exec(`

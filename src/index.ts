@@ -81,6 +81,7 @@ import { syncNodesFromProjects } from './core/node-projection.js';
 import { createPipelineOrchestrator } from './core/pipeline-orchestrator.js';
 import { createProjectRelationsEngine } from './core/project-relations.js';
 import { adaptSendPrompt } from './core/pipeline-llm.js';
+import { createEvidenceGister } from './core/evidence-gist.js';
 import { createBackfiller } from './core/backfill.js';
 import { checkDependencies } from './core/deps-check.js';
 import { initToolchain } from './core/toolchain.js';
@@ -526,7 +527,12 @@ async function main() {
   const projectOrganizer = createProjectOrganizer({ db, brainStore, llm: pipelineLlm, failures });
   const channelDigester = createChannelDigester({ db, contentStore, brainStore, failures, llm: pipelineLlm });
   const projectRelations = createProjectRelationsEngine(db);
-  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations });
+  // Evidence gists: one readable sentence per routed item for the Today
+  // changes cards (TODAY_CHANGES_PLAN.md). Same lane as the other
+  // interpretation passes; its revision joins the dashboard version so an
+  // open Today tab re-renders as sentences land.
+  const evidenceGister = createEvidenceGister({ db, contentStore, llm: pipelineLlm, failures });
+  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister });
   // Sibling links are derived data — refresh once at startup so the project
   // pages are current even before the first interpretation wave fires.
   try {

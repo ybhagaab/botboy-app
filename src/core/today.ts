@@ -3,18 +3,26 @@ import type Database from 'better-sqlite3';
 import type { Brain, BrainStore, ProjectRow, TaskState } from './brain-store.js';
 import { getSetting, setSetting } from './storage.js';
 import { createChannelTierResolver } from './engagement.js';
+import { createOwnerMatcher, type OwnerMatcher } from './owner-identity.js';
+import { SUBSTANTIVE_EVIDENCE_SQL_PREDICATE, describeEvidence, excerptGist, gistSourceText, type GistKind } from './evidence-gist.js';
+
+/** Evidence lines rendered per changed-project card; the rest is "+N more". */
+const CHANGE_LINES_PER_PROJECT = 3;
 
 const SETTINGS_KEY = 'today.attention.v1';
 const CURSOR_KIND = 'work_item_project_event_rowid' as const;
 const DEFAULT_CHANGE_WINDOW_MS = 24 * 60 * 60 * 1000;
-const ATTENTION_LIMIT = 12;
-const WAITING_LIMIT = 10;
+/** Attention / waiting are ranked PROJECT rows (owner ruling 2026-09-09:
+ * one project = one slot). The focus-board rail includes EVERY eligible
+ * project and the selected detail includes EVERY current commitment. */
 const CHANGE_LIMIT = 8;
 const RECENT_LIMIT = 6;
 const MAX_SNOOZE_MS = 366 * 24 * 60 * 60 * 1000;
 
 type TodayItemKind = 'task' | 'blocker' | 'project' | 'change';
 export type TodayItemAction = 'pin' | 'unpin' | 'snooze' | 'dismiss' | 'restore';
+export type TodayProjectSection = 'attention' | 'waiting';
+export type TodayProjectAction = Extract<TodayItemAction, 'snooze' | 'dismiss'>;
 
 interface TodayChangeSnapshot {
   kind: 'change';
@@ -67,13 +75,64 @@ export interface TodayAttentionItem {
   score: number;
 }
 
+/**
+ * A ranked project focus entry with every current task / blocker nested under
+ * it. `hiddenCount` remains in the response for compatibility and is always 0;
+ * the bounded list-detail board, not truncation, owns density. The project
+ * control is separate so section-level snooze/dismiss never removes its pin.
+ */
+export interface TodayAttentionGroup {
+  projectId: string;
+  projectTitle: string;
+  projectControlId: string;
+  /** 1-based rank of the card within its section. */
+  rank: number;
+  /** Project pinned by the owner (kind 'project' candidate) — leads the section. */
+  projectPinned: boolean;
+  /** Any shown line is pinned, or the project is. */
+  pinned: boolean;
+  score: number;
+  items: TodayAttentionItem[];
+  hiddenCount: number;
+  counts: { open: number; doing: number; blocked: number; blockers: number; decisions: number; total: number };
+  freshEvidenceCount: number;
+  staleDays?: number;
+  /** Focus line for a pinned project that has no lines of its own. */
+  focus?: string;
+}
+
+/**
+ * One evidence line on a changed-project card (TODAY_CHANGES_PLAN.md §8):
+ * `gist` is the sentence ("Parag Ahire asks Ravi to review…"), `meta` the
+ * quieter kind · addressing · identifier line. `gistKind` tells the UI how
+ * honest to be about the text: 'model' gets the sparkle glyph, 'verbatim' and
+ * 'excerpt' are the source's own words, 'derived' is deterministic metadata.
+ */
+export interface TodayChangeEvidence {
+  itemId: string;
+  gist: string;
+  gistKind: GistKind;
+  meta: string;
+  kindLabel: string;
+  icon: string;
+  actor: string;
+  actorIsOwner: boolean;
+  source: string;
+  type: string;
+  capturedAt: string;
+  version: number;
+  url?: string;
+}
+
 export interface TodayChangeItem {
   id: string;
   kind: 'change';
   projectId: string;
   projectTitle: string;
   projectControlId: string;
+  /** Headline = the newest evidence line's gist (also the snapshot title). */
   title: string;
+  /** Headline meta line (also the snapshot summary). */
   summary: string;
   reason: string;
   source: string;
@@ -81,6 +140,10 @@ export interface TodayChangeItem {
   capturedAt: string;
   version: number;
   count: number;
+  /** Newest first, at most CHANGE_LINES_PER_PROJECT. */
+  items: TodayChangeEvidence[];
+  /** Evidence rows beyond `items` — rendered as "+N more in this project". */
+  hiddenCount: number;
   pinned: boolean;
   snoozedUntil?: string;
   dismissedAt?: string;
@@ -130,8 +193,13 @@ export interface TodayView {
     explicitActionCount: number;
     pinnedProjectCount: number;
     attentionShown: number;
+    /** Distinct projects behind attentionCount / attentionShown. */
+    attentionProjects: number;
+    attentionProjectsShown: number;
     waitingCount: number;
     waitingShown: number;
+    waitingProjects: number;
+    waitingProjectsShown: number;
     changeCount: number;
     changesShown: number;
     deferredCount: number;
@@ -141,6 +209,9 @@ export interface TodayView {
   };
   attention: TodayAttentionItem[];
   waiting: TodayAttentionItem[];
+  /** Grouped forms of `attention` / `waiting` (same items, same order, per project). */
+  attentionGroups: TodayAttentionGroup[];
+  waitingGroups: TodayAttentionGroup[];
   /** Document comment threads whose latest word is someone else's (signals R3). */
   awaitingReply: TodayAwaitingReplyItem[];
   changes: TodayChangeItem[];
@@ -290,6 +361,10 @@ interface EvidenceRow {
   type: string;
   source: string;
   capturedAt: string;
+  url: string | null;
+  metadata: string | null;
+  gist: string | null;
+  gistKind: string | null;
 }
 
 interface ProjectContext {
@@ -549,29 +624,65 @@ function compareAttention(a: TodayAttentionItem, b: TodayAttentionItem): number 
   return projectOrder || a.title.localeCompare(b.title);
 }
 
-function selectWithProjectDiversity(items: TodayAttentionItem[], limit: number): TodayAttentionItem[] {
+/**
+ * Rank per PROJECT, not per task (owner ruling 2026-09-09): a project with
+ * several open commitments takes one rail row and every current line appears
+ * in its independently scrolling detail pane. Pinned projects/lines lead;
+ * then the project's best line score; freshest evidence; then title.
+ */
+function groupByProject(
+  items: TodayAttentionItem[],
+  contextByProject: Map<string, ProjectContext>,
+): { groups: TodayAttentionGroup[]; shown: TodayAttentionItem[] } {
   const sorted = [...new Map(items.map(item => [item.id, item])).values()].sort(compareAttention);
-  const pinned = sorted.filter(item => item.pinned);
-  const selected = [...pinned];
-  const selectedIds = new Set(pinned.map(item => item.id));
-  const perProject = new Map<string, number>();
-  for (const item of pinned) perProject.set(item.projectId, (perProject.get(item.projectId) ?? 0) + 1);
-  const target = Math.max(limit, pinned.length);
+  const byProject = new Map<string, TodayAttentionItem[]>();
   for (const item of sorted) {
-    if (selectedIds.has(item.id)) continue;
-    const count = perProject.get(item.projectId) ?? 0;
-    if (count >= 2) continue;
-    selected.push(item);
-    selectedIds.add(item.id);
-    perProject.set(item.projectId, count + 1);
-    if (selected.length >= target) return selected;
+    const rows = byProject.get(item.projectId) ?? [];
+    rows.push(item);
+    byProject.set(item.projectId, rows);
   }
-  for (const item of sorted) {
-    if (selectedIds.has(item.id)) continue;
-    selected.push(item);
-    if (selected.length >= target) break;
+  const groups: TodayAttentionGroup[] = [];
+  for (const [projectId, rows] of byProject) {
+    const projectItem = rows.find(item => item.kind === 'project');
+    const lines = rows.filter(item => item.kind !== 'project');
+    const context = contextByProject.get(projectId);
+    const shownLines = lines;
+    const best = rows[0];
+    groups.push({
+      projectId,
+      projectTitle: best.projectTitle,
+      projectControlId: stableItemId('project', projectId),
+      rank: 0,
+      projectPinned: projectItem?.pinned === true,
+      pinned: projectItem?.pinned === true || shownLines.some(item => item.pinned),
+      score: best.score,
+      items: shownLines,
+      hiddenCount: 0,
+      counts: {
+        open: lines.filter(item => item.kind === 'task' && item.state === 'todo').length,
+        doing: lines.filter(item => item.kind === 'task' && item.state === 'doing').length,
+        blocked: lines.filter(item => item.kind === 'task' && item.state === 'blocked').length,
+        blockers: lines.filter(item => item.kind === 'blocker').length,
+        decisions: lines.filter(item => isDecisionOrResponse(item.title)).length,
+        total: lines.length,
+      },
+      freshEvidenceCount: best.freshEvidenceCount,
+      staleDays: best.staleDays,
+      focus: lines.length === 0 && context ? projectFocusTitle(context) : undefined,
+    });
   }
-  return selected;
+  groups.sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    if (a.score !== b.score) return b.score - a.score;
+    const evidenceOrder = (b.items[0]?.freshEvidenceVersion ?? 0) - (a.items[0]?.freshEvidenceVersion ?? 0);
+    if (evidenceOrder !== 0) return evidenceOrder;
+    return a.projectTitle.localeCompare(b.projectTitle);
+  });
+  // The focus-board rail is the collection navigator: return EVERY ranked
+  // project and let that pane own scrolling. The former 8-project cap belonged
+  // to the vertical-card layout and made lower-ranked projects unreachable.
+  groups.forEach((group, index) => { group.rank = index + 1; });
+  return { groups, shown: groups.flatMap(group => group.items) };
 }
 
 function deferredReason(preference: TodayItemPreference): string {
@@ -662,6 +773,23 @@ function changeFromSnapshot(
     capturedAt: snapshot.capturedAt,
     version: snapshot.version,
     count: snapshot.count,
+    // A restored card renders its headline as the single line; the rest of
+    // the rows are behind the cursor by now (snapshot = presented state).
+    items: [{
+      itemId: '',
+      gist: snapshot.title,
+      gistKind: 'excerpt',
+      meta: snapshot.summary,
+      kindLabel: '',
+      icon: 'activity',
+      actor: '',
+      actorIsOwner: false,
+      source: snapshot.source,
+      type: snapshot.type,
+      capturedAt: snapshot.capturedAt,
+      version: snapshot.version,
+    }],
+    hiddenCount: Math.max(0, snapshot.count - 1),
     pinned: preferenceFor(preferences, projectControlId)?.pinned === true,
     snoozedUntil: preference.snoozedUntil,
     dismissedAt: preference.dismissedAt,
@@ -737,6 +865,48 @@ function latestEvidenceEventRowId(db: Database.Database): number {
   return validRowId(row.rowId) ?? 0;
 }
 
+/**
+ * One rendered evidence line. The persisted gist wins; rows the sweeper has
+ * not reached yet (or pre-migration rows) get the deterministic excerpt over
+ * the stored preview so a card never shows a raw header dump or blank line.
+ */
+function changeEvidenceLine(row: EvidenceRow, owner: OwnerMatcher): TodayChangeEvidence {
+  const description = describeEvidence(
+    { id: row.id, type: row.type, source: row.source, title: row.title, summary: row.summary, url: row.url, metadata: row.metadata, capturedAt: row.capturedAt },
+    owner,
+  );
+  const persisted = row.gist?.trim();
+  const fallback = persisted ? null : excerptGist(
+    { id: row.id, type: row.type, source: row.source, title: row.title, summary: row.summary, url: row.url, metadata: row.metadata },
+    description,
+    previewBody(row),
+  );
+  return {
+    itemId: row.id,
+    gist: persisted || fallback!.gist,
+    gistKind: (persisted ? (row.gistKind as GistKind | null) ?? 'model' : fallback!.kind),
+    meta: description.meta,
+    kindLabel: description.kindLabel,
+    icon: description.icon,
+    actor: description.actor,
+    actorIsOwner: description.actorIsOwner,
+    source: row.source,
+    type: row.type,
+    capturedAt: row.capturedAt,
+    version: row.rowId,
+    url: description.url,
+  };
+}
+
+/** The stored 500-char preview, cleaned the same way the gister cleans full
+ * content (mail headers/greeting/quoted thread, Slack mrkdwn, comment context). */
+function previewBody(row: EvidenceRow): string {
+  return gistSourceText(
+    { id: row.id, type: row.type, source: row.source, title: row.title, summary: row.summary, url: row.url, metadata: row.metadata },
+    row.summary ?? '',
+  );
+}
+
 function freshEvidenceRows(
   db: Database.Database,
   sinceRowId: number,
@@ -753,7 +923,11 @@ function freshEvidenceRows(
            work_items.summary,
            work_items.type,
            work_items.source,
-           work_items.captured_at AS capturedAt
+           work_items.captured_at AS capturedAt,
+           work_items.url,
+           work_items.metadata,
+           work_items.gist,
+           work_items.gist_kind AS gistKind
     FROM work_item_project_events AS project_event
     JOIN work_items ON work_items.id = project_event.work_item_id
     WHERE project_event.id > ?
@@ -772,18 +946,7 @@ function freshEvidenceRows(
           AND julianday(work_items.captured_at) <= julianday(?)
         )
       )
-      AND COALESCE(work_items.process_state, '') <> 'noise'
-      AND COALESCE(work_items.incomplete, 0) = 0
-      AND work_items.type <> 'app_activity'
-      AND NOT (
-        work_items.type = 'website_visit'
-        AND COALESCE(work_items.content_bytes, length(work_items.raw_text), length(work_items.parsed_text), 0) < 1500
-      )
-      AND NOT (
-        work_items.type = 'clipboard_capture'
-        AND lower(COALESCE(work_items.title, '')) LIKE 'http%'
-        AND COALESCE(work_items.content_bytes, length(work_items.raw_text), length(work_items.parsed_text), 0) < 500
-      )
+      AND ${SUBSTANTIVE_EVIDENCE_SQL_PREDICATE}
     ORDER BY project_event.id DESC
   `).all(
     sinceRowId,
@@ -900,6 +1063,7 @@ export function buildTodayView(
 
   const changes: TodayChangeItem[] = [];
   const currentChangeIds = new Set<string>();
+  const owner = createOwnerMatcher(db);
   for (const [projectId, rows] of evidenceByProject) {
     const context = contextByProject.get(projectId);
     if (!context || rows.length === 0) continue;
@@ -907,20 +1071,24 @@ export function buildTodayView(
     const id = `change:${projectId}`;
     currentChangeIds.add(id);
     const preference = preferenceFor(preferences, id);
+    const items = rows.slice(0, CHANGE_LINES_PER_PROJECT).map(row => changeEvidenceLine(row, owner));
+    const headline = items[0];
     const change: TodayChangeItem = {
       id,
       kind: 'change',
       projectId,
       projectTitle: context.row.title,
       projectControlId: stableItemId('project', projectId),
-      title: latest.title?.trim() || latest.summary?.trim() || `${rows.length} new evidence ${rows.length === 1 ? 'item' : 'items'}`,
-      summary: latest.summary?.trim() || '',
+      title: headline.gist,
+      summary: headline.meta,
       reason: `${rows.length} substantive evidence ${rows.length === 1 ? 'item' : 'items'} since ${sinceLabel === 'last_visit' ? 'your last visit' : 'the past 24 hours'}`,
       source: latest.source,
       type: latest.type,
       capturedAt: latest.capturedAt,
       version: latest.rowId,
       count: rows.length,
+      items,
+      hiddenCount: Math.max(0, rows.length - items.length),
       pinned: preferenceFor(preferences, stableItemId('project', projectId))?.pinned === true,
       snoozedUntil: preference?.snoozedUntil,
       dismissedAt: preference?.dismissedAt,
@@ -971,8 +1139,11 @@ export function buildTodayView(
       };
     });
 
-  const attention = selectWithProjectDiversity(visibleActionable, ATTENTION_LIMIT);
-  const waiting = selectWithProjectDiversity(visibleWaiting, WAITING_LIMIT);
+  const attentionGrouped = groupByProject(visibleActionable, contextByProject);
+  const waitingGrouped = groupByProject(visibleWaiting, contextByProject);
+  const attention = attentionGrouped.shown;
+  const waiting = waitingGrouped.shown;
+  const distinctProjects = (items: TodayAttentionItem[]): number => new Set(items.map(item => item.projectId)).size;
   const visibleChanges = changes.slice(0, CHANGE_LIMIT);
   const awaitingReply = computeAwaitingReplyThreads(db);
   const pinnedIds = new Set(
@@ -989,8 +1160,12 @@ export function buildTodayView(
       explicitActionCount: visibleActionable.filter(item => item.kind === 'task').length,
       pinnedProjectCount: visibleActionable.filter(item => item.kind === 'project').length,
       attentionShown: attention.length,
+      attentionProjects: distinctProjects(visibleActionable),
+      attentionProjectsShown: attentionGrouped.groups.length,
       waitingCount: visibleWaiting.length,
       waitingShown: waiting.length,
+      waitingProjects: distinctProjects(visibleWaiting),
+      waitingProjectsShown: waitingGrouped.groups.length,
       changeCount: changes.length,
       changesShown: visibleChanges.length,
       deferredCount: deferred.length,
@@ -1000,6 +1175,8 @@ export function buildTodayView(
     },
     attention,
     waiting,
+    attentionGroups: attentionGrouped.groups,
+    waitingGroups: waitingGrouped.groups,
     awaitingReply,
     changes: visibleChanges,
     recent,
@@ -1048,7 +1225,8 @@ export function findTodayActionTarget(view: TodayView, itemId: string): TodayAct
     };
   }
   const project = view.recent.find(item => item.controlId === itemId)
-    ?? view.changes.find(item => item.projectControlId === itemId);
+    ?? view.changes.find(item => item.projectControlId === itemId)
+    ?? [...view.attentionGroups, ...view.waitingGroups].find(group => group.projectControlId === itemId);
   if (project) {
     const recentProject = 'controlId' in project;
     const projectId = recentProject ? project.id : project.projectId;
@@ -1087,18 +1265,19 @@ function snapshotFromTarget(target: TodayActionTarget): TodayChangeSnapshot {
   };
 }
 
-export function applyTodayItemAction(
-  db: Database.Database,
+interface TodayItemActionOptions {
+  snoozedUntil?: string;
+  target?: TodayActionTarget;
+  sessionSince?: string;
+}
+
+function mutateTodayItemPreference(
+  preferences: TodayPreferences,
   itemId: string,
   action: TodayItemAction,
-  options: {
-    snoozedUntil?: string;
-    target?: TodayActionTarget;
-    sessionSince?: string;
-  } = {},
-  now = new Date(),
+  options: TodayItemActionOptions,
+  now: Date,
 ): TodayItemPreference | null {
-  const preferences = readPreferences(db);
   const existing = preferences.items[itemId] ?? { updatedAt: now.toISOString() };
   const next: TodayItemPreference = { ...existing, updatedAt: now.toISOString() };
   if (action === 'pin') {
@@ -1145,12 +1324,92 @@ export function applyTodayItemAction(
 
   if (!next.pinned && !next.snoozedUntil && !next.dismissedAt && !next.snapshot) {
     delete preferences.items[itemId];
-    persistPreferences(db, preferences);
     return null;
   }
   preferences.items[itemId] = next;
-  persistPreferences(db, preferences);
   return next;
+}
+
+export function applyTodayItemAction(
+  db: Database.Database,
+  itemId: string,
+  action: TodayItemAction,
+  options: TodayItemActionOptions = {},
+  now = new Date(),
+): TodayItemPreference | null {
+  const apply = db.transaction(() => {
+    const preferences = readPreferences(db);
+    const state = mutateTodayItemPreference(preferences, itemId, action, options, now);
+    persistPreferences(db, preferences);
+    return state;
+  });
+  return apply();
+}
+
+/**
+ * Composite section action: one fixed Today view supplies one group's complete
+ * current item list. Every per-item preference is updated with the same rules
+ * and timestamp, then the single settings blob is persisted atomically. The
+ * project control itself is deliberately excluded so its pin survives.
+ */
+export function applyTodayProjectAction(
+  db: Database.Database,
+  group: TodayAttentionGroup,
+  action: TodayProjectAction,
+  options: Pick<TodayItemActionOptions, 'snoozedUntil'> = {},
+  now = new Date(),
+): { itemIds: string[]; states: Record<string, TodayItemPreference | null> } {
+  const itemIds = [...new Set(group.items.map(item => item.id))];
+  if (itemIds.length === 0) throw new Error('This project has no current items in this section');
+  const apply = db.transaction(() => {
+    const preferences = readPreferences(db);
+    const states: Record<string, TodayItemPreference | null> = {};
+    for (const itemId of itemIds) {
+      states[itemId] = mutateTodayItemPreference(preferences, itemId, action, options, now);
+    }
+    persistPreferences(db, preferences);
+    return { itemIds, states };
+  });
+  return apply();
+}
+
+/**
+ * Composite Set aside recovery: targets come from one authoritative fixed
+ * Today view, then every current deferred item for that project is restored in
+ * one transaction and one settings-blob write. Change targets retain their
+ * saved snapshot for this exact session; project controls are never accepted,
+ * so project pins remain independent.
+ */
+export function applyTodayDeferredProjectRestore(
+  db: Database.Database,
+  targets: TodayActionTarget[],
+  sessionSince: string,
+  now = new Date(),
+): { itemIds: string[]; states: Record<string, TodayItemPreference | null> } {
+  const normalizedSince = validIso(sessionSince);
+  if (!normalizedSince) throw new Error('A valid Today session is required to restore this project');
+  const uniqueTargets = [...new Map(targets.map(target => [target.id, target])).values()];
+  if (uniqueTargets.length === 0) throw new Error('This project has no current deferred items');
+  if (uniqueTargets.some(target => target.kind === 'project')) {
+    throw new Error('Project pin controls cannot be restored from Set aside');
+  }
+  if (new Set(uniqueTargets.map(target => target.projectId)).size !== 1) {
+    throw new Error('Deferred project restore targets must belong to one project');
+  }
+
+  const apply = db.transaction(() => {
+    const preferences = readPreferences(db);
+    const states: Record<string, TodayItemPreference | null> = {};
+    for (const target of uniqueTargets) {
+      states[target.id] = mutateTodayItemPreference(preferences, target.id, 'restore', {
+        target,
+        sessionSince: normalizedSince,
+      }, now);
+    }
+    persistPreferences(db, preferences);
+    return { itemIds: uniqueTargets.map(target => target.id), states };
+  });
+  return apply();
 }
 
 export function recordTodayVisit(db: Database.Database, view: TodayView): string {

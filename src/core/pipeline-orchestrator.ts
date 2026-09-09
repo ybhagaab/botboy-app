@@ -54,6 +54,8 @@ export interface OrchestratorConfig {
   fullOrganizeRetryBackoffMs?: number;
   /** Cadence of the ambient channel-digest pass (default 6h). */
   digestIntervalMs?: number;
+  /** Cadence of the evidence-gist sweeper (default 30s; backfill + misses). */
+  gistSweepIntervalMs?: number;
 }
 
 /**
@@ -145,9 +147,21 @@ export function createPipelineOrchestrator(deps: {
   brainStore: BrainStore;
   /** Deterministic sibling-link refresh; runs after passes that change its input signals. */
   projectRelations?: { recompute(): unknown };
+  /**
+   * Evidence gists for the Today changes cards (evidence-gist.ts). Runs after
+   * each brain update so freshly routed items read as sentences within the
+   * same wave, plus a short sweeper for misses/backfill. Best-effort: never
+   * blocks routing or brains.
+   */
+  gister?: { tick(opts?: { limit?: number }): Promise<unknown> };
   config?: OrchestratorConfig;
 }): PipelineOrchestrator {
-  const { db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, digester, brainStore } = deps;
+  const { db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, digester, brainStore, gister } = deps;
+
+  async function gistRoutedEvidence(limit: number): Promise<void> {
+    if (!gister) return;
+    try { await gister.tick({ limit }); } catch { /* reading aid — must never break the wave */ }
+  }
 
   // Relations derive from scope alerts (brain pass), titles (organize), and
   // channel cross-links (digest) — refresh after any of those, best-effort.
@@ -165,6 +179,7 @@ export function createPipelineOrchestrator(deps: {
   // pass itself fires only when the persistent ledger says it is due.
   const fullOrganizeCheckMs = Math.min(10 * 60 * 1000, fullOrganizeIntervalMs);
   const digestIntervalMs = deps.config?.digestIntervalMs ?? 6 * 60 * 60 * 1000;
+  const gistSweepIntervalMs = deps.config?.gistSweepIntervalMs ?? 30 * 1000;
 
   const timers: ReturnType<typeof setInterval>[] = [];
   let extracting = false;
@@ -195,6 +210,7 @@ export function createPipelineOrchestrator(deps: {
       const wave = await librarian.runWave();
       if (wave.status === 'deferred' || !wave.batchId) return { ran: false };
       await brainUpdater.runForBatch(wave.batchId);
+      await gistRoutedEvidence(Math.max(8, wave.assigned));
       try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
       refreshProjectRelations();
       return { ran: true, batchId: wave.batchId };
@@ -251,6 +267,7 @@ export function createPipelineOrchestrator(deps: {
         result.noise += wave.noise;
         const updates = await brainUpdater.runForBatch(wave.batchId);
         result.projectsUpdated += updates.filter((u) => u.status === 'updated').length;
+        await gistRoutedEvidence(Math.max(8, wave.assigned));
       }
       try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
     } finally {
@@ -362,6 +379,9 @@ export function createPipelineOrchestrator(deps: {
         tickOrganize({ full: true }).catch(() => {});
       }, fullOrganizeCheckMs));
       if (digester) timers.push(setInterval(() => { tickDigest().catch(() => {}); }, digestIntervalMs));
+      // Gist sweeper: recently routed evidence still lacking a sentence (LLM
+      // was down during its wave, or rows routed before the column existed).
+      if (gister) timers.push(setInterval(() => { gistRoutedEvidence(8).catch(() => {}); }, gistSweepIntervalMs));
     },
     stop(): void {
       for (const t of timers) clearInterval(t);
