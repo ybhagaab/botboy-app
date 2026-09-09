@@ -1,5 +1,10 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { ToolCall } from '../core/llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from '../core/tool-executor.js';
+import { DocumentExportError, exportDocument, isDocumentExportFormat } from './document-exporter.js';
 import { DOCUMENT_MATURITIES } from './types.js';
 import type {
   DocumentMaturity,
@@ -49,6 +54,32 @@ function parseArguments(call: ToolCall): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+async function materializeCanonicalExport(
+  artifactId: string,
+  filename: string,
+  data: Buffer,
+): Promise<{ filePath: string; relativePath: string; downloadUrl: string }> {
+  const filesRoot = path.resolve(path.join(os.homedir(), '.personal-productivity-tracker', 'files'));
+  const safeArtifactId = artifactId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120) || 'artifact';
+  const relativePath = path.join('document-exports', safeArtifactId, filename);
+  const filePath = path.resolve(filesRoot, relativePath);
+  if (!filePath.startsWith(`${filesRoot}${path.sep}`)) {
+    throw new Error('Resolved export path escaped the BotBoy files directory.');
+  }
+
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(temporaryPath, data, { flag: 'wx' });
+    await fs.rename(temporaryPath, filePath);
+  } finally {
+    await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+
+  const urlPath = relativePath.split(path.sep).map(segment => encodeURIComponent(segment)).join('/');
+  return { filePath, relativePath, downloadUrl: `/api/files/${urlPath}` };
 }
 
 /** Compact receipt: everything the chat model needs to report honestly, nothing more. */
@@ -130,6 +161,60 @@ export function withProductDocumentChatTools(
           return result(call, { ok: true, ...guide });
         } catch (error) {
           return errorResult(call, error instanceof Error ? error.message : 'Loading the writing guide failed.');
+        }
+      }
+
+      if (call.function.name === 'export_product_document') {
+        const args = parseArguments(call);
+        if (!args) return errorResult(call, 'Tool arguments must be one JSON object.');
+        if (args.ownerRequested !== true) {
+          return errorResult(call, 'ownerRequested must be true — export a document only when the owner asked for a file in this conversation.');
+        }
+        const artifactId = typeof args.artifactId === 'string' ? args.artifactId.trim() : '';
+        if (!artifactId) return errorResult(call, 'artifactId is required: use the ID returned by save_product_document or the Documents page.');
+        if (!isDocumentExportFormat(args.format)) {
+          return errorResult(call, 'format must be markdown, html, docx, or pdf.');
+        }
+        const artifact = service.getArtifact(artifactId);
+        if (!artifact) {
+          return errorResult(call, `Official product-document artifact '${artifactId}' was not found. Do not recreate it from chat memory; resolve the correct artifact ID first.`);
+        }
+
+        try {
+          const exported = await exportDocument({
+            title: artifact.title,
+            content: artifact.content,
+            format: args.format,
+          });
+          const materialized = await materializeCanonicalExport(
+            artifact.artifactId,
+            exported.filename,
+            exported.data,
+          );
+          return result(call, {
+            ok: true,
+            exported: true,
+            canonicalExport: true,
+            source: 'official_product_document',
+            artifactId: artifact.artifactId,
+            title: brief(artifact.title),
+            format: args.format,
+            filename: exported.filename,
+            mediaType: exported.mediaType,
+            bytes: exported.data.length,
+            sha256: createHash('sha256').update(exported.data).digest('hex'),
+            ...materialized,
+            documentsUrl: `#/documents/${encodeURIComponent(artifact.artifactId)}`,
+            next: 'Use filePath verbatim for any upload or attachment tool. This receipt proves only that the canonical file was exported locally; claim a delivery only after the destination tool returns its own successful receipt.',
+          });
+        } catch (error) {
+          return errorResult(
+            call,
+            error instanceof Error ? error.message : 'Exporting the official document failed.',
+            error instanceof DocumentExportError
+              ? { exported: false, code: error.code, artifactId, format: args.format }
+              : { exported: false, artifactId, format: args.format },
+          );
         }
       }
 

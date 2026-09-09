@@ -4,7 +4,7 @@ import type { Brain, BrainStore, ProjectRow, TaskState } from './brain-store.js'
 import { getSetting, setSetting } from './storage.js';
 import { createChannelTierResolver } from './engagement.js';
 import { createOwnerMatcher, type OwnerMatcher } from './owner-identity.js';
-import { SUBSTANTIVE_EVIDENCE_SQL_PREDICATE, describeEvidence, excerptGist, gistSourceText, type GistKind } from './evidence-gist.js';
+import { SUBSTANTIVE_EVIDENCE_SQL_PREDICATE, describeEvidence, derivedGist, excerptGist, gistSourceText, type GistKind } from './evidence-gist.js';
 
 /** Evidence lines rendered per changed-project card; the rest is "+N more". */
 const CHANGE_LINES_PER_PROJECT = 3;
@@ -871,13 +871,22 @@ function latestEvidenceEventRowId(db: Database.Database): number {
  * the stored preview so a card never shows a raw header dump or blank line.
  */
 function changeEvidenceLine(row: EvidenceRow, owner: OwnerMatcher): TodayChangeEvidence {
-  const description = describeEvidence(
-    { id: row.id, type: row.type, source: row.source, title: row.title, summary: row.summary, url: row.url, metadata: row.metadata, capturedAt: row.capturedAt },
-    owner,
-  );
+  const evidence = {
+    id: row.id,
+    type: row.type,
+    source: row.source,
+    title: row.title,
+    summary: row.summary,
+    url: row.url,
+    metadata: row.metadata,
+    capturedAt: row.capturedAt,
+  };
+  const description = describeEvidence(evidence, owner);
   const persisted = row.gist?.trim();
-  const fallback = persisted ? null : excerptGist(
-    { id: row.id, type: row.type, source: row.source, title: row.title, summary: row.summary, url: row.url, metadata: row.metadata },
+  // Deterministic provenance must be visible on the very first render; the
+  // async gister persists the same sentence shortly afterward.
+  const fallback = persisted ? null : derivedGist(evidence, description) ?? excerptGist(
+    evidence,
     description,
     previewBody(row),
   );

@@ -224,10 +224,17 @@ export function describeEvidence(row: EvidenceRowLike, owner: OwnerMatcher): Evi
       const who = displayName(meta.lastModifiedBy || meta.author);
       const mine = isOwnerName(meta.lastModifiedBy || meta.author || '');
       const actor = mine ? 'You' : who;
+      const folderName = meta.localFolderName?.trim();
+      const captureMode = meta.captureMode === 'backfill' || meta.captureMode === 'live'
+        ? meta.captureMode
+        : '';
+      const provenance = captureMode === 'backfill'
+        ? ['Backfill', ...(folderName ? [folderName] : [])]
+        : captureMode === 'live' && folderName ? [folderName] : [];
       return {
         kindLabel: 'Document', icon: 'file', actor, actorIsOwner: mine,
         addressing: '', identifier: title || 'document',
-        meta: ['Document', ...(actor ? [actor] : []), title || 'document'].join(' · '),
+        meta: ['Document', ...provenance, ...(actor ? [actor] : []), title || 'document'].join(' · '),
         url: httpUrl(meta.webUrl, row.url),
       };
     }
@@ -377,12 +384,26 @@ export function derivedGist(row: EvidenceRowLike, description: EvidenceDescripti
     const doc = description.identifier;
     const who = description.actor;
     const change = meta.changeSummary?.trim();
+    const folderName = meta.localFolderName?.trim();
+    if (meta.captureMode === 'backfill') {
+      const context = folderName ? `${folderName} backfill` : 'folder backfill';
+      return {
+        gist: truncate(`Found during ${context}: ${doc}${change ? ` — ${change}` : ''}`, MAX_GIST_CHARS),
+        kind: 'derived',
+      };
+    }
     if (change) {
       const subject = who ? `${who} updated ${doc}` : `${doc} updated`;
       return { gist: truncate(`${subject}: ${change}`, MAX_GIST_CHARS), kind: 'derived' };
     }
+    if (meta.captureMode === 'live') {
+      return {
+        gist: truncate(folderName ? `Captured from ${folderName}: ${doc}` : `Captured from a watched folder: ${doc}`, MAX_GIST_CHARS),
+        kind: 'derived',
+      };
+    }
     return {
-      gist: truncate(who ? `${doc} is now in this project (last edited by ${who})` : `${doc} is now in this project`, MAX_GIST_CHARS),
+      gist: truncate(who ? `Project evidence includes ${doc} (last edited by ${who})` : `Project evidence includes ${doc}`, MAX_GIST_CHARS),
       kind: 'derived',
     };
   }

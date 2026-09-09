@@ -494,6 +494,18 @@ export function createFilesystemMonitor(deps: {
     return supportedFormatsCache;
   }
 
+  type CaptureMode = 'live' | 'backfill';
+
+  /** Stable provenance consumed by evidence-gist.ts and Today. Never infer
+   * backfill from timestamps: only the explicit tree-walk path may set it. */
+  function captureProvenance(row: LocalFolder, captureMode: CaptureMode): Record<string, string> {
+    return {
+      captureMode,
+      localFolderId: String(row.id),
+      localFolderName: path.basename(row.path) || row.path,
+    };
+  }
+
   /**
    * Emit-or-skip a single file under `row`. The filter chain is:
    *
@@ -518,7 +530,7 @@ export function createFilesystemMonitor(deps: {
    * Skipped paths are debug-logged with their reason so users can diagnose
    * missing ingests via `LOCAL_FOLDERS_DEBUG=1` (Requirement 8.5).
    */
-  function handleAddOrChange(row: LocalFolder, filePath: string): void {
+  function handleAddOrChange(row: LocalFolder, filePath: string, captureMode: CaptureMode = 'live'): void {
     let stat: ReturnType<typeof statSync>;
     try {
       stat = statSync(filePath);
@@ -597,6 +609,7 @@ export function createFilesystemMonitor(deps: {
           title: path.basename(filePath),
           content: parsed.text,
           metadata: {
+            ...captureProvenance(row, captureMode),
             filePath, fileType: ext,
             mtime: String(stat.mtimeMs), size: String(stat.size), contentHash,
           },
@@ -628,6 +641,7 @@ export function createFilesystemMonitor(deps: {
       title: path.basename(filePath),
       content: '', // extractor fills this via parse/OCR from metadata.filePath
       metadata: {
+        ...captureProvenance(row, captureMode),
         filePath, fileType: ext,
         mtime: String(stat.mtimeMs), size: String(stat.size),
       },
@@ -655,7 +669,7 @@ export function createFilesystemMonitor(deps: {
    * file with identical contents would be silently swallowed by the
    * content-hash dedup in `handleAddOrChange`.
    */
-  function handleUnlink(_row: LocalFolder, filePath: string): void {
+  function handleUnlink(row: LocalFolder, filePath: string): void {
     const item: RawWorkItem = {
       type: 'document_capture',
       source: 'filesystem',
@@ -664,6 +678,7 @@ export function createFilesystemMonitor(deps: {
       title: path.basename(filePath),
       content: '',
       metadata: {
+        ...captureProvenance(row, 'live'),
         filePath,
         archived: 'true',
       },
@@ -947,7 +962,7 @@ export function createFilesystemMonitor(deps: {
           if (isStaticallyIgnored(entry.name, false)) continue;
 
           try {
-            handleAddOrChange(row, fullPath);
+            handleAddOrChange(row, fullPath, 'backfill');
           } catch (err) {
             onProgress?.({
               phase: 'error',
