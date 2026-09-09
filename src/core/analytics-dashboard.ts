@@ -351,7 +351,8 @@ export function createAnalyticsDashboardService(options: {
   queryTimeoutMs?: number;
   /** Fallback data lane (etl-analytics A4): the Datanet ETL composite. When
    * present AND sql-context is not running at run start, widget queries run
-   * through it — serially (one scratch pair), minutes-scale budgets. */
+   * through the scratch-pair pool — widgets may execute in parallel, each
+   * with a minutes-scale budget. */
   etlRunner?: QueryRunner;
   /** Escalation hook (incident 2026-09-04): called once per run that
    * finalizes with failed widgets AFTER the cross-lane retry pass. The
@@ -363,7 +364,7 @@ export function createAnalyticsDashboardService(options: {
   const db = options.db;
   const mcpManager = options.mcpManager;
   const etlRunner = options.etlRunner;
-  const defaultQueryTimeoutMs = 35 * 60_000; // owner decision 2026-08-27: 35-min queries are real
+  const defaultQueryTimeoutMs = 60 * 60_000; // owner decision 2026-09-09: allow slow ETL-backed widgets to finish
   const configuredQueryTimeoutMs = Number(
     options.queryTimeoutMs ?? process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? defaultQueryTimeoutMs,
   );

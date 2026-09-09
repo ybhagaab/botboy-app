@@ -1,8 +1,9 @@
 /**
  * GRASP background sync — canonical Outlook mail + calendar ingestion.
  *
- * Every 30 minutes this loop pulls the owner's new inbox mail, sent mail, and
- * a rolling calendar window from the managed GRASP MCP (read tools only), and
+ * On the configured cadence (5 minutes at the app callsite), this loop pulls
+ * the owner's new inbox mail, sent mail, and a rolling calendar window from the
+ * managed GRASP MCP (read tools only), and
  * emits the survivors as RawWorkItems through the shared event bus. Items then
  * flow through the normal capture path (lossless ContentStore, FTS) and are
  * consumed by the interpretation pipeline (librarian → brain updates →
@@ -12,10 +13,12 @@
  * Trust and noise rules (user directives, 2026-08-17):
  * - Owner identity is auto-detected from GRASP `get_profile` and can be
  *   overridden via the `grasp_sync.owner_email` setting.
- * - Automated senders (no-reply, pipelines, CleverTap, marketing…) are
- *   dropped BEFORE the direct-address check, because automation regularly
- *   addresses the owner directly. Meeting summary/recap subjects override the
- *   deny list — those carry project action items.
+ * - Automated senders (no-reply, pipelines, CleverTap, marketing…) and Code
+ *   Review notification subjects are dropped BEFORE the direct-address check,
+ *   because automation regularly addresses the owner directly. Outlook exposes
+ *   the CR author/reviewer as From, so the subject identifies that notification
+ *   class without suppressing mail written by those people. Meeting summary/recap
+ *   subjects override the sender deny list — those carry project action items.
  * - Inbox mail is kept only when the owner's address is literally in To or
  *   Cc. To gets precedence via `directlyAddressedToOwner`, which unlocks
  *   action-capable email evidence in the brain updater. Distribution-list
@@ -61,6 +64,9 @@ const DEFAULT_NOISE_SENDERS = [
   'receipts@', 'survey@', 'surveys@', 'feedback@', 'reminderservice',
   'concursolutions',
 ];
+
+/** CRUX/Code Review mail is sent on behalf of the author/reviewer in Outlook. */
+export const CODE_REVIEW_SUBJECT = /^CR-\d+:.*\[Code Review\]\s*$/i;
 
 /** Meeting recap/summary mail carries action items — never treat as noise. */
 const MEETING_SUMMARY_SUBJECT = /\bmeeting\s+(?:summary|recap|notes|minutes|insights)\b|\baction\s+items?\b|\brecap\b/i;
@@ -278,6 +284,9 @@ export function createGraspSync(deps: {
   }
 
   function isNoiseSender(entry: GraspEmailListEntry, patterns: string[]): boolean {
+    // Graph reports these as coming from the human CR author/reviewer. Filter by
+    // the canonical CR subject instead, so ordinary mail from that person remains.
+    if (CODE_REVIEW_SUBJECT.test(entry.subject ?? '')) return true;
     if (MEETING_SUMMARY_SUBJECT.test(entry.subject ?? '')) return false;
     const haystack = `${normalizeAddress(entry.from?.emailAddress)} ${String(entry.from?.displayName ?? '').toLowerCase()}`;
     return patterns.some(pattern => haystack.includes(pattern));

@@ -83,17 +83,17 @@ export function selectDashboardLane(servers: McpServerSnapshot[]): DashboardLane
  * The dashboard's own composite instance: same scratch pair and Sentry
  * self-heal as chat (shared EtlToolCall path), but a widget-scale poll
  * budget instead of chat's 6-minute alive-handoff — a dashboard widget has
- * no model to hand a runId to, so it waits like the sql lane does (35-min
+ * no model to hand a runId to, so it waits like the sql lane does (60-min
  * class), minus lease headroom.
  */
 export function createDashboardEtlRunner(options: {
   db: Database.Database;
   mcpManager: McpManager;
   /** Widget budget; defaults to the analytics engine's own resolution
-   * (35 min, PPT_ANALYTICS_QUERY_TIMEOUT_MS override, 30s–60min clamp). */
+   * (60 min, PPT_ANALYTICS_QUERY_TIMEOUT_MS override, 30s–60min clamp). */
   queryTimeoutMs?: number;
 }): QueryRunner {
-  const fallback = 35 * 60_000; // parity with analytics-dashboard defaultQueryTimeoutMs
+  const fallback = 60 * 60_000; // parity with analytics-dashboard defaultQueryTimeoutMs
   const configured = Number(options.queryTimeoutMs ?? process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? fallback);
   const queryTimeoutMs = Number.isFinite(configured)
     ? Math.max(30_000, Math.min(60 * 60_000, Math.floor(configured)))
