@@ -80,6 +80,12 @@ describe('chat-attachments store', () => {
     expect(() => saveChatAttachment(big)).toThrow(/8MB/);
   });
 
+  it('accepts a large attachment set because the main prompt carries only visual asset manifests', () => {
+    const one = saveTracked(`data:image/png;base64,${Buffer.alloc(1_500_000, 1).toString('base64')}`);
+    const two = saveTracked(`data:image/png;base64,${Buffer.alloc(1_500_000, 2).toString('base64')}`);
+    expect(validateAttachmentIds([one.id, two.id])).toEqual({ ok: true, ids: [one.id, two.id] });
+  });
+
   it('loadChatAttachment refuses malformed ids (no path traversal surface)', () => {
     expect(loadChatAttachment('../../etc/passwd')).toBeNull();
     expect(loadChatAttachment('att_NOTHEX000000')).toBeNull();

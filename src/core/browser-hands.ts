@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,6 +11,9 @@ const NAVIGATION_TIMEOUT_MS = 45_000;
 const MAX_INSPECT_NODES = 200;
 const MAX_PAGE_TEXT_CHARS = 20_000;
 const MAX_HTML_CHARS = 16_000;
+const MODEL_SCREENSHOT_MAX_DIMENSION = 1_600;
+const MODEL_SCREENSHOT_FALLBACK_DIMENSION = 1_200;
+const MODEL_SCREENSHOT_MAX_BYTES = 1_200_000;
 
 export type BrowserHandsAction =
   | 'list'
@@ -83,12 +87,16 @@ export interface BrowserScreenshotReceipt extends BrowserReceipt {
   fullPage?: boolean;
   clipped?: boolean;
   modelImageIncluded?: boolean;
+  modelImageMime?: 'image/jpeg';
+  modelImageBytes?: number;
+  modelImageWidth?: number;
+  modelImageHeight?: number;
 }
 
 export interface BrowserHandsService {
   initialize(): Promise<void>;
   execute(input: BrowserHandsInput): Promise<BrowserReceipt>;
-  screenshot(input: { tabId?: string; fullPage?: boolean }): Promise<{
+  screenshot(input: { tabId?: string; fullPage?: boolean; includeModelImage?: boolean }): Promise<{
     receipt: BrowserScreenshotReceipt;
     dataUrl?: string;
   }>;
@@ -250,6 +258,45 @@ function pngDimensions(buffer: Buffer): { width: number; height: number } {
     throw new BrowserHandsError('INVALID_SCREENSHOT', 'Chrome returned invalid PNG data', 'Retry browser_screenshot.');
   }
   return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
+function jpegDimensions(buffer: Buffer): { width: number; height: number } {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
+    throw new BrowserHandsError('INVALID_SCREENSHOT', 'Chrome returned invalid JPEG model evidence', 'Retry browser_screenshot.');
+  }
+  let offset = 2;
+  while (offset + 8 < buffer.length) {
+    if (buffer[offset] !== 0xff) { offset += 1; continue; }
+    const marker = buffer[offset + 1];
+    offset += 2;
+    if (marker === 0xd8 || marker === 0xd9) continue;
+    const length = buffer.readUInt16BE(offset);
+    if (length < 2 || offset + length > buffer.length) break;
+    if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+      return { height: buffer.readUInt16BE(offset + 3), width: buffer.readUInt16BE(offset + 5) };
+    }
+    offset += length;
+  }
+  throw new BrowserHandsError('INVALID_SCREENSHOT', 'Could not read JPEG model-evidence dimensions', 'Retry browser_screenshot.');
+}
+
+function deriveModelJpeg(
+  sourcePng: string,
+  destinationJpeg: string,
+  maximumDimension: number,
+  quality: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile('/usr/bin/sips', [
+      '-s', 'format', 'jpeg',
+      '-s', 'formatOptions', String(quality),
+      '-Z', String(maximumDimension),
+      sourcePng,
+      '--out', destinationJpeg,
+    ], { timeout: 30_000, maxBuffer: 1024 * 1024 }, error => {
+      if (error) reject(error); else resolve();
+    });
+  });
 }
 
 function keyDefinition(input: string): { key: string; code: string; windowsVirtualKeyCode: number } {
@@ -1029,17 +1076,18 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
     }
   }
 
-  async function screenshot(input: { tabId?: string; fullPage?: boolean }): Promise<{ receipt: BrowserScreenshotReceipt; dataUrl?: string }> {
+  async function screenshot(input: { tabId?: string; fullPage?: boolean; includeModelImage?: boolean }): Promise<{ receipt: BrowserScreenshotReceipt; dataUrl?: string }> {
     const tabId = String(input.tabId ?? '').trim();
     try {
       await initialize();
       if (!tabId) throw new BrowserHandsError('TAB_ID_REQUIRED', 'browser_screenshot requires tabId', 'Call browser_hands action=list or open, then pass the returned tabId.');
       return await enqueue(tabId, () => withSession(tabId, async (session, _entry, target) => {
         let clip: Record<string, number> | undefined;
+        let layoutMetrics: any;
         let clipped = false;
         if (input.fullPage) {
-          const metrics = await session.send('Page.getLayoutMetrics');
-          const size = metrics?.cssContentSize ?? metrics?.contentSize;
+          layoutMetrics = await session.send('Page.getLayoutMetrics');
+          const size = layoutMetrics?.cssContentSize ?? layoutMetrics?.contentSize;
           if (size?.width && size?.height) {
             const width = Math.min(16_384, Math.max(1, Number(size.width)));
             const height = Math.min(16_384, Math.max(1, Number(size.height)));
@@ -1063,6 +1111,59 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
         fs.writeFileSync(filePath, buffer, { mode: 0o600 });
         const state = await pageState(session, target);
         const newTabs = await adoptPopups(session);
+
+        // Registry-backed inspection reads the exact PNG later through a
+        // compact visual-reader call. Do not spend time/quality deriving a
+        // JPEG sidecar that the production tool path will intentionally omit.
+        if (input.includeModelImage === false) {
+          return {
+            receipt: {
+              ok: true,
+              action: 'screenshot',
+              tabId,
+              url: state.url,
+              title: state.title,
+              readyState: state.readyState,
+              filePath,
+              fileUrl: `/api/files/browser-hands/${encodeURIComponent(filename)}`,
+              bytes: buffer.length,
+              width: dimensions.width,
+              height: dimensions.height,
+              fullPage: Boolean(input.fullPage),
+              clipped,
+              modelImageIncluded: false,
+              ...(latestDialog(session) ? { dialog: latestDialog(session) } : {}),
+              ...(newTabs.length ? { newTabs } : {}),
+            },
+          };
+        }
+
+        const modelPath = path.join(filesDir, `.${filename}.${randomUUID()}.model.jpg`);
+        const deriveModel = async (maximumDimension: number, quality: number) => {
+          try {
+            await deriveModelJpeg(filePath, modelPath, maximumDimension, quality);
+            const modelBuffer = fs.readFileSync(modelPath);
+            return {
+              modelData: modelBuffer.toString('base64'),
+              modelBuffer,
+              modelDimensions: jpegDimensions(modelBuffer),
+            };
+          } finally {
+            fs.rmSync(modelPath, { force: true });
+          }
+        };
+        let model = await deriveModel(MODEL_SCREENSHOT_MAX_DIMENSION, 70);
+        if (model.modelBuffer.length > MODEL_SCREENSHOT_MAX_BYTES) {
+          model = await deriveModel(MODEL_SCREENSHOT_FALLBACK_DIMENSION, 55);
+        }
+        if (model.modelBuffer.length > MODEL_SCREENSHOT_MAX_BYTES) {
+          throw new BrowserHandsError(
+            'MODEL_SCREENSHOT_TOO_LARGE',
+            `Model screenshot remains ${model.modelBuffer.length} bytes after optimization`,
+            'Capture a smaller viewport or inspect/scroll to a more focused region before retrying.',
+          );
+        }
+
         const receipt: BrowserScreenshotReceipt = {
           ok: true,
           action: 'screenshot',
@@ -1078,10 +1179,14 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
           fullPage: Boolean(input.fullPage),
           clipped,
           modelImageIncluded: true,
+          modelImageMime: 'image/jpeg',
+          modelImageBytes: model.modelBuffer.length,
+          modelImageWidth: model.modelDimensions.width,
+          modelImageHeight: model.modelDimensions.height,
           ...(latestDialog(session) ? { dialog: latestDialog(session) } : {}),
           ...(newTabs.length ? { newTabs } : {}),
         };
-        return { receipt, dataUrl: `data:image/png;base64,${data}` };
+        return { receipt, dataUrl: `data:image/jpeg;base64,${model.modelData}` };
       }));
     } catch (error) {
       return { receipt: errorReceipt('screenshot', error, tabId || undefined) as BrowserScreenshotReceipt };

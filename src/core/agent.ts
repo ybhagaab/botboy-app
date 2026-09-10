@@ -15,6 +15,11 @@ import type { TieredContextManager } from './context-sync.js';
 import type { ClassificationPipeline } from './classification-pipeline.js';
 import type { SubagentDelegator } from './subagent-delegator.js';
 import type { WorkItem, ProcessingResult, ProcessingStatus, ProcessOptions } from './types.js';
+import {
+  appendToolImageEvidence,
+  prepareImageFreePayloadRecovery,
+  type ToolImageEvidence,
+} from './vision-payload.js';
 
 export interface AgentOrchestrator {
   processInboxItems(options?: ProcessOptions): Promise<ProcessingResult>;
@@ -185,24 +190,42 @@ Be concise, helpful, proactive. You have full authority.`;
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userMsg },
           ];
-          const BROWSER_SCREENSHOT_EVIDENCE_MESSAGE = 'Browser screenshot evidence from the preceding tool result. Inspect these pixels now and keep using them through the rest of this tool turn; the saved owner-openable path is in that tool result.';
 
           // Max reasoning for document-writing iterations, armed by the
           // model's own get_document_writing_guide call (mirrors the SSE
           // chat route). Normal turns think only on the first call.
           let documentAuthoringThink = false;
+          // Same-turn payload recovery is semantic reconstruction, not an
+          // endpoint retry. It is available once across all 15 iterations.
+          let payloadRecoveryUsed = false;
           // 15 (was 8, raised 2026-08-28 alongside the chat-loop uncap).
           // Background executions stay CAPPED by design: this path runs
           // unattended (background jobs, reader assist, sentinel composing)
           // with nobody watching and no Stop button — bounded autonomy here,
           // unbounded work only in interactive chat where the owner presides.
           for (let i = 0; i < 15; i++) {
-            const resp = await llmClient.chatCompletion({
+            const request = {
               messages,
               tools,
               think: i === 0 || documentAuthoringThink,
               ...(documentAuthoringThink ? { reasoningEffort: 'max' as const } : {}),
-            });
+            };
+            let resp;
+            try {
+              resp = await llmClient.chatCompletion(request);
+            } catch (error) {
+              const receipt = payloadRecoveryUsed ? null : prepareImageFreePayloadRecovery(messages, error);
+              if (!receipt) throw error;
+              payloadRecoveryUsed = true;
+              console.warn(`[Agent] Payload recovery: removed ${receipt.removedImageCount} image(s), ${receipt.removedImageChars} chars; resuming the same instruction without rejected pixels`);
+              resp = await llmClient.chatCompletion({
+                ...request,
+                payloadConstraint: {
+                  requireImageFree: true,
+                  smallerThanBytes: receipt.rejectedBodyBytes,
+                },
+              });
+            }
 
             if (!resp.toolCalls?.length) {
               return resp.content || '';
@@ -215,22 +238,28 @@ Be concise, helpful, proactive. You have full authority.`;
               toolCalls: resp.toolCalls,
               providerOutput: resp.providerOutput,
             });
-            const toolImages: string[] = [];
+            const toolImageEvidence: ToolImageEvidence[] = [];
             for (const tc of resp.toolCalls) {
               const result = await toolExecutor.executeTool(tc, {
                 currentUserMessage: instruction,
+                callerKind: 'background',
               });
               if (tc.function.name === 'get_document_writing_guide') documentAuthoringThink = true;
               messages.push({ role: 'tool', content: result.content, toolCallId: tc.id });
-              if (result.images?.length) toolImages.push(...result.images);
+              if (result.imageEvidence?.length) toolImageEvidence.push(...result.imageEvidence);
+              if (result.images?.length) {
+                result.images.forEach((dataUrl, index) => toolImageEvidence.push({
+                  dataUrl,
+                  evidenceKey: `tool:${tc.id}:${index}`,
+                  source: 'browser_screenshot',
+                  mimeType: dataUrl.slice(5, dataUrl.indexOf(';')) || 'image/png',
+                  bytes: Math.ceil(dataUrl.length * 0.75),
+                  width: 0,
+                  height: 0,
+                }));
+              }
             }
-            if (toolImages.length) {
-              messages.push({
-                role: 'user',
-                content: BROWSER_SCREENSHOT_EVIDENCE_MESSAGE,
-                images: toolImages.slice(0, 4),
-              });
-            }
+            if (toolImageEvidence.length) appendToolImageEvidence(messages, toolImageEvidence);
           }
           return messages.filter(m => m.role === 'assistant' && m.content).pop()?.content || '';
         }

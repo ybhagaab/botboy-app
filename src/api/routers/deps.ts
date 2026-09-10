@@ -34,6 +34,8 @@ import type { ChatTerminalService } from '../../core/chat-terminal.js';
 import type { ContentStore } from '../../core/content-store.js';
 import type { DocumentParser } from '../../core/document-parser.js';
 import type { EtlOnboardingService } from '../../core/etl-onboarding.js';
+import type { VisualAssetRegistry } from '../../core/visual-assets.js';
+import type { VisualInspector } from '../../core/visual-inspector.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -69,6 +71,9 @@ export interface RouterDeps {
   documentParser?: DocumentParser;
   /** ETL preset onboarding (etl-analytics A3): status + generate trigger. */
   etlOnboarding?: EtlOnboardingService;
+  /** Immutable local visuals and question-directed inspection. */
+  visualAssets?: VisualAssetRegistry;
+  visualInspector?: VisualInspector;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

@@ -29,6 +29,8 @@ import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
 import { createToolExecutor } from './core/tool-executor.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
+import { createVisualAssetRegistry } from './core/visual-assets.js';
+import { createVisualInspector } from './core/visual-inspector.js';
 import { createEtlToolCall } from './core/etl-adhoc.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
@@ -397,6 +399,11 @@ async function main() {
   // stored document content (it only needs the db; the capture pipeline that
   // also uses it is wired further down).
   const contentStore = createContentStore(db);
+  // Local visual evidence: immutable originals/versions plus compact,
+  // question-directed inspection. Constructed before all visual producers and
+  // the executor so uploads/screenshots can register IDs atomically.
+  const visualAssets = createVisualAssetRegistry(db);
+  const visualInspector = createVisualInspector({ db, registry: visualAssets, llmClient });
   // ETL onboarding (etl-analytics A3): background preset generation over the
   // user's own Datanet group. Shares the Sentry-self-healing ETL call from
   // etl-adhoc and the chat LLM client for classification/synthesis; exposed
@@ -422,6 +429,8 @@ async function main() {
     contentStore,
     etlOnboarding,
     browserHands,
+    visualAssets,
+    visualInspector,
   });
   const toolExecutor = withProductDocumentChatTools(baseToolExecutor, productDocumentService);
 
@@ -980,6 +989,8 @@ async function main() {
     writingConfigStore,
     chatTerminal,
     etlOnboarding,
+    visualAssets,
+    visualInspector,
   };
   app.use('/api', createRouter(routerDeps));
 

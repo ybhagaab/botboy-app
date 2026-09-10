@@ -231,6 +231,122 @@ function createSchema(db: Database.Database): void {
 
   // ── guarded workspace catalog + native page layouts migration ──
   migrateWorkspaceControl(db);
+
+  // ── local visual assets + question-directed inspection ledger ──
+  migrateVisualInspection(db);
+}
+
+/**
+ * Local visual evidence registry and restart-safe inspection ledger.
+ *
+ * This is deliberately separate from work_items: registering or inspecting a
+ * visual never creates captured evidence, project events, Today changes, or
+ * external writes. Originals are immutable files under the app home; SQLite
+ * stores only version pins, producer references, and coverage receipts.
+ */
+export function migrateVisualInspection(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS visual_assets (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS visual_asset_versions (
+      id TEXT PRIMARY KEY,
+      asset_id TEXT NOT NULL REFERENCES visual_assets(id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+      source_sha256 TEXT NOT NULL,
+      source_bytes INTEGER NOT NULL CHECK(source_bytes > 0),
+      mime TEXT NOT NULL CHECK(mime IN ('image/png','image/jpeg')),
+      width INTEGER NOT NULL CHECK(width > 0),
+      height INTEGER NOT NULL CHECK(height > 0),
+      original_rel_path TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(asset_id, ordinal),
+      UNIQUE(asset_id, source_sha256)
+    );
+
+    CREATE TABLE IF NOT EXISTS visual_asset_references (
+      id TEXT PRIMARY KEY,
+      asset_version_id TEXT NOT NULL REFERENCES visual_asset_versions(id) ON DELETE RESTRICT,
+      owner_kind TEXT NOT NULL CHECK(owner_kind IN ('chat_attachment','browser_screenshot')),
+      owner_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      released_at TEXT,
+      UNIQUE(owner_kind, owner_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS visual_inspection_runs (
+      id TEXT PRIMARY KEY,
+      request_key TEXT NOT NULL,
+      question TEXT NOT NULL,
+      owner_request TEXT NOT NULL,
+      asset_versions_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+      comparison_mode TEXT CHECK(comparison_mode IN ('co_batch','observation_merge')),
+      coverage_total INTEGER NOT NULL DEFAULT 0 CHECK(coverage_total >= 0),
+      coverage_completed INTEGER NOT NULL DEFAULT 0 CHECK(coverage_completed >= 0),
+      provider TEXT,
+      model TEXT,
+      receipt_json TEXT,
+      receipt_sha256 TEXT,
+      error TEXT,
+      queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+      started_at TEXT,
+      completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS visual_inspection_units (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES visual_inspection_runs(id) ON DELETE CASCADE,
+      asset_version_id TEXT NOT NULL REFERENCES visual_asset_versions(id) ON DELETE RESTRICT,
+      unit_key TEXT NOT NULL,
+      unit_kind TEXT NOT NULL CHECK(unit_kind IN ('original','overview','tile')),
+      source_x INTEGER NOT NULL DEFAULT 0 CHECK(source_x >= 0),
+      source_y INTEGER NOT NULL DEFAULT 0 CHECK(source_y >= 0),
+      source_width INTEGER NOT NULL CHECK(source_width > 0),
+      source_height INTEGER NOT NULL CHECK(source_height > 0),
+      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','observed','uncertain','unreadable','unsupported','failed','changed','excluded')),
+      rendition_rel_path TEXT,
+      rendition_sha256 TEXT,
+      request_body_bytes INTEGER,
+      request_image_chars INTEGER,
+      observation_json TEXT,
+      observation_sha256 TEXT,
+      error TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      UNIQUE(run_id, unit_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_visual_asset_versions_asset
+      ON visual_asset_versions(asset_id, ordinal DESC);
+    CREATE INDEX IF NOT EXISTS idx_visual_asset_versions_sha
+      ON visual_asset_versions(source_sha256);
+    CREATE INDEX IF NOT EXISTS idx_visual_asset_references_owner
+      ON visual_asset_references(owner_kind, owner_id);
+    CREATE INDEX IF NOT EXISTS idx_visual_inspection_runs_request
+      ON visual_inspection_runs(request_key, queued_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_visual_inspection_runs_active_request
+      ON visual_inspection_runs(request_key)
+      WHERE status IN ('queued','running');
+    CREATE INDEX IF NOT EXISTS idx_visual_inspection_units_run_status
+      ON visual_inspection_units(run_id, status);
+  `);
+
+  // A process died mid-call: preserve completed unit receipts and make the run
+  // resumable. The next identical composite call owns continuation.
+  db.exec(`
+    UPDATE visual_inspection_runs
+    SET status = 'failed', error = 'Stale queued inspection expired before execution', completed_at = datetime('now')
+    WHERE status = 'queued' AND queued_at < datetime('now', '-24 hours');
+    UPDATE visual_inspection_units
+    SET status = 'queued', error = 'Interrupted before a terminal receipt', started_at = NULL
+    WHERE status = 'running';
+    UPDATE visual_inspection_runs
+    SET status = 'queued', error = 'Interrupted; resume required', started_at = NULL
+    WHERE status = 'running';
+  `);
 }
 
 /**

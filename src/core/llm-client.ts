@@ -34,9 +34,21 @@ export interface StreamResult {
   providerOutput?: unknown[];
 }
 
+export interface PrimaryRequestPreflight extends ProviderRequestSize {
+  model: string;
+  apiMode: LlmApiMode;
+  maximumBytes: number;
+  remainingBytes: number;
+}
+
 export interface LlmClient {
   chatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse>;
   chatCompletionStream(request: ChatCompletionRequest): AsyncGenerator<StreamChunk, StreamResult, undefined>;
+  /** Exact primary-provider planning using the same private body builder as send. */
+  preflightPrimary(request: ChatCompletionRequest): PrimaryRequestPreflight;
+  /** Primary-only/no-fallback call that does not mutate shared endpoint health. */
+  chatCompletionPrimary(request: ChatCompletionRequest): Promise<ChatCompletionResponse>;
+  getMaxRequestBytes(): number;
   /** The primary (non-Ollama) endpoint's default model id — the anchor blessed overrides resolve against. */
   getDefaultModel(): string;
   sendPrompt(prompt: string): Promise<AcpResponse>; // backward compat
@@ -86,6 +98,12 @@ export interface ChatCompletionRequest {
    * keeps its own local model.
    */
   model?: string;
+  /**
+   * Internal exact-wire guard used only by same-turn payload recovery. The
+   * final serialized provider body must satisfy this before logging, auth, or
+   * fetch so recovery can never resend an identical/unsafe request.
+   */
+  payloadConstraint?: ProviderRequestConstraint;
 }
 
 export interface ChatCompletionResponse {
@@ -123,6 +141,9 @@ export interface LlmMessage {
    * and are replaced upstream by a text note.
    */
   images?: string[];
+  /** Internal-only provenance for bounded tool-image supersession. */
+  visionEvidenceKey?: string;
+  visionEvidenceSource?: 'browser_screenshot';
 }
 
 /** Which model-family conventions the remote endpoint uses. */
@@ -165,6 +186,147 @@ export interface ToolDefinition {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
+export interface ProviderRequestSize {
+  bodyChars: number;
+  bodyBytes: number;
+  imageCount: number;
+  imageChars: number;
+}
+
+export interface ProviderRequestConstraint {
+  requireImageFree?: boolean;
+  /** Recovery bodies must be strictly smaller than the rejected body. */
+  smallerThanBytes?: number;
+}
+
+export type LlmPayloadLimitSource = 'local' | 'remote';
+
+export class LlmPayloadTooLargeError extends Error {
+  readonly code = 'LLM_PAYLOAD_TOO_LARGE';
+  readonly source: LlmPayloadLimitSource;
+  readonly httpStatus?: number;
+  readonly providerMessage?: string;
+
+  constructor(
+    readonly size: ProviderRequestSize,
+    readonly maximumBytes: number,
+    details: { source?: LlmPayloadLimitSource; httpStatus?: number; providerMessage?: string } = {},
+  ) {
+    const source = details.source ?? 'local';
+    const prefix = source === 'remote'
+      ? `LLM endpoint rejected a ${(size.bodyBytes / 1_000_000).toFixed(2)} MB request; its reported payload limit is ${(maximumBytes / 1_000_000).toFixed(2)} MB`
+      : `LLM request payload is ${(size.bodyBytes / 1_000_000).toFixed(2)} MB; local safe limit is ${(maximumBytes / 1_000_000).toFixed(2)} MB`;
+    super(`${prefix} (${size.imageCount} inline image(s), ${(size.imageChars / 1_000_000).toFixed(2)} MB base64). The rejected request was not processed. Recover with a smaller request: Capture fewer/more focused screenshots or attach fewer/smaller images.`);
+    this.name = 'LlmPayloadTooLargeError';
+    this.source = source;
+    this.httpStatus = details.httpStatus;
+    this.providerMessage = details.providerMessage?.slice(0, 500);
+  }
+}
+
+export class LlmPayloadConstraintError extends Error {
+  readonly code = 'LLM_PAYLOAD_RECOVERY_UNSAFE';
+  constructor(message: string) {
+    super(`LLM payload recovery invariant failed: ${message}`);
+    this.name = 'LlmPayloadConstraintError';
+  }
+}
+
+export function isLlmPayloadTooLargeError(error: unknown): error is LlmPayloadTooLargeError {
+  return error instanceof LlmPayloadTooLargeError || (error as any)?.code === 'LLM_PAYLOAD_TOO_LARGE';
+}
+
+function bytesFromHumanSize(value: string, unit: string): number | null {
+  const numeric = Number(value.replace(/,/g, ''));
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  const multipliers: Record<string, number> = {
+    b: 1,
+    byte: 1,
+    bytes: 1,
+    kb: 1_000,
+    kib: 1_024,
+    mb: 1_000_000,
+    mib: 1_048_576,
+    gb: 1_000_000_000,
+    gib: 1_073_741_824,
+  };
+  const multiplier = multipliers[unit.toLowerCase()];
+  return multiplier ? Math.floor(numeric * multiplier) : null;
+}
+
+/** Normalize only the provider's explicit payload-limit rejection. */
+export function providerHttpError(status: number, responseText: string, size: ProviderRequestSize): Error {
+  const detail = String(responseText ?? '');
+  const match = /\bpayload size of\s+([\d,.]+)\s*(bytes?|b|kb|kib|mb|mib|gb|gib)\s+exceeds\s+the\s+allowed limit of\s+([\d,.]+)\s*(bytes?|b|kb|kib|mb|mib|gb|gib)\b/i.exec(detail);
+  if ((status === 400 || status === 413) && match) {
+    const maximumBytes = bytesFromHumanSize(match[3], match[4]);
+    if (maximumBytes) {
+      return new LlmPayloadTooLargeError(size, maximumBytes, {
+        source: 'remote',
+        httpStatus: status,
+        providerMessage: detail,
+      });
+    }
+  }
+  return new Error(`HTTP ${status}: ${detail}`);
+}
+
+export function providerRequestSize(bodyStr: string): ProviderRequestSize {
+  let cursor = 0;
+  let imageCount = 0;
+  let imageChars = 0;
+  while (true) {
+    const start = bodyStr.indexOf('data:image/', cursor);
+    if (start < 0) break;
+    const end = bodyStr.indexOf('"', start);
+    const boundary = end < 0 ? bodyStr.length : end;
+    imageCount += 1;
+    imageChars += boundary - start;
+    cursor = boundary + 1;
+  }
+  return {
+    bodyChars: bodyStr.length,
+    bodyBytes: Buffer.byteLength(bodyStr, 'utf8'),
+    imageCount,
+    imageChars,
+  };
+}
+
+function assertProviderRequestConstraint(size: ProviderRequestSize, constraint?: ProviderRequestConstraint): void {
+  if (!constraint) return;
+  if (constraint.requireImageFree && size.imageCount !== 0) {
+    throw new LlmPayloadConstraintError(`expected an image-free body, found ${size.imageCount} inline image(s)`);
+  }
+  if (
+    Number.isFinite(constraint.smallerThanBytes) &&
+    Number(constraint.smallerThanBytes) > 0 &&
+    size.bodyBytes >= Number(constraint.smallerThanBytes)
+  ) {
+    throw new LlmPayloadConstraintError(`recovery body ${size.bodyBytes} bytes is not smaller than rejected body ${constraint.smallerThanBytes} bytes`);
+  }
+}
+
+export function serializeProviderRequest(
+  body: unknown,
+  maximumBytes?: number,
+  constraint?: ProviderRequestConstraint,
+): { bodyStr: string; size: ProviderRequestSize } {
+  const bodyStr = JSON.stringify(body);
+  const size = assertProviderRequestSize(bodyStr, maximumBytes);
+  assertProviderRequestConstraint(size, constraint);
+  return { bodyStr, size };
+}
+
+export function assertProviderRequestSize(
+  bodyStr: string,
+  maximumBytes = Number(process.env.BOTBOY_LLM_MAX_REQUEST_BYTES || 5_500_000),
+): ProviderRequestSize {
+  const size = providerRequestSize(bodyStr);
+  const boundedMaximum = Number.isFinite(maximumBytes) && maximumBytes > 0 ? Math.floor(maximumBytes) : 5_500_000;
+  if (size.bodyBytes > boundedMaximum) throw new LlmPayloadTooLargeError(size, boundedMaximum);
+  return size;
+}
+
 export interface LlmConfig {
   ecs: {
     endpoint: string; model: string; maxContextTokens: number; requestTimeoutMs: number; apiKey?: string;
@@ -196,6 +358,8 @@ export interface LlmConfig {
   defaults: { temperature: number; maxCompletionTokens: number; contextBudgetTokens: number };
   healthCheckIntervalMs: number;
   fallbackEnabled: boolean;
+  /** Exact serialized HTTP body ceiling for this provider profile. */
+  maxRequestBytes?: number;
   /**
    * Streaming idle watchdog: abort a stream when no bytes arrive for this many
    * ms (wedged socket after laptop sleep, silent ALB drop). There is
@@ -394,6 +558,8 @@ export function toWireMessages(ep: Pick<Endpoint, 'dialect'>, messages: LlmMessa
       ];
     }
     delete wire.images;
+    delete wire.visionEvidenceKey;
+    delete wire.visionEvidenceSource;
     return wire;
   });
 }
@@ -488,6 +654,10 @@ export function createLlmClient(config: LlmConfig): LlmClient {
   }
 
   let healthTimer: ReturnType<typeof setInterval> | null = null;
+  const configuredRequestMaximum = Number(config.maxRequestBytes ?? process.env.BOTBOY_LLM_MAX_REQUEST_BYTES ?? 5_500_000);
+  const maximumRequestBytes = Number.isFinite(configuredRequestMaximum) && configuredRequestMaximum > 0
+    ? Math.floor(configuredRequestMaximum)
+    : 5_500_000;
 
   function getOrderedEndpoints(): Endpoint[] {
     const healthy = endpoints.filter(e => e.healthy);
@@ -593,6 +763,9 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
   // Build request body for Ollama native API
   function buildOllamaBody(ep: Endpoint, req: ChatCompletionRequest): any {
+    if (req.messages.some(message => message.images?.length)) {
+      throw new Error('OLLAMA_VISION_UNSUPPORTED: local fallback cannot preserve image evidence; retry on the configured vision endpoint');
+    }
     return {
       model: ep.model,
       messages: req.messages.map(m => ({ role: m.role, content: m.content || '' })),
@@ -792,17 +965,30 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
   }
 
-  async function callEndpoint(ep: Endpoint, req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+  function prepareBatchRequest(ep: Endpoint, req: ChatCompletionRequest) {
     const isOllama = ep.useOllamaApi;
     const isResponses = !isOllama && ep.apiMode === 'responses';
     const url = isOllama ? `${ep.url}/api/chat` : remoteRequestUrl(ep);
-    // Serialize ONCE: SigV4 signs the payload hash, so the signed string and
-    // the sent string must be byte-identical.
     const body = isOllama
       ? buildOllamaBody(ep, req)
       : (isResponses ? buildResponsesBody(ep, req, false) : buildOpenAIBody(ep, req));
-    const bodyStr = JSON.stringify(body);
-    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions'), stream: false, request: body });
+    const { bodyStr, size } = serializeProviderRequest(body, maximumRequestBytes, req.payloadConstraint);
+    return { isOllama, isResponses, url, body, bodyStr, size };
+  }
+
+  async function callEndpoint(
+    ep: Endpoint,
+    req: ChatCompletionRequest,
+    options: { healthNeutral?: boolean } = {},
+  ): Promise<ChatCompletionResponse> {
+    // Serialize ONCE: SigV4 signs the payload hash, so the signed string and
+    // the sent string must be byte-identical.
+    const prepared = prepareBatchRequest(ep, req);
+    const { isOllama, isResponses, url, body, bodyStr, size } = prepared;
+    logLlmPrompt({
+      url, model: effectiveModel(ep, req), apiMode: isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions'), stream: false, request: body,
+      bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
+    });
 
     const resp = await postWithAuthRetry(
       ep,
@@ -812,16 +998,20 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     );
 
     if (resp.status === 429 || resp.status === 503) {
-      const wait = Math.min(1000 * Math.pow(2, ep.retryCount++), 30000);
-      await new Promise(r => setTimeout(r, wait));
+      if (!options.healthNeutral) {
+        const wait = Math.min(1000 * Math.pow(2, ep.retryCount++), 30000);
+        await new Promise(r => setTimeout(r, wait));
+      }
       throw new Error(`${resp.status} — retryable`);
     }
 
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text().catch(() => '')}`);
+    if (!resp.ok) throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
 
     const data = await resp.json();
-    ep.retryCount = 0;
-    ep.healthy = true;
+    if (!options.healthNeutral) {
+      ep.retryCount = 0;
+      ep.healthy = true;
+    }
     if (isOllama) return parseOllamaResponse(data);
     return isResponses
       ? parseResponsesResponse(data, (req.tools?.length ?? 0) > 0)
@@ -848,8 +1038,11 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     const toolsOffered = (req.tools?.length ?? 0) > 0;
     const url = remoteRequestUrl(ep);
     const responsesBody = buildResponsesBody(ep, req, true);
-    const bodyStr = JSON.stringify(responsesBody);
-    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: 'responses', stream: true, request: responsesBody });
+    const { bodyStr, size } = serializeProviderRequest(responsesBody, maximumRequestBytes, req.payloadConstraint);
+    logLlmPrompt({
+      url, model: effectiveModel(ep, req), apiMode: 'responses', stream: true, request: responsesBody,
+      bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
+    });
 
     const idleMs = config.streamIdleTimeoutMs ?? 120000;
     const controller = new AbortController();
@@ -875,7 +1068,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
     if (!resp.ok) {
       if (idleTimer) clearTimeout(idleTimer);
-      throw new Error(`HTTP ${resp.status}: ${await resp.text().catch(() => '')}`);
+      throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
     }
     if (!resp.body) {
       if (idleTimer) clearTimeout(idleTimer);
@@ -1108,8 +1301,11 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     const url = remoteRequestUrl(ep);
     // Serialize ONCE — sigv4 signs the payload hash (see callEndpoint).
     const openAiStreamBody = buildOpenAIStreamBody(ep, req);
-    const bodyStr = JSON.stringify(openAiStreamBody);
-    logLlmPrompt({ url, model: effectiveModel(ep, req), apiMode: 'chat-completions', stream: true, request: openAiStreamBody });
+    const { bodyStr, size } = serializeProviderRequest(openAiStreamBody, maximumRequestBytes, req.payloadConstraint);
+    logLlmPrompt({
+      url, model: effectiveModel(ep, req), apiMode: 'chat-completions', stream: true, request: openAiStreamBody,
+      bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
+    });
     // Whether the caller opted into chain-of-thought. When false, Qwen3.5 emits
     // plain content with NO <think>/</think> tags — so we must NOT treat content
     // as "thinking" just because a </think> marker is absent.
@@ -1143,7 +1339,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
     if (!resp.ok) {
       if (idleTimer) clearTimeout(idleTimer);
-      throw new Error(`HTTP ${resp.status}: ${await resp.text().catch(() => '')}`);
+      throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
     }
     if (!resp.body) {
       if (idleTimer) clearTimeout(idleTimer);
@@ -1358,6 +1554,29 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       return primary?.model ?? '';
     },
 
+    preflightPrimary(request: ChatCompletionRequest): PrimaryRequestPreflight {
+      const primary = endpoints.find(endpoint => !endpoint.useOllamaApi);
+      if (!primary) throw new Error('Primary visual-capable LLM endpoint is unavailable');
+      const prepared = prepareBatchRequest(primary, request);
+      return {
+        ...prepared.size,
+        model: effectiveModel(primary, request),
+        apiMode: primary.apiMode,
+        maximumBytes: maximumRequestBytes,
+        remainingBytes: Math.max(0, maximumRequestBytes - prepared.size.bodyBytes),
+      };
+    },
+
+    async chatCompletionPrimary(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
+      const primary = endpoints.find(endpoint => !endpoint.useOllamaApi);
+      if (!primary) throw new Error('Primary visual-capable LLM endpoint is unavailable');
+      return callEndpoint(primary, request, { healthNeutral: true });
+    },
+
+    getMaxRequestBytes(): number {
+      return maximumRequestBytes;
+    },
+
     async chatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
       const ordered = getOrderedEndpoints();
       let lastError: Error | null = null;
@@ -1366,6 +1585,10 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         try {
           return await callEndpoint(ep, request);
         } catch (err: any) {
+          // Payload limits are request-specific, not endpoint health. Never
+          // poison health or fall through to a transport that would lose
+          // image evidence; the owning loop gets one smaller recovery pass.
+          if (isLlmPayloadTooLargeError(err)) throw err;
           ep.healthy = false;
           lastError = err;
           if (!config.fallbackEnabled) throw err;
@@ -1382,6 +1605,9 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       try {
         return yield* streamEndpoint(ecsEp, request);
       } catch (err: any) {
+        // A request-specific payload rejection says nothing about endpoint
+        // health; preserve the endpoint and let the chat loop rebuild once.
+        if (isLlmPayloadTooLargeError(err)) throw err;
         ecsEp.healthy = false;
         throw err;
       }

@@ -81,6 +81,10 @@ export interface LlmPromptLogEntry {
   stream: boolean;
   /** The exact request body object (already serialized once for the wire). */
   request: unknown;
+  bodyChars?: number;
+  bodyBytes?: number;
+  imageCount?: number;
+  imageChars?: number;
 }
 
 // ── Markdown rendering ───────────────────────────────────────────────────────
@@ -132,6 +136,8 @@ function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): 
       `- **model**: ${entry.model}`,
       `- **apiMode**: ${entry.apiMode}${entry.stream ? ' (streaming)' : ''}`,
       `- **bodyChars**: ${bodyChars.toLocaleString()}`,
+      `- **bodyBytes**: ${(entry.bodyBytes ?? bodyChars).toLocaleString()}`,
+      `- **inlineImages**: ${(entry.imageCount ?? 0).toLocaleString()} (${(entry.imageChars ?? 0).toLocaleString()} chars)`,
     ].join('\n'),
   );
 
@@ -203,7 +209,8 @@ export function logLlmPrompt(rawEntry: LlmPromptLogEntry): void {
   // short random suffix keeps every request its own file.
   const suffix = Math.random().toString(36).slice(2, 6);
   const stem = `${localStamp(now)}_${entry.apiMode}${entry.stream ? '-stream' : ''}_${suffix}`;
-  const bodyChars = JSON.stringify(rawEntry.request).length;
+  const bodyChars = rawEntry.bodyChars ?? JSON.stringify(rawEntry.request).length;
+  const bodyBytes = rawEntry.bodyBytes ?? bodyChars;
   const jsonPayload = JSON.stringify(
     {
       ts: now.toISOString(),
@@ -212,6 +219,9 @@ export function logLlmPrompt(rawEntry: LlmPromptLogEntry): void {
       apiMode: entry.apiMode,
       stream: entry.stream,
       bodyChars,
+      bodyBytes,
+      imageCount: rawEntry.imageCount ?? 0,
+      imageChars: rawEntry.imageChars ?? 0,
       request: entry.request,
     },
     null,

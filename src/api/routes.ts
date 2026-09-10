@@ -28,6 +28,7 @@ import { createLessonsRouter } from './routers/lessons.js';
 import { createWorkspaceRouter } from './routers/workspace.js';
 import { createProductDocumentsRouter } from './routers/product-documents.js';
 import { createDocumentsRouter } from './routers/documents.js';
+import { createVisualAssetsRouter } from './routers/visual-assets.js';
 
 export type { RouterDeps } from './routers/deps.js';
 
@@ -54,6 +55,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createLessonsRouter(deps));
   router.use(createWorkspaceRouter(deps));
   router.use(createProductDocumentsRouter(deps));
+  router.use(createVisualAssetsRouter(deps));
   // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from
   // /product-documents — the writing workspace stays untouched.
   router.use(createDocumentsRouter(deps));

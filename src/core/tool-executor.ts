@@ -31,25 +31,32 @@ import { createPendingEdit, listPendingEdits, decidePendingEdit } from './pendin
 import { listDocumentCorpus, buildDocumentView, docKeyForPath } from './document-corpus.js';
 import type { ContentStore } from './content-store.js';
 import type { BrowserHandsService } from './browser-hands.js';
+import type { VisualAssetRegistry } from './visual-assets.js';
+import type { VisualInspector } from './visual-inspector.js';
+import type { ToolImageEvidence } from './vision-payload.js';
 
 
 export interface ToolResult {
   toolCallId: string;
   content: string;
   isError: boolean;
-  /** Binary evidence for the immediately following model iteration. */
+  /** Binary evidence carried out-of-band from capped tool text. */
   images?: string[];
+  /** Scoped tool evidence used for supersession and turn-wide budgeting. */
+  imageEvidence?: ToolImageEvidence[];
 }
 
 type ToolHandlerOutput = string | {
   content: string;
   images?: string[];
+  imageEvidence?: ToolImageEvidence[];
   isError?: boolean;
 };
 
 export interface ToolExecutionContext {
   /** Exact owner turn, supplied by the server rather than the model. */
   currentUserMessage?: string;
+  callerKind?: 'interactive' | 'background';
 }
 
 export interface ToolExecutor {
@@ -219,6 +226,8 @@ export function createToolExecutor(
     contentStore?: ContentStore;
     etlOnboarding?: EtlOnboardingService;
     browserHands?: BrowserHandsService;
+    visualAssets?: VisualAssetRegistry;
+    visualInspector?: VisualInspector;
   } = {},
 ): ToolExecutor {
   const brainStore = extras.brainStore;
@@ -229,6 +238,8 @@ export function createToolExecutor(
   const contentStore = extras.contentStore;
   const etlOnboarding = extras.etlOnboarding;
   const browserHands = extras.browserHands;
+  const visualAssets = extras.visualAssets;
+  const visualInspector = extras.visualInspector;
   const API_BASE = `http://localhost:${process.env.PPT_PORT || 7778}/api`;
   const normalizeTaskText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -1402,12 +1413,91 @@ export function createToolExecutor(
       const result = await browserHands.screenshot({
         tabId: String(args.tabId ?? ''),
         fullPage: args.fullPage === true,
+        includeModelImage: !visualAssets,
       });
+      let receipt: any = result.receipt;
+      if (receipt.ok && receipt.filePath && visualAssets) {
+        try {
+          const asset = visualAssets.registerFile({
+            filePath: String(receipt.filePath),
+            declaredMime: 'image/png',
+            ownerKind: 'browser_screenshot',
+            ownerId: String(receipt.filePath),
+          });
+          receipt = {
+            ...receipt,
+            assetId: asset.assetId,
+            versionId: asset.versionId,
+            originalSha256: asset.sha256,
+            originalUrl: asset.originalUrl,
+            modelInspection: 'Pixels are stored locally and not inserted into the main prompt. Call inspect_visual_assets with this assetId and the exact visual question.',
+          };
+        } catch (error: any) {
+          receipt = {
+            ...receipt,
+            assetRegistrationError: String(error?.message ?? error),
+            nextAction: 'Retry the screenshot. Do not claim visual inspection without an inspect_visual_assets receipt.',
+          };
+        }
+      }
       return {
-        content: JSON.stringify(result.receipt, null, 1),
-        ...(result.dataUrl ? { images: [result.dataUrl] } : {}),
-        isError: !result.receipt.ok,
+        content: JSON.stringify(receipt, null, 1),
+        // Compatibility fallback for lightweight/test construction without the
+        // registry. Production uses asset IDs and the compact visual reader.
+        ...(!visualAssets && result.dataUrl && result.receipt.tabId ? {
+          imageEvidence: [{
+            dataUrl: result.dataUrl,
+            evidenceKey: `browser:${result.receipt.tabId}`,
+            source: 'browser_screenshot' as const,
+            mimeType: result.receipt.modelImageMime ?? 'image/jpeg',
+            bytes: Number(result.receipt.modelImageBytes ?? 0),
+            width: Number(result.receipt.modelImageWidth ?? 0),
+            height: Number(result.receipt.modelImageHeight ?? 0),
+          }],
+        } : {}),
+        isError: !receipt.ok || Boolean(receipt.assetRegistrationError),
       };
+    },
+
+    inspect_visual_assets: async (args, context: ToolExecutionContext = {}) => {
+      if (!visualInspector) return 'Error: visual inspection service unavailable';
+      const assetIds = Array.isArray(args.assetIds) ? args.assetIds.map((value: unknown) => String(value)) : [];
+      try {
+        const receipt = await visualInspector.inspect({
+          assetIds,
+          question: String(args.question ?? ''),
+          ownerRequest: String(context.currentUserMessage ?? ''),
+          callerKind: context.callerKind ?? 'background',
+        });
+        let payload = JSON.stringify(receipt, null, 1);
+        if (payload.length > 110_000) {
+          payload = JSON.stringify({
+            ...receipt,
+            evidence: receipt.evidence.map(item => ({
+              assetId: item.assetId,
+              versionId: item.versionId,
+              unitKey: item.unitKey,
+              status: item.status,
+              answer: item.answer.slice(0, 300),
+              sourceRegion: item.sourceRegion,
+              requestBodyBytes: item.requestBodyBytes,
+            })),
+            evidenceCompactedForChat: true,
+            durableRunId: receipt.runId,
+          }, null, 1);
+        }
+        return payload;
+      } catch (error: any) {
+        return {
+          content: JSON.stringify({
+            ok: false,
+            code: String(error?.code ?? 'VISUAL_INSPECTION_FAILED'),
+            error: String(error?.message ?? error),
+            nextAction: String(error?.nextAction ?? 'Retry with exact asset IDs and a narrower visual question.'),
+          }),
+          isError: true,
+        };
+      }
     },
 
     ui_inspect: async (args) => {
@@ -2307,7 +2397,7 @@ export function createToolExecutor(
   };
 
   return {
-    async executeTool(call: ToolCall): Promise<ToolResult> {
+    async executeTool(call: ToolCall, context: ToolExecutionContext = {}): Promise<ToolResult> {
       const name = call.function.name;
       const handler = handlers[name];
       if (!handler) return { toolCallId: call.id, content: `Unknown tool: ${name}`, isError: true };
@@ -2316,22 +2406,29 @@ export function createToolExecutor(
       try { args = JSON.parse(call.function.arguments); } catch {}
 
       try {
-        const timeoutMs = name === 'publish_static_artifact_to_harmony'
+        const timeoutMs = name === 'publish_static_artifact_to_harmony' || name === 'inspect_visual_assets'
           ? 20 * 60_000
           : name.startsWith('mcp_')
             ? 95_000
             : name.startsWith('browser_') ? 65_000 : TIMEOUT;
-        const rawOutput = await withTimeout(() => handler(args), timeoutMs);
+        const rawOutput = await withTimeout(() => (handler as any)(args, context), timeoutMs);
         const normalized = typeof rawOutput === 'string'
-          ? { content: rawOutput, isError: false, images: undefined }
-          : { content: rawOutput.content, isError: rawOutput.isError ?? false, images: rawOutput.images };
+          ? { content: rawOutput, isError: false, images: undefined, imageEvidence: undefined }
+          : {
+              content: rawOutput.content,
+              isError: rawOutput.isError ?? false,
+              images: rawOutput.images,
+              imageEvidence: rawOutput.imageEvidence,
+            };
         // Universal Kimi-era tool-result ceiling. The retired 32K Qwen path
         // used 4K characters, which discarded most schema/docs before the
         // model could synthesize them. Context-pressure trimming in chat.ts is
         // the final safety valve when a long multi-tool loop approaches the
         // actual provider window. Binary image sidecars are never mixed into
         // this textual cap; the chat/agent loops carry them once as vision.
-        const MAX_RESULT_CHARS = MAX_MODEL_VISIBLE_TOOL_RESULT_CHARS;
+        const MAX_RESULT_CHARS = name === 'inspect_visual_assets'
+          ? 120_000
+          : MAX_MODEL_VISIBLE_TOOL_RESULT_CHARS;
         let content = normalized.content;
         if (content.length > MAX_RESULT_CHARS) {
           const head = content.slice(0, MAX_RESULT_CHARS);
@@ -2344,6 +2441,7 @@ export function createToolExecutor(
           content,
           isError: normalized.isError,
           ...(normalized.images?.length ? { images: normalized.images } : {}),
+          ...(normalized.imageEvidence?.length ? { imageEvidence: normalized.imageEvidence } : {}),
         };
       } catch (e: any) {
         return { toolCallId: call.id, content: `Error: ${e.message}`, isError: true };

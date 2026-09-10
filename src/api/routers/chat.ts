@@ -24,9 +24,14 @@ import {
 import {
   saveChatAttachment,
   loadChatAttachment,
-  attachmentAsDataUrl,
   validateAttachmentIds,
 } from '../../core/chat-attachments.js';
+import {
+  appendToolImageEvidence,
+  imageDataUrlChars,
+  prepareImageFreePayloadRecovery,
+  type ToolImageEvidence,
+} from '../../core/vision-payload.js';
 
 /**
  * Transient-error detector for the chat stream retry: network hiccups,
@@ -38,6 +43,7 @@ import {
  */
 export function isTransientStreamError(err: unknown): boolean {
   const msg = String((err as any)?.message || err || '');
+  if ((err as any)?.code === 'LLM_PAYLOAD_TOO_LARGE' || msg.includes('LLM_PAYLOAD_TOO_LARGE')) return false;
   if (msg.includes('HTTP 4')) return false; // provider rejection — don't retry
   const transientPatterns = [
     'terminated', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN',
@@ -132,7 +138,37 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       return res.status(400).json({ error: 'dataUrl (base64 image data URL) is required' });
     }
     try {
-      res.json(saveChatAttachment(dataUrl));
+      const attachment = saveChatAttachment(dataUrl);
+      const loaded = loadChatAttachment(attachment.id);
+      let visualAsset: Record<string, unknown> | undefined;
+      let visualInspection: Record<string, unknown> | undefined;
+      if (loaded && deps.visualAssets) {
+        try {
+          const registered = deps.visualAssets.registerBuffer({
+            buffer: loaded.buffer,
+            declaredMime: loaded.mime,
+            ownerKind: 'chat_attachment',
+            ownerId: attachment.id,
+          });
+          visualAsset = {
+            assetId: registered.assetId,
+            versionId: registered.versionId,
+            sha256: registered.sha256,
+            width: registered.width,
+            height: registered.height,
+            originalUrl: registered.originalUrl,
+          };
+        } catch (error: any) {
+          // Preserve the existing upload/transcript behavior for formats the
+          // first visual-reader milestone does not yet inspect (WebP/GIF).
+          visualInspection = {
+            status: 'unsupported',
+            error: String(error?.message ?? error),
+            nextAction: String(error?.nextAction ?? 'Convert to PNG or JPEG for visual inspection.'),
+          };
+        }
+      }
+      res.json({ ...attachment, ...(visualAsset ? { visualAsset } : {}), ...(visualInspection ? { visualInspection } : {}) });
     } catch (err: any) {
       res.status(400).json({ error: String(err?.message ?? err) });
     }
@@ -191,6 +227,32 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       return res.status(400).json({ error: attachmentsCheck.error });
     }
     const attachmentIds = attachmentsCheck.ids;
+    // Resolve each upload to an immutable local visual version before SSE.
+    // Legacy att_* files are lazily registered; unsupported WebP/GIF remain
+    // valid transcript attachments but are disclosed as uninspectable.
+    const attachmentVisualAssets: any[] = [];
+    const unsupportedAttachmentIds: string[] = [];
+    if (attachmentIds.length && deps.visualAssets) {
+      for (const attachmentId of attachmentIds) {
+        let visual = deps.visualAssets.getByReference('chat_attachment', attachmentId);
+        if (!visual) {
+          const loaded = loadChatAttachment(attachmentId);
+          if (loaded) {
+            try {
+              visual = deps.visualAssets.registerBuffer({
+                buffer: loaded.buffer,
+                declaredMime: loaded.mime,
+                ownerKind: 'chat_attachment',
+                ownerId: attachmentId,
+              });
+            } catch {
+              unsupportedAttachmentIds.push(attachmentId);
+            }
+          }
+        }
+        if (visual) attachmentVisualAssets.push(visual);
+      }
+    }
     // Model picker (chat panel, 2026-09-03): a blessed gpt-5.6 sibling per
     // message. Absent/empty = the provider default (Terra everywhere,
     // background lanes included). Unknown values are rejected, and the
@@ -308,7 +370,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // pixels — images are token-expensive and ride the current turn only);
         // the current turn's window strips it back below when images attach.
         const sessionContent = attachmentIds.length
-          ? `${message}\n\n[${attachmentIds.length} image(s) were attached to this message and shown to the model in that turn]`
+          ? `${message}\n\n[${attachmentIds.length} image attachment(s) were stored locally for that turn${attachmentVisualAssets.length ? ` as visual assets ${attachmentVisualAssets.map(asset => asset.assetId).join(', ')}` : ''}; future turns do not automatically reload pixels]`
           : message;
         if (convManager && sessionId) convManager.appendUser(sessionId, sessionContent);
 
@@ -387,24 +449,38 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           ...(recentMessages.length > 0 ? recentMessages.filter((m: any) => m.role !== 'system') : [{ role: 'user', content: message }]),
         ];
 
-        // Attach current-turn images to the LAST user message only. Earlier
-        // attachment turns in the window already carry the session-history
-        // note instead of pixels (token discipline). Content resets to the
-        // raw message so the current turn is image + clean text, not both.
+        // Current-turn attachments are represented by compact immutable asset
+        // manifests. Pixels are loaded only by inspect_visual_assets through a
+        // compact no-tools provider call, never into the full BotBoy prompt.
         if (attachmentIds.length) {
-          const turnImages = attachmentIds
-            .map(id => attachmentAsDataUrl(id))
-            .filter((url): url is string => typeof url === 'string');
+          const manifest = deps.visualAssets
+            ? deps.visualAssets.formatManifest(attachmentVisualAssets.map(asset => asset.assetId))
+            : '';
+          const unsupported = unsupportedAttachmentIds.length
+            ? `\nUNSUPPORTED VISUAL ATTACHMENTS: ${unsupportedAttachmentIds.join(', ')} cannot be inspected until converted to PNG or JPEG; do not claim their pixels were seen.`
+            : '';
           for (let i = messages.length - 1; i >= 0; i--) {
             if (messages[i].role === 'user') {
-              messages[i] = { ...messages[i], content: message, images: turnImages };
+              if (deps.visualAssets) {
+                messages[i] = {
+                  ...messages[i],
+                  content: `${message}${manifest ? `\n\n${manifest}` : ''}${unsupported}`,
+                };
+              } else {
+                // Compatibility for isolated test/legacy construction without
+                // the registry; production always supplies visualAssets.
+                const images = attachmentIds.flatMap(id => {
+                  const loaded = loadChatAttachment(id);
+                  return loaded ? [`data:${loaded.mime};base64,${loaded.buffer.toString('base64')}`] : [];
+                });
+                messages[i] = { ...messages[i], content: message, images };
+              }
               break;
             }
           }
         }
 
         const tools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
-        const BROWSER_SCREENSHOT_EVIDENCE_MESSAGE = 'Browser screenshot evidence from the preceding tool result. Inspect these pixels now and keep using them through the rest of this tool turn; the saved owner-openable path is in that tool result.';
 
         // Chat replies don't need the global 16K completion budget; capping at
         // 4K frees ~12K tokens of input headroom so the pre-flight trimmer
@@ -454,6 +530,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         let writeToolCalled = false;
         let integrityRetryUsed = false;
         let analyticsGroundingRetryUsed = false;
+        let visualInspectionRetryUsed = false;
+        const pendingVisualAssetIds = new Set<string>(attachmentVisualAssets.map(asset => String(asset.assetId)));
+        // One semantic rebuild per live turn. Unlike the transient retry, this
+        // removes rejected image bytes and asks the model to resume the SAME
+        // task from preserved owner text + tool receipts.
+        let payloadRecoveryUsed = false;
         // Document authoring runs at maximum reasoning (owner request
         // 2026-08-20). Armed mechanically by the model's own tool use — a
         // get_document_writing_guide call marks the turn as document
@@ -510,7 +592,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }
             return sum + chars;
           }, 0) / 2.7);
-          console.log(`[Chat] Iteration ${i}, messages: ${messages.length}, endpoint: ${llmClient.getActiveEndpoint()}, prompt tokens ~${estPromptTokens}`);
+          const activeImageChars = imageDataUrlChars(messages);
+          console.log(`[Chat] Iteration ${i}, messages: ${messages.length}, endpoint: ${llmClient.getActiveEndpoint()}, prompt tokens ~${estPromptTokens}, vision chars=${activeImageChars}`);
 
           // Pre-flight: trim only when the prompt estimate + reserved output
           // would overflow the server window. The ~2768-token margin generalizes
@@ -601,7 +684,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // Wrap the stream in a single-retry helper. On transient network errors we restart
           // the entire vLLM stream — model regenerates from the same history. Costs one extra
           // inference but is robust against laptop sleep / wifi flaps / DNS blips.
-          const runStream = async (attempt: number): Promise<any> => {
+          const runStream = async (
+            attempt: number,
+            payloadConstraint?: { requireImageFree?: boolean; smallerThanBytes?: number },
+          ): Promise<any> => {
             let streamResult: any = null;
             const gen = llmClient.chatCompletionStream({
               messages,
@@ -620,6 +706,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
               // Blessed sibling override — same family/profile, body-only change.
               ...(modelOverride ? { model: modelOverride } : {}),
+              ...(payloadConstraint ? { payloadConstraint } : {}),
             });
             let iterResult = await gen.next();
             while (!iterResult.done) {
@@ -639,19 +726,56 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             return streamResult;
           };
 
+          const tryPayloadRecovery = async (error: unknown): Promise<{ handled: false } | { handled: true; result: any }> => {
+            if (payloadRecoveryUsed) return { handled: false };
+            const receipt = prepareImageFreePayloadRecovery(messages, error);
+            if (!receipt) return { handled: false };
+
+            // Spend the budget before inference: a failed recovery must never
+            // recurse into another context rewrite.
+            payloadRecoveryUsed = true;
+            console.warn(`[Chat] Payload recovery: removed ${receipt.removedImageCount} image(s), ${receipt.removedImageChars} chars; retrying ${receipt.rejectedBodyBytes}-byte rejection with an image-free body`);
+            try {
+              res.write(`data: ${JSON.stringify({
+                type: 'retry',
+                reason: 'payload_size',
+                message: 'The model endpoint rejected the image payload. Rebuilding a smaller continuation and resuming the same task...',
+              })}\n\n`);
+            } catch {}
+            const result = await runStream(3, {
+              requireImageFree: true,
+              smallerThanBytes: receipt.rejectedBodyBytes,
+            });
+            console.log('[Chat] Image-free payload recovery succeeded; continuing the original tool loop');
+            return { handled: true, result };
+          };
+
           let streamResult: any = null;
           try {
             try {
               streamResult = await runStream(1);
             } catch (firstErr: any) {
-              if (isTransientStreamError(firstErr)) {
+              const payloadRecovery = await tryPayloadRecovery(firstErr);
+              if (payloadRecovery.handled) {
+                streamResult = payloadRecovery.result;
+              } else if (isTransientStreamError(firstErr)) {
                 console.warn(`[Chat] Transient stream error on attempt 1, retrying once: ${firstErr?.message || firstErr}`);
                 // Notify frontend so it can reset any partial bubble state for this iteration
                 try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'network', message: 'Stream interrupted, retrying...' })}\n\n`); } catch {}
                 // Small backoff to let DNS/wifi recover
                 await new Promise(r => setTimeout(r, 1000));
-                streamResult = await runStream(2);
-                console.log(`[Chat] Retry attempt 2 succeeded`);
+                try {
+                  streamResult = await runStream(2);
+                  console.log(`[Chat] Retry attempt 2 succeeded`);
+                } catch (secondErr: any) {
+                  // The first attempt may die transiently before the provider
+                  // can reject the deterministic payload. Normalize/rebuild if
+                  // the retry reveals that payload limit; never send it a third
+                  // time unchanged.
+                  const retryPayloadRecovery = await tryPayloadRecovery(secondErr);
+                  if (retryPayloadRecovery.handled) streamResult = retryPayloadRecovery.result;
+                  else throw secondErr;
+                }
               } else {
                 throw firstErr;
               }
@@ -678,6 +802,30 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             const rawContent = streamResult.content || '';
             // Strip <think> tags from saved content — thinking is stored separately
             let content = rawContent.replace(/<think>[\s\S]*?<\/think>\s*/g, '').replace(/<\/?think>/g, '').trim();
+
+            // ── Visual evidence gate ──
+            // A manifest/path is not pixel inspection. Attachment and browser
+            // producers add exact asset IDs here; only a successful composite
+            // receipt clears them. One corrective pass prevents confident
+            // visual answers that never loaded the local originals.
+            if (pendingVisualAssetIds.size > 0) {
+              if (!visualInspectionRetryUsed) {
+                visualInspectionRetryUsed = true;
+                console.warn(`[Chat] Visual evidence gate: ${pendingVisualAssetIds.size} asset(s) remain uninspected`);
+                try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'visual_grounding', message: 'Inspecting the attached visual evidence before answering...' })}\n\n`); } catch {}
+                messages.push({ role: 'assistant', content });
+                messages.push({
+                  role: 'user',
+                  content: `VISUAL EVIDENCE CHECK (internal; do not mention this mechanism): these local assets have no successful inspection receipt yet: ${[...pendingVisualAssetIds].join(', ')}. If the owner job depends on their pixels, call inspect_visual_assets now with the exact IDs and precise unresolved visual question. If pixels are genuinely irrelevant, explicitly state in the final answer that you did not inspect them and why; never make a visual claim from manifest metadata.`,
+                });
+                continue;
+              }
+              content += `\n\n---\n⚠️ *Visual coverage note: ${pendingVisualAssetIds.size} attached/captured asset(s) were not inspected in this turn; no pixel-level claim is verified for them.*`;
+            }
+
+            if (unsupportedAttachmentIds.length > 0) {
+              content += `\n\n---\n⚠️ *Visual coverage note: ${unsupportedAttachmentIds.length} attachment(s) use a format not yet supported by the local visual reader (${unsupportedAttachmentIds.join(', ')}); their pixels were not inspected.*`;
+            }
 
             // ── Analytics grounding gate ──
             // The schema preflight happened server-side before inference. If
@@ -806,7 +954,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }, 10_000);
             try {
               const settled = await Promise.all(sanitizedToolCalls.map((tc: any) =>
-                toolExecutor.executeTool(tc as any, { currentUserMessage: message })
+                toolExecutor.executeTool(tc as any, { currentUserMessage: message, callerKind: 'interactive' })
                   .catch((error: any) => ({ content: `Error: ${error?.message ?? String(error)}` }))));
               for (const [index, tc] of sanitizedToolCalls.entries()) {
                 toolResults.push({ tc, result: settled[index] });
@@ -886,6 +1034,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               try {
                 result = await toolExecutor.executeTool(tc as any, {
                   currentUserMessage: message,
+                  callerKind: 'interactive',
                 });
               } finally {
                 if (blockingKeepalive) clearInterval(blockingKeepalive);
@@ -964,23 +1113,50 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ? { reasoning_content: streamResult.reasoning }
               : {}),
           });
-          const toolImages: string[] = [];
+          const toolImageEvidence: ToolImageEvidence[] = [];
           for (const { tc, result } of toolResults) {
+            if (tc.function.name === 'browser_screenshot') {
+              try {
+                const receipt = JSON.parse(String(result.content ?? '{}'));
+                if (receipt.ok && typeof receipt.assetId === 'string') pendingVisualAssetIds.add(receipt.assetId);
+              } catch {}
+            }
+            if (tc.function.name === 'inspect_visual_assets') {
+              try {
+                const requested = JSON.parse(String(tc.function.arguments ?? '{}'));
+                const receipt = JSON.parse(String(result.content ?? '{}'));
+                if (receipt.ok && Array.isArray(requested.assetIds)) {
+                  for (const assetId of requested.assetIds) pendingVisualAssetIds.delete(String(assetId));
+                }
+              } catch {}
+            }
             messages.push({ role: 'tool', content: result.content, tool_call_id: tc.id });
-            if (Array.isArray(result.images)) toolImages.push(...result.images.filter((image: unknown) => typeof image === 'string'));
+            if (Array.isArray(result.imageEvidence)) toolImageEvidence.push(...result.imageEvidence);
+            // Backward-compatible unscoped images: keep them bounded under a
+            // unique call key until every producer migrates to provenance.
+            if (Array.isArray(result.images)) {
+              result.images.filter((image: unknown) => typeof image === 'string').forEach((dataUrl: string, index: number) => {
+                toolImageEvidence.push({
+                  dataUrl,
+                  evidenceKey: `tool:${tc.id}:${index}`,
+                  source: 'browser_screenshot',
+                  mimeType: dataUrl.slice(5, dataUrl.indexOf(';')) || 'image/png',
+                  bytes: Math.ceil(dataUrl.length * 0.75),
+                  width: 0,
+                  height: 0,
+                });
+              });
+            }
             console.log(`[Chat] Tool result: ${tc.function.name} resultLen=${(result.content || '').length} argsLen=${(tc.function.arguments || '').length}`);
             res.write(`data: ${JSON.stringify({ type: 'tool_result', name: tc.function.name, preview: result.content.slice(0, 200) })}\n\n`);
           }
-          // Both provider protocols require every function output before the
-          // next user item. Carry screenshot bytes after all tool results for
-          // the remainder of this non-persisted live turn; the text result
-          // separately holds the durable file path and URL.
-          if (toolImages.length) {
-            messages.push({
-              role: 'user',
-              content: BROWSER_SCREENSHOT_EVIDENCE_MESSAGE,
-              images: toolImages.slice(0, 4),
-            });
+          // Tool outputs must precede the following user image item. The shared
+          // manager preserves the latest screenshot per tab through close/final
+          // synthesis, supersedes older same-tab captures, and evicts oldest
+          // tool evidence before the turn-wide visual payload budget is crossed.
+          if (toolImageEvidence.length) {
+            const visionReceipt = appendToolImageEvidence(messages, toolImageEvidence);
+            console.log(`[Chat] Vision context: images=${visionReceipt.activeImageCount}, chars=${visionReceipt.activeImageChars}, superseded=${visionReceipt.supersededKeys.length}, evicted=${visionReceipt.evictedKeys.length}`);
           }
         }
 

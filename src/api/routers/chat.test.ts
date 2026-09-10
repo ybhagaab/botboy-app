@@ -66,6 +66,11 @@ describe('isTransientStreamError', () => {
   });
 
   describe('non-transient failures — never retryable', () => {
+    it('rejects the local vision payload budget error even if its message mentions request failure', () => {
+      const error = Object.assign(new Error('LLM request payload is too large'), { code: 'LLM_PAYLOAD_TOO_LARGE' });
+      expect(isTransientStreamError(error)).toBe(false);
+    });
+
     it('rejects plain logic errors', () => {
       expect(isTransientStreamError(new Error("Cannot read properties of undefined (reading 'content')"))).toBe(false);
     });

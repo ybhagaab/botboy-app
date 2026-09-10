@@ -21,6 +21,11 @@ import path from 'path';
 const ATTACHMENT_DIR = path.join(os.homedir(), '.personal-productivity-tracker', 'chat-attachments');
 export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+// Historical inline-image threshold retained as an exported compatibility
+// constant. Current chat turns send opaque visual-asset manifests and inspect
+// pixels through the compact reader, so aggregate attachment bytes no longer
+// gate the main BotBoy request.
+export const MAX_ATTACHMENT_MODEL_CHARS = 3_500_000;
 
 const MIME_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
@@ -86,17 +91,19 @@ export function attachmentAsDataUrl(id: string): string | null {
   return `data:${loaded.mime};base64,${loaded.buffer.toString('base64')}`;
 }
 
-/** Validate an incoming id list from the chat body: shape, existence, cap. */
+/** Validate an incoming id list from the chat body: shape and existence. */
 export function validateAttachmentIds(ids: unknown): { ok: true; ids: string[] } | { ok: false; error: string } {
   if (ids === undefined || ids === null) return { ok: true, ids: [] };
   if (!Array.isArray(ids)) return { ok: false, error: 'attachments must be an array of attachment ids' };
-  const cleaned = ids.map(value => String(value ?? '').trim()).filter(Boolean);
-  if (cleaned.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+  const submitted = ids.map(value => String(value ?? '').trim()).filter(Boolean);
+  if (submitted.length > MAX_ATTACHMENTS_PER_MESSAGE) {
     return { ok: false, error: `at most ${MAX_ATTACHMENTS_PER_MESSAGE} images per message` };
   }
+  const cleaned = [...new Set(submitted)];
   for (const id of cleaned) {
     if (!ID_RE.test(id)) return { ok: false, error: `invalid attachment id "${id.slice(0, 40)}"` };
-    if (!loadChatAttachment(id)) return { ok: false, error: `attachment ${id} not found — upload it first via POST /chat/attachments` };
+    const loaded = loadChatAttachment(id);
+    if (!loaded) return { ok: false, error: `attachment ${id} not found — upload it first via POST /chat/attachments` };
   }
   return { ok: true, ids: cleaned };
 }
