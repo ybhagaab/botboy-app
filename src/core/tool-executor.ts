@@ -1644,7 +1644,24 @@ export function createToolExecutor(
         staticArtifactPublishing: {
           tool: 'publish_static_artifact_to_harmony',
           available: dashboardPublisher.getConfig().id === 'harmony',
-          note: 'Use dryRun=true to validate/package without publishing. A real publish requires explicit ownerRequested=true and visibility matching the app-wide Harmony setting.',
+          configuredVisibility: dashboardPublisher.getConfig().harmony.visibility,
+          recentAttempts: dashboardPublisher.listStaticArtifactAttempts(5).map(attempt => ({
+            attemptId: attempt.attemptId,
+            slug: attempt.slug,
+            manifestSha256: attempt.manifestSha256,
+            phase: attempt.phase,
+            deployed: attempt.deployed,
+            contentVerified: attempt.contentVerified,
+            visibilityConverged: attempt.visibilityConverged,
+            published: attempt.published,
+            url: attempt.url,
+            visibility: attempt.visibility,
+            error: attempt.error ? attempt.error.slice(0, 600) : undefined,
+            nextAction: attempt.nextAction,
+            createdAt: attempt.createdAt,
+            publishedAt: attempt.publishedAt,
+          })),
+          note: 'An explicit publish request should use one live call; validation is built in. dryRun is only for preview/diagnosis. Partial post-deploy attempts are resumable without redeploying, and browser_hands may repair the Bindles permission named by nextAction.',
         },
         next: dashboardId
           ? `Canonical dashboard sharing still uses #/dashboards/${dashboardId} and its confirmation card. Existing HTML files use publish_static_artifact_to_harmony.`
@@ -1663,11 +1680,13 @@ export function createToolExecutor(
           filePath: String(args.filePath ?? ''),
           ...(args.slug ? { slug: String(args.slug) } : {}),
           ...(Array.isArray(args.assetPaths) ? { assetPaths: args.assetPaths.map((value: unknown) => String(value)) } : {}),
-          visibility: String(args.visibility ?? '') as 'everyone' | 'private',
+          ...(args.visibility ? { visibility: String(args.visibility) as 'everyone' | 'private' } : {}),
           dryRun: args.dryRun === true,
           ownerRequested: args.ownerRequested === true,
+          ...(args.resumeAttemptId ? { resumeAttemptId: String(args.resumeAttemptId) } : {}),
+          verifyExisting: args.verifyExisting === true,
         });
-        return JSON.stringify(result, null, 1);
+        return { content: JSON.stringify(result, null, 1), isError: !result.ok };
       } catch (error: any) {
         return `Error: ${error?.message ?? error}`;
       }
@@ -2298,7 +2317,7 @@ export function createToolExecutor(
 
       try {
         const timeoutMs = name === 'publish_static_artifact_to_harmony'
-          ? 15 * 60_000
+          ? 20 * 60_000
           : name.startsWith('mcp_')
             ? 95_000
             : name.startsWith('browser_') ? 65_000 : TIMEOUT;

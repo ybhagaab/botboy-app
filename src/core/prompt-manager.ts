@@ -235,18 +235,20 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
     type: 'function',
     function: {
       name: 'publish_static_artifact_to_harmony',
-      description: 'Publish an EXISTING interactive HTML file from BotBoy files to the configured owner Harmony app at a stable /a/<slug>/ URL. Use this for prototypes, mocks, and static artifacts; do not convert them into analytics dashboards. The composite externalizes inline style/script blocks for Harmony CSP, includes referenced local assets, packages app.tar, deploys, converges the configured audience, and returns the exact URL/hash/file receipt. It never changes app, stage, bindle, or visibility: visibility MUST equal the app-wide setting from get_dashboard_sharing_status. Set dryRun=true to validate/transform/hash without external publication. A real publish requires an explicit current owner request and ownerRequested=true.',
+      description: 'Publish an EXISTING interactive HTML file from BotBoy files to the configured owner Harmony app at a stable /a/<slug>/ URL. Use this for prototypes, mocks, and static artifacts; do not convert them into analytics dashboards. For an explicit publish request, call this ONCE with ownerRequested=true—validation is built in, so do not run dryRun first unless the owner asked to preview/diagnose. The tool automatically uses app-level stage/bindle/visibility, deploys, retries resource discovery, verifies Can view app, and hashes every served file before published=true. visibility is an optional assertion only; omit it to use configuration. A partial post-deploy receipt includes an attemptId: retry the same call or pass resumeAttemptId to continue verification WITHOUT redeploying. Browser hands are an allowed fallback when nextAction names the Bindles resource; after repair, retry/resume this tool for the final receipt. For a known pre-ledger/manual deployment, verifyExisting=true certifies and records the existing route without running Harmony deploy.',
       parameters: {
         type: 'object',
         properties: {
           filePath: { type: 'string', description: 'Absolute path returned by BotBoy file tools, or a path relative to ~/.personal-productivity-tracker/files. HTML/HTM only.' },
           slug: { type: 'string', description: 'Optional stable URL slug; defaults to the HTML filename.' },
           assetPaths: { type: 'array', items: { type: 'string' }, description: 'Optional additional files relative to the HTML directory for assets referenced dynamically by JavaScript. Ordinary HTML/CSS references are discovered automatically.' },
-          visibility: { type: 'string', enum: ['everyone', 'private'], description: 'Required explicit audience; must match configured app-wide Harmony visibility.' },
-          dryRun: { type: 'boolean', description: 'true validates, externalizes, discovers assets, hashes, and predicts the URL without invoking Harmony.' },
+          visibility: { type: 'string', enum: ['everyone', 'private'], description: 'Optional assertion; when omitted the configured app-wide Harmony visibility is used. A mismatch is rejected and never changes existing audience settings.' },
+          dryRun: { type: 'boolean', description: 'true validates, externalizes, discovers assets, hashes, and predicts the URL without invoking Harmony. Do not use before a normal explicit publish because the live call performs the same validation.' },
           ownerRequested: { type: 'boolean', description: 'Required true only for a real external publish explicitly requested in the current conversation.' },
+          resumeAttemptId: { type: 'string', description: 'Optional attemptId from a partial post-deploy receipt. Resumes access/content verification without redeploying.' },
+          verifyExisting: { type: 'boolean', description: 'Recovery-only: adopt and certify a known already-deployed stable route without running harmony app deploy (for pre-ledger/manual deployments). Still requires ownerRequested=true.' },
         },
-        required: ['filePath', 'visibility'],
+        required: ['filePath'],
       },
     },
   },
@@ -645,7 +647,7 @@ When the user asks about emails, meetings, files, messages, documents, or data, 
 - For dashboard project links, call list_projects to resolve exact IDs. Set projectIds when the owner names a project or the relationship is unambiguous; never invent IDs or guess an uncertain link.
 - Dashboard query widgets remain untrusted analytical output. Pick metric/table/bar/line based on the requested decision, use text only for owner-authored context, and keep SQL bounded and read-only. A successful definition save is not a successful data refresh; report refresh errors honestly.
 - Use refresh_analytics_dashboard when the user asks for current data. Never claim a scheduled refresh or public share exists unless the corresponding dashboard tool confirms it.
-- Sharing is a production AWS write. Use get_dashboard_sharing_status to inspect readiness, then direct the owner to the dashboard’s Share control. The agent cannot upload: the owner must review the exact S3 destination and click the one-time confirmation in the local UI. Never ask to disable S3/CloudFront safety controls.
+- Sharing is an external write. Canonical analytics dashboards use get_dashboard_sharing_status plus the dashboard Share confirmation card. Existing HTML/prototype files use publish_static_artifact_to_harmony directly: for an explicit publish request make ONE live call (validation is built in), use app-level configuration automatically, and claim success only from published=true with contentVerified=true and visibilityConverged=true. dryRun is preview/diagnosis only. A partial post-deploy receipt is resumable without redeploying; follow its nextAction. browser_hands MAY repair the named Bindles permission when deterministic convergence exhausts, then resume the attempt for a final receipt. Never disable S3/CloudFront or Harmony safety controls.
 
 ${formatMcpInventory(ctx?.mcpServers)}
 ${formatDataLaneNotice(ctx?.mcpServers)}

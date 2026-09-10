@@ -9,6 +9,7 @@ import {
   ensureHarmonyViewerAccess,
   provisionHarmonyIdentity,
   provisioningPlan,
+  verifyHarmonyArtifactContent,
   type ProvisionTransport,
 } from './harmony-provision.js';
 
@@ -16,10 +17,11 @@ const TEAM_ID = 'amzn1.abacus.team.abcdef1234567890';
 const BINDLE_ID = 'amzn1.bindle.resource.abcdef1234567890';
 const APP_RESOURCE = 'amzn1.bindle.resource.appappappapp1234';
 
-interface Call { kind: 'graphql' | 'coral' | 'perms'; name: string; payload: any }
+interface Call { kind: 'graphql' | 'coral' | 'perms' | 'urls'; name: string; payload: any }
 
 function transport(overrides: Partial<Record<string, (payload: any) => any>> = {}, rows: Array<{ op: string; ns: string; actorTypeId: string; actorId: string }> = []): { t: ProvisionTransport; calls: Call[] } {
   const calls: Call[] = [];
+  let permissionRows = [...rows];
   const t: ProvisionTransport = {
     async managerAlias(alias) {
       calls.push({ kind: 'graphql', name: 'managerAlias', payload: alias });
@@ -45,11 +47,37 @@ function transport(overrides: Partial<Record<string, (payload: any) => any>> = {
       if (overrides[operation]) return overrides[operation]!(input);
       if (operation === 'DescribeResource') throw new Error('NotFound');
       if (operation === 'CreateBindle') return { bindleId: BINDLE_ID };
+      if (operation === 'GrantPermission') {
+        const permission = input.permission as any;
+        permissionRows.push({
+          op: String(permission.permissionOperation?.[0] ?? ''),
+          ns: String(permission.permissionNamespace ?? ''),
+          actorTypeId: String(permission.actorType ?? ''),
+          actorId: String(permission.actorId ?? ''),
+        });
+        return {};
+      }
+      if (operation === 'RevokePermission') {
+        const permission = input.permission as any;
+        permissionRows = permissionRows.filter(row => !(
+          row.op === String(permission.permissionOperation?.[0] ?? '') &&
+          row.ns === String(permission.permissionNamespace ?? '') &&
+          row.actorTypeId === String(permission.actorType ?? '') &&
+          row.actorId === String(permission.actorId ?? '')
+        ));
+        return {};
+      }
       return {};
     },
     async readPermissions(resourceId) {
       calls.push({ kind: 'perms', name: 'read', payload: resourceId });
-      return rows;
+      if (overrides.readPermissions) return overrides.readPermissions!(resourceId);
+      return [...permissionRows];
+    },
+    async readUrlHashes(urls) {
+      calls.push({ kind: 'urls', name: 'hash', payload: urls });
+      if (overrides.readUrlHashes) return overrides.readUrlHashes!(urls);
+      return [];
     },
   };
   return { t, calls };
@@ -161,5 +189,78 @@ describe('ensureHarmonyViewerAccess', () => {
     const { t } = transport({ DescribeResource: () => app, GrantPermission: () => { throw new Error('PermissionDenied'); } });
     await expect(ensureHarmonyViewerAccess(t, { appName: 'x-botboy-dashboard', settings: settings('everyone') }, 'jdoe'))
       .rejects.toThrow(new RegExp(`bindles\\.amazon\\.com/resource/${APP_RESOURCE}`));
+  });
+});
+
+describe('Harmony post-deploy retry and verification', () => {
+  const app = { resourceId: APP_RESOURCE, owningTeam: { teamId: TEAM_ID } };
+  const settings = { bindleId: BINDLE_ID, stage: 'beta' as const, visibility: 'everyone' as const };
+
+  it('retries transient app discovery with fresh transport calls and returns a verified receipt', async () => {
+    let attempts = 0;
+    const allPeople = { op: 'Can view app', ns: 'harmony', actorTypeId: 'amzn1.bindle.actor-type.public', actorId: 'amzn1.bindle.actor-type.principal' };
+    const { t, calls } = transport({
+      DescribeResource: () => {
+        attempts += 1;
+        if (attempts < 3) throw new Error('[FETCH_FAILED] transient');
+        return app;
+      },
+    }, [allPeople]);
+    const receipt = await ensureHarmonyViewerAccess(
+      t,
+      { appName: 'x-botboy-dashboard', settings },
+      'jdoe',
+      { maxAttempts: 3, delayMs: 0, sleep: async () => undefined },
+    );
+    expect(receipt).toMatchObject({ resourceId: APP_RESOURCE, visibility: 'everyone', verified: true, changed: false });
+    expect(calls.filter(call => call.name === 'DescribeResource')).toHaveLength(3);
+  });
+
+  it('returns a browser-hands fallback only after bounded discovery exhaustion', async () => {
+    const { t } = transport({ DescribeResource: () => { throw new Error('[FETCH_FAILED] still down'); } });
+    await expect(ensureHarmonyViewerAccess(
+      t,
+      { appName: 'x-botboy-dashboard', settings },
+      'jdoe',
+      { maxAttempts: 2, delayMs: 0, sleep: async () => undefined },
+    )).rejects.toThrow(/Browser fallback: open https:\/\/bindles\.amazon\.com\/resource\/harmony\/HarmonyApp/);
+  });
+
+  it('verifies every served file by status, bytes, and sha256', async () => {
+    const files = [
+      { relativePath: 'index.html', bytes: 10, sha256: 'a'.repeat(64) },
+      { relativePath: 'assets/app.js', bytes: 20, sha256: 'b'.repeat(64) },
+    ];
+    const { t, calls } = transport({
+      readUrlHashes: (urls: string[]) => urls.map((requestedUrl, index) => ({
+        requestedUrl,
+        responseUrl: requestedUrl,
+        status: 200,
+        bytes: files[index].bytes,
+        sha256: files[index].sha256,
+      })),
+    });
+    const receipt = await verifyHarmonyArtifactContent(
+      t,
+      { url: 'https://x.beta.harmony.a2z.com/a/mock/', files },
+      { maxAttempts: 1, delayMs: 0 },
+    );
+    expect(receipt.verified).toBe(true);
+    expect(receipt.files.map(file => file.relativePath)).toEqual(['index.html', 'assets/app.js']);
+    expect(calls.find(call => call.kind === 'urls')?.payload).toHaveLength(2);
+  });
+
+  it('retries stale served bytes then fails with a browser fallback', async () => {
+    const file = { relativePath: 'index.html', bytes: 10, sha256: 'a'.repeat(64) };
+    const { t } = transport({
+      readUrlHashes: (urls: string[]) => [{
+        requestedUrl: urls[0], responseUrl: urls[0], status: 200, bytes: 9, sha256: 'c'.repeat(64),
+      }],
+    });
+    await expect(verifyHarmonyArtifactContent(
+      t,
+      { url: 'https://x.beta.harmony.a2z.com/a/mock/', files: [file] },
+      { maxAttempts: 2, delayMs: 0, sleep: async () => undefined },
+    )).rejects.toThrow(/Browser fallback: open https:\/\/x\.beta\.harmony\.a2z\.com\/a\/mock\//);
   });
 });

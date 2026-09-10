@@ -15,7 +15,7 @@ import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from '
 import { createDashboardEtlRunner } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
-import { createCdpProvisionTransport, ensureHarmonyViewerAccess, provisionHarmonyIdentity } from './core/harmony-provision.js';
+import { createCdpProvisionTransport, ensureHarmonyViewerAccess, provisionHarmonyIdentity, verifyHarmonyArtifactContent } from './core/harmony-provision.js';
 import { createNodeManager } from './core/node-manager.js';
 import { createEventBus } from './core/event-bus.js';
 import { createDeduplicator } from './core/deduplicator.js';
@@ -302,6 +302,7 @@ async function main() {
     harmonyHooks: {
       provision: () => provisionHarmonyIdentity(createCdpProvisionTransport()),
       ensureViewerAccess: context => ensureHarmonyViewerAccess(createCdpProvisionTransport(), context),
+      verifyStaticArtifact: context => verifyHarmonyArtifactContent(createCdpProvisionTransport(), context),
     },
   });
   const analyticsScheduler = createAnalyticsScheduler({ db, analyticsService });

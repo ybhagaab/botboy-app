@@ -222,19 +222,39 @@ export interface StaticArtifactPublishInput {
   slug?: string;
   /** Additional files relative to the HTML file's directory. */
   assetPaths?: string[];
-  /** Must match the configured app-wide Harmony visibility. */
-  visibility: 'everyone' | 'private';
+  /** Optional assertion; when omitted the configured app-wide visibility is used. */
+  visibility?: 'everyone' | 'private';
   /** Validate/transform/hash only; never invokes Harmony. */
   dryRun?: boolean;
   /** Required true for a real external publish. */
   ownerRequested?: boolean;
+  /** Resume one persisted post-deploy attempt without redeploying. */
+  resumeAttemptId?: string;
+  /** Adopt and verify a known already-deployed route without running Harmony deploy. */
+  verifyExisting?: boolean;
 }
 
+export type StaticArtifactPublishPhase =
+  | 'prepared'
+  | 'deploying'
+  | 'deployed'
+  | 'converging'
+  | 'verifying_content'
+  | 'published'
+  | 'failed_pre_deploy'
+  | 'failed_after_deploy';
+
 export interface StaticArtifactPublishResult {
-  ok: true;
+  ok: boolean;
+  outcome: 'dry_run' | 'complete' | 'partial';
   provider: 'harmony';
   published: boolean;
   dryRun: boolean;
+  attemptId?: string;
+  phase: StaticArtifactPublishPhase;
+  deployed: boolean;
+  contentVerified: boolean;
+  visibilityConverged: boolean;
   appName: string;
   stage: HarmonyPublisherSettings['stage'];
   visibility: HarmonyPublisherSettings['visibility'];
@@ -249,6 +269,11 @@ export interface StaticArtifactPublishResult {
     inlineScriptsExternalized: number;
     localAssetsIncluded: number;
   };
+  resourceId?: string;
+  error?: string;
+  nextAction?: string;
+  createdAt?: string;
+  deployedAt?: string;
   publishedAt?: string;
 }
 
@@ -290,6 +315,8 @@ export interface DashboardPublisherService {
   publish(dashboardId: string, confirmationToken: string): Promise<DashboardPublishResult>;
   /** Publish an existing BotBoy-files HTML artifact through the configured Harmony app. */
   publishStaticArtifact(input: StaticArtifactPublishInput): Promise<StaticArtifactPublishResult>;
+  /** Recent persisted static publish attempts, newest first. */
+  listStaticArtifactAttempts(limit?: number): StaticArtifactPublishResult[];
   /** Harmony setup stepper: where is the owner in install-cli → bindle → ready? */
   probeHarmonySetup(): Promise<HarmonySetupProbe>;
   /** One-click `toolbox install harmonycli` (the 99% first-run path). */

@@ -853,7 +853,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               tc.function.name === 'wait_for_terminal' ||
               tc.function.name === 'read_terminal' ||
               tc.function.name === 'browser_hands' ||
-              tc.function.name === 'browser_screenshot';
+              tc.function.name === 'browser_screenshot' ||
+              tc.function.name === 'publish_static_artifact_to_harmony';
             const repeats = repeatExempt ? 0 : (seenToolCalls.get(repeatKey) ?? 0);
             if (!repeatExempt) seenToolCalls.set(repeatKey, repeats + 1);
             if (repeats === 0) {

@@ -21,3 +21,22 @@ describe('getToolDefinitions — conversation modes share one toolset', () => {
     }
   });
 });
+
+
+describe('static Harmony publish guidance', () => {
+  it('teaches one-call publish/resume and no longer claims the agent cannot upload', () => {
+    const pm = createPromptManager();
+    const definition = pm.getToolDefinitions('chat').find(tool => tool.function.name === 'publish_static_artifact_to_harmony');
+    expect(definition).toBeTruthy();
+    expect((definition!.function.parameters as any).required).toEqual(['filePath']);
+    expect((definition!.function.parameters as any).properties.resumeAttemptId).toBeTruthy();
+    expect((definition!.function.parameters as any).properties.verifyExisting).toBeTruthy();
+    expect(definition!.function.description).toContain('call this ONCE');
+    expect(definition!.function.description).toContain('WITHOUT redeploying');
+
+    const system = pm.getSystemPrompt('chat');
+    expect(system).not.toContain('The agent cannot upload');
+    expect(system).toContain('Existing HTML/prototype files use publish_static_artifact_to_harmony directly');
+    expect(system).toContain('browser_hands MAY repair');
+  });
+});

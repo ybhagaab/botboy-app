@@ -462,6 +462,32 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_dashboard_publications_dashboard
       ON dashboard_publications(dashboard_id, created_at);
 
+    CREATE TABLE IF NOT EXISTS static_artifact_publications (
+      id TEXT PRIMARY KEY,
+      source_path TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      manifest_sha256 TEXT NOT NULL,
+      manifest_json TEXT NOT NULL,
+      total_bytes INTEGER NOT NULL,
+      transformations_json TEXT NOT NULL,
+      app_name TEXT NOT NULL,
+      stage TEXT NOT NULL CHECK(stage IN ('beta','gamma','prod')),
+      visibility TEXT NOT NULL CHECK(visibility IN ('everyone','private')),
+      url TEXT NOT NULL,
+      phase TEXT NOT NULL CHECK(phase IN ('prepared','deploying','deployed','converging','verifying_content','published','failed_pre_deploy','failed_after_deploy')),
+      resource_id TEXT,
+      deployed INTEGER NOT NULL DEFAULT 0,
+      content_verified INTEGER NOT NULL DEFAULT 0,
+      visibility_converged INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      deployed_at TEXT,
+      published_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_static_artifact_publications_lookup
+      ON static_artifact_publications(slug, manifest_sha256, stage, visibility, created_at);
+
     -- Lessons ledger (LESSONS_LEDGER_PLAN.md): BotBoy's experiential
     -- operating rules — proposed by agents, adopted by the owner, rendered
     -- into the analytics knowledge dir as retrieved knowledge. The table is

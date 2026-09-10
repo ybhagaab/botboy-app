@@ -306,14 +306,20 @@ exit [lindex $result 3]
   return scriptPath;
 }
 
+export interface HarmonyDeployReceipt {
+  appName: string;
+  stage: HarmonySettings['stage'];
+  appExisted: boolean;
+  deployedAt: string;
+}
+
 async function deployHarmonyAssetTree(options: {
   settings: HarmonySettings;
   appRoot: string;
   assetRoot: string;
   appName: string;
   exec: ExecFn;
-  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<void>;
-}): Promise<void> {
+}): Promise<HarmonyDeployReceipt> {
   const probe = await probeHarmony(options.settings, options.exec);
   if (!probe.ready) throw new Error(probe.detail);
 
@@ -327,9 +333,12 @@ async function deployHarmonyAssetTree(options: {
     : await options.exec('harmony', deployArgs, { cwd: options.appRoot, timeoutMs: DEPLOY_TIMEOUT_MS });
   if (deploy.code !== 0) throw new Error(classifyHarmonyFailure(deploy.stdout, deploy.stderr));
 
-  if (options.ensureViewerAccess) {
-    await options.ensureViewerAccess({ appName: options.appName, settings: options.settings });
-  }
+  return {
+    appName: options.appName,
+    stage: options.settings.stage,
+    appExisted: existing.exists,
+    deployedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -350,7 +359,7 @@ export async function publishToHarmony(options: {
   appRoot?: string;
   exec?: ExecFn;
   /** Converge Can-view-app rows to settings.visibility (task 1c″ wires the real transport). */
-  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<void>;
+  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<unknown>;
 }): Promise<{ url: string }> {
   const { settings, dashboard } = options;
   const exec = options.exec ?? defaultExec;
@@ -372,8 +381,10 @@ export async function publishToHarmony(options: {
     assetRoot,
     appName,
     exec,
-    ensureViewerAccess: options.ensureViewerAccess,
   });
+  if (options.ensureViewerAccess) {
+    await options.ensureViewerAccess({ appName, settings });
+  }
 
   return { url: harmonyDashboardUrl(settings, dashboard.id, appName) };
 }
@@ -388,8 +399,7 @@ export async function publishStaticArtifactToHarmony(options: {
   appName?: string;
   appRoot?: string;
   exec?: ExecFn;
-  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<void>;
-}): Promise<{ url: string; appName: string; artifactPath: string }> {
+}): Promise<{ url: string; appName: string; artifactPath: string; deploy: HarmonyDeployReceipt }> {
   const exec = options.exec ?? defaultExec;
   const { appRoot, assetRoot, appName } = scaffoldHarmonyApp(options.settings, {
     appName: options.appName,
@@ -398,18 +408,18 @@ export async function publishStaticArtifactToHarmony(options: {
   const artifactPath = path.join(assetRoot, 'a', options.bundle.slug);
   writeStaticArtifactBundle(options.bundle, artifactPath);
 
-  await deployHarmonyAssetTree({
+  const deploy = await deployHarmonyAssetTree({
     settings: options.settings,
     appRoot,
     assetRoot,
     appName,
     exec,
-    ensureViewerAccess: options.ensureViewerAccess,
   });
 
   return {
     url: harmonyStaticArtifactUrl(options.settings, options.bundle.slug, appName),
     appName,
     artifactPath,
+    deploy,
   };
 }

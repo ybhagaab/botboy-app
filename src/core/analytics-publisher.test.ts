@@ -139,11 +139,9 @@ describe('publisher provider dispatch', () => {
       staticService.updateConfig({ provider: 'harmony', enabled: true, bindleId: BINDLE, stage: 'beta', visibility: 'everyone' } as any);
       const result = await staticService.publishStaticArtifact({
         filePath: 'mock.html',
-        visibility: 'everyone',
         dryRun: true,
       });
-      expect(result.published).toBe(false);
-      expect(result.dryRun).toBe(true);
+      expect(result).toMatchObject({ published: false, dryRun: true, outcome: 'dry_run', phase: 'prepared', visibility: 'everyone' });
       expect(result.url).toBe(`https://${harmonyAppName()}.beta.harmony.a2z.com/a/mock/`);
       expect(result.files.map(file => file.relativePath)).toEqual([
         'botboy-inline-script-1.js',
@@ -158,6 +156,94 @@ describe('publisher provider dispatch', () => {
       await expect(staticService.publishStaticArtifact({
         filePath: 'mock.html', visibility: 'everyone',
       })).rejects.toThrow(/ownerRequested must be true/);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('persists deployed partial state and resumes convergence without redeploying', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'publisher-static-resume-'));
+    try {
+      writeFileSync(path.join(filesRoot, 'mock.html'), '<!doctype html><h1>Mock</h1>');
+      let deployCalls = 0;
+      let accessCalls = 0;
+      let verifyCalls = 0;
+      const staticService = createDashboardPublisherService({
+        db: storage.getDb(),
+        analyticsService: fakeAnalyticsService(dash()),
+        vendorDir,
+        staticFilesRoot: filesRoot,
+        staticPublishAdapter: async ({ settings, bundle }) => {
+          deployCalls += 1;
+          return {
+            url: `https://${harmonyAppName()}.${settings.stage}.harmony.a2z.com/a/${bundle.slug}/`,
+            appName: harmonyAppName(),
+            artifactPath: '/tmp/mock',
+            deploy: { appName: harmonyAppName(), stage: settings.stage, appExisted: true, deployedAt: '2026-09-10T00:00:00.000Z' },
+          };
+        },
+        harmonyHooks: {
+          provision: async () => { throw new Error('unused'); },
+          ensureViewerAccess: async ({ settings }) => {
+            accessCalls += 1;
+            if (accessCalls === 1) throw new Error('viewer-access: transient fetch');
+            return { resourceId: 'resource_1', owningTeamId: 'team_1', visibility: settings.visibility, changed: false, verified: true };
+          },
+          verifyStaticArtifact: async ({ files }) => {
+            verifyCalls += 1;
+            return { verified: true, files: files.map(file => ({ ...file, status: 200, responseUrl: `https://example/${file.relativePath}` })) };
+          },
+        },
+      });
+      staticService.updateConfig({ provider: 'harmony', enabled: true, bindleId: BINDLE, stage: 'beta', visibility: 'everyone' } as any);
+
+      const partial = await staticService.publishStaticArtifact({ filePath: 'mock.html', ownerRequested: true });
+      expect(partial).toMatchObject({ ok: false, outcome: 'partial', deployed: true, published: false, visibilityConverged: false, phase: 'failed_after_deploy' });
+      expect(partial.attemptId).toMatch(/^static_/);
+      expect(partial.nextAction).toContain('without redeploying');
+      expect(deployCalls).toBe(1);
+      expect(verifyCalls).toBe(0);
+
+      const completed = await staticService.publishStaticArtifact({
+        filePath: 'mock.html', ownerRequested: true, resumeAttemptId: partial.attemptId,
+      });
+      expect(completed).toMatchObject({ ok: true, outcome: 'complete', deployed: true, published: true, visibilityConverged: true, contentVerified: true, resourceId: 'resource_1' });
+      expect(deployCalls).toBe(1);
+      expect(accessCalls).toBe(2);
+      expect(verifyCalls).toBe(1);
+      expect(staticService.listStaticArtifactAttempts(1)[0].attemptId).toBe(partial.attemptId);
+
+      const idempotent = await staticService.publishStaticArtifact({ filePath: 'mock.html', ownerRequested: true });
+      expect(idempotent.published).toBe(true);
+      expect(deployCalls).toBe(1);
+      expect(accessCalls).toBe(2);
+      expect(verifyCalls).toBe(1);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('verifyExisting certifies and persists a pre-ledger route without calling deploy', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'publisher-static-adopt-'));
+    try {
+      writeFileSync(path.join(filesRoot, 'existing.html'), '<!doctype html><h1>Existing</h1>');
+      let deployCalls = 0;
+      const staticService = createDashboardPublisherService({
+        db: storage.getDb(),
+        analyticsService: fakeAnalyticsService(dash()),
+        staticFilesRoot: filesRoot,
+        staticPublishAdapter: async () => { deployCalls += 1; throw new Error('must not deploy'); },
+        harmonyHooks: {
+          provision: async () => { throw new Error('unused'); },
+          ensureViewerAccess: async ({ settings }) => ({ resourceId: 'resource_existing', owningTeamId: 'team_1', visibility: settings.visibility, changed: false, verified: true }),
+          verifyStaticArtifact: async ({ files }) => ({ verified: true, files: files.map(file => ({ ...file, status: 200, responseUrl: `https://example/${file.relativePath}` })) }),
+        },
+      });
+      staticService.updateConfig({ provider: 'harmony', enabled: true, bindleId: BINDLE, stage: 'beta', visibility: 'everyone' } as any);
+      const result = await staticService.publishStaticArtifact({ filePath: 'existing.html', ownerRequested: true, verifyExisting: true });
+      expect(result).toMatchObject({ published: true, deployed: true, contentVerified: true, visibilityConverged: true, resourceId: 'resource_existing' });
+      expect(deployCalls).toBe(0);
+      expect(staticService.listStaticArtifactAttempts(1)[0].attemptId).toBe(result.attemptId);
     } finally {
       rmSync(filesRoot, { recursive: true, force: true });
     }

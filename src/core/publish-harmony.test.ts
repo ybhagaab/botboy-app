@@ -180,27 +180,25 @@ describe('harmony adapter (reworked)', () => {
     expect(again.calls.some(call => call.cmd === 'tar' && call.args.includes('app.tar'))).toBe(true);
   });
 
-  it('stages static artifacts under a/<slug>/ and reuses the same deploy/viewer path', async () => {
+  it('stages static artifacts under a/<slug>/ and returns a deploy-phase receipt before convergence', async () => {
     const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'harmony-static-source-'));
     try {
       writeFileSync(path.join(filesRoot, 'mock.html'), '<!doctype html><style>body{color:red}</style><h1>Mock</h1><script>window.ready=true</script>');
       const bundle = buildStaticArtifactBundle({ filePath: 'mock.html', filesRoot });
       const run = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
-      const audiences: string[] = [];
       const result = await publishStaticArtifactToHarmony({
         settings: settings(),
         bundle,
         appName: 'me-botboy-dashboard',
         appRoot,
         exec: run.exec,
-        ensureViewerAccess: async ({ settings: current }) => { audiences.push(current.visibility); },
       });
       expect(result.url).toBe('https://me-botboy-dashboard.beta.harmony.a2z.com/a/mock/');
       expect(readFileSync(path.join(result.artifactPath, 'index.html'), 'utf8')).toContain('botboy-inline-style-1.css');
       expect(existsSync(path.join(result.artifactPath, 'botboy-inline-script-1.js'))).toBe(true);
       expect(run.calls.some(call => call.cmd === 'tar')).toBe(true);
       expect(run.calls.some(call => call.args[1] === 'deploy')).toBe(true);
-      expect(audiences).toEqual(['everyone']);
+      expect(result.deploy).toMatchObject({ appName: 'me-botboy-dashboard', stage: 'beta', appExisted: true });
     } finally {
       rmSync(filesRoot, { recursive: true, force: true });
     }

@@ -21,7 +21,7 @@ import {
   publishStaticArtifactToHarmony,
   publishToHarmony,
 } from './publish-harmony.js';
-import { provisioningPlan } from './harmony-provision.js';
+import { provisioningPlan, type HarmonyArtifactVerificationReceipt, type HarmonyViewerAccessReceipt } from './harmony-provision.js';
 import { fromIni } from '@aws-sdk/credential-providers';
 import type {
   AnalyticsDashboard,
@@ -34,6 +34,7 @@ import type {
   HarmonyPublisherSettings,
   PublisherProviderId,
   StaticArtifactPublishInput,
+  StaticArtifactPublishPhase,
   StaticArtifactPublishResult,
   UpdateDashboardPublisherInput,
   AnalyticsDashboardService,
@@ -141,6 +142,45 @@ function objectUrl(baseUrl: string, objectKey: string): string {
   return `${baseUrl.replace(/\/+$/, '')}/${objectKey.split('/').map(encodeURIComponent).join('/')}`;
 }
 
+function mapStaticArtifactPublication(row: any): StaticArtifactPublishResult {
+  const phase = row.phase as StaticArtifactPublishPhase;
+  const published = phase === 'published';
+  return {
+    ok: published,
+    outcome: published ? 'complete' : 'partial',
+    provider: 'harmony',
+    published,
+    dryRun: false,
+    attemptId: row.id,
+    phase,
+    deployed: row.deployed === 1,
+    contentVerified: row.content_verified === 1,
+    visibilityConverged: row.visibility_converged === 1,
+    appName: row.app_name,
+    stage: row.stage,
+    visibility: row.visibility,
+    slug: row.slug,
+    sourcePath: row.source_path,
+    url: row.url,
+    manifestSha256: row.manifest_sha256,
+    totalBytes: row.total_bytes,
+    files: parseJson(row.manifest_json, []),
+    transformations: parseJson(row.transformations_json, {
+      inlineStylesExternalized: 0,
+      inlineScriptsExternalized: 0,
+      localAssetsIncluded: 0,
+    }),
+    ...(row.resource_id ? { resourceId: row.resource_id } : {}),
+    ...(row.error ? { error: row.error } : {}),
+    ...(!published && row.deployed === 1 ? {
+      nextAction: `Retry publish_static_artifact_to_harmony with resumeAttemptId="${row.id}"; it resumes access/content verification without redeploying. Browser fallback is allowed when the receipt names a Bindles URL.`,
+    } : {}),
+    createdAt: row.created_at,
+    ...(row.deployed_at ? { deployedAt: row.deployed_at } : {}),
+    ...(row.published_at ? { publishedAt: row.published_at } : {}),
+  };
+}
+
 function mapPublication(row: any): AnalyticsPublication {
   return {
     id: row.id,
@@ -159,8 +199,10 @@ function mapPublication(row: any): AnalyticsPublication {
 export interface HarmonyHooks {
   /** Idempotent team+bindle creation over the CDP owner-Chrome transport. */
   provision: () => Promise<{ teamId: string; bindleId: string; teamName: string; bindleName: string; createdTeam: boolean; createdBindle: boolean; detail: string }>;
-  /** Converge Can-view-app rows to the configured visibility (runs inside every publish). */
-  ensureViewerAccess: (context: { appName: string; settings: HarmonyPublisherSettings }) => Promise<void>;
+  /** Converge and verify Can-view-app rows to the configured visibility. */
+  ensureViewerAccess: (context: { appName: string; settings: HarmonyPublisherSettings }) => Promise<HarmonyViewerAccessReceipt>;
+  /** Fetch and hash the deployed static files through authenticated debug Chrome. */
+  verifyStaticArtifact: (context: { url: string; files: Array<{ relativePath: string; bytes: number; sha256: string }> }) => Promise<HarmonyArtifactVerificationReceipt>;
 }
 
 export function createDashboardPublisherService(options: {
@@ -172,12 +214,15 @@ export function createDashboardPublisherService(options: {
   harmonyHooks?: HarmonyHooks;
   /** Test injection for static-artifact source containment. */
   staticFilesRoot?: string;
+  /** Test injection for the external deploy phase. */
+  staticPublishAdapter?: typeof publishStaticArtifactToHarmony;
 }): DashboardPublisherService {
   const db = options.db;
   const analyticsService = options.analyticsService;
   const vendorDir = options.vendorDir;
   const harmonyHooks = options.harmonyHooks;
   const staticFilesRoot = options.staticFilesRoot;
+  const staticPublishAdapter = options.staticPublishAdapter ?? publishStaticArtifactToHarmony;
 
   function providerRow(id: PublisherProviderId): any {
     return db.prepare('SELECT * FROM dashboard_publishers WHERE id = ?').get(id);
@@ -478,6 +523,14 @@ export function createDashboardPublisherService(options: {
     return { publication, url };
   }
 
+  function listStaticArtifactAttempts(limit = 10): StaticArtifactPublishResult[] {
+    const bounded = Math.min(50, Math.max(1, Math.floor(Number(limit) || 10)));
+    return (db.prepare(`
+      SELECT * FROM static_artifact_publications
+      ORDER BY datetime(created_at) DESC, rowid DESC LIMIT ?
+    `).all(bounded) as any[]).map(mapStaticArtifactPublication);
+  }
+
   async function publishStaticArtifact(input: StaticArtifactPublishInput): Promise<StaticArtifactPublishResult> {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new Error('Static artifact publish input must be an object');
@@ -486,9 +539,11 @@ export function createDashboardPublisherService(options: {
     if (config.provider !== 'harmony') {
       throw new Error('Static artifact publishing currently requires Amazon Harmony to be the active Dashboard sharing provider');
     }
-    const requestedVisibility = String(input.visibility ?? '');
+    const requestedVisibility = input.visibility == null
+      ? config.harmony.visibility
+      : String(input.visibility);
     if (requestedVisibility !== 'everyone' && requestedVisibility !== 'private') {
-      throw new Error('visibility must be everyone or private');
+      throw new Error('visibility must be everyone or private when provided');
     }
     if (requestedVisibility !== config.harmony.visibility) {
       throw new Error(`Requested visibility ${requestedVisibility} does not match the configured app-wide Harmony visibility ${config.harmony.visibility}. Change it in Settings → Dashboard sharing first; this tool never changes the audience of existing shares.`);
@@ -501,11 +556,16 @@ export function createDashboardPublisherService(options: {
     });
     const appName = harmonyAppName();
     const url = harmonyStaticArtifactUrl(config.harmony, bundle.slug, appName);
-    const base: StaticArtifactPublishResult = {
+    const dryRun: StaticArtifactPublishResult = {
       ok: true,
+      outcome: 'dry_run',
       provider: 'harmony',
       published: false,
-      dryRun: input.dryRun === true,
+      dryRun: true,
+      phase: 'prepared',
+      deployed: false,
+      contentVerified: false,
+      visibilityConverged: false,
       appName,
       stage: config.harmony.stage,
       visibility: config.harmony.visibility,
@@ -517,33 +577,128 @@ export function createDashboardPublisherService(options: {
       files: bundle.manifest,
       transformations: bundle.transformations,
     };
-    if (input.dryRun === true) return base;
+    if (input.dryRun === true) return dryRun;
     if (input.ownerRequested !== true) {
       throw new Error('ownerRequested must be true for a real Harmony publish and may only reflect an explicit request in the current conversation');
     }
     if (!harmonyHooks) {
-      throw new Error('Harmony viewer-access convergence is unavailable in this build; nothing was published');
+      throw new Error('Harmony viewer-access/content verification is unavailable in this build; nothing was published');
     }
-    try {
-      const deployed = await publishStaticArtifactToHarmony({
-        settings: config.harmony,
-        bundle,
-        ensureViewerAccess: harmonyHooks.ensureViewerAccess,
-      });
+
+    let row: any = null;
+    if (input.resumeAttemptId) {
+      row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(clean(input.resumeAttemptId, 'resumeAttemptId', 128, true));
+      if (!row) throw new Error(`Static publish attempt ${input.resumeAttemptId} not found`);
+      if (
+        row.manifest_sha256 !== bundle.manifestSha256 || row.slug !== bundle.slug ||
+        row.app_name !== appName || row.stage !== config.harmony.stage || row.visibility !== config.harmony.visibility
+      ) {
+        throw new Error('resumeAttemptId does not match the current artifact bytes or Harmony configuration; start a new publish without resumeAttemptId');
+      }
+    } else {
+      row = db.prepare(`
+        SELECT * FROM static_artifact_publications
+        WHERE slug = ? AND manifest_sha256 = ? AND app_name = ? AND stage = ? AND visibility = ?
+          AND (deployed = 1 OR phase = 'published')
+        ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1
+      `).get(bundle.slug, bundle.manifestSha256, appName, config.harmony.stage, config.harmony.visibility);
+    }
+    if (row?.phase === 'published' && row.content_verified === 1 && row.visibility_converged === 1) {
+      return mapStaticArtifactPublication(row);
+    }
+
+    const attemptId = row?.id ?? `static_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    if (!row) {
+      db.prepare(`
+        INSERT INTO static_artifact_publications (
+          id, source_path, slug, manifest_sha256, manifest_json, total_bytes,
+          transformations_json, app_name, stage, visibility, url, phase
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared')
+      `).run(
+        attemptId, bundle.sourcePath, bundle.slug, bundle.manifestSha256,
+        JSON.stringify(bundle.manifest), bundle.totalBytes, JSON.stringify(bundle.transformations),
+        appName, config.harmony.stage, config.harmony.visibility, url,
+      );
+      row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId);
+    }
+
+    if (input.verifyExisting === true && row.deployed !== 1) {
+      db.prepare(`
+        UPDATE static_artifact_publications
+        SET phase = 'deployed', deployed = 1, deployed_at = ?, error = NULL, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(new Date().toISOString(), attemptId);
+      row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId);
+    }
+
+    if (row.deployed !== 1) {
+      db.prepare("UPDATE static_artifact_publications SET phase = 'deploying', error = NULL, updated_at = datetime('now') WHERE id = ?").run(attemptId);
+      try {
+        const deployed = await staticPublishAdapter({ settings: config.harmony, bundle });
+        db.prepare(`
+          UPDATE static_artifact_publications
+          SET phase = 'deployed', deployed = 1, deployed_at = ?, error = NULL, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(deployed.deploy.deployedAt, attemptId);
+      } catch (error: any) {
+        const message = String(error?.message ?? error).slice(0, 4000);
+        db.transaction(() => {
+          db.prepare("UPDATE static_artifact_publications SET phase = 'failed_pre_deploy', error = ?, updated_at = datetime('now') WHERE id = ?").run(message, attemptId);
+          db.prepare("UPDATE dashboard_publishers SET last_error = ?, updated_at = datetime('now') WHERE id = 'harmony'").run(message);
+        })();
+        throw new Error(`Static artifact deploy failed before a successful deploy receipt: ${message}`);
+      }
+    }
+
+    row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId);
+    if (row.visibility_converged !== 1) {
+      db.prepare("UPDATE static_artifact_publications SET phase = 'converging', error = NULL, updated_at = datetime('now') WHERE id = ?").run(attemptId);
+      try {
+        const access = await harmonyHooks.ensureViewerAccess({ appName, settings: config.harmony });
+        db.prepare(`
+          UPDATE static_artifact_publications
+          SET visibility_converged = 1, resource_id = ?, phase = 'verifying_content', error = NULL, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(access.resourceId, attemptId);
+      } catch (error: any) {
+        const message = String(error?.message ?? error).slice(0, 4000);
+        db.transaction(() => {
+          db.prepare("UPDATE static_artifact_publications SET phase = 'failed_after_deploy', error = ?, updated_at = datetime('now') WHERE id = ?").run(message, attemptId);
+          db.prepare("UPDATE dashboard_publishers SET last_error = ?, updated_at = datetime('now') WHERE id = 'harmony'").run(message);
+        })();
+        return mapStaticArtifactPublication(db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId));
+      }
+    }
+
+    row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId);
+    if (row.content_verified !== 1) {
+      db.prepare("UPDATE static_artifact_publications SET phase = 'verifying_content', error = NULL, updated_at = datetime('now') WHERE id = ?").run(attemptId);
+      try {
+        await harmonyHooks.verifyStaticArtifact({
+          url,
+          files: bundle.manifest.map(file => ({ relativePath: file.relativePath, bytes: file.bytes, sha256: file.sha256 })),
+        });
+        db.prepare("UPDATE static_artifact_publications SET content_verified = 1, error = NULL, updated_at = datetime('now') WHERE id = ?").run(attemptId);
+      } catch (error: any) {
+        const message = String(error?.message ?? error).slice(0, 4000);
+        db.transaction(() => {
+          db.prepare("UPDATE static_artifact_publications SET phase = 'failed_after_deploy', error = ?, updated_at = datetime('now') WHERE id = ?").run(message, attemptId);
+          db.prepare("UPDATE dashboard_publishers SET last_error = ?, updated_at = datetime('now') WHERE id = 'harmony'").run(message);
+        })();
+        return mapStaticArtifactPublication(db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId));
+      }
+    }
+
+    const publishedAt = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE static_artifact_publications
+        SET phase = 'published', content_verified = 1, visibility_converged = 1,
+          error = NULL, published_at = ?, updated_at = datetime('now') WHERE id = ?
+      `).run(publishedAt, attemptId);
       db.prepare("UPDATE dashboard_publishers SET last_error = NULL, updated_at = datetime('now') WHERE id = 'harmony'").run();
-      return {
-        ...base,
-        published: true,
-        dryRun: false,
-        appName: deployed.appName,
-        url: deployed.url,
-        publishedAt: new Date().toISOString(),
-      };
-    } catch (error: any) {
-      const message = String(error?.message ?? error).slice(0, 4000);
-      db.prepare("UPDATE dashboard_publishers SET last_error = ?, updated_at = datetime('now') WHERE id = 'harmony'").run(message);
-      throw new Error(`Static artifact publish failed: ${message}`);
-    }
+    })();
+    return mapStaticArtifactPublication(db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(attemptId));
   }
 
   async function probeHarmonySetup() {
@@ -590,6 +745,7 @@ export function createDashboardPublisherService(options: {
     createShareRequest,
     publish,
     publishStaticArtifact,
+    listStaticArtifactAttempts,
     probeHarmonySetup,
     installHarmonyCli,
     planHarmonyProvisioning,

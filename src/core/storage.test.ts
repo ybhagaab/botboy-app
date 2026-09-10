@@ -29,6 +29,7 @@ describe('StorageLayer', () => {
     expect(names).toContain('slack_api_config');
     expect(names).toContain('activity_log');
     expect(names).toContain('dedup_cache');
+    expect(names).toContain('static_artifact_publications');
   });
 
   it('uses WAL journal mode (file-based db)', () => {
