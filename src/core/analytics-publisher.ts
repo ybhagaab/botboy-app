@@ -11,11 +11,14 @@ import {
   SNAPSHOT_CSS,
 } from './snapshot-render.js';
 import { renderDashboardBundle } from './publish-bundle.js';
+import { buildStaticArtifactBundle } from './publish-static-artifact.js';
 import {
   harmonyAppName,
   harmonyDashboardUrl,
+  harmonyStaticArtifactUrl,
   installHarmonyCli as installHarmonyCliBinary,
   probeHarmony,
+  publishStaticArtifactToHarmony,
   publishToHarmony,
 } from './publish-harmony.js';
 import { provisioningPlan } from './harmony-provision.js';
@@ -30,6 +33,8 @@ import type {
   DashboardShareRequest,
   HarmonyPublisherSettings,
   PublisherProviderId,
+  StaticArtifactPublishInput,
+  StaticArtifactPublishResult,
   UpdateDashboardPublisherInput,
   AnalyticsDashboardService,
 } from './analytics-types.js';
@@ -165,11 +170,14 @@ export function createDashboardPublisherService(options: {
   vendorDir?: string;
   /** Runtime wiring (index.ts). Absent in unit tests → provisioning/converge unavailable, deploys still work. */
   harmonyHooks?: HarmonyHooks;
+  /** Test injection for static-artifact source containment. */
+  staticFilesRoot?: string;
 }): DashboardPublisherService {
   const db = options.db;
   const analyticsService = options.analyticsService;
   const vendorDir = options.vendorDir;
   const harmonyHooks = options.harmonyHooks;
+  const staticFilesRoot = options.staticFilesRoot;
 
   function providerRow(id: PublisherProviderId): any {
     return db.prepare('SELECT * FROM dashboard_publishers WHERE id = ?').get(id);
@@ -470,6 +478,74 @@ export function createDashboardPublisherService(options: {
     return { publication, url };
   }
 
+  async function publishStaticArtifact(input: StaticArtifactPublishInput): Promise<StaticArtifactPublishResult> {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw new Error('Static artifact publish input must be an object');
+    }
+    const config = requireReadyConfig();
+    if (config.provider !== 'harmony') {
+      throw new Error('Static artifact publishing currently requires Amazon Harmony to be the active Dashboard sharing provider');
+    }
+    const requestedVisibility = String(input.visibility ?? '');
+    if (requestedVisibility !== 'everyone' && requestedVisibility !== 'private') {
+      throw new Error('visibility must be everyone or private');
+    }
+    if (requestedVisibility !== config.harmony.visibility) {
+      throw new Error(`Requested visibility ${requestedVisibility} does not match the configured app-wide Harmony visibility ${config.harmony.visibility}. Change it in Settings → Dashboard sharing first; this tool never changes the audience of existing shares.`);
+    }
+    const bundle = buildStaticArtifactBundle({
+      filePath: clean(input.filePath, 'filePath', 2000, true),
+      ...(input.slug ? { slug: clean(input.slug, 'slug', 100, true) } : {}),
+      ...(Array.isArray(input.assetPaths) ? { assetPaths: input.assetPaths.map(value => clean(value, 'assetPaths entry', 1000, true)) } : {}),
+      ...(staticFilesRoot ? { filesRoot: staticFilesRoot } : {}),
+    });
+    const appName = harmonyAppName();
+    const url = harmonyStaticArtifactUrl(config.harmony, bundle.slug, appName);
+    const base: StaticArtifactPublishResult = {
+      ok: true,
+      provider: 'harmony',
+      published: false,
+      dryRun: input.dryRun === true,
+      appName,
+      stage: config.harmony.stage,
+      visibility: config.harmony.visibility,
+      slug: bundle.slug,
+      sourcePath: bundle.sourcePath,
+      url,
+      manifestSha256: bundle.manifestSha256,
+      totalBytes: bundle.totalBytes,
+      files: bundle.manifest,
+      transformations: bundle.transformations,
+    };
+    if (input.dryRun === true) return base;
+    if (input.ownerRequested !== true) {
+      throw new Error('ownerRequested must be true for a real Harmony publish and may only reflect an explicit request in the current conversation');
+    }
+    if (!harmonyHooks) {
+      throw new Error('Harmony viewer-access convergence is unavailable in this build; nothing was published');
+    }
+    try {
+      const deployed = await publishStaticArtifactToHarmony({
+        settings: config.harmony,
+        bundle,
+        ensureViewerAccess: harmonyHooks.ensureViewerAccess,
+      });
+      db.prepare("UPDATE dashboard_publishers SET last_error = NULL, updated_at = datetime('now') WHERE id = 'harmony'").run();
+      return {
+        ...base,
+        published: true,
+        dryRun: false,
+        appName: deployed.appName,
+        url: deployed.url,
+        publishedAt: new Date().toISOString(),
+      };
+    } catch (error: any) {
+      const message = String(error?.message ?? error).slice(0, 4000);
+      db.prepare("UPDATE dashboard_publishers SET last_error = ?, updated_at = datetime('now') WHERE id = 'harmony'").run(message);
+      throw new Error(`Static artifact publish failed: ${message}`);
+    }
+  }
+
   async function probeHarmonySetup() {
     return probeHarmony(storedHarmony());
   }
@@ -508,5 +584,15 @@ export function createDashboardPublisherService(options: {
     return { ...result, publisher: getConfig() };
   }
 
-  return { getConfig, updateConfig, createShareRequest, publish, probeHarmonySetup, installHarmonyCli, planHarmonyProvisioning, provisionHarmonyIdentity };
+  return {
+    getConfig,
+    updateConfig,
+    createShareRequest,
+    publish,
+    publishStaticArtifact,
+    probeHarmonySetup,
+    installHarmonyCli,
+    planHarmonyProvisioning,
+    provisionHarmonyIdentity,
+  };
 }

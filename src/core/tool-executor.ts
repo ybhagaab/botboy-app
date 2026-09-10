@@ -30,13 +30,22 @@ import {
 import { createPendingEdit, listPendingEdits, decidePendingEdit } from './pending-edits.js';
 import { listDocumentCorpus, buildDocumentView, docKeyForPath } from './document-corpus.js';
 import type { ContentStore } from './content-store.js';
+import type { BrowserHandsService } from './browser-hands.js';
 
 
 export interface ToolResult {
   toolCallId: string;
   content: string;
   isError: boolean;
+  /** Binary evidence for the immediately following model iteration. */
+  images?: string[];
 }
+
+type ToolHandlerOutput = string | {
+  content: string;
+  images?: string[];
+  isError?: boolean;
+};
 
 export interface ToolExecutionContext {
   /** Exact owner turn, supplied by the server rather than the model. */
@@ -209,6 +218,7 @@ export function createToolExecutor(
     chatTerminal?: ChatTerminalService;
     contentStore?: ContentStore;
     etlOnboarding?: EtlOnboardingService;
+    browserHands?: BrowserHandsService;
   } = {},
 ): ToolExecutor {
   const brainStore = extras.brainStore;
@@ -218,6 +228,7 @@ export function createToolExecutor(
   const chatTerminal = extras.chatTerminal;
   const contentStore = extras.contentStore;
   const etlOnboarding = extras.etlOnboarding;
+  const browserHands = extras.browserHands;
   const API_BASE = `http://localhost:${process.env.PPT_PORT || 7778}/api`;
   const normalizeTaskText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -373,7 +384,7 @@ export function createToolExecutor(
   // mapSharePointWriteTarget lives in docx-body-editor.ts (shared with the
   // reader's Sync path since the pending-edits lane landed).
 
-  const handlers: Record<string, (args: any) => Promise<string> | string> = {
+  const handlers: Record<string, (args: any) => Promise<ToolHandlerOutput> | ToolHandlerOutput> = {
     // ── Guarded canonical workspace control plane ──
     manage_area: async (args) => {
       const action = String(args.action ?? '').trim();
@@ -1380,6 +1391,25 @@ export function createToolExecutor(
     },
 
     // ── Self-eyes (SELF_EYES_PLAN.md): observe BotBoy's own rendered UI ──
+    browser_hands: async (args) => {
+      if (!browserHands) return 'Error: browser hands service unavailable';
+      const receipt = await browserHands.execute(args);
+      return { content: JSON.stringify(receipt, null, 1), isError: !receipt.ok };
+    },
+
+    browser_screenshot: async (args) => {
+      if (!browserHands) return 'Error: browser hands service unavailable';
+      const result = await browserHands.screenshot({
+        tabId: String(args.tabId ?? ''),
+        fullPage: args.fullPage === true,
+      });
+      return {
+        content: JSON.stringify(result.receipt, null, 1),
+        ...(result.dataUrl ? { images: [result.dataUrl] } : {}),
+        isError: !result.receipt.ok,
+      };
+    },
+
     ui_inspect: async (args) => {
       try {
         const result = await uiInspect(args.route, String(args.selector ?? ''), args.settleMs ? Number(args.settleMs) : undefined);
@@ -1611,10 +1641,36 @@ export function createToolExecutor(
         dashboardId: dashboardId || undefined,
         latestPublication: dashboard?.latestPublication,
         confirmationRequired: true,
+        staticArtifactPublishing: {
+          tool: 'publish_static_artifact_to_harmony',
+          available: dashboardPublisher.getConfig().id === 'harmony',
+          note: 'Use dryRun=true to validate/package without publishing. A real publish requires explicit ownerRequested=true and visibility matching the app-wide Harmony setting.',
+        },
         next: dashboardId
-          ? `The owner must open #/dashboards/${dashboardId} and confirm the exact S3 upload in the UI. Agent tools cannot perform the upload.`
-          : 'Choose a dashboard, then have the owner confirm sharing from its local detail page.',
+          ? `Canonical dashboard sharing still uses #/dashboards/${dashboardId} and its confirmation card. Existing HTML files use publish_static_artifact_to_harmony.`
+          : 'Choose a canonical dashboard for the UI confirmation flow, or use publish_static_artifact_to_harmony for an existing HTML file.',
       }, null, 1);
+    },
+
+    publish_static_artifact_to_harmony: async (args) => {
+      if (!dashboardPublisher) return 'Error: dashboard publisher unavailable';
+      if (args.dryRun !== true) {
+        const intentError = requireOwnerRequested(args, 'publish this static artifact to Harmony');
+        if (intentError) return intentError;
+      }
+      try {
+        const result = await dashboardPublisher.publishStaticArtifact({
+          filePath: String(args.filePath ?? ''),
+          ...(args.slug ? { slug: String(args.slug) } : {}),
+          ...(Array.isArray(args.assetPaths) ? { assetPaths: args.assetPaths.map((value: unknown) => String(value)) } : {}),
+          visibility: String(args.visibility ?? '') as 'everyone' | 'private',
+          dryRun: args.dryRun === true,
+          ownerRequested: args.ownerRequested === true,
+        });
+        return JSON.stringify(result, null, 1);
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
     },
 
     list_analytics_dashboards: () => {
@@ -2241,22 +2297,35 @@ export function createToolExecutor(
       try { args = JSON.parse(call.function.arguments); } catch {}
 
       try {
-        const timeoutMs = name.startsWith('mcp_') ? 95_000 : TIMEOUT;
-        const rawContent = await withTimeout(() => handler(args), timeoutMs);
+        const timeoutMs = name === 'publish_static_artifact_to_harmony'
+          ? 15 * 60_000
+          : name.startsWith('mcp_')
+            ? 95_000
+            : name.startsWith('browser_') ? 65_000 : TIMEOUT;
+        const rawOutput = await withTimeout(() => handler(args), timeoutMs);
+        const normalized = typeof rawOutput === 'string'
+          ? { content: rawOutput, isError: false, images: undefined }
+          : { content: rawOutput.content, isError: rawOutput.isError ?? false, images: rawOutput.images };
         // Universal Kimi-era tool-result ceiling. The retired 32K Qwen path
         // used 4K characters, which discarded most schema/docs before the
         // model could synthesize them. Context-pressure trimming in chat.ts is
         // the final safety valve when a long multi-tool loop approaches the
-        // actual provider window.
+        // actual provider window. Binary image sidecars are never mixed into
+        // this textual cap; the chat/agent loops carry them once as vision.
         const MAX_RESULT_CHARS = MAX_MODEL_VISIBLE_TOOL_RESULT_CHARS;
-        let content = rawContent;
+        let content = normalized.content;
         if (content.length > MAX_RESULT_CHARS) {
           const head = content.slice(0, MAX_RESULT_CHARS);
           const note = `\n\n[Tool result TRUNCATED: original was ${content.length} chars, capped to ${MAX_RESULT_CHARS}. Narrow your request (add filters, pagination, LIMIT, or call a more specific tool) to see more.]`;
           content = head + note;
-          console.warn(`[Tool] ${name} result capped: ${rawContent.length} → ${content.length} chars`);
+          console.warn(`[Tool] ${name} result capped: ${normalized.content.length} → ${content.length} chars`);
         }
-        return { toolCallId: call.id, content, isError: false };
+        return {
+          toolCallId: call.id,
+          content,
+          isError: normalized.isError,
+          ...(normalized.images?.length ? { images: normalized.images } : {}),
+        };
       } catch (e: any) {
         return { toolCallId: call.id, content: `Error: ${e.message}`, isError: true };
       }

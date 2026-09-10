@@ -33,6 +33,7 @@ import os from 'os';
 import path from 'path';
 import type { AnalyticsDashboard } from './analytics-types.js';
 import { renderDashboardBundle, writeBundle } from './publish-bundle.js';
+import { writeStaticArtifactBundle, type StaticArtifactBundle } from './publish-static-artifact.js';
 import { escapeHtml, SNAPSHOT_CSS } from './snapshot-render.js';
 
 import type { HarmonyPublisherSettings } from './analytics-types.js';
@@ -232,6 +233,14 @@ export function harmonyDashboardUrl(settings: HarmonySettings, dashboardId: stri
   return `${base}/d/${encodeURIComponent(dashboardId)}/`;
 }
 
+/** Stable public URL for a non-dashboard static artifact in the same owner app. */
+export function harmonyStaticArtifactUrl(settings: HarmonySettings, slug: string, appName: string = harmonyAppName()): string {
+  const base = settings.stage === 'prod'
+    ? `https://${appName}.harmony.a2z.com`
+    : `https://${appName}.${settings.stage}.harmony.a2z.com`;
+  return `${base}/a/${encodeURIComponent(slug)}/`;
+}
+
 function renderListingPage(entries: PublishedEntry[]): string {
   const items = entries
     .slice()
@@ -297,6 +306,32 @@ exit [lindex $result 3]
   return scriptPath;
 }
 
+async function deployHarmonyAssetTree(options: {
+  settings: HarmonySettings;
+  appRoot: string;
+  assetRoot: string;
+  appName: string;
+  exec: ExecFn;
+  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<void>;
+}): Promise<void> {
+  const probe = await probeHarmony(options.settings, options.exec);
+  if (!probe.ready) throw new Error(probe.detail);
+
+  await buildAppTar(options.appRoot, options.assetRoot, options.exec);
+  const existing = await appExists(options.appRoot, options.settings.stage, options.exec);
+  const deployArgs = ['app', 'deploy', '--stage', options.settings.stage, '-B'];
+  if (!existing.exists) deployArgs.push('--parentBindleId', options.settings.bindleId);
+
+  const deploy = options.settings.stage === 'prod'
+    ? await options.exec('/usr/bin/expect', [buildProdExpectScript(options.appRoot, deployArgs)], { cwd: options.appRoot, timeoutMs: DEPLOY_TIMEOUT_MS + 30_000 })
+    : await options.exec('harmony', deployArgs, { cwd: options.appRoot, timeoutMs: DEPLOY_TIMEOUT_MS });
+  if (deploy.code !== 0) throw new Error(classifyHarmonyFailure(deploy.stdout, deploy.stderr));
+
+  if (options.ensureViewerAccess) {
+    await options.ensureViewerAccess({ appName: options.appName, settings: options.settings });
+  }
+}
+
 /**
  * Stage the bundle + listing into the app tree and deploy; then converge
  * viewer access to the configured visibility (injected transport). Returns
@@ -319,8 +354,6 @@ export async function publishToHarmony(options: {
 }): Promise<{ url: string }> {
   const { settings, dashboard } = options;
   const exec = options.exec ?? defaultExec;
-  const probe = await probeHarmony(settings, exec);
-  if (!probe.ready) throw new Error(probe.detail);
 
   const { appRoot, assetRoot, appName } = scaffoldHarmonyApp(settings, { appName: options.appName, appRoot: options.appRoot });
   const bundle = renderDashboardBundle(dashboard, options.snapshotCreatedAt, { vendorDir: options.vendorDir });
@@ -333,22 +366,50 @@ export async function publishToHarmony(options: {
   fs.writeFileSync(path.join(assetRoot, 'assets', 'style.css'), SNAPSHOT_CSS);
   fs.writeFileSync(path.join(assetRoot, 'index.html'), renderListingPage(options.publishedEntries));
 
-  // Package the pre-built assets exactly as the CLI validator demands.
-  await buildAppTar(appRoot, assetRoot, exec);
-
-  // First deploy bootstraps the app registration under the team bindle.
-  const existing = await appExists(appRoot, settings.stage, exec);
-  const deployArgs = ['app', 'deploy', '--stage', settings.stage, '-B'];
-  if (!existing.exists) deployArgs.push('--parentBindleId', settings.bindleId);
-
-  const deploy = settings.stage === 'prod'
-    ? await exec('/usr/bin/expect', [buildProdExpectScript(appRoot, deployArgs)], { cwd: appRoot, timeoutMs: DEPLOY_TIMEOUT_MS + 30_000 })
-    : await exec('harmony', deployArgs, { cwd: appRoot, timeoutMs: DEPLOY_TIMEOUT_MS });
-  if (deploy.code !== 0) throw new Error(classifyHarmonyFailure(deploy.stdout, deploy.stderr));
-
-  // Viewing is deny-by-default on Harmony: the publish is not complete until
-  // the audience matches the toggle (owner ruling: baked into the deploy step).
-  if (options.ensureViewerAccess) await options.ensureViewerAccess({ appName, settings });
+  await deployHarmonyAssetTree({
+    settings,
+    appRoot,
+    assetRoot,
+    appName,
+    exec,
+    ensureViewerAccess: options.ensureViewerAccess,
+  });
 
   return { url: harmonyDashboardUrl(settings, dashboard.id, appName) };
+}
+
+/**
+ * Stage an already-built static HTML artifact under a/<slug>/ in the same
+ * owner app, then ride the exact dashboard tar/deploy/audience path.
+ */
+export async function publishStaticArtifactToHarmony(options: {
+  settings: HarmonySettings;
+  bundle: StaticArtifactBundle;
+  appName?: string;
+  appRoot?: string;
+  exec?: ExecFn;
+  ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<void>;
+}): Promise<{ url: string; appName: string; artifactPath: string }> {
+  const exec = options.exec ?? defaultExec;
+  const { appRoot, assetRoot, appName } = scaffoldHarmonyApp(options.settings, {
+    appName: options.appName,
+    appRoot: options.appRoot,
+  });
+  const artifactPath = path.join(assetRoot, 'a', options.bundle.slug);
+  writeStaticArtifactBundle(options.bundle, artifactPath);
+
+  await deployHarmonyAssetTree({
+    settings: options.settings,
+    appRoot,
+    assetRoot,
+    appName,
+    exec,
+    ensureViewerAccess: options.ensureViewerAccess,
+  });
+
+  return {
+    url: harmonyStaticArtifactUrl(options.settings, options.bundle.slug, appName),
+    appName,
+    artifactPath,
+  };
 }

@@ -28,6 +28,7 @@ import { createInferenceProviderFromEnv } from './core/inference-provider.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
 import { createToolExecutor } from './core/tool-executor.js';
+import { createBrowserHandsService } from './core/browser-hands.js';
 import { createEtlToolCall } from './core/etl-adhoc.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
@@ -404,6 +405,13 @@ async function main() {
     call: createEtlToolCall(mcpManager),
     llm: llmClient,
   });
+  // General browser hands: persistent BotBoy-created tabs in the same debug
+  // Chrome profile used by ambient capture. Initialization is best-effort at
+  // boot and retried lazily by the tools if Chrome becomes available later.
+  const browserHands = createBrowserHandsService();
+  await browserHands.initialize().catch((error: any) => {
+    console.warn(`[BrowserHands] Debug Chrome not ready at boot: ${error?.message ?? error}`);
+  });
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     brainStore,
     mcpManager,
@@ -412,6 +420,7 @@ async function main() {
     chatTerminal,
     contentStore,
     etlOnboarding,
+    browserHands,
   });
   const toolExecutor = withProductDocumentChatTools(baseToolExecutor, productDocumentService);
 
@@ -835,7 +844,9 @@ async function main() {
   });
 
   // ── Monitors ──
-  const browserMonitor = createBrowserMonitor();
+  const browserMonitor = createBrowserMonitor({
+    shouldSkipTarget: targetId => browserHands.ownsTarget(targetId),
+  });
   // Once canonical GRASP mail sync is live, browser-scraped email is a noisier
   // duplicate of the same messages — suppress ALL browser email capture at the
   // emit boundary (GRASP plan §17.5; user directive 2026-08-18). Every other

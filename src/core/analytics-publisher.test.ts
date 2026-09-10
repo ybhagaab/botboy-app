@@ -126,6 +126,43 @@ describe('publisher provider dispatch', () => {
     await expect(service.publish('dash_pub', request.confirmationToken)).rejects.toThrow(/settings changed/);
   });
 
+  it('static artifact dry-run is non-publishing, CSP-safe, and bound to app-wide visibility', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'publisher-static-files-'));
+    try {
+      writeFileSync(path.join(filesRoot, 'mock.html'), '<!doctype html><style>body{color:red}</style><h1>Mock</h1><script>window.ready=true</script>');
+      const staticService = createDashboardPublisherService({
+        db: storage.getDb(),
+        analyticsService: fakeAnalyticsService(dash()),
+        vendorDir,
+        staticFilesRoot: filesRoot,
+      });
+      staticService.updateConfig({ provider: 'harmony', enabled: true, bindleId: BINDLE, stage: 'beta', visibility: 'everyone' } as any);
+      const result = await staticService.publishStaticArtifact({
+        filePath: 'mock.html',
+        visibility: 'everyone',
+        dryRun: true,
+      });
+      expect(result.published).toBe(false);
+      expect(result.dryRun).toBe(true);
+      expect(result.url).toBe(`https://${harmonyAppName()}.beta.harmony.a2z.com/a/mock/`);
+      expect(result.files.map(file => file.relativePath)).toEqual([
+        'botboy-inline-script-1.js',
+        'botboy-inline-style-1.css',
+        'index.html',
+      ]);
+      expect(result.manifestSha256).toMatch(/^[a-f0-9]{64}$/);
+
+      await expect(staticService.publishStaticArtifact({
+        filePath: 'mock.html', visibility: 'private', dryRun: true,
+      })).rejects.toThrow(/does not match.*app-wide/i);
+      await expect(staticService.publishStaticArtifact({
+        filePath: 'mock.html', visibility: 'everyone',
+      })).rejects.toThrow(/ownerRequested must be true/);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
+  });
+
   it('legacy S3 updates without a provider field still work (back-compat)', () => {
     const config = service.updateConfig({ enabled: true, bucket: 'legacy-bucket', region: 'us-east-1', awsProfile: 'pub', cloudFrontBaseUrl: 'https://cdn.example.com' } as any);
     expect(config.id).toBe('s3-cloudfront');

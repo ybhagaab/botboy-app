@@ -230,7 +230,26 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
   reject_evidence: { type: 'function', function: { name: 'reject_evidence', description: 'Remove one evidence item from a project and permanently block it from routing back there. The item stays in the system and may be placed elsewhere. Reversible from the project page. Use when the user says evidence is misfiled.', parameters: { type: 'object', properties: { projectId: { type: 'string' }, itemId: { type: 'string' } }, required: ['projectId', 'itemId'] } } },
   discard_item: { type: 'function', function: { name: 'discard_item', description: "Hide an evidence item EVERYWHERE (projects, Today, digests, routing) — for junk captures. Reversible from the Inbox page's Recently discarded section. Use only when the user calls something junk, not merely misfiled.", parameters: { type: 'object', properties: { itemId: { type: 'string' } }, required: ['itemId'] } } },
   rebuild_brain: { type: 'function', function: { name: 'rebuild_brain', description: "Re-synthesize a project's brain from its current evidence (runs in background, 1-3 min). Use after evidence curation so the summary/tasks reflect what remains.", parameters: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'] } } },
-  get_dashboard_sharing_status: { type: 'function', function: { name: 'get_dashboard_sharing_status', description: 'Inspect the non-secret S3/CloudFront publisher configuration and a dashboard’s latest publication. Actual upload is intentionally unavailable to the agent; the owner must review and confirm the exact destination in the dashboard UI.', parameters: { type: 'object', properties: { dashboardId: { type: 'string' } } } } },
+  get_dashboard_sharing_status: { type: 'function', function: { name: 'get_dashboard_sharing_status', description: 'Inspect the non-secret Dashboard sharing configuration and a dashboard’s latest publication. Canonical dashboards still publish through their local confirmation card. Existing HTML files under BotBoy files can use publish_static_artifact_to_harmony when Harmony is active.', parameters: { type: 'object', properties: { dashboardId: { type: 'string' } } } } },
+  publish_static_artifact_to_harmony: {
+    type: 'function',
+    function: {
+      name: 'publish_static_artifact_to_harmony',
+      description: 'Publish an EXISTING interactive HTML file from BotBoy files to the configured owner Harmony app at a stable /a/<slug>/ URL. Use this for prototypes, mocks, and static artifacts; do not convert them into analytics dashboards. The composite externalizes inline style/script blocks for Harmony CSP, includes referenced local assets, packages app.tar, deploys, converges the configured audience, and returns the exact URL/hash/file receipt. It never changes app, stage, bindle, or visibility: visibility MUST equal the app-wide setting from get_dashboard_sharing_status. Set dryRun=true to validate/transform/hash without external publication. A real publish requires an explicit current owner request and ownerRequested=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          filePath: { type: 'string', description: 'Absolute path returned by BotBoy file tools, or a path relative to ~/.personal-productivity-tracker/files. HTML/HTM only.' },
+          slug: { type: 'string', description: 'Optional stable URL slug; defaults to the HTML filename.' },
+          assetPaths: { type: 'array', items: { type: 'string' }, description: 'Optional additional files relative to the HTML directory for assets referenced dynamically by JavaScript. Ordinary HTML/CSS references are discovered automatically.' },
+          visibility: { type: 'string', enum: ['everyone', 'private'], description: 'Required explicit audience; must match configured app-wide Harmony visibility.' },
+          dryRun: { type: 'boolean', description: 'true validates, externalizes, discovers assets, hashes, and predicts the URL without invoking Harmony.' },
+          ownerRequested: { type: 'boolean', description: 'Required true only for a real external publish explicitly requested in the current conversation.' },
+        },
+        required: ['filePath', 'visibility'],
+      },
+    },
+  },
   // ── Canonical analytical dashboards ──
   list_analytics_dashboards: { type: 'function', function: { name: 'list_analytics_dashboards', description: 'List BotBoy analytical dashboards with status, widget count, refresh time, and linked-project count.', parameters: { type: 'object', properties: {} } } },
   get_analytics_dashboard: { type: 'function', function: { name: 'get_analytics_dashboard', description: 'Get one canonical local analytical dashboard including widgets, persisted results, errors, schedule, runs, and latest publication.', parameters: { type: 'object', properties: { dashboardId: { type: 'string' } }, required: ['dashboardId'] } } },
@@ -267,6 +286,76 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
   ui_inspect: { type: 'function', function: { name: 'ui_inspect', description: "SEE BotBoy's own rendered UI: opens a fresh scratch tab of the app at a route (never the owner's tab), waits for load, and returns real geometry for a CSS selector — match count, bounding rects, computed display/visibility/overflow/width/height, text excerpts, viewport size. THE verification tool after changing UI code (build first — it observes the SERVED app): a 'fixed' chart that renders 18px wide is caught here in one call. Routes are app hash routes like '/dashboards' or '/doc/<id>'; only BotBoy's own app can be observed.", parameters: { type: 'object', properties: { route: { type: 'string', description: "App hash route, e.g. '/dashboards/dash_abc123' or '/' for home" }, selector: { type: 'string', description: 'CSS selector to measure, e.g. ".analytics-vega svg.marks"' }, settleMs: { type: 'number', description: 'Extra wait after load for data-heavy views (default 1800, max 8000)' } }, required: ['route', 'selector'] } } },
   ui_console_errors: { type: 'function', function: { name: 'ui_console_errors', description: "Console errors and warnings captured during a FRESH load of one of BotBoy's own app routes in a scratch tab (exceptions, console.error/warn, log entries — from tab boot, so load-time failures are included). Use when the UI misbehaves with no visible reason, or after a UI change to confirm a clean load.", parameters: { type: 'object', properties: { route: { type: 'string' }, settleMs: { type: 'number' } }, required: ['route'] } } },
   ui_screenshot: { type: 'function', function: { name: 'ui_screenshot', description: "Full-viewport PNG of one of BotBoy's own app routes, rendered in a fresh scratch tab and saved locally. The screenshot is FOR THE OWNER's eyes (share the file path) — you cannot see the pixels yourself; for self-verification use ui_inspect geometry instead.", parameters: { type: 'object', properties: { route: { type: 'string' }, settleMs: { type: 'number' } }, required: ['route'] } } },
+  browser_hands: {
+    type: 'function',
+    function: {
+      name: 'browser_hands',
+      description: 'Operate ordinary web pages in BotBoy-created tabs inside the existing authenticated debug Chrome. Start with open (or list to resume), inspect to get current DOM/accessibility text and element refs, then click/type/select/key/scroll/wait/navigate as needed; inspect again after navigation or major page changes because refs are document-bound. When a click can open an alert/confirm/prompt, pass dialog.decision in that SAME click call so the short-lived CDP action can handle it; action=dialog is for a dialog already open before the call. Popups spawned by an owned tab are adopted and returned as newTabs. Close tabs when the browser job is done. This is the primary tool for links that require rendered DOM, login state, page interactions, or popups—do not improvise CDP with run_command, Python, npm, Playwright, or Selenium.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list', 'open', 'navigate', 'inspect', 'click', 'type', 'select', 'key', 'scroll', 'wait', 'dialog', 'close'] },
+          tabId: { type: 'string', description: 'Opaque tab id returned by open, list, or newTabs.' },
+          url: { type: 'string', description: 'Complete http(s) URL for open or navigate.' },
+          target: {
+            type: 'object',
+            properties: {
+              ref: { type: 'string', description: 'Current element ref from inspect, e.g. r3.' },
+              selector: { type: 'string', description: 'CSS selector when a stable ref is not available.' },
+            },
+          },
+          inspect: {
+            type: 'object',
+            properties: {
+              mode: { type: 'string', enum: ['accessibility', 'dom', 'both'] },
+              selector: { type: 'string', description: 'Optional CSS scope; omit for the whole page.' },
+              maxNodes: { type: 'number', minimum: 1, maximum: 200 },
+            },
+          },
+          text: { type: 'string', description: 'Text for action=type.' },
+          values: { type: 'array', items: { type: 'string' }, description: 'Option values for action=select.' },
+          replace: { type: 'boolean', description: 'For type: replace current value (default true) or append.' },
+          key: { type: 'string', description: 'Named key such as Enter, Tab, Escape, ArrowDown, or one character.' },
+          modifiers: { type: 'array', items: { type: 'string', enum: ['Alt', 'Control', 'Meta', 'Shift'] } },
+          deltaX: { type: 'number' },
+          deltaY: { type: 'number', description: 'Wheel delta; positive scrolls down. Default 700.' },
+          clickCount: { type: 'number', minimum: 1, maximum: 3 },
+          wait: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['load', 'url', 'selector', 'text', 'timeout'] },
+              value: { type: 'string', description: 'URL/text substring or CSS selector.' },
+              state: { type: 'string', enum: ['present', 'visible', 'hidden', 'absent'] },
+              timeoutMs: { type: 'number', minimum: 0, maximum: 30000 },
+            },
+          },
+          dialog: {
+            type: 'object',
+            properties: {
+              decision: { type: 'string', enum: ['accept', 'dismiss'] },
+              promptText: { type: 'string' },
+            },
+          },
+        },
+        required: ['action'],
+      },
+    },
+  },
+  browser_screenshot: {
+    type: 'function',
+    function: {
+      name: 'browser_screenshot',
+      description: 'Capture an owned browser tab as PNG after the page is in the state you need. Saves the file under BotBoy files, returns its absolute path and /api/files URL, AND keeps the pixels in your current live tool turn so you can inspect them and still use that evidence after follow-up actions such as closing the tab. Use fullPage=true only when the whole document matters; viewport capture is better for app canvases and modal states.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tabId: { type: 'string', description: 'Owned tab id from browser_hands.' },
+          fullPage: { type: 'boolean' },
+        },
+        required: ['tabId'],
+      },
+    },
+  },
   propose_lesson: { type: 'function', function: { name: 'propose_lesson', description: "Stage ONE operating lesson in BotBoy's ledger. A lesson must pass ALL SIX criteria — do not propose otherwise: (1) VERIFIED: grounded in an observed outcome with evidence (exact error text, run id, a fix that worked) — never a guess; (2) DURABLE: an invariant that stays true (a dialect rule, a semantic trap), NOT a transient state (expired auth, VPN down, service slow today); (3) GENERALIZABLE: a rule about a CLASS that changes future behavior, not a description of one incident; (4) ACTIONABLE: says what to DO differently; (5) NON-DUPLICATIVE: not already taught by a loaded preset, the tooling guide, or an existing lesson (check list_lessons for the scope first); (6) SCOPED: tagged to the business/lane it governs. Proposals are STAGED — they load into briefings only after the owner adopts them; say so when reporting. Re-proposing an equivalent rule bumps its recurrence counter instead of duplicating.", parameters: { type: 'object', properties: { scope: { type: 'string', description: 'Lowercase tag the rule governs: a business ("ott", "fatafat"), a lane ("etl-lane"), or "general"' }, rule: { type: 'string', description: 'ONE bounded operating rule (≤500 chars) stating what to do differently' }, evidence: { type: 'string', description: 'The observed outcome that verifies it: exact error text, run id, parity check' }, provenance: { type: 'string', description: 'Where this was learned, e.g. "run run_x escalation" or "chat 2026-09-05"' } }, required: ['scope', 'rule', 'evidence'] } } },
   list_lessons: { type: 'function', function: { name: 'list_lessons', description: "Read BotBoy's lessons ledger, optionally filtered by scope and status (proposed|adopted|retired). Check this before proposing a lesson in a scope, and when the owner asks what BotBoy has learned or what awaits their approval.", parameters: { type: 'object', properties: { scope: { type: 'string' }, status: { type: 'string', enum: ['proposed', 'adopted', 'retired'] } }, required: [] } } },
   adopt_lesson: { type: 'function', function: { name: 'adopt_lesson', description: "ADOPT a proposed lesson — the owner's approval. Renders it into the knowledge directory so future data briefings in its scope carry it. Requires the owner to have explicitly approved this lesson in this conversation (ownerRequested).", parameters: { type: 'object', properties: { id: { type: 'string', description: 'Lesson id, e.g. lesson_ab12cd34ef56' }, ownerRequested: { type: 'boolean', description: 'true ONLY when the current user explicitly approved adopting this lesson' } }, required: ['id', 'ownerRequested'] } } },
@@ -291,7 +380,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
 
 const ROLE_TOOLS: Record<AgentRole, string[]> = {
   orchestrator: ['query_db', 'execute_db', 'list_nodes', 'get_node_items', 'assign_item', 'create_node', 'search_items', 'send_chat_message', 'enrich_item', 'run_command', 'create_item', 'update_item', 'write_file', 'read_file'],
-  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
+  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
   classifier: [], // no tools — just returns JSON
   enricher: ['enrich_item', 'query_db'],
   organizer: ['list_nodes', 'get_node_items', 'create_node', 'assign_item'],

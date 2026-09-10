@@ -404,6 +404,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         }
 
         const tools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
+        const BROWSER_SCREENSHOT_EVIDENCE_MESSAGE = 'Browser screenshot evidence from the preceding tool result. Inspect these pixels now and keep using them through the rest of this tool turn; the saved owner-openable path is in that tool result.';
 
         // Chat replies don't need the global 16K completion budget; capping at
         // 4K frees ~12K tokens of input headroom so the pre-flight trimmer
@@ -440,6 +441,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const WRITE_TOOLS = new Set([
           'create_item', 'update_item', 'execute_db', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
           'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
+          'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony',
         ]);
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked)\b)/i;
         // Read-only SQL tools that may run as a concurrent batch (the
@@ -847,7 +849,11 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             // arguments IS the designed monitoring loop (each call returns
             // fresh progress), so the repeat-breaker must not nudge or
             // kill-switch it. The session timeout bounds the total wait.
-            const repeatExempt = tc.function.name === 'wait_for_terminal' || tc.function.name === 'read_terminal';
+            const repeatExempt =
+              tc.function.name === 'wait_for_terminal' ||
+              tc.function.name === 'read_terminal' ||
+              tc.function.name === 'browser_hands' ||
+              tc.function.name === 'browser_screenshot';
             const repeats = repeatExempt ? 0 : (seenToolCalls.get(repeatKey) ?? 0);
             if (!repeatExempt) seenToolCalls.set(repeatKey, repeats + 1);
             if (repeats === 0) {
@@ -860,6 +866,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 } catch {}
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: terminal-wait ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (tc.function.name === 'publish_static_artifact_to_harmony') {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🚀 Publishing static artifact to Harmony...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: harmony-publish ${Date.now()}\n\n`); } catch {}
                 }, 10000);
               } else if (PARALLEL_SQL_TOOLS.has(tc.function.name)) {
                 // Warehouse queries now run on a 35-minute budget — the SSE
@@ -950,10 +963,23 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ? { reasoning_content: streamResult.reasoning }
               : {}),
           });
+          const toolImages: string[] = [];
           for (const { tc, result } of toolResults) {
             messages.push({ role: 'tool', content: result.content, tool_call_id: tc.id });
+            if (Array.isArray(result.images)) toolImages.push(...result.images.filter((image: unknown) => typeof image === 'string'));
             console.log(`[Chat] Tool result: ${tc.function.name} resultLen=${(result.content || '').length} argsLen=${(tc.function.arguments || '').length}`);
             res.write(`data: ${JSON.stringify({ type: 'tool_result', name: tc.function.name, preview: result.content.slice(0, 200) })}\n\n`);
+          }
+          // Both provider protocols require every function output before the
+          // next user item. Carry screenshot bytes after all tool results for
+          // the remainder of this non-persisted live turn; the text result
+          // separately holds the durable file path and URL.
+          if (toolImages.length) {
+            messages.push({
+              role: 'user',
+              content: BROWSER_SCREENSHOT_EVIDENCE_MESSAGE,
+              images: toolImages.slice(0, 4),
+            });
           }
         }
 

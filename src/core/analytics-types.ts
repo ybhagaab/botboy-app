@@ -217,6 +217,41 @@ export interface DashboardPublishResult {
   url: string;
 }
 
+export interface StaticArtifactPublishInput {
+  filePath: string;
+  slug?: string;
+  /** Additional files relative to the HTML file's directory. */
+  assetPaths?: string[];
+  /** Must match the configured app-wide Harmony visibility. */
+  visibility: 'everyone' | 'private';
+  /** Validate/transform/hash only; never invokes Harmony. */
+  dryRun?: boolean;
+  /** Required true for a real external publish. */
+  ownerRequested?: boolean;
+}
+
+export interface StaticArtifactPublishResult {
+  ok: true;
+  provider: 'harmony';
+  published: boolean;
+  dryRun: boolean;
+  appName: string;
+  stage: HarmonyPublisherSettings['stage'];
+  visibility: HarmonyPublisherSettings['visibility'];
+  slug: string;
+  sourcePath: string;
+  url: string;
+  manifestSha256: string;
+  totalBytes: number;
+  files: Array<{ relativePath: string; bytes: number; sha256: string; generated: boolean }>;
+  transformations: {
+    inlineStylesExternalized: number;
+    inlineScriptsExternalized: number;
+    localAssetsIncluded: number;
+  };
+  publishedAt?: string;
+}
+
 export interface HarmonySetupProbe {
   cliPresent: boolean;
   cliVersion?: string;
@@ -253,6 +288,8 @@ export interface DashboardPublisherService {
   updateConfig(input: UpdateDashboardPublisherInput): DashboardPublisherConfig;
   createShareRequest(dashboardId: string): DashboardShareRequest;
   publish(dashboardId: string, confirmationToken: string): Promise<DashboardPublishResult>;
+  /** Publish an existing BotBoy-files HTML artifact through the configured Harmony app. */
+  publishStaticArtifact(input: StaticArtifactPublishInput): Promise<StaticArtifactPublishResult>;
   /** Harmony setup stepper: where is the owner in install-cli → bindle → ready? */
   probeHarmonySetup(): Promise<HarmonySetupProbe>;
   /** One-click `toolbox install harmonycli` (the 99% first-run path). */

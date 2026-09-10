@@ -20,6 +20,8 @@ export interface BrowserMonitor {
 export interface BrowserMonitorConfig {
   cdpEndpoint: string;
   pollIntervalMs: number;
+  /** Hands-owned targets are active automation, not ambient browsing evidence. */
+  shouldSkipTarget?: (targetId: string) => boolean;
 }
 
 const DEFAULT_CONFIG: BrowserMonitorConfig = {
@@ -83,7 +85,7 @@ interface TabInfo {
   webSocketDebuggerUrl: string;
 }
 
-async function fetchTabs(endpoint: string): Promise<TabInfo[]> {
+async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string) => boolean): Promise<TabInfo[]> {
   try {
     const resp = await fetch(`${endpoint}/json/list`);
     if (!resp.ok) return [];
@@ -103,6 +105,7 @@ async function fetchTabs(endpoint: string): Promise<TabInfo[]> {
     return tabs
       .filter((t: any) => {
         if (t.type !== 'page' || !t.url) return false;
+        if (shouldSkipTarget?.(String(t.id ?? ''))) return false;
         return !BLOCKED_URLS.some(p => p.test(t.url));
       })
       .map((t: any) => ({
@@ -382,7 +385,7 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
   }
 
   async function pollOnce(): Promise<void> {
-    const tabs = await fetchTabs(cfg.cdpEndpoint);
+    const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
     for (const tab of tabs) {
       const dynamic = isDynamicPage(tab.url);
 

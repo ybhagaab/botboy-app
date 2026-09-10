@@ -12,14 +12,17 @@ import {
   classifyHarmonyFailure,
   harmonyAppName,
   harmonyDashboardUrl,
+  harmonyStaticArtifactUrl,
   installHarmonyCli,
   probeHarmony,
+  publishStaticArtifactToHarmony,
   publishToHarmony,
   scaffoldHarmonyApp,
   type ExecFn,
   type HarmonySettings,
 } from './publish-harmony.js';
 import type { AnalyticsDashboard } from './analytics-types.js';
+import { buildStaticArtifactBundle } from './publish-static-artifact.js';
 
 const BINDLE = 'amzn1.bindle.resource.4jm6ucxzuawo46cdjhua';
 
@@ -90,6 +93,7 @@ describe('harmony adapter (reworked)', () => {
     expect(harmonyDashboardUrl(settings(), 'dash_x', 'me-botboy-dashboard')).toBe('https://me-botboy-dashboard.beta.harmony.a2z.com/d/dash_x/');
     expect(harmonyDashboardUrl(settings({ stage: 'gamma' }), 'dash_x', 'me-botboy-dashboard')).toBe('https://me-botboy-dashboard.gamma.harmony.a2z.com/d/dash_x/');
     expect(harmonyDashboardUrl(settings({ stage: 'prod' }), 'dash_x', 'me-botboy-dashboard')).toBe('https://me-botboy-dashboard.harmony.a2z.com/d/dash_x/');
+    expect(harmonyStaticArtifactUrl(settings(), 'prime-mock', 'me-botboy-dashboard')).toBe('https://me-botboy-dashboard.beta.harmony.a2z.com/a/prime-mock/');
   });
 
   it('scaffolds package.json + harmony-metadata.json with the bindle id (non-interactive deploys)', () => {
@@ -174,6 +178,32 @@ describe('harmony adapter (reworked)', () => {
     // Assets are pre-built + self-packaged (app.tar via tar step): ALWAYS deploy with -B.
     expect(secondDeploy.args).toContain('-B');
     expect(again.calls.some(call => call.cmd === 'tar' && call.args.includes('app.tar'))).toBe(true);
+  });
+
+  it('stages static artifacts under a/<slug>/ and reuses the same deploy/viewer path', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'harmony-static-source-'));
+    try {
+      writeFileSync(path.join(filesRoot, 'mock.html'), '<!doctype html><style>body{color:red}</style><h1>Mock</h1><script>window.ready=true</script>');
+      const bundle = buildStaticArtifactBundle({ filePath: 'mock.html', filesRoot });
+      const run = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+      const audiences: string[] = [];
+      const result = await publishStaticArtifactToHarmony({
+        settings: settings(),
+        bundle,
+        appName: 'me-botboy-dashboard',
+        appRoot,
+        exec: run.exec,
+        ensureViewerAccess: async ({ settings: current }) => { audiences.push(current.visibility); },
+      });
+      expect(result.url).toBe('https://me-botboy-dashboard.beta.harmony.a2z.com/a/mock/');
+      expect(readFileSync(path.join(result.artifactPath, 'index.html'), 'utf8')).toContain('botboy-inline-style-1.css');
+      expect(existsSync(path.join(result.artifactPath, 'botboy-inline-script-1.js'))).toBe(true);
+      expect(run.calls.some(call => call.cmd === 'tar')).toBe(true);
+      expect(run.calls.some(call => call.args[1] === 'deploy')).toBe(true);
+      expect(audiences).toEqual(['everyone']);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
   });
 
   it('prod deploys run under /usr/bin/expect with a PTY script carrying the deploy args', async () => {

@@ -185,6 +185,7 @@ Be concise, helpful, proactive. You have full authority.`;
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userMsg },
           ];
+          const BROWSER_SCREENSHOT_EVIDENCE_MESSAGE = 'Browser screenshot evidence from the preceding tool result. Inspect these pixels now and keep using them through the rest of this tool turn; the saved owner-openable path is in that tool result.';
 
           // Max reasoning for document-writing iterations, armed by the
           // model's own get_document_writing_guide call (mirrors the SSE
@@ -214,12 +215,21 @@ Be concise, helpful, proactive. You have full authority.`;
               toolCalls: resp.toolCalls,
               providerOutput: resp.providerOutput,
             });
+            const toolImages: string[] = [];
             for (const tc of resp.toolCalls) {
               const result = await toolExecutor.executeTool(tc, {
                 currentUserMessage: instruction,
               });
               if (tc.function.name === 'get_document_writing_guide') documentAuthoringThink = true;
               messages.push({ role: 'tool', content: result.content, toolCallId: tc.id });
+              if (result.images?.length) toolImages.push(...result.images);
+            }
+            if (toolImages.length) {
+              messages.push({
+                role: 'user',
+                content: BROWSER_SCREENSHOT_EVIDENCE_MESSAGE,
+                images: toolImages.slice(0, 4),
+              });
             }
           }
           return messages.filter(m => m.role === 'assistant' && m.content).pop()?.content || '';
