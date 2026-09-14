@@ -110,16 +110,17 @@ function focusBoard(section, items, selectedId, context, renderRail, renderDetai
   if (!selected) return '';
   const panelId = `today-${section}-detail`;
   const hasRail = items.length > 1;
-  const selectedTabId = focusTabId(section, keyOf(selected));
+  const selectedKey = keyOf(selected);
+  const selectedTabId = focusTabId(section, selectedKey);
   const rail = hasRail
-    ? `<div class="today-focus-rail" role="tablist" aria-label="${esc(section)} projects">${items.map((item, index) => renderRail(item, index, keyOf(item) === keyOf(selected), panelId)).join('')}</div>`
+    ? `<div class="today-focus-rail" data-scroll-key="today:${attr(section)}:rail" role="tablist" aria-label="${esc(section)} projects">${items.map((item, index) => renderRail(item, index, keyOf(item) === selectedKey, panelId)).join('')}</div>`
     : '';
   const panelA11y = hasRail
     ? `role="tabpanel" aria-labelledby="${attr(selectedTabId)}"`
     : `role="region" aria-label="${esc(section)} project details"`;
   return `<section class="today-focus-board${hasRail ? '' : ' single'}" data-section="${attr(section)}">
     ${rail}
-    <div class="today-focus-detail" id="${panelId}" ${panelA11y} tabindex="0">${renderDetail(selected)}</div>
+    <div class="today-focus-detail" data-scroll-key="today:${attr(section)}:detail:${attr(selectedKey)}" id="${panelId}" ${panelA11y} tabindex="0">${renderDetail(selected)}</div>
   </section>`;
 }
 

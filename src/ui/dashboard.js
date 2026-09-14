@@ -1248,7 +1248,7 @@ function sheetTableHtml(view) {
     : `<td style="padding:4px 9px; border-bottom:1px solid var(--border); font-size:11.5px; white-space:nowrap;">${esc(cell)}</td>`).join('')}</tr>`).join('');
   return `<div style="display:flex; flex-direction:column; gap:8px;">
     <span style="color:var(--muted); font-size:11px;">${esc(notes)}</span>
-    <div style="overflow:auto; max-height:70vh; border:1px solid var(--border); border-radius:9px;"><table style="border-collapse:collapse; width:max-content; min-width:100%;">${body}</table></div>
+    <div data-scroll-key="doc-reader:sheet:${attr(view.name)}" style="overflow:auto; max-height:70vh; border:1px solid var(--border); border-radius:9px;"><table style="border-collapse:collapse; width:max-content; min-width:100%;">${body}</table></div>
   </div>`;
 }
 
@@ -1688,8 +1688,8 @@ function renderDocReader() {
     ${editMode ? '' : pendingEditsSection(data, docKey, state.docReader.syncing === true)}
     ${editMode ? '' : sheetChips}
     <div class="document-annotated with-rail">
-      <section class="card pad document-preview-shell">${contentHtml}</section>
-      <aside class="document-annotations">
+      <section class="card pad document-preview-shell" data-scroll-key="doc-reader:preview:${attr(docKey)}">${contentHtml}</section>
+      <aside class="document-annotations" data-scroll-key="doc-reader:annotations:${attr(docKey)}">
         ${relatedHtml}
         ${suggestions.length ? `<div class="doc-annotation-group"><h3>Suggested changes <span class="doc-annotation-count">${suggestions.length}</span></h3>${suggestionsHtml}</div>` : ''}
         <div class="doc-annotation-group"><h3>Comments <span class="doc-annotation-count">${liveComments.length}</span></h3>${commentFilters}${commentsHtml}${deletedHtml}</div>
@@ -3683,7 +3683,7 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0) {
     if (widget.kind === 'table') body = renderAnalyticsTable(result);
     if (widget.kind === 'bar') body = renderAnalyticsBars(widget, result);
     if (widget.kind === 'line') body = renderAnalyticsLine(widget, result);
-    if (widget.kind === 'visualization') body = `<div class="analytics-vega" data-analytics-visualization="${attr(widget.id)}" role="img" aria-label="${attr(widget.title)}"><span>Preparing interactive visualization…</span></div>`;
+    if (widget.kind === 'visualization') body = `<div class="analytics-vega" data-scroll-key="analytics:vega:${attr(widget.id)}" data-analytics-visualization="${attr(widget.id)}" role="img" aria-label="${attr(widget.title)}"><span>Preparing interactive visualization…</span></div>`;
     if (widget.kind === 'text') body = `<div class="analytics-text">${renderAnalyticsText(result.rows?.[0]?.[0] ?? widget.config?.text ?? '')}</div>`;
   }
   const spanClass = span ? ` analytics-span-${span}` : '';
@@ -4159,7 +4159,7 @@ function renderDocumentListPane(selectedArtifactId) {
       const origin = document.revisionOrigin === 'owner_edit' ? ' · Owner edit' : '';
       return `<a class="document-row ${active ? 'active' : ''} ${historical ? 'document-row-version' : ''}" href="#/documents/${encodeURIComponent(document.artifactId)}" data-artifact="${attr(document.artifactId)}" ${active ? 'aria-current="page"' : ''}><span class="source-icon">${icon('file', 16)}</span><span class="document-row-copy"><strong>${esc(document.title)}</strong><span>${esc(document.profileId || 'Unknown profile')} · ${esc(size)}${esc(origin)}${versionNote ? ` · ${esc(versionNote)}` : ''}</span></span><span class="document-row-side"><span class="pill ${documentStateTone(document.state)}">${esc(documentStateLabel(document.state))}</span><time>${esc(relativeTime(document.createdAt))}</time></span></a>`;
     };
-    body = `<nav class="document-list" aria-label="Documents">${groupDocumentChains(items).map(chain => {
+    body = `<nav class="document-list" data-scroll-key="documents:list" aria-label="Documents">${groupDocumentChains(items).map(chain => {
       const versions = chain.older.length + 1;
       const head = documentRow(chain.head, { versionNote: versions > 1 ? `${number(versions)} versions` : '' });
       const history = chain.older
@@ -4217,7 +4217,7 @@ function renderDocumentDetailPane(artifactId) {
   // Collapsible panel with capped internal scrolling: answering questions
   // must never steal the whole pane from the document preview below it.
   const questionsBlock = openQuestions.length && !editing
-    ? `<details class="document-questions" data-document-questions ${documents.questionsOpen ? 'open' : ''}><summary>${icon('sparkles', 14)} <strong>${number(openQuestions.length)} open question${openQuestions.length === 1 ? '' : 's'} to answer</strong><span>Answer below and BotBoy will create an improved version.</span><span class="document-questions-chevron">${icon('chevron-down', 13)}</span></summary><div class="document-questions-body"><ol>${openQuestions.slice(0, 10).map(question => `<li>${esc(question)}</li>`).join('')}</ol><textarea class="document-answers-input" data-document-answers rows="3" placeholder="Type your answers here (any format — reference the questions by number if useful)">${esc(documents.answersDraft || '')}</textarea><div class="document-questions-actions"><button class="button" type="button" data-action="documents-send-answers" data-artifact="${attr(artifactId)}" ${documents.saving ? 'disabled' : ''}>${icon('sparkles', 13)} Send answers to BotBoy</button><span>Sends your answers to chat; a new version is generated from them.</span></div></div></details>`
+    ? `<details class="document-questions" data-document-questions ${documents.questionsOpen ? 'open' : ''}><summary>${icon('sparkles', 14)} <strong>${number(openQuestions.length)} open question${openQuestions.length === 1 ? '' : 's'} to answer</strong><span>Answer below and BotBoy will create an improved version.</span><span class="document-questions-chevron">${icon('chevron-down', 13)}</span></summary><div class="document-questions-body"><ol data-scroll-key="documents:questions:${attr(artifactId)}">${openQuestions.slice(0, 10).map(question => `<li>${esc(question)}</li>`).join('')}</ol><textarea class="document-answers-input" data-document-answers rows="3" placeholder="Type your answers here (any format — reference the questions by number if useful)">${esc(documents.answersDraft || '')}</textarea><div class="document-questions-actions"><button class="button" type="button" data-action="documents-send-answers" data-artifact="${attr(artifactId)}" ${documents.saving ? 'disabled' : ''}>${icon('sparkles', 13)} Send answers to BotBoy</button><span>Sends your answers to chat; a new version is generated from them.</span></div></div></details>`
     : '';
 
   const parentLine = artifact.parentArtifactId
@@ -4249,7 +4249,7 @@ function renderDocumentDetailPane(artifactId) {
       ? `${icon('shield', 13)} Markdown rendered with escape-first formatting`
       : `${icon('shield', 13)} Content is rendered as plain text only`;
 
-  return `<article class="card document-detail-pane"><div class="document-detail-toolbar">${back}<span class="pill ${stateTone}">${esc(documentStateLabel(artifact.state))}</span>${modeButtons}<div class="document-toolbar-actions">${downloadMenu}${deleteButton}${fullscreenButton}</div></div><header class="document-detail-header"><div><div class="eyebrow">${icon('file', 14)} Product document</div><h2>${esc(artifact.title)}</h2><p><code>${esc(artifact.artifactId)}</code></p>${parentLine}</div><button class="button small" type="button" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)} ${loading ? 'Refreshing…' : 'Refresh document'}</button></header><div class="document-detail-meta"><span>${esc(`${artifact.profileId || 'Unknown profile'}${profileVersion}`)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span>${extraMetadata.map(value => `<span>${esc(value)}</span>`).join('')}</div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}${advisoriesBlock}<div class="document-preview-shell">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
+  return `<article class="card document-detail-pane"><div class="document-detail-toolbar">${back}<span class="pill ${stateTone}">${esc(documentStateLabel(artifact.state))}</span>${modeButtons}<div class="document-toolbar-actions">${downloadMenu}${deleteButton}${fullscreenButton}</div></div><header class="document-detail-header"><div><div class="eyebrow">${icon('file', 14)} Product document</div><h2>${esc(artifact.title)}</h2><p><code>${esc(artifact.artifactId)}</code></p>${parentLine}</div><button class="button small" type="button" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)} ${loading ? 'Refreshing…' : 'Refresh document'}</button></header><div class="document-detail-meta"><span>${esc(`${artifact.profileId || 'Unknown profile'}${profileVersion}`)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span>${extraMetadata.map(value => `<span>${esc(value)}</span>`).join('')}</div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}${advisoriesBlock}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
 }
 
 function renderDocuments() {
@@ -4325,7 +4325,7 @@ function renderDocumentAnnotationsRail(artifact) {
     <span class="doc-annotation-message">${esc(String(finding.message || ''))}</span>
   </div>`).join('');
 
-  return `<aside class="document-annotations" aria-label="Document annotations">
+  return `<aside class="document-annotations" data-scroll-key="documents:annotations:${attr(artifact.artifactId)}" aria-label="Document annotations">
     ${citations.length ? `<div class="doc-annotation-group"><h3>${icon('link', 12)} Evidence <span class="doc-annotation-count">${citations.length}</span></h3>${citeCards}</div>` : ''}
     ${review ? `<div class="doc-annotation-group"><h3>${icon('sparkles', 12)} Conformance review <span class="pill ${statusTone}">${esc(statusLabel)}</span></h3>${review.summary ? `<p class="doc-annotation-summary">${esc(String(review.summary))}</p>` : ''}${reviewCards}</div>` : ''}
   </aside>`;
@@ -4714,6 +4714,67 @@ function hasUnsavedUserInput() {
   return false;
 }
 
+// Routed views now contain persistent descendant scrollers (document readers,
+// Today focus panes, and Vega canvases) in addition to #workspace. A wholesale
+// #app-view repaint destroys those elements, so preserve their keyed top/left
+// offsets across same-route background renders. Keys are opt-in and semantic;
+// true navigation deliberately does not restore another route's position.
+let routeRenderGeneration = 0;
+let pendingReloadKeyedScroll = null;
+
+function captureKeyedScrollPositions(root = document.getElementById('app-view')) {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll('[data-scroll-key]'))
+    .map(element => ({
+      key: String(element.dataset.scrollKey || ''),
+      top: element.scrollTop,
+      left: element.scrollLeft,
+    }))
+    .filter(entry => entry.key && (entry.top || entry.left));
+}
+
+function restoreKeyedScrollPositions(snapshot, routeKey, generation, retryMs = 2500, onComplete) {
+  if (!snapshot.length) { onComplete?.(); return; }
+  const pending = new Map(snapshot.map(entry => [entry.key, { ...entry, topDone: entry.top === 0, leftDone: entry.left === 0 }]));
+  const startedAt = Date.now();
+  const attempt = () => {
+    if (generation !== routeRenderGeneration) return;
+    if (JSON.stringify(state.route ?? {}) !== routeKey) { onComplete?.(); return; }
+    const elements = new Map(Array.from(document.querySelectorAll('#app-view [data-scroll-key]'))
+      .map(element => [String(element.dataset.scrollKey || ''), element]));
+    const expired = Date.now() - startedAt >= retryMs;
+    for (const [key, entry] of pending) {
+      const element = elements.get(key);
+      if (!element) {
+        if (expired) pending.delete(key);
+        continue;
+      }
+      if (!entry.topDone) {
+        const maximum = Math.max(0, element.scrollHeight - element.clientHeight);
+        if (element.scrollTop !== 0) {
+          entry.topDone = true; // owner moved before delayed content became tall
+        } else if (maximum >= entry.top || expired) {
+          element.scrollTop = Math.min(entry.top, maximum);
+          entry.topDone = true;
+        }
+      }
+      if (!entry.leftDone) {
+        const maximum = Math.max(0, element.scrollWidth - element.clientWidth);
+        if (element.scrollLeft !== 0) {
+          entry.leftDone = true; // owner moved before delayed content became wide
+        } else if (maximum >= entry.left || expired) {
+          element.scrollLeft = Math.min(entry.left, maximum);
+          entry.leftDone = true;
+        }
+      }
+      if (entry.topDone && entry.leftDone) pending.delete(key);
+    }
+    if (pending.size && !expired) setTimeout(attempt, 100);
+    else onComplete?.();
+  };
+  requestAnimationFrame(attempt);
+}
+
 // INVERTED DEFAULT (2026-08-26): every render is treated as background
 // unless the call site declares `userAction: true`. Background renders
 // yield to in-progress typing; user-action renders always paint. A
@@ -4725,6 +4786,7 @@ function hasUnsavedUserInput() {
 function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   const workspace = document.getElementById('workspace');
   const previousScrollTop = workspace?.scrollTop || 0;
+  const previousNestedScroll = captureKeyedScrollPositions();
   const previousRouteKey = JSON.stringify(state.route ?? {});
   state.route = parseRoute();
   const routeChanged = JSON.stringify(state.route) !== previousRouteKey;
@@ -4732,6 +4794,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   // already fresh in memory, and the next user-driven render (save, action,
   // navigation) paints it. Real navigation always renders.
   if (!userAction && !routeChanged && hasUnsavedUserInput()) return;
+  const renderGeneration = ++routeRenderGeneration;
   // The Slack channel picker and Local-folders panels are OVERLAYS shown
   // imperatively (showIntegration), invisible to the router. A background
   // re-render (version-bump poll) must not slam them shut mid-selection
@@ -4800,7 +4863,26 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   // through. Found live 2026-08-26: on project pages every capture cleared the
   // detail cache, and the re-fetch completion render (bare renderRoute()) was
   // yanking the owner to the top even though the poll render preserved scroll.
-  if (workspace) workspace.scrollTop = (preserveScroll || overlayOpen || !userAction) ? previousScrollTop : 0;
+  const keepScroll = preserveScroll || overlayOpen || !userAction;
+  if (workspace) workspace.scrollTop = keepScroll ? previousScrollTop : 0;
+  if (keepScroll && !routeChanged) {
+    restoreKeyedScrollPositions(previousNestedScroll, previousRouteKey, renderGeneration,
+      state.route.view === 'analytics-dashboard' ? 5000 : 2500);
+  }
+  const reloadSnapshot = pendingReloadKeyedScroll;
+  if (reloadSnapshot) {
+    if (reloadSnapshot.hash !== location.hash || reloadSnapshot.expiresAt <= Date.now()) {
+      pendingReloadKeyedScroll = null;
+    } else {
+      restoreKeyedScrollPositions(
+        reloadSnapshot.positions,
+        JSON.stringify(state.route ?? {}),
+        renderGeneration,
+        reloadSnapshot.expiresAt - Date.now(),
+        () => { if (pendingReloadKeyedScroll === reloadSnapshot) pendingReloadKeyedScroll = null; },
+      );
+    }
+  }
 }
 
 function closeIntegration({ keepLegacy = false } = {}) {
@@ -5789,6 +5871,11 @@ async function pollVersion() {
       } else {
         try { sessionStorage.setItem('botboy-reload-scroll', String(document.getElementById('workspace')?.scrollTop || 0)); } catch {}
         try {
+          const positions = captureKeyedScrollPositions();
+          if (positions.length) sessionStorage.setItem('botboy-reload-keyed-scroll', JSON.stringify({ hash: location.hash, positions }));
+          else sessionStorage.removeItem('botboy-reload-keyed-scroll');
+        } catch {}
+        try {
           const draft = document.getElementById('chatInput')?.value || '';
           if (draft.trim()) sessionStorage.setItem('botboy-reload-draft', draft);
         } catch {}
@@ -5848,6 +5935,21 @@ function initialize() {
   setMobileSidebarOpen(false);
   if (!location.hash || location.hash === '#') history.replaceState(null, '', '#/today');
   state.route = parseRoute();
+  try {
+    const raw = sessionStorage.getItem('botboy-reload-keyed-scroll');
+    sessionStorage.removeItem('botboy-reload-keyed-scroll');
+    const parsed = raw ? JSON.parse(raw) : null;
+    const positions = Array.isArray(parsed?.positions)
+      ? parsed.positions.slice(0, 100).map(entry => ({
+          key: String(entry?.key || '').slice(0, 240),
+          top: Math.max(0, Number(entry?.top) || 0),
+          left: Math.max(0, Number(entry?.left) || 0),
+        })).filter(entry => entry.key && (entry.top || entry.left))
+      : [];
+    if (parsed?.hash === location.hash && positions.length) {
+      pendingReloadKeyedScroll = { hash: location.hash, positions, expiresAt: Date.now() + 8000 };
+    }
+  } catch {}
   queueDocumentRouteFocus({ view: '' }, state.route);
   bindEvents();
   window.addEventListener('botboy:page-layout-ready', event => {
