@@ -31,6 +31,18 @@ export type DashboardLaneId = 'sql-mcp' | 'etl';
 export type WidgetFailureClass = 'content' | 'infra';
 
 /**
+ * A runtime-generation mismatch discovered before the MCP tool call starts is
+ * safe to retry once on the SAME lane: no remote side effect or query has run.
+ * Keep this deliberately narrower than generic transport failures — retrying a
+ * connection close after submission could duplicate an ETL job.
+ */
+export function isSafeRuntimeQueueChurn(error: unknown): boolean {
+  const lower = String((error as any)?.message ?? error ?? '').toLowerCase();
+  return lower.includes('runtime changed before the queued call could start')
+    || lower.includes('runtime changed before the call could be queued');
+}
+
+/**
  * Failure classification for the post-run cross-lane retry (incident
  * 2026-09-04: 5 Prime-dashboard widgets failed — 2 were SQL dialect bugs,
  * 3 were mid-run network loss; only the latter class can possibly succeed

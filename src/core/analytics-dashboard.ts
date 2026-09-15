@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { McpManager } from './mcp-types.js';
 import { validateReadOnlySql } from './mcp-policy.js';
-import { selectDashboardLane, classifyWidgetFailure, otherDashboardLane, laneUsable, type DashboardLaneId } from './analytics-runners.js';
+import { selectDashboardLane, classifyWidgetFailure, isSafeRuntimeQueueChurn, otherDashboardLane, laneUsable, type DashboardLaneId } from './analytics-runners.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type {
   AnalyticsDashboard,
@@ -856,6 +856,20 @@ export function createAnalyticsDashboardService(options: {
     return { ...parseSqlMcpResult(call.text), lane: 'sql-mcp' };
   }
 
+  async function executeRunWidgetWithSafeRuntimeRetry(
+    row: any,
+    lane: DashboardLaneId,
+  ): Promise<AnalyticsWidgetResult> {
+    try {
+      return await executeRunWidget(row, lane);
+    } catch (error) {
+      if (!isSafeRuntimeQueueChurn(error)) throw error;
+      console.warn(`[Analytics] transient ${lane} runtime queue churn before widget ${String(row.widget_id ?? row.id ?? 'unknown')} started; retrying once`);
+      await new Promise<void>(resolve => setTimeout(resolve, 250));
+      return executeRunWidget(row, lane);
+    }
+  }
+
   function finalizeRun(runId: string): void {
     const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
     if (!run || run.status !== 'running' || run.worker_id !== workerId || run.worker_pid !== process.pid) return;
@@ -1163,7 +1177,7 @@ export function createAnalyticsDashboardService(options: {
 
     const runWidgetToCompletion = async (widget: any): Promise<void> => {
       try {
-        const result = await executeRunWidget(widget, lane);
+        const result = await executeRunWidgetWithSafeRuntimeRetry(widget, lane);
         const completedAt = new Date().toISOString();
         db.transaction(() => {
           const progressed = db.prepare(`
@@ -1275,7 +1289,7 @@ export function createAnalyticsDashboardService(options: {
         WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
       `).run(widget.widget_id, heartbeat, leaseExpiresAt(), runId, workerId, process.pid);
       try {
-        const result = await executeRunWidget(widget, retryLane);
+        const result = await executeRunWidgetWithSafeRuntimeRetry(widget, retryLane);
         const completedAt = new Date().toISOString();
         db.transaction(() => {
           const runWidget = db.prepare(`

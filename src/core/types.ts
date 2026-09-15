@@ -156,15 +156,22 @@ export interface WhatsAppMessageMetadata {
 export interface EmailMetadata {
   subject: string;
   sender?: string;
-  recipients: string[];
+  recipients: string[] | string;
   direction: 'read' | 'sent' | 'received';
   /** Canonical owner identity required before an email can support a task. */
   ownerEmail?: string;
-  /** Structured addressing; browser read captures currently leave these unset. */
-  toRecipients?: string[];
-  ccRecipients?: string[];
+  /** Structured addressing; canonical GRASP rows serialize these as comma-separated strings. */
+  toRecipients?: string[] | string;
+  ccRecipients?: string[] | string;
   /** Deterministic capture-layer signal for a direct-To assignment. */
-  directlyAddressedToOwner?: boolean;
+  directlyAddressedToOwner?: boolean | 'true' | 'false';
+  /** Exact Outlook conversation membership; opaque and case-sensitive. */
+  conversationId?: string;
+  /** Direction-correct immutable event time: receivedDateTime or sentDateTime. */
+  messageTimestamp?: string;
+  /** Canonical relational mail must be stamped by GRASP M365 capture. */
+  platform?: 'grasp_m365' | string;
+  graspId?: string;
 }
 
 export interface CallSummaryMetadata {

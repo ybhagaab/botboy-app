@@ -3,6 +3,27 @@
 // workflows; this module owns the new shell, routing, and read-model rendering.
 
 import { nextTodayFocusIndex, renderTodayView, todayPaneHandoffDelta } from './today.js';
+import {
+  boundedDocumentCountLabel,
+  boundedDocumentScopeLabel,
+  buildDocumentLibraryView,
+  buildDocumentReviewModel,
+  loadedDocumentRevisionLabel,
+  toggleDocumentFocusState,
+  toggleDocumentLibraryState,
+  toggleDocumentReviewState,
+} from './document-reader.js';
+import {
+  applyDocumentReaderPresentation,
+  syncDocumentReaderPresentation,
+} from './document-reader-presentation.js';
+import {
+  beginRouteNavigation,
+  enforceRootScrollOrigin,
+  parseReloadScrollSnapshot,
+  shouldPreserveOuterScroll,
+  startOuterScrollRestore,
+} from './shell-scroll.js';
 
 const API = '/api';
 const DOCUMENT_LIST_LIMIT = 100;
@@ -69,6 +90,12 @@ const state = {
     detailErrors: new Map(),
     detailLoading: new Set(),
     pendingFocus: null,
+    // Library view state survives artifact switches; it applies only to the
+    // latest bounded summary page returned by the existing API.
+    libraryQuery: '',
+    librarySort: 'recent',
+    libraryOpen: true,
+    reviewCollapsedLibrary: false,
     // Per-selected-artifact view state; reset whenever the selection changes.
     uiArtifactId: '',
     previewMode: 'rendered',
@@ -77,7 +104,10 @@ const state = {
     answersDraft: '',
     saving: false,
     actionError: '',
-    fullscreen: false,
+    reviewOpen: false,
+    detailsOpen: false,
+    focusMode: false,
+    embeddedShellWidth: 0,
     questionsOpen: true,
     downloading: null,
     deleting: false,
@@ -342,11 +372,6 @@ async function loadCore({ quiet = false } = {}) {
   // First paint has scrollTop 0 anyway. Unlabeled render = background:
   // it also defers the repaint while the owner is typing.
   renderRoute({ preserveScroll: true });
-  // One-shot scroll restore after a bootId hard reload (stashed by
-  // pollVersion just before location.reload). The route's content loads
-  // asynchronously (project detail, documents), so the page may not have
-  // enough height yet — retry until the target offset is reachable (or give
-  // up after 8s / the moment the owner scrolls themselves).
   // Restore any chat draft stashed by the pre-reload handler in pollVersion —
   // an auto-reload must never eat a half-typed message.
   try {
@@ -357,22 +382,6 @@ async function loadCore({ quiet = false } = {}) {
       if (input && !input.value) input.value = savedDraft;
     }
   } catch {}
-  let savedScroll = null;
-  try { savedScroll = sessionStorage.getItem('botboy-reload-scroll'); } catch {}
-  if (savedScroll !== null) {
-    try { sessionStorage.removeItem('botboy-reload-scroll'); } catch {}
-    const target = Number(savedScroll) || 0;
-    if (target > 0) {
-      const startedAt = Date.now();
-      const tryRestore = () => {
-        const el = document.getElementById('workspace');
-        if (!el || el.scrollTop !== 0) return; // owner already scrolled — don't fight them
-        if (el.scrollHeight - el.clientHeight >= target) { el.scrollTop = target; return; }
-        if (Date.now() - startedAt < 8000) setTimeout(tryRestore, 250);
-      };
-      tryRestore();
-    }
-  }
 }
 
 async function openTodayVisit({ propagate = false } = {}) {
@@ -3936,43 +3945,6 @@ function normalizeDocumentSummary(raw) {
   };
 }
 
-/**
- * Group summaries into version chains via parent linkage. Each chain shows
- * its newest version as the primary row; older versions render as indented
- * history rows so iterations of one document no longer read as unrelated
- * artifacts. Artifacts without a resolvable parent start their own chain.
- */
-function groupDocumentChains(items) {
-  const byId = new Map(items.map(entry => [entry.artifactId, entry]));
-  const childrenOf = new Map();
-  const roots = [];
-  for (const entry of items) {
-    if (entry.parentArtifactId && byId.has(entry.parentArtifactId)) {
-      const siblings = childrenOf.get(entry.parentArtifactId) || [];
-      siblings.push(entry);
-      childrenOf.set(entry.parentArtifactId, siblings);
-    } else {
-      roots.push(entry);
-    }
-  }
-  const chains = roots.map(root => {
-    const members = [];
-    const stack = [root];
-    const seen = new Set();
-    while (stack.length) {
-      const current = stack.pop();
-      if (seen.has(current.artifactId)) continue;
-      seen.add(current.artifactId);
-      members.push(current);
-      for (const child of childrenOf.get(current.artifactId) || []) stack.push(child);
-    }
-    members.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-    return { head: members[0], older: members.slice(1) };
-  });
-  chains.sort((a, b) => String(b.head.createdAt).localeCompare(String(a.head.createdAt)));
-  return chains;
-}
-
 function documentSummariesFromPayload(payload) {
   const source = Array.isArray(payload)
     ? payload
@@ -4007,8 +3979,13 @@ function documentArtifactFromPayload(payload, expectedArtifactId) {
 }
 
 function documentStateLabel(value) {
-  const normalized = String(value || 'unknown').replaceAll('_', ' ').trim();
-  return normalized.replace(/\b\w/g, character => character.toUpperCase());
+  const normalized = String(value || 'unknown').replaceAll('_', ' ').trim().toLowerCase();
+  return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : 'Unknown';
+}
+
+function documentProfileLabel(value) {
+  const leaf = String(value || 'Unknown profile').split('/').pop().replace(/\.v\d+(?:\.\d+)*$/i, '').replaceAll('_', ' ').trim();
+  return leaf.replace(/\b(op|prd|mvp|api|ux|ui)\b/gi, token => token.toUpperCase()) || 'Unknown profile';
 }
 
 function documentStateTone(value) {
@@ -4036,6 +4013,11 @@ function rememberDocumentEntry(map, key, value) {
 function queueDocumentRouteFocus(previousRoute, nextRoute) {
   if (nextRoute.view !== 'documents') {
     state.documents.pendingFocus = null;
+    state.documents.reviewOpen = false;
+    state.documents.detailsOpen = false;
+    state.documents.focusMode = false;
+    if (state.documents.reviewCollapsedLibrary) state.documents.libraryOpen = true;
+    state.documents.reviewCollapsedLibrary = false;
     return;
   }
   if (nextRoute.artifactId && (previousRoute.view !== 'documents' || previousRoute.artifactId !== nextRoute.artifactId)) {
@@ -4048,6 +4030,43 @@ function queueDocumentRouteFocus(previousRoute, nextRoute) {
 function restoreDocumentRouteFocus() {
   const pending = state.documents.pendingFocus;
   if (!pending) return;
+
+  if (pending.target === 'focus-content') {
+    document.querySelector('[data-document-preview], [data-document-editor]')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'focus-control') {
+    document.querySelector('[data-action="documents-focus"]')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'library-control') {
+    document.querySelector('.document-title-library-toggle')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'library-search') {
+    document.querySelector('[data-document-search]')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'library-sort') {
+    document.querySelector('[data-document-sort]')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'review-control') {
+    document.querySelector('[data-action="documents-toggle-review"]')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+  if (pending.target === 'review') {
+    document.querySelector('.document-review-heading')?.focus({ preventScroll: true });
+    state.documents.pendingFocus = null;
+    return;
+  }
+
   const mobile = typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 820px)').matches;
   if (!mobile) {
     state.documents.pendingFocus = null;
@@ -4070,6 +4089,35 @@ function restoreDocumentRouteFocus() {
   }
   document.querySelector('.document-list-pane')?.focus({ preventScroll: true });
   if (!state.documents.loading) state.documents.pendingFocus = null;
+}
+
+function currentEmbeddedDocumentShellWidth() {
+  const shell = document.querySelector('.documents-shell');
+  if (!shell) return state.documents.embeddedShellWidth || 0;
+  if (!shell.classList.contains('document-focus')) {
+    const width = shell.getBoundingClientRect().width;
+    if (width > 0) state.documents.embeddedShellWidth = width;
+  }
+  return state.documents.embeddedShellWidth
+    || document.querySelector('.main-content')?.getBoundingClientRect().width
+    || shell.getBoundingClientRect().width;
+}
+
+function updateDocumentReaderPresentation({ transition = 'local', focusTarget = '' } = {}) {
+  state.documents.pendingFocus = null;
+  const result = applyDocumentReaderPresentation({
+    documentRef: document,
+    state: state.documents,
+    transition,
+    focusTarget,
+  });
+  const settle = () => {
+    enforceShellRootScroll();
+    if (!state.documents.focusMode) currentEmbeddedDocumentShellWidth();
+  };
+  if (result?.finished) Promise.resolve(result.finished).catch(() => undefined).then(settle);
+  else requestAnimationFrame(settle);
+  return result;
 }
 
 async function loadDocuments({ force = false, renderAfter = true } = {}) {
@@ -4136,40 +4184,75 @@ async function refreshDocuments() {
   }
 }
 
+function renderDocumentLibraryRows(selectedArtifactId) {
+  const documents = state.documents;
+  const items = documents.items;
+  if (items === null && documents.loading) {
+    return `<div class="document-list-loading" aria-label="Loading documents"><div class="skeleton row"></div><div class="skeleton row"></div><div class="skeleton row"></div><div class="skeleton row"></div></div>`;
+  }
+  if (items === null) {
+    return `<div class="document-pane-state"><span class="source-icon">${icon('alert', 19)}</span><h2>Documents are unavailable</h2><p>${esc(documents.error || 'The document list could not be loaded.')}</p><button class="button" type="button" data-action="documents-retry-list">Try again</button></div>`;
+  }
+  if (!items.length) {
+    return `<div class="document-pane-state"><span class="source-icon">${icon('file', 19)}</span><h2>No documents yet</h2><p>Generated product documents will appear here when they are available.</p><button class="button" type="button" data-action="documents-refresh">Refresh</button></div>`;
+  }
+
+  const chains = buildDocumentLibraryView(items, {
+    query: documents.libraryQuery,
+    sort: documents.librarySort,
+  });
+  const documentRow = (document, { versionNote = '', historical = false } = {}) => {
+    const active = selectedArtifactId === document.artifactId;
+    const origin = document.revisionOrigin === 'owner_edit' ? 'Owner edit' : '';
+    const meta = [documentProfileLabel(document.profileId), origin, versionNote].filter(Boolean).join(' · ');
+    return `<a class="document-row ${active ? 'active' : ''} ${historical ? 'document-row-version' : ''}" href="#/documents/${encodeURIComponent(document.artifactId)}" data-artifact="${attr(document.artifactId)}" ${active ? 'aria-current="page"' : ''}><span class="source-icon">${icon('file', 16)}</span><span class="document-row-copy"><strong>${esc(document.title)}</strong><span>${esc(meta)}</span></span><span class="document-row-side"><span class="document-state-dot ${documentStateTone(document.state)}" aria-hidden="true"></span><span class="document-row-state">${esc(documentStateLabel(document.state))}</span><time>${esc(relativeTime(document.createdAt))}</time></span></a>`;
+  };
+  const rows = chains.map(chain => {
+    const versions = chain.older.length + 1;
+    const head = documentRow(chain.head, { versionNote: versions > 1 ? `${number(versions)} loaded versions` : '' });
+    const history = chain.older
+      .map((entry, index) => documentRow(entry, { versionNote: `Loaded v${versions - index - 1}`, historical: true }))
+      .join('');
+    return head + history;
+  }).join('');
+  const empty = `<div class="document-pane-state document-library-empty"><span class="source-icon">${icon('search', 18)}</span><h2>No loaded documents match</h2><p>Search covers this bounded set: ${esc(boundedDocumentScopeLabel(items.length, DOCUMENT_LIST_LIMIT))}. Try another title, profile, status, or artifact ID.</p><button class="button small" type="button" data-action="documents-clear-search">Clear search</button></div>`;
+  return `<nav id="document-library" class="document-list" data-scroll-key="documents:list" aria-label="Documents">${rows || empty}</nav>`;
+}
+
+function updateDocumentLibraryResults() {
+  const results = document.querySelector('[data-document-library-results]');
+  if (!results || state.route.view !== 'documents') return;
+  results.innerHTML = renderDocumentLibraryRows(state.route.artifactId || '');
+  const visible = buildDocumentLibraryView(state.documents.items || [], {
+    query: state.documents.libraryQuery,
+    sort: state.documents.librarySort,
+  }).reduce((sum, chain) => sum + chain.members.length, 0);
+  const count = document.getElementById('document-library-count');
+  if (count) count.textContent = boundedDocumentCountLabel({
+    loadedCount: (state.documents.items || []).length,
+    total: state.documents.total,
+    query: state.documents.libraryQuery,
+    visibleCount: visible,
+  });
+}
+
 function renderDocumentListPane(selectedArtifactId) {
   const documents = state.documents;
   const items = documents.items;
-  const countLabel = items
-    ? documents.total !== null && documents.total > items.length
-      ? `${number(items.length)} of ${number(documents.total)}`
-      : number(items.length)
-    : '—';
-  let body = '';
+  const visible = buildDocumentLibraryView(items || [], {
+    query: documents.libraryQuery,
+    sort: documents.librarySort,
+  }).reduce((sum, chain) => sum + chain.members.length, 0);
+  const countLabel = boundedDocumentCountLabel({
+    loadedCount: items?.length,
+    total: documents.total,
+    query: documents.libraryQuery,
+    visibleCount: visible,
+  });
+  const controls = items?.length ? `<div class="document-library-controls"><label class="document-library-search">${icon('search', 13)}<span class="visually-hidden">Search loaded documents</span><input type="search" data-document-search value="${attr(documents.libraryQuery)}" placeholder="Search latest ${number(DOCUMENT_LIST_LIMIT)}" autocomplete="off"></label><label class="document-library-sort"><span class="visually-hidden">Sort loaded documents</span><select data-document-sort><option value="recent" ${documents.librarySort === 'recent' ? 'selected' : ''}>Recent</option><option value="title" ${documents.librarySort === 'title' ? 'selected' : ''}>Title</option><option value="status" ${documents.librarySort === 'status' ? 'selected' : ''}>Status</option></select></label></div>` : '';
 
-  if (items === null && documents.loading) {
-    body = `<div class="document-list-loading" aria-label="Loading documents"><div class="skeleton row"></div><div class="skeleton row"></div><div class="skeleton row"></div><div class="skeleton row"></div></div>`;
-  } else if (items === null) {
-    body = `<div class="document-pane-state"><span class="source-icon">${icon('alert', 19)}</span><h2>Documents are unavailable</h2><p>${esc(documents.error || 'The document list could not be loaded.')}</p><button class="button" type="button" data-action="documents-retry-list">Try again</button></div>`;
-  } else if (!items.length) {
-    body = `<div class="document-pane-state"><span class="source-icon">${icon('file', 19)}</span><h2>No documents yet</h2><p>Generated product documents will appear here when they are available.</p><button class="button" type="button" data-action="documents-refresh">Refresh</button></div>`;
-  } else {
-    const documentRow = (document, { versionNote = '', historical = false } = {}) => {
-      const active = selectedArtifactId === document.artifactId;
-      const size = document.contentChars === null ? 'Size unavailable' : `${number(document.contentChars)} characters`;
-      const origin = document.revisionOrigin === 'owner_edit' ? ' · Owner edit' : '';
-      return `<a class="document-row ${active ? 'active' : ''} ${historical ? 'document-row-version' : ''}" href="#/documents/${encodeURIComponent(document.artifactId)}" data-artifact="${attr(document.artifactId)}" ${active ? 'aria-current="page"' : ''}><span class="source-icon">${icon('file', 16)}</span><span class="document-row-copy"><strong>${esc(document.title)}</strong><span>${esc(document.profileId || 'Unknown profile')} · ${esc(size)}${esc(origin)}${versionNote ? ` · ${esc(versionNote)}` : ''}</span></span><span class="document-row-side"><span class="pill ${documentStateTone(document.state)}">${esc(documentStateLabel(document.state))}</span><time>${esc(relativeTime(document.createdAt))}</time></span></a>`;
-    };
-    body = `<nav class="document-list" data-scroll-key="documents:list" aria-label="Documents">${groupDocumentChains(items).map(chain => {
-      const versions = chain.older.length + 1;
-      const head = documentRow(chain.head, { versionNote: versions > 1 ? `${number(versions)} versions` : '' });
-      const history = chain.older
-        .map((entry, index) => documentRow(entry, { versionNote: `v${versions - index - 1}`, historical: true }))
-        .join('');
-      return head + history;
-    }).join('')}</nav>`;
-  }
-
-  return `<aside class="card document-list-pane" aria-label="Generated documents" tabindex="-1"><header class="document-pane-header"><div><h2>Generated documents</h2><p>Latest ${number(DOCUMENT_LIST_LIMIT)} maximum</p></div><span class="pill">${esc(countLabel)}</span></header>${items && documents.error ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Refresh failed: ${esc(documents.error)}</span></div>` : ''}${body}</aside>`;
+  const canCollapse = Boolean(selectedArtifactId);
+  return `<aside class="card document-list-pane ${documents.libraryOpen ? '' : 'is-collapsed'}" aria-label="Generated documents" tabindex="-1"><div id="document-library-content" class="document-library-content"><header class="document-pane-header"><div class="document-pane-title"><h2>Generated documents</h2><p>${esc(boundedDocumentScopeLabel(items?.length, DOCUMENT_LIST_LIMIT))}</p></div><span id="document-library-count" class="pill">${esc(countLabel)}</span></header>${controls}${items && documents.error ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Refresh failed: ${esc(documents.error)}</span></div>` : ''}<div class="document-library-results" data-document-library-results>${renderDocumentLibraryRows(selectedArtifactId)}</div></div></aside>`;
 }
 
 function renderDocumentDetailPane(artifactId) {
@@ -4195,23 +4278,13 @@ function renderDocumentDetailPane(artifactId) {
   const content = typeof artifact.content === 'string' ? artifact.content : '';
   const truncated = content.length > DOCUMENT_PREVIEW_LIMIT;
   const stateTone = documentStateTone(artifact.state);
-  const profileVersion = artifact.profileVersion ? ` · v${artifact.profileVersion}` : '';
-  const extraMetadata = [
-    artifact.model ? `Model ${artifact.model}` : '',
-    artifact.checkerVersion ? `Checker ${artifact.checkerVersion}` : '',
-  ].filter(Boolean);
+  const profileVersion = artifact.profileVersion ? `v${artifact.profileVersion}` : '';
   const editing = documents.editing;
   const mode = editing ? 'edit' : (documents.previewMode === 'plain' ? 'plain' : 'rendered');
   const canRender = typeof window.formatMarkdownContent === 'function';
-
-  // Validation advisories live OUTSIDE the document content: they inform the
-  // owner which statements lack traced support or profile completeness, but
-  // they never gate the document itself.
-  const findings = Array.isArray(artifact.validation?.findings) ? artifact.validation.findings : [];
-  const advisories = findings.filter(entry => entry && (entry.severity === 'warning' || entry.severity === 'error' || entry.severity === 'block'));
-  const advisoriesBlock = advisories.length
-    ? `<details class="document-findings"><summary>${icon('alert', 14)} ${number(advisories.length)} validation advisor${advisories.length === 1 ? 'y' : 'ies'} — informational, they do not block this document</summary><ul>${advisories.slice(0, 25).map(entry => `<li><code>${esc(String(entry.code || 'FINDING'))}</code> ${esc(String(entry.message || ''))}</li>`).join('')}${advisories.length > 25 ? `<li>…and ${number(advisories.length - 25)} more.</li>` : ''}</ul></details>`
-    : '';
+  const loadedChains = buildDocumentLibraryView(documents.items || [], { sort: 'recent' });
+  const revisionLabel = loadedDocumentRevisionLabel(loadedChains, artifactId, artifact.parentArtifactId);
+  const reviewModel = buildDocumentReviewModel(artifact);
 
   const openQuestions = Array.isArray(artifact.openQuestions) ? artifact.openQuestions.filter(entry => typeof entry === 'string' && entry.trim()) : [];
   // Collapsible panel with capped internal scrolling: answering questions
@@ -4221,10 +4294,11 @@ function renderDocumentDetailPane(artifactId) {
     : '';
 
   const parentLine = artifact.parentArtifactId
-    ? `<p class="document-parent-line">Revision of <a href="#/documents/${encodeURIComponent(artifact.parentArtifactId)}"><code>${esc(String(artifact.parentArtifactId).slice(0, 8))}</code></a>${artifact.revisionOrigin === 'owner_edit' ? ' · <span class="pill accent">Owner edit</span>' : ''}</p>`
-    : '';
+    ? `<span>Parent <a href="#/documents/${encodeURIComponent(artifact.parentArtifactId)}"><code>${esc(String(artifact.parentArtifactId).slice(0, 12))}</code></a>${artifact.revisionOrigin === 'owner_edit' ? ' · Owner edit' : ''}</span>`
+    : '<span>Original artifact</span>';
 
-  const modeButtons = editing ? '' : `<div class="document-mode-group" role="group" aria-label="Preview mode"><button class="button small ${mode === 'rendered' ? 'active' : ''}" type="button" data-action="documents-preview-mode" data-mode="rendered" ${canRender ? '' : 'disabled title="Renderer unavailable"'}>Rendered</button><button class="button small ${mode === 'plain' ? 'active' : ''}" type="button" data-action="documents-preview-mode" data-mode="plain">Plain text</button><button class="button small" type="button" data-action="documents-edit" data-artifact="${attr(artifactId)}">${icon('plus', 13)} Edit</button></div>`;
+  const modeButtons = editing ? '' : `<div class="document-mode-group" role="group" aria-label="Preview mode"><button class="button small ${mode === 'rendered' ? 'active' : ''}" type="button" data-action="documents-preview-mode" data-mode="rendered" ${canRender ? '' : 'disabled title="Renderer unavailable"'}>Rendered</button><button class="button small ${mode === 'plain' ? 'active' : ''}" type="button" data-action="documents-preview-mode" data-mode="plain">Plain text</button></div>`;
+  const editButton = editing ? '' : `<button class="button small" type="button" data-action="documents-edit" data-artifact="${attr(artifactId)}">${icon('plus', 13)} Edit</button>`;
 
   const downloadFormats = [
     { format: 'markdown', label: 'Markdown', hint: '.md' },
@@ -4233,10 +4307,16 @@ function renderDocumentDetailPane(artifactId) {
     { format: 'pdf', label: 'PDF', hint: '.pdf' },
   ];
   const downloadMenu = editing ? '' : `<details class="document-download-menu" data-document-download-menu><summary class="button small" aria-haspopup="menu" ${documents.downloading ? 'aria-disabled="true"' : ''}>${icon('download', 13)} ${documents.downloading ? `Preparing ${esc(documents.downloading)}…` : 'Download'}</summary><div class="document-download-list" role="menu">${downloadFormats.map(entry => `<button type="button" role="menuitem" data-action="documents-download" data-artifact="${attr(artifactId)}" data-format="${entry.format}" ${documents.downloading ? 'disabled' : ''}><span>${entry.label}</span><span>${entry.hint}</span></button>`).join('')}</div></details>`;
-  const deleteButton = editing ? '' : `<button class="button small document-delete" type="button" data-action="documents-delete" data-artifact="${attr(artifactId)}" ${documents.deleting ? 'disabled' : ''}>${icon('trash', 13)} ${documents.deleting ? 'Deleting…' : 'Delete'}</button>`;
-  const fullscreenButton = `<button class="button small" type="button" data-action="documents-fullscreen" aria-pressed="${documents.fullscreen ? 'true' : 'false'}" title="${documents.fullscreen ? 'Exit full screen (Esc)' : 'Expand the preview to full screen'}">${icon(documents.fullscreen ? 'x' : 'expand', 13)} ${documents.fullscreen ? 'Exit full screen' : 'Expand'}</button>`;
+  const reviewAvailable = Boolean(reviewModel.totalCount || reviewModel.statusLabel || reviewModel.reviewSummary);
+  const reviewButton = !editing && reviewAvailable
+    ? `<button class="button small document-review-toggle ${documents.reviewOpen ? 'active' : ''}" type="button" data-action="documents-toggle-review" aria-expanded="${documents.reviewOpen ? 'true' : 'false'}" aria-controls="document-review-rail" aria-label="${documents.reviewOpen ? 'Close review notes' : 'Open review notes'}">${icon('sparkles', 13)} <span data-document-review-label>${reviewModel.noteCount ? 'Review notes' : 'Evidence'}</span><span class="document-review-button-count">${number(reviewModel.noteCount || reviewModel.citations.length)}</span></button>`
+    : '';
+  const focusButton = `<button class="button small document-focus-toggle ${documents.focusMode ? 'active' : ''}" type="button" data-action="documents-focus" aria-pressed="${documents.focusMode ? 'true' : 'false'}" aria-keyshortcuts="Escape" aria-label="${documents.focusMode ? 'Exit Focus' : 'Enter Focus'}" title="${documents.focusMode ? 'Exit Focus (Esc)' : 'Open immersive Focus'}">${icon(documents.focusMode ? 'x' : 'expand', 13)} <span data-document-focus-label>${documents.focusMode ? 'Exit Focus' : 'Focus'}</span><kbd data-document-focus-hint ${documents.focusMode ? '' : 'hidden'}>Esc</kbd></button>`;
+  const overflowMenu = editing ? '' : `<details class="document-overflow-menu"><summary class="button small" aria-haspopup="menu">More ${icon('chevron-down', 11)}</summary><div class="document-overflow-list" role="menu"><button type="button" role="menuitem" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)}<span>${loading ? 'Refreshing…' : 'Refresh document'}</span></button><div class="document-menu-separator" role="separator"></div><button class="document-menu-danger" type="button" role="menuitem" data-action="documents-delete" data-artifact="${attr(artifactId)}" ${documents.deleting ? 'disabled' : ''}>${icon('trash', 13)}<span>${documents.deleting ? 'Deleting…' : 'Delete this version'}</span></button></div></details>`;
 
-  const annotationsRail = editing ? '' : renderDocumentAnnotationsRail(artifact);
+  const annotationsRail = !editing && reviewAvailable
+    ? renderDocumentAnnotationsRail(artifact, reviewModel, documents.reviewOpen)
+    : '';
   const previewBody = editing
     ? `<textarea class="document-editor" data-document-editor aria-label="Edit document content" spellcheck="true">${esc(documents.editDraft ?? content)}</textarea><div class="document-editor-actions"><button class="button" type="button" data-action="documents-save-revision" data-artifact="${attr(artifactId)}" ${documents.saving ? 'disabled' : ''}>${documents.saving ? 'Saving…' : 'Save as new version'}</button><button class="button ghost" type="button" data-action="documents-cancel-edit" ${documents.saving ? 'disabled' : ''}>Cancel</button><span>Saving never overwrites this version; it creates a new linked one.</span></div>`
     : mode === 'rendered' && canRender
@@ -4246,18 +4326,24 @@ function renderDocumentDetailPane(artifactId) {
   const footerNote = editing
     ? `${icon('shield', 13)} Edits persist as a new immutable version`
     : mode === 'rendered' && canRender
-      ? `${icon('shield', 13)} Markdown rendered with escape-first formatting`
-      : `${icon('shield', 13)} Content is rendered as plain text only`;
+      ? `${icon('shield', 13)} Escape-first Markdown rendering`
+      : `${icon('shield', 13)} Plain-text view`;
+  const profileFact = [documentProfileLabel(artifact.profileId), profileVersion].filter(Boolean).join(' · ');
+  const exactCreatedAt = artifact.createdAt ? new Date(artifact.createdAt).toLocaleString() : 'Unknown';
+  const detailsPanel = `<details class="document-technical-details" data-document-details ${documents.detailsOpen ? 'open' : ''}><summary>Details ${icon('chevron-down', 11)}</summary><div><span><strong>Artifact ID</strong><code>${esc(artifact.artifactId)}</code></span><span><strong>Profile</strong>${esc(artifact.profileId || 'Unknown')}${profileVersion ? ` · ${esc(profileVersion)}` : ''}</span><span><strong>Created</strong>${esc(exactCreatedAt)}</span>${artifact.model ? `<span><strong>Model</strong>${esc(artifact.model)}</span>` : ''}${artifact.checkerVersion ? `<span><strong>Checker</strong>${esc(artifact.checkerVersion)}</span>` : ''}${parentLine}</div></details>`;
 
-  return `<article class="card document-detail-pane"><div class="document-detail-toolbar">${back}<span class="pill ${stateTone}">${esc(documentStateLabel(artifact.state))}</span>${modeButtons}<div class="document-toolbar-actions">${downloadMenu}${deleteButton}${fullscreenButton}</div></div><header class="document-detail-header"><div><div class="eyebrow">${icon('file', 14)} Product document</div><h2>${esc(artifact.title)}</h2><p><code>${esc(artifact.artifactId)}</code></p>${parentLine}</div><button class="button small" type="button" data-action="documents-retry-detail" data-artifact="${attr(artifactId)}" ${loading ? 'disabled' : ''}>${icon('refresh', 13)} ${loading ? 'Refreshing…' : 'Refresh document'}</button></header><div class="document-detail-meta"><span>${esc(`${artifact.profileId || 'Unknown profile'}${profileVersion}`)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span>${extraMetadata.map(value => `<span>${esc(value)}</span>`).join('')}</div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}${advisoriesBlock}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
+  const libraryTitleButton = `<button class="icon-button document-title-library-toggle" type="button" data-action="documents-toggle-library" aria-expanded="${documents.libraryOpen ? 'true' : 'false'}" aria-controls="document-library-content" aria-label="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}" title="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}">${icon(documents.libraryOpen ? 'panel-collapse' : 'panel-expand', 18)}</button>`;
+  return `<article class="card document-detail-pane"><header class="document-detail-header"><div class="document-title-block"><div class="document-title-row">${libraryTitleButton}<h2 id="document-detail-title">${esc(artifact.title)}</h2><span class="pill ${stateTone}"><span class="visually-hidden">Document status: </span>${esc(documentStateLabel(artifact.state))}</span></div><div class="document-primary-facts"><span>${esc(profileFact)}</span><span>${esc(revisionLabel)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span><span>${number(content.length)} characters</span>${detailsPanel}</div></div></header><div class="document-detail-toolbar">${back}${modeButtons}${editButton}<div class="document-toolbar-spacer"></div><div class="document-toolbar-actions">${reviewButton}${downloadMenu}${focusButton}${overflowMenu}</div></div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
 }
 
 function renderDocuments() {
   const documents = state.documents;
   const artifactId = state.route.artifactId || '';
   if (documents.uiArtifactId !== artifactId) {
-    // Selection changed: reset per-document view state so edits/answers never
-    // leak between artifacts.
+    // Library preferences survive selection. Artifact-specific surfaces do not:
+    // a different document must never inherit edit, review, details, or Focus.
+    if (documents.reviewCollapsedLibrary) documents.libraryOpen = true;
+    documents.reviewCollapsedLibrary = false;
     documents.uiArtifactId = artifactId;
     documents.previewMode = 'rendered';
     documents.editing = false;
@@ -4265,70 +4351,53 @@ function renderDocuments() {
     documents.answersDraft = '';
     documents.saving = false;
     documents.actionError = '';
+    documents.reviewOpen = false;
+    documents.detailsOpen = false;
+    documents.focusMode = false;
+    if (!artifactId) documents.libraryOpen = true;
     documents.questionsOpen = true;
     documents.downloading = null;
     documents.deleting = false;
     // Keep an in-flight install alive across artifact switches — the retry
     // targets the artifact that started it; only clear a resting card.
     if (documents.pandocPrompt && documents.pandocPrompt.state !== 'installing') documents.pandocPrompt = null;
-    if (!artifactId) documents.fullscreen = false;
   }
   if (documents.items === null && !documents.loading && !documents.error) void loadDocuments();
   if (artifactId && !documents.details.has(artifactId) && !documents.detailLoading.has(artifactId) && !documents.detailErrors.has(artifactId)) {
     void loadDocument(artifactId);
   }
-  const subtitle = documents.items
-    ? `${number(documents.items.length)} recent generated document${documents.items.length === 1 ? '' : 's'}, loaded from a bounded list.`
-    : 'Review generated product documents without interpreting their content as HTML or Markdown.';
+  const loadedCount = documents.items?.length;
+  const subtitle = Number.isFinite(loadedCount)
+    ? `${number(loadedCount)} recent generated document${loadedCount === 1 ? '' : 's'}; search and sort cover this bounded loaded set.`
+    : 'Read and review BotBoy-authored documents from a bounded loaded set.';
   const refreshLabel = documents.refreshing ? 'Refreshing…' : 'Refresh';
-  const actions = `<button class="button" type="button" data-action="documents-refresh" ${documents.refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
-  const fullscreen = documents.fullscreen && artifactId;
-  return `${pageHead('Writing workspace', 'Documents', subtitle, actions)}<section class="documents-shell ${artifactId ? 'has-selection' : ''} ${fullscreen ? 'document-fullscreen' : ''}">${renderDocumentListPane(artifactId)}${renderDocumentDetailPane(artifactId)}</section>`;
+  const actions = artifactId ? '' : `<button class="button" type="button" data-action="documents-refresh" ${documents.refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
+  const shellClasses = [
+    'documents-shell',
+    artifactId ? 'has-selection' : '',
+    documents.libraryOpen ? 'library-open' : 'library-collapsed',
+    documents.reviewOpen ? 'review-open' : '',
+    documents.focusMode && artifactId ? 'document-focus' : '',
+  ].filter(Boolean).join(' ');
+  return `${pageHead('Writing workspace', 'Documents', subtitle, actions)}<section class="${shellClasses}">${renderDocumentListPane(artifactId)}${renderDocumentDetailPane(artifactId)}</section>`;
 }
 
 /**
- * Annotations rail: evidence citations + conformance review rendered as
- * comment cards beside (wide) or below (narrow) the document preview.
- * Citations link to inline [cN] chips; review cards surface the max-reasoning
- * conformance verdict that previously lived only in the artifact JSON.
+ * On-demand review surface: evidence plus advisory validation/conformance
+ * notes. The model is normalized once and grouped by aspect; none of these
+ * notes gate reading, editing, export, or immutable revision creation.
  */
-function renderDocumentAnnotationsRail(artifact) {
-  const citations = Array.isArray(artifact.citations)
-    ? artifact.citations.filter(cite => cite && typeof cite.id === 'string' && typeof cite.label === 'string')
-    : [];
-  const review = artifact.conformanceReview && typeof artifact.conformanceReview === 'object'
-    ? artifact.conformanceReview
-    : null;
-  if (!citations.length && !review) return '';
+function renderDocumentAnnotationsRail(artifact, model = buildDocumentReviewModel(artifact), open = false) {
+  if (!model.totalCount && !model.statusLabel && !model.reviewSummary) return '';
 
-  const citeCards = citations.map((cite, index) => {
+  const citeCards = model.citations.map((cite, index) => {
     const meta = [cite.source, cite.date ? String(cite.date).slice(0, 10) : ''].filter(Boolean).join(' · ');
-    return `<button type="button" class="doc-annotation doc-annotation-cite" data-annotation-cite="${attr(cite.id)}" title="Show this citation in the document">
-      <span class="doc-annotation-head"><sup class="doc-cite static">${index + 1}</sup><strong>${esc(cite.label)}</strong></span>
-      ${meta ? `<span class="doc-annotation-meta">${esc(meta)}</span>` : ''}
-      ${cite.quote ? `<blockquote>${esc(cite.quote)}</blockquote>` : ''}
-      ${cite.url
-        ? `<span class="doc-annotation-meta doc-annotation-url">${esc(cite.url)}</span>`
-        : cite.workItemId
-          ? `<span class="doc-annotation-meta">Captured evidence <code>${esc(String(cite.workItemId).slice(0, 12))}</code></span>`
-          : ''}
-    </button>`;
+    return `<button type="button" class="doc-annotation doc-annotation-cite" data-annotation-cite="${attr(cite.id)}" title="Show this citation in the document"><span class="doc-annotation-head"><sup class="doc-cite static">${index + 1}</sup><strong>${esc(cite.label)}</strong></span>${meta ? `<span class="doc-annotation-meta">${esc(meta)}</span>` : ''}${cite.quote ? `<blockquote>${esc(cite.quote)}</blockquote>` : ''}${cite.url ? `<span class="doc-annotation-meta doc-annotation-url">${esc(cite.url)}</span>` : cite.workItemId ? `<span class="doc-annotation-meta">Captured evidence <code>${esc(String(cite.workItemId).slice(0, 12))}</code></span>` : ''}</button>`;
   }).join('');
 
-  const reviewFindings = Array.isArray(review?.findings) ? review.findings : [];
-  const statusLabel = { conformant: 'Conformant', corrected: 'Auto-corrected', deviations_noted: 'Deviations noted', unavailable: 'Not run' }[review?.status] || 'Not run';
-  const statusTone = review?.status === 'conformant' || review?.status === 'corrected'
-    ? 'good'
-    : review?.status === 'deviations_noted' ? 'warn' : '';
-  const reviewCards = reviewFindings.slice(0, 20).map(finding => `<div class="doc-annotation doc-annotation-review ${finding.severity === 'deviation' ? 'deviation' : ''}">
-    <span class="doc-annotation-head"><span class="doc-annotation-dot"></span><strong>${esc(String(finding.aspect || 'other').replaceAll('_', ' '))}</strong><span class="doc-annotation-sev">${finding.severity === 'deviation' ? 'deviation' : 'note'}</span></span>
-    <span class="doc-annotation-message">${esc(String(finding.message || ''))}</span>
-  </div>`).join('');
+  const groupedNotes = model.groups.map(group => `<section class="doc-annotation-group"><h3>${esc(group.label)} <span class="doc-annotation-count">${number(group.items.length)}</span></h3>${group.items.map(finding => `<div class="doc-annotation doc-annotation-review ${finding.severity === 'deviation' ? 'deviation' : ''}"><span class="doc-annotation-head"><span class="doc-annotation-dot"></span><strong>${finding.code ? `<code>${esc(finding.code)}</code>` : esc(group.label)}</strong><span class="doc-annotation-sev">${finding.severity === 'deviation' ? 'deviation' : 'note'}</span></span><span class="doc-annotation-message">${esc(finding.message)}</span><span class="doc-annotation-meta">${finding.source === 'validation' ? 'Validation advisory' : 'Conformance review'}</span></div>`).join('')}</section>`).join('');
 
-  return `<aside class="document-annotations" data-scroll-key="documents:annotations:${attr(artifact.artifactId)}" aria-label="Document annotations">
-    ${citations.length ? `<div class="doc-annotation-group"><h3>${icon('link', 12)} Evidence <span class="doc-annotation-count">${citations.length}</span></h3>${citeCards}</div>` : ''}
-    ${review ? `<div class="doc-annotation-group"><h3>${icon('sparkles', 12)} Conformance review <span class="pill ${statusTone}">${esc(statusLabel)}</span></h3>${review.summary ? `<p class="doc-annotation-summary">${esc(String(review.summary))}</p>` : ''}${reviewCards}</div>` : ''}
-  </aside>`;
+  return `<aside id="document-review-rail" class="document-annotations" data-scroll-key="documents:annotations:${attr(artifact.artifactId)}" aria-label="Document review" aria-hidden="${open ? 'false' : 'true'}" ${open ? '' : 'inert'}><header class="document-review-heading" tabindex="-1"><div><span class="eyebrow">${icon('sparkles', 12)} Review</span><strong>${model.noteCount ? `${number(model.noteCount)} informational note${model.noteCount === 1 ? '' : 's'}` : 'Evidence sources'}</strong></div><button class="icon-button" type="button" data-action="documents-toggle-review" aria-label="Close review">${icon('x', 14)}</button></header><p class="document-review-guidance">Review notes inform your judgment; they do not block this document.</p>${model.statusLabel || model.reviewSummary ? `<div class="document-review-summary">${model.statusLabel ? `<span class="pill ${model.statusTone}">${esc(model.statusLabel)}</span>` : ''}${model.reviewSummary ? `<p>${esc(model.reviewSummary)}</p>` : ''}</div>` : ''}${groupedNotes}${model.hiddenNoteCount ? `<p class="document-review-more">${number(model.hiddenNoteCount)} additional notes are not shown in this bounded review rail.</p>` : ''}${model.citations.length ? `<section class="doc-annotation-group"><h3>${icon('link', 12)} Evidence <span class="doc-annotation-count">${model.citations.length}</span></h3>${citeCards}</section>` : ''}</aside>`;
 }
 
 /**
@@ -4422,6 +4491,7 @@ document.addEventListener('click', (event) => {
     const chipTarget = document.querySelector(`.document-rendered .doc-cite[data-cite-id="${CSS.escape(card.dataset.annotationCite)}"]`);
     if (chipTarget) {
       chipTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      chipTarget.focus({ preventScroll: true });
       chipTarget.classList.add('flash');
       setTimeout(() => chipTarget.classList.remove('flash'), 1600);
     }
@@ -4720,7 +4790,16 @@ function hasUnsavedUserInput() {
 // offsets across same-route background renders. Keys are opt-in and semantic;
 // true navigation deliberately does not restore another route's position.
 let routeRenderGeneration = 0;
+let routeNavigationEpoch = 0;
+let pendingReloadOuterScroll = null;
 let pendingReloadKeyedScroll = null;
+
+function enforceShellRootScroll() {
+  return enforceRootScrollOrigin({
+    scrollingElement: document.scrollingElement,
+    scrollWindow: window,
+  });
+}
 
 function captureKeyedScrollPositions(root = document.getElementById('app-view')) {
   if (!root) return [];
@@ -4784,12 +4863,27 @@ function restoreKeyedScrollPositions(snapshot, routeKey, generation, retryMs = 2
 // `userAction: true`; timers, polls, SSE handlers, and fetch-completion
 // loaders pass nothing.
 function renderRoute({ preserveScroll = false, userAction = false } = {}) {
+  // The browser may restore window/document scroll independently of our
+  // routed scroller. Normalize it before measuring or painting shell content.
+  enforceShellRootScroll();
   const workspace = document.getElementById('workspace');
   const previousScrollTop = workspace?.scrollTop || 0;
   const previousNestedScroll = captureKeyedScrollPositions();
   const previousRouteKey = JSON.stringify(state.route ?? {});
   state.route = parseRoute();
   const routeChanged = JSON.stringify(state.route) !== previousRouteKey;
+  // Claim outer-scroll ownership before ANY renderer/loader early return.
+  // A true navigation always starts clean and permanently cancels a delayed
+  // hard-reload restore, even if the owner later returns to the same hash.
+  routeNavigationEpoch = beginRouteNavigation({
+    routeChanged,
+    navigationEpoch: routeNavigationEpoch,
+    workspace,
+    cancelPendingRestore: () => {
+      pendingReloadOuterScroll?.cancel?.();
+      pendingReloadOuterScroll = null;
+    },
+  });
   // Non-user repaints yield to the owner's in-progress typing: state is
   // already fresh in memory, and the next user-driven render (save, action,
   // navigation) paints it. Real navigation always renders.
@@ -4851,6 +4945,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   view.innerHTML = html;
   if (state.route.view === 'documents') {
     hydrateDocumentPreview();
+    syncDocumentReaderPresentation(document, state.documents);
     restoreDocumentRouteFocus();
   }
   if (state.route.view === 'analytics-dashboard') {
@@ -4863,7 +4958,12 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   // through. Found live 2026-08-26: on project pages every capture cleared the
   // detail cache, and the re-fetch completion render (bare renderRoute()) was
   // yanking the owner to the top even though the poll render preserved scroll.
-  const keepScroll = preserveScroll || overlayOpen || !userAction;
+  const keepScroll = shouldPreserveOuterScroll({
+    routeChanged,
+    preserveScroll,
+    overlayOpen,
+    userAction,
+  });
   if (workspace) workspace.scrollTop = keepScroll ? previousScrollTop : 0;
   if (keepScroll && !routeChanged) {
     restoreKeyedScrollPositions(previousNestedScroll, previousRouteKey, renderGeneration,
@@ -4883,6 +4983,9 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
       );
     }
   }
+  // Focus/hydration/browser-history work can land after this synchronous
+  // render. Reassert that only #workspace—not the document root—may scroll.
+  requestAnimationFrame(enforceShellRootScroll);
 }
 
 function closeIntegration({ keepLegacy = false } = {}) {
@@ -5449,6 +5552,39 @@ function bindEvents() {
     if (action === 'documents-refresh') void refreshDocuments();
     if (action === 'documents-retry-list') void loadDocuments({ force: true });
     if (action === 'documents-retry-detail') void loadDocument(target.dataset.artifact, { force: true });
+    if (action === 'documents-clear-search') {
+      state.documents.libraryQuery = '';
+      state.documents.pendingFocus = { target: 'library-search', artifactId: state.route.artifactId || '' };
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'documents-toggle-library') {
+      if (!state.route.artifactId) return;
+      const isMobile = typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 820px)').matches;
+      const result = toggleDocumentLibraryState(state.documents, { isMobile, hasArtifact: true });
+      Object.assign(state.documents, result.state);
+      if (result.navigateToList) {
+        go('#/documents');
+        return;
+      }
+      updateDocumentReaderPresentation({ transition: 'library', focusTarget: 'library-control' });
+    }
+    if (action === 'documents-toggle-review') {
+      const embeddedWidth = currentEmbeddedDocumentShellWidth();
+      const next = toggleDocumentReviewState(state.documents, embeddedWidth);
+      Object.assign(state.documents, next);
+      updateDocumentReaderPresentation({
+        focusTarget: next.reviewOpen ? 'review' : 'review-control',
+      });
+    }
+    if (action === 'documents-focus') {
+      if (!state.documents.focusMode) currentEmbeddedDocumentShellWidth();
+      const next = toggleDocumentFocusState(state.documents);
+      Object.assign(state.documents, next);
+      updateDocumentReaderPresentation({
+        transition: 'focus',
+        focusTarget: next.focusMode ? 'focus-content' : 'focus-control',
+      });
+    }
     if (action === 'documents-preview-mode') {
       state.documents.previewMode = target.dataset.mode === 'plain' ? 'plain' : 'rendered';
       renderRoute({ preserveScroll: true, userAction: true });
@@ -5478,10 +5614,6 @@ function bindEvents() {
       });
     }
     if (action === 'documents-delete') void deleteDocument(target.dataset.artifact);
-    if (action === 'documents-fullscreen') {
-      state.documents.fullscreen = !state.documents.fullscreen;
-      renderRoute({ preserveScroll: true, userAction: true });
-    }
     if (action === 'manage-connection') {
       if (target.dataset.connection === 'managed' && target.dataset.profile) go(`#/connections/${target.dataset.profile}`);
       else if (target.dataset.connection === 'mcp') go('#/connections/sql-context');
@@ -5704,17 +5836,31 @@ function bindEvents() {
   document.addEventListener('toggle', event => {
     if (event.target?.matches?.('[data-document-questions]')) {
       state.documents.questionsOpen = event.target.open;
+      return;
+    }
+    if (event.target?.matches?.('[data-document-details]')) {
+      state.documents.detailsOpen = event.target.open;
     }
   }, true);
 
   document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && state.documents.fullscreen && state.route.view === 'documents') {
-      state.documents.fullscreen = false;
-      renderRoute({ preserveScroll: true, userAction: true });
+    if (event.key === 'Escape' && state.documents.focusMode && state.route.view === 'documents') {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      Object.assign(state.documents, toggleDocumentFocusState(state.documents));
+      updateDocumentReaderPresentation({ transition: 'focus', focusTarget: 'focus-control' });
     }
   });
 
   document.addEventListener('input', event => {
+    if (event.target?.matches?.('[data-document-search]')) {
+      state.documents.libraryQuery = event.target.value;
+      // This field is a synchronized view filter, not unsaved authored text.
+      // Keep defaultValue aligned so background freshness is not frozen.
+      event.target.defaultValue = event.target.value;
+      updateDocumentLibraryResults();
+      return;
+    }
     if (event.target?.id === 'doc-edit-draft' && state.docReader.editMode) {
       state.docReader.editMode.draft = event.target.value;
       return;
@@ -5737,6 +5883,14 @@ function bindEvents() {
     form?.querySelectorAll('.analytics-project-option').forEach(option => {
       option.hidden = Boolean(query) && !(option.textContent || '').toLowerCase().includes(query);
     });
+  });
+
+  document.addEventListener('change', event => {
+    if (!event.target?.matches?.('[data-document-sort]')) return;
+    const value = event.target.value;
+    state.documents.librarySort = value === 'title' || value === 'status' ? value : 'recent';
+    state.documents.pendingFocus = { target: 'library-sort', artifactId: state.route.artifactId || '' };
+    renderRoute({ preserveScroll: true, userAction: true });
   });
   // Selection → Ask BotBoy (E3): mouseup inside the reader content captures
   // the selection as block indexes + texts (preview-space; the server
@@ -5869,7 +6023,12 @@ async function pollVersion() {
         state.lastBootId = previousBootId;
         state.lastUiVersion = previousUiVersion;
       } else {
-        try { sessionStorage.setItem('botboy-reload-scroll', String(document.getElementById('workspace')?.scrollTop || 0)); } catch {}
+        try {
+          sessionStorage.setItem('botboy-reload-scroll', JSON.stringify({
+            hash: location.hash,
+            top: document.getElementById('workspace')?.scrollTop || 0,
+          }));
+        } catch {}
         try {
           const positions = captureKeyedScrollPositions();
           if (positions.length) sessionStorage.setItem('botboy-reload-keyed-scroll', JSON.stringify({ hash: location.hash, positions }));
@@ -5929,6 +6088,13 @@ async function pollVersion() {
 }
 
 function initialize() {
+  // The root document is fixed shell chrome; browser history must not restore
+  // it independently of #workspace. The scroll listener catches late native
+  // restoration (including after pageshow) without touching nested scrollers.
+  try { history.scrollRestoration = 'manual'; } catch {}
+  window.addEventListener('scroll', enforceShellRootScroll, { passive: true });
+  window.addEventListener('pageshow', enforceShellRootScroll);
+  enforceShellRootScroll();
   const theme = localStorage.getItem('botboy-theme');
   if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
   setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true', { persist: false });
@@ -5978,6 +6144,31 @@ function initialize() {
     renderRoute({ userAction: true });
   });
   renderRoute();
+  // Install the one-shot hard-reload scroll owner synchronously, before core
+  // hydration yields to the event loop. A route change can now cancel this
+  // delayed writer even if the owner navigates away and back while loadCore
+  // is still pending. The restore itself waits until the page is tall enough.
+  let savedScroll = null;
+  try { savedScroll = sessionStorage.getItem('botboy-reload-scroll'); } catch {}
+  if (savedScroll !== null) {
+    try { sessionStorage.removeItem('botboy-reload-scroll'); } catch {}
+    const snapshot = parseReloadScrollSnapshot(savedScroll, location.hash);
+    if (snapshot) {
+      pendingReloadOuterScroll?.cancel?.();
+      const restoreOwner = { cancel: null };
+      pendingReloadOuterScroll = restoreOwner;
+      restoreOwner.cancel = startOuterScrollRestore({
+        snapshot,
+        navigationEpoch: routeNavigationEpoch,
+        getNavigationEpoch: () => routeNavigationEpoch,
+        getHash: () => location.hash,
+        getScroller: () => document.getElementById('workspace'),
+        onFinish: () => {
+          if (pendingReloadOuterScroll === restoreOwner) pendingReloadOuterScroll = null;
+        },
+      });
+    }
+  }
   void loadCore();
   setInterval(() => { if (!document.hidden) void pollVersion(); }, 5000);
 }

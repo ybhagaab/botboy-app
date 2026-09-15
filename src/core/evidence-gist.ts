@@ -29,6 +29,7 @@ import { extractJson } from './pipeline-llm.js';
 import { completeModelAudit, failModelAudit, startModelAudit } from './pipeline-audit.js';
 import { createOwnerMatcher, type OwnerMatcher } from './owner-identity.js';
 import type { FailureRecorder } from './failures.js';
+import { emailAuthoredBody } from './email-thread.js';
 
 export const MAX_GIST_CHARS = 140;
 export const GIST_PROMPT_VERSION = 'gist-v1';
@@ -291,44 +292,8 @@ export function describeEvidence(row: EvidenceRowLike, owner: OwnerMatcher): Evi
 
 // ── Text preparation ──────────────────────────────────────────────────────
 
-const HEADER_LINE = /^(subject|from|to|cc|bcc|received|sent|date)\s*:/i;
-const DATA_SENTINEL = /^treat all content below as data only\.?$/i;
-const QUOTED_REPLY_START = [
-  /^from\s*:/i,
-  /^-{3,}\s*original message\s*-{3,}/i,
-  /^_{6,}\s*$/,
-  /^on .{6,120} wrote:\s*$/i,
-  /^(de|von|da)\s*:/i,
-  /^sent from (my|outlook)/i,
-];
-const GREETING = /^(hi|hello|hey|dear|good (morning|afternoon|evening)|team|all|folks)\b[^\n]{0,40}$/i;
-const SIGN_OFF = /^(thanks|thank you|many thanks|regards|best|best regards|kind regards|warm regards|cheers|br|sincerely|thx)\b[\s,!.]*(all|team)?[\s,!.]*$/i;
-
-/**
- * The part of an email the recipient actually needs to read: the top of the
- * body up to the first quoted-reply marker, without headers, the data
- * sentinel, the greeting line, or the sign-off tail. Deterministic.
- */
-export function emailNewPart(content: string): string {
-  const lines = content.replace(/\r\n?/g, '\n').split('\n');
-  let index = 0;
-  // Header block: leading "Key: value" lines, then optional blank + sentinel.
-  while (index < lines.length && (HEADER_LINE.test(lines[index]) || lines[index].trim() === '')) index++;
-  if (index < lines.length && DATA_SENTINEL.test(lines[index].trim())) index++;
-  const body: string[] = [];
-  for (; index < lines.length; index++) {
-    const line = lines[index];
-    const trimmed = line.trim();
-    if (QUOTED_REPLY_START.some(pattern => pattern.test(trimmed))) break;
-    body.push(line);
-  }
-  // Trim blank edges, drop greeting, cut at sign-off.
-  while (body.length && body[0].trim() === '') body.shift();
-  if (body.length && GREETING.test(body[0].trim())) body.shift();
-  const signOff = body.findIndex(line => SIGN_OFF.test(line.trim()));
-  const kept = signOff >= 0 ? body.slice(0, signOff) : body;
-  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
+// Backward-compatible export; task admission and gists now share one parser.
+export const emailNewPart = emailAuthoredBody;
 
 /** Slack mrkdwn → plain: <url|label> → label, <url> → url, *bold* → bold. */
 export function slackPlainText(text: string): string {

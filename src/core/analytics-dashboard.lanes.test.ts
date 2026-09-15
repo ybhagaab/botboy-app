@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './analytics-dashboard.js';
-import { selectDashboardLane, classifyWidgetFailure } from './analytics-runners.js';
+import { selectDashboardLane, classifyWidgetFailure, isSafeRuntimeQueueChurn } from './analytics-runners.js';
 import type { AnalyticsDashboardService } from './analytics-types.js';
 import type { McpManager, McpServerSnapshot } from './mcp-types.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
@@ -112,6 +112,45 @@ describe('analytics dashboard lanes (A4)', () => {
     expect(selectDashboardLane([sqlDown, etlUnconfigured])).toBe('sql-mcp'); // no lane to switch to
     expect(selectDashboardLane([etlOk])).toBe('etl');                        // no sql server at all
     expect(selectDashboardLane([])).toBe('sql-mcp');
+  });
+
+  it('recognizes only pre-execution runtime churn as safe for same-lane retry', () => {
+    expect(isSafeRuntimeQueueChurn("MCP server 'a2-analytics' runtime changed before the queued call could start")).toBe(true);
+    expect(isSafeRuntimeQueueChurn("MCP server 'a2-analytics' runtime changed before the call could be queued")).toBe(true);
+    expect(isSafeRuntimeQueueChurn('MCP error -32000: Connection closed')).toBe(false);
+    expect(isSafeRuntimeQueueChurn('MCP error -32001: Request timed out')).toBe(false);
+  });
+
+  it('retries pre-execution MCP runtime churn once on the same ETL lane', async () => {
+    let calls = 0;
+    const runner: QueryRunner = {
+      id: 'etl-adhoc',
+      runQuery: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { ok: false, error: "MCP server 'a2-analytics' runtime changed before the queued call could start" };
+        }
+        return { ok: true, runId: '9002', columns: ['value'], rows: [['42']], rowCount: 1 };
+      },
+    };
+    const service = makeService(
+      [server('sql-context', { state: 'stopped' }), server('a2-analytics')],
+      runner,
+    );
+    const dashboard = service.createDashboard({
+      title: 'Runtime churn recovery',
+      widgets: [{ kind: 'metric', title: 'M', sql: 'SELECT 7' }],
+    } as any);
+    service.enqueueRefresh(dashboard.id, 'manual');
+    expect(await service.processQueuedRuns(1)).toBe(1);
+
+    expect(calls).toBe(2);
+    const [widget] = widgetResults(dashboard.id);
+    expect(widget.lastError).toBeNull();
+    expect(widget.result.lane).toBe('etl');
+    const run = db().prepare('SELECT status, widgets_succeeded FROM analytics_runs LIMIT 1').get() as any;
+    expect(run.status).toBe('completed');
+    expect(run.widgets_succeeded).toBe(1);
   });
 
   it('sql-context running: the ETL runner is never consulted and results carry the sql-mcp lane', async () => {

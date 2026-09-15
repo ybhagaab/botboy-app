@@ -13,7 +13,7 @@ import { randomUUID } from 'crypto';
 import type Database from 'better-sqlite3';
 import type { Batcher, WaveItem } from './batcher.js';
 import type { ContentStore, ContentRowColumns } from './content-store.js';
-import type { BrainStore } from './brain-store.js';
+import type { BrainStore, ProjectRow } from './brain-store.js';
 import { newBrain, projectScopeAnchor } from './brain-store.js';
 import type { FailureRecorder } from './failures.js';
 import type { PipelineLlm } from './pipeline-llm.js';
@@ -30,10 +30,25 @@ import {
   startModelAudit,
 } from './pipeline-audit.js';
 import {
+  evaluateProjectEvidenceScope,
   evidenceAnchorsMultipleIndependentScopes,
   isSourceContainerProjectTitle,
   projectTitleHasExclusiveEvidenceAnchor,
 } from './project-scope.js';
+import {
+  isSlackTimestamp,
+  parseSlackThreadIdentity,
+  WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX,
+  type SlackThreadIdentity,
+} from './slack-thread.js';
+import {
+  isDirectIncomingOutlookEmail,
+  isOwnerSentOutlookEmail,
+  OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX,
+  parseOutlookThreadIdentity,
+  sentContinuesIncomingOutlookThread,
+  type OutlookThreadIdentity,
+} from './email-thread.js';
 import {
   createChannelTierResolver,
   isPersonallyRelevantSlackMessage,
@@ -77,6 +92,10 @@ const MIN_PER_ITEM_PROMPT_CHARS = 1200;
 const MAX_PER_ITEM_PROMPT_CHARS = 64_000;
 const LIBRARIAN_FIXED_PROMPT_RESERVE_CHARS = 16_000;
 const LIBRARIAN_PROMPT_VERSION = 'librarian-v4-budgeted-balanced-context';
+const MAX_SLACK_SCOPE_CORROBORATORS = 20;
+const MAX_OUTLOOK_THREAD_CANDIDATES = 20;
+const OUTLOOK_THREAD_SCAN_PAGE_SIZE = 50;
+const MAX_OUTLOOK_THREAD_SCAN_ROWS = 500;
 
 function redactSensitiveText(value: string): string {
   return value
@@ -234,13 +253,246 @@ Return ONLY the JSON array.`;
     ).get(itemId, projectId));
   }
 
+  interface SlackMessageContext {
+    metadata: Record<string, unknown>;
+    identity: SlackThreadIdentity;
+  }
+
+  /** Parse historical and live Slack metadata through the shared strict
+   * provenance contract used by brain task validation. */
+  function slackMessageContext(itemId: string): SlackMessageContext | null {
+    const row = db.prepare('SELECT source, type, metadata FROM work_items WHERE id = ?').get(itemId) as
+      | { source: string; type: string; metadata: string | null }
+      | undefined;
+    if (!row || row.source !== 'slack' || row.type !== 'slack_message') return null;
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(row.metadata ?? '{}'); } catch { return null; }
+    const identity = parseSlackThreadIdentity(metadata);
+    return identity ? { metadata, identity } : null;
+  }
+
+  /** A terse Slack reply inherits placement from its already-routed root. This
+   * is conversation provenance, not semantic inference; the root itself still
+   * has to pass deterministic scope validation. */
+  function routedSlackThreadProject(itemId: string): string | null {
+    const context = slackMessageContext(itemId);
+    if (!context?.identity.isReply) return null;
+    const root = db.prepare(`
+      SELECT w.project_id AS projectId
+      FROM work_items w
+      JOIN projects p ON p.id = w.project_id
+      WHERE w.source = 'slack' AND w.type = 'slack_message'
+        AND w.process_state = 'routed'
+        AND w.scope_alert IS NULL
+        AND json_extract(w.metadata, '$.channelId') = ?
+        AND json_extract(w.metadata, '$.timestamp') = ?
+        AND (
+          COALESCE(json_extract(w.metadata, '$.threadTs'), '') = ''
+          OR json_extract(w.metadata, '$.threadTs') = json_extract(w.metadata, '$.timestamp')
+        )
+        AND w.project_id IS NOT NULL
+        AND p.status IN ('active','paused')
+        AND NOT EXISTS (
+          SELECT 1 FROM work_item_rejections r
+          WHERE r.work_item_id = w.id AND r.project_id = w.project_id
+        )
+      ORDER BY w.captured_at DESC LIMIT 1
+    `).get(context.identity.channelId, context.identity.rootTs) as { projectId: string } | undefined;
+    return root?.projectId ?? null;
+  }
+
+  interface OutlookEmailContext {
+    metadata: Record<string, unknown>;
+    identity: OutlookThreadIdentity;
+  }
+
+  function outlookEmailContext(itemId: string): OutlookEmailContext | null {
+    const row = db.prepare('SELECT source, type, metadata FROM work_items WHERE id = ?').get(itemId) as
+      | { source: string; type: string; metadata: string | null }
+      | undefined;
+    if (!row) return null;
+    let metadata: Record<string, unknown> = {};
+    try { metadata = JSON.parse(row.metadata ?? '{}'); } catch { return null; }
+    const identity = parseOutlookThreadIdentity({
+      source: row.source,
+      type: row.type,
+      metadata,
+    });
+    return identity ? { metadata, identity } : null;
+  }
+
+  function isOwnerSentOutlookItem(itemId: string): boolean {
+    const context = outlookEmailContext(itemId);
+    return Boolean(context && isOwnerSentOutlookEmail(context.identity));
+  }
+
+  /** A canonical owner-sent Outlook message may inherit one authoritative
+   * project from strictly earlier direct incoming rows in the same exact
+   * mailbox conversation. Subject text is never an identity signal. */
+  function routedOutlookThreadProject(itemId: string): string | null {
+    const current = outlookEmailContext(itemId);
+    if (!current || !isOwnerSentOutlookEmail(current.identity)) return null;
+    const selectCandidates = db.prepare(`
+      SELECT w.id, w.project_id AS projectId, w.metadata
+      FROM work_items w
+      JOIN projects p ON p.id = w.project_id
+      WHERE w.source = 'grasp' AND w.type = 'email_read'
+        AND w.process_state = 'routed'
+        AND w.scope_alert IS NULL
+        AND w.project_id IS NOT NULL
+        AND p.status = 'active'
+        AND lower(json_extract(w.metadata, '$.ownerEmail')) = ?
+        AND json_extract(w.metadata, '$.conversationId') = ?
+        AND julianday(json_extract(w.metadata, '$.messageTimestamp')) < julianday(?)
+        AND NOT EXISTS (
+          SELECT 1 FROM work_item_rejections r
+          WHERE r.work_item_id = w.id AND r.project_id = w.project_id
+        )
+      ORDER BY julianday(json_extract(w.metadata, '$.messageTimestamp')) DESC
+      LIMIT ? OFFSET ?
+    `);
+
+    const projectIds = new Set<string>();
+    let qualifyingRows = 0;
+    let scannedRows = 0;
+    while (qualifyingRows < MAX_OUTLOOK_THREAD_CANDIDATES) {
+      const rows = selectCandidates.all(
+        current.identity.ownerEmail,
+        current.identity.conversationId,
+        current.identity.messageTimestamp,
+        OUTLOOK_THREAD_SCAN_PAGE_SIZE,
+        scannedRows,
+      ) as Array<{ id: string; projectId: string; metadata: string | null }>;
+      if (rows.length === 0) break;
+      scannedRows += rows.length;
+      for (const row of rows) {
+        let metadata: Record<string, unknown> = {};
+        try { metadata = JSON.parse(row.metadata ?? '{}'); } catch { continue; }
+        const request = parseOutlookThreadIdentity({ source: 'grasp', type: 'email_read', metadata });
+        if (!request
+          || !isDirectIncomingOutlookEmail(request)
+          || !sentContinuesIncomingOutlookThread(request, current.identity)) continue;
+        qualifyingRows++;
+        projectIds.add(row.projectId);
+        if (projectIds.size > 1) return null;
+        if (qualifyingRows >= MAX_OUTLOOK_THREAD_CANDIDATES) break;
+      }
+      if (rows.length < OUTLOOK_THREAD_SCAN_PAGE_SIZE) break;
+      // An extremely noisy conversation must not hide older authority beyond
+      // our scan budget. Fail closed rather than inheriting from partial proof.
+      if (scannedRows >= MAX_OUTLOOK_THREAD_SCAN_ROWS
+        && qualifyingRows < MAX_OUTLOOK_THREAD_CANDIDATES) return null;
+    }
+    return projectIds.size === 1 ? [...projectIds][0] : null;
+  }
+
   /** Stable routing anchors (founding scope, falling back to title) for every
    * active project. Validation runs against these, never mutable summaries. */
-  function activeProjectScopeAnchors(): string[] {
+  function activeProjectScopes(): Array<{ id: string; anchor: string }> {
     return brainStore.listProjects()
       .filter((project) => (project.status === 'active' || project.status === 'paused')
         && !isSourceContainerProjectTitle(project.title))
-      .map((project) => projectScopeAnchor(project));
+      .map((project) => ({ id: project.id, anchor: projectScopeAnchor(project) }));
+  }
+
+  function activeProjectScopeAnchors(): string[] {
+    return activeProjectScopes().map((project) => project.anchor);
+  }
+
+  /**
+   * A directly addressed Slack root can be terse after an explicit prior
+   * project message in the same channel. The LLM still proposes the project;
+   * this fallback only corroborates that proposal when the current root has
+   * one target term and the nearest earlier scope-bearing routed ROOT uniquely
+   * and independently proves the same immutable project anchor.
+   *
+   * This is deliberately not channel affinity: another project's newer strong
+   * root, ambiguous scope, cross-channel evidence, weak-only history, replies,
+   * owner-rejected rows, or malformed chronology all fail closed.
+   */
+  function corroboratedSlackRootScope(
+    item: WaveItem,
+    target: ProjectRow,
+    failedScope: ReturnType<typeof evaluateProjectEvidenceScope>,
+  ): string | null {
+    if (failedScope.matches
+      || !failedScope.reason.startsWith('insufficient title evidence')
+      || failedScope.matchedTokens.length !== 1
+      || failedScope.hasDistinctiveAnchor
+      || failedScope.hasExactPhraseAnchor) return null;
+
+    const context = slackMessageContext(item.id);
+    if (!context || context.identity.isReply) return null;
+    const direction = String(context.metadata.direction ?? '').trim();
+    const channelType = String(context.metadata.channelType ?? '').trim();
+    const mentionedMe = context.metadata.mentionedMe === true
+      || context.metadata.mentionedMe === 'true';
+    const directlyAddressed = mentionedMe || channelType === 'dm' || channelType === 'group_dm';
+    if (direction !== 'received' || !directlyAddressed) return null;
+
+    const currentEvidence = readContent(item.id);
+    const activeScopes = activeProjectScopes();
+    const currentTargetScope = evaluateProjectEvidenceScope(
+      projectScopeAnchor(target),
+      currentEvidence,
+    );
+    if (currentTargetScope.matches
+      || currentTargetScope.matchedTokens.length !== 1
+      || currentTargetScope.hasDistinctiveAnchor
+      || currentTargetScope.hasExactPhraseAnchor) return null;
+    if (activeScopes.some((project) => project.id !== target.id
+      && evaluateProjectEvidenceScope(project.anchor, currentEvidence).matches)) return null;
+
+    const priorRoots = db.prepare(`
+      SELECT w.id, w.project_id AS projectId,
+             json_extract(w.metadata, '$.timestamp') AS timestamp
+      FROM work_items w
+      JOIN projects p ON p.id = w.project_id
+      WHERE w.source = 'slack' AND w.type = 'slack_message'
+        AND w.process_state = 'routed'
+        AND w.project_id IS NOT NULL
+        AND w.scope_alert IS NULL
+        AND p.status IN ('active','paused')
+        AND json_extract(w.metadata, '$.channelId') = ?
+        AND CAST(json_extract(w.metadata, '$.timestamp') AS REAL) < CAST(? AS REAL)
+        AND (
+          COALESCE(json_extract(w.metadata, '$.threadTs'), '') = ''
+          OR json_extract(w.metadata, '$.threadTs') = json_extract(w.metadata, '$.timestamp')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM work_item_rejections r
+          WHERE r.work_item_id = w.id AND r.project_id = w.project_id
+        )
+      ORDER BY CAST(json_extract(w.metadata, '$.timestamp') AS REAL) DESC
+      LIMIT ?
+    `).all(
+      context.identity.channelId,
+      context.identity.timestamp,
+      MAX_SLACK_SCOPE_CORROBORATORS,
+    ) as Array<{
+      id: string;
+      projectId: string;
+      timestamp: string;
+    }>;
+
+    const weakToken = currentTargetScope.matchedTokens[0];
+    for (const prior of priorRoots) {
+      if (!isSlackTimestamp(prior.timestamp)) return null;
+      const priorEvidence = readContent(prior.id);
+      const anchored = activeScopes
+        .map((project) => ({
+          ...project,
+          scope: evaluateProjectEvidenceScope(project.anchor, priorEvidence),
+        }))
+        .filter((project) => project.scope.matches);
+      if (anchored.length === 0) continue;
+      if (anchored.length !== 1) return null;
+      const unique = anchored[0];
+      if (unique.id !== prior.projectId || prior.projectId !== target.id) return null;
+      if (!unique.scope.matchedTokens.includes(weakToken)) return null;
+      return `${WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX}${weakToken}) corroborated by unique prior same-channel root ${prior.id}`;
+    }
+    return null;
   }
 
   function scopeEvidence(item: WaveItem): string {
@@ -275,14 +527,17 @@ Return ONLY the JSON array.`;
         scopeEvidence(item),
         activeProjectScopeAnchors(),
       );
-      if (!scope.matches) return orphan(scope.reason);
+      const corroboratedReason = scope.matches
+        ? null
+        : corroboratedSlackRootScope(item, target, scope);
+      if (!scope.matches && !corroboratedReason) return orphan(scope.reason);
 
       batcher.transition(item.id, 'routed', { projectId: d.projectId });
       return {
         bucket: 'assigned',
         appliedDecision: 'assign',
         appliedProjectId: d.projectId,
-        validationReason: scope.reason,
+        validationReason: corroboratedReason ?? scope.reason,
       };
     }
 
@@ -413,6 +668,50 @@ Return ONLY the JSON array.`;
               validationReason: 'ambient channel message reserved for channel digest',
             });
           }
+        } else if (
+          item.source === 'slack'
+          && item.type === 'slack_message'
+          && slackMessageContext(item.id)?.identity.isReply
+        ) {
+          const threadProjectId = routedSlackThreadProject(item.id);
+          if (threadProjectId && !ownerRejected(item.id, threadProjectId)) {
+            if (batcher.transition(item.id, 'routed', { projectId: threadProjectId })) {
+              result.assigned++;
+              recordRoutingDecision(db, {
+                runId,
+                batchId: wave.batchId,
+                itemId: item.id,
+                modelDecision: 'not_called',
+                appliedDecision: 'assign',
+                appliedProjectId: threadProjectId,
+                validationReason: 'deterministic slack-reply-follows-routed-root rule',
+              });
+            }
+          } else {
+            modelItems.push(item);
+          }
+        } else if (
+          item.source === 'grasp'
+          && item.type === 'email_sent'
+          && isOwnerSentOutlookItem(item.id)
+        ) {
+          const threadProjectId = routedOutlookThreadProject(item.id);
+          if (threadProjectId && !ownerRejected(item.id, threadProjectId)) {
+            if (batcher.transition(item.id, 'routed', { projectId: threadProjectId })) {
+              result.assigned++;
+              recordRoutingDecision(db, {
+                runId,
+                batchId: wave.batchId,
+                itemId: item.id,
+                modelDecision: 'not_called',
+                appliedDecision: 'assign',
+                appliedProjectId: threadProjectId,
+                validationReason: OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX,
+              });
+            }
+          } else {
+            modelItems.push(item);
+          }
         } else if (item.source === 'sharepoint' && item.type === 'document_comment') {
           // Comments follow their document. The sync stamps parentProjectId
           // from the routed document_capture at emit time; when that project
@@ -480,9 +779,51 @@ Return ONLY the JSON array.`;
       }
 
       const byId = new Map(decisions.map((d) => [d.itemId, d]));
-      for (const item of modelItems) {
+      // Authoritative roots/received mail must land before same-wave
+      // Slack replies or owner-sent Outlook responses.
+      const orderedModelItems = [...modelItems].sort((left, right) => {
+        const leftSlack = slackMessageContext(left.id)?.identity;
+        const rightSlack = slackMessageContext(right.id)?.identity;
+        const leftEmail = outlookEmailContext(left.id)?.identity;
+        const rightEmail = outlookEmailContext(right.id)?.identity;
+        const leftFollower = Boolean(leftSlack?.isReply)
+          || Boolean(leftEmail && isOwnerSentOutlookEmail(leftEmail));
+        const rightFollower = Boolean(rightSlack?.isReply)
+          || Boolean(rightEmail && isOwnerSentOutlookEmail(rightEmail));
+        const followerOrder = Number(leftFollower) - Number(rightFollower);
+        if (followerOrder !== 0) return followerOrder;
+        const leftMillis = leftSlack
+          ? Number.parseFloat(leftSlack.timestamp) * 1000
+          : leftEmail?.messageMillis ?? 0;
+        const rightMillis = rightSlack
+          ? Number.parseFloat(rightSlack.timestamp) * 1000
+          : rightEmail?.messageMillis ?? 0;
+        return leftMillis - rightMillis;
+      });
+      for (const item of orderedModelItems) {
         const decision = byId.get(item.id) ?? { itemId: item.id, decision: 'omitted' as const };
-        const applied = applyDecision(decision, item, resolveTier);
+        const slackThreadProjectId = routedSlackThreadProject(item.id);
+        const outlookThreadProjectId = routedOutlookThreadProject(item.id);
+        const deterministicThreadProjectId = slackThreadProjectId
+          && !ownerRejected(item.id, slackThreadProjectId)
+          ? slackThreadProjectId
+          : outlookThreadProjectId && !ownerRejected(item.id, outlookThreadProjectId)
+            ? outlookThreadProjectId
+            : null;
+        const deterministicReason = slackThreadProjectId
+          ? 'deterministic slack-reply-follows-routed-root rule after same-wave root'
+          : `${OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX} after same-wave request`;
+        const applied: AppliedRoutingDecision = deterministicThreadProjectId
+          ? {
+              bucket: 'assigned',
+              appliedDecision: 'assign',
+              appliedProjectId: deterministicThreadProjectId,
+              validationReason: deterministicReason,
+            }
+          : applyDecision(decision, item, resolveTier);
+        if (deterministicThreadProjectId) {
+          batcher.transition(item.id, 'routed', { projectId: deterministicThreadProjectId });
+        }
         result[applied.bucket]++;
         recordRoutingDecision(db, {
           runId,
