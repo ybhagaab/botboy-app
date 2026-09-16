@@ -134,6 +134,7 @@ const state = {
   commandTimer: null,
   lastVersion: null,
   lastAnalyticsVersion: null,
+  lastDocumentsVersion: null,
   lastBootId: null,
   lastUiVersion: null,
 };
@@ -4485,7 +4486,7 @@ function renderDocuments() {
     ? `${number(loadedCount)} recent generated document${loadedCount === 1 ? '' : 's'}; search and sort cover this bounded loaded set.`
     : 'Read and review BotBoy-authored documents from a bounded loaded set.';
   const refreshLabel = documents.refreshing ? 'Refreshing…' : 'Refresh';
-  const actions = artifactId ? '' : `<button class="button" type="button" data-action="documents-refresh" ${documents.refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
+  const actions = `<button class="button" type="button" data-action="documents-refresh" ${documents.refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const shellClasses = [
     'documents-shell',
     artifactId ? 'has-selection' : '',
@@ -6149,10 +6150,12 @@ async function pollVersion() {
     const payload = await request('/dashboard/version');
     const previousVersion = state.lastVersion;
     const previousAnalyticsVersion = state.lastAnalyticsVersion;
+    const previousDocumentsVersion = state.lastDocumentsVersion;
     const previousBootId = state.lastBootId;
     const previousUiVersion = state.lastUiVersion;
     state.lastVersion = payload.version;
     state.lastAnalyticsVersion = payload.analyticsVersion ?? '0';
+    state.lastDocumentsVersion = payload.documentsVersion ?? '0';
     state.lastBootId = payload.bootId ?? null;
     state.lastUiVersion = payload.uiVersion ?? null;
 
@@ -6226,6 +6229,29 @@ async function pollVersion() {
       // ever see a missing detail and collapse the view.
       if (staleDetail) void loadProject(activeProjectId, { force: true });
       if (staleDocs) void loadProjectDocuments(activeProjectId, { force: true });
+    }
+
+    if (previousDocumentsVersion !== null && state.lastDocumentsVersion !== previousDocumentsVersion) {
+      if (state.documents.loading || state.documents.refreshing) {
+        // A request that started before the durable version changed can return
+        // the old bounded page. Re-arm this comparison so the next poll
+        // performs one conclusive fetch after the in-flight request settles.
+        state.lastDocumentsVersion = previousDocumentsVersion;
+      } else if (state.route.view === 'documents') {
+        await loadDocuments({ force: true, renderAfter: false });
+        if (state.documents.error) {
+          // Structured retry: keep the old tracker until a later poll proves
+          // that the newly-versioned library was loaded successfully.
+          state.lastDocumentsVersion = previousDocumentsVersion;
+        }
+        if (state.route.view === 'documents') renderRoute({ preserveScroll: true });
+      } else {
+        // Do not fetch resident context for a hidden surface. Invalidate the
+        // bounded page now; the Documents route will retrieve it on demand.
+        state.documents.items = null;
+        state.documents.total = null;
+        state.documents.error = '';
+      }
     }
 
     if (previousAnalyticsVersion !== null && state.lastAnalyticsVersion !== previousAnalyticsVersion) {

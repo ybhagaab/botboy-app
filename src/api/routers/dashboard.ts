@@ -96,6 +96,26 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
     }
   }
 
+  function currentDocumentsVersion(): string {
+    if (!db) return '0';
+    try {
+      const documents = db.prepare(`
+        SELECT COUNT(*) AS artifactCount,
+          COALESCE(MAX(rowid), 0) AS artifactRowId,
+          COALESCE(MAX(created_at), '') AS createdAt
+        FROM product_document_artifacts
+      `).get() as {
+        artifactCount: number;
+        artifactRowId: number;
+        createdAt: string;
+      };
+      return [documents.artifactCount, documents.artifactRowId, documents.createdAt].join(':');
+    } catch {
+      // Product-document migrations may not have created the table yet.
+      return '0';
+    }
+  }
+
   function currentAnalyticsVersion(): string {
     if (!db) return '0';
     try {
@@ -140,6 +160,7 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
     res.json({
       version: currentVersion(),
       analyticsVersion: currentAnalyticsVersion(),
+      documentsVersion: currentDocumentsVersion(),
       bootId: BOOT_ID,
       uiVersion: computeUiAssetsVersion(),
       terminal: terminalSession ? { id: terminalSession.id, status: terminalSession.status } : null,
