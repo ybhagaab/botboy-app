@@ -4,6 +4,8 @@ type Listener = (item: RawWorkItem) => void | Promise<void>;
 
 export interface EventBus {
   emit(item: RawWorkItem): void;
+  /** Emit and wait until every listener has durably completed or failed. */
+  emitAndWait(item: RawWorkItem): Promise<void>;
   on(listener: Listener): () => void;
 }
 
@@ -23,6 +25,9 @@ export function createEventBus(): EventBus {
           console.error('EventBus listener error:', err);
         }
       }
+    },
+    async emitAndWait(item: RawWorkItem): Promise<void> {
+      await Promise.all([...listeners].map(listener => Promise.resolve().then(() => listener(item))));
     },
     on(listener: Listener): () => void {
       listeners.add(listener);

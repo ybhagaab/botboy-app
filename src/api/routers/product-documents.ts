@@ -122,7 +122,17 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       return res.status(400).json({ error: 'limit must be an integer from 1 through 100.' });
     }
     try {
-      return res.json({ documents: service.listArtifacts(limit) });
+      const projectId = typeof req.query.projectId === 'string' ? req.query.projectId.trim() : undefined;
+      const unassigned = req.query.unassigned === 'true';
+      if (projectId === '' || (projectId !== undefined && unassigned)) {
+        return res.status(400).json({ error: 'Choose projectId or unassigned=true, not both.' });
+      }
+      return res.json({
+        documents: service.listArtifacts(limit, {
+          ...(projectId === undefined ? {} : { projectId }),
+          ...(unassigned ? { unassigned: true } : {}),
+        }),
+      });
     } catch (error) {
       return handleError(res, error);
     }
@@ -223,6 +233,33 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       const { discoveredEvidence: _rejectedDiscovery, parentArtifactId: _rejectedParent, parentVersion: _rejectedParentVersion, ...publicBody } = req.body as Record<string, unknown>;
       const artifact = await service.generate(publicBody as unknown as Parameters<typeof service.generate>[0]);
       return res.status(artifact.state === 'blocked_for_context' ? 409 : 200).json({ artifact: publicArtifact(artifact) });
+    } catch (error) {
+      return handleError(res, error);
+    }
+  });
+
+  router.put('/product-documents/:artifactId/project', (req: Request, res: Response) => {
+    const service = deps.productDocumentService;
+    if (!service) return res.status(503).json({ error: 'Product-document service is not available.' });
+    const artifactId = req.params.artifactId;
+    if (!validArtifactId(artifactId)) return res.status(400).json({ error: 'Invalid artifact id.' });
+    if (!isRecord(req.body)) return res.status(400).json({ error: 'Body must be a JSON object.' });
+    const projectId = typeof req.body.projectId === 'string' ? req.body.projectId.trim() : undefined;
+    const unassigned = req.body.unassigned === true || req.body.projectId === null;
+    if (projectId === '' || (projectId !== undefined && unassigned)) {
+      return res.status(400).json({ error: 'Choose a non-empty projectId or unassigned=true, not both.' });
+    }
+    if (projectId === undefined && !unassigned) {
+      return res.status(400).json({ error: 'Body requires projectId or unassigned=true.' });
+    }
+    try {
+      if (deps.productDocumentPublications?.hasForChain(artifactId)) {
+        return res.status(409).json({
+          error: 'This document chain has publication history and cannot be refiled. Supersede or resolve its publication records first.',
+        });
+      }
+      const assignment = service.assignArtifactProject(artifactId, projectId);
+      return res.json({ assignment });
     } catch (error) {
       return handleError(res, error);
     }
@@ -354,6 +391,9 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     const artifactId = req.params.artifactId;
     if (!validArtifactId(artifactId)) return res.status(400).json({ error: 'artifactId is invalid.' });
     try {
+      if (deps.productDocumentPublications?.listByArtifact(artifactId).length) {
+        return res.status(409).json({ error: 'Published artifact versions cannot be deleted; their publication receipt must remain auditable.' });
+      }
       const removed = service.deleteArtifact(artifactId);
       if (!removed) return res.status(404).json({ error: 'Product-document artifact not found.' });
       return res.status(204).end();
@@ -373,7 +413,10 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     try {
       const artifact = service.getArtifact(artifactId);
       if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
-      return res.json({ artifact: publicArtifact(artifact) });
+      return res.json({
+        artifact: publicArtifact(artifact),
+        publications: deps.productDocumentPublications?.listByArtifact(artifactId) ?? [],
+      });
     } catch (error) {
       return handleError(res, error);
     }

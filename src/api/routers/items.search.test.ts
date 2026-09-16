@@ -19,10 +19,10 @@ describe('GET /api/search', () => {
   beforeEach(() => { storage = createStorage(':memory:'); storage.initialize(); });
   afterEach(() => storage.close());
 
-  function app() {
+  function app(extra: Partial<RouterDeps> = {}) {
     const a = express();
     a.use(express.json());
-    a.use('/api', createItemsRouter({ db: storage.getDb() } as RouterDeps));
+    a.use('/api', createItemsRouter({ db: storage.getDb(), ...extra } as RouterDeps));
     return a;
   }
 
@@ -65,6 +65,61 @@ describe('GET /api/search', () => {
     expect(res.body.results[0].item.id).toBe('s1');
     expect(res.body.results[0].item.docKey).toBeUndefined();
     expect(res.body.results[0].item.url).toBe('https://slack/x');
+  });
+  it('reserves bounded result slots for both authored documents and evidence', async () => {
+    const db = storage.getDb();
+    for (let index = 0; index < 5; index++) {
+      db.prepare(`
+        INSERT INTO work_items (id, type, source, title, captured_at, process_state, raw_text)
+        VALUES (?, 'slack_message', 'slack', ?, ?, 'routed', 'catalog evidence')
+      `).run(`e${index}`, `catalog evidence ${index}`, `2026-09-1${index}T00:00:00Z`);
+    }
+    const service = {
+      listArtifacts: () => Array.from({ length: 5 }, (_, index) => ({
+        artifactId: `a${index}`, title: `catalog authored ${index}`,
+        profileId: 'business_document/adaptive.v1', createdAt: `2026-09-1${index}T01:00:00Z`,
+        state: 'ready_for_review',
+      })),
+    };
+    const res = await request(app({ productDocumentService: service as never }))
+      .get('/api/search').query({ q: 'catalog', limit: 4 });
+    expect(res.body.results).toHaveLength(4);
+    expect(res.body.results.some((result: any) => result.item.artifactId)).toBe(true);
+    expect(res.body.results.some((result: any) => result.item.source === 'slack')).toBe(true);
+  });
+
+  it('composes one typed authored-chain hit without inserting synthetic evidence', async () => {
+    storage.getDb().prepare(`
+      INSERT INTO projects (id, title, one_liner, brain_path, status)
+      VALUES ('p1', 'Catalog unification', '', '/tmp/brain', 'active')
+    `).run();
+    const service = {
+      listArtifacts: () => [
+        {
+          artifactId: 'artifact-v2', projectId: 'p1', parentArtifactId: 'artifact-v1',
+          title: 'Unified document catalog', profileId: 'business_document/adaptive.v1',
+          createdAt: '2026-09-16T02:00:00Z', state: 'ready_for_review',
+        },
+        {
+          artifactId: 'artifact-v1', projectId: 'p1',
+          title: 'Unified document catalog', profileId: 'business_document/adaptive.v1',
+          createdAt: '2026-09-16T01:00:00Z', state: 'draft_review',
+        },
+      ],
+    };
+    const res = await request(app({ productDocumentService: service as never }))
+      .get('/api/search').query({ q: 'catalog' });
+    const authored = res.body.results.filter((result: any) => result.item.artifactId);
+    expect(authored).toHaveLength(1);
+    expect(authored[0]).toMatchObject({
+      item: {
+        artifactId: 'artifact-v2',
+        type: 'product_document_artifact',
+        projectId: 'p1',
+      },
+      node: { id: 'p1', title: 'Catalog unification' },
+    });
+    expect((storage.getDb().prepare("SELECT COUNT(*) AS count FROM work_items WHERE source = 'botboy'").get() as { count: number }).count).toBe(0);
   });
 });
 

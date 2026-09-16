@@ -557,6 +557,10 @@ export interface ValidateDocumentRequest {
 export interface GenerateDocumentRequest {
   profileId: string;
   prompt: string;
+  /** Owning project for a new root artifact. Revisions inherit their parent. */
+  projectId?: string;
+  /** Explicitly confirm that a new root is intentionally not filed to a project. */
+  unassigned?: boolean;
   steMode?: SteEnforcementMode;
   maturity?: DocumentMaturity;
   authoringPlan?: DocumentAuthoringPlan;
@@ -590,6 +594,8 @@ export interface GenerateDocumentRequest {
 export interface ProductDocumentArtifact {
   artifactId: string;
   persisted: boolean;
+  /** Canonical owning project. Absence means explicitly Unassigned or legacy. */
+  projectId?: string;
   state: ArtifactState;
   profileId: string;
   profileVersion: string;
@@ -622,6 +628,8 @@ export interface ProductDocumentArtifact {
 
 export interface ProductDocumentSummary {
   artifactId: string;
+  /** Canonical owning project. Absence means Unassigned. */
+  projectId?: string;
   state: ArtifactState;
   profileId: string;
   profileVersion: string;
@@ -693,6 +701,10 @@ export interface DocumentCitation {
 export interface SaveAuthoredDocumentRequest {
   /** Document title; required for new documents, defaults to the parent title on revisions. */
   title?: string;
+  /** Owning project for a new root artifact. Revisions inherit their parent. */
+  projectId?: string;
+  /** Explicitly confirm that a new root is intentionally not filed to a project. */
+  unassigned?: boolean;
   /** Complete authored Markdown content. */
   content: string;
   /** Lifecycle maturity; defaults to working (or the parent's maturity on revisions). */
@@ -716,10 +728,28 @@ export interface OwnerRevisionRequest {
   title?: string;
 }
 
+export interface ProductDocumentListOptions {
+  projectId?: string;
+  unassigned?: boolean;
+}
+
+export interface ProductDocumentProject {
+  id: string;
+  title: string;
+  status: string;
+}
+
+export interface ProductDocumentProjectAssignment {
+  artifactIds: string[];
+  updated: number;
+  projectId?: string;
+}
+
 export interface ProductDocumentStore {
   save(artifact: ProductDocumentArtifact): void;
-  list(limit: number): ProductDocumentSummary[];
+  list(limit: number, options?: ProductDocumentListOptions): ProductDocumentSummary[];
   get(artifactId: string): ProductDocumentArtifact | null;
+  assignProject(artifactId: string, projectId: string | undefined): ProductDocumentProjectAssignment;
   /**
    * Permanently delete one artifact. Children of the deleted version are
    * re-linked to its parent so the chain stays connected. Returns false when
@@ -731,8 +761,9 @@ export interface ProductDocumentStore {
 export interface ProductDocumentService {
   listProfiles(): ProductProfileSummary[];
   listOverlays(): Array<{ overlayId: string; version: string; type: OverlayType; purpose: string }>;
-  listArtifacts(limit: number): ProductDocumentSummary[];
+  listArtifacts(limit: number, options?: ProductDocumentListOptions): ProductDocumentSummary[];
   getArtifact(artifactId: string): ProductDocumentArtifact | null;
+  assignArtifactProject(artifactId: string, projectId: string | undefined): ProductDocumentProjectAssignment;
   /** Permanently delete one artifact version; false when it does not exist. */
   deleteArtifact(artifactId: string): boolean;
   getSteBundleReadiness(): SteBundleReadiness;
@@ -772,6 +803,8 @@ export interface ProductDocumentServiceDependencies {
   validator: DocumentValidator;
   steBundleLoader: SteBundleLoader;
   store?: ProductDocumentStore;
+  /** Read-only canonical project lookup used to validate filing. */
+  resolveProject?: (projectId: string) => ProductDocumentProject | null;
   now?: () => Date;
   createArtifactId?: () => string;
 }

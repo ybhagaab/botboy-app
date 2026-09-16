@@ -103,6 +103,7 @@ const state = {
     editDraft: null,
     answersDraft: '',
     saving: false,
+    projectAssigning: false,
     actionError: '',
     reviewOpen: false,
     detailsOpen: false,
@@ -811,7 +812,13 @@ function renderProject(projectId) {
   const brain = detail.brain || {};
   const area = areaForProject(projectId);
   const docsEntry = state.projectDocuments.get(projectId);
-  const docsCount = docsEntry?.documents?.length;
+  const authoredDocCount = Array.isArray(docsEntry?.authoredDocuments)
+    ? buildDocumentLibraryView(docsEntry.authoredDocuments, { sort: 'recent' }).length
+    : null;
+  const externalDocCount = Array.isArray(docsEntry?.documents) ? docsEntry.documents.length : null;
+  const docsCount = authoredDocCount === null && externalDocCount === null
+    ? null
+    : (authoredDocCount || 0) + (externalDocCount || 0);
   const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['documents', `Documents${typeof docsCount === 'number' ? ` ${docsCount}` : ''}`], ['timeline', 'Timeline']];
   let content = '';
   if (state.projectTab === 'brief') content = renderProjectBrief(project, detail, area);
@@ -826,6 +833,7 @@ function renderProject(projectId) {
     area,
     activeTab: state.projectTab,
     rebuilding: state.rebuilding.has(project.id),
+    documentCount: typeof docsCount === 'number' ? docsCount : null,
     fallbackHtml,
   }) || fallbackHtml;
 }
@@ -1116,32 +1124,56 @@ function tierChip(tier) {
 
 async function loadProjectDocuments(projectId, { force = false } = {}) {
   const existing = state.projectDocuments.get(projectId);
-  if (existing?.loading || (existing?.documents && !force)) return;
-  state.projectDocuments.set(projectId, { documents: existing?.documents ?? null, loading: true, error: '' });
+  if (existing?.loading || (existing?.documents && existing?.authoredDocuments && !force)) return;
+  state.projectDocuments.set(projectId, {
+    documents: existing?.documents ?? null,
+    authoredDocuments: existing?.authoredDocuments ?? null,
+    publications: existing?.publications ?? [],
+    stagedCreations: existing?.stagedCreations ?? [],
+    loading: true,
+    error: '',
+  });
   try {
     const payload = await request(`/projects/${encodeURIComponent(projectId)}/documents`);
-    state.projectDocuments.set(projectId, { documents: payload.documents || [], stagedCreations: payload.stagedCreations || [], loading: false, error: '' });
+    state.projectDocuments.set(projectId, {
+      documents: payload.documents || [],
+      authoredDocuments: documentSummariesFromPayload(payload.authoredDocuments || []),
+      publications: payload.publications || [],
+      stagedCreations: payload.stagedCreations || [],
+      loading: false,
+      error: '',
+    });
   } catch (error) {
-    state.projectDocuments.set(projectId, { documents: existing?.documents ?? null, stagedCreations: existing?.stagedCreations ?? [], loading: false, error: String(error?.message || error) });
+    state.projectDocuments.set(projectId, {
+      documents: existing?.documents ?? null,
+      authoredDocuments: existing?.authoredDocuments ?? null,
+      publications: existing?.publications ?? [],
+      stagedCreations: existing?.stagedCreations ?? [],
+      loading: false,
+      error: String(error?.message || error),
+    });
   }
   if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ preserveScroll: true });
 }
 
 function renderProjectDocuments(projectId) {
   const entry = state.projectDocuments.get(projectId);
-  if (!entry || (entry.loading && !entry.documents)) {
+  if (!entry || (entry.loading && !entry.documents && !entry.authoredDocuments)) {
     if (!entry) void loadProjectDocuments(projectId);
     return '<section class="card"><div class="empty-state"><p>Loading documents…</p></div></section>';
   }
-  if (entry.error && !entry.documents) {
+  if (entry.error && !entry.documents && !entry.authoredDocuments) {
     return `<section class="card error-state"><span class="source-icon">${icon('alert', 18)}</span><h3>Documents could not be loaded</h3><p>${esc(entry.error)}</p></section>`;
   }
   const docs = entry.documents || [];
+  const publications = entry.publications || [];
+  const authoredDocuments = entry.authoredDocuments || [];
+  const authoredChains = buildDocumentLibraryView(authoredDocuments, { sort: 'recent' });
   // Staged creations (authoring bridge): documents BotBoy drafted that
   // publish to SharePoint only after Approve + Sync here.
   const creations = entry.stagedCreations || [];
   const creationBlock = creations.length ? `
-    <div class="section-heading"><div><h2>Staged creations</h2><p>Documents BotBoy drafted for this project. Nothing exists on SharePoint until you approve and sync.</p></div><span class="pill blue">${creations.length}</span></div>
+    <div class="section-heading"><div><h2>Awaiting publication</h2><p>Approved or proposed SharePoint creations. Nothing is a published document until upload and verification complete.</p></div><span class="pill blue">${creations.length}</span></div>
     <section class="card pad">${creations.map(creation => {
     const statusTone = { pending: '', approved: 'blue', conflicted: 'warn' }[creation.status] || '';
     const canRender = typeof window.formatMarkdownContent === 'function';
@@ -1149,6 +1181,8 @@ function renderProjectDocuments(projectId) {
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <strong>${esc(creation.fileName)}</strong>
           <span class="pill ${statusTone}">${esc(creation.status)}</span>
+          ${creation.publicationStatus ? `<span class="pill blue">${icon('link', 10)} ${esc(documentStateLabel(creation.publicationStatus))}</span>` : ''}
+          ${creation.sourceArtifactId ? `<a href="#/documents/${encodeURIComponent(creation.sourceArtifactId)}" class="document-project-link">Official source</a>` : ''}
           ${creation.originNote ? `<span style="color:var(--muted); font-size:11.5px;">${esc(creation.originNote)}</span>` : ''}
         </div>
         <span style="color:var(--muted); font-size:11px;">→ ${esc(creation.serverRelativeUrl)}</span>
@@ -1166,10 +1200,52 @@ function renderProjectDocuments(projectId) {
       </article>`;
   }).join('')}</section>` : '';
 
-  if (!docs.length && !creations.length) {
-    return `<section class="card"><div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No synced documents</h3><p>SharePoint documents routed to this project appear here, grouped with their revisions and comments.</p></div></section>`;
+  const authoredBlock = authoredChains.length ? `
+    <div class="section-heading"><div><h2>Authored in BotBoy</h2><p>Canonical project documents and their immutable revision chains. Open a document to review, revise, export, or publish it.</p></div><span class="pill accent">${authoredChains.length}</span></div>
+    <section class="card evidence-list project-authored-documents">${authoredChains.map(chain => {
+    const document = chain.head;
+    const versionCount = chain.members.length;
+    const chainArtifactIds = new Set(chain.members.map(version => version.artifactId));
+    const chainPublications = publications.filter(publication => chainArtifactIds.has(publication.artifactId));
+    const latestPublication = chainPublications[0] || null;
+    const publicationTone = latestPublication?.status === 'complete'
+      ? 'good'
+      : latestPublication?.status === 'verification_failed'
+        || latestPublication?.status === 'capture_failed'
+        || latestPublication?.status === 'identity_mismatch'
+        || latestPublication?.status === 'target_conflict'
+          ? 'warn'
+          : latestPublication ? 'blue' : '';
+    const publicationLabel = latestPublication
+      ? latestPublication.status === 'complete'
+        ? 'Published to SharePoint'
+        : `Publication ${documentStateLabel(latestPublication.status)}`
+      : '';
+    const publishedLocation = latestPublication?.status === 'complete'
+      ? `<a class="project-publication-link" href="#/doc/${encodeDocKey(latestPublication.docKey)}">${icon('link', 10)} Published copy</a>`
+      : '';
+    return `<article class="evidence-row project-authored-row">
+      <span class="source-icon project-authored-icon">${icon('file', 16)}</span>
+      <a class="today-item-copy" href="#/documents/${encodeURIComponent(document.artifactId)}" style="min-width:0; flex:1;">
+        <strong style="font-size:13px;">${esc(document.title)}</strong>
+        <span class="evidence-meta" style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:3px;">
+          <span class="pill accent">BotBoy original</span>
+          <span class="pill">${icon('activity', 10)} ${versionCount} loaded version${versionCount === 1 ? '' : 's'}</span>
+          <span class="pill ${documentStateTone(document.state)}">${esc(documentStateLabel(document.state))}</span>
+          ${publicationLabel ? `<span class="pill ${publicationTone}">${icon('link', 10)} ${esc(publicationLabel)}</span>` : ''}
+          ${publishedLocation}
+          <span>${esc(documentProfileLabel(document.profileId))}</span>
+          <time>${esc(relativeTime(document.createdAt))}</time>
+        </span>
+      </a>
+      <a class="button small" href="#/documents/${encodeURIComponent(document.artifactId)}">Open</a>
+    </article>`;
+  }).join('')}</section>` : '';
+
+  if (!docs.length && !creations.length && !authoredChains.length) {
+    return `<section class="card"><div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No project documents yet</h3><p>Authored BotBoy documents and SharePoint references filed to this project appear here.</p></div></section>`;
   }
-  if (!docs.length) return creationBlock;
+  if (!docs.length) return `${authoredBlock}${creationBlock}`;
   const rows = docs.map(doc => {
     const readerHref = `#/doc/${encodeDocKey(doc.docKey)}`;
     const ext = String(doc.fileType || '').replace('.', '').toLowerCase() || 'doc';
@@ -1195,8 +1271,8 @@ function renderProjectDocuments(projectId) {
       <a class="button small" href="${esc(String(doc.webUrl || '#'))}" target="_blank" rel="noopener noreferrer" style="flex:0 0 auto;">SharePoint</a>
     </article>`;
   }).join('');
-  return `${creationBlock}
-    <div class="section-heading"><div><h2>Documents</h2><p>SharePoint documents routed here — one row per document; open for content, comments, and revision history.</p></div><span class="pill">${docs.length}</span></div>
+  return `${authoredBlock}${creationBlock}
+    <div class="section-heading"><div><h2>External & reference</h2><p>SharePoint documents routed here independently. Open them for synced content, comments, and remote revision history.</p></div><span class="pill">${docs.length}</span></div>
     <section class="card evidence-list">${rows}</section>`;
 }
 
@@ -3935,13 +4011,17 @@ function normalizeDocumentSummary(raw) {
   const parsedContentChars = Number(rawContentChars);
   return {
     artifactId,
+    projectId: typeof raw.projectId === 'string' && raw.projectId.trim() ? raw.projectId.trim() : null,
+    projectTitle: typeof raw.projectTitle === 'string' && raw.projectTitle.trim() ? raw.projectTitle.trim() : '',
     title: typeof raw.title === 'string' && raw.title.trim() ? raw.title : 'Untitled document',
     state: typeof raw.state === 'string' && raw.state ? raw.state : 'unknown',
     profileId: typeof raw.profileId === 'string' ? raw.profileId : '',
     createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : '',
     contentChars: Number.isFinite(parsedContentChars) && parsedContentChars >= 0 ? Math.trunc(parsedContentChars) : null,
     parentArtifactId: typeof raw.parentArtifactId === 'string' && raw.parentArtifactId ? raw.parentArtifactId : null,
-    revisionOrigin: raw.revisionOrigin === 'owner_edit' || raw.revisionOrigin === 'generated' ? raw.revisionOrigin : null,
+    revisionOrigin: raw.revisionOrigin === 'owner_edit' || raw.revisionOrigin === 'generated' || raw.revisionOrigin === 'chat_authored'
+      ? raw.revisionOrigin
+      : null,
   };
 }
 
@@ -3971,6 +4051,9 @@ function documentArtifactFromPayload(payload, expectedArtifactId) {
   return {
     ...raw,
     artifactId,
+    publications: Array.isArray(payload?.publications) ? payload.publications : [],
+    projectId: typeof raw.projectId === 'string' && raw.projectId.trim() ? raw.projectId.trim() : null,
+    projectTitle: typeof raw.projectTitle === 'string' && raw.projectTitle.trim() ? raw.projectTitle.trim() : '',
     title: typeof raw.title === 'string' && raw.title.trim() ? raw.title : 'Untitled document',
     state: typeof raw.state === 'string' && raw.state ? raw.state : 'unknown',
     profileId: typeof raw.profileId === 'string' ? raw.profileId : '',
@@ -4128,7 +4211,11 @@ async function loadDocuments({ force = false, renderAfter = true } = {}) {
   if (renderAfter && state.route.view === 'documents') renderRoute({ preserveScroll: true });
   try {
     const payload = await request(`/product-documents?limit=${DOCUMENT_LIST_LIMIT}`);
-    documents.items = documentSummariesFromPayload(payload);
+    const summaries = documentSummariesFromPayload(payload);
+    documents.items = summaries.map(document => ({
+      ...document,
+      projectTitle: document.projectId ? (projectById(document.projectId)?.title || document.projectTitle || '') : '',
+    }));
     const parsedTotal = Number(payload?.total ?? payload?.count);
     documents.total = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? Math.trunc(parsedTotal) : null;
     documents.error = '';
@@ -4204,7 +4291,9 @@ function renderDocumentLibraryRows(selectedArtifactId) {
   const documentRow = (document, { versionNote = '', historical = false } = {}) => {
     const active = selectedArtifactId === document.artifactId;
     const origin = document.revisionOrigin === 'owner_edit' ? 'Owner edit' : '';
-    const meta = [documentProfileLabel(document.profileId), origin, versionNote].filter(Boolean).join(' · ');
+    const project = document.projectId ? projectById(document.projectId) : null;
+    const projectLabel = project?.title || document.projectTitle || (document.projectId ? `Project ${document.projectId}` : 'Unassigned');
+    const meta = [projectLabel, documentProfileLabel(document.profileId), origin, versionNote].filter(Boolean).join(' · ');
     return `<a class="document-row ${active ? 'active' : ''} ${historical ? 'document-row-version' : ''}" href="#/documents/${encodeURIComponent(document.artifactId)}" data-artifact="${attr(document.artifactId)}" ${active ? 'aria-current="page"' : ''}><span class="source-icon">${icon('file', 16)}</span><span class="document-row-copy"><strong>${esc(document.title)}</strong><span>${esc(meta)}</span></span><span class="document-row-side"><span class="document-state-dot ${documentStateTone(document.state)}" aria-hidden="true"></span><span class="document-row-state">${esc(documentStateLabel(document.state))}</span><time>${esc(relativeTime(document.createdAt))}</time></span></a>`;
   };
   const rows = chains.map(chain => {
@@ -4307,6 +4396,14 @@ function renderDocumentDetailPane(artifactId) {
     { format: 'pdf', label: 'PDF', hint: '.pdf' },
   ];
   const downloadMenu = editing ? '' : `<details class="document-download-menu" data-document-download-menu><summary class="button small" aria-haspopup="menu" ${documents.downloading ? 'aria-disabled="true"' : ''}>${icon('download', 13)} ${documents.downloading ? `Preparing ${esc(documents.downloading)}…` : 'Download'}</summary><div class="document-download-list" role="menu">${downloadFormats.map(entry => `<button type="button" role="menuitem" data-action="documents-download" data-artifact="${attr(artifactId)}" data-format="${entry.format}" ${documents.downloading ? 'disabled' : ''}><span>${entry.label}</span><span>${entry.hint}</span></button>`).join('')}</div></details>`;
+  const publishPrompt = artifact.projectId
+    ? `Publish the exact official BotBoy document artifact ${artifact.artifactId} ("${artifact.title}") to SharePoint for project ${artifact.projectId}. Ask me for the destination folder and md/docx format if I have not supplied them, then call publish_product_document_to_sharepoint. Do not recreate or copy the artifact text.`
+    : '';
+  const publishButton = editing
+    ? ''
+    : artifact.projectId
+      ? `<button class="button small" type="button" data-prompt="${attr(publishPrompt)}">${icon('link', 13)} Publish</button>`
+      : `<button class="button small" type="button" disabled title="Assign this document chain to a project before publishing">${icon('link', 13)} Publish</button>`;
   const reviewAvailable = Boolean(reviewModel.totalCount || reviewModel.statusLabel || reviewModel.reviewSummary);
   const reviewButton = !editing && reviewAvailable
     ? `<button class="button small document-review-toggle ${documents.reviewOpen ? 'active' : ''}" type="button" data-action="documents-toggle-review" aria-expanded="${documents.reviewOpen ? 'true' : 'false'}" aria-controls="document-review-rail" aria-label="${documents.reviewOpen ? 'Close review notes' : 'Open review notes'}">${icon('sparkles', 13)} <span data-document-review-label>${reviewModel.noteCount ? 'Review notes' : 'Evidence'}</span><span class="document-review-button-count">${number(reviewModel.noteCount || reviewModel.citations.length)}</span></button>`
@@ -4328,12 +4425,29 @@ function renderDocumentDetailPane(artifactId) {
     : mode === 'rendered' && canRender
       ? `${icon('shield', 13)} Escape-first Markdown rendering`
       : `${icon('shield', 13)} Plain-text view`;
+  const project = artifact.projectId ? projectById(artifact.projectId) : null;
+  const projectFact = artifact.projectId
+    ? `<a class="document-project-link" href="#/projects/${encodeURIComponent(artifact.projectId)}" title="Open owning project">${icon('folder', 11)} ${esc(project?.title || artifact.projectTitle || artifact.projectId)}</a>`
+    : `<span class="document-project-unassigned">${icon('folder', 11)} Unassigned</span>`;
+  const latestPublication = Array.isArray(artifact.publications) ? artifact.publications[0] : null;
+  const publicationFact = latestPublication
+    ? latestPublication.status === 'complete'
+      ? `<a class="document-project-link" href="#/doc/${encodeDocKey(latestPublication.docKey)}">${icon('link', 11)} Published copy</a>`
+      : `<span class="document-publication-status">${icon('link', 11)} ${esc(documentStateLabel(latestPublication.status))}</span>`
+    : '';
+  const projectChoices = [...new Map([
+    ...state.projects,
+    ...state.areas.flatMap(area => area.projects || []),
+  ].filter(candidate => candidate.status === 'active' || candidate.status === 'paused')
+    .map(candidate => [candidate.id, candidate])).values()]
+    .sort((left, right) => String(left.title).localeCompare(String(right.title), undefined, { sensitivity: 'base' }));
+  const projectAssignmentControl = `<span class="document-project-assignment"><strong>Owning project</strong><span><select data-document-project-assignment aria-label="Owning project for this document chain" ${documents.projectAssigning ? 'disabled' : ''}><option value="" ${artifact.projectId ? '' : 'selected'}>Unassigned</option>${projectChoices.map(candidate => `<option value="${attr(candidate.id)}" ${candidate.id === artifact.projectId ? 'selected' : ''}>${esc(candidate.title)}${candidate.status === 'paused' ? ' · Paused' : ''}</option>`).join('')}</select><button class="button small" type="button" data-action="documents-set-project" data-artifact="${attr(artifactId)}" ${documents.projectAssigning ? 'disabled' : ''}>${documents.projectAssigning ? 'Updating…' : 'Update chain'}</button></span><small>Applies to every version in this immutable chain. No title or citation inference is used.</small></span>`;
   const profileFact = [documentProfileLabel(artifact.profileId), profileVersion].filter(Boolean).join(' · ');
   const exactCreatedAt = artifact.createdAt ? new Date(artifact.createdAt).toLocaleString() : 'Unknown';
-  const detailsPanel = `<details class="document-technical-details" data-document-details ${documents.detailsOpen ? 'open' : ''}><summary>Details ${icon('chevron-down', 11)}</summary><div><span><strong>Artifact ID</strong><code>${esc(artifact.artifactId)}</code></span><span><strong>Profile</strong>${esc(artifact.profileId || 'Unknown')}${profileVersion ? ` · ${esc(profileVersion)}` : ''}</span><span><strong>Created</strong>${esc(exactCreatedAt)}</span>${artifact.model ? `<span><strong>Model</strong>${esc(artifact.model)}</span>` : ''}${artifact.checkerVersion ? `<span><strong>Checker</strong>${esc(artifact.checkerVersion)}</span>` : ''}${parentLine}</div></details>`;
+  const detailsPanel = `<details class="document-technical-details" data-document-details ${documents.detailsOpen ? 'open' : ''}><summary>Details ${icon('chevron-down', 11)}</summary><div><span><strong>Artifact ID</strong><code>${esc(artifact.artifactId)}</code></span><span><strong>Profile</strong>${esc(artifact.profileId || 'Unknown')}${profileVersion ? ` · ${esc(profileVersion)}` : ''}</span><span><strong>Created</strong>${esc(exactCreatedAt)}</span>${artifact.model ? `<span><strong>Model</strong>${esc(artifact.model)}</span>` : ''}${artifact.checkerVersion ? `<span><strong>Checker</strong>${esc(artifact.checkerVersion)}</span>` : ''}${parentLine}${projectAssignmentControl}</div></details>`;
 
   const libraryTitleButton = `<button class="icon-button document-title-library-toggle" type="button" data-action="documents-toggle-library" aria-expanded="${documents.libraryOpen ? 'true' : 'false'}" aria-controls="document-library-content" aria-label="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}" title="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}">${icon(documents.libraryOpen ? 'panel-collapse' : 'panel-expand', 18)}</button>`;
-  return `<article class="card document-detail-pane"><header class="document-detail-header"><div class="document-title-block"><div class="document-title-row">${libraryTitleButton}<h2 id="document-detail-title">${esc(artifact.title)}</h2><span class="pill ${stateTone}"><span class="visually-hidden">Document status: </span>${esc(documentStateLabel(artifact.state))}</span></div><div class="document-primary-facts"><span>${esc(profileFact)}</span><span>${esc(revisionLabel)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span><span>${number(content.length)} characters</span>${detailsPanel}</div></div></header><div class="document-detail-toolbar">${back}${modeButtons}${editButton}<div class="document-toolbar-spacer"></div><div class="document-toolbar-actions">${reviewButton}${downloadMenu}${focusButton}${overflowMenu}</div></div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
+  return `<article class="card document-detail-pane"><header class="document-detail-header"><div class="document-title-block"><div class="document-title-row">${libraryTitleButton}<h2 id="document-detail-title">${esc(artifact.title)}</h2><span class="pill ${stateTone}"><span class="visually-hidden">Document status: </span>${esc(documentStateLabel(artifact.state))}</span></div><div class="document-primary-facts"><span>${projectFact}</span>${publicationFact ? `<span>${publicationFact}</span>` : ''}<span>${esc(profileFact)}</span><span>${esc(revisionLabel)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span><span>${number(content.length)} characters</span>${detailsPanel}</div></div></header><div class="document-detail-toolbar">${back}${modeButtons}${editButton}<div class="document-toolbar-spacer"></div><div class="document-toolbar-actions">${reviewButton}${publishButton}${downloadMenu}${focusButton}${overflowMenu}</div></div>${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
 }
 
 function renderDocuments() {
@@ -4549,6 +4663,43 @@ async function saveDocumentRevision(artifactId) {
     documents.saving = false;
     documents.actionError = `Saving the new version failed: ${error?.message || 'unknown error'}`;
     renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+async function assignDocumentProject(artifactId) {
+  const documents = state.documents;
+  const artifact = documents.details.get(artifactId);
+  const select = document.querySelector('[data-document-project-assignment]');
+  if (!artifact || !select || documents.projectAssigning) return;
+  const nextProjectId = String(select.value || '').trim();
+  const previousProjectId = artifact.projectId || '';
+  if (nextProjectId === previousProjectId) {
+    toast('Project assignment is already current');
+    return;
+  }
+  documents.projectAssigning = true;
+  documents.actionError = '';
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    await request(`/product-documents/${encodeURIComponent(artifactId)}/project`, {
+      method: 'PUT',
+      body: JSON.stringify(nextProjectId ? { projectId: nextProjectId } : { unassigned: true }),
+    });
+    documents.details.delete(artifactId);
+    await Promise.all([
+      loadDocuments({ force: true, renderAfter: false }),
+      loadDocument(artifactId, { force: true, renderAfter: false }),
+      previousProjectId ? loadProjectDocuments(previousProjectId, { force: true }) : Promise.resolve(),
+      nextProjectId ? loadProjectDocuments(nextProjectId, { force: true }) : Promise.resolve(),
+    ]);
+    toast(nextProjectId
+      ? `Filed the full document chain under ${projectById(nextProjectId)?.title || nextProjectId}`
+      : 'Moved the full document chain to Unassigned');
+  } catch (error) {
+    documents.actionError = `Project assignment failed: ${error?.message || 'unknown error'}`;
+  } finally {
+    documents.projectAssigning = false;
+    if (state.route.view === 'documents') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -5080,13 +5231,19 @@ async function updateCommandResults(query = '') {
       // Synced documents route to the STAGED reader (#/doc/…), grouped under
       // their own label; runCommand prefers route over url, so these never
       // pop an external tab (owner report 2026-08-27).
-      const evidenceItems = (result.results || []).map(entry => (entry.item?.docKey
+      const evidenceItems = (result.results || []).map(entry => (entry.item?.artifactId
         ? {
-            title: entry.item?.title || '(untitled document)',
-            meta: `Staged copy in BotBoy${entry.item?.collapsedCount ? ` · ${entry.item.collapsedCount} more capture${entry.item.collapsedCount === 1 ? '' : 's'} collapsed` : ''}${entry.snippet ? ` — ${entry.snippet}` : ''}`,
-            icon: 'file', route: `#/doc/${encodeDocKey(entry.item.docKey)}`, kind: 'Documents',
+            title: entry.item?.title || '(untitled authored document)',
+            meta: `Authored in BotBoy${entry.node?.title ? ` · ${entry.node.title}` : ''}${entry.snippet ? ` — ${entry.snippet}` : ''}`,
+            icon: 'file', route: `#/documents/${encodeURIComponent(entry.item.artifactId)}`, kind: 'Documents',
           }
-        : {
+        : entry.item?.docKey
+          ? {
+              title: entry.item?.title || '(untitled document)',
+              meta: `Synced SharePoint copy${entry.item?.collapsedCount ? ` · ${entry.item.collapsedCount} more capture${entry.item.collapsedCount === 1 ? '' : 's'} collapsed` : ''}${entry.snippet ? ` — ${entry.snippet}` : ''}`,
+              icon: 'file', route: `#/doc/${encodeDocKey(entry.item.docKey)}`, kind: 'Documents',
+            }
+          : {
             title: entry.item?.title || '(untitled evidence)', meta: entry.snippet || entry.item?.summary || 'Evidence',
             icon: sourceIcon(entry.item?.source, entry.item?.type), url: entry.item?.url || '', nodeId: entry.node?.id || '', kind: 'Evidence',
           }));
@@ -5603,6 +5760,7 @@ function bindEvents() {
       renderRoute({ preserveScroll: true, userAction: true });
     }
     if (action === 'documents-save-revision') void saveDocumentRevision(target.dataset.artifact);
+    if (action === 'documents-set-project') void assignDocumentProject(target.dataset.artifact);
     if (action === 'documents-send-answers') sendDocumentAnswers(target.dataset.artifact);
     if (action === 'documents-download') void downloadDocument(target.dataset.artifact, target.dataset.format);
     if (action === 'documents-pandoc-install') void startPandocInstall();

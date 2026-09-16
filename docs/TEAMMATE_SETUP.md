@@ -31,6 +31,63 @@ npm run build
 them for you automatically — the first launch just takes a few minutes
 longer.)
 
+## Updating BotBoy
+
+Use the updater built into the teammate release:
+
+```bash
+cd ~/botboy-app
+./start.sh --update
+```
+
+It preserves all tracked BotBoy customizations as a binary patch under
+`~/.personal-productivity-tracker/update-backups/`, fast-forwards the release,
+and three-way reapplies each customized file independently before rebuilding.
+Customizations that still merge cleanly remain active. If an upstream release
+changes the same lines, BotBoy starts on the new release and preserves only
+those conflicting patches in a clearly named `-needs-reapply` folder for
+BotBoy or the owner to rebase. It never deletes untracked files or anything in
+your local evidence/credentials directory.
+
+BotBoy may customize its own UI/source when you ask. Keep using
+`./start.sh --update` rather than plain `git pull` so those customizations are
+preserved across owner-published releases.
+
+### One-time transition from an older release
+
+If `git pull` already fails with “local changes would be overwritten”, that
+older checkout does not have `./start.sh --update` yet. Run this bridge **once**:
+
+```bash
+cd ~/botboy-app
+mkdir -p ~/.personal-productivity-tracker/update-backups
+STAMP="$(date +%Y%m%d-%H%M%S)"
+PATCH="$HOME/.personal-productivity-tracker/update-backups/pre-updater-$STAMP.patch"
+
+git status --short
+git diff --binary HEAD -- . > "$PATCH"
+git restore --source=HEAD --staged --worktree -- .
+git pull --ff-only
+./start.sh
+
+echo "Saved pre-update customizations: $PATCH"
+```
+
+This first bridge updates to the release that contains the customization-aware
+updater. It deliberately starts the new release without blindly applying an
+old patch across overlapping source changes. The patch keeps every tracked
+customization; if you still want it, ask BotBoy or the owner to reapply/rebase
+that patch against the new version.
+
+Do **not** run `./start.sh --update` again during this same transition—the pull
+has already completed. Starting with the next owner release, the only update
+command is:
+
+```bash
+cd ~/botboy-app
+./start.sh --update
+```
+
 ## Configure + run (download, then start — that's it)
 
 The owner DMs you a **personal, expiring download link** (a private S3
@@ -156,6 +213,7 @@ starts one fresh instance.
 
 | Symptom | Fix |
 |---|---|
+| `git pull` says local changes would be overwritten | Your BotBoy customization changed tracked app files. If this checkout predates `./start.sh --update`, follow **One-time transition from an older release** above: save the full patch, restore, pull, and start once. Do not blindly apply the old patch across changed upstream lines; ask BotBoy/the owner to rebase it if needed. Current releases use only `./start.sh --update`. Never use `git reset --hard`. |
 | Startup error: `Incomplete OAuth config` | One of the two .env lines is missing or misspelled |
 | Startup/chat error mentioning `invalid_client` (HTTP 400) | Credentials wrong or revoked — re-paste from 1Password, or ask the owner to reissue |
 | Chat errors with HTTP 401 | Your client isn't on the gateway allowlist — ask the owner to run their audit |

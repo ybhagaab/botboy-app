@@ -14,7 +14,14 @@ function compareTitle(left, right) {
 }
 
 function searchableDocumentText(document) {
-  return normalizeSearchText([document?.title, document?.profileId, document?.state, document?.artifactId]
+  return normalizeSearchText([
+    document?.title,
+    document?.profileId,
+    document?.state,
+    document?.artifactId,
+    document?.projectId,
+    document?.projectTitle,
+  ]
     .filter(Boolean)
     .join(' '));
 }

@@ -113,12 +113,12 @@
     return links.length ? `<div class="roadmap-links">${links.join('')}</div>` : '';
   }
 
-  function projectTabs(project, brain, active = 'brief') {
+  function projectTabs(project, brain, active = 'brief', documentCount = null) {
     const tabs = [
       ['brief', 'Roadmap'],
       ['tasks', `Tasks ${Array.isArray(brain?.tasks) ? brain.tasks.length : 0}`],
       ['evidence', `Evidence ${Number(project?.itemCount || 0)}`],
-      ['documents', 'Documents'], // mirror of dashboard.js renderProject tabs (map: duplicate list)
+      ['documents', `Documents${typeof documentCount === 'number' ? ` ${documentCount}` : ''}`], // mirror of dashboard.js renderProject tabs (map: duplicate list)
       ['timeline', 'Timeline'],
     ];
     return `<div class="tabs native-layout-tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${active === id ? 'active' : ''}" type="button" role="tab" aria-selected="${active === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div>`;
@@ -145,7 +145,7 @@
     </article>`;
   }
 
-  function renderRoadmap({ project, detail, area, layout, activeTab, rebuilding = false }) {
+  function renderRoadmap({ project, detail, area, layout, activeTab, rebuilding = false, documentCount = null }) {
     if (activeTab !== 'brief') return '';
     const config = layout.config || {};
     const items = Array.isArray(config.items) ? config.items : [];
@@ -173,7 +173,7 @@
     return `<div class="${layoutClass(config)} roadmap-layout">
       <div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${area ? `<a href="#/areas/${encodeURIComponent(area.id)}">${esc(area.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Native roadmap</span></div>
       <header class="page-head roadmap-page-head"><div><div class="eyebrow"><span class="eyebrow-dot"></span>Project · Native roadmap</div><div class="project-title-row"><h1 class="page-title">${esc(title)}</h1><span class="pill accent">${esc(project.status || 'active')}</span></div><p class="project-status-line">${esc(subtitle)}</p><div class="project-meta"><span>${icon('branch', 13)} ${number(grouped.size)} ${esc(groupBy)} groups</span><span>${icon('activity', 13)} ${number(versions.length)} release stages</span><span>${icon('file', 13)} ${number(items.length)} roadmap items</span><span>${icon('shield', 13)} Validated local layout</span></div></div><div class="head-actions"><button class="button" type="button" data-action="rebuild-brain" data-project="${attr(project.id)}" ${rebuilding ? 'disabled' : ''}>${icon('refresh')} ${rebuilding ? 'Rebuilding…' : 'Rebuild brain'}</button><button class="button primary" type="button" data-prompt="${attr(askSeed(title, project.id))}">${icon('sparkles')} Ask BotBoy</button></div></header>
-      ${projectTabs(project, brain, activeTab)}
+      ${projectTabs(project, brain, activeTab, documentCount)}
       ${showSummary ? `<section class="roadmap-summary" aria-label="Roadmap summary"><article class="card roadmap-metric"><span>Total scope</span><strong>${number(items.length)}</strong><small>Tracked roadmap items</small></article><article class="card roadmap-metric"><span>Completed</span><strong>${number(doneCount)}</strong><small>${number(Math.round(doneCount / items.length * 100))}% of visible scope</small></article><article class="card roadmap-metric ${riskCount ? 'has-risk' : ''}"><span>Needs attention</span><strong>${number(riskCount)}</strong><small>Blocked, at risk, or waiting</small></article><article class="card roadmap-metric"><span>GTM milestones</span><strong>${number(gtmCount)}</strong><small>Distinct launch windows</small></article></section>` : ''}
       <section class="roadmap-section"><div class="section-heading roadmap-heading"><div><h2>Release-stage matrix</h2><p>Each marker represents its declared release stage; no duration is inferred from the source.</p></div><div class="roadmap-legend"><span><i class="tone-accent"></i>In motion</span><span><i class="tone-good"></i>Complete</span><span><i class="tone-bad"></i>Attention</span></div></div>
         <div class="card roadmap-scroll" tabindex="0" aria-label="Roadmap matrix, horizontally scrollable"><div class="roadmap-matrix" style="${columnStyle}">

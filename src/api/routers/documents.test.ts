@@ -8,6 +8,8 @@ import { createDocumentsRouter } from './documents.js';
 import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { createContentStore, refToColumns, type ContentStore } from '../../core/content-store.js';
 import type { RouterDeps } from './deps.js';
+import { createProductDocumentPublicationService } from '../../product-manager/product-document-publications.js';
+import type { ProductDocumentArtifact, ProductDocumentService } from '../../product-manager/types.js';
 
 /**
  * Document workbench router (document-workbench R1/R2): grouped project
@@ -93,9 +95,32 @@ describe('documents router', () => {
     insertComment('m1', '2026-08-24T11:00:00Z');
     insertComment('m2', '2026-08-24T12:00:00Z', { resolved: true });
 
-    const res = await request(appWith()).get('/api/projects/p1/documents');
+    const res = await request(appWith({
+      productDocumentService: {
+        listArtifacts: (_limit: number, options?: { projectId?: string }) => options?.projectId === 'p1'
+          ? [{
+              artifactId: 'artifact-p1',
+              projectId: 'p1',
+              state: 'ready_for_review',
+              profileId: 'business_document/adaptive.v1',
+              profileVersion: '1',
+              title: 'Project brief',
+              checkerVersion: 'test',
+              contentChars: 500,
+              validationStatus: 'pass',
+              createdAt: '2026-08-24T09:00:00Z',
+              revisionOrigin: 'chat_authored',
+            }]
+          : [],
+      } as never,
+    })).get('/api/projects/p1/documents');
     expect(res.status).toBe(200);
     expect(res.body.documents).toHaveLength(1);
+    expect(res.body.authoredDocuments).toEqual([expect.objectContaining({
+      artifactId: 'artifact-p1',
+      projectId: 'p1',
+      title: 'Project brief',
+    })]);
     const doc = res.body.documents[0];
     expect(doc.docKey).toBe(DOC_KEY);
     expect(doc.revisionCount).toBe(2);
@@ -307,6 +332,88 @@ describe('documents router', () => {
     expect(calls[0].tool).toBe('sharepoint_read_file');
     const rows = await request(app).get(`/api/documents/pending-edits?docKey=${encodeURIComponent(CREATE_KEY)}`);
     expect(rows.body.edits[0].status).toBe('synced');
+  });
+
+  it('DOCUMENT CATALOG: an approved artifact publication preserves exact-version lineage through capture', async () => {
+    storage.getDb().prepare(`
+      INSERT INTO projects (id, title, one_liner, brain_path, status)
+      VALUES ('p1', 'Catalog', '', '/tmp/catalog-brain', 'active')
+    `).run();
+    const CREATE_KEY = 'amazon-my.sharepoint.com/personal/u_amazon_com/Documents/Published/catalog-strategy.md';
+    const TARGET = '/personal/u_amazon_com/Documents/Published/catalog-strategy.md';
+    const CONTENT = '# Catalog strategy\n\nThis exact immutable artifact version is the canonical publication source.';
+    const artifact = {
+      artifactId: 'artifact-v1',
+      persisted: true,
+      projectId: 'p1',
+      title: 'Catalog strategy',
+      content: CONTENT,
+    } as unknown as ProductDocumentArtifact;
+    const productDocumentService = {
+      getArtifact: (artifactId: string) => artifactId === artifact.artifactId ? artifact : null,
+      listArtifacts: () => [],
+    } as unknown as ProductDocumentService;
+    const publications = createProductDocumentPublicationService(storage.getDb(), productDocumentService, {
+      createId: () => 'publication-integration',
+      now: () => new Date('2026-09-16T01:00:00Z'),
+    });
+    const staged = publications.stage({
+      artifactId: artifact.artifactId,
+      projectId: 'p1',
+      format: 'md',
+      title: artifact.title,
+      serverRelativeUrl: TARGET,
+    });
+    let uploaded = '';
+    const mcpManager = {
+      callTool: async (_id: string, tool: string, args: Record<string, unknown>) => {
+        if (tool === 'sharepoint_read_file' && !uploaded) return { text: 'Error: File not found', isError: true };
+        if (tool === 'sharepoint_write_file') {
+          uploaded = String(args.content ?? '');
+          return { text: JSON.stringify({ result: { webUrl: 'https://x/catalog-strategy.md', driveItemId: 'item-1', eTag: 'etag-1' } }), isError: false };
+        }
+        if (tool === 'sharepoint_read_file') return { text: uploaded, isError: false };
+        throw new Error(`unexpected ${tool}`);
+      },
+    };
+    let enqueueOptions: Record<string, unknown> | undefined;
+    const sharePointSync = {
+      enqueueByPath: (_path: string, options: Record<string, unknown>) => {
+        enqueueOptions = options;
+        return { queued: true, docKey: CREATE_KEY };
+      },
+      drainNow: async () => {
+        publications.recordCapture('publication-integration', 'capture-1', CREATE_KEY);
+        return 1;
+      },
+    };
+    const app = appWith({
+      mcpManager: mcpManager as never,
+      sharePointSync: sharePointSync as never,
+      productDocumentService,
+      productDocumentPublications: publications,
+    });
+
+    await request(app)
+      .post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`)
+      .send({})
+      .expect(200);
+    const synced = await request(app).post('/api/documents/sync').send({ docKey: CREATE_KEY }).expect(200);
+    expect(synced.body).toMatchObject({ uploaded: true, verifiedOnReadBack: true });
+    expect(uploaded).toBe(CONTENT);
+    expect(enqueueOptions).toMatchObject({
+      publicationId: 'publication-integration',
+      sourceArtifactId: 'artifact-v1',
+      projectId: 'p1',
+      exportSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(publications.get('publication-integration')).toMatchObject({
+      status: 'complete',
+      artifactId: 'artifact-v1',
+      capturedWorkItemId: 'capture-1',
+      remoteItemId: 'item-1',
+      remoteEtag: 'etag-1',
+    });
   });
 
   it('AUTHORING BRIDGE: a target that appeared since approval lands conflicted — never overwritten', async () => {

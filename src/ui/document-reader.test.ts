@@ -187,6 +187,9 @@ describe('generated-document reading-first view model', () => {
     expect(source).toContain('data-action="documents-focus"');
     expect(source).toContain("event.stopImmediatePropagation()");
     expect(source).toContain('data-action="documents-save-revision"');
+    expect(source).toContain('data-action="documents-set-project"');
+    expect(source).toContain('data-document-project-assignment');
+    expect(source).toContain('publish_product_document_to_sharepoint');
     expect(source).toContain('Saving never overwrites this version; it creates a new linked one.');
     expect(source).toContain('data-action="documents-delete"');
     expect(source).toContain('window.confirm(`Delete "${title}"?');

@@ -40,6 +40,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
+import { exportDocument } from '../../product-manager/document-exporter.js';
+import { publicationRemoteReceipt, sha256Buffer } from '../../product-manager/product-document-publications.js';
 
 export function createDocumentsRouter(deps: RouterDeps): Router {
   const router = Router();
@@ -54,18 +56,37 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     // tools (document-corpus.ts) so UI and model agree about the corpus.
     // Staged creations (authoring bridge): documents that will exist once
     // approved+synced — they have no corpus row yet, so they ride alongside.
-    const stagedCreations = listStagedCreations(db, projectId).map(creation => ({
-      id: creation.id,
-      docKey: creation.docKey,
-      serverRelativeUrl: creation.serverRelativeUrl,
-      fileName: creation.serverRelativeUrl.split('/').pop() ?? '',
-      status: creation.status,
-      conflictReason: creation.conflictReason,
-      originNote: creation.originNote,
-      createContent: creation.createContent ?? '',
-      createdAt: creation.createdAt,
-    }));
-    res.json({ documents: listDocumentCorpus(db, { projectId }), stagedCreations });
+    const stagedCreations = listStagedCreations(db, projectId).map(creation => {
+      const publication = deps.productDocumentPublications?.findByPendingEdit(creation.id) ?? null;
+      return {
+        id: creation.id,
+        docKey: creation.docKey,
+        serverRelativeUrl: creation.serverRelativeUrl,
+        fileName: creation.serverRelativeUrl.split('/').pop() ?? '',
+        status: creation.status,
+        conflictReason: creation.conflictReason,
+        originNote: creation.originNote,
+        createContent: creation.createContent ?? '',
+        createdAt: creation.createdAt,
+        ...(publication ? {
+          publicationId: publication.publicationId,
+          sourceArtifactId: publication.artifactId,
+          publicationStatus: publication.status,
+        } : {}),
+      };
+    });
+    const publications = deps.productDocumentPublications?.listByProject(projectId) ?? [];
+    const linkedDocKeys = new Set(publications
+      .filter(publication => publication.status === 'complete' && publication.capturedWorkItemId)
+      .map(publication => publication.docKey));
+    const authoredDocuments = deps.productDocumentService?.listArtifacts(100, { projectId }) ?? [];
+    res.json({
+      documents: listDocumentCorpus(db, { projectId })
+        .filter(document => !linkedDocKeys.has(document.docKey)),
+      authoredDocuments,
+      publications,
+      stagedCreations,
+    });
   });
 
   // Corpus-wide listing (chat tools + future cross-project views).
@@ -287,8 +308,20 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const decision = String(req.params.decision ?? '');
     if (decision !== 'approve' && decision !== 'reject') return res.status(404).json({ error: 'unknown action' });
     try {
-      const edit = decidePendingEdit(deps.db, String(req.params.id ?? ''), decision === 'approve' ? 'approved' : 'rejected');
-      res.json({ edit });
+      const edit = deps.db.transaction(() => {
+        const decided = decidePendingEdit(
+          deps.db!,
+          String(req.params.id ?? ''),
+          decision === 'approve' ? 'approved' : 'rejected',
+        );
+        deps.productDocumentPublications?.recordDecision(
+          decided.id,
+          decision === 'approve' ? 'approved' : 'rejected',
+          decision === 'approve' ? decided.approvedAt ?? undefined : undefined,
+        );
+        return decided;
+      })();
+      res.json({ edit, publication: deps.productDocumentPublications?.findByPendingEdit(edit.id) ?? null });
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }
@@ -486,17 +519,38 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
   > {
     const db = deps.db!;
     const mcpManager = deps.mcpManager!;
+    const publication = deps.productDocumentPublications?.findByPendingEdit(creation.id) ?? null;
+    const sourceArtifact = publication
+      ? deps.productDocumentService?.getArtifact(publication.artifactId) ?? null
+      : null;
+    if (publication && !sourceArtifact) {
+      deps.productDocumentPublications?.recordFailure(
+        publication.publicationId,
+        'identity_mismatch',
+        'The staged source artifact no longer exists.',
+      );
+      markEditConflicted(db, creation.id, 'the staged source artifact no longer exists');
+      return {
+        status: 'done',
+        uploaded: false,
+        verifiedOnReadBack: false,
+        results: [{ id: creation.id, applied: false, reason: 'source artifact missing' }],
+      };
+    }
     const mapped = mapSharePointWriteTarget(creation.serverRelativeUrl, creation.siteUrl ?? undefined);
     if (typeof mapped === 'string') {
+      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', mapped);
       markEditConflicted(db, creation.id, mapped);
       return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason: mapped }] };
     }
-    const content = String(creation.createContent ?? '');
+    const content = sourceArtifact?.content ?? String(creation.createContent ?? '');
     // The MCP's savePath allowlist covers the HOME dir but not os.tmpdir()
     // (live find 2026-08-26: /var/folders/... rejected) — staging files live
     // under our own dot-dir.
     const scratchDir = path.join(os.homedir(), '.personal-productivity-tracker', 'tmp');
     fs.mkdirSync(scratchDir, { recursive: true });
+    const isDocx = creation.serverRelativeUrl.toLowerCase().endsWith('.docx');
+    let canonicalExport: Awaited<ReturnType<typeof exportDocument>> | null = null;
 
     // 1. The world may have changed since approval: a file now AT the target
     //    means someone created it — conflict, never overwrite.
@@ -510,6 +564,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     try { fs.unlinkSync(probePath); } catch { /* absent = fine */ }
     if (!probeRead.isError) {
       const reason = 'target already exists on SharePoint — edit the existing document instead';
+      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
       markEditConflicted(db, creation.id, reason);
       return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
     }
@@ -519,8 +574,26 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       return { status: 'failed', error: `could not verify the target is free: ${String(probeRead.text).slice(0, 300)}` };
     }
 
+    if (publication && sourceArtifact) {
+      try {
+        canonicalExport = await exportDocument({
+          title: sourceArtifact.title,
+          content: sourceArtifact.content,
+          format: publication.format === 'md' ? 'markdown' : 'docx',
+        });
+        deps.productDocumentPublications?.recordExport(publication.publicationId, {
+          sha256: sha256Buffer(canonicalExport.data),
+          bytes: canonicalExport.data.length,
+          filename: canonicalExport.filename,
+        });
+      } catch (error) {
+        const message = `Canonical export failed: ${error instanceof Error ? error.message : String(error)}`;
+        deps.productDocumentPublications?.recordFailure(publication.publicationId, 'upload_failed', message);
+        return { status: 'failed', error: message };
+      }
+    }
+
     // 2. Build bytes and upload under the guided waiver.
-    const isDocx = creation.serverRelativeUrl.toLowerCase().endsWith('.docx');
     let tempDir: string | null = null;
     try {
       const writeArgs: Record<string, unknown> = {
@@ -531,21 +604,34 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         ...mapped.siteUrl,
       };
       if (isDocx) {
-        const built = await buildDocxFromMarkdown(content);
-        tempDir = built.tempDir;
-        // Upload from the home scratch dir (same allowlist rule as savePath).
+        // Official publications upload the canonical exporter bytes; generic
+        // authoring-bridge creations retain the lightweight builder.
         const uploadPath = path.join(scratchDir, `create-upload-${creation.id}.docx`);
-        fs.copyFileSync(built.filePath, uploadPath);
+        if (canonicalExport) {
+          fs.writeFileSync(uploadPath, canonicalExport.data);
+        } else {
+          const built = await buildDocxFromMarkdown(content);
+          tempDir = built.tempDir;
+          fs.copyFileSync(built.filePath, uploadPath);
+        }
         writeArgs.sourcePath = uploadPath;
       } else {
-        writeArgs.content = content;
+        writeArgs.content = canonicalExport ? canonicalExport.data.toString('utf8') : content;
       }
       const upload = await mcpManager.callTool('sharepoint', 'sharepoint_write_file', writeArgs, {
         guidedFlow: true, ownerApproved: true, timeoutMs: 120_000,
       });
       if (upload.isError) {
         if (/file is locked/i.test(String(upload.text))) return { status: 'locked' };
-        return { status: 'failed', error: String(upload.text).slice(0, 400) };
+        const message = String(upload.text).slice(0, 400);
+        if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'upload_failed', message);
+        return { status: 'failed', error: message };
+      }
+      if (publication) {
+        deps.productDocumentPublications?.recordUploaded(
+          publication.publicationId,
+          publicationRemoteReceipt(String(upload.text ?? '')),
+        );
       }
 
       // 3. Read-back probes: the document as SharePoint now serves it must
@@ -580,17 +666,73 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         verified = !back.isError && probes.length > 0 && probes.every(probe => String(back.text).includes(probe));
       }
 
+      if (!verified) {
+        const reason = 'upload returned success but SharePoint read-back did not verify the authored content';
+        if (publication) {
+          deps.productDocumentPublications?.recordFailure(
+            publication.publicationId,
+            'verification_failed',
+            reason,
+          );
+        }
+        markEditConflicted(db, creation.id, reason);
+        return {
+          status: 'done',
+          uploaded: true,
+          verifiedOnReadBack: false,
+          results: [{ id: creation.id, applied: false, reason }],
+        };
+      }
+
+      if (publication) deps.productDocumentPublications?.recordVerified(publication.publicationId);
       markEditSynced(db, creation.id);
-      // 4. Corpus ingestion: the document BotBoy just created becomes a
-      //    synced document like any other (reader link live after drain).
+      // 4. Corpus ingestion: a publication is complete only after the
+      // lineage-stamped capture has been durably inserted and linked.
       try {
         const enqueue = deps.sharePointSync?.enqueueByPath(creation.serverRelativeUrl, {
           siteUrl: creation.siteUrl ?? undefined,
+          ...(publication && sourceArtifact ? {
+            publicationId: publication.publicationId,
+            sourceArtifactId: sourceArtifact.artifactId,
+            projectId: publication.projectId,
+            exportSha256: deps.productDocumentPublications?.get(publication.publicationId)?.exportSha256 ?? undefined,
+          } : {}),
         });
-        if (enqueue?.queued) void deps.sharePointSync?.drainNow();
-        console.log(`[Documents] created ${creation.serverRelativeUrl} (verified=${verified}); ingestion ${enqueue?.queued ? 'queued' : `skipped: ${enqueue?.reason ?? 'sync unavailable'}`}`);
-      } catch { /* ingestion is best-effort; discovery heals */ }
-      return { status: 'done', uploaded: true, verifiedOnReadBack: verified, results: [{ id: creation.id, applied: true }] };
+        if (enqueue?.queued) {
+          if (publication) deps.productDocumentPublications?.recordCaptureQueued(publication.publicationId);
+          await deps.sharePointSync?.drainNow();
+        } else if (publication) {
+          deps.productDocumentPublications?.recordFailure(
+            publication.publicationId,
+            'capture_failed',
+            enqueue?.reason ?? 'SharePoint sync is unavailable.',
+          );
+        }
+        console.log(`[Documents] created ${creation.serverRelativeUrl} (verified=true); ingestion ${enqueue?.queued ? 'completed or failed with receipt' : `skipped: ${enqueue?.reason ?? 'sync unavailable'}`}`);
+      } catch (error) {
+        if (publication && deps.productDocumentPublications?.get(publication.publicationId)?.status === 'capture_queued') {
+          deps.productDocumentPublications.recordFailure(
+            publication.publicationId,
+            'capture_failed',
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+      return { status: 'done', uploaded: true, verifiedOnReadBack: true, results: [{ id: creation.id, applied: true }] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (publication) {
+        const current = deps.productDocumentPublications?.get(publication.publicationId);
+        const failureStatus = current?.status === 'uploaded_unverified'
+          ? 'verification_failed'
+          : current?.status === 'approved' || current?.status === 'exported'
+            ? 'upload_failed'
+            : null;
+        if (failureStatus) {
+          try { deps.productDocumentPublications?.recordFailure(publication.publicationId, failureStatus, message); } catch { /* preserve original failure */ }
+        }
+      }
+      return { status: 'failed', error: message };
     } finally {
       if (tempDir) { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ } }
       try { fs.unlinkSync(path.join(scratchDir, `create-upload-${creation.id}.docx`)); } catch { /* absent = fine */ }

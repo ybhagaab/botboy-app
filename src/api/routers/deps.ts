@@ -30,6 +30,7 @@ import type { GraspSync } from '../../monitors/grasp-sync.js';
 import type { SharePointSync } from '../../monitors/sharepoint-sync.js';
 import type { AnalyticsDashboardService, DashboardPublisherService } from '../../core/analytics-types.js';
 import type { ProductDocumentService, WritingConfigStore } from '../../product-manager/types.js';
+import type { ProductDocumentPublicationService } from '../../product-manager/product-document-publications.js';
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
 import type { ContentStore } from '../../core/content-store.js';
 import type { DocumentParser } from '../../core/document-parser.js';
@@ -63,6 +64,7 @@ export interface RouterDeps {
   analyticsService?: AnalyticsDashboardService;
   dashboardPublisher?: DashboardPublisherService;
   productDocumentService?: ProductDocumentService;
+  productDocumentPublications?: ProductDocumentPublicationService;
   writingConfigStore?: WritingConfigStore;
   chatTerminal?: ChatTerminalService;
   /** Evidence content reads (document workbench reader). */

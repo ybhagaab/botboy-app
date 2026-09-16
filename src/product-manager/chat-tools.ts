@@ -6,6 +6,7 @@ import type { ToolCall } from '../core/llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from '../core/tool-executor.js';
 import { DocumentExportError, exportDocument, isDocumentExportFormat } from './document-exporter.js';
 import { DOCUMENT_MATURITIES } from './types.js';
+import type { ProductDocumentPublicationService } from './product-document-publications.js';
 import type {
   DocumentMaturity,
   ProductDocumentArtifact,
@@ -101,6 +102,7 @@ function saveReceipt(artifact: ProductDocumentArtifact) {
     ok: artifact.persisted,
     persisted: artifact.persisted,
     artifactId: artifact.artifactId,
+    ...(artifact.projectId ? { projectId: artifact.projectId, unassigned: false } : { unassigned: true }),
     title: brief(artifact.title),
     state: artifact.state,
     maturity: artifact.maturity,
@@ -146,6 +148,7 @@ function saveReceipt(artifact: ProductDocumentArtifact) {
 export function withProductDocumentChatTools(
   base: ToolExecutor,
   service: ProductDocumentService,
+  publications?: ProductDocumentPublicationService,
 ): ToolExecutor {
   return {
     async executeTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
@@ -161,6 +164,57 @@ export function withProductDocumentChatTools(
           return result(call, { ok: true, ...guide });
         } catch (error) {
           return errorResult(call, error instanceof Error ? error.message : 'Loading the writing guide failed.');
+        }
+      }
+
+      if (call.function.name === 'publish_product_document_to_sharepoint') {
+        const args = parseArguments(call);
+        if (!args) return errorResult(call, 'Tool arguments must be one JSON object.');
+        if (!publications) return errorResult(call, 'Product-document publication service is unavailable.');
+        if (args.ownerRequested !== true) {
+          return errorResult(call, 'ownerRequested must be true — stage publication only when the owner asked to share this document.');
+        }
+        const artifactId = typeof args.artifactId === 'string' ? args.artifactId.trim() : '';
+        const projectId = typeof args.projectId === 'string' ? args.projectId.trim() : '';
+        const format = args.format === 'md' || args.format === 'docx' ? args.format : null;
+        const title = typeof args.title === 'string' ? args.title.trim() : '';
+        if (!artifactId || !projectId || !format) {
+          return errorResult(call, 'artifactId, projectId, and format (md or docx) are required.');
+        }
+        try {
+          const staged = publications.stage({
+            artifactId,
+            projectId,
+            format,
+            title,
+            ...(typeof args.serverRelativeUrl === 'string' && args.serverRelativeUrl.trim()
+              ? { serverRelativeUrl: args.serverRelativeUrl.trim() }
+              : {}),
+            ...(typeof args.targetFolder === 'string' && args.targetFolder.trim()
+              ? { targetFolder: args.targetFolder.trim() }
+              : {}),
+            ...(typeof args.siteUrl === 'string' && args.siteUrl.trim()
+              ? { siteUrl: args.siteUrl.trim() }
+              : {}),
+            ...(typeof args.purpose === 'string' && args.purpose.trim()
+              ? { purpose: args.purpose.trim().slice(0, 200) }
+              : {}),
+          });
+          return result(call, {
+            ok: true,
+            status: 'staged',
+            publicationId: staged.publication.publicationId,
+            pendingEditId: staged.pendingEdit.id,
+            artifactId,
+            projectId,
+            format,
+            docKey: staged.publication.docKey,
+            destination: staged.publication.serverRelativeUrl,
+            approveAt: `#/projects/${encodeURIComponent(projectId)}`,
+            next: 'Publication is staged only. The owner must approve it in the project Documents tab; claim upload, verification, and capture only from later receipts.',
+          });
+        } catch (error) {
+          return errorResult(call, error instanceof Error ? error.message : 'Could not stage the publication.');
         }
       }
 
@@ -197,6 +251,7 @@ export function withProductDocumentChatTools(
             canonicalExport: true,
             source: 'official_product_document',
             artifactId: artifact.artifactId,
+            ...(artifact.projectId ? { projectId: artifact.projectId } : { unassigned: true }),
             title: brief(artifact.title),
             format: args.format,
             filename: exported.filename,
@@ -246,6 +301,18 @@ export function withProductDocumentChatTools(
       if (args.parentArtifactId !== undefined && (typeof args.parentArtifactId !== 'string' || !args.parentArtifactId.trim())) {
         return errorResult(call, 'parentArtifactId must be a non-empty artifact ID when provided.');
       }
+      if (args.projectId !== undefined && (typeof args.projectId !== 'string' || !args.projectId.trim())) {
+        return errorResult(call, 'projectId must be a non-empty exact project ID when provided.');
+      }
+      if (args.unassigned !== undefined && typeof args.unassigned !== 'boolean') {
+        return errorResult(call, 'unassigned must be boolean when provided.');
+      }
+      if (args.parentArtifactId === undefined) {
+        const hasProject = typeof args.projectId === 'string' && Boolean(args.projectId.trim());
+        if (hasProject === (args.unassigned === true)) {
+          return errorResult(call, 'A new document requires exactly one filing choice: projectId or unassigned=true.');
+        }
+      }
       if (args.citations !== undefined && !Array.isArray(args.citations)) {
         return errorResult(call, 'citations must be an array of {id, label, source?, date?, quote?, workItemId?, url?} matching inline [cN] markers.');
       }
@@ -257,6 +324,8 @@ export function withProductDocumentChatTools(
           ...(args.maturity !== undefined ? { maturity: args.maturity as DocumentMaturity } : {}),
           ...(args.steMode !== undefined ? { steMode: args.steMode as SteEnforcementMode } : {}),
           ...(args.profileId !== undefined ? { profileId: (args.profileId as string).trim() } : {}),
+          ...(args.projectId !== undefined ? { projectId: (args.projectId as string).trim() } : {}),
+          ...(args.unassigned === true ? { unassigned: true } : {}),
           ...(args.parentArtifactId !== undefined ? { parentArtifactId: (args.parentArtifactId as string).trim() } : {}),
           ...(args.citations !== undefined ? { citations: args.citations as SaveAuthoredDocumentRequest['citations'] } : {}),
         });

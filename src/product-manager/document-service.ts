@@ -725,11 +725,63 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
     return dependencies.contextResolver.resolve(config.config, { allowAssumptionDraft });
   };
 
+  const requireAssignableProject = (projectId: string) => {
+    if (!projectId || projectId.length > 200) {
+      throw new ProductDocumentRequestError('projectId must be a non-empty bounded string.');
+    }
+    const project = dependencies.resolveProject?.(projectId);
+    if (dependencies.resolveProject && !project) {
+      throw new ProductDocumentRequestError(`Project '${projectId}' does not exist.`);
+    }
+    if (project && project.status !== 'active' && project.status !== 'paused') {
+      throw new ProductDocumentRequestError(`Project '${project.title}' is ${project.status}; choose an active or paused project.`);
+    }
+    return projectId;
+  };
+
+  /** New roots require an explicit filing decision. Revisions inherit and may
+   * not smuggle a chain move through ordinary authoring. */
+  const resolveArtifactProject = (
+    request: { projectId?: unknown; unassigned?: unknown },
+    parent: ProductDocumentArtifact | null,
+  ): string | undefined => {
+    const suppliedProject = request.projectId === undefined
+      ? undefined
+      : typeof request.projectId === 'string'
+        ? request.projectId.trim()
+        : null;
+    if (suppliedProject === null || (request.unassigned !== undefined && typeof request.unassigned !== 'boolean')) {
+      throw new ProductDocumentRequestError('projectId must be a string and unassigned must be boolean.');
+    }
+    if (parent) {
+      if (request.unassigned === true || (suppliedProject !== undefined && suppliedProject !== parent.projectId)) {
+        throw new ProductDocumentRequestError('Revisions inherit the parent project. Use the separate project-link action to move the full chain.');
+      }
+      return parent.projectId;
+    }
+    const hasProject = Boolean(suppliedProject);
+    const explicitlyUnassigned = request.unassigned === true;
+    if (hasProject === explicitlyUnassigned) {
+      throw new ProductDocumentRequestError('A new document requires exactly one filing choice: projectId or unassigned=true.');
+    }
+    return hasProject ? requireAssignableProject(suppliedProject!) : undefined;
+  };
+
   return {
     listProfiles: () => dependencies.registry.listProfiles(),
     listOverlays: () => dependencies.registry.listOverlays(),
-    listArtifacts: (limit) => dependencies.store?.list(limit) ?? [],
+    listArtifacts: (limit, options) => dependencies.store?.list(limit, options) ?? [],
     getArtifact: (artifactId) => dependencies.store?.get(artifactId) ?? null,
+    assignArtifactProject: (artifactId, projectId) => {
+      if (!dependencies.store) throw new ProductDocumentRequestError('Product-document store is not available.');
+      const normalized = projectId === undefined ? undefined : requireAssignableProject(projectId.trim());
+      try {
+        return dependencies.store.assignProject(artifactId, normalized);
+      } catch (error) {
+        if (error instanceof ProductDocumentRequestError) throw error;
+        throw new ProductDocumentRequestError(error instanceof Error ? error.message : 'Could not assign the document chain.');
+      }
+    },
     deleteArtifact: (artifactId) => dependencies.store?.remove(artifactId) ?? false,
     getSteBundleReadiness: () => dependencies.steBundleLoader.load(),
 
@@ -772,6 +824,10 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
       const parentArtifact = request.parentArtifactId
         ? dependencies.store?.get(request.parentArtifactId) ?? null
         : null;
+      if (request.parentArtifactId && !parentArtifact) {
+        throw new ProductDocumentRequestError('The artifact being revised does not exist. Omit parentArtifactId for a new document or use an artifactId from the Documents list.');
+      }
+      const projectId = resolveArtifactProject(request, parentArtifact);
       const parentVersion = parentArtifact && parentArtifact.content.trim()
         ? { artifactId: parentArtifact.artifactId, title: parentArtifact.title, content: parentArtifact.content }
         : undefined;
@@ -806,6 +862,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
         const emptyEvidence: SourceEvidenceIndex = { units: [], truncated: false };
         return saveArtifact({
           artifactId: createArtifactId(),
+          ...(projectId === undefined ? {} : { projectId }),
           state: 'blocked_for_context',
           profileId: profile.profile_id,
           profileVersion: profile.version,
@@ -970,6 +1027,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
           : 'ready_for_review';
       return saveArtifact({
         artifactId: createArtifactId(),
+        ...(projectId === undefined ? {} : { projectId }),
         state,
         profileId: profile.profile_id,
         profileVersion: profile.version,
@@ -1040,6 +1098,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
       const createdAt = now();
       return saveArtifact({
         artifactId: createArtifactId(),
+        ...(parent.projectId === undefined ? {} : { projectId: parent.projectId }),
         // Owner-authored content is always a usable draft: validation findings
         // are informational for the owner's own document, never a gate.
         state: 'draft_review',
@@ -1106,6 +1165,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
       if (request.parentArtifactId && !parent) {
         throw new ProductDocumentRequestError('The artifact being revised does not exist. Omit parentArtifactId for a new document or use an artifactId from the Documents list.');
       }
+      const projectId = resolveArtifactProject(request, parent);
       // Citations: bounded normalization, never a gate. Malformed entries are
       // dropped rather than rejected — a missing annotation must not lose a
       // document.
@@ -1296,6 +1356,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
       }
       return saveArtifact({
         artifactId: createArtifactId(),
+        ...(projectId === undefined ? {} : { projectId }),
         // Advisory-only by design: findings inform review, never gate it.
         state: 'ready_for_review',
         profileId: profile.profile_id,

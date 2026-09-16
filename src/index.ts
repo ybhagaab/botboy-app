@@ -53,6 +53,7 @@ import { createSteChecker } from './product-manager/ste-checker.js';
 import { createDocumentValidator } from './product-manager/document-validator.js';
 import { createProductDocumentService } from './product-manager/document-service.js';
 import { createProductDocumentStore } from './product-manager/product-document-store.js';
+import { createProductDocumentPublicationService } from './product-manager/product-document-publications.js';
 import { withProductDocumentChatTools } from './product-manager/chat-tools.js';
 import { createAgent } from './core/agent.js';
 import type { AgentOrchestrator } from './core/agent.js';
@@ -106,7 +107,7 @@ process.on('uncaughtException', (err: any) => {
   console.error('[UNCAUGHT EXCEPTION]', err?.message || err);
 });
 
-/** Ensure the agent workspace has symlinks to the actual source code + config */
+/** Ensure the agent workspace has symlinks to the actual source code + config. */
 function ensureAgentWorkspace() {
   const home = process.env.HOME || '';
   const wsDir = path.join(home, '.personal-productivity-tracker', 'workspace');
@@ -117,7 +118,9 @@ function ensureAgentWorkspace() {
     fs.mkdirSync(d, { recursive: true });
   }
 
-  // Symlink src/ and dist/ so the agent can read/write code
+  // Expose source/build to every BotBoy owner: personal UI modification is a
+  // supported product capability. The update workflow preserves/reapplies
+  // tracked customizations across owner-published releases.
   for (const dir of ['src', 'dist']) {
     const link = path.join(wsDir, dir);
     const target = path.join(projectDir, dir);
@@ -146,8 +149,6 @@ function ensureAgentWorkspace() {
       if (srcStat.mtimeMs > dstMtime) fs.copyFileSync(src, dst);
     } catch {}
   }
-
-  console.log('✅ Agent workspace ready (symlinks + config synced)');
 }
 
 // Shown while initialization runs. Self-contained (no static assets — those
@@ -370,7 +371,14 @@ async function main() {
     validator: productDocumentValidator,
     steBundleLoader,
     store: productDocumentStore,
+    resolveProject: (projectId) => {
+      const row = db.prepare('SELECT id, title, status FROM projects WHERE id = ?').get(projectId) as
+        | { id: string; title: string; status: string }
+        | undefined;
+      return row ?? null;
+    },
   });
+  const productDocumentPublications = createProductDocumentPublicationService(db, productDocumentService);
   const steReadiness = steBundleLoader.load();
   console.log(
     `✅ Product-manager writing system ready (${profileRegistry.listProfiles().length} profiles; STE bundle: ${steReadiness.ready ? 'approved' : steReadiness.available ? 'pending or invalid' : 'missing'})`,
@@ -432,7 +440,11 @@ async function main() {
     visualAssets,
     visualInspector,
   });
-  const toolExecutor = withProductDocumentChatTools(baseToolExecutor, productDocumentService);
+  const toolExecutor = withProductDocumentChatTools(
+    baseToolExecutor,
+    productDocumentService,
+    productDocumentPublications,
+  );
 
   // Backward-compat: llmClient implements sendPrompt() for components not yet migrated
   const acpClient = llmClient; // alias — same interface
@@ -584,9 +596,33 @@ async function main() {
 
   // ── Pipeline: event bus → dedup → classify → store ──
   eventBus.on(async (item: RawWorkItem) => {
+    const awaitedPublicationCapture = item.source === 'sharepoint'
+      && item.type === 'document_capture'
+      && Boolean(String(item.metadata?.publicationId ?? '').trim());
     try {
-    // Dedup check (in-memory for Slack cross-platform)
-    if (dedup.isDuplicate(item)) return;
+    const publicationId = awaitedPublicationCapture
+      ? String(item.metadata?.publicationId ?? '').trim()
+      : '';
+    const publication = publicationId ? productDocumentPublications.get(publicationId) : null;
+    const publicationDocKey = String(item.metadata?.docKey ?? '').trim();
+    const publicationIdentityValid = Boolean(publication
+      && publication.artifactId === String(item.metadata?.sourceArtifactId ?? '')
+      && publication.projectId === String(item.metadata?.publicationProjectId ?? '')
+      && publication.docKey === publicationDocKey
+      && (publication.status === 'capture_queued' || publication.status === 'verified'));
+    if (publication && !publicationIdentityValid
+      && (publication.status === 'uploaded_unverified'
+        || publication.status === 'verified'
+        || publication.status === 'capture_queued')) {
+      productDocumentPublications.recordFailure(
+        publication.publicationId,
+        'identity_mismatch',
+        'SharePoint capture lineage did not match the staged artifact, project, and destination identity.',
+      );
+    }
+    // Dedup check (in-memory for Slack cross-platform). Publication captures
+    // must reach the durable URL/DB path so their receipt can be linked.
+    if (!publicationIdentityValid && dedup.isDuplicate(item)) return;
     dedup.register(item);
 
     // DB-level dedup for clipboard: skip if same content_hash exists in last hour.
@@ -756,6 +792,15 @@ async function main() {
               updateMetadata();
             }
           }
+          if (publicationIdentityValid && publication) {
+            db.prepare('UPDATE work_items SET project_id = ? WHERE id = ?')
+              .run(publication.projectId, existing.id);
+            productDocumentPublications.recordCapture(
+              publication.publicationId,
+              existing.id,
+              publicationDocKey,
+            );
+          }
           return; // Skip creating a duplicate when in-place enrichment is safe.
         }
       }
@@ -821,8 +866,8 @@ async function main() {
       db.prepare(`
         INSERT INTO work_items (id, type, source, source_app, title, summary, url, file_path, content_hash, screenshot_path,
           raw_text, content_storage, content_path, content_sha256, content_bytes,
-          metadata, captured_at, process_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          metadata, captured_at, process_state, project_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, item.type, item.source, item.sourceApp,
         title, preview,
@@ -833,6 +878,7 @@ async function main() {
         cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes,
         JSON.stringify(metadata), item.capturedAt.toISOString(),
         needsExtraction ? 'captured' : 'extracted',
+        publicationIdentityValid && publication ? publication.projectId : null,
       );
 
       // Full-text search index over title + full content (no prefix).
@@ -840,16 +886,26 @@ async function main() {
         db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)')
           .run(id, title ?? '', content);
       } catch { /* FTS is best-effort; failure here must not lose the item */ }
+      if (publicationIdentityValid && publication) {
+        productDocumentPublications.recordCapture(
+          publication.publicationId,
+          id,
+          publicationDocKey,
+          item.capturedAt.toISOString(),
+        );
+      }
     } catch (dbErr: any) {
       failures.record({ itemId: id, step: 'capture', message: `insert failed: ${dbErr.message}`, retryable: true });
       console.error(`[DB] Insert failed for ${item.source}/${item.type}: ${dbErr.message}`);
-      return; // Don't crash — skip this item
+      if (awaitedPublicationCapture) throw dbErr;
+      return; // Ordinary monitors stay fail-soft.
     }
 
     // NOTE: no per-item embedding here (R10.1 — removes the local hot loop).
     // Routing into projects happens in the batched interpretation passes.
     } catch (outerErr: any) {
       console.error(`[EventBus] Handler error for ${item.source}/${item.type}: ${outerErr.message}`);
+      if (awaitedPublicationCapture) throw outerErr;
     }
   });
 
@@ -939,7 +995,7 @@ async function main() {
   // Read-only MCP calls; documents flow through the same capture handler.
   // The parser powers the large-file lane (self-parsed in the drain).
   const sharePointSync = createSharePointSync({
-    db, mcpManager, documentParser, contentStore, emit: item => eventBus.emit(item),
+    db, mcpManager, documentParser, contentStore, emit: item => eventBus.emitAndWait(item),
   });
 
   // R12.3: one-time ingestion of pre-existing files per enabled folder. A
@@ -986,6 +1042,7 @@ async function main() {
     analyticsService,
     dashboardPublisher,
     productDocumentService,
+    productDocumentPublications,
     writingConfigStore,
     chatTerminal,
     etlOnboarding,

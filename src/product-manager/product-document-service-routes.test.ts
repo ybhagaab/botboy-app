@@ -132,7 +132,7 @@ function modelJson(content = opContent, claims = opClaims()): string {
   });
 }
 
-function makeFixture(responseContent = modelJson()): {
+function makeFixture(responseContent = modelJson(), options: { persist?: boolean } = {}): {
   service: ProductDocumentService;
   configStore: ReturnType<typeof createWritingConfigStore>;
   calls: ChatCompletionRequest[];
@@ -142,7 +142,14 @@ function makeFixture(responseContent = modelJson()): {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-pm-service-'));
   cleanup.push(home);
   const db = new Database(':memory:');
-  db.exec('CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)');
+  db.exec(`
+    CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE projects (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+    INSERT INTO projects (id, title, status) VALUES
+      ('proj-active', 'Active project', 'active'),
+      ('proj-paused', 'Paused project', 'paused'),
+      ('proj-archived', 'Archived project', 'archived');
+  `);
   const registry = createProfileRegistry();
   const configStore = createWritingConfigStore(db, { homeDir: home });
   const parser: DocumentParser = {
@@ -177,6 +184,8 @@ function makeFixture(responseContent = modelJson()): {
       };
     },
   } as unknown as LlmClient;
+  let artifactCounter = 0;
+  const store = options.persist ? createProductDocumentStore(db) : undefined;
   const service = createProductDocumentService({
     llmClient,
     promptManager: createPromptManager(),
@@ -186,8 +195,15 @@ function makeFixture(responseContent = modelJson()): {
     glossaryResolver,
     validator,
     steBundleLoader,
+    ...(store ? { store } : {}),
+    resolveProject: (projectId) => {
+      const row = db.prepare('SELECT id, title, status FROM projects WHERE id = ?').get(projectId) as
+        | { id: string; title: string; status: string }
+        | undefined;
+      return row ?? null;
+    },
     now: () => new Date('2026-08-08T15:00:00.000Z'),
-    createArtifactId: () => 'artifact-test-1',
+    createArtifactId: () => options.persist ? `artifact-test-${++artifactCounter}` : 'artifact-test-1',
   });
   return {
     service,
@@ -198,12 +214,17 @@ function makeFixture(responseContent = modelJson()): {
   };
 }
 
-function buildApp(service?: ProductDocumentService, configStore?: ReturnType<typeof createWritingConfigStore>) {
+function buildApp(
+  service?: ProductDocumentService,
+  configStore?: ReturnType<typeof createWritingConfigStore>,
+  publications?: import('./product-document-publications.js').ProductDocumentPublicationService,
+) {
   const app = express();
   app.use(express.json());
   app.use('/api', createProductDocumentsRouter({
     nodeManager: {} as never,
     ...(service ? { productDocumentService: service } : {}),
+    ...(publications ? { productDocumentPublications: publications } : {}),
     ...(configStore ? { writingConfigStore: configStore } : {}),
   }));
   return app;
@@ -213,6 +234,7 @@ describe('native product-manager generation service', () => {
   it('uses the native no-tool persona, structured output, manifests, and deterministic validation', async () => {
     const fixture = makeFixture();
     const artifact = await fixture.service.generate({
+      unassigned: true,
       profileId: 'op_roadmap_vision.v1',
       prompt: 'Draft the proposed operating plan without inventing evidence.',
       steMode: 'advisory',
@@ -250,6 +272,7 @@ describe('native product-manager generation service', () => {
     fs.rmSync(overview);
 
     const artifact = await fixture.service.generate({
+      unassigned: true,
       profileId: 'op_roadmap_vision.v1',
       prompt: 'Draft the plan.',
       inputs: opInputs,
@@ -262,6 +285,7 @@ describe('native product-manager generation service', () => {
   it('rejects malformed structured model output without treating free text as a draft', async () => {
     const fixture = makeFixture('not json');
     await expect(fixture.service.generate({
+      unassigned: true,
       profileId: 'op_roadmap_vision.v1',
       prompt: 'Draft the plan.',
       inputs: opInputs,
@@ -273,6 +297,7 @@ describe('native product-manager generation service', () => {
     generated.claims[0].caveat = null;
     const fixture = makeFixture(JSON.stringify(generated));
     const artifact = await fixture.service.generate({
+      unassigned: true,
       profileId: 'op_roadmap_vision.v1',
       prompt: 'Draft the plan.',
       inputs: opInputs,
@@ -348,6 +373,7 @@ describe('product-document HTTP API', () => {
     const email = await request(app)
       .post('/api/product-documents/email/draft')
       .send({
+        unassigned: true,
         prompt: 'Draft an information-only email.',
         steMode: 'advisory',
         inputs: {
@@ -377,7 +403,7 @@ describe('product-document HTTP API', () => {
     const fixture = makeFixture('free text, not JSON');
     const response = await request(buildApp(fixture.service, fixture.configStore))
       .post('/api/product-documents/generate')
-      .send({ profileId: 'op_roadmap_vision.v1', prompt: 'Draft the plan.', inputs: opInputs })
+      .send({ profileId: 'op_roadmap_vision.v1', prompt: 'Draft the plan.', inputs: opInputs, unassigned: true })
       .expect(502);
     expect(response.body).toEqual({ error: 'The model did not return valid JSON.', code: 'malformed_output' });
   });
@@ -394,6 +420,7 @@ describe('document authoring mode routing and detail preservation', () => {
       findings: [{ aspect: 'style', severity: 'note', message: 'Consistent terminology throughout.' }],
     }));
     const artifact = await fixture.service.saveAuthoredDocument({
+      unassigned: true,
       title: 'AppsFlyer & CleverTap 3P SDK Requirements',
       content: '# Requirements\n\nComplete chat-authored document body with every supplied table preserved. [c1]',
       citations: [
@@ -425,6 +452,7 @@ describe('document authoring mode routing and detail preservation', () => {
     expect(artifact.state).not.toBe('blocked_validation');
 
     await expect(fixture.service.saveAuthoredDocument({
+      unassigned: true,
       title: 'Orphan revision',
       content: 'Revision body.',
       parentArtifactId: 'missing-artifact-id',
@@ -443,6 +471,7 @@ describe('document authoring mode routing and detail preservation', () => {
       correctedContent: correctedDocument,
     }));
     const corrected = await fixture.service.saveAuthoredDocument({
+      unassigned: true,
       title: 'Launch decision',
       content: authored,
       profileId: 'business_document/adaptive.v1',
@@ -459,6 +488,7 @@ describe('document authoring mode routing and detail preservation', () => {
       correctedContent: '# Too short',
     }));
     const refused = await fixture.service.saveAuthoredDocument({
+      unassigned: true,
       title: 'Launch decision',
       content: authored,
     });
@@ -474,6 +504,7 @@ describe('document authoring mode routing and detail preservation', () => {
 
     expect(toolNames).toContain('write_file');
     expect(toolNames).toContain('save_product_document');
+    expect(toolNames).toContain('publish_product_document_to_sharepoint');
     expect(toolNames).toContain('get_document_writing_guide');
     expect(toolNames).not.toContain('generate_product_document');
     expect(toolNames).not.toContain('list_product_document_profiles');
@@ -516,10 +547,82 @@ describe('document authoring mode routing and detail preservation', () => {
 });
 
 
+describe('authored document project ownership', () => {
+  it('requires an explicit filing choice, validates projects, and inherits ownership across revisions', async () => {
+    const fixture = makeFixture(modelJson(), { persist: true });
+
+    await expect(fixture.service.saveAuthoredDocument({
+      title: 'Unfiled by omission',
+      content: '# Draft\n\nThis request omitted an explicit filing decision.',
+    })).rejects.toThrow('exactly one filing choice');
+    await expect(fixture.service.saveAuthoredDocument({
+      projectId: 'missing-project',
+      title: 'Unknown project',
+      content: '# Draft\n\nThis request names a project that does not exist.',
+    })).rejects.toThrow("does not exist");
+    await expect(fixture.service.saveAuthoredDocument({
+      projectId: 'proj-archived',
+      title: 'Archived project',
+      content: '# Draft\n\nThis request tries to file new work into an archived project.',
+    })).rejects.toThrow('is archived');
+
+    const root = await fixture.service.saveAuthoredDocument({
+      projectId: 'proj-active',
+      title: 'Project document',
+      content: '# Project document\n\nThe canonical project-owned authored document.',
+    });
+    const revision = await fixture.service.ownerRevision({
+      parentArtifactId: root.artifactId,
+      content: '# Project document\n\nThe complete owner-authored revision.',
+    });
+    expect(root.projectId).toBe('proj-active');
+    expect(revision.projectId).toBe('proj-active');
+    expect(fixture.service.listArtifacts(10, { projectId: 'proj-active' }))
+      .toHaveLength(2);
+
+    await expect(fixture.service.saveAuthoredDocument({
+      parentArtifactId: root.artifactId,
+      projectId: 'proj-paused',
+      title: 'Invalid move',
+      content: '# Project document\n\nA revision cannot move the chain.',
+    })).rejects.toThrow('Revisions inherit');
+  });
+
+  it('relinks or unlinks the complete connected chain atomically', async () => {
+    const fixture = makeFixture(modelJson(), { persist: true });
+    const root = await fixture.service.saveAuthoredDocument({
+      unassigned: true,
+      title: 'Legacy-style chain',
+      content: '# Root\n\nAn explicitly unassigned root document.',
+    });
+    const child = await fixture.service.ownerRevision({
+      parentArtifactId: root.artifactId,
+      content: '# Child\n\nA first child revision.',
+    });
+    const leaf = await fixture.service.ownerRevision({
+      parentArtifactId: child.artifactId,
+      content: '# Leaf\n\nA second child revision.',
+    });
+
+    const linked = fixture.service.assignArtifactProject(child.artifactId, 'proj-paused');
+    expect(linked.updated).toBe(3);
+    expect(linked.artifactIds).toEqual([root.artifactId, child.artifactId, leaf.artifactId].sort());
+    expect(fixture.service.listArtifacts(10, { projectId: 'proj-paused' })).toHaveLength(3);
+    expect(fixture.service.getArtifact(root.artifactId)?.projectId).toBe('proj-paused');
+    expect(fixture.service.getArtifact(leaf.artifactId)?.projectId).toBe('proj-paused');
+
+    const unlinked = fixture.service.assignArtifactProject(leaf.artifactId, undefined);
+    expect(unlinked.updated).toBe(3);
+    expect(fixture.service.listArtifacts(10, { unassigned: true })).toHaveLength(3);
+    expect(fixture.service.getArtifact(child.artifactId)).not.toHaveProperty('projectId');
+  });
+});
+
 describe('non-publication review readiness', () => {
   it('keeps discussion items visible without reopening a ready artifact generation loop', async () => {
     const fixture = makeFixture();
     const artifact = await fixture.service.generate({
+      unassigned: true,
       profileId: 'op_roadmap_vision.v1',
       prompt: 'Draft an alignment operating plan without inventing evidence.',
       maturity: 'alignment',
@@ -552,12 +655,61 @@ describe('artifact deletion and local export', () => {
   function storeBackedService() {
     const store = createProductDocumentStore(new Database(':memory:'));
     const service = {
-      listArtifacts: (limit: number) => store.list(limit),
+      listArtifacts: (limit: number, options?: Parameters<typeof store.list>[1]) => store.list(limit, options),
       getArtifact: (artifactId: string) => store.get(artifactId),
+      assignArtifactProject: (artifactId: string, projectId: string | undefined) => store.assignProject(artifactId, projectId),
       deleteArtifact: (artifactId: string) => store.remove(artifactId),
     } as unknown as ProductDocumentService;
     return { store, service };
   }
+
+  it('migrates legacy artifact tables to explicit Unassigned project ownership', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE product_document_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        schema_version TEXT NOT NULL,
+        state TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        profile_version TEXT NOT NULL,
+        title TEXT NOT NULL,
+        model TEXT,
+        checker_version TEXT NOT NULL,
+        content_chars INTEGER NOT NULL,
+        validation_status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        artifact_json TEXT NOT NULL
+      );
+    `);
+    const legacy = fakeArtifact('legacy');
+    db.prepare(`
+      INSERT INTO product_document_artifacts
+        (artifact_id, schema_version, state, profile_id, profile_version, title, model,
+         checker_version, content_chars, validation_status, created_at, artifact_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      legacy.artifactId,
+      'product-document-artifact.v1',
+      legacy.state,
+      legacy.profileId,
+      legacy.profileVersion,
+      legacy.title,
+      null,
+      legacy.checkerVersion,
+      legacy.content.length,
+      legacy.validation.status,
+      legacy.createdAt,
+      JSON.stringify({ ...legacy, schemaVersion: 'product-document-artifact.v1' }),
+    );
+
+    const store = createProductDocumentStore(db);
+    expect((db.prepare('PRAGMA table_info(product_document_artifacts)').all() as Array<{ name: string }>)
+      .map(column => column.name)).toContain('project_id');
+    expect(store.get('legacy')).not.toHaveProperty('projectId');
+    expect(store.list(10, { unassigned: true }).map(entry => entry.artifactId)).toEqual(['legacy']);
+    expect((db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+      .map(index => index.name)).toContain('idx_product_document_artifacts_project_created');
+  });
 
   it('removes one version and re-links its children to the deleted version parent', () => {
     const { store } = storeBackedService();
@@ -571,6 +723,51 @@ describe('artifact deletion and local export', () => {
     expect(summaries.map((entry) => entry.artifactId).sort()).toEqual(['leaf', 'root']);
     expect(summaries.find((entry) => entry.artifactId === 'leaf')?.parentArtifactId).toBe('root');
     expect(store.remove('middle')).toBe(false);
+  });
+
+  it('assigns the complete chain over HTTP and supports project/unassigned filters', async () => {
+    const { store, service } = storeBackedService();
+    store.save(fakeArtifact('project-root'));
+    store.save(fakeArtifact('project-child', 'project-root'));
+    const app = buildApp(service);
+
+    const linked = await request(app)
+      .put('/api/product-documents/project-child/project')
+      .send({ projectId: 'proj-active' })
+      .expect(200);
+    expect(linked.body.assignment).toMatchObject({ projectId: 'proj-active', updated: 2 });
+    expect((await request(app).get('/api/product-documents?projectId=proj-active').expect(200)).body.documents)
+      .toHaveLength(2);
+    expect((await request(app).get('/api/product-documents?unassigned=true').expect(200)).body.documents)
+      .toHaveLength(0);
+
+    await request(app)
+      .put('/api/product-documents/project-root/project')
+      .send({ unassigned: true })
+      .expect(200);
+    expect((await request(app).get('/api/product-documents?unassigned=true').expect(200)).body.documents)
+      .toHaveLength(2);
+    await request(app).put('/api/product-documents/project-root/project').send({}).expect(400);
+    await request(app).get('/api/product-documents?projectId=proj-active&unassigned=true').expect(400);
+  });
+
+  it('blocks chain refiling and source-version deletion when publication history exists', async () => {
+    const { store, service } = storeBackedService();
+    store.save(fakeArtifact('published-root'));
+    const publicationGuards = {
+      hasForChain: () => true,
+      listByArtifact: () => [{ publicationId: 'pub-1' }],
+    } as unknown as import('./product-document-publications.js').ProductDocumentPublicationService;
+    const app = buildApp(service, undefined, publicationGuards);
+
+    const move = await request(app)
+      .put('/api/product-documents/published-root/project')
+      .send({ projectId: 'proj-active' })
+      .expect(409);
+    expect(move.body.error).toContain('publication history');
+    await request(app).delete('/api/product-documents/published-root').expect(409);
+    expect(store.get('published-root')).not.toBeNull();
+    expect(store.get('published-root')).not.toHaveProperty('projectId');
   });
 
   it('deletes artifacts over HTTP with strict id validation', async () => {

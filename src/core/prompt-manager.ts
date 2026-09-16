@@ -94,7 +94,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
     type: 'function',
     function: {
       name: 'save_product_document',
-      description: 'Persist a complete Markdown document YOU authored as an official versioned artifact on the Documents page. YOU are the writer: compose the full document first (research with your normal tools as needed, preserve every supplied inventory/table/requirement at full granularity), then call this once with the finished content. The save always succeeds for valid input; profile structure and ASD-STE100 language checks run as ADVISORY findings on the artifact — report notable ones honestly, never loop on them. For a revision, pass parentArtifactId and the complete improved document (artifacts are immutable versions). Use write_file instead only for plain files (CSV/HTML/scratch notes) that do not belong in the Documents library.',
+      description: 'Persist a complete Markdown document YOU authored as an official versioned artifact on the Documents page. YOU are the writer: compose the full document first, then call this once. A new root requires an exact projectId or explicit unassigned=true; use list_projects/get_project_brain to resolve project identity rather than guessing from a title. Revisions inherit the parent project and cannot move a chain. Validation is advisory. Use write_file only for non-library scratch output.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -123,7 +123,9 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
               required: ['id', 'label'],
             },
           },
-          parentArtifactId: { type: 'string', description: 'Optional: the existing artifactId this document revises. The new version links into that artifact’s chain.' },
+          projectId: { type: 'string', description: 'Exact owning project ID for a new root document. Resolve it with list_projects/get_project_brain; never infer an ID from a title.' },
+          unassigned: { type: 'boolean', description: 'Set true only when this new root is intentionally global/unfiled. For a new root, provide exactly one of projectId or unassigned=true. Revisions inherit and need neither.' },
+          parentArtifactId: { type: 'string', description: 'Optional: the existing artifactId this document revises. The new version links into that artifact’s chain and inherits its project.' },
           ownerRequested: { type: 'boolean', description: 'Set true only when the owner asked for a document in this conversation.' },
         },
         required: ['title', 'content', 'ownerRequested'],
@@ -144,6 +146,29 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
           ownerRequested: { type: 'boolean', description: 'Set true only when the current owner explicitly asked to export/share a document file.' },
         },
         required: ['artifactId', 'format', 'ownerRequested'],
+      },
+    },
+  },
+  publish_product_document_to_sharepoint: {
+    type: 'function',
+    function: {
+      name: 'publish_product_document_to_sharepoint',
+      description: 'Stage an exact immutable official artifact version for owner-approved SharePoint publication. This is the only lineage-preserving SharePoint path for Documents-page artifacts: it binds artifactId, projectId, canonical export format, and destination before upload. It does not upload immediately; the owner approves under the project Documents tab. Never copy artifact Markdown into sharepoint_create_document when an official artifact exists.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          artifactId: { type: 'string', description: 'Exact immutable official artifact version to publish.' },
+          projectId: { type: 'string', description: 'Exact owning project ID; must match the artifact chain.' },
+          format: { type: 'string', enum: ['md', 'docx'], description: 'SharePoint publication format.' },
+          title: { type: 'string', description: 'Destination filename title when targetFolder is used; defaults to artifact title.' },
+          targetFolder: { type: 'string', description: 'Destination folder path; provide this or serverRelativeUrl.' },
+          serverRelativeUrl: { type: 'string', description: 'Complete destination path ending in the chosen extension.' },
+          siteUrl: { type: 'string', description: 'Required for team-site destinations.' },
+          purpose: { type: 'string', description: 'Short owner-facing reason shown in the approval lane.' },
+          ownerRequested: { type: 'boolean', description: 'True only when the owner asked to publish/share this official document.' },
+        },
+        required: ['artifactId', 'projectId', 'format', 'ownerRequested'],
       },
     },
   },
@@ -397,7 +422,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
 
 const ROLE_TOOLS: Record<AgentRole, string[]> = {
   orchestrator: ['query_db', 'execute_db', 'list_nodes', 'get_node_items', 'assign_item', 'create_node', 'search_items', 'send_chat_message', 'enrich_item', 'run_command', 'create_item', 'update_item', 'write_file', 'read_file'],
-  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
+  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
   classifier: [], // no tools — just returns JSON
   enricher: ['enrich_item', 'query_db'],
   organizer: ['list_nodes', 'get_node_items', 'create_node', 'assign_item'],
@@ -604,6 +629,7 @@ Follow these non-negotiable rules:
 
 ## Document authoring
 - YOU are the document writer. For any official, shareable, or library document, write the COMPLETE Markdown yourself (research first with your normal tools when the content needs facts you have not seen), then persist it with ONE save_product_document call. It returns the artifactId and #/documents link.
+- FILE IT EXPLICITLY: for a new project document, resolve and pass the exact projectId (use list_projects/get_project_brain; never guess an ID from title text). Use unassigned=true only for an intentionally global/unfiled document. Revisions inherit the parent's project; do not pass filing fields to move them.
 - For a TYPED document — operating plan/OP, roadmap, vision, PRD, decision memo, feature workshop, user-stories workbook, email — call get_document_writing_guide FIRST and follow its ordered section contract, narrative rules, and style guidance while writing. Generic briefs/explainers need no guide (adaptive default).
 - Never ask the owner to choose an authoring mode, confirm generation with a specific phrase, name a profile ID, or re-confirm across turns. If they asked for a document, write it and save it in the same turn when the content is ready. Ask at most one question, only when a genuine content decision blocks a useful draft.
 - Preserve every supplied material event, requirement, interface, scope/exclusion, decision, dependency, risk, metric, and acceptance criterion at useful granularity; never replace a detailed table with a summary merely for brevity.
@@ -611,7 +637,8 @@ Follow these non-negotiable rules:
 - Every save runs a server-side maximum-reasoning conformance review: the writing guide is re-sent with your document and audited (structure, section contract, narrative, style, completeness). The receipt's conformance field reports the verdict; a bounded safe correction may be applied automatically (correctionApplied=true). Relay the conformance status and any deviations honestly; do not rewrite-loop on notes.
 - Validation (profile structure + ASD-STE100 language) is ADVISORY: it never blocks a save. Report notable findings honestly in one sentence; never rewrite-loop on advisories. Strict STE modes only when the owner explicitly asks.
 - Artifacts are immutable versions. For a revision, pass parentArtifactId and the complete improved document that retains every still-applicable detail from the parent.
-- OFFICIAL EXPORT DEFAULT: when the owner asks to download, send, upload, attach, or otherwise share an official Documents-page artifact, call export_product_document with its artifactId and requested format. It is the same canonical Markdown/HTML/DOCX/PDF pipeline as the reader Download menu. Never reconstruct the artifact with write_file, run_command, raw Pandoc, or chat memory; that bypasses its house-style rules.
+- OFFICIAL EXPORT DEFAULT: when the owner asks to download, send, attach, or otherwise share an official Documents-page artifact outside SharePoint, call export_product_document with its artifactId and requested format. It is the same canonical Markdown/HTML/DOCX/PDF pipeline as the reader Download menu. Never reconstruct the artifact with write_file, run_command, raw Pandoc, or chat memory; that bypasses its house-style rules.
+- SHAREPOINT PUBLICATION: use publish_product_document_to_sharepoint for an official artifact. It stages an exact artifact version and destination for project approval, then the server performs canonical export, upload, verification, and capture linkage. Never copy official artifact text into sharepoint_create_document; that loses version lineage.
 - An export receipt proves ONLY that the local canonical file exists. Use its filePath verbatim for the destination tool and claim delivery/attachment only after that tool's own receipt confirms the exact effect.
 - NON-OFFICIAL OPTION: use write_file or run_command only when the owner explicitly asks for an ad-hoc, scratch, raw, or non-library file, or when no official artifact exists and the requested output is intentionally not a library document. Say that it is non-official. Do not force the owner to choose a path when their intent is ordinary sharing—the official artifact route is the default.
 - Use write_file for plain working files (CSV, HTML artifacts, scratch output) that do not belong in the Documents library. A successful tool receipt is the only authority that something was saved.

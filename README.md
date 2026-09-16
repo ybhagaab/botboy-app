@@ -109,11 +109,24 @@ connecting your data sources, the optional Dock app — are in
 ## Update
 
 ```bash
-git pull
-./start.sh
+./start.sh --update
 ```
 
-The launcher detects the new version and rebuilds on its own.
+This is the recommended teammate update path. It backs up tracked BotBoy
+customizations to `~/.personal-productivity-tracker/update-backups/`,
+fast-forwards from `botboy-app/main`, and three-way reapplies each customized
+file independently before rebuilding. Clean merges remain active; overlapping
+customizations are preserved in a `-needs-reapply` folder while the new base
+release stays usable. Untracked files are never deleted.
+
+BotBoy UI self-customization is supported. Use this updater instead of plain
+`git pull` whenever BotBoy has changed its own source.
+
+If an older checkout already fails during `git pull`, it does not have this
+updater yet. Follow **One-time transition from an older release** in
+[`docs/TEAMMATE_SETUP.md`](docs/TEAMMATE_SETUP.md): back up the tracked patch,
+restore, pull once, then run ordinary `./start.sh`. Do not run `--update` again
+in that same cycle; use it for every release after that.
 
 ## Privacy
 

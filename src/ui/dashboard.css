@@ -1499,3 +1499,20 @@ html[data-document-transition="library"]::view-transition-new(botboy-document-li
   html[data-document-transition="library"]::view-transition-old(botboy-document-library-toggle),
   html[data-document-transition="library"]::view-transition-new(botboy-document-library-toggle){animation:none!important}
 }
+
+/* ── Unified project document catalog ── */
+.project-authored-documents { overflow:hidden; }
+.project-authored-row { align-items:center; }
+.project-authored-icon { flex:0 0 auto; color:var(--accent); background:color-mix(in srgb,var(--accent-soft) 72%,var(--surface-2)); }
+.document-project-link,
+.document-project-unassigned { display:inline-flex; align-items:center; gap:5px; color:var(--muted); text-decoration:none; }
+.document-project-link:hover { color:var(--accent); }
+.document-project-unassigned { color:var(--faint); }
+
+.document-project-assignment { grid-column:1/-1; display:grid!important; gap:6px; padding-top:8px; border-top:1px solid var(--border); }
+.document-project-assignment>span { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.document-project-assignment select { min-width:min(280px,100%); height:32px; padding:0 30px 0 9px; border:1px solid var(--border); border-radius:8px; color:var(--text); background:var(--surface-2); font-size:10.5px; }
+.document-project-assignment small { color:var(--faint); font-size:9.5px; }
+.document-publication-status,
+.project-publication-link { display:inline-flex; align-items:center; gap:5px; color:var(--muted); text-decoration:none; }
+.project-publication-link:hover { color:var(--accent); }

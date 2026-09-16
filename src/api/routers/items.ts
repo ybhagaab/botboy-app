@@ -97,7 +97,66 @@ export function createItemsRouter(deps: RouterDeps): Router {
       };
     });
 
-    res.json({ query: q, totalResults: results.length, results });
+    const artifactResults = (() => {
+      const service = deps.productDocumentService;
+      if (!service) return [];
+      const artifacts = service.listArtifacts(100);
+      const byId = new Map(artifacts.map(artifact => [artifact.artifactId, artifact]));
+      const groups = new Map<string, typeof artifacts>();
+      for (const artifact of artifacts) {
+        let root = artifact;
+        const seenParents = new Set<string>();
+        while (root.parentArtifactId && byId.has(root.parentArtifactId) && !seenParents.has(root.parentArtifactId)) {
+          seenParents.add(root.parentArtifactId);
+          root = byId.get(root.parentArtifactId)!;
+        }
+        const members = groups.get(root.artifactId) ?? [];
+        members.push(artifact);
+        groups.set(root.artifactId, members);
+      }
+      const lq = q.toLowerCase();
+      return [...groups.values()].flatMap(members => {
+        members.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+        const head = members[0];
+        const project = head.projectId
+          ? db.prepare('SELECT title FROM projects WHERE id = ?').get(head.projectId) as { title: string } | undefined
+          : undefined;
+        const searchable = members.map(artifact => [
+          artifact.title,
+          artifact.profileId,
+          artifact.artifactId,
+          artifact.projectId,
+          project?.title,
+        ].filter(Boolean).join(' ')).join(' ').toLowerCase();
+        if (!searchable.includes(lq)) return [];
+        return [{
+          item: {
+            id: head.artifactId,
+            artifactId: head.artifactId,
+            type: 'product_document_artifact',
+            source: 'botboy',
+            sourceApp: 'BotBoy',
+            title: head.title,
+            summary: `${members.length} loaded version${members.length === 1 ? '' : 's'} · ${project?.title || 'Unassigned'}`,
+            capturedAt: head.createdAt,
+            ...(head.projectId ? { projectId: head.projectId } : {}),
+          },
+          node: head.projectId ? { id: head.projectId, title: project?.title || head.projectId } : null,
+          matchField: searchable.startsWith(lq) ? 'title' : 'metadata',
+          snippet: `${project?.title || 'Unassigned'} · ${head.profileId}`,
+        }];
+      });
+    })();
+    const artifactSlots = artifactResults.length
+      ? results.length && limit > 1
+        ? Math.min(artifactResults.length, Math.max(1, Math.floor(limit / 3)), limit - 1)
+        : Math.min(artifactResults.length, limit)
+      : 0;
+    const combined = [
+      ...artifactResults.slice(0, artifactSlots),
+      ...results.slice(0, limit - artifactSlots),
+    ];
+    res.json({ query: q, totalResults: combined.length, results: combined });
   });
   // ── Work Items ──
 

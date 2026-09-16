@@ -140,6 +140,11 @@ interface QueuePayload {
   itemId?: number;
   /** Library title for item-comment calls (list_files sources only). */
   libraryName?: string;
+  /** Exact authored-publication lineage for server-owned creation captures. */
+  publicationId?: string;
+  sourceArtifactId?: string;
+  publicationProjectId?: string;
+  exportSha256?: string;
 }
 
 interface DiscoveryCounters {
@@ -198,7 +203,14 @@ export interface SharePointSync {
   refreshDocument(docKey: string): { queued: boolean; reason?: string };
   /** Queue a document the corpus does not know yet, by path (authoring
    * bridge ingestion). The caller drives drainNow. */
-  enqueueByPath(serverRelativeUrl: string, opts?: { siteUrl?: string; sizeBytes?: number }): { queued: boolean; docKey: string; reason?: string };
+  enqueueByPath(serverRelativeUrl: string, opts?: {
+    siteUrl?: string;
+    sizeBytes?: number;
+    publicationId?: string;
+    sourceArtifactId?: string;
+    projectId?: string;
+    exportSha256?: string;
+  }): { queued: boolean; docKey: string; reason?: string };
 }
 
 function sha1(value: string): string {
@@ -244,7 +256,7 @@ export function createSharePointSync(deps: {
   /** Content reads for revision diff stamping (signals R2). Absent → sweep
    * disabled. Tests build a real store over their temp dirs. */
   contentStore?: Pick<ContentStore, 'refFromRow' | 'get'>;
-  emit: (item: RawWorkItem) => void;
+  emit: (item: RawWorkItem) => void | Promise<void>;
   config?: SharePointSyncConfig;
 }): SharePointSync {
   const { db, mcpManager, emit } = deps;
@@ -865,7 +877,7 @@ export function createSharePointSync(deps: {
     // loop) have no large lane — over the full-parse cap they degrade to
     // presence rather than pulling tens of MB of text through stdio.
     if (payload.size > largeLaneMax || ((INLINE_EXTS.has(ext) || LOOP_EXTS.has(ext) || ext === '.docx') && payload.size > fullParseMax)) {
-      emitItem(payload, url, {
+      await emitItem(payload, url, {
         content: `Large document (${Math.round(payload.size / 1024 / 1024)} MB) — content not synced. `
           + `Author: ${payload.author ?? 'unknown'}; last modified by ${payload.lastModifiedBy ?? 'unknown'} on ${payload.modified.slice(0, 10)}. Open in SharePoint to view.`,
         tier: 'metadata_only',
@@ -885,7 +897,7 @@ export function createSharePointSync(deps: {
           }, 180_000);
       const content = text.trim();
       if (!content) throw new Error('inline read returned empty content');
-      emitItem(payload, url, { content, tier: 'full' });
+      await emitItem(payload, url, { content, tier: 'full' });
       return;
     }
 
@@ -920,7 +932,7 @@ export function createSharePointSync(deps: {
         // Way over the large lane: never hand this to the extractor or the
         // bounded parser — degrade to presence evidence like any oversize doc.
         try { fs.unlinkSync(partPath); } catch { /* best effort */ }
-        emitItem(payload, url, {
+        await emitItem(payload, url, {
           content: `Large document (${Math.round(stat.size / 1024 / 1024)} MB — listing reported a wrong size) — content not synced. `
             + `Author: ${payload.author ?? 'unknown'}; last modified by ${payload.lastModifiedBy ?? 'unknown'} on ${payload.modified.slice(0, 10)}. Open in SharePoint to view.`,
           tier: 'metadata_only',
@@ -932,7 +944,7 @@ export function createSharePointSync(deps: {
 
     if (payload.size <= fullParseMax) {
       // Pipeline extractor parses it; the cache sweep evicts after extraction.
-      emitItem(payload, url, { filePath: finalPath, tier: 'full' });
+      await emitItem(payload, url, { filePath: finalPath, tier: 'full' });
       return;
     }
 
@@ -940,7 +952,7 @@ export function createSharePointSync(deps: {
     // the binary immediately — no extraction race, nothing squats in cache.
     if (!parser?.parseLargeAsync) {
       try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
-      emitItem(payload, url, {
+      await emitItem(payload, url, {
         content: `Large document (${Math.round(payload.size / 1024 / 1024)} MB) — bounded extraction unavailable in this build. `
           + `Author: ${payload.author ?? 'unknown'}; last modified ${payload.modified.slice(0, 10)}. Open in SharePoint to view.`,
         tier: 'metadata_only',
@@ -949,17 +961,17 @@ export function createSharePointSync(deps: {
     }
     try {
       const parsed = await parser.parseLargeAsync(finalPath);
-      emitItem(payload, url, { content: parsed.text, tier: 'truncated', truncation: parsed.truncation });
+      await emitItem(payload, url, { content: parsed.text, tier: 'truncated', truncation: parsed.truncation });
     } finally {
       try { fs.unlinkSync(finalPath); } catch { /* best effort */ }
     }
   }
 
-  function emitItem(
+  async function emitItem(
     payload: QueuePayload,
     url: string,
     body: { content?: string; filePath?: string; tier: 'full' | 'truncated' | 'metadata_only'; truncation?: Record<string, unknown> },
-  ): void {
+  ): Promise<void> {
     const metadata: Record<string, string> = {
       docKey: payload.docKey,
       serverRelativeUrl: payload.serverRelativeUrl,
@@ -970,13 +982,17 @@ export function createSharePointSync(deps: {
       sharePointSource: payload.sourceKind,
       extractionTier: body.tier,
     };
+    if (payload.publicationId) metadata.publicationId = payload.publicationId;
+    if (payload.sourceArtifactId) metadata.sourceArtifactId = payload.sourceArtifactId;
+    if (payload.publicationProjectId) metadata.publicationProjectId = payload.publicationProjectId;
+    if (payload.exportSha256) metadata.exportSha256 = payload.exportSha256;
     if (payload.siteUrl) metadata.siteUrl = payload.siteUrl;
     if (payload.author) metadata.author = payload.author;
     if (payload.lastModifiedBy) metadata.lastModifiedBy = payload.lastModifiedBy;
     if (body.filePath) metadata.filePath = body.filePath;
     if (body.truncation) metadata.truncation = JSON.stringify(body.truncation);
 
-    emit({
+    await emit({
       type: 'document_capture',
       source: 'sharepoint',
       sourceApp: 'SharePoint',
@@ -1802,7 +1818,14 @@ export function createSharePointSync(deps: {
    * requires an existing capture and cannot serve this). Synthesizes the
    * payload the drain needs; docKey derivation matches discovery's.
    */
-  function enqueueByPath(serverRelativeUrl: string, opts: { siteUrl?: string; sizeBytes?: number } = {}): { queued: boolean; docKey: string; reason?: string } {
+  function enqueueByPath(serverRelativeUrl: string, opts: {
+    siteUrl?: string;
+    sizeBytes?: number;
+    publicationId?: string;
+    sourceArtifactId?: string;
+    projectId?: string;
+    exportSha256?: string;
+  } = {}): { queued: boolean; docKey: string; reason?: string } {
     const docKey = docKeyForPath(db, serverRelativeUrl, opts.siteUrl);
     const host = docKey.split('/')[0];
     const sources = getSources();
@@ -1821,6 +1844,10 @@ export function createSharePointSync(deps: {
       fileType: path.extname(serverRelativeUrl).toLowerCase(),
       sourceKind: source.kind,
       libraryName: 'Documents',
+      ...(opts.publicationId ? { publicationId: opts.publicationId } : {}),
+      ...(opts.sourceArtifactId ? { sourceArtifactId: opts.sourceArtifactId } : {}),
+      ...(opts.projectId ? { publicationProjectId: opts.projectId } : {}),
+      ...(opts.exportSha256 ? { exportSha256: opts.exportSha256 } : {}),
     };
     const json = JSON.stringify(payload);
     const ts = new Date(now()).toISOString();

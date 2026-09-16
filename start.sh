@@ -17,6 +17,9 @@ fi
 #   ./start.sh --stop        stop every running BotBoy server and exit
 #   ./start.sh --doctor      print a diagnostic report (paste it when asking
 #                            for help) and exit; changes nothing
+#   ./start.sh --update      safely back up and discard tracked local app
+#                            edits, fast-forward from botboy-app/main, rebuild,
+#                            and start. Teammate distribution checkouts only.
 #   ./start.sh --foreground  stay in the foreground for the lifetime of the
 #                            server. Used by /Applications/BotBoy.app so the
 #                            app owns the tracker's lifecycle: its dock icon
@@ -28,16 +31,108 @@ FOREGROUND=0
 OPEN_WINDOW_ONLY=0
 STOP_ONLY=0
 DOCTOR=0
+UPDATE_ONLY=0
 [ "$1" = "--foreground" ] && FOREGROUND=1
 # --open-window: just focus/open the dashboard window (used when BotBoy.app's
 # dock icon is clicked while the tracker is already running).
 [ "$1" = "--open-window" ] && OPEN_WINDOW_ONLY=1
 [ "$1" = "--stop" ] && STOP_ONLY=1
 [ "$1" = "--doctor" ] && DOCTOR=1
+[ "$1" = "--update" ] && UPDATE_ONLY=1
 
 # Resolve the project dir from THIS script's location — never hardcode, or the
 # launcher silently breaks the moment the repo moves.
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Release checkouts are customizable runtime snapshots. Detect from the
+# generated marker (current releases) or origin URL (backward compatibility).
+BOTBOY_REMOTE_URL="$(git -C "$PROJ_DIR" remote get-url origin 2>/dev/null || true)"
+if [ -f "$PROJ_DIR/.botboy-distribution" ] || [[ "$BOTBOY_REMOTE_URL" == *"/botboy-app.git" ]] || [[ "$BOTBOY_REMOTE_URL" == *"/botboy-app" ]]; then
+  BOTBOY_RELEASE_CHECKOUT=1
+else
+  BOTBOY_RELEASE_CHECKOUT=0
+fi
+
+# Customization-aware teammate updater. BotBoy may legitimately modify tracked
+# UI/source files. Preserve the full diff, fast-forward the release baseline,
+# then three-way reapply each changed file independently. Cleanly applicable
+# customizations stay live; conflicting ones remain safely archived for BotBoy
+# or the owner to rebase. Untracked files are never deleted or moved.
+if [ "$UPDATE_ONLY" = "1" ]; then
+  if [ "$BOTBOY_RELEASE_CHECKOUT" != "1" ]; then
+    echo "❌ --update is for botboy-app teammate checkouts only; update the development repo with Git directly."
+    exit 1
+  fi
+  if ! git -C "$PROJ_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "❌ This botboy-app install is not a Git checkout. Re-clone it to update."
+    exit 1
+  fi
+
+  BACKUP_PATH=""
+  PATCH_PARTS_DIR=""
+  TRACKED_CHANGES="$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no)"
+  if [ -n "$TRACKED_CHANGES" ]; then
+    BACKUP_DIR="$HOME/.personal-productivity-tracker/update-backups"
+    BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_PATH="$BACKUP_DIR/botboy-app-$BACKUP_STAMP.patch"
+    PATCH_PARTS_DIR="$BACKUP_DIR/.parts-$BACKUP_STAMP"
+    mkdir -p "$PATCH_PARTS_DIR"
+    git -C "$PROJ_DIR" diff --binary HEAD -- . > "$BACKUP_PATH"
+    PART_INDEX=0
+    while IFS= read -r -d '' CHANGED_PATH; do
+      PART_INDEX=$((PART_INDEX + 1))
+      printf '%s' "$CHANGED_PATH" > "$PATCH_PARTS_DIR/$PART_INDEX.path"
+      git -C "$PROJ_DIR" diff --binary HEAD -- "$CHANGED_PATH" > "$PATCH_PARTS_DIR/$PART_INDEX.patch"
+    done < <(git -C "$PROJ_DIR" diff --name-only -z HEAD -- .)
+    git -C "$PROJ_DIR" restore --source=HEAD --staged --worktree -- .
+    echo "ℹ️  Backed up tracked BotBoy customizations to: $BACKUP_PATH"
+  fi
+
+  if ! git -C "$PROJ_DIR" pull --ff-only; then
+    echo "❌ Update could not fast-forward. No untracked files were removed; inspect 'git status --short'."
+    exit 1
+  fi
+
+  REAPPLIED=0
+  CONFLICTS=0
+  if [ -n "$PATCH_PARTS_DIR" ] && [ -d "$PATCH_PARTS_DIR" ]; then
+    CONFLICT_DIR="${BACKUP_PATH%.patch}-needs-reapply"
+    for PART_PATCH in "$PATCH_PARTS_DIR"/*.patch; do
+      [ -f "$PART_PATCH" ] || continue
+      PART_PREFIX="${PART_PATCH%.patch}"
+      CHANGED_PATH="$(cat "$PART_PREFIX.path")"
+      if git -C "$PROJ_DIR" apply --3way "$PART_PATCH" >/dev/null 2>&1 \
+        && ! git -C "$PROJ_DIR" ls-files -u -- "$CHANGED_PATH" | grep -q .; then
+        git -C "$PROJ_DIR" restore --staged -- "$CHANGED_PATH" 2>/dev/null || true
+        REAPPLIED=$((REAPPLIED + 1))
+      else
+        # Three-way apply may report success while leaving conflict stages.
+        # Restore only this path to the new release; its patch remains durable.
+        git -C "$PROJ_DIR" restore --source=HEAD --staged --worktree -- "$CHANGED_PATH"
+        mkdir -p "$CONFLICT_DIR"
+        cp "$PART_PATCH" "$CONFLICT_DIR/$CONFLICTS.patch"
+        printf '%s\n' "$CHANGED_PATH" > "$CONFLICT_DIR/$CONFLICTS.path"
+        CONFLICTS=$((CONFLICTS + 1))
+      fi
+    done
+    rm -rf "$PATCH_PARTS_DIR"
+    if [ "$REAPPLIED" -gt 0 ]; then
+      echo "✅ Reapplied $REAPPLIED customized tracked file(s) onto the new release"
+    fi
+    if [ "$CONFLICTS" -gt 0 ]; then
+      echo "⚠️  $CONFLICTS customization(s) overlap the new release and were not applied."
+      echo "    BotBoy is updated and usable; preserved conflict patches: $CONFLICT_DIR"
+      echo "    Ask BotBoy or the owner to reapply those customizations against this version."
+    fi
+  fi
+
+  echo "✅ BotBoy updated — rebuilding and starting"
+  if [ "${BOTBOY_UPDATE_NO_START:-0}" = "1" ]; then
+    exit 0
+  fi
+  export BOTBOY_FORCE_BUILD=1
+  exec /bin/bash "$0"
+fi
 
 # File-descriptor headroom. macOS defaults the soft limit to 256. Folder
 # watching is O(1) descriptors per folder since the native FSEvents engine
@@ -391,6 +486,9 @@ if [ "$DOCTOR" = "1" ]; then
   echo "macos: $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
   echo "node:  $NODE ($("$NODE" --version 2>/dev/null))"
   echo "npm:   $(command -v npm) ($(npm --version 2>/dev/null))"
+  echo "checkout-mode: $([ "$BOTBOY_RELEASE_CHECKOUT" = "1" ] && echo 'teammate release (customizations supported)' || echo 'development')"
+  TRACKED_DIRTY_COUNT=$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+  echo "tracked local changes: ${TRACKED_DIRTY_COUNT:-unknown}$([ "${TRACKED_DIRTY_COUNT:-0}" != "0" ] && echo ' — run ./start.sh --update before pulling' || true)"
   if xcode-select -p >/dev/null 2>&1; then echo "xcode-clt: installed"; else echo "xcode-clt: MISSING — run: xcode-select --install"; fi
   [ -x "$CHROME" ] && echo "chrome: installed" || echo "chrome: MISSING at $CHROME"
   [ -f "$PROJ_DIR/dist/index.js" ] && echo "build: dist/index.js present" || echo "build: MISSING — run: npm run build"
@@ -491,7 +589,9 @@ trap release_start_lock EXIT
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
 NEED_BUILD=""
-if [ ! -f "$PROJ_DIR/dist/index.js" ]; then
+if [ "${BOTBOY_FORCE_BUILD:-0}" = "1" ]; then
+  NEED_BUILD="updated release/customizations"
+elif [ ! -f "$PROJ_DIR/dist/index.js" ]; then
   NEED_BUILD="first run"
 else
   CURRENT_COMMIT=$(git -C "$PROJ_DIR" rev-parse HEAD 2>/dev/null || echo "")
