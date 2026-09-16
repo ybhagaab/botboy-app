@@ -17,9 +17,9 @@ fi
 #   ./start.sh --stop        stop every running BotBoy server and exit
 #   ./start.sh --doctor      print a diagnostic report (paste it when asking
 #                            for help) and exit; changes nothing
-#   ./start.sh --update      safely back up and discard tracked local app
-#                            edits, fast-forward from botboy-app/main, rebuild,
-#                            and start. Teammate distribution checkouts only.
+#   ./start.sh --update      back up tracked BotBoy customizations, fast-forward
+#                            the owner release, three-way reapply clean changes,
+#                            preserve overlaps for rebase, rebuild, and start.
 #   ./start.sh --foreground  stay in the foreground for the lifetime of the
 #                            server. Used by /Applications/BotBoy.app so the
 #                            app owns the tracker's lifecycle: its dock icon
