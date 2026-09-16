@@ -177,14 +177,18 @@ export function withProductDocumentChatTools(
         const artifactId = typeof args.artifactId === 'string' ? args.artifactId.trim() : '';
         const projectId = typeof args.projectId === 'string' ? args.projectId.trim() : '';
         const format = args.format === 'md' || args.format === 'docx' ? args.format : null;
+        const action = args.action === 'create' || args.action === 'update_existing' ? args.action : null;
+        const basePublicationId = typeof args.basePublicationId === 'string' ? args.basePublicationId.trim() : '';
         const title = typeof args.title === 'string' ? args.title.trim() : '';
-        if (!artifactId || !projectId || !format) {
-          return errorResult(call, 'artifactId, projectId, and format (md or docx) are required.');
+        if (!artifactId || !projectId || !format || !action) {
+          return errorResult(call, 'artifactId, projectId, action (create or update_existing), and format (md or docx) are required.');
         }
         try {
           const staged = publications.stage({
             artifactId,
             projectId,
+            action,
+            ...(basePublicationId ? { basePublicationId } : {}),
             format,
             title,
             ...(typeof args.serverRelativeUrl === 'string' && args.serverRelativeUrl.trim()
@@ -207,11 +211,13 @@ export function withProductDocumentChatTools(
             pendingEditId: staged.pendingEdit.id,
             artifactId,
             projectId,
+            action,
+            ...(staged.publication.basePublicationId ? { basePublicationId: staged.publication.basePublicationId } : {}),
             format,
             docKey: staged.publication.docKey,
             destination: staged.publication.serverRelativeUrl,
             approveAt: `#/projects/${encodeURIComponent(projectId)}`,
-            next: 'Publication is staged only. The owner must approve it in the project Documents tab; claim upload, verification, and capture only from later receipts.',
+            next: `Publication is staged only as ${action}. The owner must approve the exact action and path in the project Documents tab; claim upload, verification, versioning, and capture only from later receipts.`,
           });
         } catch (error) {
           return errorResult(call, error instanceof Error ? error.message : 'Could not stage the publication.');

@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { createStorage, StorageLayer } from './storage.js';
 import { createContentStore, refToColumns } from './content-store.js';
-import { createBrainStore } from './brain-store.js';
+import { createBrainStore, newBrain } from './brain-store.js';
 import { createBatcher } from './batcher.js';
 import { createFailureRecorder } from './failures.js';
 import { createExtractor } from './extractor.js';
@@ -48,7 +48,35 @@ describe('PipelineOrchestrator', () => {
     ).run(id, source, `title-${id}`, new Date().toISOString(), JSON.stringify({ filePath }));
   }
 
-  function build(llm: PipelineLlm) {
+  function insertRoutedBrainItem(input: {
+    id: string;
+    projectId: string;
+    content: string;
+    capturedAt: string;
+  }): void {
+    const db = storage.getDb();
+    const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
+    const ref = contentStore.put(input.id, input.content);
+    const cols = refToColumns(ref);
+    db.prepare(`
+      INSERT INTO work_items
+        (id, type, source, title, captured_at, process_state, project_id,
+         raw_text, content_storage, content_path, content_sha256, content_bytes, metadata)
+      VALUES (?, 'slack_message', 'slack', 'Critical Project update', ?, 'routed', ?,
+              ?, ?, ?, ?, ?, '{"direction":"sent","channelType":"dm"}')
+    `).run(
+      input.id,
+      input.capturedAt,
+      input.projectId,
+      cols.raw_text,
+      cols.content_storage,
+      cols.content_path,
+      cols.content_sha256,
+      cols.content_bytes,
+    );
+  }
+
+  function buildState(llm: PipelineLlm) {
     const db = storage.getDb();
     const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
     const failures = createFailureRecorder(db);
@@ -59,7 +87,15 @@ describe('PipelineOrchestrator', () => {
     const brainUpdater = createBrainUpdater({ db, contentStore, brainStore, failures, llm });
     const reconciler = createReconciler({ db, batcher, contentStore, brainStore, failures, llm });
     const organizer = createProjectOrganizer({ db, brainStore, failures, llm });
-    return createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, brainStore, config: { extractionConcurrency: 2 } });
+    const orchestrator = createPipelineOrchestrator({
+      db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, brainStore,
+      config: { extractionConcurrency: 2 },
+    });
+    return { orchestrator, brainStore };
+  }
+
+  function build(llm: PipelineLlm) {
+    return buildState(llm).orchestrator;
   }
 
   it('extraction tick processes at most `concurrency` items per call (bounded load)', async () => {
@@ -132,6 +168,101 @@ describe('PipelineOrchestrator', () => {
     expect(r.routed + r.created).toBe(5); // all 5 extracted items routed
     const pending = (storage.getDb().prepare("SELECT COUNT(*) AS c FROM work_items WHERE process_state='extracted' AND project_id IS NULL").get() as any).c;
     expect(pending).toBe(0); // fully routed
+  });
+
+  it('stages every rebuild chunk and publishes the canonical brain exactly once', async () => {
+    let calls = 0;
+    let state!: ReturnType<typeof buildState>;
+    const llm: PipelineLlm = {
+      isAvailable: () => true,
+      complete: async () => {
+        calls++;
+        expect(state.brainStore.read('proj_critical')!.summary).toBe('Owner-restored canonical summary');
+        return JSON.stringify({
+          summary: `Rebuilt complete summary after chunk ${calls}`,
+          statusLine: 'Validated rebuild in progress', status: 'active',
+          tasks: [], blockers: [], people: [], newActivity: [],
+        });
+      },
+    };
+    state = buildState(llm);
+    state.brainStore.write({
+      ...newBrain('proj_critical', 'Critical Project'),
+      summary: 'Owner-restored canonical summary',
+      statusLine: 'Restored and protected',
+    });
+    insertRoutedBrainItem({ id: 'r1', projectId: 'proj_critical', content: 'Critical Project first evidence', capturedAt: '2026-09-16T01:00:00Z' });
+    insertRoutedBrainItem({ id: 'r2', projectId: 'proj_critical', content: 'Critical Project second evidence', capturedAt: '2026-09-16T02:00:00Z' });
+
+    const result = await state.orchestrator.rebuildBrain('proj_critical', { chunkSize: 1 });
+    expect(result).toEqual({ status: 'rebuilt', items: 2 });
+    expect(calls).toBe(2);
+    expect(state.brainStore.read('proj_critical')!.summary).toBe('Rebuilt complete summary after chunk 2');
+    const revisions = storage.getDb().prepare(
+      "SELECT reason FROM brain_revisions WHERE project_id='proj_critical'",
+    ).all() as Array<{ reason: string }>;
+    expect(revisions).toEqual([{ reason: 'rebuild_publish' }]);
+    const run = storage.getDb().prepare(
+      "SELECT status, items_in AS itemsIn, items_out AS itemsOut FROM pipeline_runs WHERE batch_id='rebuild:proj_critical'",
+    ).get() as { status: string; itemsIn: number; itemsOut: number };
+    expect(run).toEqual({ status: 'completed', itemsIn: 2, itemsOut: 2 });
+  });
+
+  it('leaves the canonical brain untouched when a later rebuild chunk fails', async () => {
+    let calls = 0;
+    const state = buildState({
+      isAvailable: () => true,
+      complete: async () => {
+        calls++;
+        if (calls === 2) throw new Error('simulated provider failure');
+        return JSON.stringify({
+          summary: 'Partial staged summary', statusLine: 'partial', status: 'active',
+          tasks: [], blockers: [], people: [], newActivity: [],
+        });
+      },
+    });
+    state.brainStore.write({
+      ...newBrain('proj_critical', 'Critical Project'),
+      summary: 'Owner-restored canonical summary', statusLine: 'Restored and protected',
+    });
+    insertRoutedBrainItem({ id: 'f1', projectId: 'proj_critical', content: 'Critical Project first evidence', capturedAt: '2026-09-16T01:00:00Z' });
+    insertRoutedBrainItem({ id: 'f2', projectId: 'proj_critical', content: 'Critical Project second evidence', capturedAt: '2026-09-16T02:00:00Z' });
+
+    const result = await state.orchestrator.rebuildBrain('proj_critical', { chunkSize: 1 });
+    expect(result).toEqual({ status: 'skipped', items: 0 });
+    expect(state.brainStore.read('proj_critical')!.summary).toBe('Owner-restored canonical summary');
+    expect((storage.getDb().prepare('SELECT COUNT(*) AS n FROM brain_revisions').get() as { n: number }).n).toBe(0);
+    expect((storage.getDb().prepare(
+      "SELECT status FROM pipeline_runs WHERE batch_id='rebuild:proj_critical'",
+    ).get() as { status: string }).status).toBe('failed');
+  });
+
+  it('does not overwrite a canonical brain changed while rebuild inference is running', async () => {
+    let state!: ReturnType<typeof buildState>;
+    const llm: PipelineLlm = {
+      isAvailable: () => true,
+      complete: async () => {
+        state.brainStore.write({
+          ...state.brainStore.read('proj_critical')!,
+          summary: 'Concurrent owner restoration',
+          updated: '2026-09-16T08:00:00Z',
+        }, undefined, { reason: 'owner_restore' });
+        return JSON.stringify({
+          summary: 'Stale rebuild candidate', statusLine: 'stale', status: 'active',
+          tasks: [], blockers: [], people: [], newActivity: [],
+        });
+      },
+    };
+    state = buildState(llm);
+    state.brainStore.write({
+      ...newBrain('proj_critical', 'Critical Project'),
+      summary: 'Original canonical summary', statusLine: 'Original',
+    });
+    insertRoutedBrainItem({ id: 'c1', projectId: 'proj_critical', content: 'Critical Project evidence', capturedAt: '2026-09-16T01:00:00Z' });
+
+    const result = await state.orchestrator.rebuildBrain('proj_critical', { chunkSize: 1 });
+    expect(result).toEqual({ status: 'skipped', items: 0 });
+    expect(state.brainStore.read('proj_critical')!.summary).toBe('Concurrent owner restoration');
   });
 
   it('interpretation defers (no state change) when the LLM is down', async () => {

@@ -59,9 +59,12 @@ import {
 export interface BrainUpdateResult {
   projectId: string;
   status: 'updated' | 'conflict' | 'skipped';
-  /** Why a chunk was skipped: scope filtering is recoverable (later chunks
-   * may still apply); model failure is not. */
-  skipReason?: 'out_of_scope' | 'model_failure';
+  /** Why a chunk was skipped. Scope/no-change are recoverable in later rebuild
+   * chunks; model failure, conflict, and destructive regression abort one. */
+  skipReason?: 'out_of_scope' | 'model_failure' | 'destructive_regression' | 'no_change';
+  /** Present only for an in-memory staged update. Never written canonically by
+   * the updater; the rebuild coordinator publishes one final candidate. */
+  brain?: Brain;
 }
 
 export interface BrainUpdater {
@@ -69,6 +72,14 @@ export interface BrainUpdater {
   runForBatch(batchId: string): Promise<BrainUpdateResult[]>;
   /** Update a single project given specific item ids. */
   updateProject(projectId: string, itemIds: string[]): Promise<BrainUpdateResult>;
+  /** Fold one rebuild chunk into an in-memory brain without touching the
+   * canonical file or projects index. */
+  stageProject(
+    projectId: string,
+    itemIds: string[],
+    baseBrain: Brain,
+    auditContext?: { runId?: string; batchId?: string },
+  ): Promise<BrainUpdateResult>;
 }
 
 type ActionBasis = 'explicit_commitment' | 'explicit_assignment' | 'accepted_assignment';
@@ -641,30 +652,38 @@ function validatedTasks(
   proposed: LlmTaskCandidate[] | undefined,
   items: BrainInputItem[],
   currentItemIds: Set<string>,
-  preserveExisting = false,
+  preserveExisting = true,
 ): BrainTask[] {
   if (!Array.isArray(proposed)) return existing;
 
   const existingByText = new Map(existing.map((task) => [normalizeText(task.text), task]));
   const itemById = new Map(items.map((item) => [item.id, item]));
   const accepted: BrainTask[] = preserveExisting ? existing.map((task) => ({ ...task })) : [];
-  const seen = new Set(accepted.map((task) => normalizeText(task.text)));
+  const acceptedIndex = new Map(accepted.map((task, index) => [normalizeText(task.text), index]));
+  const seen = new Set(acceptedIndex.keys());
 
   for (const candidate of proposed) {
     if (!candidate || typeof candidate.text !== 'string' || !candidate.text.trim()) continue;
     const text = candidate.text.trim();
     const key = normalizeText(text);
-    if (seen.has(key)) continue;
-
     const state = TASK_STATES.has(candidate.state) ? candidate.state : 'todo';
     const prior = existingByText.get(key);
     if (prior) {
       // A state change keeps the task's original evidence day: chronology
-      // records when the commitment was established, not when it moved.
-      accepted.push({ state, text, ...(prior.date ? { date: prior.date } : {}) });
-      seen.add(key);
+      // records when the commitment was established, not when it moved. In
+      // additive mode, replace the preserved entry in place rather than
+      // allowing an omitted model task to delete any sibling task.
+      const next = { state, text, ...(prior.date ? { date: prior.date } : {}) };
+      const index = acceptedIndex.get(key);
+      if (index !== undefined) accepted[index] = next;
+      else {
+        acceptedIndex.set(key, accepted.length);
+        accepted.push(next);
+        seen.add(key);
+      }
       continue;
     }
+    if (seen.has(key)) continue;
 
     const basis = candidate.actionBasis;
     const confidence = candidate.confidence;
@@ -672,6 +691,7 @@ function validatedTasks(
       ? validatedRelationalTaskEvidence(candidate, text, itemById, currentItemIds)
       : null;
     if (threadEvidence) {
+      acceptedIndex.set(key, accepted.length);
       accepted.push({ state, text, date: latestEvidenceDay(threadEvidence) });
       seen.add(key);
       continue;
@@ -694,6 +714,7 @@ function validatedTasks(
     if (!supported || !evidence) continue;
 
     // New tasks are dated by the capture day of their citing evidence.
+    acceptedIndex.set(key, accepted.length);
     accepted.push({ state, text, date: activityDayOf(evidence.capturedAt) });
     seen.add(key);
   }
@@ -703,7 +724,69 @@ function validatedTasks(
 
 function stringArray(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
-  return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+  const entries = value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.length > 0 ? entries : null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+function validProjectStatus(value: unknown): ProjectStatus | null {
+  return value === 'active' || value === 'paused' || value === 'done' || value === 'archived'
+    ? value
+    : null;
+}
+
+/** Background synthesis is additive for curated list fields. There is no
+ * evidence-grounded delete operation in this pass, so omission or a partial
+ * model list can never remove an existing blocker/person. */
+function mergeStringArray(existing: string[], proposed: string[] | null): string[] {
+  if (!proposed) return existing;
+  const merged = existing.map((value) => value.trim()).filter(Boolean);
+  const seen = new Set(merged.map(normalizeText));
+  for (const value of proposed) {
+    const key = normalizeText(value);
+    if (seen.has(key)) continue;
+    merged.push(value);
+    seen.add(key);
+  }
+  return merged;
+}
+
+function semanticBrainSnapshot(brain: Brain): string {
+  return JSON.stringify({
+    id: brain.id,
+    title: brain.title,
+    status: brain.status,
+    summary: brain.summary,
+    statusLine: brain.statusLine,
+    tasks: brain.tasks,
+    blockers: brain.blockers,
+    people: brain.people,
+    activityLog: brain.activityLog,
+  });
+}
+
+/** Last-resort invariant guard after field-level normalization. It catches a
+ * syntactically valid but information-collapsing summary and any future code
+ * regression that reintroduces collection/activity replacement semantics. */
+function destructiveRegressionReasons(existing: Brain, candidate: Brain): string[] {
+  const reasons: string[] = [];
+  const beforeSummary = existing.summary.trim();
+  const afterSummary = candidate.summary.trim();
+  if (beforeSummary.length >= 80
+    && afterSummary.length < beforeSummary.length * 0.2) {
+    reasons.push(`summary collapsed from ${beforeSummary.length} to ${afterSummary.length} characters`);
+  }
+  if (candidate.tasks.length < existing.tasks.length) reasons.push('task count decreased');
+  if (candidate.blockers.length < existing.blockers.length) reasons.push('blocker count decreased');
+  if (candidate.people.length < existing.people.length) reasons.push('people count decreased');
+  if (candidate.activityLog.length < existing.activityLog.length) reasons.push('activity log decreased');
+  return reasons;
 }
 
 function activityReflectsEvidence(text: string, items: BrainInputItem[]): boolean {
@@ -1244,9 +1327,16 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
   async function apply(
     projectId: string,
     itemIds: string[],
-    auditContext: { runId?: string; batchId?: string } = {},
+    options: {
+      runId?: string;
+      batchId?: string;
+      baseBrain?: Brain;
+      persist?: boolean;
+    } = {},
   ): Promise<BrainUpdateResult> {
-    const existing = brainStore.read(projectId) ?? newBrain(projectId, brainStore.getProject(projectId)?.title ?? projectId);
+    const existing = options.baseBrain ?? brainStore.read(projectId)
+      ?? newBrain(projectId, brainStore.getProject(projectId)?.title ?? projectId);
+    const persist = options.persist !== false;
     const projectRow = brainStore.getProject(projectId);
     const homeAnchor = projectScopeAnchor(
       projectRow ?? { title: existing.title, founding_scope: null },
@@ -1356,9 +1446,9 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
     try {
       const prompt = buildPrompt(existing, cleanItems, threadContextItems);
       invocationId = startModelAudit(db, llm, {
-        runId: auditContext.runId,
+        runId: options.runId,
         pass: 'brain',
-        batchId: auditContext.batchId,
+        batchId: options.batchId,
         projectId,
         promptVersion: BRAIN_PROMPT_VERSION,
       }, prompt);
@@ -1385,9 +1475,9 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
         const recoveryPrompt = buildThreadTaskRecoveryPrompt(existing, recoveryPairs, proposedTasks);
         assertPipelinePromptWithinBudget(llm, recoveryPrompt, 'brain thread task recovery');
         recoveryInvocationId = startModelAudit(db, llm, {
-          runId: auditContext.runId,
+          runId: options.runId,
           pass: 'brain',
-          batchId: auditContext.batchId,
+          batchId: options.batchId,
           projectId,
           promptVersion: THREAD_TASK_RECOVERY_PROMPT_VERSION,
         }, recoveryPrompt);
@@ -1470,7 +1560,7 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
           proposedTasks,
           taskEvidenceItems,
           currentItemIds,
-          !allEvidenceActionable,
+          true,
         )
       : existing.tasks;
     const finalValidatedTasks = recoveredTaskCandidates.length > 0
@@ -1482,27 +1572,66 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
           true,
         )
       : primaryValidatedTasks;
+    const proposedSummary = nonEmptyString(update.summary);
+    const rawProposedStatusLine = nonEmptyString(update.statusLine);
+    // The live destructive payload used the scaffold sentinel "active". It is
+    // not information and must never replace a richer existing status line.
+    const proposedStatusLine = rawProposedStatusLine
+      && (normalizeText(rawProposedStatusLine) !== 'active'
+        || !existing.statusLine.trim()
+        || normalizeText(existing.statusLine) === 'active')
+      ? rawProposedStatusLine
+      : null;
+    const rawProposedStatus = validProjectStatus(update.status);
+    // The same empty-scaffold payload carries status="active". Treat it as a
+    // sentinel when the canonical project is non-active; background evidence
+    // cannot silently resume a paused/done/archived project.
+    const proposedStatus = rawProposedStatus === 'active' && existing.status !== 'active'
+      ? null
+      : rawProposedStatus;
     const merged: Brain = {
       ...existing,
-      summary: !hasTaskOnlyThreadContext && allEvidenceSummaryCapable
-        ? (update.summary ?? existing.summary)
+      summary: !hasTaskOnlyThreadContext && allEvidenceSummaryCapable && proposedSummary
+        ? proposedSummary
         : existing.summary,
-      statusLine: !hasTaskOnlyThreadContext && allEvidenceActionable
-        ? (update.statusLine ?? existing.statusLine)
+      statusLine: !hasTaskOnlyThreadContext && allEvidenceActionable && proposedStatusLine
+        ? proposedStatusLine
         : existing.statusLine,
-      status: !hasTaskOnlyThreadContext && allEvidenceActionable
-        ? (update.status ?? existing.status)
+      status: !hasTaskOnlyThreadContext && allEvidenceActionable && proposedStatus
+        ? proposedStatus
         : existing.status,
       tasks: finalValidatedTasks,
-      blockers: !hasTaskOnlyThreadContext && allEvidenceActionable && proposedBlockers
-        ? proposedBlockers
+      blockers: !hasTaskOnlyThreadContext && allEvidenceActionable
+        ? mergeStringArray(existing.blockers, proposedBlockers)
         : existing.blockers,
-      people: !hasTaskOnlyThreadContext && allEvidenceActionable && proposedPeople
-        ? proposedPeople
+      people: !hasTaskOnlyThreadContext && allEvidenceActionable
+        ? mergeStringArray(existing.people, proposedPeople)
         : existing.people,
       activityLog: [...existing.activityLog, ...proposedActivity, ...passiveEmailActivity],
       updated: new Date().toISOString(),
     };
+
+    const destructiveReasons = destructiveRegressionReasons(existing, merged);
+    if (destructiveReasons.length > 0) {
+      failures.record({
+        step: 'brain',
+        message: `blocked destructive brain update for ${projectId}: ${destructiveReasons.join('; ')}`,
+        retryable: true,
+      });
+      return { projectId, status: 'skipped', skipReason: 'destructive_regression', brain: existing };
+    }
+
+    // A syntactically valid empty-shaped response is not an update. This is
+    // the exact incident boundary: do not write a new timestamp/checksum and
+    // do not let rebuild count the chunk as progress.
+    if (semanticBrainSnapshot(existing) === semanticBrainSnapshot(merged)) {
+      return { projectId, status: 'skipped', skipReason: 'no_change', brain: existing };
+    }
+
+    // Rebuilds use the same deterministic validators but keep the candidate in
+    // memory. The orchestrator performs one compare-and-swap publication only
+    // after every chunk succeeds.
+    if (!persist) return { projectId, status: 'updated', brain: merged };
 
     // P8: if the user hand-edited the file, do not overwrite it.
     if (brainStore.hasManualEdit(projectId)) {
@@ -1516,13 +1645,22 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
       return { projectId, status: 'conflict' };
     }
 
-    brainStore.write(merged, merged.summary.slice(0, 200));
+    brainStore.write(merged, merged.summary.slice(0, 200), { reason: 'incremental_brain_update' });
     return { projectId, status: 'updated' };
   }
 
   return {
     updateProject(projectId: string, itemIds: string[]): Promise<BrainUpdateResult> {
       return apply(projectId, itemIds);
+    },
+
+    stageProject(
+      projectId: string,
+      itemIds: string[],
+      baseBrain: Brain,
+      auditContext: { runId?: string; batchId?: string } = {},
+    ): Promise<BrainUpdateResult> {
+      return apply(projectId, itemIds, { ...auditContext, baseBrain, persist: false });
     },
 
     async runForBatch(batchId: string): Promise<BrainUpdateResult[]> {

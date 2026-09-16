@@ -79,6 +79,44 @@ describe('search_items tool', () => {
     expect(ftsRow.snippet).toContain('[weblab]');
   });
 
+  it('treats malformed legacy metadata as empty flags in FTS and LIKE search', async () => {
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, raw_text, metadata, captured_at)
+      VALUES ('malformed_fts', 'note', 'manual', 'malformed FTS row', 'malformedftsterm', '{broken', '2026-09-16T09:00:00Z')
+    `).run();
+    db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)').run('malformed_fts', 'malformed FTS row', 'malformedftsterm');
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, raw_text, metadata, captured_at)
+      VALUES ('malformed_like', 'note', 'manual', 'malformed LIKE row', 'malformedliketerm', 'legacy-not-json', '2026-09-16T09:01:00Z')
+    `).run();
+
+    expect(JSON.parse((await search(executor, 'malformedftsterm')).content).map((row: any) => row.id)).toContain('malformed_fts');
+    expect(JSON.parse((await search(executor, 'malformedliketerm')).content).map((row: any) => row.id)).toContain('malformed_like');
+  });
+
+  it('excludes retired publication and deleted-comment rows from FTS and LIKE fallback', async () => {
+    const retiredMeta = JSON.stringify({ publicationRetired: 'true', docKey: 'retired/doc.docx' });
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, raw_text, metadata, captured_at)
+      VALUES ('retired_fts', 'document_capture', 'sharepoint', 'retired indexed doc', 'retiredindexedterm', ?, '2026-09-16T10:00:00Z')
+    `).run(retiredMeta);
+    db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)').run('retired_fts', 'retired indexed doc', 'retiredindexedterm');
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, raw_text, metadata, captured_at)
+      VALUES ('retired_like', 'document_capture', 'sharepoint', 'retired legacy doc', 'retiredliketerm', ?, '2026-09-16T10:01:00Z')
+    `).run(retiredMeta);
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, raw_text, metadata, captured_at)
+      VALUES ('deleted_comment', 'document_comment', 'sharepoint', 'deleted comment', 'deletedcommentterm', ?, '2026-09-16T10:02:00Z')
+    `).run(JSON.stringify({ deletedFromDoc: 'true', docKey: 'retired/doc.docx' }));
+    db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)').run('deleted_comment', 'deleted comment', 'deletedcommentterm');
+
+    for (const term of ['retiredindexedterm', 'retiredliketerm', 'deletedcommentterm']) {
+      const rows = JSON.parse((await search(executor, term)).content);
+      expect(rows).toEqual([]);
+    }
+  });
+
   it('survives hyphens, quotes and FTS operators in the query', async () => {
     for (const q of ['apt-weblab', 'session "id', 'weblab NEAR/2 metrics', 'a AND b OR (c']) {
       const result = await search(executor, q);

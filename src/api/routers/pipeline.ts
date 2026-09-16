@@ -396,17 +396,25 @@ export function createPipelineRouter(deps: RouterDeps): Router {
     }
   });
 
-  // Regenerate project brains (catch-up briefings) from all their items.
-  // Body: { projectId?: string, chunkSize?: number, minItems?: number }.
-  // With projectId → rebuild one; without → rebuild all populated projects.
+  // Owner-authorized regeneration of project brains from current evidence.
+  // Body: { ownerRequested:true, projectId?: string, allProjects?:true,
+  //         chunkSize?: number, minItems?: number }.
+  // A missing target is rejected rather than accidentally rebuilding all.
   router.post('/pipeline/rebuild-brains', async (req: Request, res: Response) => {
     const orch = deps.pipelineOrchestrator;
     if (!orch) return res.status(503).json({ error: 'pipeline not available' });
+    if (!isSameOriginMutation(req)) return res.status(403).json({ error: 'Cross-origin brain rebuild rejected' });
+    if (req.body?.ownerRequested !== true) {
+      return res.status(403).json({ error: 'ownerRequested=true is required for an explicit brain rebuild' });
+    }
     try {
-      const { projectId, chunkSize, minItems } = req.body ?? {};
+      const { projectId, allProjects, chunkSize, minItems } = req.body ?? {};
       if (projectId) {
         const r = await orch.rebuildBrain(String(projectId), { chunkSize });
         return res.json({ ok: true, ...r });
+      }
+      if (allProjects !== true) {
+        return res.status(400).json({ ok: false, error: 'projectId is required unless allProjects=true was explicitly requested' });
       }
       const r = await orch.rebuildAllBrains({ chunkSize, minItems });
       res.json({ ok: true, ...r });

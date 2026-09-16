@@ -33,7 +33,7 @@ import {
   readZipEntry,
   DOCUMENT_XML_ENTRY,
 } from '../../core/docx-body-editor.js';
-import { listDocumentCorpus, buildDocumentView } from '../../core/document-corpus.js';
+import { listDocumentCorpus, buildDocumentView, docKeyForPath } from '../../core/document-corpus.js';
 import { decomposeEditedMarkdown } from '../../core/edit-decompose.js';
 import { markdownBlocksOf, markdownLineToDocxText, blockToAnchorParagraphs } from '../../core/markdown-anchor.js';
 import * as fs from 'fs';
@@ -70,6 +70,8 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         createdAt: creation.createdAt,
         ...(publication ? {
           publicationId: publication.publicationId,
+          publicationAction: publication.action,
+          basePublicationId: publication.basePublicationId,
           sourceArtifactId: publication.artifactId,
           publicationStatus: publication.status,
         } : {}),
@@ -464,8 +466,54 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
    * download; conflicts isolate per edit. guidedFlow is set server-side —
    * the owner's Approve clicks are the approval this write path requires.
    */
+  type SharePointTargetIdentity = { itemId: string; modified: string; size: number | null; webUrl: string | null };
+
+  const normalizeSharePointPath = (value: string): string => {
+    try { return decodeURIComponent(value).replace(/\/+$/, ''); } catch { return value.replace(/\/+$/, ''); }
+  };
+
+  async function readSharePointTargetIdentity(
+    serverRelativeUrl: string,
+    siteUrl: string | null,
+  ): Promise<SharePointTargetIdentity | null> {
+    const mapped = mapSharePointWriteTarget(serverRelativeUrl, siteUrl ?? undefined);
+    if (typeof mapped === 'string') throw new Error(mapped);
+    let skipToken: string | undefined;
+    for (let page = 0; page < 8; page++) {
+      const listed = await deps.mcpManager!.callTool('sharepoint', 'sharepoint_list_files', {
+        libraryName: 'Documents',
+        ...(mapped.folderPath ? { folderPath: mapped.folderPath } : {}),
+        top: 100,
+        ...(skipToken ? { skipToken } : {}),
+        ...(mapped.personal ? {} : { personal: false }),
+        ...mapped.siteUrl,
+        includeWebUrls: true,
+      }, { timeoutMs: 60_000 });
+      if (listed.isError) throw new Error(`could not resolve SharePoint target identity: ${String(listed.text).slice(0, 300)}`);
+      let payload: any;
+      try { payload = JSON.parse(String(listed.text ?? '')); } catch {
+        throw new Error('SharePoint target listing returned an unreadable identity response.');
+      }
+      const match = (Array.isArray(payload?.files) ? payload.files : []).find((entry: any) =>
+        entry && entry.IsFolder !== true
+        && String(entry.Name ?? '') === mapped.fileName
+        && normalizeSharePointPath(String(entry.Path ?? '')) === normalizeSharePointPath(serverRelativeUrl));
+      if (match) {
+        return {
+          itemId: String(match.Id ?? '').trim(),
+          modified: String(match.Modified ?? '').trim(),
+          size: Number.isFinite(Number(match.Size)) ? Number(match.Size) : null,
+          webUrl: typeof match.WebUrl === 'string' && match.WebUrl.trim() ? match.WebUrl.trim() : null,
+        };
+      }
+      skipToken = typeof payload?.nextToken === 'string' && payload.nextToken ? payload.nextToken : undefined;
+      if (!skipToken) return null;
+    }
+    throw new Error('SharePoint target listing exceeded the bounded identity lookup window.');
+  }
+
   async function runDocumentSync(docKey: string): Promise<
-    | { status: 'done'; uploaded: boolean; verifiedOnReadBack: boolean; results: Array<{ id: string; applied: boolean; reason?: string }> }
+    | { status: 'done'; uploaded: boolean; alreadyCurrent?: boolean; verifiedOnReadBack: boolean; results: Array<{ id: string; applied: boolean; reason?: string }> }
     | { status: 'locked' }
     | { status: 'nothing-approved' }
     | { status: 'failed'; error: string }
@@ -513,7 +561,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
    * server-side — the owner's Approve click is the approval.
    */
   async function runDocumentCreate(creation: import('../../core/pending-edits.js').PendingEdit): Promise<
-    | { status: 'done'; uploaded: boolean; verifiedOnReadBack: boolean; results: Array<{ id: string; applied: boolean; reason?: string }> }
+    | { status: 'done'; uploaded: boolean; alreadyCurrent?: boolean; verifiedOnReadBack: boolean; results: Array<{ id: string; applied: boolean; reason?: string }> }
     | { status: 'locked' }
     | { status: 'failed'; error: string }
   > {
@@ -523,6 +571,21 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const sourceArtifact = publication
       ? deps.productDocumentService?.getArtifact(publication.artifactId) ?? null
       : null;
+    const isPublicationUpdate = publication?.action === 'update_existing';
+    const basePublication = isPublicationUpdate && publication?.basePublicationId
+      ? deps.productDocumentPublications?.get(publication.basePublicationId) ?? null
+      : null;
+    if (isPublicationUpdate && (!basePublication
+      || basePublication.status !== 'complete'
+      || basePublication.docKey !== publication?.docKey
+      || basePublication.serverRelativeUrl !== publication?.serverRelativeUrl
+      || basePublication.projectId !== publication?.projectId
+      || !basePublication.exportSha256)) {
+      const reason = 'The approved update no longer has one matching completed base publication receipt.';
+      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'identity_mismatch', reason);
+      markEditConflicted(db, creation.id, reason);
+      return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+    }
     if (publication && !sourceArtifact) {
       deps.productDocumentPublications?.recordFailure(
         publication.publicationId,
@@ -552,26 +615,62 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const isDocx = creation.serverRelativeUrl.toLowerCase().endsWith('.docx');
     let canonicalExport: Awaited<ReturnType<typeof exportDocument>> | null = null;
 
-    // 1. The world may have changed since approval: a file now AT the target
-    //    means someone created it — conflict, never overwrite.
-    const probePath = path.join(scratchDir, `create-probe-${creation.id}.docx`);
+    // 1. Re-check the exact target at apply time. Create requires absence;
+    //    update requires the completed base bytes at the inherited path.
+    const probePath = path.join(scratchDir, `publication-probe-${creation.id}${isDocx ? '.docx' : '.md'}`);
     const probeRead = await mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
       serverRelativeUrl: creation.serverRelativeUrl,
       ...(creation.siteUrl ? { siteUrl: creation.siteUrl } : {}),
-      inline: creation.serverRelativeUrl.toLowerCase().endsWith('.md'),
-      ...(creation.serverRelativeUrl.toLowerCase().endsWith('.docx') ? { savePath: probePath } : {}),
-    }, { timeoutMs: 60_000 }).catch((error: Error) => ({ text: `Error: ${error.message}`, isError: true }));
-    try { fs.unlinkSync(probePath); } catch { /* absent = fine */ }
-    if (!probeRead.isError) {
-      const reason = 'target already exists on SharePoint — edit the existing document instead';
-      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
-      markEditConflicted(db, creation.id, reason);
-      return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
-    }
-    if (!/not.?found|does not exist|404|no file|could not find/i.test(String(probeRead.text))) {
-      // An auth/transport failure must never be mistaken for "missing" and
-      // trigger a blind write (same rule as the guided update tool).
-      return { status: 'failed', error: `could not verify the target is free: ${String(probeRead.text).slice(0, 300)}` };
+      savePath: probePath,
+    }, { timeoutMs: 120_000 }).catch((error: Error) => ({ text: `Error: ${error.message}`, isError: true }));
+    let baselineIdentity: SharePointTargetIdentity | null = null;
+    let baselineSha256: string | null = null;
+    try {
+      if (isPublicationUpdate) {
+        if (probeRead.isError || !fs.existsSync(probePath)) {
+          const reason = /not.?found|does not exist|404|no file|could not find/i.test(String(probeRead.text))
+            ? 'The previously published SharePoint target no longer exists; update stopped without creating a replacement.'
+            : `Could not read the existing published target safely: ${String(probeRead.text).slice(0, 300)}`;
+          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+          markEditConflicted(db, creation.id, reason);
+          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+        }
+        baselineSha256 = sha256Buffer(fs.readFileSync(probePath));
+        if (baselineSha256 !== basePublication!.exportSha256) {
+          const reason = 'The existing SharePoint file changed after its base publication; update stopped to preserve those remote edits.';
+          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+          markEditConflicted(db, creation.id, reason);
+          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+        }
+        try {
+          baselineIdentity = await readSharePointTargetIdentity(creation.serverRelativeUrl, creation.siteUrl);
+        } catch (error) {
+          return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+        }
+        if (!baselineIdentity?.itemId) {
+          return { status: 'failed', error: 'Could not prove the existing SharePoint item identity; update was not attempted.' };
+        }
+        if (basePublication!.remoteItemId && baselineIdentity.itemId !== basePublication!.remoteItemId) {
+          const reason = 'A different SharePoint item now occupies the published path; update stopped without overwriting it.';
+          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+          markEditConflicted(db, creation.id, reason);
+          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+        }
+      } else {
+        if (!probeRead.isError) {
+          const reason = 'target already exists on SharePoint — choose update_existing with its exact completed publication instead';
+          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+          markEditConflicted(db, creation.id, reason);
+          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+        }
+        if (!/not.?found|does not exist|404|no file|could not find/i.test(String(probeRead.text))) {
+          // An auth/transport failure must never be mistaken for "missing"
+          // and trigger a blind write.
+          return { status: 'failed', error: `could not verify the target is free: ${String(probeRead.text).slice(0, 300)}` };
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(probePath); } catch { /* absent = fine */ }
     }
 
     if (publication && sourceArtifact) {
@@ -593,7 +692,13 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       }
     }
 
-    // 2. Build bytes and upload under the guided waiver.
+    const expectedRemoteSha256 = canonicalExport ? sha256Buffer(canonicalExport.data) : null;
+    const alreadyCurrent = Boolean(isPublicationUpdate
+      && expectedRemoteSha256
+      && baselineSha256 === expectedRemoteSha256);
+
+    // 2. Build bytes and upload under the guided waiver. update_existing uses
+    //    the exact inherited path; no destination field can be substituted.
     let tempDir: string | null = null;
     try {
       const writeArgs: Record<string, unknown> = {
@@ -602,6 +707,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         ...(mapped.folderPath ? { folderPath: mapped.folderPath } : {}),
         ...(mapped.personal ? {} : { personal: false }),
         ...mapped.siteUrl,
+        includeWebUrl: true,
       };
       if (isDocx) {
         // Official publications upload the canonical exporter bytes; generic
@@ -618,9 +724,18 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       } else {
         writeArgs.content = canonicalExport ? canonicalExport.data.toString('utf8') : content;
       }
-      const upload = await mcpManager.callTool('sharepoint', 'sharepoint_write_file', writeArgs, {
-        guidedFlow: true, ownerApproved: true, timeoutMs: 120_000,
-      });
+      const upload = alreadyCurrent
+        ? {
+            text: JSON.stringify({
+              Id: baselineIdentity?.itemId,
+              WebUrl: baselineIdentity?.webUrl,
+              alreadyCurrent: true,
+            }),
+            isError: false,
+          }
+        : await mcpManager.callTool('sharepoint', 'sharepoint_write_file', writeArgs, {
+            guidedFlow: true, ownerApproved: true, timeoutMs: 120_000,
+          });
       if (upload.isError) {
         if (/file is locked/i.test(String(upload.text))) return { status: 'locked' };
         const message = String(upload.text).slice(0, 400);
@@ -634,14 +749,51 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         );
       }
 
-      // 3. Read-back probes: the document as SharePoint now serves it must
-      //    contain the authored passages.
+      // 3. Official publications require exact-byte read-back. Generic
+      //    authoring-bridge creations retain their established passage proof.
       const probes = content.split('\n')
         .map(line => line.replace(/^#{1,3}\s+/, '').replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, '').replace(/\*\*?/g, '').trim())
         .filter(line => line.length >= 12)
         .slice(0, 3);
       let verified = false;
-      if (isDocx) {
+      let verificationReason = 'SharePoint read-back did not verify the authored content';
+      let remoteSha256: string | null = null;
+      let finalIdentity: SharePointTargetIdentity | null = null;
+      if (publication && expectedRemoteSha256) {
+        const readBackPath = path.join(scratchDir, `publication-verify-${creation.id}${isDocx ? '.docx' : '.md'}`);
+        try {
+          const back = await mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+            serverRelativeUrl: creation.serverRelativeUrl,
+            ...(creation.siteUrl ? { siteUrl: creation.siteUrl } : {}),
+            savePath: readBackPath,
+          }, { timeoutMs: 120_000 });
+          if (!back.isError && fs.existsSync(readBackPath)) {
+            remoteSha256 = sha256Buffer(fs.readFileSync(readBackPath));
+            verified = remoteSha256 === expectedRemoteSha256;
+            if (!verified) verificationReason = 'SharePoint read-back bytes did not match the canonical artifact export';
+          }
+        } finally {
+          try { fs.unlinkSync(readBackPath); } catch { /* best effort */ }
+        }
+        if (verified && isPublicationUpdate) {
+          for (let attempt = 0; attempt < 4 && !finalIdentity; attempt++) {
+            try { finalIdentity = await readSharePointTargetIdentity(creation.serverRelativeUrl, creation.siteUrl); } catch {
+              finalIdentity = null;
+            }
+            if (!finalIdentity && attempt < 3) await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          if (finalIdentity?.itemId !== baselineIdentity?.itemId) {
+            verified = false;
+            verificationReason = finalIdentity?.itemId
+              ? 'The target path now resolves to a different SharePoint item; same-file versioning could not be proven'
+              : 'The updated SharePoint item identity could not be re-read';
+          }
+        } else if (verified) {
+          try { finalIdentity = await readSharePointTargetIdentity(creation.serverRelativeUrl, creation.siteUrl); } catch {
+            finalIdentity = null;
+          }
+        }
+      } else if (isDocx) {
         const readBackPath = path.join(scratchDir, `create-verify-${creation.id}.docx`);
         try {
           const back = await mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
@@ -667,7 +819,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       }
 
       if (!verified) {
-        const reason = 'upload returned success but SharePoint read-back did not verify the authored content';
+        const reason = `upload returned success but ${verificationReason}`;
         if (publication) {
           deps.productDocumentPublications?.recordFailure(
             publication.publicationId,
@@ -678,13 +830,19 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         markEditConflicted(db, creation.id, reason);
         return {
           status: 'done',
-          uploaded: true,
+          uploaded: !alreadyCurrent,
           verifiedOnReadBack: false,
           results: [{ id: creation.id, applied: false, reason }],
         };
       }
 
-      if (publication) deps.productDocumentPublications?.recordVerified(publication.publicationId);
+      if (publication) {
+        deps.productDocumentPublications?.recordVerified(publication.publicationId, {
+          remoteSha256: remoteSha256!,
+          ...(finalIdentity?.itemId ? { remoteItemId: finalIdentity.itemId } : {}),
+          ...(finalIdentity?.webUrl ? { webUrl: finalIdentity.webUrl } : {}),
+        });
+      }
       markEditSynced(db, creation.id);
       // 4. Corpus ingestion: a publication is complete only after the
       // lineage-stamped capture has been durably inserted and linked.
@@ -708,7 +866,8 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
             enqueue?.reason ?? 'SharePoint sync is unavailable.',
           );
         }
-        console.log(`[Documents] created ${creation.serverRelativeUrl} (verified=true); ingestion ${enqueue?.queued ? 'completed or failed with receipt' : `skipped: ${enqueue?.reason ?? 'sync unavailable'}`}`);
+        const effect = isPublicationUpdate ? (alreadyCurrent ? 'already current at' : 'versioned') : 'created';
+        console.log(`[Documents] ${effect} ${creation.serverRelativeUrl} (exact-byte verified); ingestion ${enqueue?.queued ? 'completed or failed with receipt' : `skipped: ${enqueue?.reason ?? 'sync unavailable'}`}`);
       } catch (error) {
         if (publication && deps.productDocumentPublications?.get(publication.publicationId)?.status === 'capture_queued') {
           deps.productDocumentPublications.recordFailure(
@@ -718,7 +877,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
           );
         }
       }
-      return { status: 'done', uploaded: true, verifiedOnReadBack: true, results: [{ id: creation.id, applied: true }] };
+      return { status: 'done', uploaded: !alreadyCurrent, alreadyCurrent, verifiedOnReadBack: true, results: [{ id: creation.id, applied: true }] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (publication) {
@@ -738,6 +897,175 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       try { fs.unlinkSync(path.join(scratchDir, `create-upload-${creation.id}.docx`)); } catch { /* absent = fine */ }
     }
   }
+
+  /**
+   * Owner-approved legacy publication repair. This is intentionally NOT a
+   * model tool: it adopts a pre-ledger physical file only when the caller
+   * supplies the exact target item id, baseline SHA, source publication, and
+   * a path-bound confirmation. It never deletes the accidental source copy.
+   */
+  router.post('/documents/publication-repair', async (req: Request, res: Response) => {
+    const isLoopback = (address: string | undefined) =>
+      address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+    if (!isLoopback(req.socket.remoteAddress) || !isLoopback(req.socket.localAddress)) {
+      return res.status(403).json({ error: 'Publication repair is local-only.' });
+    }
+    if (!deps.db || !deps.mcpManager || !deps.productDocumentService || !deps.productDocumentPublications || !deps.sharePointSync) {
+      return res.status(503).json({ error: 'Publication repair dependencies are unavailable.' });
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const artifactId = String(body.artifactId ?? '').trim();
+    const projectId = String(body.projectId ?? '').trim();
+    const sourcePublicationId = String(body.sourcePublicationId ?? '').trim();
+    const serverRelativeUrl = String(body.serverRelativeUrl ?? '').trim();
+    const siteUrl = String(body.siteUrl ?? '').trim();
+    const expectedItemId = String(body.expectedItemId ?? '').trim();
+    const expectedBaselineSha256 = String(body.expectedBaselineSha256 ?? '').trim().toLowerCase();
+    const confirmation = String(body.confirmation ?? '');
+    const requiredConfirmation = `UPDATE ITEM ${expectedItemId} AT ${serverRelativeUrl}`;
+    if (body.ownerRequested !== true || !artifactId || !projectId || !sourcePublicationId
+      || !serverRelativeUrl || !expectedItemId || !/^[a-f0-9]{64}$/.test(expectedBaselineSha256)
+      || confirmation !== requiredConfirmation) {
+      return res.status(400).json({
+        error: 'ownerRequested, exact artifact/project/source publication/target/item/baseline SHA, and path-bound confirmation are required.',
+        requiredConfirmation,
+      });
+    }
+    const artifact = deps.productDocumentService.getArtifact(artifactId);
+    const sourcePublication = deps.productDocumentPublications.get(sourcePublicationId);
+    if (!artifact || artifact.projectId !== projectId) return res.status(409).json({ error: 'The exact artifact is not owned by the requested project.' });
+    if (!sourcePublication || sourcePublication.artifactId !== artifactId || sourcePublication.projectId !== projectId
+      || sourcePublication.status !== 'complete' || !sourcePublication.exportSha256 || !sourcePublication.exportFilename) {
+      return res.status(409).json({ error: 'The source publication is not a completed exact receipt for this artifact/project.' });
+    }
+    if (sourcePublication.serverRelativeUrl === serverRelativeUrl) {
+      return res.status(409).json({ error: 'Source and repair target are the same physical path; no legacy repair is needed.' });
+    }
+    const mapped = mapSharePointWriteTarget(serverRelativeUrl, siteUrl || undefined);
+    if (typeof mapped === 'string') return res.status(400).json({ error: mapped.replace(/^Error:\s*/i, '') });
+    if (!serverRelativeUrl.toLowerCase().endsWith(`.${sourcePublication.format}`)) {
+      return res.status(409).json({ error: `Repair target must preserve the source ${sourcePublication.format} format.` });
+    }
+    const docKey = docKeyForPath(deps.db, serverRelativeUrl, siteUrl || undefined);
+    const scratchDir = path.join(os.homedir(), '.personal-productivity-tracker', 'tmp');
+    fs.mkdirSync(scratchDir, { recursive: true });
+    const sourcePath = path.join(scratchDir, `publication-repair-source-${artifactId}.${sourcePublication.format}`);
+    const beforePath = path.join(scratchDir, `publication-repair-before-${artifactId}.${sourcePublication.format}`);
+    const afterPath = path.join(scratchDir, `publication-repair-after-${artifactId}.${sourcePublication.format}`);
+    try {
+      const identityBefore = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl || null);
+      if (!identityBefore || identityBefore.itemId !== expectedItemId) {
+        return res.status(409).json({ error: 'The repair target item identity changed before upload; nothing was written.', identityBefore });
+      }
+      const [sourceRead, beforeRead] = await Promise.all([
+        deps.mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+          serverRelativeUrl: sourcePublication.serverRelativeUrl,
+          ...(sourcePublication.siteUrl ? { siteUrl: sourcePublication.siteUrl } : {}),
+          savePath: sourcePath,
+        }, { timeoutMs: 120_000 }),
+        deps.mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+          serverRelativeUrl,
+          ...(siteUrl ? { siteUrl } : {}),
+          savePath: beforePath,
+        }, { timeoutMs: 120_000 }),
+      ]);
+      if (sourceRead.isError || beforeRead.isError || !fs.existsSync(sourcePath) || !fs.existsSync(beforePath)) {
+        return res.status(502).json({ error: 'Could not download both source and target bytes; nothing was written.' });
+      }
+      const sourceBytes = fs.readFileSync(sourcePath);
+      const sourceSha256 = sha256Buffer(sourceBytes);
+      const beforeSha256 = sha256Buffer(fs.readFileSync(beforePath));
+      if (sourceSha256 !== sourcePublication.exportSha256) {
+        return res.status(409).json({ error: 'The completed source publication bytes no longer match its export receipt; nothing was written.' });
+      }
+      const alreadyCurrent = beforeSha256 === sourceSha256;
+      if (!alreadyCurrent && beforeSha256 !== expectedBaselineSha256) {
+        return res.status(409).json({ error: 'The target bytes changed after owner approval; nothing was written.', beforeSha256 });
+      }
+      let uploadReceipt: { text: string; isError: boolean } = { text: '{}', isError: false };
+      if (!alreadyCurrent) {
+        uploadReceipt = await deps.mcpManager.callTool('sharepoint', 'sharepoint_write_file', {
+          libraryName: 'Documents',
+          fileName: mapped.fileName,
+          ...(mapped.folderPath ? { folderPath: mapped.folderPath } : {}),
+          ...(mapped.personal ? {} : { personal: false }),
+          ...mapped.siteUrl,
+          sourcePath,
+          includeWebUrl: true,
+        }, { guidedFlow: true, ownerApproved: true, timeoutMs: 120_000 });
+        if (uploadReceipt.isError) {
+          return res.status(/file is locked/i.test(String(uploadReceipt.text)) ? 409 : 502).json({ error: String(uploadReceipt.text).slice(0, 500) });
+        }
+      }
+      const afterRead = await deps.mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+        serverRelativeUrl,
+        ...(siteUrl ? { siteUrl } : {}),
+        savePath: afterPath,
+      }, { timeoutMs: 120_000 });
+      if (afterRead.isError || !fs.existsSync(afterPath)) {
+        return res.status(502).json({ error: 'Upload returned success but exact target bytes could not be read back.' });
+      }
+      const remoteSha256 = sha256Buffer(fs.readFileSync(afterPath));
+      const identityAfter = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl || null);
+      if (remoteSha256 !== sourceSha256 || identityAfter?.itemId !== expectedItemId) {
+        return res.status(502).json({
+          error: 'Repair write could not prove exact V2 bytes on the same SharePoint item.',
+          expectedSha256: sourceSha256,
+          remoteSha256,
+          expectedItemId,
+          actualItemId: identityAfter?.itemId ?? null,
+        });
+      }
+      const opaqueReceipt = publicationRemoteReceipt(String(uploadReceipt.text ?? ''));
+      const repair = deps.productDocumentPublications.recordLegacyRepair({
+        artifactId,
+        projectId,
+        format: sourcePublication.format,
+        ...(siteUrl ? { siteUrl } : {}),
+        serverRelativeUrl,
+        docKey,
+        baseRemoteSha256: beforeSha256,
+        exportSha256: sourceSha256,
+        exportBytes: sourceBytes.length,
+        exportFilename: sourcePublication.exportFilename,
+        remoteItemId: expectedItemId,
+        webUrl: identityAfter.webUrl ?? opaqueReceipt.webUrl,
+        repairNote: `Owner approved canonical-target repair from publication ${sourcePublicationId}; source item remains untouched.`,
+      });
+      const enqueue = deps.sharePointSync.enqueueByPath(serverRelativeUrl, {
+        ...(siteUrl ? { siteUrl } : {}),
+        publicationId: repair.publication.publicationId,
+        sourceArtifactId: artifactId,
+        projectId,
+        exportSha256: sourceSha256,
+      });
+      if (!enqueue.queued) {
+        deps.productDocumentPublications.recordFailure(repair.publication.publicationId, 'capture_failed', enqueue.reason ?? 'Capture queue rejected the repaired target.');
+        return res.status(502).json({ error: 'Remote repair verified, but durable capture could not be queued.', publication: deps.productDocumentPublications.get(repair.publication.publicationId) });
+      }
+      deps.productDocumentPublications.recordCaptureQueued(repair.publication.publicationId);
+      await deps.sharePointSync.drainNow();
+      const completed = deps.productDocumentPublications.get(repair.publication.publicationId);
+      if (completed?.status !== 'complete') {
+        return res.status(502).json({ error: 'Remote repair verified, but durable capture did not complete.', publication: completed });
+      }
+      return res.json({
+        repaired: true,
+        uploaded: !alreadyCurrent,
+        sourcePublicationId,
+        publication: completed,
+        before: { itemId: identityBefore.itemId, sha256: beforeSha256, modified: identityBefore.modified, backupRequired: true },
+        after: { itemId: identityAfter.itemId, sha256: remoteSha256, modified: identityAfter.modified, webUrl: identityAfter.webUrl },
+        untouchedSource: { itemId: sourcePublication.remoteItemId, path: sourcePublication.serverRelativeUrl },
+      });
+    } catch (error) {
+      return res.status(502).json({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      for (const file of [sourcePath, beforePath, afterPath]) {
+        try { fs.unlinkSync(file); } catch { /* best effort */ }
+      }
+    }
+  });
 
   // ── Lock retry (soak find #2, 2026-08-25) ────────────────────────────────
   // SharePoint refuses whole-file uploads while ANYONE has an editing
@@ -810,9 +1138,11 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       verifiedOnReadBack: outcome.verifiedOnReadBack,
       results: outcome.results,
       edits: listPendingEdits(deps.db, docKey),
-      note: outcome.uploaded
-        ? 'One upload applied all synced edits; the pre-edit version stays in SharePoint version history.'
-        : 'Nothing was uploaded — every approved edit conflicted with the current document; re-create them from current text.',
+      note: outcome.alreadyCurrent
+        ? 'The exact artifact bytes were already present at the approved SharePoint item; BotBoy verified and linked them without creating a redundant version.'
+        : outcome.uploaded
+          ? 'One upload applied the approved publication/edit; the pre-edit version stays in SharePoint version history.'
+          : 'Nothing was uploaded — every approved edit conflicted with the current document; re-create them from current text.',
     });
   });
 

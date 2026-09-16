@@ -1206,6 +1206,18 @@ export function migrateLosslessCapture(db: Database.Database): void {
     -- Hashes plus provider/model/prompt version establish which model call
     -- produced a decision without creating a second plaintext secret archive.
     -- Per-item routing reasons are retained separately below.
+    -- Durable before-write snapshots make every canonical brain replacement
+    -- recoverable. The Markdown is the exact prior on-disk representation;
+    -- reason identifies the write path without retaining model plaintext.
+    CREATE TABLE IF NOT EXISTS brain_revisions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      brain_sha256 TEXT NOT NULL,
+      markdown TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT 'brain_write',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS pipeline_llm_audit (
       id TEXT PRIMARY KEY,
       run_id TEXT,
@@ -1259,6 +1271,7 @@ export function migrateLosslessCapture(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_item_ocr_lines_item ON item_ocr_lines(item_id);
     CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pass ON pipeline_runs(pass);
     CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at);
+    CREATE INDEX IF NOT EXISTS idx_brain_revisions_project ON brain_revisions(project_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_pipeline_llm_audit_run ON pipeline_llm_audit(run_id);
     CREATE INDEX IF NOT EXISTS idx_pipeline_llm_audit_batch ON pipeline_llm_audit(batch_id);
     CREATE INDEX IF NOT EXISTS idx_pipeline_llm_audit_project ON pipeline_llm_audit(project_id);

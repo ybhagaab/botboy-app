@@ -16,6 +16,7 @@
  * them on timers.
  */
 
+import { randomUUID } from 'crypto';
 import type Database from 'better-sqlite3';
 import type { Extractor } from './extractor.js';
 import type { Batcher } from './batcher.js';
@@ -25,7 +26,7 @@ import type { Reconciler } from './reconciler.js';
 import type { ProjectOrganizer } from './project-organizer.js';
 import type { ChannelDigester } from './channel-digest.js';
 import type { BrainStore } from './brain-store.js';
-import { newBrain } from './brain-store.js';
+import { BrainWriteConflictError, newBrain, type Brain } from './brain-store.js';
 import { syncNodesFromProjects } from './node-projection.js';
 
 export interface OrchestratorConfig {
@@ -121,11 +122,11 @@ export interface PipelineOrchestrator {
    */
   processAll(opts?: { maxWaves?: number; maxExtractBatches?: number }): Promise<DrainResult>;
   /**
-   * Regenerate a project's brain from scratch, folding in ALL of its items in
-   * chronological chunks. Used to refresh briefings after prompt changes or to
-   * clean up a noisy/low-quality brain. The original brain is restored when no
-   * chunk updates or inference fails, so a skipped rebuild is non-destructive.
-   * Returns items successfully rebuilt. Skips if the LLM is down.
+   * Regenerate a project's brain from all current evidence in chronological
+   * chunks. Chunk results stay in memory; one compare-and-swap publication
+   * occurs only after a non-empty final summary passes every guard. Crashes,
+   * model failures, no-op output, and concurrent edits leave canonical state
+   * untouched. Every successful replacement snapshots the prior revision.
    */
   rebuildBrain(projectId: string, opts?: { chunkSize?: number }): Promise<{ status: 'rebuilt' | 'skipped'; items: number }>;
   /** Rebuild every project that has at least one item. */
@@ -276,58 +277,96 @@ export function createPipelineOrchestrator(deps: {
     return result;
   }
 
+  const rebuildingProjects = new Set<string>();
+
   async function rebuildBrain(projectId: string, opts?: { chunkSize?: number }): Promise<{ status: 'rebuilt' | 'skipped'; items: number }> {
-    const proj = brainStore.getProject(projectId);
-    if (!proj) return { status: 'skipped', items: 0 };
+    if (rebuildingProjects.has(projectId)) return { status: 'skipped', items: 0 };
+    rebuildingProjects.add(projectId);
 
-    const ids = (
-      db.prepare("SELECT id FROM work_items WHERE project_id = ? ORDER BY captured_at ASC").all(projectId) as { id: string }[]
-    ).map((r) => r.id);
-    if (ids.length === 0) return { status: 'skipped', items: 0 };
+    const runId = randomUUID();
+    const batchId = `rebuild:${projectId}`;
+    let runStarted = false;
+    const finishRun = (status: 'completed' | 'failed', itemsOut: number, error?: string): void => {
+      if (!runStarted) return;
+      db.prepare(`
+        UPDATE pipeline_runs
+        SET items_out=?, status=?, errors=?, completed_at=datetime('now')
+        WHERE id=?
+      `).run(itemsOut, status, error?.slice(0, 500) ?? null, runId);
+    };
 
-    // Never use a rebuild to overwrite a hand-edited brain. Capture the
-    // canonical pre-rebuild state so every unsuccessful attempt can restore it.
-    if (brainStore.hasManualEdit(projectId)) return { status: 'skipped', items: 0 };
-    const original = brainStore.read(projectId) ?? newBrain(projectId, proj.title);
-    const originalOneLiner = proj.one_liner ?? original.summary.slice(0, 200);
-
-    let updatedChunks = 0;
     try {
-      // A fresh scaffold prevents duplicated activity while chunks fold in
-      // chronological evidence. It is temporary until at least one update
-      // succeeds; failures and all-out-of-scope runs roll back below.
-      brainStore.write(newBrain(projectId, proj.title), originalOneLiner);
+      const proj = brainStore.getProject(projectId);
+      if (!proj) return { status: 'skipped', items: 0 };
 
-      const chunk = Math.max(1, opts?.chunkSize ?? 12);
-      for (let i = 0; i < ids.length; i += chunk) {
-        const slice = ids.slice(i, i + chunk);
-        const r = await brainUpdater.updateProject(projectId, slice);
-        if (r.status === 'updated') {
+      const ids = (
+        db.prepare("SELECT id FROM work_items WHERE project_id = ? ORDER BY captured_at ASC").all(projectId) as { id: string }[]
+      ).map((row) => row.id);
+      if (ids.length === 0) return { status: 'skipped', items: 0 };
+
+      // Owner/manual changes and concurrent background writes always win. The
+      // expected checksum is rechecked atomically at the one final publish.
+      if (brainStore.hasManualEdit(projectId)) return { status: 'skipped', items: 0 };
+      const expectedSha256 = proj.brain_sha256;
+
+      db.prepare("INSERT INTO pipeline_runs (id, pass, batch_id, items_in, status) VALUES (?, 'brain', ?, ?, 'running')")
+        .run(runId, batchId, ids.length);
+      runStarted = true;
+
+      // Fold every chunk into memory. The canonical file and projects row stay
+      // untouched throughout inference, so crashes and model failures cannot
+      // expose or strand an empty/partial scaffold.
+      let staged: Brain = newBrain(projectId, proj.title);
+      let updatedChunks = 0;
+      const chunkSize = Math.max(1, opts?.chunkSize ?? 12);
+      for (let index = 0; index < ids.length; index += chunkSize) {
+        const result = await brainUpdater.stageProject(
+          projectId,
+          ids.slice(index, index + chunkSize),
+          staged,
+          { runId, batchId },
+        );
+        if (result.status === 'updated' && result.brain) {
+          staged = result.brain;
           updatedChunks++;
           continue;
         }
-        if (r.status === 'conflict' || r.skipReason === 'model_failure') {
-          if (!brainStore.hasManualEdit(projectId)) brainStore.write(original, originalOneLiner);
-          try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+        if (result.status === 'conflict'
+          || result.skipReason === 'model_failure'
+          || result.skipReason === 'destructive_regression') {
+          finishRun('failed', 0, `rebuild aborted: ${result.status}/${result.skipReason ?? 'conflict'}`);
           return { status: 'skipped', items: 0 };
         }
-        // An out-of-scope chunk is recoverable; a later chunk may still update.
+        // Scope filtering and a safe no-op are recoverable; later evidence may
+        // still produce a publishable staged brain.
       }
 
       if (updatedChunks === 0) {
-        if (!brainStore.hasManualEdit(projectId)) brainStore.write(original, originalOneLiner);
-        try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+        finishRun('failed', 0, 'rebuild produced no safe semantic changes');
         return { status: 'skipped', items: 0 };
       }
-    } catch (err) {
-      if (!brainStore.hasManualEdit(projectId)) brainStore.write(original, originalOneLiner);
-      try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
-      throw err;
-    }
+      if (!staged.summary.trim()) {
+        finishRun('failed', 0, 'rebuild candidate has no summary; canonical brain preserved');
+        return { status: 'skipped', items: 0 };
+      }
 
-    try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
-    refreshProjectRelations();
-    return { status: 'rebuilt', items: ids.length };
+      brainStore.write(staged, staged.summary.slice(0, 200), {
+        reason: 'rebuild_publish',
+        expectedSha256,
+      });
+      finishRun('completed', ids.length);
+      try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+      refreshProjectRelations();
+      return { status: 'rebuilt', items: ids.length };
+    } catch (err) {
+      finishRun('failed', 0, (err as Error).message);
+      if (err instanceof BrainWriteConflictError) {
+        return { status: 'skipped', items: 0 };
+      }
+      throw err;
+    } finally {
+      rebuildingProjects.delete(projectId);
+    }
   }
 
   async function rebuildAllBrains(opts?: { chunkSize?: number; minItems?: number }): Promise<{ projects: number; items: number }> {

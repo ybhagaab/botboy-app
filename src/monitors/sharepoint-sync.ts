@@ -1571,6 +1571,7 @@ export function createSharePointSync(deps: {
         WHERE source = 'sharepoint' AND type = 'document_capture'
           AND process_state != 'captured'
           AND json_extract(metadata, '$.docKey') IS NOT NULL
+          AND COALESCE(json_extract(metadata, '$.publicationRetired'), '') != 'true'
           AND json_extract(metadata, '$.extractionTier') != 'metadata_only'
       ) WHERE rn = 1
     `).all() as Array<ContentRowColumns & { docKey: string; id: string; capturedAt: string }>;

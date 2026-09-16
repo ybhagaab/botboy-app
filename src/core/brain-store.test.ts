@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fc from 'fast-check';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { createStorage, StorageLayer } from './storage.js';
-import { createBrainStore, BrainStore, Brain, newBrain, TaskState } from './brain-store.js';
+import { createBrainStore, BrainStore, Brain, BrainWriteConflictError, newBrain, TaskState } from './brain-store.js';
 
 describe('BrainStore', () => {
   let storage: StorageLayer;
@@ -100,6 +100,45 @@ describe('BrainStore', () => {
     // Simulate a user editing the file directly.
     writeFileSync(brains.brainPathFor('proj_fatafat'), '---\nid: proj_fatafat\n---\n## Summary\nedited by hand\n', 'utf8');
     expect(brains.hasManualEdit('proj_fatafat')).toBe(true);
+  });
+
+  it('snapshots the exact prior Markdown before every changed canonical write', () => {
+    const before = sampleBrain();
+    brains.write(before);
+    const priorMarkdown = readFileSync(brains.brainPathFor(before.id), 'utf8');
+    const priorSha = brains.sha256(priorMarkdown);
+
+    brains.write(
+      { ...before, summary: 'A validated replacement summary.', updated: '2026-09-16T08:00:00Z' },
+      undefined,
+      { reason: 'incremental_brain_update' },
+    );
+
+    const revision = storage.getDb().prepare(`
+      SELECT project_id AS projectId, brain_sha256 AS sha, markdown, reason
+      FROM brain_revisions WHERE project_id = ?
+    `).get(before.id) as { projectId: string; sha: string; markdown: string; reason: string };
+    expect(revision).toEqual({
+      projectId: before.id,
+      sha: priorSha,
+      markdown: priorMarkdown,
+      reason: 'incremental_brain_update',
+    });
+  });
+
+  it('compare-and-swap publication preserves a concurrently changed brain', () => {
+    const before = sampleBrain();
+    brains.write(before);
+    const expectedSha = brains.getProject(before.id)!.brain_sha256!;
+    const concurrent = { ...before, summary: 'Owner-restored state', updated: '2026-09-16T08:01:00Z' };
+    brains.write(concurrent, undefined, { reason: 'owner_restore' });
+
+    expect(() => brains.write(
+      { ...before, summary: 'Stale rebuild candidate', updated: '2026-09-16T08:02:00Z' },
+      undefined,
+      { reason: 'rebuild_publish', expectedSha256: expectedSha },
+    )).toThrow(BrainWriteConflictError);
+    expect(brains.read(before.id)!.summary).toBe('Owner-restored state');
   });
 
   it('newBrain scaffolds an empty active project', () => {

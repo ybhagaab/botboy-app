@@ -1170,18 +1170,22 @@ function renderProjectDocuments(projectId) {
   const publications = entry.publications || [];
   const authoredDocuments = entry.authoredDocuments || [];
   const authoredChains = buildDocumentLibraryView(authoredDocuments, { sort: 'recent' });
-  // Staged creations (authoring bridge): documents BotBoy drafted that
-  // publish to SharePoint only after Approve + Sync here.
+  // Staged publications: exact artifact actions that reach SharePoint only
+  // after Approve + Sync here. The typed publication action—not origin copy—
+  // decides whether Sync creates a copy or versions an existing exact target.
   const creations = entry.stagedCreations || [];
   const creationBlock = creations.length ? `
-    <div class="section-heading"><div><h2>Awaiting publication</h2><p>Approved or proposed SharePoint creations. Nothing is a published document until upload and verification complete.</p></div><span class="pill blue">${creations.length}</span></div>
+    <div class="section-heading"><div><h2>Awaiting publication</h2><p>Exact SharePoint create/update actions. Nothing is complete until guarded upload, exact-byte verification, and capture linkage succeed.</p></div><span class="pill blue">${creations.length}</span></div>
     <section class="card pad">${creations.map(creation => {
     const statusTone = { pending: '', approved: 'blue', conflicted: 'warn' }[creation.status] || '';
     const canRender = typeof window.formatMarkdownContent === 'function';
+    const isUpdate = creation.publicationAction === 'update_existing';
+    const actionLabel = isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy';
     return `<article style="display:flex; flex-direction:column; gap:8px; padding:10px 0; border-bottom:1px solid var(--border);">
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <strong>${esc(creation.fileName)}</strong>
           <span class="pill ${statusTone}">${esc(creation.status)}</span>
+          <span class="pill ${isUpdate ? 'accent' : ''}">${icon(isUpdate ? 'refresh' : 'plus', 10)} ${esc(actionLabel)}</span>
           ${creation.publicationStatus ? `<span class="pill blue">${icon('link', 10)} ${esc(documentStateLabel(creation.publicationStatus))}</span>` : ''}
           ${creation.sourceArtifactId ? `<a href="#/documents/${encodeURIComponent(creation.sourceArtifactId)}" class="document-project-link">Official source</a>` : ''}
           ${creation.originNote ? `<span style="color:var(--muted); font-size:11.5px;">${esc(creation.originNote)}</span>` : ''}
@@ -1196,7 +1200,7 @@ function renderProjectDocuments(projectId) {
             <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}">Approve</button>
             <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}">Reject</button>` : ''}
           ${creation.status === 'approved' ? `
-            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}">${icon('refresh', 12)} Create on SharePoint</button>` : ''}
+            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}">${icon('refresh', 12)} ${isUpdate ? 'Update SharePoint version' : 'Create SharePoint copy'}</button>` : ''}
         </div>
       </article>`;
   }).join('')}</section>` : '';
@@ -1208,23 +1212,32 @@ function renderProjectDocuments(projectId) {
     const versionCount = chain.members.length;
     const chainArtifactIds = new Set(chain.members.map(version => version.artifactId));
     const chainPublications = publications.filter(publication => chainArtifactIds.has(publication.artifactId));
-    const latestPublication = chainPublications[0] || null;
-    const publicationTone = latestPublication?.status === 'complete'
+    const currentPublication = chainPublications.find(publication => publication.artifactId === document.artifactId) || null;
+    const completedLocations = chainPublications
+      .filter(publication => publication.status === 'complete' && publication.capturedWorkItemId)
+      .filter((publication, index, all) => all.findIndex(candidate => candidate.docKey === publication.docKey) === index);
+    const olderCompleted = completedLocations.find(publication => publication.artifactId !== document.artifactId) || null;
+    const latestPublication = currentPublication || chainPublications[0] || null;
+    const publicationTone = currentPublication?.status === 'complete'
       ? 'good'
-      : latestPublication?.status === 'verification_failed'
-        || latestPublication?.status === 'capture_failed'
-        || latestPublication?.status === 'identity_mismatch'
-        || latestPublication?.status === 'target_conflict'
+      : currentPublication?.status === 'verification_failed'
+        || currentPublication?.status === 'capture_failed'
+        || currentPublication?.status === 'identity_mismatch'
+        || currentPublication?.status === 'target_conflict'
           ? 'warn'
-          : latestPublication ? 'blue' : '';
-    const publicationLabel = latestPublication
-      ? latestPublication.status === 'complete'
-        ? 'Published to SharePoint'
-        : `Publication ${documentStateLabel(latestPublication.status)}`
-      : '';
-    const publishedLocation = latestPublication?.status === 'complete'
-      ? `<a class="project-publication-link" href="#/doc/${encodeDocKey(latestPublication.docKey)}">${icon('link', 10)} Published copy</a>`
-      : '';
+          : currentPublication ? 'blue' : olderCompleted ? 'warn' : '';
+    const publicationLabel = currentPublication
+      ? currentPublication.status === 'complete'
+        ? 'Current version published'
+        : `Current publication ${documentStateLabel(currentPublication.status)}`
+      : olderCompleted
+        ? 'Older version published · current version local'
+        : latestPublication
+          ? `Publication ${documentStateLabel(latestPublication.status)}`
+          : '';
+    const publishedLocations = completedLocations.map(publication =>
+      `<a class="project-publication-link" href="#/doc/${encodeDocKey(publication.docKey)}" title="${attr(publication.serverRelativeUrl)}">${icon('link', 10)} ${publication.artifactId === document.artifactId ? 'Current published copy' : 'Older published copy'}</a>`
+    ).join('');
     return `<article class="evidence-row project-authored-row">
       <span class="source-icon project-authored-icon">${icon('file', 16)}</span>
       <a class="today-item-copy" href="#/documents/${encodeURIComponent(document.artifactId)}" style="min-width:0; flex:1;">
@@ -1234,7 +1247,7 @@ function renderProjectDocuments(projectId) {
           <span class="pill">${icon('activity', 10)} ${versionCount} loaded version${versionCount === 1 ? '' : 's'}</span>
           <span class="pill ${documentStateTone(document.state)}">${esc(documentStateLabel(document.state))}</span>
           ${publicationLabel ? `<span class="pill ${publicationTone}">${icon('link', 10)} ${esc(publicationLabel)}</span>` : ''}
-          ${publishedLocation}
+          ${publishedLocations}
           <span>${esc(documentProfileLabel(document.profileId))}</span>
           <time>${esc(relativeTime(document.createdAt))}</time>
         </span>
@@ -1939,7 +1952,7 @@ async function rebuildProjectBrain(projectId) {
   state.rebuilding.add(projectId);
   renderRoute({ userAction: true });
   try {
-    const result = await request('/pipeline/rebuild-brains', { method: 'POST', body: { projectId } });
+    const result = await request('/pipeline/rebuild-brains', { method: 'POST', body: { projectId, ownerRequested: true } });
     if (result?.status === 'rebuilt') toast(`Brain rebuilt from ${number(result.items)} evidence item(s)`);
     else toast('Rebuild skipped — the model may be unavailable or the project has no evidence', 'bad');
     state.projectDetails.delete(projectId);
@@ -4397,13 +4410,31 @@ function renderDocumentDetailPane(artifactId) {
     { format: 'pdf', label: 'PDF', hint: '.pdf' },
   ];
   const downloadMenu = editing ? '' : `<details class="document-download-menu" data-document-download-menu><summary class="button small" aria-haspopup="menu" ${documents.downloading ? 'aria-disabled="true"' : ''}>${icon('download', 13)} ${documents.downloading ? `Preparing ${esc(documents.downloading)}…` : 'Download'}</summary><div class="document-download-list" role="menu">${downloadFormats.map(entry => `<button type="button" role="menuitem" data-action="documents-download" data-artifact="${attr(artifactId)}" data-format="${entry.format}" ${documents.downloading ? 'disabled' : ''}><span>${entry.label}</span><span>${entry.hint}</span></button>`).join('')}</div></details>`;
+  const completedPublicationLocations = (Array.isArray(artifact.publications) ? artifact.publications : [])
+    .filter(publication => publication.status === 'complete' && publication.capturedWorkItemId)
+    .filter((publication, index, all) => all.findIndex(candidate => candidate.docKey === publication.docKey) === index);
+  const currentCompletedPublication = completedPublicationLocations.find(publication => publication.artifactId === artifactId) || null;
+  const updateCandidate = !currentCompletedPublication && completedPublicationLocations.length === 1
+    ? completedPublicationLocations[0]
+    : null;
   const publishPrompt = artifact.projectId
-    ? `Publish the exact official BotBoy document artifact ${artifact.artifactId} ("${artifact.title}") to SharePoint for project ${artifact.projectId}. Ask me for the destination folder and md/docx format if I have not supplied them, then call publish_product_document_to_sharepoint. Do not recreate or copy the artifact text.`
+    ? updateCandidate
+      ? `Update the existing SharePoint copy at ${updateCandidate.serverRelativeUrl} with exact official BotBoy artifact ${artifact.artifactId} ("${artifact.title}") for project ${artifact.projectId}. Call publish_product_document_to_sharepoint with action=update_existing, basePublicationId=${updateCandidate.publicationId}, format=${updateCandidate.format}, ownerRequested=true. Do not ask for or substitute a destination; the completed base receipt owns the exact physical file.`
+      : completedPublicationLocations.length > 1 && !currentCompletedPublication
+        ? `Publish exact official BotBoy artifact ${artifact.artifactId} ("${artifact.title}") for project ${artifact.projectId}. This chain has multiple completed SharePoint locations: ${completedPublicationLocations.map(publication => `${publication.publicationId} → ${publication.serverRelativeUrl}`).join('; ')}. Ask me which exact existing copy to version, then call publish_product_document_to_sharepoint with action=update_existing and that basePublicationId. Offer action=create only if I explicitly want an additional physical copy.`
+        : currentCompletedPublication
+          ? `Exact official BotBoy artifact ${artifact.artifactId} is already published at ${currentCompletedPublication.serverRelativeUrl}. Tell me it is current. If I explicitly request an additional physical SharePoint copy, ask for its new destination and call publish_product_document_to_sharepoint with action=create. Do not overwrite or duplicate anything merely because I clicked Publish.`
+          : `Publish exact official BotBoy artifact ${artifact.artifactId} ("${artifact.title}") as a new SharePoint copy for project ${artifact.projectId}. Ask me for the destination folder and md/docx format if I have not supplied them, then call publish_product_document_to_sharepoint with action=create and ownerRequested=true. Do not recreate or copy the artifact text.`
     : '';
+  const publishLabel = updateCandidate
+    ? 'Update published copy'
+    : currentCompletedPublication
+      ? 'Published'
+      : 'Publish';
   const publishButton = editing
     ? ''
     : artifact.projectId
-      ? `<button class="button small" type="button" data-prompt="${attr(publishPrompt)}">${icon('link', 13)} Publish</button>`
+      ? `<button class="button small" type="button" data-prompt="${attr(publishPrompt)}">${icon('link', 13)} ${esc(publishLabel)}</button>`
       : `<button class="button small" type="button" disabled title="Assign this document chain to a project before publishing">${icon('link', 13)} Publish</button>`;
   const reviewAvailable = Boolean(reviewModel.totalCount || reviewModel.statusLabel || reviewModel.reviewSummary);
   const reviewButton = !editing && reviewAvailable
@@ -4430,12 +4461,17 @@ function renderDocumentDetailPane(artifactId) {
   const projectFact = artifact.projectId
     ? `<a class="document-project-link" href="#/projects/${encodeURIComponent(artifact.projectId)}" title="Open owning project">${icon('folder', 11)} ${esc(project?.title || artifact.projectTitle || artifact.projectId)}</a>`
     : `<span class="document-project-unassigned">${icon('folder', 11)} Unassigned</span>`;
-  const latestPublication = Array.isArray(artifact.publications) ? artifact.publications[0] : null;
-  const publicationFact = latestPublication
-    ? latestPublication.status === 'complete'
-      ? `<a class="document-project-link" href="#/doc/${encodeDocKey(latestPublication.docKey)}">${icon('link', 11)} Published copy</a>`
-      : `<span class="document-publication-status">${icon('link', 11)} ${esc(documentStateLabel(latestPublication.status))}</span>`
-    : '';
+  const currentArtifactPublication = Array.isArray(artifact.publications)
+    ? artifact.publications.find(publication => publication.artifactId === artifactId) || null
+    : null;
+  const olderCompletedPublication = completedPublicationLocations.find(publication => publication.artifactId !== artifactId) || null;
+  const publicationFact = currentArtifactPublication
+    ? currentArtifactPublication.status === 'complete'
+      ? `<a class="document-project-link" href="#/doc/${encodeDocKey(currentArtifactPublication.docKey)}">${icon('link', 11)} Current version published</a>`
+      : `<span class="document-publication-status">${icon('link', 11)} Current publication ${esc(documentStateLabel(currentArtifactPublication.status))}</span>`
+    : olderCompletedPublication
+      ? `<a class="document-project-link" href="#/doc/${encodeDocKey(olderCompletedPublication.docKey)}">${icon('link', 11)} Older version published</a>`
+      : '';
   const projectChoices = [...new Map([
     ...state.projects,
     ...state.areas.flatMap(area => area.projects || []),

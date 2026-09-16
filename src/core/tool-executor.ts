@@ -564,13 +564,15 @@ export function createToolExecutor(
     rebuild_brain: (args) => {
       const projectId = String(args.projectId ?? '').trim();
       if (!projectId) return 'Error: projectId required';
+      const intentError = requireOwnerRequested(args, 'rebuild this project brain from evidence');
+      if (intentError) return intentError;
       // Rebuilds take minutes — fire and forget, never block the tool loop.
       void fetch(`${API_BASE}/pipeline/rebuild-brains`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId }),
+        headers: { 'Content-Type': 'application/json', 'X-BotBoy-Actor': 'agent' },
+        body: JSON.stringify({ projectId, ownerRequested: true }),
       }).catch(() => { /* surfaced via pipeline health */ });
-      return `OK: rebuild started for ${projectId}. It re-synthesizes the brain from current evidence in the background (1-3 min). Do NOT claim it finished — tell the user it is running.`;
+      return `OK: owner-authorized rebuild started for ${projectId}. It stages a new brain from current evidence and publishes only after complete validation (1-3 min). Do NOT claim it finished — tell the user it is running.`;
     },
 
     // ── Managed MCP tools ──
@@ -2117,6 +2119,8 @@ export function createToolExecutor(
           FROM work_items_fts
           JOIN work_items wi ON wi.id = work_items_fts.item_id
           WHERE work_items_fts MATCH ?
+            AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
+            AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
           ORDER BY rank
           LIMIT ?
         `).all(ftsQuery, LIMIT) as any[];
@@ -2133,7 +2137,9 @@ export function createToolExecutor(
         const likeRows = db.prepare(`
           SELECT id, type, title, substr(COALESCE(summary, raw_text), 1, 150) AS snippet, url, captured_at
           FROM work_items
-          WHERE title LIKE ? OR summary LIKE ? OR raw_text LIKE ?
+          WHERE (title LIKE ? OR summary LIKE ? OR raw_text LIKE ?)
+            AND COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
+            AND COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
           ORDER BY captured_at DESC
           LIMIT ?
         `).all(pattern, pattern, pattern, LIMIT) as any[];

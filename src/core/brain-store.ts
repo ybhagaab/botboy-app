@@ -12,7 +12,7 @@
  * YAML/markdown dependency) and tolerant of hand edits.
  */
 
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   mkdirSync,
   writeFileSync,
@@ -71,13 +71,31 @@ export function projectScopeAnchor(project: Pick<ProjectRow, 'title' | 'founding
   return founding && founding.length > 0 ? founding : project.title;
 }
 
+export interface BrainWriteOptions {
+  /** Durable revision classification for incident recovery/audit. */
+  reason?: string;
+  /** Compare-and-swap guard. `null` requires no current file. */
+  expectedSha256?: string | null;
+}
+
+export class BrainWriteConflictError extends Error {
+  constructor(
+    public readonly projectId: string,
+    public readonly expectedSha256: string | null,
+    public readonly actualSha256: string | null,
+  ) {
+    super(`brain ${projectId} changed before publish (expected ${expectedSha256 ?? 'none'}, found ${actualSha256 ?? 'none'})`);
+    this.name = 'BrainWriteConflictError';
+  }
+}
+
 export interface BrainStore {
   brainPathFor(projectId: string): string;
   serialize(brain: Brain): string;
   parse(markdown: string): Brain;
   read(projectId: string): Brain | null;
-  /** Write brain to disk (atomic), upsert the projects index row. */
-  write(brain: Brain, oneLiner?: string): void;
+  /** Write brain to disk (atomic), snapshotting the exact prior Markdown. */
+  write(brain: Brain, oneLiner?: string, options?: BrainWriteOptions): void;
   /** True if the on-disk brain differs from the recorded brain_sha256 (R7.5). */
   hasManualEdit(projectId: string): boolean;
   listProjects(status?: ProjectStatus): ProjectRow[];
@@ -231,17 +249,40 @@ export function createBrainStore(db: Database.Database, config?: BrainStoreConfi
       return this.parse(readFileSync(p, 'utf8'));
     },
 
-    write(brain: Brain, oneLiner?: string): void {
+    write(brain: Brain, oneLiner?: string, options?: BrainWriteOptions): void {
       const p = this.brainPathFor(brain.id);
       mkdirSync(path.dirname(p), { recursive: true });
       const markdown = this.serialize(brain);
+      const nextSha = sha256Hex(markdown);
+      const priorMarkdown = existsSync(p) ? readFileSync(p, 'utf8') : null;
+      const priorSha = priorMarkdown === null ? null : sha256Hex(priorMarkdown);
 
-      // Atomic write.
+      if (options && Object.prototype.hasOwnProperty.call(options, 'expectedSha256')
+        && priorSha !== options.expectedSha256) {
+        throw new BrainWriteConflictError(brain.id, options.expectedSha256 ?? null, priorSha);
+      }
+
+      // Snapshot BEFORE replacement. If the process dies after this insert but
+      // before rename, the extra revision merely duplicates the current brain;
+      // if it dies after rename, the prior state is already durable.
+      if (priorMarkdown !== null && priorSha !== nextSha) {
+        db.prepare(`
+          INSERT INTO brain_revisions (id, project_id, brain_sha256, markdown, reason)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          randomUUID(),
+          brain.id,
+          priorSha,
+          priorMarkdown,
+          options?.reason?.trim() || 'brain_write',
+        );
+      }
+
+      // Atomic file replacement.
       const tmp = path.join(path.dirname(p), `.${brain.id}.md.tmp-${process.pid}-${Date.now()}`);
       writeFileSync(tmp, markdown, 'utf8');
       renameSync(tmp, p);
 
-      const sha = sha256Hex(markdown);
       const now = new Date().toISOString();
       // founding_scope is written once at creation and deliberately left out
       // of the conflict-update set: later brain rewrites must not move the
@@ -263,7 +304,7 @@ export function createBrainStore(db: Database.Database, config?: BrainStoreConfi
         brain.status,
         oneLiner ?? brain.summary.slice(0, 200),
         p,
-        sha,
+        nextSha,
         brain.title,
         now,
         now,

@@ -160,6 +160,7 @@ describe('lossless-capture-brain-pipeline migration', () => {
     expect(names).toContain('item_ocr_lines');
     expect(names).toContain('failures');
     expect(names).toContain('pipeline_runs');
+    expect(names).toContain('brain_revisions');
     expect(names).toContain('work_items_fts');
   });
 

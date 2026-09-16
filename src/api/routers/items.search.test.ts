@@ -49,6 +49,22 @@ describe('GET /api/search', () => {
     expect(hit.item.collapsedCount).toBe(3);
   });
 
+  it('excludes retired publication captures and comments from active search', async () => {
+    const db = storage.getDb();
+    const retired = JSON.stringify({ docKey: DOC_KEY, publicationRetired: 'true' });
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, metadata, raw_text)
+      VALUES ('retired-cap', 'document_capture', 'sharepoint', 'retired unification publication', 'https://x/retired', '2026-09-16T10:00:00Z', 'routed', ?, 'retired body')
+    `).run(retired);
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, metadata, raw_text)
+      VALUES ('retired-comment', 'document_comment', 'sharepoint', 'retired unification comment', 'https://x/retired#comment=1', '2026-09-16T10:01:00Z', 'routed', ?, 'retired note')
+    `).run(JSON.stringify({ docKey: DOC_KEY, publicationRetired: 'true', deletedFromDoc: 'true' }));
+    const res = await request(app()).get('/api/search').query({ q: 'retired unification' });
+    expect(res.status).toBe(200);
+    expect(res.body.results).toEqual([]);
+  });
+
   it('collapses node-join fan-out to one row per item and leaves non-doc items untouched', async () => {
     const db = storage.getDb();
     db.prepare(`

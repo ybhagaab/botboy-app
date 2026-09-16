@@ -29,7 +29,9 @@ export function createItemsRouter(deps: RouterDeps): Router {
       FROM work_items wi
       LEFT JOIN node_work_items nwi ON wi.id = nwi.work_item_id
       LEFT JOIN nodes n ON nwi.node_id = n.id
-      WHERE wi.title LIKE ? OR wi.summary LIKE ? OR wi.parsed_text LIKE ?
+      WHERE (wi.title LIKE ? OR wi.summary LIKE ? OR wi.parsed_text LIKE ?)
+        AND COALESCE(json_extract(wi.metadata, '$.publicationRetired'), '') != 'true'
+        AND COALESCE(json_extract(wi.metadata, '$.deletedFromDoc'), '') != 'true'
       ORDER BY wi.captured_at DESC
       LIMIT ?
     `).all(pattern, pattern, pattern, limit) as any[];

@@ -609,6 +609,8 @@ async function main() {
       && publication.artifactId === String(item.metadata?.sourceArtifactId ?? '')
       && publication.projectId === String(item.metadata?.publicationProjectId ?? '')
       && publication.docKey === publicationDocKey
+      && Boolean(publication.exportSha256)
+      && publication.exportSha256 === String(item.metadata?.exportSha256 ?? '').trim().toLowerCase()
       && (publication.status === 'capture_queued' || publication.status === 'verified'));
     if (publication && !publicationIdentityValid
       && (publication.status === 'uploaded_unverified'
@@ -617,7 +619,7 @@ async function main() {
       productDocumentPublications.recordFailure(
         publication.publicationId,
         'identity_mismatch',
-        'SharePoint capture lineage did not match the staged artifact, project, and destination identity.',
+        'SharePoint capture lineage did not match the staged artifact, project, destination, and export SHA-256 identity.',
       );
     }
     // Dedup check (in-memory for Slack cross-platform). Publication captures

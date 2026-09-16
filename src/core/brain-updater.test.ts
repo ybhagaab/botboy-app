@@ -206,6 +206,92 @@ describe('BrainUpdater', () => {
     expect(after.tasks[0].date).toBe('2026-07-08'); // dated by citing evidence
   });
 
+  it('treats the exact incident empty-shaped response as a no-op', async () => {
+    const incidentResponse = {
+      summary: '', statusLine: 'active', status: 'active',
+      tasks: [], blockers: [], people: [], newActivity: [],
+    };
+    const { brains, updater } = build(mockLlm(incidentResponse));
+    const seed: Brain = {
+      ...newBrain('proj_x', 'Incident Remediation'),
+      status: 'paused',
+      summary: 'A'.repeat(700),
+      statusLine: 'Seven workstreams are active',
+      tasks: [{ state: 'doing', text: 'Preserve the critical migration plan' }],
+      blockers: ['Awaiting architecture approval'],
+      people: ['Owner', 'Reviewer'],
+      activityLog: ['2026-09-15 — Prior durable event'],
+    };
+    brains.write(seed);
+    const beforeSha = brains.getProject('proj_x')!.brain_sha256;
+    insertRouted('empty-shape', 'Incident remediation', 'Incident Remediation status update', 'proj_x', 'empty-batch');
+
+    const result = await updater.runForBatch('empty-batch');
+    expect(result[0]).toMatchObject({ status: 'skipped', skipReason: 'no_change' });
+    expect(brains.getProject('proj_x')!.brain_sha256).toBe(beforeSha);
+    expect(brains.read('proj_x')).toEqual(seed);
+    expect((storage.getDb().prepare('SELECT COUNT(*) AS n FROM brain_revisions').get() as { n: number }).n).toBe(0);
+    expect((storage.getDb().prepare(
+      "SELECT response_sha256 AS sha FROM pipeline_llm_audit WHERE project_id='proj_x' ORDER BY started_at DESC LIMIT 1",
+    ).get() as { sha: string }).sha).toBe('acfb7e51e15eaac990fdaec8c7ec7c851fa431887a474924ad8f548c83f1caed');
+  });
+
+  it('preserves every curated field when an actionable batch adds activity but proposes empty fields', async () => {
+    const { brains, updater } = build(mockLlm({
+      summary: '', statusLine: '', status: 'active', tasks: [], blockers: [], people: [],
+      newActivity: [{ text: 'I will preserve this project', evidenceItemIds: ['safe-add'] }],
+    }));
+    const seed: Brain = {
+      ...newBrain('proj_x', 'Incident Remediation'),
+      status: 'paused',
+      summary: 'Existing evidence-rich summary', statusLine: 'Decision pending',
+      tasks: [{ state: 'doing', text: 'Keep the migration task' }],
+      blockers: ['Architecture decision'], people: ['Owner'],
+    };
+    brains.write(seed);
+    insertRouted(
+      'safe-add',
+      'Incident remediation',
+      'Incident Remediation: I will preserve this project',
+      'proj_x',
+      'safe-add-batch',
+    );
+
+    const result = await updater.runForBatch('safe-add-batch');
+    expect(result[0].status).toBe('updated');
+    const after = brains.read('proj_x')!;
+    expect(after.summary).toBe(seed.summary);
+    expect(after.statusLine).toBe(seed.statusLine);
+    expect(after.status).toBe('paused');
+    expect(after.tasks).toEqual(seed.tasks);
+    expect(after.blockers).toEqual(seed.blockers);
+    expect(after.people).toEqual(seed.people);
+    expect(after.activityLog).toContain('2026-07-08 — I will preserve this project');
+  });
+
+  it('blocks and records a severe non-empty summary collapse', async () => {
+    const { brains, updater } = build(mockLlm({
+      summary: 'No update.', statusLine: 'active', status: 'active',
+      tasks: [], blockers: [], people: [], newActivity: [],
+    }));
+    const seed: Brain = {
+      ...newBrain('proj_x', 'Incident Remediation'),
+      summary: 'Evidence-grounded detail. '.repeat(8).trim(),
+      statusLine: 'In progress',
+    };
+    brains.write(seed);
+    insertRouted('collapse', 'Incident remediation', 'Incident Remediation evidence', 'proj_x', 'collapse-batch');
+
+    const result = await updater.runForBatch('collapse-batch');
+    expect(result[0]).toMatchObject({ status: 'skipped', skipReason: 'destructive_regression' });
+    expect(brains.read('proj_x')!.summary).toBe(seed.summary);
+    const failure = storage.getDb().prepare(
+      "SELECT message FROM failures WHERE step='brain' ORDER BY id DESC LIMIT 1",
+    ).get() as { message: string };
+    expect(failure.message).toContain('blocked destructive brain update');
+    expect(failure.message).toContain('summary collapsed');
+  });
+
   it('admits a semantic Slack request plus owner acceptance without changing persisted task shape', async () => {
     let calls = 0;
     const mainResponse = {

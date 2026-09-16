@@ -1,14 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { createDocumentsRouter } from './documents.js';
 import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { createContentStore, refToColumns, type ContentStore } from '../../core/content-store.js';
 import type { RouterDeps } from './deps.js';
-import { createProductDocumentPublicationService } from '../../product-manager/product-document-publications.js';
+import { createProductDocumentPublicationService, sha256Buffer } from '../../product-manager/product-document-publications.js';
 import type { ProductDocumentArtifact, ProductDocumentService } from '../../product-manager/types.js';
 
 /**
@@ -360,6 +360,7 @@ describe('documents router', () => {
     const staged = publications.stage({
       artifactId: artifact.artifactId,
       projectId: 'p1',
+      action: 'create',
       format: 'md',
       title: artifact.title,
       serverRelativeUrl: TARGET,
@@ -371,6 +372,10 @@ describe('documents router', () => {
         if (tool === 'sharepoint_write_file') {
           uploaded = String(args.content ?? '');
           return { text: JSON.stringify({ result: { webUrl: 'https://x/catalog-strategy.md', driveItemId: 'item-1', eTag: 'etag-1' } }), isError: false };
+        }
+        if (tool === 'sharepoint_read_file' && args.savePath) {
+          writeFileSync(String(args.savePath), uploaded);
+          return { text: '{}', isError: false };
         }
         if (tool === 'sharepoint_read_file') return { text: uploaded, isError: false };
         throw new Error(`unexpected ${tool}`);
@@ -414,6 +419,151 @@ describe('documents router', () => {
       remoteItemId: 'item-1',
       remoteEtag: 'etag-1',
     });
+  });
+
+  it('DOCUMENT CATALOG: V2 update inherits the exact V1 path and versions the same SharePoint item', async () => {
+    storage.getDb().prepare(`
+      INSERT INTO projects (id, title, one_liner, brain_path, status)
+      VALUES ('p1', 'Catalog', '', '/tmp/catalog-brain', 'active')
+    `).run();
+    storage.getDb().exec(`
+      CREATE TABLE product_document_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        parent_artifact_id TEXT
+      );
+      INSERT INTO product_document_artifacts (artifact_id, parent_artifact_id) VALUES ('artifact-v1', NULL);
+      INSERT INTO product_document_artifacts (artifact_id, parent_artifact_id) VALUES ('artifact-v2', 'artifact-v1');
+    `);
+    const TARGET = '/personal/u_amazon_com/Documents/Documents/catalog-strategy.md';
+    const V1 = '# Catalog strategy\n\nThe completed V1 artifact is already published at the nested path.';
+    const V2 = '# Catalog strategy\n\nThe exact V2 artifact must become a new version of that same physical item.';
+    const artifacts = new Map<string, ProductDocumentArtifact>([
+      ['artifact-v1', { artifactId: 'artifact-v1', persisted: true, projectId: 'p1', title: 'Catalog strategy', content: V1 } as ProductDocumentArtifact],
+      ['artifact-v2', { artifactId: 'artifact-v2', parentArtifactId: 'artifact-v1', persisted: true, projectId: 'p1', title: 'Catalog strategy', content: V2 } as ProductDocumentArtifact],
+    ]);
+    const productDocumentService = {
+      getArtifact: (artifactId: string) => artifacts.get(artifactId) ?? null,
+      listArtifacts: () => [],
+    } as unknown as ProductDocumentService;
+    let publicationNumber = 0;
+    const publications = createProductDocumentPublicationService(storage.getDb(), productDocumentService, {
+      createId: () => `publication-update-${++publicationNumber}`,
+      now: () => new Date('2026-09-16T01:00:00Z'),
+    });
+    const base = publications.stage({
+      artifactId: 'artifact-v1', projectId: 'p1', action: 'create', format: 'md', title: 'Catalog strategy', serverRelativeUrl: TARGET,
+    });
+    const { decidePendingEdit, markEditSynced } = await import('../../core/pending-edits.js');
+    const baseApproved = decidePendingEdit(storage.getDb(), base.pendingEdit.id, 'approved');
+    publications.recordDecision(baseApproved.id, 'approved', baseApproved.approvedAt!);
+    publications.recordExport(base.publication.publicationId, { sha256: sha256Buffer(Buffer.from(V1)), bytes: Buffer.byteLength(V1), filename: 'catalog-strategy.md' });
+    publications.recordUploaded(base.publication.publicationId, { remoteItemId: '140' });
+    publications.recordVerified(base.publication.publicationId, { remoteSha256: sha256Buffer(Buffer.from(V1)), remoteItemId: '140' });
+    publications.recordCaptureQueued(base.publication.publicationId);
+    publications.recordCapture(base.publication.publicationId, 'capture-v1', base.publication.docKey);
+    markEditSynced(storage.getDb(), base.pendingEdit.id);
+
+    const staged = publications.stage({
+      artifactId: 'artifact-v2', projectId: 'p1', action: 'update_existing',
+      basePublicationId: base.publication.publicationId, format: 'md', title: 'Catalog strategy',
+    });
+    let remote = Buffer.from(V1);
+    const writes: Array<Record<string, unknown>> = [];
+    const mcpManager = {
+      callTool: async (_id: string, tool: string, args: Record<string, unknown>) => {
+        if (tool === 'sharepoint_read_file') {
+          writeFileSync(String(args.savePath), remote);
+          return { text: '{}', isError: false };
+        }
+        if (tool === 'sharepoint_list_files') {
+          return { text: JSON.stringify({ files: [{ Id: 140, Name: 'catalog-strategy.md', Path: TARGET, IsFolder: false, Size: remote.length, Modified: '2026-09-16T01:00:00Z', WebUrl: 'https://x/Documents/Documents/catalog-strategy.md?web=1' }] }), isError: false };
+        }
+        if (tool === 'sharepoint_write_file') {
+          writes.push(args);
+          remote = Buffer.from(String(args.content ?? ''));
+          return { text: JSON.stringify({ Id: 140, WebUrl: 'https://x/Documents/Documents/catalog-strategy.md?web=1' }), isError: false };
+        }
+        throw new Error(`unexpected ${tool}`);
+      },
+    };
+    const sharePointSync = {
+      enqueueByPath: () => ({ queued: true, docKey: staged.publication.docKey }),
+      drainNow: async () => {
+        publications.recordCapture(staged.publication.publicationId, 'capture-v2', staged.publication.docKey);
+        return 1;
+      },
+    };
+    const app = appWith({
+      mcpManager: mcpManager as never,
+      sharePointSync: sharePointSync as never,
+      productDocumentService,
+      productDocumentPublications: publications,
+    });
+    await request(app).post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`).send({}).expect(200);
+    const synced = await request(app).post('/api/documents/sync').send({ docKey: staged.publication.docKey }).expect(200);
+
+    expect(synced.body).toMatchObject({ uploaded: true, verifiedOnReadBack: true });
+    expect(remote.toString('utf8')).toBe(V2);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ libraryName: 'Documents', folderPath: 'Documents', fileName: 'catalog-strategy.md' });
+    expect(publications.get(staged.publication.publicationId)).toMatchObject({
+      action: 'update_existing',
+      basePublicationId: base.publication.publicationId,
+      status: 'complete',
+      docKey: base.publication.docKey,
+      remoteItemId: '140',
+      verifiedRemoteSha256: sha256Buffer(Buffer.from(V2)),
+      capturedWorkItemId: 'capture-v2',
+    });
+  });
+
+  it('DOCUMENT CATALOG: owner-approved legacy repair versions item 140 and records completed lineage', async () => {
+    storage.getDb().prepare(`INSERT INTO projects (id, title, one_liner, brain_path, status) VALUES ('p1', 'Catalog', '', '/tmp/catalog-brain', 'active')`).run();
+    const artifact = { artifactId: 'artifact-v2-repair', persisted: true, projectId: 'p1', title: 'Catalog strategy', content: '# Catalog strategy\n\nExact V2 canonical content for the repaired original.' } as ProductDocumentArtifact;
+    const productDocumentService = { getArtifact: (id: string) => id === artifact.artifactId ? artifact : null, listArtifacts: () => [] } as unknown as ProductDocumentService;
+    let publicationNumber = 0;
+    const publications = createProductDocumentPublicationService(storage.getDb(), productDocumentService, { createId: () => `publication-repair-${++publicationNumber}`, now: () => new Date('2026-09-16T03:00:00Z') });
+    const SOURCE = '/personal/u_amazon_com/Documents/Catalog-strategy.docx';
+    const TARGET = '/personal/u_amazon_com/Documents/Documents/Catalog-strategy.docx';
+    const sourceKey = 'amazon-my.sharepoint.com/personal/u_amazon_com/Documents/Catalog-strategy.docx';
+    const targetKey = 'amazon-my.sharepoint.com/personal/u_amazon_com/Documents/Documents/Catalog-strategy.docx';
+    const sourceBytes = Buffer.from('canonical-v2-docx-bytes');
+    const targetBefore = Buffer.from('legacy-v1-docx-bytes');
+    const source = publications.stage({ artifactId: artifact.artifactId, projectId: 'p1', action: 'create', format: 'docx', title: artifact.title, serverRelativeUrl: SOURCE });
+    const { decidePendingEdit, markEditSynced } = await import('../../core/pending-edits.js');
+    const approved = decidePendingEdit(storage.getDb(), source.pendingEdit.id, 'approved');
+    publications.recordDecision(approved.id, 'approved', approved.approvedAt!);
+    publications.recordExport(source.publication.publicationId, { sha256: sha256Buffer(sourceBytes), bytes: sourceBytes.length, filename: 'Catalog-strategy.docx' });
+    publications.recordUploaded(source.publication.publicationId, { remoteItemId: '141' });
+    publications.recordVerified(source.publication.publicationId, { remoteSha256: sha256Buffer(sourceBytes), remoteItemId: '141' });
+    publications.recordCaptureQueued(source.publication.publicationId);
+    publications.recordCapture(source.publication.publicationId, 'capture-source', sourceKey);
+    markEditSynced(storage.getDb(), source.pendingEdit.id);
+
+    let sourceRemote = Buffer.from(sourceBytes);
+    let targetRemote = Buffer.from(targetBefore);
+    let repairPublicationId = '';
+    const mcpManager = { callTool: async (_id: string, tool: string, args: Record<string, unknown>) => {
+      if (tool === 'sharepoint_list_files') return { text: JSON.stringify({ files: [{ Id: 140, Name: 'Catalog-strategy.docx', Path: TARGET, IsFolder: false, Size: targetRemote.length, Modified: '2026-09-16T02:00:00Z', WebUrl: 'https://x/Documents/Documents/Catalog-strategy.docx?web=1' }] }), isError: false };
+      if (tool === 'sharepoint_read_file') { writeFileSync(String(args.savePath), String(args.serverRelativeUrl) === SOURCE ? sourceRemote : targetRemote); return { text: '{}', isError: false }; }
+      if (tool === 'sharepoint_write_file') { targetRemote = readFileSync(String(args.sourcePath)); return { text: JSON.stringify({ Id: 140 }), isError: false }; }
+      throw new Error(`unexpected ${tool}`);
+    } };
+    const sharePointSync = {
+      enqueueByPath: (_path: string, options: Record<string, unknown>) => { repairPublicationId = String(options.publicationId); return { queued: true, docKey: targetKey }; },
+      drainNow: async () => { publications.recordCapture(repairPublicationId, 'capture-repair', targetKey); return 1; },
+    };
+    const app = appWith({ mcpManager: mcpManager as never, sharePointSync: sharePointSync as never, productDocumentService, productDocumentPublications: publications });
+    const repaired = await request(app).post('/api/documents/publication-repair').send({
+      ownerRequested: true, artifactId: artifact.artifactId, projectId: 'p1', sourcePublicationId: source.publication.publicationId,
+      serverRelativeUrl: TARGET, siteUrl: 'https://amazon-my.sharepoint.com/personal/u_amazon_com', expectedItemId: '140',
+      expectedBaselineSha256: sha256Buffer(targetBefore), confirmation: `UPDATE ITEM 140 AT ${TARGET}`,
+    }).expect(200);
+
+    expect(targetRemote).toEqual(sourceRemote);
+    expect(repaired.body).toMatchObject({ repaired: true, uploaded: true, before: { itemId: '140', sha256: sha256Buffer(targetBefore) }, after: { itemId: '140', sha256: sha256Buffer(sourceBytes) } });
+    expect(repaired.body.publication).toMatchObject({ status: 'complete', action: 'update_existing', basePublicationId: null, baseRemoteSha256: sha256Buffer(targetBefore), verifiedRemoteSha256: sha256Buffer(sourceBytes), remoteItemId: '140', capturedWorkItemId: 'capture-repair', repairNote: expect.stringContaining('Owner approved') });
+    expect(sourceRemote).toEqual(sourceBytes);
   });
 
   it('AUTHORING BRIDGE: a target that appeared since approval lands conflicted — never overwritten', async () => {

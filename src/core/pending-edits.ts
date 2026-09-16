@@ -53,6 +53,8 @@ export interface CreatePendingEditInput {
   createContent?: string;
   projectId?: string;
   originNote?: string;
+  /** Internal publication-only waiver: the exact existing target is bound by a typed publication receipt. */
+  allowExistingTarget?: boolean;
 }
 
 const TABLE_SCHEMA = `(
@@ -183,7 +185,7 @@ export function createPendingEdit(db: Database.Database, input: CreatePendingEdi
       WHERE source = 'sharepoint' AND type = 'document_capture'
         AND json_extract(metadata, '$.docKey') = ? LIMIT 1
     `).get(input.docKey);
-    if (existing) throw new Error('a document with this target already exists in the corpus — edit it instead of creating a duplicate');
+    if (existing && !input.allowExistingTarget) throw new Error('a document with this target already exists in the corpus — edit it instead of creating a duplicate');
     const openCreation = db.prepare(`
       SELECT 1 FROM document_pending_edits
       WHERE doc_key = ? AND operation = 'createDocument' AND status IN ('pending','approved') LIMIT 1

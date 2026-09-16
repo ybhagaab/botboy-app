@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createStorage, StorageLayer } from './storage.js';
 import {
   buildCorpusLinkIndex,
+  buildDocumentView,
   extractDocumentLinks,
+  listDocumentCorpus,
   replaceOutgoingLinks,
   getRelatedDocuments,
   linkCountsByDocKey,
@@ -33,6 +35,19 @@ describe('document link graph', () => {
     }));
   }
 
+  it('retired publication captures remain stored but disappear from active corpus and reader', () => {
+    const db = storage.getDb();
+    insertDoc('retired', HLD, 'Retired publication.docx');
+    db.prepare(`
+      UPDATE work_items
+      SET metadata = json_set(metadata, '$.publicationRetired', 'true', '$.publicationRetiredAt', '2026-09-16T14:01:26Z')
+      WHERE id = 'retired'
+    `).run();
+    expect((db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE id = 'retired'").get() as { count: number }).count).toBe(1);
+    expect(listDocumentCorpus(db)).toEqual([]);
+    expect(buildDocumentView(db, undefined, HLD)).toBeNull();
+  });
+
   it('extracts hyperlink edges from path-form, encoded, query-stringed, and sourcedoc-GUID URLs; skips external links and self-links', () => {
     const db = storage.getDb();
     insertDoc('d1', HLD, 'MX Unification High Level Design.docx', {
@@ -60,6 +75,21 @@ describe('document link graph', () => {
     // From the WORKSHOP's perspective the GUID form resolves to the HLD.
     const fromWorkshop = extractDocumentLinks(content, WORKSHOP, index);
     expect(fromWorkshop.find(l => l.kind === 'hyperlink' && l.toDocKey === HLD)).toBeTruthy();
+  });
+
+  it('retired captures are excluded from link resolution and related-document traversal', () => {
+    const db = storage.getDb();
+    insertDoc('active', HLD, 'MX Unification High Level Design.docx');
+    insertDoc('retired-target', WORKSHOP, 'MX_PV_Catalog_Unification_Workshop.docx', {
+      serverRelativeUrl: '/personal/u_amazon_com/Documents/MX_PV_Catalog_Unification_Workshop.docx',
+    });
+    db.prepare(`UPDATE work_items SET metadata = json_set(metadata, '$.publicationRetired', 'true') WHERE id = 'retired-target'`).run();
+    const index = buildCorpusLinkIndex(db);
+    expect(index.titles.some(entry => entry.docKey === WORKSHOP)).toBe(false);
+    expect([...index.byPathTail.values()]).not.toContain(WORKSHOP);
+    replaceOutgoingLinks(db, HLD, [{ toDocKey: WORKSHOP, kind: 'hyperlink', evidence: 'retired target' }]);
+    expect(getRelatedDocuments(db, HLD)).toEqual([]);
+    expect((db.prepare("SELECT COUNT(*) AS count FROM work_items WHERE id = 'retired-target'").get() as { count: number }).count).toBe(1);
   });
 
   it('title references need >=12 chars; short titles never spray edges', () => {

@@ -74,6 +74,7 @@ export function buildCorpusLinkIndex(db: Database.Database): CorpusLinkIndex {
     FROM work_items
     WHERE source = 'sharepoint' AND type = 'document_capture'
       AND json_extract(metadata, '$.docKey') IS NOT NULL
+      AND COALESCE(json_extract(metadata, '$.publicationRetired'), '') != 'true'
   `).all() as Array<{ docKey: string; serverRelativeUrl: string | null; webUrl: string | null; title: string | null }>;
   const index: CorpusLinkIndex = { byPathTail: new Map(), byGuid: new Map(), titles: [] };
   const seenTitles = new Set<string>();
@@ -171,6 +172,7 @@ export function getRelatedDocuments(db: Database.Database, docKey: string): Rela
       SELECT json_extract(metadata, '$.docKey') AS docKey, MAX(title) AS title
       FROM work_items
       WHERE source = 'sharepoint' AND type = 'document_capture'
+        AND COALESCE(json_extract(metadata, '$.publicationRetired'), '') != 'true'
       GROUP BY 1
     )
     SELECT l.to_doc_key AS docKey, c.title, l.kind, 'outgoing' AS direction, l.evidence
@@ -277,6 +279,7 @@ export function listDocumentCorpus(
       FROM work_items
       WHERE source = 'sharepoint' AND type = 'document_capture'
         AND json_extract(metadata, '$.docKey') IS NOT NULL
+        AND COALESCE(json_extract(metadata, '$.publicationRetired'), '') != 'true'
         ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
     )
     SELECT * FROM captures WHERE rn = 1
@@ -395,6 +398,7 @@ export function buildDocumentView(
     FROM work_items
     WHERE source = 'sharepoint' AND type = 'document_capture'
       AND json_extract(metadata, '$.docKey') = ?
+      AND COALESCE(json_extract(metadata, '$.publicationRetired'), '') != 'true'
     ORDER BY captured_at DESC
   `).all(docKey) as Array<Record<string, unknown> & { id: string; metadata: string | null; capturedAt: string }>;
   if (captures.length === 0) return null;

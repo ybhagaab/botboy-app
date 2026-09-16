@@ -415,7 +415,7 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
       return res.json({
         artifact: publicArtifact(artifact),
-        publications: deps.productDocumentPublications?.listByArtifact(artifactId) ?? [],
+        publications: deps.productDocumentPublications?.listByChain(artifactId) ?? [],
       });
     } catch (error) {
       return handleError(res, error);
