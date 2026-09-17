@@ -23,6 +23,9 @@ import type { ProductDocumentArtifact, ProductDocumentService } from '../../prod
 import type { RouterDeps } from './deps.js';
 
 const TARGET = '/personal/u_amazon_com/Documents/Documents/catalog-strategy.md';
+const UNICODE_TARGET = '/personal/u_amazon_com/Documents/MX PMT × PVAA AI Automation — Discussion Strawman.docx';
+const ENCODED_UNICODE_NAME = 'MX PMT %C3%97 PVAA AI Automation %E2%80%94 Discussion Strawman.docx';
+const ENCODED_UNICODE_TARGET = '/personal/u_amazon_com/Documents/MX PMT %C3%97 PVAA AI Automation %E2%80%94 Discussion Strawman.docx';
 const V1 = '# Catalog strategy\n\nThe completed V1 artifact is the historical publication base.';
 const V2 = '# Catalog strategy\n\nThe exact V2 artifact becomes the next version of the same item.';
 
@@ -50,11 +53,15 @@ describe('publication approval remote snapshot', () => {
     return app;
   }
 
-  function setupUpdate(): {
+  function setupUpdate(options: { target?: string; format?: 'md' | 'docx'; baseRemoteItemId?: string | null } = {}): {
     productDocuments: ProductDocumentService;
     publications: ProductDocumentPublicationService;
     staged: ReturnType<ProductDocumentPublicationService['stage']>;
+    target: string;
   } {
+    const target = options.target ?? TARGET;
+    const format = options.format ?? 'md';
+    const baseRemoteItemId = options.baseRemoteItemId === undefined ? '140' : options.baseRemoteItemId;
     storage.getDb().prepare(`
       INSERT INTO projects (id, title, one_liner, brain_path, status)
       VALUES ('p1', 'Catalog', '', '/tmp/catalog-brain', 'active')
@@ -86,17 +93,17 @@ describe('publication approval remote snapshot', () => {
       now: () => new Date('2026-09-16T01:00:00Z'),
     });
     const base = publications.stage({
-      artifactId: 'artifact-v1', projectId: 'p1', action: 'create', format: 'md',
-      title: 'Catalog strategy', serverRelativeUrl: TARGET,
+      artifactId: 'artifact-v1', projectId: 'p1', action: 'create', format,
+      title: 'Catalog strategy', serverRelativeUrl: target,
     });
     const baseApproved = decidePendingEdit(storage.getDb(), base.pendingEdit.id, 'approved');
     publications.recordDecision(baseApproved.id, 'approved', baseApproved.approvedAt!);
     publications.recordExport(base.publication.publicationId, {
-      sha256: sha256Buffer(Buffer.from(V1)), bytes: Buffer.byteLength(V1), filename: 'catalog-strategy.md',
+      sha256: sha256Buffer(Buffer.from(V1)), bytes: Buffer.byteLength(V1), filename: path.basename(target),
     });
-    publications.recordUploaded(base.publication.publicationId, { remoteItemId: '140' });
+    publications.recordUploaded(base.publication.publicationId, baseRemoteItemId ? { remoteItemId: baseRemoteItemId } : {});
     publications.recordVerified(base.publication.publicationId, {
-      remoteSha256: sha256Buffer(Buffer.from(V1)), remoteItemId: '140',
+      remoteSha256: sha256Buffer(Buffer.from(V1)), ...(baseRemoteItemId ? { remoteItemId: baseRemoteItemId } : {}),
     });
     publications.recordCaptureQueued(base.publication.publicationId);
     publications.recordCapture(base.publication.publicationId, 'capture-v1', base.publication.docKey);
@@ -104,9 +111,9 @@ describe('publication approval remote snapshot', () => {
 
     const staged = publications.stage({
       artifactId: 'artifact-v2', projectId: 'p1', action: 'update_existing',
-      basePublicationId: base.publication.publicationId, format: 'md', title: 'Catalog strategy',
+      basePublicationId: base.publication.publicationId, format, title: 'Catalog strategy',
     });
-    return { productDocuments, publications, staged };
+    return { productDocuments, publications, staged, target };
   }
 
   function listedIdentity(input: {
@@ -115,12 +122,15 @@ describe('publication approval remote snapshot', () => {
     etag: string;
     version: string;
     modified: string;
+    name?: string;
+    target?: string;
   }) {
+    const target = input.target ?? TARGET;
     return JSON.stringify({
       files: [{
         Id: input.itemId,
-        Name: 'catalog-strategy.md',
-        Path: TARGET,
+        Name: input.name ?? path.basename(target),
+        Path: target,
         IsFolder: false,
         Size: input.remote.length,
         Modified: input.modified,
@@ -130,6 +140,116 @@ describe('publication approval remote snapshot', () => {
       }],
     });
   }
+
+  it('decodes MCP v2 Unicode list fields and establishes a missing base item ID before approval', async () => {
+    const { productDocuments, publications, staged } = setupUpdate({
+      target: UNICODE_TARGET,
+      format: 'docx',
+      baseRemoteItemId: null,
+    });
+    const remote = Buffer.from('current remote docx bytes after owner editing');
+    const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+    const mcpManager = {
+      callTool: async (_server: string, tool: string, args: Record<string, unknown>) => {
+        calls.push({ tool, args });
+        if (tool === 'sharepoint_list_files') {
+          return {
+            text: listedIdentity({
+              itemId: '140', remote, etag: 'etag-unicode', version: '7.0',
+              modified: '2026-09-17T08:00:00Z',
+              name: ENCODED_UNICODE_NAME,
+              target: ENCODED_UNICODE_TARGET,
+            }),
+            isError: false,
+          };
+        }
+        if (tool === 'sharepoint_read_file') {
+          writeFileSync(String(args.savePath), remote);
+          return { text: '{}', isError: false };
+        }
+        if (tool === 'sharepoint_write_file') throw new Error('approval must not write');
+        throw new Error(`unexpected tool ${tool}`);
+      },
+    };
+    const app = appWith({
+      mcpManager: mcpManager as never,
+      productDocumentService: productDocuments,
+      productDocumentPublications: publications,
+    });
+
+    const approved = await request(app)
+      .post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`)
+      .send({})
+      .expect(200);
+
+    expect(calls.map(call => call.tool)).toEqual([
+      'sharepoint_list_files',
+      'sharepoint_read_file',
+      'sharepoint_list_files',
+    ]);
+    for (const call of calls.filter(entry => entry.tool === 'sharepoint_list_files')) {
+      expect(call.args).toMatchObject({ libraryName: 'Documents', top: 100, includeWebUrls: true });
+      expect(call.args).not.toHaveProperty('folderPath');
+      expect(call.args).not.toHaveProperty('personal');
+      expect(call.args).not.toHaveProperty('siteUrl');
+    }
+    expect(approved.body.remoteSnapshot).toMatchObject({
+      sha256: sha256Buffer(remote),
+      itemId: '140',
+      etag: 'etag-unicode',
+      version: '7.0',
+    });
+    expect(publications.get(staged.publication.publicationId)).toMatchObject({
+      status: 'approved',
+      expectedRemoteItemId: '140',
+      expectedRemoteSha256: sha256Buffer(remote),
+    });
+  });
+
+  it('fails closed on malformed, duplicate, missing, or base-mismatched list identity', async () => {
+    const { productDocuments, publications, staged } = setupUpdate();
+    let listPayload: unknown = {};
+    let reads = 0;
+    const mcpManager = {
+      callTool: async (_server: string, tool: string, args: Record<string, unknown>) => {
+        if (tool === 'sharepoint_list_files') return { text: JSON.stringify(listPayload), isError: false };
+        if (tool === 'sharepoint_read_file') {
+          reads++;
+          writeFileSync(String(args.savePath), Buffer.from('must not be read'));
+          return { text: '{}', isError: false };
+        }
+        throw new Error(`unexpected tool ${tool}`);
+      },
+    };
+    const app = appWith({
+      mcpManager: mcpManager as never,
+      productDocumentService: productDocuments,
+      productDocumentPublications: publications,
+    });
+    const approve = () => request(app)
+      .post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`)
+      .send({});
+    const exact = { Name: 'catalog-strategy.md', Path: TARGET, IsFolder: false, Size: 10, Modified: '2026-09-17T08:00:00Z' };
+
+    listPayload = { files: [{ ...exact, Name: 'catalog-strategy%ZZ.md', Id: 140 }] };
+    expect((await approve()).body.error).toMatch(/could not be resolved to one item/);
+
+    listPayload = { files: [{ ...exact, Id: 140 }, { ...exact, Id: 141 }] };
+    expect((await approve()).body.error).toMatch(/More than one SharePoint item matched/);
+
+    listPayload = { files: [{ ...exact, Id: '' }] };
+    expect((await approve()).body.error).toMatch(/no stable item ID/);
+
+    listPayload = { files: [{ ...exact, Id: 141 }] };
+    expect((await approve()).body.error).toMatch(/different SharePoint item now occupies/);
+
+    expect(reads).toBe(0);
+    expect(publications.get(staged.publication.publicationId)).toMatchObject({
+      status: 'staged',
+      expectedRemoteItemId: null,
+    });
+    expect(getPendingEdit(storage.getDb(), staged.pendingEdit.id)?.status).toBe('pending');
+  });
 
   it('allows intentional remote edits before approval, then publishes and verifies the exact artifact', async () => {
     const { productDocuments, publications, staged } = setupUpdate();
@@ -309,7 +429,7 @@ describe('publication approval remote snapshot', () => {
       .send({})
       .expect(400);
 
-    expect(approval.body.error).toMatch(/changed while BotBoy was observing it/);
+    expect(approval.body.error).toMatch(/different SharePoint item now occupies/);
     expect(listCalls).toBe(2);
     expect(writes).toBe(0);
     expect(publications.get(staged.publication.publicationId)).toMatchObject({

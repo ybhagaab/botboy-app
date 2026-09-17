@@ -340,10 +340,14 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       let snapshot: PublicationRemoteSnapshot | undefined;
       if (decision === 'approve' && currentPublication?.action === 'update_existing') {
         if (!deps.mcpManager) return res.status(503).json({ error: 'managed MCP runtime unavailable' });
+        const basePublication = currentPublication.basePublicationId
+          ? deps.productDocumentPublications?.get(currentPublication.basePublicationId) ?? null
+          : null;
         snapshot = await observeSharePointTarget(
           currentPublication.serverRelativeUrl,
           currentPublication.siteUrl,
           pendingEditId,
+          basePublication?.remoteItemId ?? null,
         );
       }
       const edit = deps.db.transaction(() => {
@@ -516,17 +520,32 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     version: string | null;
   };
 
-  const normalizeSharePointPath = (value: string): string => {
-    try { return decodeURIComponent(value).replace(/\/+$/, ''); } catch { return value.replace(/\/+$/, ''); }
+  class SharePointTargetConflictError extends Error {}
+
+  const decodeSharePointWireValue = (value: unknown): string | null => {
+    if (typeof value !== 'string') return null;
+    try { return decodeURIComponent(value); } catch { return null; }
+  };
+
+  const normalizeSharePointPath = (value: unknown): string | null => {
+    const decoded = decodeSharePointWireValue(value);
+    return decoded === null ? null : decoded.replace(/\/+$/, '');
   };
 
   async function readSharePointTargetIdentity(
     serverRelativeUrl: string,
     siteUrl: string | null,
+    expectedItemId: string | null = null,
   ): Promise<SharePointTargetIdentity | null> {
     const mapped = mapSharePointWriteTarget(serverRelativeUrl, siteUrl ?? undefined);
     if (typeof mapped === 'string') throw new Error(mapped);
+    const targetName = decodeSharePointWireValue(mapped.fileName);
+    const targetPath = normalizeSharePointPath(serverRelativeUrl);
+    if (!targetName || !targetPath) throw new Error('The SharePoint target path could not be normalized safely.');
+
+    const matches: SharePointTargetIdentity[] = [];
     let skipToken: string | undefined;
+    let exhausted = false;
     for (let page = 0; page < 8; page++) {
       const listed = await deps.mcpManager!.callTool('sharepoint', 'sharepoint_list_files', {
         libraryName: 'Documents',
@@ -542,32 +561,47 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       try { payload = JSON.parse(String(listed.text ?? '')); } catch {
         throw new Error('SharePoint target listing returned an unreadable identity response.');
       }
-      const match = (Array.isArray(payload?.files) ? payload.files : []).find((entry: any) =>
-        entry && entry.IsFolder !== true
-        && String(entry.Name ?? '') === mapped.fileName
-        && normalizeSharePointPath(String(entry.Path ?? '')) === normalizeSharePointPath(serverRelativeUrl));
-      if (match) {
-        return {
-          itemId: String(match.Id ?? '').trim(),
-          modified: String(match.Modified ?? '').trim(),
-          size: Number.isFinite(Number(match.Size)) ? Number(match.Size) : null,
-          webUrl: typeof match.WebUrl === 'string' && match.WebUrl.trim() ? match.WebUrl.trim() : null,
-          etag: typeof (match.eTag ?? match.etag ?? match.ETag) === 'string'
-            ? String(match.eTag ?? match.etag ?? match.ETag).trim() || null
+      for (const entry of Array.isArray(payload?.files) ? payload.files : []) {
+        if (!entry || entry.IsFolder === true) continue;
+        const entryName = decodeSharePointWireValue(entry.Name);
+        const entryPath = normalizeSharePointPath(entry.Path);
+        if (entryName !== targetName || entryPath !== targetPath) continue;
+        const itemId = String(entry.Id ?? '').trim();
+        if (!itemId) {
+          throw new SharePointTargetConflictError('The exact SharePoint target listing carried no stable item ID.');
+        }
+        matches.push({
+          itemId,
+          modified: String(entry.Modified ?? '').trim(),
+          size: Number.isFinite(Number(entry.Size)) ? Number(entry.Size) : null,
+          webUrl: typeof entry.WebUrl === 'string' && entry.WebUrl.trim() ? entry.WebUrl.trim() : null,
+          etag: typeof (entry.eTag ?? entry.etag ?? entry.ETag) === 'string'
+            ? String(entry.eTag ?? entry.etag ?? entry.ETag).trim() || null
             : null,
-          version: typeof (match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version) === 'string'
-            || typeof (match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version) === 'number'
-            ? String(match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version).trim() || null
+          version: typeof (entry.VersionLabel ?? entry.versionLabel ?? entry.Version ?? entry.version) === 'string'
+            || typeof (entry.VersionLabel ?? entry.versionLabel ?? entry.Version ?? entry.version) === 'number'
+            ? String(entry.VersionLabel ?? entry.versionLabel ?? entry.Version ?? entry.version).trim() || null
             : null,
-        };
+        });
       }
       skipToken = typeof payload?.nextToken === 'string' && payload.nextToken ? payload.nextToken : undefined;
-      if (!skipToken) return null;
+      if (!skipToken) {
+        exhausted = true;
+        break;
+      }
     }
-    throw new Error('SharePoint target listing exceeded the bounded identity lookup window.');
+    if (!exhausted) throw new Error('SharePoint target listing exceeded the bounded identity lookup window.');
+    if (matches.length === 0) return null;
+    if (matches.length !== 1) {
+      throw new SharePointTargetConflictError('More than one SharePoint item matched the exact target path; approval was not recorded.');
+    }
+    const match = matches[0];
+    const requiredItemId = expectedItemId?.trim() || null;
+    if (requiredItemId && match.itemId !== requiredItemId) {
+      throw new SharePointTargetConflictError('A different SharePoint item now occupies the publication target; approval was not recorded.');
+    }
+    return match;
   }
-
-  class SharePointTargetConflictError extends Error {}
 
   const sameObservedIdentity = (left: SharePointTargetIdentity, right: SharePointTargetIdentity): boolean =>
     left.itemId === right.itemId
@@ -580,9 +614,10 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     serverRelativeUrl: string,
     siteUrl: string | null,
     tag: string,
+    expectedItemId: string | null = null,
   ): Promise<PublicationRemoteSnapshot> {
     if (!deps.mcpManager) throw new Error('managed MCP runtime unavailable');
-    const before = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl);
+    const before = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl, expectedItemId);
     if (!before?.itemId) throw new SharePointTargetConflictError('The existing SharePoint target could not be resolved to one item.');
     const scratchDir = path.join(os.homedir(), '.personal-productivity-tracker', 'tmp');
     fs.mkdirSync(scratchDir, { recursive: true });
@@ -598,7 +633,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         throw new Error(`Could not read the current SharePoint target safely: ${String(read.text).slice(0, 300)}`);
       }
       const sha256 = sha256Buffer(fs.readFileSync(savePath));
-      const after = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl);
+      const after = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl, before.itemId);
       if (!after?.itemId || !sameObservedIdentity(before, after)) {
         throw new SharePointTargetConflictError('The SharePoint target changed while BotBoy was observing it; approval was not recorded.');
       }
@@ -731,7 +766,12 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       }
       let observed: PublicationRemoteSnapshot;
       try {
-        observed = await observeSharePointTarget(creation.serverRelativeUrl, creation.siteUrl, `apply-${creation.id}`);
+        observed = await observeSharePointTarget(
+          creation.serverRelativeUrl,
+          creation.siteUrl,
+          `apply-${creation.id}`,
+          publication.expectedRemoteItemId,
+        );
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         if (!(error instanceof SharePointTargetConflictError)) {
@@ -890,7 +930,13 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         }
         if (verified && isPublicationUpdate) {
           for (let attempt = 0; attempt < 4 && !finalIdentity; attempt++) {
-            try { finalIdentity = await readSharePointTargetIdentity(creation.serverRelativeUrl, creation.siteUrl); } catch {
+            try {
+              finalIdentity = await readSharePointTargetIdentity(
+                creation.serverRelativeUrl,
+                creation.siteUrl,
+                baselineIdentity?.itemId ?? null,
+              );
+            } catch {
               finalIdentity = null;
             }
             if (!finalIdentity && attempt < 3) await new Promise(resolve => setTimeout(resolve, 250));
