@@ -22,6 +22,7 @@ import type { BrainStore } from './brain-store.js';
 import type { FailureRecorder } from './failures.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 import { extractJson } from './pipeline-llm.js';
+import { redactSensitiveText } from './prompt-redaction.js';
 import { completeModelAudit, failModelAudit, startModelAudit } from './pipeline-audit.js';
 import { getChannelConfig } from './slack-config.js';
 import { createChannelTierResolver } from './engagement.js';
@@ -66,12 +67,6 @@ const WINDOW_DAYS = 7;
 const MAX_TOPICS = 6;
 const MAX_TOPIC_CHARS = 80;
 const MAX_DIGEST_CHARS = 1200;
-
-function redactSensitiveText(value: string): string {
-  return value
-    .replace(/((?:id_token|access_token|refresh_token|samlresponse|token|code|state)=)[^&\s]+/gi, '$1[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_TOKEN]');
-}
 
 interface DigestMessage {
   id: string;

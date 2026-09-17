@@ -221,8 +221,27 @@ export function createPipelineOrchestrator(deps: {
   }
 
   async function tickReconcile(): Promise<void> {
-    await reconciler.run();
-    try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+    // Share the interpretation lock: reconciliation can now adopt evidence and
+    // immediately synthesize the affected brains, so it must not race a normal
+    // librarian/brain wave over the same project.
+    if (interpreting) return;
+    interpreting = true;
+    try {
+      const result = await reconciler.run();
+      const byProject = new Map<string, string[]>();
+      for (const adopted of result.adoptedItems) {
+        if (!byProject.has(adopted.projectId)) byProject.set(adopted.projectId, []);
+        byProject.get(adopted.projectId)!.push(adopted.itemId);
+      }
+      for (const [projectId, itemIds] of byProject) {
+        await brainUpdater.updateProject(projectId, itemIds);
+      }
+      await gistRoutedEvidence(Math.max(8, result.adoptedItems.length));
+      try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+      refreshProjectRelations();
+    } finally {
+      interpreting = false;
+    }
   }
 
   async function tickOrganize(opts?: { full?: boolean }): Promise<void> {

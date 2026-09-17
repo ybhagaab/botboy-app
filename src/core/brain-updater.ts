@@ -24,6 +24,7 @@ import { newBrain, projectScopeAnchor } from './brain-store.js';
 import type { FailureRecorder } from './failures.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 import { extractJson } from './pipeline-llm.js';
+import { redactSensitiveText } from './prompt-redaction.js';
 import {
   assertPipelinePromptWithinBudget,
   evidenceExcerptLabel,
@@ -50,6 +51,7 @@ import {
 } from './email-thread.js';
 import {
   parseSlackThreadIdentity,
+  RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX,
   sameSlackThread,
   slackThreadKey,
   WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX,
@@ -150,12 +152,6 @@ const DEFERRED_TASK_TIMELINE_PATTERN = /\b(?:today|tomorrow|tonight|asap|urgent(
 
 function normalizeText(value: string): string {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
-}
-
-function redactSensitiveText(value: string): string {
-  return value
-    .replace(/((?:id_token|access_token|refresh_token|samlresponse|token|code|state)=)[^&\s]+/gi, '$1[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_TOKEN]');
 }
 
 function quoteAppearsInEvidence(quote: string, item: BrainInputItem): boolean {
@@ -1088,7 +1084,8 @@ export function createBrainUpdater(deps: {
       } | undefined;
       return decision?.appliedDecision === 'assign'
         && decision.appliedProjectId === projectId
-        && decision.validationReason.startsWith(WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX);
+        && (decision.validationReason.startsWith(WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX)
+          || decision.validationReason.startsWith(RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX));
     });
   }
 

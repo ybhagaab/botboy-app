@@ -9,6 +9,7 @@ import { createBatcher } from './batcher.js';
 import { createFailureRecorder } from './failures.js';
 import { createLibrarian, Librarian } from './librarian.js';
 import { createBrainUpdater } from './brain-updater.js';
+import { RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX } from './slack-thread.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 
 describe('Librarian', () => {
@@ -303,6 +304,38 @@ describe('Librarian', () => {
       modelDecision: 'not_called',
       reason: 'deterministic outlook-sent-follows-routed-thread rule',
     });
+  });
+
+  it('does not blanket-inherit a future reply from a retroactively reconciled root', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_catalog', 'Catalog Unification Migration'));
+    insertSlackMessage({
+      id: 'reconciled-root', content: 'Catalog migration thread root.', timestamp: '100.000001',
+      direction: 'received', projectId: 'proj_catalog',
+    });
+    db.prepare(`
+      INSERT INTO routing_decisions
+        (run_id,batch_id,item_id,model_decision,requested_project_id,
+         applied_decision,applied_project_id,validation_reason)
+      VALUES ('reconcile-run','reconcile-thread:test','reconciled-root',
+              'reconcile_thread_assign','proj_catalog','assign','proj_catalog',?)
+    `).run(`${RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX}proj_catalog) bounded proof`);
+    insertSlackMessage({
+      id: 'future-reply', content: 'A later reply that needs fresh scope review.', timestamp: '200.000001',
+      threadTs: '100.000001', direction: 'received',
+    });
+    let called = false;
+    const { lib } = build(mockLlm(() => {
+      called = true;
+      return JSON.stringify([{ itemId: 'future-reply', decision: 'orphan' }]);
+    }));
+
+    const result = await lib.runWave();
+    expect(called).toBe(true);
+    expect(result.orphaned).toBe(1);
+    expect(db.prepare("SELECT process_state,project_id FROM work_items WHERE id='future-reply'").get())
+      .toMatchObject({ process_state: 'orphaned', project_id: null });
   });
 
   it('orders a same-wave Outlook request before the owner response and admits one canonical task', async () => {

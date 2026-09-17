@@ -18,6 +18,7 @@ import { newBrain, projectScopeAnchor } from './brain-store.js';
 import type { FailureRecorder } from './failures.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 import { extractJson } from './pipeline-llm.js';
+import { redactSensitiveText } from './prompt-redaction.js';
 import {
   assertPipelinePromptWithinBudget,
   evidenceExcerptLabel,
@@ -38,6 +39,7 @@ import {
 import {
   isSlackTimestamp,
   parseSlackThreadIdentity,
+  RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX,
   WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX,
   type SlackThreadIdentity,
 } from './slack-thread.js';
@@ -96,12 +98,6 @@ const MAX_SLACK_SCOPE_CORROBORATORS = 20;
 const MAX_OUTLOOK_THREAD_CANDIDATES = 20;
 const OUTLOOK_THREAD_SCAN_PAGE_SIZE = 50;
 const MAX_OUTLOOK_THREAD_SCAN_ROWS = 500;
-
-function redactSensitiveText(value: string): string {
-  return value
-    .replace(/((?:id_token|access_token|refresh_token|samlresponse|token|code|state)=)[^&\s]+/gi, '$1[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_TOKEN]');
-}
 
 export function createLibrarian(deps: {
   db: Database.Database;
@@ -278,7 +274,9 @@ Return ONLY the JSON array.`;
     const context = slackMessageContext(itemId);
     if (!context?.identity.isReply) return null;
     const root = db.prepare(`
-      SELECT w.project_id AS projectId
+      SELECT w.id AS rootId, w.project_id AS projectId,
+             (SELECT d.validation_reason FROM routing_decisions d
+              WHERE d.item_id=w.id ORDER BY d.id DESC LIMIT 1) AS validationReason
       FROM work_items w
       JOIN projects p ON p.id = w.project_id
       WHERE w.source = 'slack' AND w.type = 'slack_message'
@@ -297,7 +295,15 @@ Return ONLY the JSON array.`;
           WHERE r.work_item_id = w.id AND r.project_id = w.project_id
         )
       ORDER BY w.captured_at DESC LIMIT 1
-    `).get(context.identity.channelId, context.identity.rootTs) as { projectId: string } | undefined;
+    `).get(context.identity.channelId, context.identity.rootTs) as {
+      rootId: string;
+      projectId: string;
+      validationReason: string | null;
+    } | undefined;
+    // A root rescued from a bounded historical prefix is not blanket authority
+    // for future replies: the later conversation may have drifted after the
+    // cutoff. Those replies return to ordinary routing/reconciliation.
+    if (root?.validationReason?.startsWith(RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX)) return null;
     return root?.projectId ?? null;
   }
 

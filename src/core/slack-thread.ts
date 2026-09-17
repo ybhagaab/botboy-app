@@ -7,6 +7,10 @@
  */
 
 export const WEAK_SLACK_ROOT_SCOPE_REASON_PREFIX = 'weak Slack root scope (';
+/** Exact audit proof for a root placed later from one bounded chronological thread. */
+export const RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX = 'reconciled Slack thread scope (';
+/** A 21st row proves the snapshot is partial; reconciliation then fails closed. */
+export const MAX_RECONCILED_SLACK_THREAD_MESSAGES = 20;
 
 const SLACK_TIMESTAMP_PATTERN = /^\d+\.\d+$/;
 

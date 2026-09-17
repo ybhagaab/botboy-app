@@ -7,6 +7,7 @@ import { createContentStore, refToColumns } from './content-store.js';
 import { createBrainStore, newBrain, Brain } from './brain-store.js';
 import { createFailureRecorder } from './failures.js';
 import { createBrainUpdater } from './brain-updater.js';
+import { RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX } from './slack-thread.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 
 describe('BrainUpdater', () => {
@@ -1005,6 +1006,48 @@ describe('BrainUpdater', () => {
     expect(after.statusLine).toBe('Original status');
     expect(after.blockers).toEqual(['Original blocker']);
     expect(after.people).toEqual(['Original person']);
+  });
+
+  it('accepts exact reconciled-root proof as routing scope for a terse current reply', async () => {
+    let prompt = '';
+    const { brains, updater } = build({
+      isAvailable: () => true,
+      complete: async (value) => {
+        prompt = value;
+        return JSON.stringify({
+          summary: 'Must stay frozen by thread context', statusLine: 'active', status: 'active',
+          tasks: [], blockers: [], people: [],
+          newActivity: [{ text: 'Shuriken is a proxy', evidenceItemIds: ['current-reply'] }],
+        });
+      },
+    });
+    brains.write({
+      ...newBrain('proj_catalog', 'Catalog Unification Migration'),
+      summary: 'Original catalog summary', statusLine: 'Original status',
+    });
+    insertSlackThread({
+      id: 'reconciled-root', content: 'Yes, that support remains.', projectId: 'proj_catalog', batchId: 'old-batch',
+      timestamp: '100.000001', direction: 'received', mentionedMe: true,
+    });
+    storage.getDb().prepare(`
+      INSERT INTO routing_decisions
+        (run_id,batch_id,item_id,model_decision,requested_project_id,
+         applied_decision,applied_project_id,validation_reason)
+      VALUES ('reconcile-run','reconcile-thread:test','reconciled-root',
+              'reconcile_thread_assign','proj_catalog','assign','proj_catalog',?)
+    `).run(`${RECONCILED_SLACK_ROOT_SCOPE_REASON_PREFIX}proj_catalog) bounded proof`);
+    insertSlackThread({
+      id: 'current-reply', content: 'Shuriken is a proxy', projectId: 'proj_catalog', batchId: 'current-batch',
+      timestamp: '200.000001', threadTs: '100.000001', direction: 'received',
+    });
+
+    const result = await updater.runForBatch('current-batch');
+    expect(result[0].status).toBe('updated');
+    expect(prompt).toContain('id="reconciled-root"');
+    const after = brains.read('proj_catalog')!;
+    expect(after.summary).toBe('Original catalog summary');
+    expect(after.statusLine).toBe('Original status');
+    expect(after.activityLog).toContain('1970-01-01 — Shuriken is a proxy');
   });
 
   it('does not retrieve a future acceptance while processing an earlier request', async () => {

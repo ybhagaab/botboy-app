@@ -76,6 +76,38 @@ describe('PipelineOrchestrator', () => {
     );
   }
 
+  function insertOrphanThreadItem(input: {
+    id: string;
+    content: string;
+    timestamp: string;
+    threadTs?: string;
+  }): void {
+    const db = storage.getDb();
+    const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
+    const ref = contentStore.put(input.id, input.content);
+    const cols = refToColumns(ref);
+    db.prepare(`
+      INSERT INTO work_items
+        (id,type,source,title,captured_at,process_state,raw_text,
+         content_storage,content_path,content_sha256,content_bytes,metadata)
+      VALUES (?, 'slack_message','slack','Slack #thread-routing-test',?,
+              'orphaned',?,?,?,?,?,?)
+    `).run(
+      input.id,
+      new Date(Number.parseFloat(input.timestamp) * 1000).toISOString(),
+      cols.raw_text,
+      cols.content_storage,
+      cols.content_path,
+      cols.content_sha256,
+      cols.content_bytes,
+      JSON.stringify({
+        channelId: 'C_THREAD', channelType: 'private_channel', engaged: 'true',
+        mentionedMe: 'true', direction: 'received', timestamp: input.timestamp,
+        threadTs: input.threadTs ?? '',
+      }),
+    );
+  }
+
   function buildState(llm: PipelineLlm) {
     const db = storage.getDb();
     const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
@@ -168,6 +200,42 @@ describe('PipelineOrchestrator', () => {
     expect(r.routed + r.created).toBe(5); // all 5 extracted items routed
     const pending = (storage.getDb().prepare("SELECT COUNT(*) AS c FROM work_items WHERE process_state='extracted' AND project_id IS NULL").get() as any).c;
     expect(pending).toBe(0); // fully routed
+  });
+
+  it('completes reconciled thread adoption through the affected project brain without rewriting batch ids', async () => {
+    let calls = 0;
+    const state = buildState({
+      isAvailable: () => true,
+      complete: async (prompt) => {
+        calls++;
+        if (prompt.includes('SLACK THREAD RECONCILIATION')) {
+          return JSON.stringify({
+            decision: 'assign', projectId: 'proj_catalog', supportedThroughItemId: 'reply',
+          });
+        }
+        if (prompt.includes('You maintain the "brain"')) {
+          return JSON.stringify({
+            summary: 'Reconciled catalog thread is now reflected.',
+            statusLine: 'Thread evidence reconciled', status: 'active',
+            tasks: [], blockers: [], people: [], newActivity: [],
+          });
+        }
+        throw new Error('unexpected model call');
+      },
+    });
+    state.brainStore.write({
+      ...newBrain('proj_catalog', 'Catalog Unification Migration'),
+      summary: 'Prior summary', statusLine: 'Prior status',
+    });
+    insertOrphanThreadItem({ id: 'root', content: 'Catalog migration compatibility.', timestamp: '100.000001' });
+    insertOrphanThreadItem({ id: 'reply', content: 'Catalog unification migration details.', timestamp: '200.000001', threadTs: '100.000001' });
+
+    await state.orchestrator.tickReconcile();
+    expect(calls).toBe(2);
+    const rows = storage.getDb().prepare("SELECT id,process_state,project_id,batch_id FROM work_items WHERE id IN ('root','reply') ORDER BY id").all() as any[];
+    expect(rows.every((row) => row.process_state === 'routed' && row.project_id === 'proj_catalog')).toBe(true);
+    expect(rows.every((row) => row.batch_id === null)).toBe(true);
+    expect(state.brainStore.read('proj_catalog')!.summary).toBe('Reconciled catalog thread is now reflected.');
   });
 
   it('stages every rebuild chunk and publishes the canonical brain exactly once', async () => {

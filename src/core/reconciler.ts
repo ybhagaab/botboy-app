@@ -17,6 +17,7 @@ import { newBrain, projectScopeAnchor } from './brain-store.js';
 import type { FailureRecorder } from './failures.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 import { extractJson } from './pipeline-llm.js';
+import { redactSensitiveText } from './prompt-redaction.js';
 import {
   assertPipelinePromptWithinBudget,
   evidenceExcerptLabel,
@@ -35,6 +36,11 @@ import {
   projectTitleHasExclusiveEvidenceAnchor,
 } from './project-scope.js';
 import { createChannelTierResolver, isPersonallyRelevantSlackMessage } from './engagement.js';
+import { parseSlackThreadIdentity, slackThreadKey } from './slack-thread.js';
+import {
+  reconcileOrphanSlackThreads,
+  type ReconciledRoutingItem,
+} from './slack-thread-reconciliation.js';
 
 export interface ReconcileProposal {
   newProjects: { title: string; itemIds: string[] }[];
@@ -47,6 +53,7 @@ export interface ReconcileResult {
   orphansConsidered: number;
   projectsCreated: number;
   itemsAdopted: number;
+  adoptedItems: ReconciledRoutingItem[];
   advisoryMerges: number;
   advisorySplits: number;
 }
@@ -60,12 +67,6 @@ const MAX_PER_ITEM_PROMPT_CHARS = 64_000;
 const RECONCILE_FIXED_PROMPT_RESERVE_CHARS = 16_000;
 const MAX_ORPHANS_PER_RUN = 100;
 const RECONCILE_PROMPT_VERSION = 'reconcile-v4-budgeted-balanced-context';
-
-function redactSensitiveText(value: string): string {
-  return value
-    .replace(/((?:id_token|access_token|refresh_token|samlresponse|token|code|state)=)[^&\s]+/gi, '$1[REDACTED]')
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_TOKEN]');
-}
 
 export function createReconciler(deps: {
   db: Database.Database;
@@ -96,9 +97,19 @@ export function createReconciler(deps: {
     async run(): Promise<ReconcileResult> {
       const base: ReconcileResult = {
         status: 'completed', orphansConsidered: 0, projectsCreated: 0,
-        itemsAdopted: 0, advisoryMerges: 0, advisorySplits: 0,
+        itemsAdopted: 0, adoptedItems: [], advisoryMerges: 0, advisorySplits: 0,
       };
       if (!llm.isAvailable()) return { ...base, status: 'deferred' };
+
+      // Context-dependent Slack roots are reconciled as one bounded exact
+      // thread before generic orphan grouping. Considered threads are reserved
+      // from the generic path for this run even when they fail closed.
+      const threadOutcome = await reconcileOrphanSlackThreads({
+        db, batcher, brainStore, failures, llm, readContent,
+      });
+      base.orphansConsidered += threadOutcome.orphansConsidered;
+      base.itemsAdopted += threadOutcome.adoptedItems.length;
+      base.adoptedItems.push(...threadOutcome.adoptedItems);
 
       const orphanRows = db
         .prepare(
@@ -118,13 +129,19 @@ export function createReconciler(deps: {
       // channel digests and must not be reconciled into owner projects.
       const resolveTier = createChannelTierResolver(db);
       const orphans = orphanRows.filter((orphan) => {
+        if (threadOutcome.consideredItemIds.has(orphan.id)) return false;
         if (orphan.source !== 'slack' || orphan.type !== 'slack_message') return true;
         let metadata: Record<string, unknown> = {};
         try { metadata = JSON.parse(orphan.metadata ?? '{}'); } catch { /* legacy rows */ }
+        const identity = parseSlackThreadIdentity(metadata);
+        if (identity && threadOutcome.consideredThreadKeys.has(slackThreadKey(identity))) {
+          return false;
+        }
         return isPersonallyRelevantSlackMessage(metadata, resolveTier);
       });
       if (orphans.length === 0) return base;
-      base.orphansConsidered = orphans.length;
+      base.orphansConsidered += orphans.length;
+      const adoptedBeforeGenericReconcile = base.itemsAdopted;
 
       const projects = brainStore.listProjects().filter(
         (project) => (project.status === 'active' || project.status === 'paused')
@@ -338,6 +355,7 @@ Return ONLY JSON:
           if (batcher.transition(id, 'routed', { projectId: pid })) {
             claimedItemIds.add(id);
             base.itemsAdopted++;
+            base.adoptedItems.push({ itemId: id, projectId: pid });
             recordRoutingDecision(db, {
               runId,
               invocationId,
@@ -356,7 +374,7 @@ Return ONLY JSON:
       base.advisorySplits = (proposal.splits ?? []).length;
 
       db.prepare("UPDATE pipeline_runs SET items_out=?, status='completed', completed_at=datetime('now') WHERE id=?")
-        .run(base.itemsAdopted, runId);
+        .run(base.itemsAdopted - adoptedBeforeGenericReconcile, runId);
       return base;
     },
   };
