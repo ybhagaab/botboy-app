@@ -23,12 +23,40 @@ export type ProductDocumentPublicationStatus =
 
 export type ProductDocumentPublicationAction = 'create' | 'update_existing';
 
+export interface PublicationRemoteSnapshot {
+  sha256: string;
+  itemId: string;
+  etag?: string;
+  version?: string;
+  modified?: string;
+  size?: number;
+  webUrl?: string;
+  observedAt: string;
+}
+
+export interface StageProductDocumentPublicationResult {
+  publication: ProductDocumentPublication;
+  pendingEdit: PendingEdit;
+  idempotent: boolean;
+  replacesPublicationIds: string[];
+}
+
 export interface ProductDocumentPublication {
   publicationId: string;
   artifactId: string;
   projectId: string;
   action: ProductDocumentPublicationAction;
   basePublicationId: string | null;
+  intentKey: string | null;
+  expectedRemoteSha256: string | null;
+  expectedRemoteItemId: string | null;
+  expectedRemoteEtag: string | null;
+  expectedRemoteVersion: string | null;
+  expectedRemoteModified: string | null;
+  expectedRemoteSize: number | null;
+  remoteObservedAt: string | null;
+  supersededAt: string | null;
+  supersessionReason: string | null;
   baseRemoteSha256: string | null;
   repairNote: string | null;
   retiredAt: string | null;
@@ -88,7 +116,7 @@ export interface RecordLegacyPublicationRepairInput {
 }
 
 export interface ProductDocumentPublicationService {
-  stage(input: StageProductDocumentPublicationInput): { publication: ProductDocumentPublication; pendingEdit: PendingEdit };
+  stage(input: StageProductDocumentPublicationInput): StageProductDocumentPublicationResult;
   recordLegacyRepair(input: RecordLegacyPublicationRepairInput, at?: string): { publication: ProductDocumentPublication; pendingEdit: PendingEdit };
   get(publicationId: string): ProductDocumentPublication | null;
   findByPendingEdit(pendingEditId: string): ProductDocumentPublication | null;
@@ -96,7 +124,7 @@ export interface ProductDocumentPublicationService {
   listByArtifact(artifactId: string): ProductDocumentPublication[];
   listByChain(artifactId: string): ProductDocumentPublication[];
   hasForChain(artifactId: string): boolean;
-  recordDecision(pendingEditId: string, decision: 'approved' | 'rejected', at?: string): ProductDocumentPublication | null;
+  recordDecision(pendingEditId: string, decision: 'approved' | 'rejected', at?: string, snapshot?: PublicationRemoteSnapshot): ProductDocumentPublication | null;
   recordExport(publicationId: string, receipt: { sha256: string; bytes: number; filename: string }, at?: string): ProductDocumentPublication;
   recordUploaded(publicationId: string, receipt?: { webUrl?: string; remoteItemId?: string; remoteEtag?: string }, at?: string): ProductDocumentPublication;
   recordVerified(publicationId: string, receipt: { remoteSha256: string; remoteItemId?: string; webUrl?: string }, at?: string): ProductDocumentPublication;
@@ -112,6 +140,16 @@ interface PublicationRow {
   project_id: string;
   publication_action: ProductDocumentPublicationAction;
   base_publication_id: string | null;
+  intent_key: string | null;
+  expected_remote_sha256: string | null;
+  expected_remote_item_id: string | null;
+  expected_remote_etag: string | null;
+  expected_remote_version: string | null;
+  expected_remote_modified: string | null;
+  expected_remote_size: number | null;
+  remote_observed_at: string | null;
+  superseded_at: string | null;
+  supersession_reason: string | null;
   base_remote_sha256: string | null;
   repair_note: string | null;
   retired_at: string | null;
@@ -159,7 +197,7 @@ const STATUS_PREDECESSORS: Record<ProductDocumentPublicationStatus, ProductDocum
   verification_failed: ['uploaded_unverified'],
   capture_failed: ['verified', 'capture_queued'],
   identity_mismatch: ['uploaded_unverified', 'verified', 'capture_queued'],
-  superseded: ['staged', 'approved', 'exported', 'uploaded_unverified', 'verified', 'capture_queued'],
+  superseded: ['staged', 'target_conflict'],
 };
 
 function rowToPublication(row: PublicationRow): ProductDocumentPublication {
@@ -169,6 +207,16 @@ function rowToPublication(row: PublicationRow): ProductDocumentPublication {
     projectId: row.project_id,
     action: row.publication_action ?? 'create',
     basePublicationId: row.base_publication_id ?? null,
+    intentKey: row.intent_key ?? null,
+    expectedRemoteSha256: row.expected_remote_sha256 ?? null,
+    expectedRemoteItemId: row.expected_remote_item_id ?? null,
+    expectedRemoteEtag: row.expected_remote_etag ?? null,
+    expectedRemoteVersion: row.expected_remote_version ?? null,
+    expectedRemoteModified: row.expected_remote_modified ?? null,
+    expectedRemoteSize: row.expected_remote_size ?? null,
+    remoteObservedAt: row.remote_observed_at ?? null,
+    supersededAt: row.superseded_at ?? null,
+    supersessionReason: row.supersession_reason ?? null,
     baseRemoteSha256: row.base_remote_sha256 ?? null,
     repairNote: row.repair_note ?? null,
     retiredAt: row.retired_at ?? null,
@@ -208,6 +256,40 @@ function boundedOptional(value: unknown, maximum: number): string | null {
   return normalized ? normalized.slice(0, maximum) : null;
 }
 
+export function productDocumentPublicationIntentKey(input: {
+  artifactId: string;
+  projectId: string;
+  action: ProductDocumentPublicationAction;
+  basePublicationId?: string | null;
+  format: 'md' | 'docx';
+  docKey: string;
+}): string {
+  return createHash('sha256').update(JSON.stringify([
+    input.artifactId,
+    input.projectId,
+    input.action,
+    input.basePublicationId ?? '',
+    input.format,
+    input.docKey,
+  ])).digest('hex');
+}
+
+function publicationTargetSlotKey(input: {
+  projectId: string;
+  action: ProductDocumentPublicationAction;
+  basePublicationId?: string | null;
+  format: 'md' | 'docx';
+  docKey: string;
+}): string {
+  return JSON.stringify([
+    input.projectId,
+    input.action,
+    input.basePublicationId ?? '',
+    input.format,
+    input.docKey,
+  ]);
+}
+
 /** Parse only stable/verification fields from an opaque MCP result. Unknown
  * response shapes stay null rather than becoming identity claims. */
 export function publicationRemoteReceipt(text: string): { webUrl?: string; remoteItemId?: string; remoteEtag?: string } {
@@ -243,6 +325,16 @@ export function createProductDocumentPublicationService(
       project_id TEXT NOT NULL,
       publication_action TEXT NOT NULL DEFAULT 'create' CHECK(publication_action IN ('create','update_existing')),
       base_publication_id TEXT,
+      intent_key TEXT,
+      expected_remote_sha256 TEXT,
+      expected_remote_item_id TEXT,
+      expected_remote_etag TEXT,
+      expected_remote_version TEXT,
+      expected_remote_modified TEXT,
+      expected_remote_size INTEGER,
+      remote_observed_at TEXT,
+      superseded_at TEXT,
+      supersession_reason TEXT,
       base_remote_sha256 TEXT,
       repair_note TEXT,
       retired_at TEXT,
@@ -290,6 +382,24 @@ export function createProductDocumentPublicationService(
   if (!publicationColumns.has('base_publication_id')) {
     db.exec('ALTER TABLE product_document_publications ADD COLUMN base_publication_id TEXT');
   }
+  const additivePublicationColumns: Array<[string, string]> = [
+    ['intent_key', 'intent_key TEXT'],
+    ['expected_remote_sha256', 'expected_remote_sha256 TEXT'],
+    ['expected_remote_item_id', 'expected_remote_item_id TEXT'],
+    ['expected_remote_etag', 'expected_remote_etag TEXT'],
+    ['expected_remote_version', 'expected_remote_version TEXT'],
+    ['expected_remote_modified', 'expected_remote_modified TEXT'],
+    ['expected_remote_size', 'expected_remote_size INTEGER'],
+    ['remote_observed_at', 'remote_observed_at TEXT'],
+    ['superseded_at', 'superseded_at TEXT'],
+    ['supersession_reason', 'supersession_reason TEXT'],
+  ];
+  for (const [name, ddl] of additivePublicationColumns) {
+    if (!publicationColumns.has(name)) {
+      db.exec(`ALTER TABLE product_document_publications ADD COLUMN ${ddl}`);
+      publicationColumns.add(name);
+    }
+  }
   if (!publicationColumns.has('base_remote_sha256')) {
     db.exec('ALTER TABLE product_document_publications ADD COLUMN base_remote_sha256 TEXT');
   }
@@ -307,6 +417,25 @@ export function createProductDocumentPublicationService(
   }
   if (!publicationColumns.has('verified_remote_sha256')) {
     db.exec('ALTER TABLE product_document_publications ADD COLUMN verified_remote_sha256 TEXT');
+  }
+  const legacyIntentRows = db.prepare(`
+    SELECT publication_id,artifact_id,project_id,publication_action,base_publication_id,format,doc_key
+    FROM product_document_publications WHERE intent_key IS NULL OR trim(intent_key)=''
+  `).all() as Array<{
+    publication_id: string; artifact_id: string; project_id: string;
+    publication_action: ProductDocumentPublicationAction; base_publication_id: string | null;
+    format: 'md' | 'docx'; doc_key: string;
+  }>;
+  const backfillIntent = db.prepare('UPDATE product_document_publications SET intent_key=? WHERE publication_id=?');
+  for (const row of legacyIntentRows) {
+    backfillIntent.run(productDocumentPublicationIntentKey({
+      artifactId: row.artifact_id,
+      projectId: row.project_id,
+      action: row.publication_action ?? 'create',
+      basePublicationId: row.base_publication_id,
+      format: row.format,
+      docKey: row.doc_key,
+    }), row.publication_id);
   }
 
   const selectById = db.prepare('SELECT * FROM product_document_publications WHERE publication_id = ?');
@@ -361,9 +490,9 @@ export function createProductDocumentPublicationService(
     `);
   const insert = db.prepare(`
     INSERT INTO product_document_publications
-      (publication_id, artifact_id, project_id, publication_action, base_publication_id, format,
+      (publication_id, artifact_id, project_id, publication_action, base_publication_id, intent_key, format,
        pending_edit_id, status, site_url, server_relative_url, doc_key, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?, ?, ?, ?)
   `);
   const insertLegacyRepair = db.prepare(`
     INSERT INTO product_document_publications
@@ -406,13 +535,24 @@ export function createProductDocumentPublicationService(
       remoteItemId: 'remote_item_id',
       remoteEtag: 'remote_etag',
       capturedWorkItemId: 'captured_work_item_id',
+      expectedRemoteSha256: 'expected_remote_sha256',
+      expectedRemoteItemId: 'expected_remote_item_id',
+      expectedRemoteEtag: 'expected_remote_etag',
+      expectedRemoteVersion: 'expected_remote_version',
+      expectedRemoteModified: 'expected_remote_modified',
+      expectedRemoteSize: 'expected_remote_size',
+      remoteObservedAt: 'remote_observed_at',
+      supersededAt: 'superseded_at',
+      supersessionReason: 'supersession_reason',
+      replacementPublicationId: 'replacement_publication_id',
       lastError: 'last_error',
       docKey: 'doc_key',
     };
     const entries = Object.entries(patch).filter(([key]) => columnByKey[key]);
     const assignments = ['status = ?', 'updated_at = ?', ...entries.map(([key]) => `${columnByKey[key]} = ?`)];
-    const values = [status, at, ...entries.map(([, value]) => value), publicationId];
-    db.prepare(`UPDATE product_document_publications SET ${assignments.join(', ')} WHERE publication_id = ?`).run(...values);
+    const values = [status, at, ...entries.map(([, value]) => value), publicationId, current.status];
+    const result = db.prepare(`UPDATE product_document_publications SET ${assignments.join(', ')} WHERE publication_id = ? AND status = ?`).run(...values);
+    if (result.changes !== 1) throw new Error(`Publication ${publicationId} changed while moving from ${current.status} to ${status}.`);
     return get(publicationId)!;
   };
 
@@ -493,9 +633,81 @@ export function createProductDocumentPublicationService(
       if (basePublication && docKey !== basePublication.docKey) {
         throw new Error('The inherited SharePoint target no longer resolves to the base publication identity.');
       }
+      const intentKey = productDocumentPublicationIntentKey({
+        artifactId: artifact.artifactId,
+        projectId: artifact.projectId,
+        action: input.action,
+        basePublicationId: basePublication?.publicationId ?? null,
+        format: input.format,
+        docKey,
+      });
+      const slotKey = publicationTargetSlotKey({
+        projectId: artifact.projectId,
+        action: input.action,
+        basePublicationId: basePublication?.publicationId ?? null,
+        format: input.format,
+        docKey,
+      });
+      const sameIntent = chainPublications.find(candidate =>
+        (candidate.intentKey ?? productDocumentPublicationIntentKey({
+          artifactId: candidate.artifactId,
+          projectId: candidate.projectId,
+          action: candidate.action,
+          basePublicationId: candidate.basePublicationId,
+          format: candidate.format,
+          docKey: candidate.docKey,
+        })) === intentKey
+        && candidate.status !== 'rejected'
+        && candidate.status !== 'superseded');
+      if (sameIntent && sameIntent.status !== 'target_conflict') {
+        const pendingEdit = getPendingEdit(db, sameIntent.pendingEditId);
+        if (pendingEdit) {
+          return { publication: sameIntent, pendingEdit, idempotent: true, replacesPublicationIds: [] };
+        }
+      }
+
+      const ancestorIds = new Set<string>();
+      let cursor = artifact.parentArtifactId ? productDocuments.getArtifact(artifact.parentArtifactId) : null;
+      for (let depth = 0; cursor && depth < 1_000; depth++) {
+        if (ancestorIds.has(cursor.artifactId)) throw new Error('Artifact chain contains a cycle.');
+        ancestorIds.add(cursor.artifactId);
+        cursor = cursor.parentArtifactId ? productDocuments.getArtifact(cursor.parentArtifactId) : null;
+      }
+      const atSlot = chainPublications.filter(candidate =>
+        candidate.publicationId !== basePublication?.publicationId
+        && publicationTargetSlotKey({
+          projectId: candidate.projectId,
+          action: candidate.action,
+          basePublicationId: candidate.basePublicationId,
+          format: candidate.format,
+          docKey: candidate.docKey,
+        }) === slotKey
+        && candidate.status !== 'rejected'
+        && candidate.status !== 'superseded');
+      const supersedable = atSlot.filter(candidate =>
+        (candidate.artifactId === artifact.artifactId || ancestorIds.has(candidate.artifactId))
+        && (candidate.status === 'staged' || candidate.status === 'target_conflict'));
+      const blocking = atSlot.find(candidate => !supersedable.some(entry => entry.publicationId === candidate.publicationId));
+      if (blocking) {
+        throw new Error(`Publication ${blocking.publicationId} is ${blocking.status} for this SharePoint target; it cannot be replaced automatically.`);
+      }
+
       const publicationId = createId();
       const createdAt = now().toISOString();
       return db.transaction(() => {
+        const replacementReason = `Superseded by publication ${publicationId} for newer/current artifact ${artifact.artifactId}.`;
+        for (const prior of supersedable) {
+          const priorEdit = getPendingEdit(db, prior.pendingEditId);
+          if (priorEdit?.status === 'pending' || priorEdit?.status === 'conflicted') {
+            decidePendingEdit(db, prior.pendingEditId, 'rejected', createdAt);
+          }
+          transition(prior.publicationId, 'superseded', {
+            supersededAt: createdAt,
+            supersessionReason: replacementReason,
+            replacementPublicationId: publicationId,
+            lastError: null,
+          }, createdAt);
+        }
         const actionLabel = input.action === 'update_existing'
           ? `update existing SharePoint version from publication ${basePublication!.publicationId}`
           : 'create new SharePoint copy';
@@ -516,6 +728,7 @@ export function createProductDocumentPublicationService(
           artifact.projectId,
           input.action,
           basePublication?.publicationId ?? null,
+          intentKey,
           input.format,
           pendingEdit.id,
           siteUrl || null,
@@ -524,7 +737,12 @@ export function createProductDocumentPublicationService(
           createdAt,
           createdAt,
         );
-        return { publication: get(publicationId)!, pendingEdit };
+        return {
+          publication: get(publicationId)!,
+          pendingEdit,
+          idempotent: false,
+          replacesPublicationIds: supersedable.map(publication => publication.publicationId),
+        };
       })();
     },
 
@@ -613,14 +831,47 @@ export function createProductDocumentPublicationService(
     hasForChain(artifactId) {
       return Boolean(hasChainPublication.get(artifactId));
     },
-    recordDecision(pendingEditId, decision, at = now().toISOString()) {
+    recordDecision(pendingEditId, decision, at = now().toISOString(), snapshot) {
       const row = selectByPending.get(pendingEditId) as PublicationRow | undefined;
       const current = row ? rowToPublication(row) : null;
       if (!current) return null;
+      const normalizedSnapshot = snapshot ? {
+        sha256: String(snapshot.sha256 ?? '').trim().toLowerCase(),
+        itemId: boundedOptional(snapshot.itemId, 300),
+        etag: boundedOptional(snapshot.etag, 300),
+        version: boundedOptional(snapshot.version, 300),
+        modified: boundedOptional(snapshot.modified, 100),
+        size: typeof snapshot.size === 'number' && Number.isSafeInteger(snapshot.size) && snapshot.size >= 0
+          ? snapshot.size
+          : null,
+        observedAt: boundedOptional(snapshot.observedAt, 100),
+      } : null;
+      if (decision === 'approved' && current.action === 'update_existing') {
+        if (!normalizedSnapshot
+          || !/^[a-f0-9]{64}$/.test(normalizedSnapshot.sha256)
+          || !normalizedSnapshot.itemId
+          || !normalizedSnapshot.observedAt) {
+          throw new Error('Update approval requires one coherent current-remote snapshot.');
+        }
+      }
       return transition(
         current.publicationId,
         decision,
-        decision === 'approved' ? { approvedAt: at, lastError: null } : { lastError: null },
+        decision === 'approved'
+          ? {
+              approvedAt: at,
+              lastError: null,
+              ...(normalizedSnapshot ? {
+                expectedRemoteSha256: normalizedSnapshot.sha256,
+                expectedRemoteItemId: normalizedSnapshot.itemId,
+                expectedRemoteEtag: normalizedSnapshot.etag,
+                expectedRemoteVersion: normalizedSnapshot.version,
+                expectedRemoteModified: normalizedSnapshot.modified,
+                expectedRemoteSize: normalizedSnapshot.size,
+                remoteObservedAt: normalizedSnapshot.observedAt,
+              } : {}),
+            }
+          : { lastError: null },
         at,
       );
     },

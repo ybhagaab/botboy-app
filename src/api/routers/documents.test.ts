@@ -467,7 +467,8 @@ describe('documents router', () => {
       artifactId: 'artifact-v2', projectId: 'p1', action: 'update_existing',
       basePublicationId: base.publication.publicationId, format: 'md', title: 'Catalog strategy',
     });
-    let remote = Buffer.from(V1);
+    const MANUAL_REMOTE = '# Catalog strategy\n\nThe owner edited SharePoint after V1; approval intentionally replaces these current bytes.';
+    let remote = Buffer.from(MANUAL_REMOTE);
     const writes: Array<Record<string, unknown>> = [];
     const mcpManager = {
       callTool: async (_id: string, tool: string, args: Record<string, unknown>) => {
@@ -476,7 +477,7 @@ describe('documents router', () => {
           return { text: '{}', isError: false };
         }
         if (tool === 'sharepoint_list_files') {
-          return { text: JSON.stringify({ files: [{ Id: 140, Name: 'catalog-strategy.md', Path: TARGET, IsFolder: false, Size: remote.length, Modified: '2026-09-16T01:00:00Z', WebUrl: 'https://x/Documents/Documents/catalog-strategy.md?web=1' }] }), isError: false };
+          return { text: JSON.stringify({ files: [{ Id: 140, Name: 'catalog-strategy.md', Path: TARGET, IsFolder: false, Size: remote.length, Modified: '2026-09-16T02:00:00Z', eTag: 'etag-owner-edit', VersionLabel: '2.0', WebUrl: 'https://x/Documents/Documents/catalog-strategy.md?web=1' }] }), isError: false };
         }
         if (tool === 'sharepoint_write_file') {
           writes.push(args);
@@ -499,7 +500,16 @@ describe('documents router', () => {
       productDocumentService,
       productDocumentPublications: publications,
     });
-    await request(app).post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`).send({}).expect(200);
+    const approvedUpdate = await request(app).post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`).send({}).expect(200);
+    expect(approvedUpdate.body.remoteSnapshot).toMatchObject({
+      sha256: sha256Buffer(Buffer.from(MANUAL_REMOTE)),
+      itemId: '140',
+      etag: 'etag-owner-edit',
+      version: '2.0',
+      modified: '2026-09-16T02:00:00Z',
+      size: Buffer.byteLength(MANUAL_REMOTE),
+    });
+    expect(approvedUpdate.body.remoteSnapshot.sha256).not.toBe(base.publication.exportSha256);
     const synced = await request(app).post('/api/documents/sync').send({ docKey: staged.publication.docKey }).expect(200);
 
     expect(synced.body).toMatchObject({ uploaded: true, verifiedOnReadBack: true });

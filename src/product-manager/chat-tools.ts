@@ -206,7 +206,9 @@ export function withProductDocumentChatTools(
           });
           return result(call, {
             ok: true,
-            status: 'staged',
+            status: staged.publication.status,
+            idempotent: staged.idempotent,
+            replacesPublicationIds: staged.replacesPublicationIds,
             publicationId: staged.publication.publicationId,
             pendingEditId: staged.pendingEdit.id,
             artifactId,
@@ -217,7 +219,9 @@ export function withProductDocumentChatTools(
             docKey: staged.publication.docKey,
             destination: staged.publication.serverRelativeUrl,
             approveAt: `#/projects/${encodeURIComponent(projectId)}`,
-            next: `Publication is staged only as ${action}. The owner must approve the exact action and path in the project Documents tab; claim upload, verification, versioning, and capture only from later receipts.`,
+            next: staged.idempotent
+              ? `No duplicate was created. Reuse publication ${staged.publication.publicationId}, currently ${staged.publication.status} with owner action ${staged.pendingEdit.status}; claim later effects only from their receipts.`
+              : `Publication is staged only as ${action}${staged.replacesPublicationIds.length ? ` and superseded ${staged.replacesPublicationIds.length} obsolete safe attempt${staged.replacesPublicationIds.length === 1 ? '' : 's'}` : ''}. The owner must approve the exact action and path in the project Documents tab; claim upload, verification, versioning, and capture only from later receipts.`,
           });
         } catch (error) {
           return errorResult(call, error instanceof Error ? error.message : 'Could not stage the publication.');

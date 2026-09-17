@@ -1191,16 +1191,19 @@ function renderProjectDocuments(projectId) {
           ${creation.originNote ? `<span style="color:var(--muted); font-size:11.5px;">${esc(creation.originNote)}</span>` : ''}
         </div>
         <span style="color:var(--muted); font-size:11px;">→ ${esc(creation.serverRelativeUrl)}</span>
+        ${creation.remoteObservedAt ? `<span style="color:var(--muted); font-size:11px;">Approved remote snapshot ${esc(relativeTime(creation.remoteObservedAt))}${creation.expectedRemoteItemId ? ` · item ${esc(creation.expectedRemoteItemId)}` : ''}${creation.expectedRemoteSha256 ? ` · SHA ${esc(String(creation.expectedRemoteSha256).slice(0, 12))}…` : ''}</span>` : ''}
         ${creation.conflictReason ? `<div class="mcp-alert warn">${icon('alert', 13)}<span>${esc(creation.conflictReason)}</span></div>` : ''}
         <details class="document-findings"><summary>Preview draft</summary>
           ${canRender ? `<div class="content-block fpv-md" style="padding:8px 2px;">${window.formatMarkdownContent(creation.createContent || '')}</div>` : `<pre class="fpv-pre">${esc(creation.createContent || '')}</pre>`}
         </details>
         <div style="display:flex; gap:6px;">
           ${creation.status === 'pending' ? `
-            <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}">Approve</button>
-            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}">Reject</button>` : ''}
+            <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}" data-update="${isUpdate ? 'true' : 'false'}">Approve</button>
+            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-update="${isUpdate ? 'true' : 'false'}">Reject</button>` : ''}
+          ${creation.status === 'conflicted' ? `
+            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-update="${isUpdate ? 'true' : 'false'}" data-conflict="true">Dismiss conflict</button>` : ''}
           ${creation.status === 'approved' ? `
-            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}">${icon('refresh', 12)} ${isUpdate ? 'Update SharePoint version' : 'Create SharePoint copy'}</button>` : ''}
+            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}" data-update="${isUpdate ? 'true' : 'false'}">${icon('refresh', 12)} ${isUpdate ? 'Update SharePoint version' : 'Create SharePoint copy'}</button>` : ''}
         </div>
       </article>`;
   }).join('')}</section>` : '';
@@ -5662,11 +5665,20 @@ function bindEvents() {
       const id = target.dataset.id || '';
       const decision = target.dataset.decision === 'approve' ? 'approve' : 'reject';
       const projectId = target.dataset.project || '';
+      const isUpdate = target.dataset.update === 'true';
+      const isConflictDismissal = target.dataset.conflict === 'true';
       if (id) {
         void (async () => {
           try {
-            await request(`/documents/pending-edits/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: {} });
-            toast(decision === 'approve' ? 'Creation approved — press "Create on SharePoint" to publish.' : 'Creation rejected.');
+            const result = await request(`/documents/pending-edits/${encodeURIComponent(id)}/${decision}`, { method: 'POST', body: {} });
+            if (decision === 'approve') {
+              const snapshot = result.remoteSnapshot;
+              toast(isUpdate
+                ? `Update approved against the current SharePoint version${snapshot?.sha256 ? ` (SHA ${String(snapshot.sha256).slice(0, 12)}…)` : ''} — press "Update SharePoint version" to publish.`
+                : 'Creation approved — press "Create SharePoint copy" to publish.');
+            } else {
+              toast(isConflictDismissal ? 'Publication conflict dismissed.' : `${isUpdate ? 'Update' : 'Creation'} rejected.`);
+            }
           } catch (error) {
             toast(`Could not ${decision}: ${String(error?.message || error)}`, 'warn');
           } finally {
@@ -5678,19 +5690,22 @@ function bindEvents() {
     if (action === 'creation-sync') {
       const docKey = target.dataset.dockey || '';
       const projectId = target.dataset.project || '';
+      const isUpdate = target.dataset.update === 'true';
       if (docKey && !state.docReader.syncing) {
         state.docReader.syncing = true;
         target.disabled = true;
         void (async () => {
           try {
             const result = await request('/documents/sync', { method: 'POST', body: { docKey } });
-            if (result.uploaded) {
-              toast(`Document created on SharePoint${result.verifiedOnReadBack ? ' (verified)' : ''} — ingesting; it appears under Documents shortly.`);
+            if (result.verifiedOnReadBack && (result.uploaded || result.alreadyCurrent)) {
+              toast(isUpdate
+                ? `SharePoint version ${result.alreadyCurrent ? 'was already current' : 'updated'} (exact bytes and item verified) — ingesting the publication receipt.`
+                : `Document created on SharePoint${result.verifiedOnReadBack ? ' (verified)' : ''} — ingesting; it appears under Documents shortly.`);
             } else {
-              toast(result.results?.[0]?.reason || 'Creation could not be published — see the staged row for the reason.', 'warn');
+              toast(result.results?.[0]?.reason || `${isUpdate ? 'Update' : 'Creation'} could not be published — see the staged row for the reason.`, 'warn');
             }
           } catch (error) {
-            toast(`Create failed: ${String(error?.message || error)}`, 'warn');
+            toast(`${isUpdate ? 'Update' : 'Create'} failed: ${String(error?.message || error)}`, 'warn');
           } finally {
             state.docReader.syncing = false;
             if (projectId) await loadProjectDocuments(projectId, { force: true });

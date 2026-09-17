@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createStorage, type StorageLayer } from '../core/storage.js';
-import { decidePendingEdit, listPendingEdits, markEditSynced } from '../core/pending-edits.js';
+import { decidePendingEdit, listPendingEdits, markEditConflicted, markEditSynced } from '../core/pending-edits.js';
 import {
   createProductDocumentPublicationService,
   publicationRemoteReceipt,
@@ -153,6 +153,26 @@ describe('product-document publication ledger', () => {
       docKey: base.publication.docKey,
     });
     expect(staged.pendingEdit.originNote).toMatch(/update existing SharePoint version/);
+    expect(() => publications.recordDecision(staged.pendingEdit.id, 'approved')).toThrow(/current-remote snapshot/);
+    const updateApproved = decidePendingEdit(db, staged.pendingEdit.id, 'approved');
+    expect(publications.recordDecision(updateApproved.id, 'approved', updateApproved.approvedAt!, {
+      sha256: 'b'.repeat(64),
+      itemId: '  item-140  ',
+      etag: '  etag-2  ',
+      version: '  2.0  ',
+      modified: '2026-09-16T02:30:00Z',
+      size: 456,
+      observedAt: '2026-09-16T02:31:00Z',
+    })).toMatchObject({
+      status: 'approved',
+      expectedRemoteSha256: 'b'.repeat(64),
+      expectedRemoteItemId: 'item-140',
+      expectedRemoteEtag: 'etag-2',
+      expectedRemoteVersion: '2.0',
+      expectedRemoteModified: '2026-09-16T02:30:00Z',
+      expectedRemoteSize: 456,
+      remoteObservedAt: '2026-09-16T02:31:00Z',
+    });
     expect(() => publications.stage({
       artifactId: v2.artifactId,
       projectId: 'p1',
@@ -162,6 +182,134 @@ describe('product-document publication ledger', () => {
       title: v2.title,
       targetFolder: '/personal/u_amazon_com/Documents',
     })).toThrow(/inherits the exact prior SharePoint target/);
+  });
+
+  it('returns the existing receipt for an exact unresolved stage instead of creating a duplicate', () => {
+    const { artifact, publications, db } = fixture();
+    const input = {
+      artifactId: artifact.artifactId,
+      projectId: 'p1',
+      action: 'create' as const,
+      format: 'md' as const,
+      title: artifact.title,
+      serverRelativeUrl: '/personal/u_amazon_com/Documents/Published/Catalog-strategy.md',
+    };
+    const first = publications.stage({ ...input, purpose: 'First request' });
+    const retry = publications.stage({ ...input, purpose: 'Retry with different prose' });
+
+    expect(retry).toMatchObject({
+      idempotent: true,
+      replacesPublicationIds: [],
+      publication: { publicationId: first.publication.publicationId, status: 'staged' },
+      pendingEdit: { id: first.pendingEdit.id, status: 'pending' },
+    });
+    expect(publications.listByProject('p1')).toHaveLength(1);
+    expect(listPendingEdits(db, first.publication.docKey)).toHaveLength(1);
+  });
+
+  it('atomically supersedes an obsolete staged ancestor when a newer artifact takes the same slot', () => {
+    const { artifact, store, publications, db } = fixture();
+    const target = '/personal/u_amazon_com/Documents/Published/Catalog-strategy.md';
+    const obsolete = publications.stage({
+      artifactId: artifact.artifactId,
+      projectId: 'p1',
+      action: 'create',
+      format: 'md',
+      title: artifact.title,
+      serverRelativeUrl: target,
+    });
+    const v2 = {
+      ...artifact,
+      artifactId: 'artifact-v2',
+      parentArtifactId: artifact.artifactId,
+      content: '# Catalog strategy\n\nThe complete successor supersedes the obsolete staged revision.',
+      createdAt: '2026-09-16T02:00:00Z',
+    } as ProductDocumentArtifact;
+    store.save(v2);
+
+    const current = publications.stage({
+      artifactId: v2.artifactId,
+      projectId: 'p1',
+      action: 'create',
+      format: 'md',
+      title: v2.title,
+      serverRelativeUrl: target,
+    });
+
+    expect(current).toMatchObject({ idempotent: false, replacesPublicationIds: [obsolete.publication.publicationId] });
+    expect(publications.get(obsolete.publication.publicationId)).toMatchObject({
+      status: 'superseded',
+      replacementPublicationId: current.publication.publicationId,
+      supersededAt: '2026-09-16T01:00:00.000Z',
+      supersessionReason: expect.stringContaining(current.publication.publicationId),
+    });
+    expect(listPendingEdits(db, obsolete.publication.docKey)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: obsolete.pendingEdit.id, status: 'rejected' }),
+      expect.objectContaining({ id: current.pendingEdit.id, status: 'pending' }),
+    ]));
+  });
+
+  it('replaces an exact target-conflict attempt but preserves its append-only linkage', () => {
+    const { artifact, publications, db } = fixture();
+    const input = {
+      artifactId: artifact.artifactId,
+      projectId: 'p1',
+      action: 'create' as const,
+      format: 'md' as const,
+      title: artifact.title,
+      serverRelativeUrl: '/personal/u_amazon_com/Documents/Published/Catalog-strategy.md',
+    };
+    const conflicted = publications.stage(input);
+    const approved = decidePendingEdit(db, conflicted.pendingEdit.id, 'approved');
+    publications.recordDecision(approved.id, 'approved', approved.approvedAt!);
+    publications.recordFailure(conflicted.publication.publicationId, 'target_conflict', 'Target appeared before write.');
+    markEditConflicted(db, conflicted.pendingEdit.id, 'Target appeared before write.');
+
+    const replacement = publications.stage(input);
+
+    expect(replacement).toMatchObject({
+      idempotent: false,
+      replacesPublicationIds: [conflicted.publication.publicationId],
+      pendingEdit: { status: 'pending' },
+    });
+    expect(publications.get(conflicted.publication.publicationId)).toMatchObject({
+      status: 'superseded',
+      replacementPublicationId: replacement.publication.publicationId,
+    });
+    expect(listPendingEdits(db, conflicted.publication.docKey).find(edit => edit.id === conflicted.pendingEdit.id)?.status).toBe('rejected');
+  });
+
+  it('never auto-supersedes an approved attempt at the same target slot', () => {
+    const { artifact, store, publications, db } = fixture();
+    const target = '/personal/u_amazon_com/Documents/Published/Catalog-strategy.md';
+    const approvedStage = publications.stage({
+      artifactId: artifact.artifactId,
+      projectId: 'p1',
+      action: 'create',
+      format: 'md',
+      title: artifact.title,
+      serverRelativeUrl: target,
+    });
+    const approved = decidePendingEdit(db, approvedStage.pendingEdit.id, 'approved');
+    publications.recordDecision(approved.id, 'approved', approved.approvedAt!);
+    const v2 = {
+      ...artifact,
+      artifactId: 'artifact-v2',
+      parentArtifactId: artifact.artifactId,
+      content: '# Catalog strategy\n\nA newer artifact cannot cancel an approved attempt automatically.',
+      createdAt: '2026-09-16T02:00:00Z',
+    } as ProductDocumentArtifact;
+    store.save(v2);
+
+    expect(() => publications.stage({
+      artifactId: v2.artifactId,
+      projectId: 'p1',
+      action: 'create',
+      format: 'md',
+      title: v2.title,
+      serverRelativeUrl: target,
+    })).toThrow(/is approved.*cannot be replaced automatically/);
+    expect(publications.get(approvedStage.publication.publicationId)?.status).toBe('approved');
   });
 
   it('rejects project mismatch, illegal transitions, and mismatched capture identity', () => {
@@ -217,7 +365,21 @@ describe('product-document publication ledger', () => {
     `);
     const service = createProductDocumentPublicationService(db, { getArtifact: () => null } as unknown as ProductDocumentService);
     const columns = (db.prepare('PRAGMA table_info(product_document_publications)').all() as Array<{ name: string }>).map(column => column.name);
-    expect(columns).toEqual(expect.arrayContaining(['retired_at', 'retirement_note', 'replacement_publication_id']));
+    expect(columns).toEqual(expect.arrayContaining([
+      'intent_key',
+      'expected_remote_sha256',
+      'expected_remote_item_id',
+      'expected_remote_etag',
+      'expected_remote_version',
+      'expected_remote_modified',
+      'expected_remote_size',
+      'remote_observed_at',
+      'superseded_at',
+      'supersession_reason',
+      'retired_at',
+      'retirement_note',
+      'replacement_publication_id',
+    ]));
     db.prepare(`
       UPDATE product_document_publications
       SET retired_at = ?, retirement_note = ?, replacement_publication_id = ?
@@ -225,6 +387,8 @@ describe('product-document publication ledger', () => {
     `).run('2026-09-16T14:01:26Z', 'Owner approved duplicate retirement.', 'replacement-pub');
     expect(service.get('retired-pub')).toMatchObject({
       status: 'superseded',
+      intentKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      expectedRemoteSha256: null,
       capturedWorkItemId: 'capture-old',
       remoteItemId: '141',
       retiredAt: '2026-09-16T14:01:26Z',

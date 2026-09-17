@@ -2870,7 +2870,12 @@ window.previewFile = async (rawHref) => {
 //     rendered with `escAttr` so quoted/UTF-8/space-bearing paths survive).
 //   - Anchors whose `href` starts with `file://` route through
 //     `/api/files/open`.
-document.addEventListener('click', (e) => {
+const fileLinkClickHandlerKey = Symbol.for('botboy.fileLinkClickHandler');
+const priorFileLinkClickHandler = document[fileLinkClickHandlerKey];
+if (typeof priorFileLinkClickHandler === 'function') {
+  document.removeEventListener('click', priorFileLinkClickHandler);
+}
+const handleFileLinkClick = (e) => {
   // Reveal-in-Finder anchors take priority — they share the `<a>` shape but
   // carry an explicit data-action attribute.
   const revealAnchor = e.target.closest && e.target.closest('a[data-action="reveal"]');
@@ -2909,7 +2914,9 @@ document.addEventListener('click', (e) => {
       fetch(`/api/files/open?path=${encodeURIComponent(path)}`).catch(() => {});
     }
   }
-});
+};
+document.addEventListener('click', handleFileLinkClick);
+document[fileLinkClickHandlerKey] = handleFileLinkClick;
 
 // ── Init ──
 (async () => {

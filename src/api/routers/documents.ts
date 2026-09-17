@@ -39,9 +39,13 @@ import { markdownBlocksOf, markdownLineToDocxText, blockToAnchorParagraphs } fro
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { exportDocument } from '../../product-manager/document-exporter.js';
-import { publicationRemoteReceipt, sha256Buffer } from '../../product-manager/product-document-publications.js';
+import {
+  publicationRemoteReceipt,
+  sha256Buffer,
+  type PublicationRemoteSnapshot,
+} from '../../product-manager/product-document-publications.js';
 
 export function createDocumentsRouter(deps: RouterDeps): Router {
   const router = Router();
@@ -56,7 +60,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     // tools (document-corpus.ts) so UI and model agree about the corpus.
     // Staged creations (authoring bridge): documents that will exist once
     // approved+synced — they have no corpus row yet, so they ride alongside.
-    const stagedCreations = listStagedCreations(db, projectId).map(creation => {
+    const stagedCreationRows = listStagedCreations(db, projectId).map(creation => {
       const publication = deps.productDocumentPublications?.findByPendingEdit(creation.id) ?? null;
       return {
         id: creation.id,
@@ -74,9 +78,30 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
           basePublicationId: publication.basePublicationId,
           sourceArtifactId: publication.artifactId,
           publicationStatus: publication.status,
+          publicationIntentKey: publication.intentKey,
+          expectedRemoteSha256: publication.expectedRemoteSha256,
+          expectedRemoteItemId: publication.expectedRemoteItemId,
+          expectedRemoteEtag: publication.expectedRemoteEtag,
+          expectedRemoteVersion: publication.expectedRemoteVersion,
+          expectedRemoteModified: publication.expectedRemoteModified,
+          expectedRemoteSize: publication.expectedRemoteSize,
+          remoteObservedAt: publication.remoteObservedAt,
+          replacementPublicationId: publication.replacementPublicationId,
+          supersededAt: publication.supersededAt,
+          supersessionReason: publication.supersessionReason,
         } : {}),
       };
     });
+    // One actionable card per exact publication intent. Historical attempts
+    // remain append-only in `publications`, but duplicate conflicted retries do
+    // not become duplicate owner actions.
+    const seenPublicationIntents = new Set<string>();
+    const stagedCreations = [...stagedCreationRows].reverse().filter(creation => {
+      const key = creation.publicationIntentKey || `pending:${creation.id}`;
+      if (seenPublicationIntents.has(key)) return false;
+      seenPublicationIntents.add(key);
+      return true;
+    }).reverse();
     const publications = deps.productDocumentPublications?.listByProject(projectId) ?? [];
     const linkedDocKeys = new Set(publications
       .filter(publication => publication.status === 'complete' && publication.capturedWorkItemId)
@@ -305,25 +330,41 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     }
   });
 
-  router.post('/documents/pending-edits/:id/:decision', (req: Request, res: Response) => {
+  router.post('/documents/pending-edits/:id/:decision', async (req: Request, res: Response) => {
     if (!deps.db) return res.status(503).json({ error: 'database unavailable' });
     const decision = String(req.params.decision ?? '');
     if (decision !== 'approve' && decision !== 'reject') return res.status(404).json({ error: 'unknown action' });
+    const pendingEditId = String(req.params.id ?? '');
     try {
+      const currentPublication = deps.productDocumentPublications?.findByPendingEdit(pendingEditId) ?? null;
+      let snapshot: PublicationRemoteSnapshot | undefined;
+      if (decision === 'approve' && currentPublication?.action === 'update_existing') {
+        if (!deps.mcpManager) return res.status(503).json({ error: 'managed MCP runtime unavailable' });
+        snapshot = await observeSharePointTarget(
+          currentPublication.serverRelativeUrl,
+          currentPublication.siteUrl,
+          pendingEditId,
+        );
+      }
       const edit = deps.db.transaction(() => {
         const decided = decidePendingEdit(
           deps.db!,
-          String(req.params.id ?? ''),
+          pendingEditId,
           decision === 'approve' ? 'approved' : 'rejected',
         );
         deps.productDocumentPublications?.recordDecision(
           decided.id,
           decision === 'approve' ? 'approved' : 'rejected',
           decision === 'approve' ? decided.approvedAt ?? undefined : undefined,
+          snapshot,
         );
         return decided;
       })();
-      res.json({ edit, publication: deps.productDocumentPublications?.findByPendingEdit(edit.id) ?? null });
+      res.json({
+        edit,
+        publication: deps.productDocumentPublications?.findByPendingEdit(edit.id) ?? null,
+        ...(snapshot ? { remoteSnapshot: snapshot } : {}),
+      });
     } catch (error) {
       res.status(400).json({ error: (error as Error).message });
     }
@@ -466,7 +507,14 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
    * download; conflicts isolate per edit. guidedFlow is set server-side —
    * the owner's Approve clicks are the approval this write path requires.
    */
-  type SharePointTargetIdentity = { itemId: string; modified: string; size: number | null; webUrl: string | null };
+  type SharePointTargetIdentity = {
+    itemId: string;
+    modified: string;
+    size: number | null;
+    webUrl: string | null;
+    etag: string | null;
+    version: string | null;
+  };
 
   const normalizeSharePointPath = (value: string): string => {
     try { return decodeURIComponent(value).replace(/\/+$/, ''); } catch { return value.replace(/\/+$/, ''); }
@@ -504,12 +552,69 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
           modified: String(match.Modified ?? '').trim(),
           size: Number.isFinite(Number(match.Size)) ? Number(match.Size) : null,
           webUrl: typeof match.WebUrl === 'string' && match.WebUrl.trim() ? match.WebUrl.trim() : null,
+          etag: typeof (match.eTag ?? match.etag ?? match.ETag) === 'string'
+            ? String(match.eTag ?? match.etag ?? match.ETag).trim() || null
+            : null,
+          version: typeof (match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version) === 'string'
+            || typeof (match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version) === 'number'
+            ? String(match.VersionLabel ?? match.versionLabel ?? match.Version ?? match.version).trim() || null
+            : null,
         };
       }
       skipToken = typeof payload?.nextToken === 'string' && payload.nextToken ? payload.nextToken : undefined;
       if (!skipToken) return null;
     }
     throw new Error('SharePoint target listing exceeded the bounded identity lookup window.');
+  }
+
+  class SharePointTargetConflictError extends Error {}
+
+  const sameObservedIdentity = (left: SharePointTargetIdentity, right: SharePointTargetIdentity): boolean =>
+    left.itemId === right.itemId
+    && (!left.etag || !right.etag || left.etag === right.etag)
+    && (!left.version || !right.version || left.version === right.version)
+    && (!left.modified || !right.modified || left.modified === right.modified)
+    && (left.size === null || right.size === null || left.size === right.size);
+
+  async function observeSharePointTarget(
+    serverRelativeUrl: string,
+    siteUrl: string | null,
+    tag: string,
+  ): Promise<PublicationRemoteSnapshot> {
+    if (!deps.mcpManager) throw new Error('managed MCP runtime unavailable');
+    const before = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl);
+    if (!before?.itemId) throw new SharePointTargetConflictError('The existing SharePoint target could not be resolved to one item.');
+    const scratchDir = path.join(os.homedir(), '.personal-productivity-tracker', 'tmp');
+    fs.mkdirSync(scratchDir, { recursive: true });
+    const extension = serverRelativeUrl.toLowerCase().endsWith('.docx') ? '.docx' : '.md';
+    const savePath = path.join(scratchDir, `publication-observe-${tag}-${randomUUID()}${extension}`);
+    try {
+      const read = await deps.mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+        serverRelativeUrl,
+        ...(siteUrl ? { siteUrl } : {}),
+        savePath,
+      }, { timeoutMs: 120_000 });
+      if (read.isError || !fs.existsSync(savePath)) {
+        throw new Error(`Could not read the current SharePoint target safely: ${String(read.text).slice(0, 300)}`);
+      }
+      const sha256 = sha256Buffer(fs.readFileSync(savePath));
+      const after = await readSharePointTargetIdentity(serverRelativeUrl, siteUrl);
+      if (!after?.itemId || !sameObservedIdentity(before, after)) {
+        throw new SharePointTargetConflictError('The SharePoint target changed while BotBoy was observing it; approval was not recorded.');
+      }
+      return {
+        sha256,
+        itemId: after.itemId,
+        ...(after.etag ? { etag: after.etag } : {}),
+        ...(after.version ? { version: after.version } : {}),
+        ...(after.modified ? { modified: after.modified } : {}),
+        ...(after.size !== null ? { size: after.size } : {}),
+        ...(after.webUrl ? { webUrl: after.webUrl } : {}),
+        observedAt: new Date().toISOString(),
+      };
+    } finally {
+      try { fs.unlinkSync(savePath); } catch { /* absent = fine */ }
+    }
   }
 
   async function runDocumentSync(docKey: string): Promise<
@@ -582,7 +687,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       || basePublication.projectId !== publication?.projectId
       || !basePublication.exportSha256)) {
       const reason = 'The approved update no longer has one matching completed base publication receipt.';
-      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'identity_mismatch', reason);
+      if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
       markEditConflicted(db, creation.id, reason);
       return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
     }
@@ -615,48 +720,58 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const isDocx = creation.serverRelativeUrl.toLowerCase().endsWith('.docx');
     let canonicalExport: Awaited<ReturnType<typeof exportDocument>> | null = null;
 
-    // 1. Re-check the exact target at apply time. Create requires absence;
-    //    update requires the completed base bytes at the inherited path.
-    const probePath = path.join(scratchDir, `publication-probe-${creation.id}${isDocx ? '.docx' : '.md'}`);
-    const probeRead = await mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
-      serverRelativeUrl: creation.serverRelativeUrl,
-      ...(creation.siteUrl ? { siteUrl: creation.siteUrl } : {}),
-      savePath: probePath,
-    }, { timeoutMs: 120_000 }).catch((error: Error) => ({ text: `Error: ${error.message}`, isError: true }));
     let baselineIdentity: SharePointTargetIdentity | null = null;
     let baselineSha256: string | null = null;
-    try {
-      if (isPublicationUpdate) {
-        if (probeRead.isError || !fs.existsSync(probePath)) {
-          const reason = /not.?found|does not exist|404|no file|could not find/i.test(String(probeRead.text))
-            ? 'The previously published SharePoint target no longer exists; update stopped without creating a replacement.'
-            : `Could not read the existing published target safely: ${String(probeRead.text).slice(0, 300)}`;
-          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
-          markEditConflicted(db, creation.id, reason);
-          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+    if (isPublicationUpdate) {
+      if (!publication?.expectedRemoteSha256 || !publication.expectedRemoteItemId || !publication.remoteObservedAt) {
+        const reason = 'This approved update has no bound remote snapshot; restage and approve it again.';
+        deps.productDocumentPublications?.recordFailure(publication!.publicationId, 'target_conflict', reason);
+        markEditConflicted(db, creation.id, reason);
+        return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+      }
+      let observed: PublicationRemoteSnapshot;
+      try {
+        observed = await observeSharePointTarget(creation.serverRelativeUrl, creation.siteUrl, `apply-${creation.id}`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (!(error instanceof SharePointTargetConflictError)) {
+          return { status: 'failed', error: reason };
         }
-        baselineSha256 = sha256Buffer(fs.readFileSync(probePath));
-        if (baselineSha256 !== basePublication!.exportSha256) {
-          const reason = 'The existing SharePoint file changed after its base publication; update stopped to preserve those remote edits.';
-          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
-          markEditConflicted(db, creation.id, reason);
-          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
-        }
-        try {
-          baselineIdentity = await readSharePointTargetIdentity(creation.serverRelativeUrl, creation.siteUrl);
-        } catch (error) {
-          return { status: 'failed', error: error instanceof Error ? error.message : String(error) };
-        }
-        if (!baselineIdentity?.itemId) {
-          return { status: 'failed', error: 'Could not prove the existing SharePoint item identity; update was not attempted.' };
-        }
-        if (basePublication!.remoteItemId && baselineIdentity.itemId !== basePublication!.remoteItemId) {
-          const reason = 'A different SharePoint item now occupies the published path; update stopped without overwriting it.';
-          if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
-          markEditConflicted(db, creation.id, reason);
-          return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
-        }
-      } else {
+        deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+        markEditConflicted(db, creation.id, reason);
+        return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+      }
+      const changedAfterApproval = observed.sha256 !== publication.expectedRemoteSha256
+        || observed.itemId !== publication.expectedRemoteItemId
+        || Boolean(publication.expectedRemoteEtag && observed.etag !== publication.expectedRemoteEtag)
+        || Boolean(publication.expectedRemoteVersion && observed.version !== publication.expectedRemoteVersion)
+        || Boolean(publication.expectedRemoteModified && observed.modified !== publication.expectedRemoteModified)
+        || Boolean(publication.expectedRemoteSize !== null && observed.size !== publication.expectedRemoteSize);
+      if (changedAfterApproval) {
+        const reason = 'The SharePoint file changed after owner approval; update stopped without overwriting that newer remote version.';
+        deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
+        markEditConflicted(db, creation.id, reason);
+        return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
+      }
+      baselineSha256 = observed.sha256;
+      baselineIdentity = {
+        itemId: observed.itemId,
+        modified: observed.modified ?? '',
+        size: observed.size ?? null,
+        webUrl: observed.webUrl ?? null,
+        etag: observed.etag ?? null,
+        version: observed.version ?? null,
+      };
+    } else {
+      // Creation requires the target to remain absent at apply time. An
+      // auth/transport error is never treated as absence.
+      const probePath = path.join(scratchDir, `publication-probe-${creation.id}${isDocx ? '.docx' : '.md'}`);
+      const probeRead = await mcpManager.callTool('sharepoint', 'sharepoint_read_file', {
+        serverRelativeUrl: creation.serverRelativeUrl,
+        ...(creation.siteUrl ? { siteUrl: creation.siteUrl } : {}),
+        savePath: probePath,
+      }, { timeoutMs: 120_000 }).catch((error: Error) => ({ text: `Error: ${error.message}`, isError: true }));
+      try {
         if (!probeRead.isError) {
           const reason = 'target already exists on SharePoint — choose update_existing with its exact completed publication instead';
           if (publication) deps.productDocumentPublications?.recordFailure(publication.publicationId, 'target_conflict', reason);
@@ -664,13 +779,11 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
           return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason }] };
         }
         if (!/not.?found|does not exist|404|no file|could not find/i.test(String(probeRead.text))) {
-          // An auth/transport failure must never be mistaken for "missing"
-          // and trigger a blind write.
           return { status: 'failed', error: `could not verify the target is free: ${String(probeRead.text).slice(0, 300)}` };
         }
+      } finally {
+        try { fs.unlinkSync(probePath); } catch { /* absent = fine */ }
       }
-    } finally {
-      try { fs.unlinkSync(probePath); } catch { /* absent = fine */ }
     }
 
     if (publication && sourceArtifact) {
@@ -1135,6 +1248,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     if (existingRetry) { clearTimeout(existingRetry.timer); lockRetries.delete(docKey); }
     res.json({
       uploaded: outcome.uploaded,
+      alreadyCurrent: outcome.alreadyCurrent ?? false,
       verifiedOnReadBack: outcome.verifiedOnReadBack,
       results: outcome.results,
       edits: listPendingEdits(deps.db, docKey),
