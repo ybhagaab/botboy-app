@@ -120,12 +120,13 @@ export interface ProductDocumentPublicationService {
   recordLegacyRepair(input: RecordLegacyPublicationRepairInput, at?: string): { publication: ProductDocumentPublication; pendingEdit: PendingEdit };
   get(publicationId: string): ProductDocumentPublication | null;
   findByPendingEdit(pendingEditId: string): ProductDocumentPublication | null;
+  findPendingEdit(pendingEditId: string): PendingEdit | null;
   listByProject(projectId: string): ProductDocumentPublication[];
   listByArtifact(artifactId: string): ProductDocumentPublication[];
   listByChain(artifactId: string): ProductDocumentPublication[];
   hasForChain(artifactId: string): boolean;
   recordDecision(pendingEditId: string, decision: 'approved' | 'rejected', at?: string, snapshot?: PublicationRemoteSnapshot): ProductDocumentPublication | null;
-  recordExport(publicationId: string, receipt: { sha256: string; bytes: number; filename: string }, at?: string): ProductDocumentPublication;
+  recordExport(publicationId: string, receipt: { sha256: string; bytes: number; filename: string }, at?: string, options?: { noRemoteEffectProven?: boolean }): ProductDocumentPublication;
   recordUploaded(publicationId: string, receipt?: { webUrl?: string; remoteItemId?: string; remoteEtag?: string }, at?: string): ProductDocumentPublication;
   recordVerified(publicationId: string, receipt: { remoteSha256: string; remoteItemId?: string; webUrl?: string }, at?: string): ProductDocumentPublication;
   recordCaptureQueued(publicationId: string, at?: string): ProductDocumentPublication;
@@ -819,6 +820,9 @@ export function createProductDocumentPublicationService(
       const row = selectByPending.get(pendingEditId) as PublicationRow | undefined;
       return row ? rowToPublication(row) : null;
     },
+    findPendingEdit(pendingEditId) {
+      return getPendingEdit(db, pendingEditId);
+    },
     listByProject(projectId) {
       return (listProject.all(projectId) as PublicationRow[]).map(rowToPublication);
     },
@@ -875,22 +879,30 @@ export function createProductDocumentPublicationService(
         at,
       );
     },
-    recordExport(publicationId, receipt, at = now().toISOString()) {
+    recordExport(publicationId, receipt, at = now().toISOString(), options = {}) {
       if (!/^[a-f0-9]{64}$/i.test(receipt.sha256) || !Number.isInteger(receipt.bytes) || receipt.bytes < 0) {
         throw new Error('Canonical export receipt is invalid.');
       }
       const current = get(publicationId);
-      if (current?.status === 'exported'
-        && current.exportSha256 === receipt.sha256.toLowerCase()
-        && current.exportBytes === receipt.bytes
-        && current.exportFilename === receipt.filename.slice(0, 300)) return current;
-      return transition(publicationId, 'exported', {
+      const normalized = {
         exportSha256: receipt.sha256.toLowerCase(),
         exportBytes: receipt.bytes,
         exportFilename: receipt.filename.slice(0, 300),
         exportedAt: at,
         lastError: null,
-      }, at);
+      };
+      if (current?.status === 'exported'
+        && current.exportSha256 === normalized.exportSha256
+        && current.exportBytes === normalized.exportBytes
+        && current.exportFilename === normalized.exportFilename) return current;
+      if (current && options.noRemoteEffectProven === true
+        && (current.status === 'exported' || current.status === 'upload_failed')) {
+        const result = db.prepare(`UPDATE product_document_publications SET status='exported', export_sha256=?, export_bytes=?, export_filename=?, exported_at=?, last_error=NULL, updated_at=? WHERE publication_id=? AND status=?`)
+          .run(normalized.exportSha256, normalized.exportBytes, normalized.exportFilename, at, at, publicationId, current.status);
+        if (result.changes !== 1) throw new Error(`Publication ${publicationId} changed during proven no-effect export recovery.`);
+        return get(publicationId)!;
+      }
+      return transition(publicationId, 'exported', normalized, at);
     },
     recordUploaded(publicationId, receipt = {}, at = now().toISOString()) {
       return transition(publicationId, 'uploaded_unverified', {

@@ -19,14 +19,22 @@ let chatRequestContext = null;
 let ambientChatRequestContext = null;
 
 function normalizeChatRequestContext(context) {
+  const projectId = typeof context?.projectId === 'string' && /^proj_[A-Za-z0-9_-]+$/.test(context.projectId)
+    ? context.projectId
+    : '';
+  const projectTitle = projectId && typeof context?.projectTitle === 'string'
+    ? context.projectTitle.replace(/\s+/g, ' ').trim().slice(0, 200)
+    : '';
+  const projectContext = projectId && projectTitle ? { projectId, projectTitle } : {};
   if (context?.mode === 'analytics_dashboard') {
     return {
       mode: 'analytics_dashboard',
       ...(context.intent === 'create' ? { intent: 'create' } : {}),
+      ...projectContext,
     };
   }
-  if (context?.mode === 'general') return { mode: 'general' };
-  return null;
+  if (context?.mode === 'general') return { mode: 'general', ...projectContext };
+  return projectId ? projectContext : null;
 }
 
 function setChatRequestContext(context) {
@@ -139,8 +147,15 @@ function initChatWidthControl() {
   });
 }
 
-function activeChatRequestContext() {
-  return chatRequestContext || ambientChatRequestContext;
+function activeChatRequestContext(message = '') {
+  const context = chatRequestContext || ambientChatRequestContext;
+  if (!context?.projectId) return context;
+  const expectedSeed = `About project ${String(context.projectTitle || '').replace(/\s+/g, ' ').trim()} (${context.projectId}):`;
+  return String(message).startsWith(expectedSeed) ? context : {
+    ...(context.mode ? { mode: context.mode } : {}),
+    ...(context.intent ? { intent: context.intent } : {}),
+    ...(context.modeHint ? { modeHint: context.modeHint } : {}),
+  };
 }
 
 // ── API ──
@@ -379,7 +394,7 @@ async function sendChat(msg) {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...(activeChatRequestContext() || {}) }),
+      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...(activeChatRequestContext(msg) || {}) }),
     });
 
     if (!resp.ok) {
@@ -490,6 +505,9 @@ async function sendChat(msg) {
             }
             if (event.name === 'create_analytics_dashboard' && /"ok"\s*:\s*true/.test(event.preview || '')) {
               clearChatRequestContext();
+            }
+            if (['write_file', 'publish_static_artifact_to_harmony', 'browser_screenshot', 'assign_project_artifact'].includes(event.name)) {
+              window.dispatchEvent(new CustomEvent('botboy:project-artifact-changed', { detail: { tool: event.name } }));
             }
             // The agent opened/closed an embedded terminal — sync the dock now
             // so the card appears while the agent is still talking.

@@ -37,6 +37,7 @@ import type { DocumentParser } from '../../core/document-parser.js';
 import type { EtlOnboardingService } from '../../core/etl-onboarding.js';
 import type { VisualAssetRegistry } from '../../core/visual-assets.js';
 import type { VisualInspector } from '../../core/visual-inspector.js';
+import type { ProjectArtifactService } from '../../core/project-artifacts.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -76,6 +77,7 @@ export interface RouterDeps {
   /** Immutable local visuals and question-directed inspection. */
   visualAssets?: VisualAssetRegistry;
   visualInspector?: VisualInspector;
+  projectArtifacts?: ProjectArtifactService;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

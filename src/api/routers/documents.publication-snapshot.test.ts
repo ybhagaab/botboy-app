@@ -387,6 +387,32 @@ describe('publication approval remote snapshot', () => {
     });
   });
 
+  it('blocks the final write when the owning project becomes inactive after approval', async () => {
+    const { productDocuments, publications, staged } = setupUpdate();
+    const approved = decidePendingEdit(storage.getDb(), staged.pendingEdit.id, 'approved');
+    publications.recordDecision(approved.id, 'approved', approved.approvedAt!, {
+      sha256: 'a'.repeat(64), itemId: '140', observedAt: '2026-09-17T09:00:00Z',
+    });
+    storage.getDb().prepare("UPDATE projects SET status='archived' WHERE id='p1'").run();
+    let mcpCalls = 0;
+    const mcpManager = { callTool: async () => { mcpCalls++; return { text: '{}', isError: false }; } };
+    const app = appWith({
+      mcpManager: mcpManager as never,
+      productDocumentService: productDocuments,
+      productDocumentPublications: publications,
+    });
+
+    const response = await request(app)
+      .post('/api/documents/sync')
+      .send({ docKey: staged.publication.docKey })
+      .expect(502);
+
+    expect(response.body.error).toMatch(/is archived.*was not started/);
+    expect(mcpCalls).toBe(0);
+    expect(publications.get(staged.publication.publicationId)?.status).toBe('approved');
+    expect(getPendingEdit(storage.getDb(), staged.pendingEdit.id)?.status).toBe('approved');
+  });
+
   it('does not record approval when item identity changes during the approval observation', async () => {
     const { productDocuments, publications, staged } = setupUpdate();
     const remote = Buffer.from('remote bytes during a racing approval');
@@ -513,8 +539,9 @@ describe('publication update UI contract', () => {
     const source = readFileSync(new URL('../../ui/dashboard.js', import.meta.url), 'utf8');
     expect(source).toContain('Approved remote snapshot');
     expect(source).toContain('data-update="${isUpdate');
-    expect(source).toContain('data-conflict="true">Dismiss conflict</button>');
-    expect(source).toContain('Update approved against the current SharePoint version');
+    expect(source).toContain('data-conflict="true"');
+    expect(source).toContain("creation.status === 'approved' && (!creation.publicationStatus || creation.publicationStatus === 'approved')");
+    expect(source).toContain('Update approved against item');
     expect(source).toContain('SharePoint version ${result.alreadyCurrent ? \'was already current\' : \'updated\'}');
   });
 });

@@ -47,6 +47,34 @@ import {
   type PublicationRemoteSnapshot,
 } from '../../product-manager/product-document-publications.js';
 
+const PUBLICATION_EXPORT_ROOT = process.env.PPT_PUBLICATION_EXPORT_DIR
+  || (process.env.NODE_ENV === 'test'
+    ? path.join(os.tmpdir(), 'ppt-publication-exports', String(process.pid))
+    : path.join(os.homedir(), '.personal-productivity-tracker', 'files', 'publication-exports'));
+
+function publicationExportPath(publicationId: string, sha256: string, filename: string): string {
+  return path.join(PUBLICATION_EXPORT_ROOT, publicationId, sha256, path.basename(filename));
+}
+
+function loadPublicationExport(publication: { publicationId: string; exportSha256: string | null; exportBytes: number | null; exportFilename: string | null }): Buffer | null {
+  if (!publication.exportSha256 || publication.exportBytes === null || !publication.exportFilename) return null;
+  const file = publicationExportPath(publication.publicationId, publication.exportSha256, publication.exportFilename);
+  try {
+    const data = fs.readFileSync(file);
+    return data.length === publication.exportBytes && sha256Buffer(data) === publication.exportSha256 ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistPublicationExport(publicationId: string, sha256: string, filename: string, data: Buffer): void {
+  const file = publicationExportPath(publicationId, sha256, filename);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.part-${randomUUID()}`;
+  fs.writeFileSync(temp, data);
+  fs.renameSync(temp, file);
+}
+
 export function createDocumentsRouter(deps: RouterDeps): Router {
   const router = Router();
 
@@ -715,6 +743,19 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const basePublication = isPublicationUpdate && publication?.basePublicationId
       ? deps.productDocumentPublications?.get(publication.basePublicationId) ?? null
       : null;
+    if (publication) {
+      const owningProject = db.prepare('SELECT title, status FROM projects WHERE id = ?').get(publication.projectId) as
+        | { title: string; status: string }
+        | undefined;
+      if (!owningProject || (owningProject.status !== 'active' && owningProject.status !== 'paused')) {
+        return {
+          status: 'failed',
+          error: owningProject
+            ? `Owning project '${owningProject.title}' is ${owningProject.status}; SharePoint publication was not started.`
+            : 'The owning project no longer exists; SharePoint publication was not started.',
+        };
+      }
+    }
     if (isPublicationUpdate && (!basePublication
       || basePublication.status !== 'complete'
       || basePublication.docKey !== publication?.docKey
@@ -828,19 +869,31 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
 
     if (publication && sourceArtifact) {
       try {
-        canonicalExport = await exportDocument({
-          title: sourceArtifact.title,
-          content: sourceArtifact.content,
-          format: publication.format === 'md' ? 'markdown' : 'docx',
-        });
-        deps.productDocumentPublications?.recordExport(publication.publicationId, {
-          sha256: sha256Buffer(canonicalExport.data),
-          bytes: canonicalExport.data.length,
-          filename: canonicalExport.filename,
-        });
+        const currentPublication = deps.productDocumentPublications?.get(publication.publicationId) ?? publication;
+        const cached = loadPublicationExport(currentPublication);
+        if (cached && currentPublication.exportFilename) {
+          canonicalExport = {
+            data: cached,
+            filename: currentPublication.exportFilename,
+            mediaType: publication.format === 'md' ? 'text/markdown' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          };
+        } else {
+          canonicalExport = await exportDocument({
+            title: sourceArtifact.title,
+            content: sourceArtifact.content,
+            format: publication.format === 'md' ? 'markdown' : 'docx',
+          });
+          const exportSha256 = sha256Buffer(canonicalExport.data);
+          persistPublicationExport(publication.publicationId, exportSha256, canonicalExport.filename, canonicalExport.data);
+          deps.productDocumentPublications?.recordExport(publication.publicationId, {
+            sha256: exportSha256,
+            bytes: canonicalExport.data.length,
+            filename: canonicalExport.filename,
+          }, undefined, { noRemoteEffectProven: true });
+        }
       } catch (error) {
         const message = `Canonical export failed: ${error instanceof Error ? error.message : String(error)}`;
-        deps.productDocumentPublications?.recordFailure(publication.publicationId, 'upload_failed', message);
+        try { deps.productDocumentPublications?.recordFailure(publication.publicationId, 'upload_failed', message); } catch { /* preserve first durable failure */ }
         return { status: 'failed', error: message };
       }
     }

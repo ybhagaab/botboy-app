@@ -234,6 +234,9 @@ function createSchema(db: Database.Database): void {
 
   // ── local visual assets + question-directed inspection ledger ──
   migrateVisualInspection(db);
+
+  // ── project HTML artifact discovery/ownership projection ──
+  migrateProjectArtifacts(db);
 }
 
 /**
@@ -1461,4 +1464,29 @@ export function setSetting(db: Database.Database, key: string, value: unknown): 
   db.prepare(
     `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
   ).run(key, JSON.stringify(value), Date.now());
+}
+
+/** Durable ownership projection for local HTML artifacts. Harmony attempts remain in their existing ledger. */
+export function migrateProjectArtifacts(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS project_artifacts (
+      id TEXT PRIMARY KEY,
+      canonical_path TEXT NOT NULL UNIQUE,
+      relative_path TEXT NOT NULL,
+      project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+      assignment_source TEXT CHECK(assignment_source IS NULL OR assignment_source IN ('explicit_context','owner')),
+      assigned_at TEXT,
+      current_sha256 TEXT,
+      current_bytes INTEGER CHECK(current_bytes IS NULL OR current_bytes >= 0),
+      current_modified_at TEXT,
+      latest_visual_asset_version_id TEXT REFERENCES visual_asset_versions(id) ON DELETE SET NULL,
+      version INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_artifacts_project
+      ON project_artifacts(project_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_project_artifacts_unassigned
+      ON project_artifacts(updated_at DESC) WHERE project_id IS NULL;
+  `);
 }

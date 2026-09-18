@@ -108,6 +108,85 @@ export function syncDocumentReaderPresentation(documentRef, state) {
   return shell;
 }
 
+export function computeDocumentPublicationDrawerGeometry({
+  viewportWidth,
+  viewportHeight,
+  paneRect,
+  triggerRect,
+  mobile = false,
+}) {
+  const width = Math.max(0, Number(viewportWidth) || 0);
+  const height = Math.max(0, Number(viewportHeight) || 0);
+  const pane = paneRect || { left: 0, right: width, top: 0, bottom: height };
+  const trigger = triggerRect || { left: pane.right, right: pane.right, bottom: pane.top };
+  if (mobile) {
+    return { mobile: true, top: 0, right: 8, bottom: 61, width: Math.max(0, width - 16), caretX: 0 };
+  }
+
+  const paneLeft = Math.max(8, Number(pane.left) + 12);
+  const paneRight = Math.min(width - 8, Number(pane.right) - 12);
+  const paneTop = Math.max(8, Number(pane.top) + 12);
+  const paneBottom = Math.min(height - 8, Number(pane.bottom) - 12);
+  const availableWidth = Math.max(280, paneRight - paneLeft);
+  const drawerWidth = Math.min(460, availableWidth);
+  const right = Math.max(8, width - paneRight);
+  const bottom = Math.max(8, height - paneBottom);
+  const minimumHeight = Math.min(240, Math.max(180, paneBottom - paneTop));
+  const preferredTop = Number(trigger.bottom) + 8;
+  const top = Math.max(paneTop, Math.min(preferredTop, paneBottom - minimumHeight));
+  const drawerLeft = width - right - drawerWidth;
+  const triggerCenter = (Number(trigger.left) + Number(trigger.right)) / 2;
+  const caretX = Math.max(28, Math.min(drawerWidth - 28, triggerCenter - drawerLeft));
+  return { mobile: false, top, right, bottom, width: drawerWidth, caretX };
+}
+
+/** Promote the publication workflow into the browser top layer without changing reader geometry. */
+export function syncDocumentPublicationDialog(documentRef, state) {
+  const dialog = documentRef.querySelector('#document-publication-dialog');
+  if (!dialog) return null;
+  const allowedOrigins = new Set(['status', 'toolbar', 'summary']);
+  const origin = allowedOrigins.has(state.publicationTrigger) ? state.publicationTrigger : 'summary';
+  const triggers = [...documentRef.querySelectorAll('[data-publication-trigger]')];
+  triggers.forEach(trigger => trigger.classList.toggle('is-publication-origin', state.publicationOpen && trigger.dataset.publicationTrigger === origin));
+
+  if (!state.publicationOpen) {
+    if (dialog.open && typeof dialog.close === 'function') dialog.close();
+    return { dialog, open: false, origin };
+  }
+
+  const pane = documentRef.querySelector('.document-detail-pane');
+  const trigger = documentRef.querySelector(`[data-publication-trigger="${origin}"]`)
+    || documentRef.querySelector('[data-publication-trigger="summary"]')
+    || triggers[0];
+  if (!pane || !trigger) return { dialog, open: false, origin };
+
+  const view = documentRef.defaultView;
+  const viewportWidth = view?.innerWidth || documentRef.documentElement?.clientWidth || 0;
+  const viewportHeight = view?.innerHeight || documentRef.documentElement?.clientHeight || 0;
+  const mobile = view?.matchMedia?.('(max-width: 820px)')?.matches === true || viewportWidth <= 820;
+  const geometry = computeDocumentPublicationDrawerGeometry({
+    viewportWidth,
+    viewportHeight,
+    paneRect: pane.getBoundingClientRect(),
+    triggerRect: trigger.getBoundingClientRect(),
+    mobile,
+  });
+  const drawer = dialog.querySelector('.document-publication-drawer');
+  if (drawer) {
+    drawer.style.setProperty('--document-publication-top', `${geometry.top}px`);
+    drawer.style.setProperty('--document-publication-right', `${geometry.right}px`);
+    drawer.style.setProperty('--document-publication-bottom', `${geometry.bottom}px`);
+    drawer.style.setProperty('--document-publication-width', `${geometry.width}px`);
+    drawer.style.setProperty('--document-publication-caret-x', `${geometry.caretX}px`);
+  }
+  dialog.dataset.presentation = mobile ? 'sheet' : 'drawer';
+  if (!dialog.open) {
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+  }
+  return { dialog, drawer, open: true, origin, geometry };
+}
+
 export function focusDocumentReaderTarget(documentRef, target) {
   const shell = documentRef.querySelector('.documents-shell');
   if (!shell) return false;

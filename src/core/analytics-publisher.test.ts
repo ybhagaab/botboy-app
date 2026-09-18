@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, realpathSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { createStorage, StorageLayer } from './storage.js';
@@ -218,6 +218,39 @@ describe('publisher provider dispatch', () => {
       expect(deployCalls).toBe(1);
       expect(accessCalls).toBe(2);
       expect(verifyCalls).toBe(1);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps identical Harmony bundles from different canonical source paths separate and rejects cross-source resume', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'publisher-static-source-identity-'));
+    try {
+      mkdirSync(path.join(filesRoot, 'a'));
+      mkdirSync(path.join(filesRoot, 'b'));
+      writeFileSync(path.join(filesRoot, 'a', 'demo.html'), '<!doctype html><h1>Same</h1>');
+      writeFileSync(path.join(filesRoot, 'b', 'demo.html'), '<!doctype html><h1>Same</h1>');
+      let deployCalls = 0;
+      const staticService = createDashboardPublisherService({
+        db: storage.getDb(), analyticsService: fakeAnalyticsService(dash()), staticFilesRoot: filesRoot,
+        staticPublishAdapter: async ({ settings, bundle }) => {
+          deployCalls += 1;
+          return { url: `https://${harmonyAppName()}.${settings.stage}.harmony.a2z.com/a/${bundle.slug}/`, appName: harmonyAppName(), artifactPath: '/tmp/demo', deploy: { appName: harmonyAppName(), stage: settings.stage, appExisted: true, deployedAt: new Date().toISOString() } };
+        },
+        harmonyHooks: {
+          provision: async () => { throw new Error('unused'); },
+          ensureViewerAccess: async ({ settings }) => ({ resourceId: 'resource', owningTeamId: 'team', visibility: settings.visibility, changed: false, verified: true }),
+          verifyStaticArtifact: async ({ files }) => ({ verified: true, files: files.map(file => ({ ...file, status: 200, responseUrl: `https://example/${file.relativePath}` })) }),
+        },
+      });
+      staticService.updateConfig({ provider: 'harmony', enabled: true, bindleId: BINDLE, stage: 'beta', visibility: 'everyone' } as any);
+      const first = await staticService.publishStaticArtifact({ filePath: 'a/demo.html', ownerRequested: true });
+      const second = await staticService.publishStaticArtifact({ filePath: 'b/demo.html', ownerRequested: true });
+      expect(first.attemptId).not.toBe(second.attemptId);
+      expect(first.sourcePath).toBe(realpathSync(path.join(filesRoot, 'a', 'demo.html')));
+      expect(second.sourcePath).toBe(realpathSync(path.join(filesRoot, 'b', 'demo.html')));
+      expect(deployCalls).toBe(2);
+      await expect(staticService.publishStaticArtifact({ filePath: 'b/demo.html', ownerRequested: true, resumeAttemptId: first.attemptId })).rejects.toThrow(/does not match/);
     } finally {
       rmSync(filesRoot, { recursive: true, force: true });
     }

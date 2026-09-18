@@ -16,6 +16,14 @@ import type {
   ProductDocumentArtifact,
   SteBundleReadiness,
 } from '../../product-manager/types.js';
+import {
+  resolveLocalPublicationDestinationDefault,
+  resolvePublicationDestinationCandidates,
+  unavailablePublicationDestinationDefault,
+} from '../../product-manager/publication-destination-default.js';
+import {
+  buildProductDocumentPublicationViewFromService,
+} from '../../product-manager/product-document-publication-view.js';
 import type { RouterDeps } from './deps.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -31,6 +39,10 @@ function parseArtifactLimit(value: unknown): number | null {
 
 function validArtifactId(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+}
+
+function isLoopback(address: string | undefined): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
 function publicReadiness(readiness: SteBundleReadiness) {
@@ -112,6 +124,22 @@ function handleError(res: Response, error: unknown): Response {
 
 export function createProductDocumentsRouter(deps: RouterDeps): Router {
   const router = Router();
+  const publicationView = (artifact: ProductDocumentArtifact) => {
+    const publications = deps.productDocumentPublications;
+    if (!publications) return null;
+    const project = artifact.projectId && deps.db
+      ? deps.db.prepare('SELECT status FROM projects WHERE id = ?').get(artifact.projectId) as { status: string } | undefined
+      : undefined;
+    return buildProductDocumentPublicationViewFromService({
+      artifactId: artifact.artifactId,
+      ...(artifact.projectId ? { projectId: artifact.projectId } : {}),
+      projectStatus: artifact.projectId && deps.db ? project?.status ?? 'missing' : null,
+    }, publications);
+  };
+
+  const publicationDestinationDefault = () => deps.db
+    ? resolveLocalPublicationDestinationDefault(deps.db)
+    : unavailablePublicationDestinationDefault('Local publication evidence is unavailable.');
 
   router.get('/product-documents', (req: Request, res: Response) => {
     res.set('Cache-Control', 'no-store');
@@ -385,6 +413,142 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     }
   });
 
+  /**
+   * Deterministic artifact-reader publication staging. This creates only the
+   * local approval ledger; approval observation and SharePoint writes remain
+   * on the existing documents routes.
+   */
+  router.get('/product-documents/:artifactId/publication-destination-default', async (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store');
+    if (!isLoopback(req.socket.remoteAddress) || !isLoopback(req.socket.localAddress)) {
+      return res.status(403).json({ error: 'Publication destination resolution is local-only.' });
+    }
+    const artifactId = req.params.artifactId;
+    if (!validArtifactId(artifactId)) return res.status(400).json({ error: 'artifactId is invalid.' });
+    if (!deps.productDocumentService?.getArtifact(artifactId)) {
+      return res.status(404).json({ error: 'Product-document artifact not found.' });
+    }
+    const local = publicationDestinationDefault();
+    if (local.status !== 'unresolved') return res.json({ publicationDestinationDefault: local });
+    if (!deps.mcpManager) {
+      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault('SharePoint connection is unavailable.') });
+    }
+    try {
+      const profile = await deps.mcpManager.getProfile('sharepoint');
+      if (!profile?.enabled || profile.state !== 'running' || profile.compatibilityState !== 'compatible') {
+        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(`SharePoint connection is ${profile?.state || 'unavailable'}.`) });
+      }
+      const result = await deps.mcpManager.callTool('sharepoint', 'sharepoint_list_files', {
+        libraryName: 'Documents', top: 50, includeWebUrls: true,
+      }, { source: 'api', timeoutMs: 120_000 });
+      if (result.isError) {
+        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(result.text.slice(0, 300) || 'SharePoint listing failed.') });
+      }
+      const payload = JSON.parse(result.text) as { files?: Array<Record<string, unknown>> };
+      const resolved = resolvePublicationDestinationCandidates(
+        (payload.files ?? []).map(file => file.Path), 'sharepoint_list_files',
+      );
+      return res.json({ publicationDestinationDefault: resolved });
+    } catch (error) {
+      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(error instanceof Error ? error.message : String(error)) });
+    }
+  });
+
+  router.post('/product-documents/:artifactId/publications', (req: Request, res: Response) => {
+    const service = deps.productDocumentService;
+    const publications = deps.productDocumentPublications;
+    if (!service || !publications) {
+      return res.status(503).json({ error: 'Product-document publication service is not available.' });
+    }
+    if (!isLoopback(req.socket.remoteAddress) || !isLoopback(req.socket.localAddress)) {
+      return res.status(403).json({ error: 'Document publication staging is local-only.' });
+    }
+    const artifactId = req.params.artifactId;
+    if (!validArtifactId(artifactId)) return res.status(400).json({ error: 'artifactId is invalid.' });
+    if (!isRecord(req.body)) return res.status(400).json({ error: 'Body must be a JSON object.' });
+    if (req.body.ownerRequested !== true) {
+      return res.status(400).json({ error: 'ownerRequested must be true for the explicit reader publication action.' });
+    }
+    const action = req.body.action;
+    if (action !== 'create' && action !== 'update_existing') {
+      return res.status(400).json({ error: 'action must be create or update_existing.' });
+    }
+    const artifact = service.getArtifact(artifactId);
+    if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
+    if (!artifact.projectId) {
+      return res.status(409).json({ error: 'Assign this document chain to a project before publishing it.' });
+    }
+
+    try {
+      const state = publicationView(artifact);
+      if (state?.phase === 'blocked_unassigned') {
+        return res.status(409).json({ error: state.blockReason ?? 'The owning project cannot start a publication.' });
+      }
+      let staged;
+      if (action === 'update_existing') {
+        const basePublicationId = typeof req.body.basePublicationId === 'string'
+          ? req.body.basePublicationId.trim()
+          : '';
+        if (!basePublicationId) return res.status(400).json({ error: 'basePublicationId is required for update_existing.' });
+        if (req.body.format !== undefined || req.body.targetFolder !== undefined
+          || req.body.serverRelativeUrl !== undefined || req.body.siteUrl !== undefined) {
+          return res.status(400).json({ error: 'update_existing inherits format and destination; do not provide overrides.' });
+        }
+        const base = publications.get(basePublicationId);
+        if (!base) return res.status(404).json({ error: 'Base publication not found.' });
+        staged = publications.stage({
+          artifactId,
+          projectId: artifact.projectId,
+          action,
+          basePublicationId,
+          format: base.format,
+          title: artifact.title,
+          purpose: 'Prepared directly from the generated-document reader.',
+        });
+      } else {
+        const format = req.body.format;
+        if (format !== 'md' && format !== 'docx') {
+          return res.status(400).json({ error: 'format must be md or docx for a new copy.' });
+        }
+        const targetFolder = typeof req.body.targetFolder === 'string' ? req.body.targetFolder.trim() : '';
+        const serverRelativeUrl = typeof req.body.serverRelativeUrl === 'string' ? req.body.serverRelativeUrl.trim() : '';
+        const siteUrl = typeof req.body.siteUrl === 'string' ? req.body.siteUrl.trim() : '';
+        if (Boolean(targetFolder) === Boolean(serverRelativeUrl)) {
+          return res.status(400).json({ error: 'Provide exactly one of targetFolder or serverRelativeUrl.' });
+        }
+        staged = publications.stage({
+          artifactId,
+          projectId: artifact.projectId,
+          action,
+          format,
+          title: artifact.title,
+          ...(targetFolder ? { targetFolder } : {}),
+          ...(serverRelativeUrl ? { serverRelativeUrl } : {}),
+          ...(siteUrl ? { siteUrl } : {}),
+          purpose: 'Prepared directly from the generated-document reader.',
+        });
+      }
+      const publicationState = publicationView(artifact);
+      return res.status(staged.idempotent ? 200 : 201).json({
+        result: {
+          publicationId: staged.publication.publicationId,
+          pendingEditId: staged.pendingEdit.id,
+          status: staged.publication.status,
+          action: staged.publication.action,
+          basePublicationId: staged.publication.basePublicationId,
+          format: staged.publication.format,
+          docKey: staged.publication.docKey,
+          serverRelativeUrl: staged.publication.serverRelativeUrl,
+          idempotent: staged.idempotent,
+          replacesPublicationIds: staged.replacesPublicationIds,
+        },
+        publicationState,
+      });
+    } catch (error) {
+      return res.status(409).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   router.delete('/product-documents/:artifactId', (req: Request, res: Response) => {
     const service = deps.productDocumentService;
     if (!service) return res.status(503).json({ error: 'Product-document service is not available.' });
@@ -413,9 +577,12 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     try {
       const artifact = service.getArtifact(artifactId);
       if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
+      const chainPublications = deps.productDocumentPublications?.listByChain(artifactId) ?? [];
       return res.json({
         artifact: publicArtifact(artifact),
-        publications: deps.productDocumentPublications?.listByChain(artifactId) ?? [],
+        publications: chainPublications,
+        publicationState: publicationView(artifact),
+        publicationDestinationDefault: publicationDestinationDefault(),
       });
     } catch (error) {
       return handleError(res, error);

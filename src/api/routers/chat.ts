@@ -278,6 +278,21 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
 
+  const projectScope = (() => {
+    const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
+    const suppliedTitle = typeof body.projectTitle === 'string' ? body.projectTitle.replace(/\s+/g, ' ').trim() : '';
+    if (!projectId || !suppliedTitle || !deps.db) return null;
+    const project = deps.db.prepare("SELECT id, title, status FROM projects WHERE id = ? AND status IN ('active','paused')").get(projectId) as
+      | { id: string; title: string; status: string }
+      | undefined;
+    if (!project) return null;
+    const canonicalTitle = project.title.replace(/\s+/g, ' ').trim();
+    const expectedSeed = `About project ${canonicalTitle} (${project.id}):`;
+    return suppliedTitle === canonicalTitle && message.startsWith(expectedSeed)
+      ? { projectId: project.id, source: 'project_scope_chip' as const }
+      : null;
+  })();
+
     // SSE streaming mode
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -954,7 +969,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }, 10_000);
             try {
               const settled = await Promise.all(sanitizedToolCalls.map((tc: any) =>
-                toolExecutor.executeTool(tc as any, { currentUserMessage: message, callerKind: 'interactive' })
+                toolExecutor.executeTool(tc as any, {
+                  currentUserMessage: message,
+                  callerKind: 'interactive',
+                  ...(projectScope ? {
+                    authoritativeProjectIds: [projectScope.projectId],
+                    projectContextSource: projectScope.source,
+                  } : {}),
+                })
                   .catch((error: any) => ({ content: `Error: ${error?.message ?? String(error)}` }))));
               for (const [index, tc] of sanitizedToolCalls.entries()) {
                 toolResults.push({ tc, result: settled[index] });
@@ -1035,6 +1057,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 result = await toolExecutor.executeTool(tc as any, {
                   currentUserMessage: message,
                   callerKind: 'interactive',
+                  ...(projectScope ? {
+                    authoritativeProjectIds: [projectScope.projectId],
+                    projectContextSource: projectScope.source,
+                  } : {}),
                 });
               } finally {
                 if (blockingKeepalive) clearInterval(blockingKeepalive);

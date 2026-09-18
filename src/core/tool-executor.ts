@@ -33,6 +33,7 @@ import type { ContentStore } from './content-store.js';
 import type { BrowserHandsService } from './browser-hands.js';
 import type { VisualAssetRegistry } from './visual-assets.js';
 import type { VisualInspector } from './visual-inspector.js';
+import type { ProjectArtifactService } from './project-artifacts.js';
 import type { ToolImageEvidence } from './vision-payload.js';
 
 
@@ -57,6 +58,9 @@ export interface ToolExecutionContext {
   /** Exact owner turn, supplied by the server rather than the model. */
   currentUserMessage?: string;
   callerKind?: 'interactive' | 'background';
+  /** Server-validated visible project scope; never parsed from model prose or tool args. */
+  authoritativeProjectIds?: string[];
+  projectContextSource?: 'project_scope_chip' | 'background_project_job';
 }
 
 export interface ToolExecutor {
@@ -228,6 +232,7 @@ export function createToolExecutor(
     browserHands?: BrowserHandsService;
     visualAssets?: VisualAssetRegistry;
     visualInspector?: VisualInspector;
+    projectArtifacts?: ProjectArtifactService;
   } = {},
 ): ToolExecutor {
   const brainStore = extras.brainStore;
@@ -240,6 +245,7 @@ export function createToolExecutor(
   const browserHands = extras.browserHands;
   const visualAssets = extras.visualAssets;
   const visualInspector = extras.visualInspector;
+  const projectArtifacts = extras.projectArtifacts;
   const API_BASE = `http://localhost:${process.env.PPT_PORT || 7778}/api`;
   const normalizeTaskText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -439,6 +445,30 @@ export function createToolExecutor(
       if (action === 'update') return workspaceApi(path, 'PATCH', args);
       if (action === 'delete') return workspaceApi(path, 'DELETE', args);
       return workspaceApi(`${path}/${action}`, 'POST', args);
+    },
+
+    assign_project_artifact: (args) => {
+      if (!projectArtifacts) return 'Error: project artifact service unavailable';
+      const intentError = requireOwnerRequested(args, 'attach this HTML artifact to the selected project');
+      if (intentError) return intentError;
+      const filePath = String(args.filePath ?? '').trim();
+      const projectId = String(args.projectId ?? '').trim();
+      if (!filePath || !projectId) return 'Error: filePath and projectId are required';
+      try {
+        const registered = projectArtifacts.registerFile(filePath);
+        if (!registered) return 'Error: filePath must identify an existing contained BotBoy HTML/HTM file or a previously recorded Harmony artifact';
+        const artifact = projectArtifacts.assign(registered.id, projectId, registered.version);
+        return JSON.stringify({
+          ok: true,
+          artifactId: artifact.id,
+          projectId: artifact.projectId,
+          fileName: artifact.fileName,
+          localUrl: artifact.local.url,
+          nextAction: 'Open the project Artifacts tab to review the local preview and Harmony history.',
+        });
+      } catch (error: any) {
+        return `Error: ${error?.message ?? error}`;
+      }
     },
 
     manage_page_layout: async (args) => {
@@ -1432,6 +1462,7 @@ export function createToolExecutor(
             versionId: asset.versionId,
             originalSha256: asset.sha256,
             originalUrl: asset.originalUrl,
+            artifactLinked: projectArtifacts?.linkVisualByUrl(String(receipt.url || ''), asset.versionId) === true,
             modelInspection: 'Pixels are stored locally and not inserted into the main prompt. Call inspect_visual_assets with this assetId and the exact visual question.',
           };
         } catch (error: any) {
@@ -1761,7 +1792,7 @@ export function createToolExecutor(
       }, null, 1);
     },
 
-    publish_static_artifact_to_harmony: async (args) => {
+    publish_static_artifact_to_harmony: async (args, context: ToolExecutionContext = {}) => {
       if (!dashboardPublisher) return 'Error: dashboard publisher unavailable';
       if (args.dryRun !== true) {
         const intentError = requireOwnerRequested(args, 'publish this static artifact to Harmony');
@@ -1778,7 +1809,28 @@ export function createToolExecutor(
           ...(args.resumeAttemptId ? { resumeAttemptId: String(args.resumeAttemptId) } : {}),
           verifyExisting: args.verifyExisting === true,
         });
-        return { content: JSON.stringify(result, null, 1), isError: !result.ok };
+        const artifact = projectArtifacts?.registerFile(
+          result.sourcePath,
+          context.authoritativeProjectIds || [],
+          'explicit_context',
+        ) ?? null;
+        return {
+          content: JSON.stringify({
+            ...result,
+            ...(artifact ? {
+              artifact: {
+                id: artifact.id,
+                projectId: artifact.projectId,
+                assignment: artifact.assignment,
+                assignmentRequired: artifact.assignmentRequired,
+                nextAction: artifact.assignmentRequired
+                  ? 'Ask the owner which project should own this HTML artifact, or leave it unassigned.'
+                  : 'The HTML artifact and Harmony history are available in the owning project Artifacts tab.',
+              },
+            } : {}),
+          }, null, 1),
+          isError: !result.ok,
+        };
       } catch (error: any) {
         return `Error: ${error?.message ?? error}`;
       }
@@ -2299,9 +2351,33 @@ export function createToolExecutor(
       }
     },
 
-    write_file: (args) => {
+    write_file: (args, context: ToolExecutionContext = {}) => {
       const filesDir = `${os.homedir()}/.personal-productivity-tracker/files`;
-      return writeFileHandler(filesDir, args);
+      const output = writeFileHandler(filesDir, args);
+      if (!projectArtifacts || output.startsWith('Error:')) return output;
+      try {
+        const receipt = JSON.parse(output);
+        const artifact = projectArtifacts.registerFile(
+          String(receipt.path || ''),
+          context.authoritativeProjectIds || [],
+          'explicit_context',
+        );
+        if (!artifact) return output;
+        return JSON.stringify({
+          ...receipt,
+          artifact: {
+            id: artifact.id,
+            projectId: artifact.projectId,
+            assignment: artifact.assignment,
+            assignmentRequired: artifact.assignmentRequired,
+            nextAction: artifact.assignmentRequired
+              ? 'Ask the owner which project should own this HTML artifact, or leave it unassigned.'
+              : 'The HTML artifact is available in the owning project Artifacts tab.',
+          },
+        });
+      } catch {
+        return output;
+      }
     },
 
     read_file: (args) => {

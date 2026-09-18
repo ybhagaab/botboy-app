@@ -5,6 +5,7 @@ import {
   boundedDocumentScopeLabel,
   buildDocumentLibraryView,
   buildDocumentReviewModel,
+  documentChainExpansionState,
   groupDocumentChains,
   loadedDocumentRevisionLabel,
   shouldCollapseLibraryForReview,
@@ -189,7 +190,28 @@ describe('generated-document reading-first view model', () => {
     expect(source).toContain('data-action="documents-save-revision"');
     expect(source).toContain('data-action="documents-set-project"');
     expect(source).toContain('data-document-project-assignment');
-    expect(source).toContain('publish_product_document_to_sharepoint');
+    expect(source).toContain('data-action="documents-publication-toggle"');
+    expect(source).toContain('/product-documents/${encodeURIComponent(artifactId)}/publications');
+    expect(source).toContain('publicationBusy: new Set()');
+    expect(source).toContain('state.documents.publicationBusy.delete(operationKey)');
+    expect(source).toContain('refreshDocumentPublicationSurfaces(artifactId, projectId)');
+    expect(source).not.toContain('publicationRequestToken');
+    const applyPublicationStart = source.indexOf('async function applyDocumentPublication');
+    const publicationRendererStart = source.indexOf('function renderDocumentLibraryRows', applyPublicationStart);
+    const applyPublicationSource = source.slice(applyPublicationStart, publicationRendererStart);
+    expect(applyPublicationSource.indexOf('await refreshDocumentPublicationSurfaces(artifactId, projectId)'))
+      .toBeLessThan(applyPublicationSource.indexOf('if (requestError)'));
+    expect(applyPublicationSource).toContain('state.documents.publicationBusy.delete(operationKey)');
+    expect(source).toContain('documents:publication:${attr(artifact.artifactId)}');
+    expect(source).toContain('aria-labelledby="document-publication-summary-label"');
+    expect(source).toContain('id="document-publication-dialog"');
+    expect(source).toContain('aria-labelledby="document-publication-heading"');
+    expect(source).toContain('aria-describedby="document-publication-description"');
+    expect(source).toContain('aria-haspopup="dialog"');
+    expect(source).toContain('data-action="documents-publication-close"');
+    expect(source).toContain('syncDocumentPublicationDialog(document, state.documents)');
+    expect(source).toContain('aria-pressed="${updateMode ?');
+    expect(source).not.toContain('publish_product_document_to_sharepoint');
     expect(source).toContain('Saving never overwrites this version; it creates a new linked one.');
     expect(source).toContain('data-action="documents-delete"');
     expect(source).toContain('window.confirm(`Delete "${title}"?');
@@ -213,6 +235,19 @@ describe('generated-document reading-first view model', () => {
     expect(css).toMatch(/\.documents-shell \.document-detail-header \{[^}]*padding:10px 16px 8px;/);
     expect(css).toMatch(/\.documents-shell \.document-rendered \{[^}]*width:min\(100%,900px\);[^}]*font-size:15\.5px;/);
     expect(css).toMatch(/\.documents-shell\.document-focus \.document-rendered \{[^}]*width:min\(100%,980px\);[^}]*font-size:17px;/);
+    expect(css).toMatch(/\.document-publication-surface \{[^}]*flex:0 0 auto;/);
+    expect(css).toContain('grid-template-columns:minmax(0,1fr) 46px');
+    expect(css).toContain('.document-chain-history>li::after');
+    expect(css).toContain('.document-chain-history>li:has(.document-row.active)::after');
+    expect(css).toContain('.document-publication-overlay');
+    expect(css).toContain('.document-publication-drawer');
+    expect(css).toContain('.document-publication-drawer-header');
+    expect(css).toContain('@media(max-width:820px)');
+    expect(css).not.toContain('.document-detail-pane:has(.document-technical-details[open]):has(.document-publication-surface.is-open)');
+    expect(css).toMatch(/\.document-publication-section-title \{[^}]*display:grid;[^}]*gap:3px;/);
+    expect(css).toContain('.document-publication-choice:has(input:checked)');
+    expect(css).toContain('.document-publication-overlay::backdrop');
+    expect(css).toContain('@media(max-width:560px)');
     expect(css).toContain('@media(prefers-reduced-motion:reduce)');
   });
 });

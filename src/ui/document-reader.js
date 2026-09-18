@@ -2,8 +2,13 @@ const RECENT = 'recent';
 const TITLE = 'title';
 const STATUS = 'status';
 
+function compareDocumentRecent(left, right) {
+  return String(right?.createdAt || '').localeCompare(String(left?.createdAt || ''))
+    || String(right?.artifactId || '').localeCompare(String(left?.artifactId || ''));
+}
+
 function compareRecent(left, right) {
-  return String(right?.head?.createdAt || '').localeCompare(String(left?.head?.createdAt || ''));
+  return compareDocumentRecent(left?.head, right?.head);
 }
 
 function compareTitle(left, right) {
@@ -59,8 +64,15 @@ export function groupDocumentChains(items = []) {
       members.push(current);
       for (const child of childrenOf.get(current.artifactId) || []) stack.push(child);
     }
-    members.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
-    return { head: members[0], older: members.slice(1), members };
+    members.sort(compareDocumentRecent);
+    return {
+      chainKey: `loaded:${root.artifactId}`,
+      root,
+      head: members[0],
+      older: members.slice(1),
+      members,
+      hasUnloadedParent: Boolean(root.parentArtifactId && !byId.has(root.parentArtifactId)),
+    };
   });
   chains.sort(compareRecent);
   return chains;
@@ -79,6 +91,17 @@ export function buildDocumentLibraryView(items = [], { query = '', sort = RECENT
     }) || compareTitle(left, right));
   } else chains.sort(compareRecent);
   return chains;
+}
+
+export function documentChainExpansionState(chains = [], selectedArtifactId = '', overrides = new Map()) {
+  const selectedChain = selectedArtifactId
+    ? chains.find(chain => chain.members.some(member => member.artifactId === selectedArtifactId))
+    : null;
+  const autoKey = selectedChain?.chainKey || (!selectedArtifactId ? chains[0]?.chainKey : null);
+  return new Map(chains.map(chain => [
+    chain.chainKey,
+    overrides.has(chain.chainKey) ? Boolean(overrides.get(chain.chainKey)) : chain.chainKey === autoKey,
+  ]));
 }
 
 export function loadedDocumentRevisionLabel(chains, artifactId, parentArtifactId = null) {

@@ -524,6 +524,48 @@ export function createPipelineRouter(deps: RouterDeps): Router {
     });
   });
 
+  router.get('/projects/:id/artifacts', (req: Request, res: Response) => {
+    const service = deps.projectArtifacts;
+    if (!service) return res.status(503).json({ error: 'project artifacts not available' });
+    const projectId = paramStr(req.params.id);
+    try {
+      const artifacts = service.listForProject(projectId);
+      res.json({ artifacts, count: artifacts.length });
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  router.get('/artifacts/unassigned', (_req: Request, res: Response) => {
+    const service = deps.projectArtifacts;
+    if (!service) return res.status(503).json({ error: 'project artifacts not available' });
+    try {
+      const artifacts = service.listUnassigned();
+      res.json({ artifacts, count: artifacts.length });
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message ?? String(error) });
+    }
+  });
+
+  router.patch('/artifacts/:artifactId/assignment', (req: Request, res: Response) => {
+    const service = deps.projectArtifacts;
+    if (!service) return res.status(503).json({ error: 'project artifacts not available' });
+    if (!isSameOriginMutation(req)) return res.status(403).json({ error: 'Cross-origin artifact mutation rejected' });
+    const artifactId = paramStr(req.params.artifactId);
+    const projectId = req.body?.projectId === null ? null : String(req.body?.projectId ?? '').trim();
+    const expectedVersion = Number(req.body?.expectedVersion);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+      return res.status(400).json({ error: 'expectedVersion must be a positive integer' });
+    }
+    if (projectId === '') return res.status(400).json({ error: 'projectId must be a project id or null' });
+    try {
+      res.json({ artifact: service.assign(artifactId, projectId, expectedVersion) });
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      res.status(/changed|missing|archived|unavailable/i.test(message) ? 409 : 400).json({ error: message });
+    }
+  });
+
   // ── Related projects: owner veto on a detected sibling link ──
   // Dismissal survives recomputes for as long as the pair keeps being
   // detected; restore undoes it. Symmetric — either side may be passed first.

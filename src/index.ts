@@ -31,6 +31,7 @@ import { createToolExecutor } from './core/tool-executor.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
 import { createVisualAssetRegistry } from './core/visual-assets.js';
 import { createVisualInspector } from './core/visual-inspector.js';
+import { createProjectArtifactService } from './core/project-artifacts.js';
 import { createEtlToolCall } from './core/etl-adhoc.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
@@ -412,6 +413,9 @@ async function main() {
   // the executor so uploads/screenshots can register IDs atomically.
   const visualAssets = createVisualAssetRegistry(db);
   const visualInspector = createVisualInspector({ db, registry: visualAssets, llmClient });
+  const projectArtifacts = createProjectArtifactService({ db });
+  const discoveredArtifacts = projectArtifacts.discoverExisting();
+  console.log(`✅ Project artifacts indexed (${discoveredArtifacts} HTML path observations)`);
   // ETL onboarding (etl-analytics A3): background preset generation over the
   // user's own Datanet group. Shares the Sentry-self-healing ETL call from
   // etl-adhoc and the chat LLM client for classification/synthesis; exposed
@@ -439,6 +443,7 @@ async function main() {
     browserHands,
     visualAssets,
     visualInspector,
+    projectArtifacts,
   });
   const toolExecutor = withProductDocumentChatTools(
     baseToolExecutor,
@@ -1050,6 +1055,7 @@ async function main() {
     etlOnboarding,
     visualAssets,
     visualInspector,
+    projectArtifacts,
   };
   app.use('/api', createRouter(routerDeps));
 

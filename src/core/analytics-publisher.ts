@@ -590,6 +590,7 @@ export function createDashboardPublisherService(options: {
       row = db.prepare('SELECT * FROM static_artifact_publications WHERE id = ?').get(clean(input.resumeAttemptId, 'resumeAttemptId', 128, true));
       if (!row) throw new Error(`Static publish attempt ${input.resumeAttemptId} not found`);
       if (
+        row.source_path !== bundle.sourcePath ||
         row.manifest_sha256 !== bundle.manifestSha256 || row.slug !== bundle.slug ||
         row.app_name !== appName || row.stage !== config.harmony.stage || row.visibility !== config.harmony.visibility
       ) {
@@ -598,10 +599,10 @@ export function createDashboardPublisherService(options: {
     } else {
       row = db.prepare(`
         SELECT * FROM static_artifact_publications
-        WHERE slug = ? AND manifest_sha256 = ? AND app_name = ? AND stage = ? AND visibility = ?
+        WHERE source_path = ? AND slug = ? AND manifest_sha256 = ? AND app_name = ? AND stage = ? AND visibility = ?
           AND (deployed = 1 OR phase = 'published')
         ORDER BY datetime(created_at) DESC, rowid DESC LIMIT 1
-      `).get(bundle.slug, bundle.manifestSha256, appName, config.harmony.stage, config.harmony.visibility);
+      `).get(bundle.sourcePath, bundle.slug, bundle.manifestSha256, appName, config.harmony.stage, config.harmony.visibility);
     }
     if (row?.phase === 'published' && row.content_verified === 1 && row.visibility_converged === 1) {
       return mapStaticArtifactPublication(row);

@@ -229,6 +229,22 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
       },
     },
   },
+  assign_project_artifact: {
+    type: 'function',
+    function: {
+      name: 'assign_project_artifact',
+      description: 'Attach an existing BotBoy HTML artifact to one exact canonical project after the owner explicitly chooses that project. This does not create, edit, or publish the artifact. Requires ownerRequested=true.',
+      parameters: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          filePath: { type: 'string', description: 'Exact HTML path returned by write_file or Harmony publish.' },
+          projectId: { type: 'string', description: 'Exact active/paused project id.' },
+          ownerRequested: { type: 'boolean', description: 'True only after the owner explicitly selected the project for this artifact.' },
+        },
+        required: ['filePath', 'projectId', 'ownerRequested'],
+      },
+    },
+  },
   manage_page_layout: {
     type: 'function',
     function: {
@@ -424,7 +440,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
 
 const ROLE_TOOLS: Record<AgentRole, string[]> = {
   orchestrator: ['query_db', 'execute_db', 'list_nodes', 'get_node_items', 'assign_item', 'create_node', 'search_items', 'send_chat_message', 'enrich_item', 'run_command', 'create_item', 'update_item', 'write_file', 'read_file'],
-  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
+  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'assign_project_artifact', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
   classifier: [], // no tools — just returns JSON
   enricher: ['enrich_item', 'query_db'],
   organizer: ['list_nodes', 'get_node_items', 'create_node', 'assign_item'],
