@@ -66,8 +66,10 @@ optional connections, troubleshooting, and unusual recovery cases.
 2. deletes the downloaded credential attachment after a successful import;
 3. selects the authenticated team gateway and Terra model automatically;
 4. builds BotBoy when the build is missing or stale;
-5. starts the local dashboard at `http://localhost:7778`; and
-6. best-effort installs `/Applications/BotBoy.app` when it is missing.
+5. starts a provisional local boot page while connections and stores initialize;
+6. opens `http://localhost:7778` only after the final dashboard endpoint is
+   ready and the server remains alive through the window launch; and
+7. best-effort installs `/Applications/BotBoy.app` when it is missing.
 
 The gateway deployment name still contains `luna`; that is infrastructure
 naming, not the selected default model. The default model is Terra.
@@ -166,6 +168,12 @@ BotBoy's runtime log is `/tmp/ppt.log`.
 ./start.sh                # start again
 ```
 
+A normal Terminal start returns to the prompt only after printing
+`✅ Dashboard ready: http://localhost:7778`. If startup fails, BotBoy does
+not open a new dashboard window, exits nonzero, and names `--doctor` plus
+`/tmp/ppt.log` as the next evidence; repeated refreshes cannot repair a
+stopped local server.
+
 Doctor never prints the credential or access token, but its log tail can
 contain internal titles, paths, or error context. Review/redact it before
 sharing. Running doctor can initialize the debug browser and import a pending
@@ -179,6 +187,7 @@ credential attachment before producing the report.
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
 | Chat returns HTTP 401 | Ask the owner to check gateway access. |
 | Dashboard does not open | Confirm Google Chrome is installed and inspect `/tmp/ppt.log`. |
+| Chrome shows `ERR_CONNECTION_REFUSED` | Do not keep refreshing. Run `./start.sh --update`, then `./start.sh`; if startup reports failure, run `./start.sh --doctor` and share only the reviewed relevant output. |
 | BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
 | A connection card is missing | Run `./start.sh --update`, then reopen BotBoy. |
 

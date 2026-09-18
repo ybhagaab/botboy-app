@@ -89,8 +89,11 @@ npm install
 ```
 
 Allow a few minutes on first run. BotBoy imports the credential attachment
-(`.env` or owner-issued ZIP), builds itself, opens the dashboard, and attempts
-to install `BotBoy.app` in Applications. Detailed connections and support
+(`.env` or owner-issued ZIP), builds itself, waits for the final dashboard to
+be usable, opens it, and attempts to install `BotBoy.app` in Applications. A
+successful Terminal start ends with `✅ Dashboard ready:`. If startup instead
+reports a failure, do not keep refreshing Chrome—run `./start.sh --doctor` and
+review the named `/tmp/ppt.log` evidence. Detailed connections and support
 steps are in **[docs/TEAMMATE_SETUP.md](docs/TEAMMATE_SETUP.md)**.
 
 ## Update

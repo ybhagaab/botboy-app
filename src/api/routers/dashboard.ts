@@ -162,6 +162,9 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
       analyticsVersion: currentAnalyticsVersion(),
       documentsVersion: currentDocumentsVersion(),
       bootId: BOOT_ID,
+      // Non-secret local receipt used by start.sh to prove that readiness came
+      // from the exact child it spawned, not another listener on the port.
+      processId: process.pid,
       uiVersion: computeUiAssetsVersion(),
       terminal: terminalSession ? { id: terminalSession.id, status: terminalSession.status } : null,
     });

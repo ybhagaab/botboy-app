@@ -1076,14 +1076,9 @@ async function main() {
     res.sendFile(path.join(uiDir, 'index.html'));
   });
 
-  // Initialization is complete — swap the boot handler for the real app on
-  // the already-bound listener. Open boot pages reload themselves into the
-  // dashboard on their next poll.
-  httpServer.removeListener('request', bootHandler);
-  httpServer.on('request', app);
-  analyticsScheduler.start();
-  console.log('✅ Durable analytics scheduler initialized');
-  console.log(`✅ API server running on http://${HOST}:${PORT} — dashboard ready in ${((Date.now() - bootStartedAt) / 1000).toFixed(1)}s`);
+  // Keep the provisional boot handler installed while startup work that may
+  // still reject is running. `/api/dashboard/version` must remain 503 until
+  // reaching this function's actual completion boundary.
 
   // Start monitors
   await browserMonitor.start();
@@ -1109,6 +1104,15 @@ async function main() {
     console.log('✅ Midway sentinel active (auto re-auth flow for session-backed MCPs)');
   }
 
+  analyticsScheduler.start();
+  console.log('✅ Durable analytics scheduler initialized');
+
+  // Every startup operation above that is allowed to abort `main` has now
+  // succeeded. Swap the listener last: this turns the version endpoint from
+  // provisional 503 into the launcher's receipt-backed final-ready signal.
+  httpServer.removeListener('request', bootHandler);
+  httpServer.on('request', app);
+  console.log(`✅ API server running on http://${HOST}:${PORT} — dashboard ready in ${((Date.now() - bootStartedAt) / 1000).toFixed(1)}s`);
   console.log(`🔍 Tracking your activity. Dashboard: http://${HOST}:${PORT}`);
 
   // Use one guarded path for both terminal interrupts and process termination.

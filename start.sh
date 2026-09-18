@@ -166,8 +166,32 @@ fi
 PATH="$(dirname "$NODE"):$PATH"
 export PATH
 
-server_is_up() {
-  curl -s -o /dev/null -w "%{http_code}" http://localhost:7778/ 2>/dev/null | grep -q 200
+server_is_ready() {
+  local expected_pid="${1:-}"
+  local payload=""
+  local ready_process_id=""
+  # `/` is intentionally 200 during provisional boot so an already-open tab
+  # can show the self-refreshing startup page. Only the version API proves the
+  # real app handler is installed and startup reached its completion boundary.
+  payload=$(curl -fsS --max-time 1 \
+    http://localhost:7778/api/dashboard/version 2>/dev/null) || return 1
+  [ -z "$expected_pid" ] && return 0
+  # The version receipt carries a non-secret process id. Parse with the same
+  # Node runtime we launch so a competing listener can never satisfy this
+  # child's readiness check.
+  ready_process_id=$(printf '%s' "$payload" \
+    | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(String(JSON.parse(d).processId??''))}catch{process.exitCode=1}})" \
+      2>/dev/null) || return 1
+  [ "$ready_process_id" = "$expected_pid" ]
+}
+
+startup_target_is_ready() {
+  local expected_pid="${1:-}"
+  if [ -n "$expected_pid" ] && ! kill -0 "$expected_pid" 2>/dev/null; then
+    return 1
+  fi
+  server_is_ready "$expected_pid" || return 1
+  [ -z "$expected_pid" ] || kill -0 "$expected_pid" 2>/dev/null
 }
 
 # 0. Ensure AEA native messaging host is in debug profile (needed for Midway SSO)
@@ -202,7 +226,14 @@ bash "$PROJ_DIR/scripts/import-credentials.sh" 2>&1 | tee -a "$LOG_FILE" || true
 
 # Load only inference-related local settings before selecting provider defaults.
 # Do not source this file: values are parsed as data and only allowlisted keys
-# are exported. A non-empty value supplied by the launching shell always wins.
+# are exported. OAuth shell overrides are atomic: either both keys come from
+# the launching shell or neither does, so a stored key can never silently mate
+# with a one-key override.
+SHELL_OAUTH_HAS_ID=0
+SHELL_OAUTH_HAS_SECRET=0
+[ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] && SHELL_OAUTH_HAS_ID=1
+[ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ] && SHELL_OAUTH_HAS_SECRET=1
+
 load_local_runtime_settings() {
   local env_file="$HOME/.personal-productivity-tracker/.env"
   local line=""
@@ -221,6 +252,13 @@ load_local_runtime_settings() {
           continue
           ;;
       esac
+      case "$key" in
+        BOTBOY_INFERENCE_OAUTH_CLIENT_ID|BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET)
+          if [ "$SHELL_OAUTH_HAS_ID" = "1" ] || [ "$SHELL_OAUTH_HAS_SECRET" = "1" ]; then
+            continue
+          fi
+          ;;
+      esac
 
       value="${value#"${value%%[![:space:]]*}"}"
       value="${value%"${value##*[![:space:]]}"}"
@@ -233,6 +271,26 @@ load_local_runtime_settings() {
 }
 load_local_runtime_settings
 unset -f load_local_runtime_settings
+
+validate_oauth_pair() {
+  local has_id=0
+  local has_secret=0
+  if [ "$SHELL_OAUTH_HAS_ID" != "$SHELL_OAUTH_HAS_SECRET" ]; then
+    echo "❌ Incomplete BotBoy OAuth shell override — set both client id and secret, or unset both."
+    echo "    Stored credentials are not mixed with a one-key shell override."
+    echo "    Need details? Run: ./start.sh --doctor"
+    return 1
+  fi
+  [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] && has_id=1
+  [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ] && has_secret=1
+  if [ "$has_id" != "$has_secret" ]; then
+    echo "❌ Incomplete BotBoy OAuth credentials — client id and secret must both be present."
+    echo "    Download the owner-issued credential attachment again, then re-run ./start.sh."
+    echo "    Need details? Run: ./start.sh --doctor"
+    return 1
+  fi
+  return 0
+}
 
 # Shared inference provider. All generative paths (chat, rolling summaries,
 # librarian routing, project brains, reconciliation, and organization) use the
@@ -343,6 +401,13 @@ open_dashboard_window() {
   # open tab whenever the server restarts — a live window is never older
   # than the running server.
   local mode="${1:-fresh}"
+  local expected_pid="${2:-}"
+  if ! startup_target_is_ready "$expected_pid"; then
+    echo "❌ BotBoy is not ready — dashboard window was not opened."
+    echo "    Run: ./start.sh --doctor"
+    echo "    Runtime log: $LOG_FILE"
+    return 1
+  fi
   # Tolerate a still-warming Chrome: retry the DevTools endpoint briefly
   # rather than deciding from a single probe.
   local devtools_up=1
@@ -362,6 +427,11 @@ open_dashboard_window() {
       # Target.activateTarget: raises the existing app window, page state
       # (route, scroll, drafts) intact.
       curl -s --max-time 3 "http://127.0.0.1:9222/json/activate/$DASH_TARGET" >/dev/null
+      if ! startup_target_is_ready "$expected_pid"; then
+        echo "❌ BotBoy stopped before its dashboard window could be focused."
+        echo "    Run: ./start.sh --doctor"
+        return 1
+      fi
       echo "✅ Dashboard window focused"
       return 0
     fi
@@ -378,22 +448,98 @@ open_dashboard_window() {
       curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$DASH_TARGET" >/dev/null
       sleep 1
     fi
+    # Snapshot every existing page target after the old dashboard is closed.
+    # The singleton Chrome process creates one new page for --app; retaining
+    # its new ID lets a failed settle close exactly this launch artifact even
+    # if its URL has already become chrome-error://.
+    PRELAUNCH_TARGET_IDS=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
+      | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).filter(x=>x.type==='page').map(x=>String(x.id||'')).filter(Boolean).join('\n'))}catch{}})" 2>/dev/null)
     "$CHROME" \
       --user-data-dir="$DEBUG_PROFILE" \
       --app="$REOPEN_URL" >/dev/null 2>&1 &
+    NEW_DASH_TARGET=""
+    for _ in $(seq 1 10); do
+      NEW_DASH_TARGET=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
+        | BOTBOY_PRELAUNCH_TARGET_IDS="$PRELAUNCH_TARGET_IDS" "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const old=new Set(String(process.env.BOTBOY_PRELAUNCH_TARGET_IDS||'').split('\n').filter(Boolean));const t=JSON.parse(d).find(x=>x.type==='page'&&x.id&&!old.has(String(x.id)));process.stdout.write(String(t?.id||''))}catch{}})" 2>/dev/null)
+      [ -n "$NEW_DASH_TARGET" ] && break
+      sleep 0.2
+    done
+    if [ -z "$NEW_DASH_TARGET" ]; then
+      echo "❌ Chrome did not create a dashboard window."
+      echo "    Run: ./start.sh --doctor"
+      return 1
+    fi
     sleep 2
-    echo "✅ Dashboard window ready: $REOPEN_URL"
+    if startup_target_is_ready "$expected_pid"; then
+      echo "✅ Dashboard ready: $REOPEN_URL"
+    else
+      curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$NEW_DASH_TARGET" >/dev/null
+      echo "❌ BotBoy stopped before the dashboard window became usable."
+      echo "    Run: ./start.sh --doctor"
+      echo "    Runtime log: $LOG_FILE"
+      return 1
+    fi
   else
-    echo "⚠️  Debug Chrome not reachable on :9222 — open http://localhost:7778 manually"
+    if ! startup_target_is_ready "$expected_pid"; then
+      echo "❌ BotBoy stopped while waiting for the dashboard window."
+      echo "    Run: ./start.sh --doctor"
+      echo "    Runtime log: $LOG_FILE"
+      return 1
+    fi
+    echo "✅ Dashboard ready: http://localhost:7778 (open it manually)"
+    echo "⚠️  Debug Chrome not reachable on :9222 — automatic window launch was skipped"
   fi
 }
 
 wait_for_server() {
-  for _ in $(seq 1 20); do
-    server_is_up && return 0
-    sleep 1
+  local server_pid="${1:-}"
+  local deadline=$((SECONDS + 90))
+  local child_exited=0
+  local exit_code=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -n "$server_pid" ] && ! kill -0 "$server_pid" 2>/dev/null; then
+      child_exited=1
+      break
+    fi
+    startup_target_is_ready "$server_pid" && return 0
+    if [ -n "$server_pid" ] && ! kill -0 "$server_pid" 2>/dev/null; then
+      child_exited=1
+      break
+    fi
+    [ "$SECONDS" -ge "$deadline" ] || sleep 1
   done
+  if [ "$child_exited" = "1" ]; then
+    if wait "$server_pid" 2>/dev/null; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+    if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$server_pid" ]; then
+      rm -f "$PID_FILE"
+    fi
+    echo "❌ BotBoy exited before the dashboard became ready (exit $exit_code)."
+  else
+    echo "❌ BotBoy did not become ready within about 90 seconds."
+  fi
+  echo "    Run: ./start.sh --doctor"
+  echo "    Runtime log: $LOG_FILE"
   return 1
+}
+
+stop_startup_child() {
+  local server_pid="$1"
+  if kill -0 "$server_pid" 2>/dev/null; then
+    kill -INT "$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 5); do
+      kill -0 "$server_pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$server_pid" 2>/dev/null || true
+  fi
+  wait "$server_pid" 2>/dev/null || true
+  if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$server_pid" ]; then
+    rm -f "$PID_FILE"
+  fi
 }
 
 # Teammate machines run the LLM through the gateway with per-person OAuth
@@ -402,11 +548,10 @@ wait_for_server() {
 # owner debug "BotBoy has no LLM" from a screenshot. Owner machines with any
 # credential source stay silent.
 warn_if_no_llm_credentials() {
-  local env_file="$HOME/.personal-productivity-tracker/.env"
   [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ] && return 0
   [ -n "${BOTBOY_INFERENCE_API_KEY:-}" ] && return 0
-  [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] && return 0
-  if [ -f "$env_file" ] && grep -qE '^(BOTBOY_INFERENCE_OAUTH_CLIENT_ID|AWS_BEARER_TOKEN_BEDROCK|BOTBOY_INFERENCE_API_KEY)=' "$env_file" 2>/dev/null; then
+  if [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] \
+    && [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ]; then
     return 0
   fi
   echo "⚠️  No LLM credentials found — BotBoy will run without chat/synthesis."
@@ -440,7 +585,15 @@ stop_existing_server() {
   pids="$(pgrep -f 'node dist/index.js' 2>/dev/null)"
   [ -f "$PID_FILE" ] && pids="$pids $(cat "$PID_FILE" 2>/dev/null)"
   pids="$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
-  [ -z "$pids" ] && return 0
+  local live_pids=""
+  for pid in $pids; do
+    ps -p "$pid" >/dev/null 2>&1 && live_pids="$live_pids $pid"
+  done
+  pids="$(echo "$live_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+  if [ -z "$pids" ]; then
+    rm -f "$PID_FILE"
+    return 0
+  fi
   echo "ℹ️  Taking over from running tracker(s): $(echo "$pids" | tr '\n' ' ')— stopping gracefully"
   for pid in $pids; do kill -INT "$pid" 2>/dev/null; done
   for _ in $(seq 1 15); do
@@ -456,12 +609,17 @@ stop_existing_server() {
       kill -9 "$pid" 2>/dev/null
     fi
   done
+  # Every process represented by this receipt was just handed over. Remove it
+  # now so the replacement path never announces or probes the dead PID twice.
+  rm -f "$PID_FILE"
 }
 
 cd "$PROJ_DIR" || exit 1
 
 if [ "$OPEN_WINDOW_ONLY" = "1" ]; then
-  open_dashboard_window focus
+  if ! open_dashboard_window focus; then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -528,29 +686,33 @@ if [ "$DOCTOR" = "1" ]; then
     echo "homebrew: not installed (optional — the in-app pandoc install needs it; https://brew.sh)"
   fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
-  if [ -f "$DOCTOR_ENV" ] && grep -q '^BOTBOY_INFERENCE_OAUTH_CLIENT_ID=' "$DOCTOR_ENV" 2>/dev/null; then
-    echo "llm-credentials: present"
-    # Live auth probe: mint a token with the stored pair. Prints ONLY the
+  # Diagnose the same effective pair normal startup will use. A partial shell
+  # override is reported directly and never completed from the stored file.
+  DOCTOR_CID="${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}"
+  DOCTOR_SEC="${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}"
+  DOCTOR_TOKEN_URL="${BOTBOY_INFERENCE_OAUTH_TOKEN_URL:-}"
+  if [ "$SHELL_OAUTH_HAS_ID" != "$SHELL_OAUTH_HAS_SECRET" ]; then
+    echo "llm-credentials: INCOMPLETE shell override — set both keys or unset both"
+  elif [ -n "$DOCTOR_CID" ] && [ -n "$DOCTOR_SEC" ]; then
+    echo "llm-credentials: complete effective pair present"
+    # Live auth probe: mint a token with the effective pair. Prints ONLY the
     # HTTP status — never the credentials or the token. This is the line
     # that separates "file imported fine" from "agent not responding":
     #   200 = credentials valid and Cognito reachable
     #   400 = invalid_client — secret wrong/revoked, ask owner to reissue
     #   000 = network problem (VPN/proxy/DNS)
-    DOCTOR_CID=$(grep '^BOTBOY_INFERENCE_OAUTH_CLIENT_ID=' "$DOCTOR_ENV" | head -1 | cut -d= -f2-)
-    DOCTOR_SEC=$(grep '^BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET=' "$DOCTOR_ENV" | head -1 | cut -d= -f2-)
-    DOCTOR_TOKEN_URL=$(grep '^BOTBOY_INFERENCE_OAUTH_TOKEN_URL=' "$DOCTOR_ENV" | head -1 | cut -d= -f2-)
     DOCTOR_TOKEN_URL=${DOCTOR_TOKEN_URL:-https://botboy-luna-603949561274.auth.us-east-1.amazoncognito.com/oauth2/token}
-    if [ -n "$DOCTOR_CID" ] && [ -n "$DOCTOR_SEC" ]; then
-      # Credentials go through a config file descriptor, not argv, so they
-      # never appear in `ps` output.
-      CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-        -K <(printf 'user = "%s:%s"\n' "$DOCTOR_CID" "$DOCTOR_SEC") \
-        -d 'grant_type=client_credentials&scope=botboy-llm/invoke' \
-        "$DOCTOR_TOKEN_URL" 2>/dev/null)
-      echo "llm auth probe: HTTP ${CODE:-000} (200=valid, 400=invalid/revoked — ask owner, 000=network)"
-    fi
+    # Credentials go through a config file descriptor, not argv, so they
+    # never appear in `ps` output.
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -K <(printf 'user = "%s:%s"\n' "$DOCTOR_CID" "$DOCTOR_SEC") \
+      -d 'grant_type=client_credentials&scope=botboy-llm/invoke' \
+      "$DOCTOR_TOKEN_URL" 2>/dev/null)
+    echo "llm auth probe: HTTP ${CODE:-000} (200=valid, 400=invalid/revoked — ask owner, 000=network)"
+  elif [ -n "$DOCTOR_CID" ] || [ -n "$DOCTOR_SEC" ]; then
+    echo "llm-credentials: INCOMPLETE — client id and secret must both be present"
   else
-    echo "llm-credentials: missing or incomplete (~/.personal-productivity-tracker/.env)"
+    echo "llm-credentials: missing (~/.personal-productivity-tracker/.env)"
   fi
   PORT_PIDS=$(lsof -ti tcp:7778 -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')
   echo "port 7778 listener: ${PORT_PIDS:-none}"
@@ -561,6 +723,13 @@ if [ "$DOCTOR" = "1" ]; then
   echo "-- last 25 lines of $LOG_FILE --"
   tail -n 25 "$LOG_FILE" 2>/dev/null || echo "(no log file)"
   exit 0
+fi
+
+# Reject a one-key OAuth state before any healthy old process is stopped. The
+# provider treats either key as gateway intent, then exits fatally if its mate
+# is absent; surface the repair directly instead of opening a dead dashboard.
+if ! validate_oauth_pair; then
+  exit 1
 fi
 
 # ── Startup lock: mashing ./start.sh must not race itself ──
@@ -615,8 +784,9 @@ if [ "$FOREGROUND" = "1" ]; then
   # The server runs as a child of THIS script and the script blocks on it, so
   # the launching .app stays alive (dock icon persists) for as long as the
   # tracker runs. Only one server may own port 7778, so an existing instance is
-  # handed over first.
-  server_is_up && stop_existing_server
+  # handed over first. This is unconditional: a provisional or wedged process
+  # may own the port without satisfying the final-ready endpoint.
+  stop_existing_server
 
   "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
@@ -625,10 +795,13 @@ if [ "$FOREGROUND" = "1" ]; then
   # Forward Quit/Ctrl-C to the server so shutdown stays graceful.
   trap 'echo "🔻 BotBoy quitting — stopping tracker (pid $SERVER_PID)" >> "$LOG_FILE"; kill -INT "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; exit 0' TERM INT HUP
 
-  if wait_for_server; then
-    open_dashboard_window
-  else
-    echo "⚠️  Server did not become ready in 20s — see $LOG_FILE"
+  if ! wait_for_server "$SERVER_PID"; then
+    stop_startup_child "$SERVER_PID"
+    exit 1
+  fi
+  if ! open_dashboard_window fresh "$SERVER_PID"; then
+    stop_startup_child "$SERVER_PID"
+    exit 1
   fi
 
   # Startup is done — release the lock now. Foreground mode blocks for the
@@ -649,21 +822,29 @@ fi
 # ── Background mode (CLI default) ──
 # A fresh build with the old server still running would serve last week's
 # code — restart onto the new build.
-if [ -n "$NEED_BUILD" ] && server_is_up; then
+if [ -n "$NEED_BUILD" ] && server_is_ready; then
   echo "ℹ️  Restarting BotBoy on the new build"
   stop_existing_server
 fi
 # 2. Start the tracker server if not already running
-if ! server_is_up; then
-  # The health check failing does NOT mean no process exists: a wedged server
-  # can hold :7778 without answering. Starting on top of it creates headless
-  # zombies (bind fails, monitors keep running). Clear every old instance.
+SERVER_PID=""
+if ! server_is_ready; then
+  # A failed final-ready check does NOT mean no process exists: a wedged or
+  # half-booted server can hold :7778. Clear every old instance before the
+  # replacement starts, then verify this exact child through final readiness.
   stop_existing_server
-  "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
-  wait_for_server
+  nohup "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
+  SERVER_PID=$!
+  echo "$SERVER_PID" > "$PID_FILE"
+  if ! wait_for_server "$SERVER_PID"; then
+    stop_startup_child "$SERVER_PID"
+    exit 1
+  fi
 fi
 
-open_dashboard_window
+if ! open_dashboard_window fresh "$SERVER_PID"; then
+  [ -z "$SERVER_PID" ] || stop_startup_child "$SERVER_PID"
+  exit 1
+fi
 warn_if_no_llm_credentials
 install_app_bundle_if_missing
