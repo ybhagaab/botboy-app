@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
 import type { AcpClient } from './acp-client.js';
 import type { LlmClient, ToolCall } from './llm-client.js';
+import type { LlmUsageContext } from './llm-usage.js';
 import type { ToolExecutor } from './tool-executor.js';
 import { type PromptManager } from './prompt-manager.js';
 import type { NodeManager } from './node-manager.js';
@@ -24,7 +25,11 @@ import {
 export interface AgentOrchestrator {
   processInboxItems(options?: ProcessOptions): Promise<ProcessingResult>;
   processItem(itemId: string): Promise<ProcessingResult>;
-  executeAction(instruction: string, nodeId?: string): Promise<string>;
+  executeAction(
+    instruction: string,
+    nodeId?: string,
+    usageContext?: Pick<LlmUsageContext, 'workload'>,
+  ): Promise<string>;
   getProcessingStatus(): ProcessingStatus;
 }
 
@@ -155,7 +160,12 @@ export function createAgentOrchestrator(
       return result;
     },
 
-    async executeAction(instruction: string, nodeId?: string): Promise<string> {
+    async executeAction(
+      instruction: string,
+      nodeId?: string,
+      usageContext?: Pick<LlmUsageContext, 'workload'>,
+    ): Promise<string> {
+      const workload = usageContext?.workload ?? 'background';
       const nodes = nodeManager.listNodes('active');
       // Same live MCP inventory as the SSE chat route: the agent knows every
       // callable server and tool up front, no discovery round-trip needed.
@@ -209,6 +219,7 @@ Be concise, helpful, proactive. You have full authority.`;
               tools,
               think: i === 0 || documentAuthoringThink,
               ...(documentAuthoringThink ? { reasoningEffort: 'max' as const } : {}),
+              usageContext: { workload },
             };
             let resp;
             try {
@@ -263,8 +274,12 @@ Be concise, helpful, proactive. You have full authority.`;
           }
           return messages.filter(m => m.role === 'assistant' && m.content).pop()?.content || '';
         }
-        // Fallback: simple prompt (no tools)
-        const resp = await acpClient.sendPrompt(systemPrompt + '\n\nUser: ' + userMsg);
+        // Fallback: simple prompt (no tools). Production aliases acpClient to
+        // the same LlmClient, so preserve workload context when that is true.
+        const prompt = systemPrompt + '\n\nUser: ' + userMsg;
+        const resp = llmClient && (acpClient as unknown) === llmClient
+          ? await llmClient.sendPrompt(prompt, { workload })
+          : await acpClient.sendPrompt(prompt);
         return resp.content;
       } catch (e: any) {
         return 'Error: ' + e.message;

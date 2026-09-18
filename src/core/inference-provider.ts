@@ -9,6 +9,7 @@ import {
 } from './llm-client.js';
 import { getBedrockBearerToken, signBedrockRequest } from './aws-sigv4.js';
 import { createOAuthClientCredentialsAuthorizer } from './oauth-authorizer.js';
+import type { LlmUsageService } from './llm-usage.js';
 
 /**
  * Application-level inference provider.
@@ -32,7 +33,7 @@ export interface InferenceProvider {
   readonly apiMode: LlmApiMode;
   readonly maxContextTokens: number;
   readonly localFallbackEnabled: boolean;
-  createClient(): LlmClient;
+  createClient(options?: { usageService?: LlmUsageService }): LlmClient;
 }
 
 interface SharedProviderOptions {
@@ -210,7 +211,7 @@ function provider(
     apiMode: options.apiMode,
     maxContextTokens: options.maxContextTokens,
     localFallbackEnabled: options.localFallback,
-    createClient: () => createLlmClient(config),
+    createClient: (clientOptions = {}) => createLlmClient(config, clientOptions.usageService),
   };
 }
 

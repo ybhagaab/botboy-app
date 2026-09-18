@@ -5,6 +5,8 @@
  * (llm-client / acp-client) behind it.
  */
 
+import type { LlmUsageContext } from './llm-usage.js';
+
 export interface PipelineLlmAuditMetadata {
   provider?: string;
   model?: string;
@@ -34,7 +36,7 @@ export interface PipelineLlm {
 export function adaptSendPrompt(
   client: {
     isAvailable(): boolean;
-    sendPrompt(prompt: string): Promise<{ content: string }>;
+    sendPrompt(prompt: string, usageContext?: LlmUsageContext): Promise<{ content: string }>;
     getActiveEndpoint?(): string;
     getActiveModel?(): string | undefined;
     getContextBudgetTokens?(): number;
@@ -43,7 +45,7 @@ export function adaptSendPrompt(
 ): PipelineLlm {
   return {
     isAvailable: () => client.isAvailable(),
-    complete: async (prompt: string) => (await client.sendPrompt(prompt)).content,
+    complete: async (prompt: string) => (await client.sendPrompt(prompt, { workload: 'background' })).content,
     getContextBudgetTokens: () => client.getContextBudgetTokens?.() ?? 16_000,
     auditMetadata: () => {
       const activeEndpoint = client.getActiveEndpoint?.() ?? metadata.activeEndpoint;

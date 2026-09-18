@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ChatCompletionRequest, LlmClient, PrimaryRequestPreflight } from './llm-client.js';
+import type { LlmUsageWorkload } from './llm-usage.js';
 import { isLlmPayloadTooLargeError } from './llm-client.js';
 import {
   inspectVisualImage,
@@ -216,6 +217,7 @@ function buildReaderRequest(
   question: string,
   units: VisualUnitInput[],
   priorEvidence = '',
+  workload: LlmUsageWorkload = 'interactive',
   correction?: string,
 ): ChatCompletionRequest {
   const ordered = units.map((unit, index) => ({
@@ -247,6 +249,7 @@ function buildReaderRequest(
     maxTokens: MAX_OUTPUT_TOKENS,
     responseFormat: { type: 'json_object' },
     think: false,
+    usageContext: { workload },
   };
 }
 
@@ -292,8 +295,8 @@ export function createVisualInspector(deps: {
   const renditionsDir = path.join(rootDir, 'renditions');
   fs.mkdirSync(renditionsDir, { recursive: true, mode: 0o700 });
 
-  function preflight(units: VisualUnitInput[], ownerRequest: string, question: string, priorEvidence = ''): PrimaryRequestPreflight | null {
-    try { return llmClient.preflightPrimary(buildReaderRequest(ownerRequest, question, units, priorEvidence)); }
+  function preflight(units: VisualUnitInput[], ownerRequest: string, question: string, priorEvidence = '', workload: LlmUsageWorkload = 'interactive'): PrimaryRequestPreflight | null {
+    try { return llmClient.preflightPrimary(buildReaderRequest(ownerRequest, question, units, priorEvidence, workload)); }
     catch (error) {
       if (isLlmPayloadTooLargeError(error)) return null;
       throw error;
@@ -305,8 +308,9 @@ export function createVisualInspector(deps: {
     ownerRequest: string,
     question: string,
     priorEvidence = '',
+    workload: LlmUsageWorkload = 'interactive',
   ): Promise<{ results: ReaderResult[]; metrics: PrimaryRequestPreflight }> {
-    const request = buildReaderRequest(ownerRequest, question, units, priorEvidence);
+    const request = buildReaderRequest(ownerRequest, question, units, priorEvidence, workload);
     const metrics = llmClient.preflightPrimary(request);
     let response = await llmClient.chatCompletionPrimary(request);
     try {
@@ -319,6 +323,7 @@ export function createVisualInspector(deps: {
         question,
         units,
         priorEvidence,
+        workload,
         `${error.message} Regenerate the COMPLETE JSON object. Return one assets entry for every supplied image; no Markdown fences or extra text.`,
       );
       const correctedMetrics = llmClient.preflightPrimary(corrected);
@@ -404,7 +409,7 @@ export function createVisualInspector(deps: {
     };
   }
 
-  async function nativeTiles(asset: VisualAssetOriginal, ownerRequest: string, question: string, priorEvidence: string): Promise<VisualUnitInput[]> {
+  async function nativeTiles(asset: VisualAssetOriginal, ownerRequest: string, question: string, priorEvidence: string, workload: LlmUsageWorkload): Promise<VisualUnitInput[]> {
     const columns = Math.ceil(asset.record.width / TILE_EDGE);
     const rows = Math.ceil(asset.record.height / TILE_EDGE);
     if (rows * columns > MAX_NATIVE_TILES) {
@@ -421,7 +426,7 @@ export function createVisualInspector(deps: {
       tileKey: string,
     ): Promise<void> => {
       const tile = await makeTile(asset, tileKey, region);
-      if (preflight([tile], ownerRequest, question, priorEvidence)) {
+      if (preflight([tile], ownerRequest, question, priorEvidence, workload)) {
         tiles.push(tile);
         if (tiles.length > MAX_NATIVE_TILES) {
           throw new VisualInspectionError('VISUAL_TILE_LIMIT', `Native-detail coverage exceeded ${MAX_NATIVE_TILES} tiles.`, 'Provide a focused crop of the relevant region.');
@@ -522,6 +527,7 @@ export function createVisualInspector(deps: {
     ownerRequest: string,
     question: string,
     priorEvidence = '',
+    workload: LlmUsageWorkload = 'interactive',
   ): Promise<VisualUnitEvidence[]> {
     const existing = units.map(unit => storedEvidence(runId, unit));
     if (existing.every(Boolean)) return existing as VisualUnitEvidence[];
@@ -533,7 +539,7 @@ export function createVisualInspector(deps: {
     });
     let call: { results: ReaderResult[]; metrics: PrimaryRequestPreflight };
     try {
-      call = await callReader(pending, ownerRequest, question, priorEvidence);
+      call = await callReader(pending, ownerRequest, question, priorEvidence, workload);
     } catch (error: any) {
       for (const unit of pending) {
         db.prepare(`
@@ -607,7 +613,7 @@ export function createVisualInspector(deps: {
     return evidence.map(item => `${item.assetId} (${item.unitKey}): ${item.answer}`).join('\n');
   }
 
-  async function synthesize(question: string, evidence: VisualUnitEvidence[]): Promise<{ answer: string; limitations: string[] }> {
+  async function synthesize(question: string, evidence: VisualUnitEvidence[], workload: LlmUsageWorkload): Promise<{ answer: string; limitations: string[] }> {
     if (evidence.length === 1) return { answer: evidence[0].answer, limitations: evidence[0].uncertainties };
     const compact = evidence.map(item => ({
       assetId: item.assetId,
@@ -630,6 +636,7 @@ export function createVisualInspector(deps: {
       maxTokens: 3_000,
       responseFormat: { type: 'json_object' },
       think: false,
+      usageContext: { workload },
     };
     try {
       llmClient.preflightPrimary(request);
@@ -663,6 +670,7 @@ export function createVisualInspector(deps: {
 
   return {
     async inspect(input) {
+      const workload: LlmUsageWorkload = input.callerKind === 'background' ? 'background' : 'interactive';
       const assetIds = [...new Set((input.assetIds ?? []).map(String))];
       if (!assetIds.length || assetIds.length > MAX_ASSETS) {
         throw new VisualInspectionError('VISUAL_ASSET_COUNT', `inspect_visual_assets requires 1–${MAX_ASSETS} unique asset IDs.`, 'Use exact IDs from the attachment or screenshot manifest.');
@@ -726,7 +734,7 @@ export function createVisualInspector(deps: {
           mime: asset.record.mime,
           authoritative: true,
         }));
-        const combinedCandidateMetrics = preflight(originals, ownerRequest, question);
+        const combinedCandidateMetrics = preflight(originals, ownerRequest, question, '', workload);
         // The gateway rejected a 3.13 MB multi-image body despite the provider's
         // 5.5 MB request gate. Keep individual originals on the provider gate,
         // but reserve transport headroom whenever multiple images share a call.
@@ -743,44 +751,44 @@ export function createVisualInspector(deps: {
 
         if (combinedMetrics) {
           originals.forEach(unit => { insertUnit(runId, unit); authoritativeUnits.push(unit); });
-          evidence.push(...await inspectUnits(runId, originals, ownerRequest, question));
+          evidence.push(...await inspectUnits(runId, originals, ownerRequest, question, '', workload));
           provider = `primary:${combinedMetrics.apiMode}`;
           model = combinedMetrics.model;
         } else {
           for (const original of originals) {
-            const metrics = preflight([original], ownerRequest, question);
+            const metrics = preflight([original], ownerRequest, question, '', workload);
             if (metrics) {
               insertUnit(runId, original);
               authoritativeUnits.push(original);
-              evidence.push(...await inspectUnits(runId, [original], ownerRequest, question));
+              evidence.push(...await inspectUnits(runId, [original], ownerRequest, question, '', workload));
               provider ??= `primary:${metrics.apiMode}`;
               model ??= metrics.model;
               continue;
             }
 
             const overview = await makeOverview(original.asset);
-            const overviewMetrics = preflight([overview], ownerRequest, question);
+            const overviewMetrics = preflight([overview], ownerRequest, question, '', workload);
             if (!overviewMetrics) {
               throw new VisualInspectionError('VISUAL_OVERVIEW_TOO_LARGE', 'The bounded overview still exceeds the provider request limit.', 'Provide a focused crop of the relevant region.');
             }
             provider ??= `primary:${overviewMetrics.apiMode}`;
             model ??= overviewMetrics.model;
             insertUnit(runId, overview);
-            const overviewEvidence = await inspectUnits(runId, [overview], ownerRequest, question);
+            const overviewEvidence = await inspectUnits(runId, [overview], ownerRequest, question, '', workload);
             evidence.push(...overviewEvidence);
             const prior = JSON.stringify(overviewEvidence.map(item => ({ answer: item.answer, observations: item.observations, uncertainties: item.uncertainties })));
-            const tiles = await nativeTiles(original.asset, ownerRequest, question, prior);
+            const tiles = await nativeTiles(original.asset, ownerRequest, question, prior, workload);
             authoritativeUnits.push(...tiles);
             // One tile per compact call: bounds peak memory and guarantees a
             // tile failure has an exact unit receipt rather than losing a batch.
-            for (const tile of tiles) evidence.push(...await inspectUnits(runId, [tile], ownerRequest, question, prior));
+            for (const tile of tiles) evidence.push(...await inspectUnits(runId, [tile], ownerRequest, question, prior, workload));
           }
         }
 
         verifyCoverage(assets, authoritativeUnits);
         const authoritativeKeys = new Set(authoritativeUnits.map(unit => `${unit.asset.record.assetId}:${unit.unitKey}`));
         const authoritativeEvidence = evidence.filter(item => authoritativeKeys.has(`${item.assetId}:${item.unitKey}`));
-        const synthesis = await synthesize(question, authoritativeEvidence);
+        const synthesis = await synthesize(question, authoritativeEvidence, workload);
         const coverage = {
           unit: authoritativeUnits.every(unit => unit.kind === 'original') ? 'original' as const : 'source_region' as const,
           eligible: authoritativeUnits.length,

@@ -7,6 +7,16 @@
 import type { AcpResponse, AcpChatMessage } from './types.js';
 import { signBedrockRequest } from './aws-sigv4.js';
 import { logLlmPrompt } from './llm-prompt-log.js';
+import {
+  createNoopLlmUsageService,
+  emptyProviderUsage,
+  type LlmAttemptHandle,
+  type LlmUsageAttemptReason,
+  type LlmUsageContext,
+  type LlmUsageService,
+  type NormalizedLlmUsageContext,
+  type ParsedProviderUsage,
+} from './llm-usage.js';
 
 export interface LlmUsage {
   promptTokens: number;
@@ -51,8 +61,8 @@ export interface LlmClient {
   getMaxRequestBytes(): number;
   /** The primary (non-Ollama) endpoint's default model id — the anchor blessed overrides resolve against. */
   getDefaultModel(): string;
-  sendPrompt(prompt: string): Promise<AcpResponse>; // backward compat
-  sendMessage(messages: AcpChatMessage[]): Promise<AcpResponse>; // backward compat
+  sendPrompt(prompt: string, usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
+  sendMessage(messages: AcpChatMessage[], usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
   initialize(): Promise<void>; // no-op for backward compat
   isAvailable(): boolean;
   getActiveEndpoint(): 'ecs' | 'ollama' | 'none';
@@ -104,6 +114,8 @@ export interface ChatCompletionRequest {
    * fetch so recovery can never resend an identical/unsafe request.
    */
   payloadConstraint?: ProviderRequestConstraint;
+  /** Local-only accounting metadata. Body builders must never serialize it. */
+  usageContext?: LlmUsageContext;
 }
 
 export interface ChatCompletionResponse {
@@ -385,6 +397,21 @@ interface Endpoint {
   requestAuthorizer?: LlmRequestAuthorizer;
 }
 
+interface RecordedResponse {
+  response: Response;
+  handle: LlmAttemptHandle;
+}
+
+interface RecordedPostMetadata {
+  context: NormalizedLlmUsageContext;
+  model: string;
+  apiMode: LlmApiMode | 'ollama';
+  stream: boolean;
+  size: ProviderRequestSize;
+  fallback?: boolean;
+  healthProbe?: boolean;
+}
+
 
 /**
  * Kimi K2/K2.5 emit tool calls as TEXT using their own token markup rather
@@ -499,25 +526,86 @@ function parseToolCallsFromText(content: string): ToolCall[] {
   return calls;
 }
 
-function parseProviderUsage(data: any): LlmUsage {
-  const usage = data?.usage ?? {};
-  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
-  const completionTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
-  const details = usage.prompt_tokens_details ?? usage.input_tokens_details ?? {};
-  const cacheReadRaw = details.cached_tokens
-    ?? usage.cache_read_input_tokens
-    ?? usage.cacheReadInputTokens;
-  const cacheWriteRaw = details.cache_write_tokens
-    ?? usage.cache_creation_input_tokens
-    ?? usage.cacheWriteInputTokens;
-  const cacheReadTokens = Number(cacheReadRaw ?? 0) || 0;
-  const cacheWriteTokens = Number(cacheWriteRaw ?? 0) || 0;
+function tokenCount(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : null;
+}
+
+/** Presence-aware provider accounting; never substitutes missing values with zero. */
+export function parseProviderUsage(data: any): ParsedProviderUsage {
+  const hasUsage = data !== null
+    && data !== undefined
+    && Object.prototype.hasOwnProperty.call(data, 'usage')
+    && data.usage !== null
+    && data.usage !== undefined;
+  if (!hasUsage) return emptyProviderUsage();
+
+  const usage = data.usage;
+  const inputDetails = usage.prompt_tokens_details ?? usage.input_tokens_details ?? {};
+  const outputDetails = usage.completion_tokens_details ?? usage.output_tokens_details ?? {};
+  const inputTokens = tokenCount(usage.prompt_tokens ?? usage.input_tokens);
+  const outputTokens = tokenCount(usage.completion_tokens ?? usage.output_tokens);
+  const reportedTotal = tokenCount(usage.total_tokens);
+  return {
+    reported: true,
+    inputTokens,
+    outputTokens,
+    totalTokens: reportedTotal ?? (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null),
+    cacheReadTokens: tokenCount(
+      inputDetails.cached_tokens
+        ?? usage.cache_read_input_tokens
+        ?? usage.cacheReadInputTokens,
+    ),
+    cacheWriteTokens: tokenCount(
+      inputDetails.cache_write_tokens
+        ?? usage.cache_creation_input_tokens
+        ?? usage.cacheWriteInputTokens,
+    ),
+    reasoningTokens: tokenCount(outputDetails.reasoning_tokens),
+  };
+}
+
+export function parseOllamaUsage(data: any): ParsedProviderUsage {
+  const reported = data !== null
+    && data !== undefined
+    && (
+      Object.prototype.hasOwnProperty.call(data, 'prompt_eval_count')
+      || Object.prototype.hasOwnProperty.call(data, 'eval_count')
+    );
+  if (!reported) return emptyProviderUsage();
+  const inputTokens = tokenCount(data.prompt_eval_count);
+  const outputTokens = tokenCount(data.eval_count);
+  return {
+    reported: true,
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    reasoningTokens: null,
+  };
+}
+
+function parseUsageFromText(text: string, ollama = false): ParsedProviderUsage {
+  if (!text) return emptyProviderUsage();
+  try {
+    const parsed = JSON.parse(text);
+    return ollama ? parseOllamaUsage(parsed) : parseProviderUsage(parsed);
+  } catch {
+    return emptyProviderUsage();
+  }
+}
+
+function compatibleUsage(usage: ParsedProviderUsage): LlmUsage {
+  const promptTokens = usage.inputTokens ?? 0;
+  const completionTokens = usage.outputTokens ?? 0;
   return {
     promptTokens,
     completionTokens,
-    totalTokens: Number(usage.total_tokens ?? (promptTokens + completionTokens)) || 0,
-    ...(cacheReadRaw !== undefined ? { cacheReadTokens } : {}),
-    ...(cacheWriteRaw !== undefined ? { cacheWriteTokens } : {}),
+    totalTokens: usage.totalTokens ?? (promptTokens + completionTokens),
+    ...(usage.cacheReadTokens !== null ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+    ...(usage.cacheWriteTokens !== null ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
   };
 }
 
@@ -627,7 +715,8 @@ export function toResponsesInput(messages: LlmMessage[]): { instructions?: strin
   return { ...(instructions ? { instructions } : {}), input };
 }
 
-export function createLlmClient(config: LlmConfig): LlmClient {
+export function createLlmClient(config: LlmConfig, usageService?: LlmUsageService): LlmClient {
+  const usage = usageService ?? createNoopLlmUsageService();
   const endpoints: Endpoint[] = [];
 
   // ECS endpoint (OpenAI-compatible vLLM)
@@ -687,29 +776,72 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     return baseHeaders;
   }
 
+  function usageErrorClass(error: unknown, fallback = 'Error'): string {
+    const value = error instanceof Error ? error.name : (typeof error === 'string' ? error : typeof error);
+    return String(value || fallback).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 80) || fallback;
+  }
+
+  function attemptReason(
+    context: NormalizedLlmUsageContext,
+    metadata: RecordedPostMetadata,
+    authRetry = false,
+  ): LlmUsageAttemptReason {
+    if (authRetry) return 'auth_retry';
+    if (context.retryReason === 'stream_retry') return 'stream_retry';
+    if (metadata.fallback) return 'fallback';
+    if (metadata.healthProbe) return 'health_probe';
+    return 'initial';
+  }
+
   /**
-   * POST with per-request authorization and a single 401 retry. When the
-   * endpoint's authorizer caches credentials (OAuth client-credentials), a 401
-   * means the cached token was revoked out-of-band; invalidate and re-send
-   * once with freshly built headers. Bodies are pre-serialized because SigV4
-   * signs the payload hash — the signed and sent bytes must be identical.
+   * POST with per-request authorization and a single 401 retry. Each actual
+   * fetch gets its own immutable usage handle; the final parser owns the
+   * returned handle and no concurrent call shares ambient attempt state.
    */
   async function postWithAuthRetry(
     ep: Endpoint,
     url: string,
     bodyStr: string,
+    metadata: RecordedPostMetadata,
     init: { signal?: AbortSignal } = {},
-  ): Promise<Response> {
-    const send = async (): Promise<Response> => {
+  ): Promise<RecordedResponse> {
+    const send = async (authRetry = false): Promise<RecordedResponse> => {
+      // Authorization can fail before a network send, so build it before the
+      // attempt row. The insert remains immediately adjacent to fetch.
       const headers = await buildAuthHeaders(ep, url, 'POST', bodyStr);
-      return fetch(url, { method: 'POST', headers, body: bodyStr, ...init });
+      const handle = usage.beginAttempt(metadata.context, {
+        endpointKey: ep.name,
+        apiMode: metadata.apiMode,
+        model: metadata.model,
+        stream: metadata.stream,
+        requestBytes: metadata.size.bodyBytes,
+        imageCount: metadata.size.imageCount,
+        attemptReason: attemptReason(metadata.context, metadata, authRetry),
+      });
+      try {
+        const response = await fetch(url, { method: 'POST', headers, body: bodyStr, ...init });
+        return { response, handle };
+      } catch (error) {
+        usage.failAttempt(handle, {
+          errorClass: usageErrorClass(error, 'FetchError'),
+          usage: emptyProviderUsage(),
+        });
+        throw error;
+      }
     };
-    let resp = await send();
-    if (resp.status === 401 && typeof ep.requestAuthorizer?.invalidate === 'function') {
+
+    let recorded = await send();
+    if (recorded.response.status === 401 && typeof ep.requestAuthorizer?.invalidate === 'function') {
+      const detail = await recorded.response.text().catch(() => '');
+      usage.failAttempt(recorded.handle, {
+        httpStatus: 401,
+        errorClass: 'HTTP_401',
+        usage: parseUsageFromText(detail),
+      });
       ep.requestAuthorizer.invalidate();
-      resp = await send();
+      recorded = await send(true);
     }
-    return resp;
+    return recorded;
   }
 
   function remoteRequestUrl(ep: Endpoint): string {
@@ -721,32 +853,66 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
   }
 
+  async function probeModelEndpoint(ep: Endpoint, body: unknown, timeoutMs: number): Promise<boolean> {
+    const url = remoteRequestUrl(ep);
+    const { bodyStr, size } = serializeProviderRequest(body, maximumRequestBytes);
+    const context = usage.normalizeContext({ workload: 'system' });
+    const { response, handle } = await postWithAuthRetry(ep, url, bodyStr, {
+      context,
+      model: ep.model,
+      apiMode: ep.apiMode,
+      stream: false,
+      size,
+      healthProbe: true,
+    }, { signal: AbortSignal.timeout(timeoutMs) });
+
+    const healthy = response.ok;
+    if (!healthy) {
+      const detail = await response.text().catch(() => '');
+      usage.failAttempt(handle, {
+        httpStatus: response.status,
+        errorClass: `HTTP_${response.status}`,
+        usage: parseUsageFromText(detail),
+      });
+      return false;
+    }
+
+    // Probe accounting is observational: an unreadable 2xx body remains a
+    // healthy probe and completes with usage unknown.
+    let parsedUsage = emptyProviderUsage();
+    try {
+      parsedUsage = parseProviderUsage(await response.json());
+    } catch {}
+    usage.completeAttempt(handle, {
+      httpStatus: response.status,
+      usage: parsedUsage,
+    });
+    return healthy;
+  }
+
   async function probeEndpoint(ep: Endpoint): Promise<boolean> {
     try {
       if (!ep.useOllamaApi && ep.apiMode === 'responses') {
         // Bedrock Mantle has no generic application health route. A tiny
         // Responses request verifies model access and bearer authentication.
-        const url = remoteRequestUrl(ep);
-        const body = JSON.stringify({
+        return await probeModelEndpoint(ep, {
           model: ep.model,
           input: [{ role: 'user', content: 'ping' }],
           max_output_tokens: 16,
           reasoning: { effort: 'low' },
           store: false,
           stream: false,
-        });
-        const resp = await postWithAuthRetry(ep, url, body, { signal: AbortSignal.timeout(30000) });
-        return resp.ok;
+        }, 30000);
       }
       if (!ep.useOllamaApi && ep.apiMode === 'chat-completions' && new URL(ep.url).hostname.startsWith('bedrock-runtime.')) {
         // Legacy Bedrock's OpenAI-compat surface has no /health or /models
         // route, so probe with a minimal Chat Completions request regardless
         // of whether that endpoint uses SigV4 or an explicit bearer token.
-        const url = remoteRequestUrl(ep);
-        const body = JSON.stringify({ model: ep.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 });
-        const headers = await buildAuthHeaders(ep, url, 'POST', body);
-        const resp = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(15000) });
-        return resp.ok;
+        return await probeModelEndpoint(ep, {
+          model: ep.model,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1,
+        }, 15000);
       }
       const url = ep.useOllamaApi ? `${ep.url}/api/tags` : `${ep.url}/health`;
       const headers = ep.useOllamaApi ? {} : await buildAuthHeaders(ep, url, 'GET');
@@ -850,11 +1016,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         id: tc.id || `call_${i}`, type: 'function' as const,
         function: { name: tc.function.name, arguments: JSON.stringify(tc.function.arguments) },
       })) ?? null,
-      usage: {
-        promptTokens: data.prompt_eval_count || 0,
-        completionTokens: data.eval_count || 0,
-        totalTokens: (data.prompt_eval_count || 0) + (data.eval_count || 0),
-      },
+      usage: compatibleUsage(parseOllamaUsage(data)),
       finishReason: msg.tool_calls?.length ? 'tool_calls' : (data.done ? 'stop' : 'length'),
     };
   }
@@ -902,7 +1064,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       // for Kimi-K3's parser — accept both.
       reasoning: msg.reasoning_content || msg.reasoning || undefined,
       toolCalls,
-      usage: parseProviderUsage(data),
+      usage: compatibleUsage(parseProviderUsage(data)),
       finishReason: choice.finish_reason || 'stop',
     };
   }
@@ -959,7 +1121,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       content,
       reasoning: reasoningParts.join('') || undefined,
       toolCalls: toolCalls.length > 0 ? toolCalls : null,
-      usage: parseProviderUsage(data),
+      usage: compatibleUsage(parseProviderUsage(data)),
       finishReason,
       providerOutput: output,
     };
@@ -979,25 +1141,45 @@ export function createLlmClient(config: LlmConfig): LlmClient {
   async function callEndpoint(
     ep: Endpoint,
     req: ChatCompletionRequest,
-    options: { healthNeutral?: boolean } = {},
+    options: {
+      context: NormalizedLlmUsageContext;
+      healthNeutral?: boolean;
+      fallback?: boolean;
+    },
   ): Promise<ChatCompletionResponse> {
     // Serialize ONCE: SigV4 signs the payload hash, so the signed string and
     // the sent string must be byte-identical.
     const prepared = prepareBatchRequest(ep, req);
     const { isOllama, isResponses, url, body, bodyStr, size } = prepared;
+    const model = effectiveModel(ep, req);
+    const apiMode = isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions');
     logLlmPrompt({
-      url, model: effectiveModel(ep, req), apiMode: isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions'), stream: false, request: body,
+      url, model, apiMode, stream: false, request: body,
       bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
     });
 
-    const resp = await postWithAuthRetry(
+    const { response: resp, handle } = await postWithAuthRetry(
       ep,
       url,
       bodyStr,
+      {
+        context: options.context,
+        model,
+        apiMode,
+        stream: false,
+        size,
+        fallback: options.fallback,
+      },
       ep.timeoutMs > 0 ? { signal: AbortSignal.timeout(ep.timeoutMs) } : {},
     );
 
     if (resp.status === 429 || resp.status === 503) {
+      const detail = await resp.text().catch(() => '');
+      usage.failAttempt(handle, {
+        httpStatus: resp.status,
+        errorClass: `HTTP_${resp.status}`,
+        usage: parseUsageFromText(detail, isOllama),
+      });
       if (!options.healthNeutral) {
         const wait = Math.min(1000 * Math.pow(2, ep.retryCount++), 30000);
         await new Promise(r => setTimeout(r, wait));
@@ -1005,17 +1187,44 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       throw new Error(`${resp.status} — retryable`);
     }
 
-    if (!resp.ok) throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
-
-    const data = await resp.json();
-    if (!options.healthNeutral) {
-      ep.retryCount = 0;
-      ep.healthy = true;
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => '');
+      usage.failAttempt(handle, {
+        httpStatus: resp.status,
+        errorClass: `HTTP_${resp.status}`,
+        usage: parseUsageFromText(detail, isOllama),
+      });
+      throw providerHttpError(resp.status, detail, size);
     }
-    if (isOllama) return parseOllamaResponse(data);
-    return isResponses
-      ? parseResponsesResponse(data, (req.tools?.length ?? 0) > 0)
-      : parseOpenAIResponse(data, (req.tools?.length ?? 0) > 0);
+
+    let parsedUsage = emptyProviderUsage();
+    try {
+      const data: any = await resp.json();
+      parsedUsage = isOllama ? parseOllamaUsage(data) : parseProviderUsage(data);
+      if (!options.healthNeutral) {
+        ep.retryCount = 0;
+        ep.healthy = true;
+      }
+      const result = isOllama
+        ? parseOllamaResponse(data)
+        : isResponses
+          ? parseResponsesResponse(data, (req.tools?.length ?? 0) > 0)
+          : parseOpenAIResponse(data, (req.tools?.length ?? 0) > 0);
+      usage.completeAttempt(handle, {
+        status: (isResponses && data?.status === 'incomplete') || result.finishReason === 'length' ? 'partial' : 'completed',
+        httpStatus: resp.status,
+        usage: parsedUsage,
+      });
+      return result;
+    } catch (error) {
+      usage.failAttempt(handle, {
+        status: 'partial',
+        httpStatus: resp.status,
+        errorClass: usageErrorClass(error, 'ResponseParseError'),
+        usage: parsedUsage,
+      });
+      throw error;
+    }
   }
 
   // ── Streaming: async generator for token-by-token SSE from vLLM ──
@@ -1034,13 +1243,18 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
   }
 
-  async function* streamResponsesEndpoint(ep: Endpoint, req: ChatCompletionRequest): AsyncGenerator<StreamChunk, StreamResult, undefined> {
+  async function* streamResponsesEndpoint(
+    ep: Endpoint,
+    req: ChatCompletionRequest,
+    context: NormalizedLlmUsageContext,
+  ): AsyncGenerator<StreamChunk, StreamResult, undefined> {
     const toolsOffered = (req.tools?.length ?? 0) > 0;
     const url = remoteRequestUrl(ep);
+    const model = effectiveModel(ep, req);
     const responsesBody = buildResponsesBody(ep, req, true);
     const { bodyStr, size } = serializeProviderRequest(responsesBody, maximumRequestBytes, req.payloadConstraint);
     logLlmPrompt({
-      url, model: effectiveModel(ep, req), apiMode: 'responses', stream: true, request: responsesBody,
+      url, model, apiMode: 'responses', stream: true, request: responsesBody,
       bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
     });
 
@@ -1058,20 +1272,51 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
 
     resetIdleTimer();
-    let resp: Response;
+    let recorded: RecordedResponse;
     try {
-      resp = await postWithAuthRetry(ep, url, bodyStr, { signal: controller.signal });
+      recorded = await postWithAuthRetry(ep, url, bodyStr, {
+        context,
+        model,
+        apiMode: 'responses',
+        stream: true,
+        size,
+      }, { signal: controller.signal });
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
     }
+    const { response: resp, handle } = recorded;
+    let terminalUsage = emptyProviderUsage();
+    let attemptClosed = false;
+    const completeStreamAttempt = (status: 'completed' | 'partial', usageValue = terminalUsage) => {
+      if (attemptClosed) return;
+      attemptClosed = true;
+      usage.completeAttempt(handle, { status, httpStatus: resp.status, usage: usageValue });
+    };
+    const failStreamAttempt = (
+      error: unknown,
+      status: 'failed' | 'partial' = 'partial',
+      usageValue = terminalUsage,
+    ) => {
+      if (attemptClosed) return;
+      attemptClosed = true;
+      usage.failAttempt(handle, {
+        status,
+        httpStatus: resp.status,
+        errorClass: usageErrorClass(error, 'StreamError'),
+        usage: usageValue,
+      });
+    };
 
     if (!resp.ok) {
       if (idleTimer) clearTimeout(idleTimer);
-      throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
+      const detail = await resp.text().catch(() => '');
+      failStreamAttempt(`HTTP_${resp.status}`, 'failed', parseUsageFromText(detail));
+      throw providerHttpError(resp.status, detail, size);
     }
     if (!resp.body) {
       if (idleTimer) clearTimeout(idleTimer);
+      failStreamAttempt('MissingResponseBody');
       throw new Error('No response body for streaming');
     }
 
@@ -1091,6 +1336,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let streamReadCompleted = false;
 
     try {
       while (true) {
@@ -1123,6 +1369,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
             throw new Error(`Responses stream failed: ${event.message || event.code || 'unknown error'}`);
           }
           if (eventType === 'response.failed' || eventType === 'response.cancelled') {
+            terminalUsage = parseProviderUsage(event.response);
             const failure = event.response?.error || event.error;
             throw new Error(`Responses stream failed: ${failure?.message || failure?.code || eventType}`);
           }
@@ -1224,7 +1471,9 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
           if (eventType === 'response.completed' || eventType === 'response.incomplete') {
             terminalEventReceived = true;
+            terminalUsage = parseProviderUsage(event.response);
             const completed = parseResponsesResponse(event.response, toolsOffered);
+            completeStreamAttempt(eventType === 'response.incomplete' ? 'partial' : 'completed', terminalUsage);
             providerOutputAcc = completed.providerOutput;
             usageAcc = completed.usage;
             finishReason = completed.finishReason;
@@ -1260,12 +1509,23 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         }
         if (done) break;
       }
+      streamReadCompleted = true;
+    } catch (error) {
+      failStreamAttempt(error);
+      throw error;
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
-      reader.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch (error) {
+        failStreamAttempt(error);
+        throw error;
+      }
+      if (!streamReadCompleted && !attemptClosed) failStreamAttempt('StreamConsumerAbandoned');
     }
 
     if (!terminalEventReceived) {
+      failStreamAttempt('MissingTerminalEvent');
       throw new Error('LLM Responses stream terminated before a completed or incomplete terminal event');
     }
     if (ignoredUnexpectedToolCalls) {
@@ -1291,19 +1551,24 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
   }
 
-  async function* streamEndpoint(ep: Endpoint, req: ChatCompletionRequest): AsyncGenerator<StreamChunk, StreamResult, undefined> {
+  async function* streamEndpoint(
+    ep: Endpoint,
+    req: ChatCompletionRequest,
+    context: NormalizedLlmUsageContext,
+  ): AsyncGenerator<StreamChunk, StreamResult, undefined> {
     if (ep.apiMode === 'responses') {
-      return yield* streamResponsesEndpoint(ep, req);
+      return yield* streamResponsesEndpoint(ep, req, context);
     }
     // Did the caller actually offer tools this turn? An empty array is a
     // deliberate "no tools" signal, not an omission.
     const toolsOffered = (req.tools?.length ?? 0) > 0;
     const url = remoteRequestUrl(ep);
+    const model = effectiveModel(ep, req);
     // Serialize ONCE — sigv4 signs the payload hash (see callEndpoint).
     const openAiStreamBody = buildOpenAIStreamBody(ep, req);
     const { bodyStr, size } = serializeProviderRequest(openAiStreamBody, maximumRequestBytes, req.payloadConstraint);
     logLlmPrompt({
-      url, model: effectiveModel(ep, req), apiMode: 'chat-completions', stream: true, request: openAiStreamBody,
+      url, model, apiMode: 'chat-completions', stream: true, request: openAiStreamBody,
       bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
     });
     // Whether the caller opted into chain-of-thought. When false, Qwen3.5 emits
@@ -1329,20 +1594,55 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     };
 
     resetIdleTimer(); // also covers time-to-first-byte (prefill)
-    let resp: Response;
+    let recorded: RecordedResponse;
     try {
-      resp = await postWithAuthRetry(ep, url, bodyStr, { signal: controller.signal });
+      recorded = await postWithAuthRetry(ep, url, bodyStr, {
+        context,
+        model,
+        apiMode: 'chat-completions',
+        stream: true,
+        size,
+      }, { signal: controller.signal });
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
     }
+    const { response: resp, handle } = recorded;
+    let terminalUsage = emptyProviderUsage();
+    let attemptClosed = false;
+    const completeStreamAttempt = (status: 'completed' | 'partial') => {
+      if (attemptClosed) return;
+      attemptClosed = true;
+      usage.completeAttempt(handle, {
+        status,
+        httpStatus: resp.status,
+        usage: terminalUsage,
+      });
+    };
+    const failStreamAttempt = (
+      error: unknown,
+      status: 'failed' | 'partial' = 'partial',
+      usageValue = terminalUsage,
+    ) => {
+      if (attemptClosed) return;
+      attemptClosed = true;
+      usage.failAttempt(handle, {
+        status,
+        httpStatus: resp.status,
+        errorClass: usageErrorClass(error, 'StreamError'),
+        usage: usageValue,
+      });
+    };
 
     if (!resp.ok) {
       if (idleTimer) clearTimeout(idleTimer);
-      throw providerHttpError(resp.status, await resp.text().catch(() => ''), size);
+      const detail = await resp.text().catch(() => '');
+      failStreamAttempt(`HTTP_${resp.status}`, 'failed', parseUsageFromText(detail));
+      throw providerHttpError(resp.status, detail, size);
     }
     if (!resp.body) {
       if (idleTimer) clearTimeout(idleTimer);
+      failStreamAttempt('MissingResponseBody');
       throw new Error('No response body for streaming');
     }
 
@@ -1354,11 +1654,13 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     let reasoningAcc = '';
     const toolCallsAcc: Map<number, { id: string; name: string; arguments: string }> = new Map();
     let usageAcc: LlmUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let usageReported = false;
     let finishReason: 'stop' | 'tool_calls' | 'length' = 'stop';
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let streamReadCompleted = false;
 
     try {
       while (true) {
@@ -1379,9 +1681,16 @@ export function createLlmClient(config: LlmConfig): LlmClient {
           let chunk: any;
           try { chunk = JSON.parse(payload); } catch { continue; }
 
-          // Usage info (vLLM sends this in the final chunk with stream_options.include_usage)
-          if (chunk.usage) {
-            usageAcc = parseProviderUsage({ usage: chunk.usage });
+          // Presence is independent of numeric compatibility zeros: only an
+          // explicit provider usage block makes this attempt reported.
+          if (
+            Object.prototype.hasOwnProperty.call(chunk, 'usage')
+            && chunk.usage !== null
+            && chunk.usage !== undefined
+          ) {
+            usageReported = true;
+            terminalUsage = parseProviderUsage({ usage: chunk.usage });
+            usageAcc = compatibleUsage(terminalUsage);
           }
 
           const choice = chunk.choices?.[0];
@@ -1482,12 +1791,23 @@ export function createLlmClient(config: LlmConfig): LlmClient {
           }
         }
       }
+      streamReadCompleted = true;
+    } catch (error) {
+      failStreamAttempt(error);
+      throw error;
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
-      reader.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch (error) {
+        failStreamAttempt(error);
+        throw error;
+      }
+      if (!streamReadCompleted && !attemptClosed) failStreamAttempt('StreamConsumerAbandoned');
     }
 
-    // Build final tool calls array
+    try {
+      // Build final tool calls array
     const toolCalls: ToolCall[] = [];
     for (const [, tc] of toolCallsAcc) {
       if (tc.name) {
@@ -1530,15 +1850,23 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       }
     }
 
-    yield { type: 'done', usage: usageAcc };
+      if (!usageReported) terminalUsage = emptyProviderUsage();
+      completeStreamAttempt(finishReason === 'length' ? 'partial' : 'completed');
+      yield { type: 'done', usage: usageAcc };
 
-    return {
-      content: contentAcc,
-      reasoning: reasoningAcc,
-      toolCalls,
-      usage: usageAcc,
-      finishReason: toolCalls.length > 0 ? 'tool_calls' : finishReason,
-    };
+      return {
+        content: contentAcc,
+        reasoning: reasoningAcc,
+        toolCalls,
+        usage: usageAcc,
+        finishReason: toolCalls.length > 0 ? 'tool_calls' : finishReason,
+      };
+    } catch (error) {
+      failStreamAttempt(error);
+      throw error;
+    } finally {
+      if (!attemptClosed) failStreamAttempt('StreamConsumerAbandoned');
+    }
   }
 
   // Start one initial health check. A zero/negative interval disables periodic
@@ -1570,7 +1898,8 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     async chatCompletionPrimary(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
       const primary = endpoints.find(endpoint => !endpoint.useOllamaApi);
       if (!primary) throw new Error('Primary visual-capable LLM endpoint is unavailable');
-      return callEndpoint(primary, request, { healthNeutral: true });
+      const context = usage.normalizeContext(request.usageContext);
+      return callEndpoint(primary, request, { context, healthNeutral: true });
     },
 
     getMaxRequestBytes(): number {
@@ -1579,11 +1908,15 @@ export function createLlmClient(config: LlmConfig): LlmClient {
 
     async chatCompletion(request: ChatCompletionRequest): Promise<ChatCompletionResponse> {
       const ordered = getOrderedEndpoints();
+      const context = usage.normalizeContext(request.usageContext);
       let lastError: Error | null = null;
 
       for (const ep of ordered) {
         try {
-          return await callEndpoint(ep, request);
+          return await callEndpoint(ep, request, {
+            context,
+            fallback: ep.useOllamaApi,
+          });
         } catch (err: any) {
           // Payload limits are request-specific, not endpoint health. Never
           // poison health or fall through to a transport that would lose
@@ -1601,9 +1934,10 @@ export function createLlmClient(config: LlmConfig): LlmClient {
       // Streaming only supported on OpenAI-compatible endpoints (ECS/vLLM), not Ollama
       const ecsEp = endpoints.find(e => !e.useOllamaApi);
       if (!ecsEp) throw new Error('Streaming requires an OpenAI-compatible endpoint (ECS/vLLM)');
+      const context = usage.normalizeContext(request.usageContext);
 
       try {
-        return yield* streamEndpoint(ecsEp, request);
+        return yield* streamEndpoint(ecsEp, request, context);
       } catch (err: any) {
         // A request-specific payload rejection says nothing about endpoint
         // health; preserve the endpoint and let the chat loop rebuild once.
@@ -1614,17 +1948,18 @@ export function createLlmClient(config: LlmConfig): LlmClient {
     },
 
     // Backward-compatible sendPrompt (wraps chatCompletion)
-    async sendPrompt(prompt: string): Promise<AcpResponse> {
+    async sendPrompt(prompt: string, usageContext?: LlmUsageContext): Promise<AcpResponse> {
       const resp = await this.chatCompletion({
         messages: [{ role: 'user', content: prompt }],
+        usageContext: usageContext ?? { workload: 'background' },
       });
       return { content: resp.content };
     },
 
     // Backward-compatible sendMessage
-    async sendMessage(messages: AcpChatMessage[]): Promise<AcpResponse> {
+    async sendMessage(messages: AcpChatMessage[], usageContext?: LlmUsageContext): Promise<AcpResponse> {
       const text = messages.map(m => m.content).join('\n');
-      return this.sendPrompt(text);
+      return this.sendPrompt(text, usageContext ?? { workload: 'background' });
     },
 
     // No-op initialize for backward compat

@@ -25,6 +25,7 @@ import { createScreenshotStore } from './core/screenshot-store.js';
 import { createDocumentParser } from './core/document-parser.js';
 import { createAcpClient } from './core/acp-client.js';
 import { createInferenceProviderFromEnv } from './core/inference-provider.js';
+import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
 import { createToolExecutor } from './core/tool-executor.js';
@@ -336,7 +337,8 @@ async function main() {
   // process value. Publish the provider's resolved value so settings loaded
   // from the local dotenv file cannot diverge from tool/prompt safety limits.
   process.env.BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS = String(inferenceProvider.maxContextTokens);
-  const llmClient = inferenceProvider.createClient();
+  const llmUsageService = createLlmUsageService(db, { primaryProvider: inferenceProvider.id });
+  const llmClient = inferenceProvider.createClient({ usageService: llmUsageService });
   await llmClient.healthCheck().catch(() => {});
   console.log(
     `✅ LLM client ready (provider: ${inferenceProvider.id}, model: ${inferenceProvider.model}, active: ${llmClient.getActiveEndpoint()})`,
@@ -1033,6 +1035,7 @@ async function main() {
     filesystemMonitor,
     db,
     llmClient,
+    llmUsageService,
     toolExecutor,
     promptManager,
     conversationManager,

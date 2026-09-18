@@ -237,6 +237,53 @@ function createSchema(db: Database.Database): void {
 
   // ── project HTML artifact discovery/ownership projection ──
   migrateProjectArtifacts(db);
+
+  // ── local provider-reported LLM generation usage (indefinite raw history) ──
+  migrateLlmUsage(db);
+}
+
+/**
+ * Provider-reported generation usage, one row per actual model network send.
+ * Rows are intentionally retained indefinitely in v1; the read API selects a
+ * bounded window without throwing away history needed by future views.
+ */
+export function migrateLlmUsage(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS llm_usage_attempts (
+      id TEXT PRIMARY KEY,
+      operation_id TEXT NOT NULL,
+      attempt_ordinal INTEGER NOT NULL CHECK(attempt_ordinal >= 1),
+      workload TEXT NOT NULL
+        CHECK(workload IN ('interactive','background','system','unattributed')),
+      attempt_reason TEXT NOT NULL
+        CHECK(attempt_reason IN ('initial','auth_retry','stream_retry','fallback','health_probe')),
+      provider TEXT NOT NULL,
+      endpoint_key TEXT NOT NULL CHECK(endpoint_key IN ('ecs','ollama')),
+      api_mode TEXT NOT NULL,
+      model TEXT NOT NULL,
+      stream INTEGER NOT NULL CHECK(stream IN (0,1)),
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL
+        CHECK(status IN ('running','completed','partial','failed','interrupted')),
+      http_status INTEGER,
+      usage_reported INTEGER NOT NULL DEFAULT 0 CHECK(usage_reported IN (0,1)),
+      input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+      output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+      total_tokens INTEGER CHECK(total_tokens IS NULL OR total_tokens >= 0),
+      cache_read_tokens INTEGER CHECK(cache_read_tokens IS NULL OR cache_read_tokens >= 0),
+      cache_write_tokens INTEGER CHECK(cache_write_tokens IS NULL OR cache_write_tokens >= 0),
+      reasoning_tokens INTEGER CHECK(reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+      request_bytes INTEGER NOT NULL CHECK(request_bytes >= 0),
+      image_count INTEGER NOT NULL DEFAULT 0 CHECK(image_count >= 0),
+      error_class TEXT,
+      UNIQUE(operation_id, attempt_ordinal)
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_usage_started_model
+      ON llm_usage_attempts(started_at, model);
+    CREATE INDEX IF NOT EXISTS idx_llm_usage_workload_started
+      ON llm_usage_attempts(workload, started_at);
+  `);
 }
 
 /**

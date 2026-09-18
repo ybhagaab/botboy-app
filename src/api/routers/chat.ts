@@ -14,6 +14,7 @@ import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
 import { resolveBlessedModelId } from '../../core/inference-provider.js';
+import { createLlmUsageOperationId } from '../../core/llm-usage.js';
 import {
   createAnalyticsSchemaBriefingLoader,
   resolveConversationMode,
@@ -93,6 +94,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             maxTokens: 1200,
             responseFormat: { type: 'json_object' },
             think: false,
+            usageContext: { workload: 'interactive' },
           });
           const raw = response.content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           const start = raw.indexOf('{');
@@ -432,6 +434,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 ],
                 temperature: 0.3,
                 maxTokens: 2000,
+                usageContext: { workload: 'background' },
               });
 
               if (summaryResp.content && summaryResp.content.length > 50) {
@@ -699,9 +702,11 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // Wrap the stream in a single-retry helper. On transient network errors we restart
           // the entire vLLM stream — model regenerates from the same history. Costs one extra
           // inference but is robust against laptop sleep / wifi flaps / DNS blips.
+          const streamOperationId = createLlmUsageOperationId();
           const runStream = async (
             attempt: number,
             payloadConstraint?: { requireImageFree?: boolean; smallerThanBytes?: number },
+            operationId = streamOperationId,
           ): Promise<any> => {
             let streamResult: any = null;
             const gen = llmClient.chatCompletionStream({
@@ -721,6 +726,11 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
               // Blessed sibling override — same family/profile, body-only change.
               ...(modelOverride ? { model: modelOverride } : {}),
+              usageContext: {
+                workload: 'interactive',
+                operationId,
+                ...(attempt === 2 ? { retryReason: 'stream_retry' as const } : {}),
+              },
               ...(payloadConstraint ? { payloadConstraint } : {}),
             });
             let iterResult = await gen.next();
@@ -760,7 +770,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             const result = await runStream(3, {
               requireImageFree: true,
               smallerThanBytes: receipt.rejectedBodyBytes,
-            });
+            }, createLlmUsageOperationId());
             console.log('[Chat] Image-free payload recovery succeeded; continuing the original tool loop');
             return { handled: true, result };
           };
@@ -1202,7 +1212,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ? 'SYSTEM (internal): the user pressed Stop. Do not request any more tools. Briefly and honestly report: what you completed, what is in progress or unverified, and the natural next step if they want you to continue. Keep it short.'
               : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
           });
-          const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false, ...(modelOverride ? { model: modelOverride } : {}) });
+          const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false, usageContext: { workload: 'interactive' }, ...(modelOverride ? { model: modelOverride } : {}) });
           let iterResult = await gen.next();
           while (!iterResult.done) {
             const chunk = iterResult.value;

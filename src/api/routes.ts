@@ -29,6 +29,7 @@ import { createWorkspaceRouter } from './routers/workspace.js';
 import { createProductDocumentsRouter } from './routers/product-documents.js';
 import { createDocumentsRouter } from './routers/documents.js';
 import { createVisualAssetsRouter } from './routers/visual-assets.js';
+import { createLlmUsageRouter } from './routers/llm-usage.js';
 
 export type { RouterDeps } from './routers/deps.js';
 
@@ -56,6 +57,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createWorkspaceRouter(deps));
   router.use(createProductDocumentsRouter(deps));
   router.use(createVisualAssetsRouter(deps));
+  router.use(createLlmUsageRouter(deps));
   // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from
   // /product-documents — the writing workspace stays untouched.
   router.use(createDocumentsRouter(deps));

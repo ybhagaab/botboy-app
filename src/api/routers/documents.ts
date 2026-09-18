@@ -507,7 +507,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const startedAt = Date.now();
     let out: string;
     try {
-      out = await deps.agent.executeAction(task);
+      out = await deps.agent.executeAction(task, undefined, { workload: 'interactive' });
     } catch (error) {
       return res.status(502).json({ error: `BotBoy could not complete the edit: ${(error as Error).message}` });
     }

@@ -46,6 +46,7 @@ const API = '/api';
 const DOCUMENT_LIST_LIMIT = 100;
 const DOCUMENT_PREVIEW_LIMIT = 200_000;
 const DOCUMENT_DETAIL_CACHE_LIMIT = 3;
+const LLM_USAGE_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 const state = {
   loading: true,
@@ -55,6 +56,7 @@ const state = {
   projectDetails: new Map(),
   projectErrors: new Map(),
   health: null,
+  llmUsage: { data: null, error: '', loading: false, days: 30, timeZone: LLM_USAGE_TIME_ZONE, requestId: 0 },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
@@ -225,6 +227,7 @@ function parseRoute() {
   // Every other managed MCP profile uses the generic settings page.
   if (parts[0] === 'connections' && parts[1]) return { view: 'profile-settings', profileId: parts[1] };
   if (parts[0] === 'settings' && parts[1] === 'dashboard-sharing') return { view: 'publisher-settings' };
+  if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
   if (parts[0] === 'dashboards') return { view: parts[1] ? 'analytics-dashboard' : 'dashboards', dashboardId: parts[1] || '' };
   if (parts[0] === 'documents') {
     let artifactId = parts[1] || '';
@@ -742,7 +745,7 @@ function renderSidebar() {
       const active = route.view === view
         || (view === 'connections' && ['mcp-settings', 'profile-settings', 'mcp-add', 'mcp-edit'].includes(route.view))
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
-        || (view === 'settings' && route.view === 'publisher-settings');
+        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings'].includes(route.view));
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
     <section class="nav-section"><div class="nav-label"><span>Areas & projects</span></div><div class="area-tree">
@@ -3231,6 +3234,31 @@ async function restartMcpConnection() {
   }
 }
 
+// ── Local LLM generation usage (route-entry/manual refresh only) ──
+async function loadLlmUsage({ force = false } = {}) {
+  if (state.llmUsage.data?.requestedDays === state.llmUsage.days && !force && !state.llmUsage.error) return;
+  const requestId = ++state.llmUsage.requestId;
+  const requestedDays = state.llmUsage.days;
+  state.llmUsage.loading = true;
+  try {
+    const params = new URLSearchParams({
+      days: String(requestedDays),
+      timeZone: state.llmUsage.timeZone,
+    });
+    const payload = await request(`/llm-usage/daily?${params.toString()}`);
+    if (requestId !== state.llmUsage.requestId) return;
+    state.llmUsage.data = payload;
+    state.llmUsage.error = '';
+  } catch (error) {
+    if (requestId !== state.llmUsage.requestId) return;
+    state.llmUsage.error = error.message;
+  } finally {
+    if (requestId !== state.llmUsage.requestId) return;
+    state.llmUsage.loading = false;
+    if (state.route.view === 'llm-usage-settings') renderRoute();
+  }
+}
+
 // ── Explicitly confirmed S3/CloudFront snapshot publishing ──
 async function loadPublisherConfig({ force = false } = {}) {
   if (state.publisher.loading || (state.publisher.config && !force)) return;
@@ -5378,10 +5406,74 @@ function renderPipeline() {
     <section class="grid two-col" style="margin-top:16px"><article class="card"><div class="card-header"><h2 class="card-title">Processing state</h2><span class="pill ${health.totalFailures ? 'warn' : 'good'}">${health.totalFailures ? 'Attention' : 'Operational'}</span></div>${Object.entries(health.itemsByState || {}).map(([key, value]) => `<div class="health-row"><span class="status-dot good"></span><span><strong>${esc(key.replaceAll('_', ' '))}</strong><small>Recorded work-item state</small></span><strong>${number(value)}</strong></div>`).join('') || '<div class="empty-state">No processing-state rows.</div>'}</article><article class="card"><div class="card-header"><h2 class="card-title">Recent pipeline runs</h2><span class="card-meta">Latest ${number(runs.length)}</span></div>${runs.slice(0, 8).map(run => `<div class="health-row"><span class="status-dot ${run.status === 'completed' ? 'good' : run.status === 'failed' ? 'bad' : 'warn'}"></span><span><strong>${esc(run.pass || 'Pipeline pass')}</strong><small>${number(run.items_in)} in · ${number(run.items_out)} out</small></span><strong>${esc(run.status || 'unknown')}</strong></div>`).join('') || '<div class="empty-state">No recent pipeline runs.</div>'}</article></section>`;
 }
 
+function llmUsageToken(value) {
+  return value === null || value === undefined
+    ? '<span class="analytics-null" title="Provider did not report this detail">—</span>'
+    : number(value);
+}
+
+function llmUsageModelLabel(model) {
+  const raw = String(model || 'Unknown model');
+  const slash = raw.lastIndexOf('/');
+  return slash >= 0 ? raw.slice(slash + 1) : raw;
+}
+
+function llmUsageMetric(models, field) {
+  const values = models.map(model => model?.[field]).filter(value => typeof value === 'number' && Number.isFinite(value));
+  return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function llmUsageDateKey(date, timeZone) {
+  const values = new Map(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date).map(part => [part.type, part.value]));
+  return `${values.get('year')}-${values.get('month')}-${values.get('day')}`;
+}
+
+function renderLlmUsageSettings() {
+  if (!state.llmUsage.data && !state.llmUsage.error && !state.llmUsage.loading) void loadLlmUsage();
+  if (!state.llmUsage.data && state.llmUsage.loading) return loadingView();
+
+  const data = state.llmUsage.data;
+  const actions = `<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">${[30, 90, 365].map(days => `<button class="button small ${state.llmUsage.days === days ? '' : 'ghost'}" type="button" data-action="llm-usage-range" data-days="${days}">${days}d</button>`).join('')}<button class="button small" type="button" data-action="llm-usage-refresh">${icon('refresh', 14)} Refresh</button></div>`;
+  if (!data) {
+    return `${pageHead('Settings', 'LLM generation usage', 'Provider-reported usage from this BotBoy installation.', actions)}<section class="card pad"><div class="error-state">${esc(state.llmUsage.error || 'Usage is unavailable.')}<br><button class="button small" type="button" data-action="llm-usage-refresh">Try again</button></div></section>`;
+  }
+
+  const todayKey = llmUsageDateKey(new Date(), data.timeZone || state.llmUsage.timeZone);
+  const todayModels = data.days?.find(day => day.date === todayKey)?.models || [];
+  const todayAttempts = todayModels.reduce((sum, model) => sum + Number(model.attempts || 0), 0);
+  const coverage = data.coverage || {};
+  const runningAttempts = Number(coverage.runningAttempts || 0);
+  const terminalAttempts = Math.max(0, Number(coverage.attempts || 0) - runningAttempts);
+  const coverageIssues = Number(coverage.unknownAttempts || 0)
+    + Number(coverage.interruptedAttempts || 0)
+    + Number(coverage.unrecordedAttemptsSinceBoot || 0)
+    + Number(coverage.unattributedAttempts || 0);
+  const rows = (data.days || []).flatMap(day => (day.models || []).map(model => ({ day: day.date, ...model })));
+  const rangeBusy = state.llmUsage.loading ? `<span class="pill">Refreshing ${number(state.llmUsage.days)}d…</span>` : '';
+  const staleNotice = state.llmUsage.error
+    ? `<section class="card pad" style="margin-top:16px;border-color:var(--yellow)"><div class="metric-note warn"><strong>Refresh failed.</strong> ${esc(state.llmUsage.error)} Showing the last successful ${number(data.requestedDays)}-day result; the selected ${number(state.llmUsage.days)}-day range has not loaded.</div></section>`
+    : '';
+  const warning = coverageIssues > 0
+    ? `<section class="card pad" style="margin-top:16px;border-color:var(--yellow)"><div class="metric-note warn"><strong>Coverage is incomplete.</strong> ${number(coverage.unknownAttempts || 0)} attempt(s) lack provider usage, ${number(coverage.interruptedAttempts || 0)} were interrupted, ${number(coverage.unattributedAttempts || 0)} are unattributed, and ${number(coverage.unrecordedAttemptsSinceBoot || 0)} recorder persistence gap(s) occurred this boot. Known token totals below remain exact.${runningAttempts > 0 ? ` ${number(runningAttempts)} additional model attempt(s) are in progress and will join totals when terminal.` : ''}</div></section>`
+    : runningAttempts > 0
+      ? `<section class="card pad" style="margin-top:16px"><div class="metric-note"><strong>Terminal coverage is complete.</strong> ${number(terminalAttempts)} terminal attempt(s) are exact and ${number(runningAttempts)} model attempt(s) are currently in progress; in-flight rows join totals only when they finish.</div></section>`
+      : `<section class="card pad" style="margin-top:16px"><div class="metric-note good"><strong>Complete provider coverage for this range.</strong> All ${number(terminalAttempts)} terminal attempt(s) have explicit workload and no recorder gaps.</div></section>`;
+
+  return `${pageHead('Settings', 'LLM generation usage', `Local provider-reported attempts · loaded ${number(data.requestedDays)} days · ${esc(data.timeZone)} · raw history retained indefinitely`, actions)}
+    <section class="grid four-col"><article class="card pad"><div class="metric-label">Today total</div><div class="metric-value">${todayAttempts === 0 ? '0' : llmUsageToken(llmUsageMetric(todayModels, 'totalTokens'))}</div><div class="metric-note">Provider total tokens</div></article><article class="card pad"><div class="metric-label">Today input</div><div class="metric-value">${todayAttempts === 0 ? '0' : llmUsageToken(llmUsageMetric(todayModels, 'inputTokens'))}</div><div class="metric-note">Prompt/input tokens</div></article><article class="card pad"><div class="metric-label">Today output</div><div class="metric-value">${todayAttempts === 0 ? '0' : llmUsageToken(llmUsageMetric(todayModels, 'outputTokens'))}</div><div class="metric-note">Includes reasoning when provider totals do</div></article><article class="card pad"><div class="metric-label">Today calls</div><div class="metric-value">${number(todayAttempts)}</div><div class="metric-note">Interactive + background + system</div></article></section>
+    ${staleNotice}${warning}
+    <section class="card" style="margin-top:16px"><div class="card-header"><div><h2 class="card-title">Daily usage by model</h2><div class="card-meta">Cache and reasoning are provider detail subsets; they are not added to Total.</div></div>${rangeBusy}</div>${rows.length ? `<div class="analytics-table-wrap" data-scroll-key="settings:llm-usage:daily"><table class="analytics-table"><thead><tr><th>Day</th><th>Model</th><th class="analytics-number">Input</th><th class="analytics-number">Output</th><th class="analytics-number">Cache read</th><th class="analytics-number">Cache write</th><th class="analytics-number">Reasoning</th><th class="analytics-number">Total</th><th class="analytics-number">Calls</th><th>Workloads</th><th class="analytics-number">Unknown</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.day)}</td><td title="${attr(row.model)}"><strong>${esc(llmUsageModelLabel(row.model))}</strong></td><td class="analytics-number">${llmUsageToken(row.inputTokens)}</td><td class="analytics-number">${llmUsageToken(row.outputTokens)}</td><td class="analytics-number">${llmUsageToken(row.cacheReadTokens)}</td><td class="analytics-number">${llmUsageToken(row.cacheWriteTokens)}</td><td class="analytics-number">${llmUsageToken(row.reasoningTokens)}</td><td class="analytics-number"><strong>${llmUsageToken(row.totalTokens)}</strong></td><td class="analytics-number">${number(row.attempts)}</td><td><span class="card-meta">I ${number(row.interactiveAttempts)} · B ${number(row.backgroundAttempts)} · S ${number(row.systemAttempts)}</span></td><td class="analytics-number">${number(row.unknownAttempts)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-state">Usage tracking starts after this BotBoy update. Make a chat request or let a background pass run, then refresh.</div>'}</section>`;
+}
+
 function renderSettings() {
   const dark = document.documentElement.dataset.theme !== 'light';
   return `${pageHead('Workspace', 'Settings', 'Appearance, diagnostics, and compatibility tools for the local dashboard.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
+    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
 // Repaints rebuild #app-view from scratch, which destroys any text the
@@ -5497,6 +5589,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   const previousRouteKey = JSON.stringify(state.route ?? {});
   state.route = parseRoute();
   const routeChanged = JSON.stringify(state.route) !== previousRouteKey;
+  if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
   // hard-reload restore, even if the owner later returns to the same hash.
@@ -5566,6 +5659,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'pipeline') html = renderPipeline();
   if (state.route.view === 'settings') html = renderSettings();
   if (state.route.view === 'publisher-settings') html = renderPublisherSettings();
+  if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   view.innerHTML = html;
   if (state.route.view === 'documents') {
@@ -6185,6 +6279,18 @@ function bindEvents() {
     if (action === 'dismiss-relation') void dismissRelation(target.dataset.project, target.dataset.other);
     if (action === 'discard-item') void discardItem(target.dataset.item, target.dataset.project);
     if (action === 'restore-discard') void restoreDiscardedItem(target.dataset.item);
+    if (action === 'llm-usage-refresh') {
+      void loadLlmUsage({ force: true });
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'llm-usage-range') {
+      const days = Number(target.dataset.days);
+      if ([30, 90, 365].includes(days) && days !== state.llmUsage.days) {
+        state.llmUsage.days = days;
+        void loadLlmUsage({ force: true });
+        renderRoute({ preserveScroll: true, userAction: true });
+      }
+    }
     if (action === 'retry-core' || action === 'refresh-core') void loadCore();
     if (action === 'documents-refresh') void refreshDocuments();
     if (action === 'documents-retry-list') void loadDocuments({ force: true });

@@ -2,54 +2,50 @@
 
 **Stop assembling your own context. Start every day already caught up.**
 
-BotBoy is a private productivity brain that lives on your Mac. It watches the
-work you choose to share with it — Slack, Outlook, SharePoint, DataCentral
-ETL jobs, local folders, your browser — and turns the noise into organized
-projects, living briefs, and a chat assistant that genuinely knows what you
-are working on. Nothing leaves your machine: captures, database, and
-documents stay local, always.
+BotBoy is a local-first productivity brain for your Mac. It watches the work
+you choose to share with it—Slack, Outlook, SharePoint, DataCentral ETL jobs,
+local folders, and your browser—and turns that activity into organized
+projects, living briefs, and a chat assistant grounded in your work. Evidence,
+document copies, generated files, and credentials stay local by default;
+selected content needed for LLM requests goes through the authenticated team
+gateway.
 
 ## Why teams use it
 
 **The context tax is real.** Every week you re-read threads to remember where
 a decision landed, re-open documents to check what changed, and re-download
 the same report outputs to build the same deck. BotBoy pays that tax for you:
-it captures as work happens, files evidence into the right project, keeps
-each project's brief current, and hands you the receipts when you ask.
+it captures as work happens, files evidence into the right project, keeps each
+project's brief current, and hands you the receipts when you ask.
 
 ## Product tour
 
-The screenshots use synthetic demo labels and obfuscated counts — no captured
+The screenshots use synthetic demo labels and obfuscated counts—no captured
 workspace content, private messages, or personal data.
 
 ### Your day, prioritized
 
-BotBoy's redesigned Today view is cleaner, calmer, and easier to navigate than
-before. Priorities and blockers are grouped by project instead of repeated
-across long lists, while meaningful changes use concise, evidence-backed
-summaries. Less clutter, more context, faster action.
+BotBoy's Today view groups priorities and blockers by project while meaningful
+changes use concise, evidence-backed summaries. Less clutter, more context,
+faster action.
 
 ![BotBoy Today overview with a prioritized attention brief](docs/screenshots/today-overview.png)
 
 ### Documents that know your projects
 
-BotBoy syncs the SharePoint documents you work in — revisions, comments, open
-threads — renders them in a built-in reader, and drafts or edits documents on
-request. Every change is staged for your explicit approval before anything
-touches SharePoint. When someone comments on your doc, BotBoy surfaces it in
-minutes, not hours.
+BotBoy syncs the SharePoint documents you work in—revisions, comments, open
+threads—renders them in a built-in reader, and drafts or edits documents on
+request. Every change is staged for explicit approval before anything touches
+SharePoint.
 
 ![BotBoy document workspace](docs/screenshots/documents.png)
 
 ### Your ETL jobs, without the tab-juggling
 
-Analysts live in DataCentral. BotBoy speaks it natively: ask about a Datanet
-job run, paste a run URL, or just say "grab this week's report cuts" — BotBoy
-checks the run, diagnoses failures, downloads the output, and assembles the
-final report file. The weekly ritual of downloading each SQL output by hand
-is over. Submitting, restarting, or creating ETL work happens only when you
-explicitly ask — and heavyweight warehouse SQL always runs on its dedicated,
-read-only analytics connection.
+Ask about a Datanet job run, paste a run URL, or ask BotBoy to fetch report
+outputs and assemble the final file. Submitting, restarting, or creating ETL
+work happens only when you explicitly ask; heavyweight warehouse SQL uses its
+dedicated read-only analytics connection.
 
 ### Connections and pipeline, in the open
 
@@ -59,88 +55,74 @@ read-only analytics connection.
     <td width="50%"><img src="docs/screenshots/pipeline-health.png" alt="BotBoy pipeline health" /></td>
   </tr>
   <tr>
-    <td align="center"><strong>Connections</strong><br />Slack channels, Outlook/SharePoint, Datanet ETL, warehouse SQL, local folders, and browser capture — each one opt-in, configured from the dashboard with guided setup.</td>
-    <td align="center"><strong>Pipeline health</strong><br />Read-only visibility into capture, extraction, organization, and synthesis, so you always know what BotBoy is doing.</td>
+    <td align="center"><strong>Connections</strong><br />Slack, Outlook/SharePoint, Datanet ETL, warehouse SQL, local folders, and browser capture—each opt-in and guided from the dashboard.</td>
+    <td align="center"><strong>Pipeline health</strong><br />Read-only visibility into capture, extraction, organization, and synthesis.</td>
   </tr>
 </table>
 
 ## What you get
 
-- **Capture without note-taking** — Slack messages in channels you pick,
-  Outlook mail and calendar, SharePoint revisions and comments, files in
-  watched folders, pages you visit. All opt-in, all local.
-- **Projects that assemble themselves** — captured evidence routes itself
-  into project briefs that stay current as work happens, receipts one click
-  away.
-- **A chat assistant with your context** — "what needs my attention?",
-  "what changed in the HLD?", "check my ETL jobs and pull yesterday's
-  output", "draft the status update" — answered from your own evidence,
-  with links back to sources.
-- **Analytics on tap** — governed, read-only SQL against your team's
-  warehouse, dashboards you can refresh and share deliberately, and Datanet
-  job outputs fetched straight into your workspace.
-- **Writes you approve, always** — BotBoy never edits a document, posts
-  anything, or touches a production pipeline without your explicit request.
-  Reads are free; changes are yours to authorize.
-- **Authentication that heals itself** — Amazon sessions expire; BotBoy
-  notices, silently re-establishes what it can, and when it truly needs you,
-  opens a terminal card with the one command to run.
-
-## Prerequisites
-
-- macOS (Apple Silicon or Intel)
-- Node.js 20+ (`node --version`)
-- A personal credentials file from the owner (one download link — no AWS
-  account or cloud setup needed)
+- **Capture without note-taking** — capture only the sources you enable.
+- **Projects that assemble themselves** — evidence routes into living project
+  briefs with links back to sources.
+- **A chat assistant with your context** — ask what needs attention, what
+  changed, or for a draft grounded in your own evidence.
+- **Analytics on tap** — governed read-only SQL, refreshable dashboards, and
+  Datanet result downloads.
+- **Writes you approve** — BotBoy does not publish documents, send messages,
+  or change production pipelines without an explicit request and the relevant
+  review boundary.
 
 ## Install
 
+You need macOS, Google Chrome, Git, Node.js 20+, and the private BotBoy
+credential attachment sent by the owner. No AWS account or `aws login` is
+required.
+
+Download the credential attachment to Downloads or Desktop, then run:
+
 ```bash
-git clone https://github.com/ybhagaab/botboy-app.git
-cd botboy-app
+git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
+cd ~/botboy-app
+npm install
 ./start.sh
 ```
 
-First launch installs dependencies and builds automatically (a few minutes),
-then opens the dashboard at `http://localhost:7778`. Full steps — credentials,
-connecting your data sources, the optional Dock app — are in
-**[docs/TEAMMATE_SETUP.md](docs/TEAMMATE_SETUP.md)**.
+Allow a few minutes on first run. BotBoy imports the credential attachment
+(`.env` or owner-issued ZIP), builds itself, opens the dashboard, and attempts
+to install `BotBoy.app` in Applications. Detailed connections and support
+steps are in **[docs/TEAMMATE_SETUP.md](docs/TEAMMATE_SETUP.md)**.
 
 ## Update
 
 ```bash
+cd ~/botboy-app
 ./start.sh --update
 ```
 
-This is the recommended teammate update path. It backs up tracked BotBoy
-customizations to `~/.personal-productivity-tracker/update-backups/`,
-fast-forwards from `botboy-app/main`, and three-way reapplies each customized
-file independently before rebuilding. Clean merges remain active; overlapping
-customizations are preserved in a `-needs-reapply` folder while the new base
-release stays usable. Untracked files are never deleted.
-
-BotBoy UI self-customization is supported. Use this updater instead of plain
-`git pull` whenever BotBoy has changed its own source.
-
-If an older checkout already fails during `git pull`, it does not have this
-updater yet. Follow **One-time transition from an older release** in
-[`docs/TEAMMATE_SETUP.md`](docs/TEAMMATE_SETUP.md): back up the tracked patch,
-restore, pull once, then run ordinary `./start.sh`. Do not run `--update` again
-in that same cycle; use it for every release after that.
+Always use this updater instead of `git pull`. It preserves compatible tracked
+customizations, saves overlaps for deliberate reapplication, and never removes
+untracked files or home-directory evidence.
 
 ## Privacy
 
-BotBoy is single-user and local-first. Your evidence database, document
-copies, and credentials live in `~/.personal-productivity-tracker/` on your
-Mac — not in this repository, and not on any shared server. The only network
-calls are to the sources you connect and to the team's authenticated LLM
-gateway for synthesis. Deleting that folder removes everything.
+BotBoy is single-user and local-first. Its evidence database, document copies,
+generated files, and credentials live under
+`~/.personal-productivity-tracker/`. Selected text and bounded visual inputs
+needed for LLM requests go through the authenticated team gateway. Connections
+communicate only with services you enable; explicit writes keep their own
+approval boundaries.
 
 ## Help
 
-Run `./start.sh --doctor` and send the output to the owner. It checks Node,
-build state, native modules, credentials, the port, and the served UI, and
-includes the recent log lines.
+```bash
+cd ~/botboy-app
+./start.sh --doctor
+```
+
+Doctor checks the environment, build, credential status, listener, UI, and a
+recent log tail. It never prints credentials or tokens, but review the report
+for internal titles, paths, or work context before sharing it with the owner.
 
 ---
 *This repository is the app distribution. It receives release snapshots; development happens elsewhere.*

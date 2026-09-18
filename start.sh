@@ -194,9 +194,10 @@ if ! curl -s http://127.0.0.1:9222/json >/dev/null 2>&1; then
   done
 fi
 
-# Teammate zero-config: if a downloaded botboy-credentials*.env is sitting in
-# ~/Downloads or ~/Desktop, fold it into ~/.personal-productivity-tracker/.env
-# (and delete the download) before settings are loaded. No-op otherwise.
+# Teammate zero-config: if an owner-issued botboy-credentials plaintext file
+# or ZIP is sitting in ~/Downloads or ~/Desktop, fold its validated pair into
+# ~/.personal-productivity-tracker/.env (and delete the attachment) before
+# settings are loaded. No-op otherwise.
 bash "$PROJ_DIR/scripts/import-credentials.sh" 2>&1 | tee -a "$LOG_FILE" || true
 
 # Load only inference-related local settings before selecting provider defaults.

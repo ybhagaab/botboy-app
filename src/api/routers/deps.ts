@@ -22,6 +22,7 @@ import type { PipelineOrchestrator } from '../../core/pipeline-orchestrator.js';
 import type { ProjectRelationsEngine } from '../../core/project-relations.js';
 import type { ChannelDigester } from '../../core/channel-digest.js';
 import type { LlmClient } from '../../core/llm-client.js';
+import type { LlmUsageService } from '../../core/llm-usage.js';
 import type { ToolExecutor } from '../../core/tool-executor.js';
 import type { PromptManager } from '../../core/prompt-manager.js';
 import type { ConversationManager } from '../../core/conversation-manager.js';
@@ -56,6 +57,7 @@ export interface RouterDeps {
   channelDigester?: ChannelDigester;
   // Chat streaming loop deps (previously accessed via `(deps as any)`)
   llmClient?: LlmClient;
+  llmUsageService?: LlmUsageService;
   toolExecutor?: ToolExecutor;
   promptManager?: PromptManager;
   conversationManager?: ConversationManager;

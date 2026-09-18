@@ -28,6 +28,7 @@ import { getSetting, setSetting } from './storage.js';
 import { resolveOwnerIdentity } from './owner-identity.js';
 import { resolveAnalyticsContextDir } from './analytics-context.js';
 import type { EtlToolCall } from './etl-adhoc.js';
+import type { LlmUsageContext } from './llm-usage.js';
 
 export interface EtlOnboardingStatus {
   state: 'idle' | 'running' | 'completed' | 'failed';
@@ -80,6 +81,7 @@ interface LlmLike {
     maxTokens?: number;
     responseFormat?: { type: 'json_object' };
     think?: boolean;
+    usageContext?: LlmUsageContext;
   }): Promise<{ content: string }>;
 }
 
@@ -294,6 +296,7 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
           maxTokens: 2000,
           responseFormat: { type: 'json_object' },
           think: false,
+          usageContext: { workload: 'background' },
         });
         const parsed = parseJson(response.content);
         const list: Array<Record<string, any>> = Array.isArray(parsed.assignments) ? parsed.assignments : [];
@@ -500,6 +503,7 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
       temperature: 0.2,
       maxTokens: synthesisMaxTokens,
       think: false,
+      usageContext: { workload: 'background' },
     });
     const body = response.content.trim();
     if (!body.startsWith('#')) throw new Error('synthesis did not return a markdown brief');

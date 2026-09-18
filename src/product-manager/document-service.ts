@@ -921,6 +921,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
           maxTokens: maxCompletionTokens,
           responseFormat: { type: 'json_object' },
           think: false,
+          usageContext: { workload: 'interactive' },
         });
       };
 
@@ -1256,6 +1257,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
             responseFormat: { type: 'json_object' },
             think: true,
             reasoningEffort: 'max',
+            usageContext: { workload: 'interactive' },
           });
           const raw = response.content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           const start = raw.indexOf('{');
