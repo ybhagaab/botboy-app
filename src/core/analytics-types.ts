@@ -101,9 +101,11 @@ export interface AnalyticsRun {
   widgetsCompleted: number;
   widgetsSucceeded: number;
   currentWidgetId?: string;
+  /** Primary lane selected by the current/last worker claim. */
+  lane?: 'sql-mcp' | 'etl';
   /** Owner asked to stop; the worker honors it between widgets. */
   cancelRequested: boolean;
-  /** Widget ids currently executing (populated for running runs; the pool runs up to 6). */
+  /** Widget ids currently executing. SQL is globally bounded; an ETL phase may run every remaining widget concurrently over distinct scratch pairs. */
   runningWidgetIds?: string[];
   queuedAt: string;
   startedAt?: string;

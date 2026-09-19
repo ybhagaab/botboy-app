@@ -11,15 +11,29 @@ import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
  * availability-switched Datanet ETL fallback. Invariants under test:
  *   - the lane is chosen once per RUN from live server state;
  *   - sql-context running ⇒ the ETL runner is never consulted;
- *   - ETL lane serializes widgets (one scratch pair) and stamps lane
- *     provenance on every result with sql-lane-identical cell coercion;
+ *   - ETL lane runs all widgets concurrently over distinct scratch pairs and
+ *     stamps lane provenance on every result with sql-lane-identical cell coercion;
  *   - a non-ok composite outcome fails ONLY that widget, with the runner's
  *     actionable message (error + nextAction) preserved.
  */
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+function tool(name: string) {
+  return { name, inputSchema: {}, risk: 'read' as const };
+}
+
 function server(id: string, overrides: Partial<McpServerSnapshot> = {}): McpServerSnapshot {
+  const tools = id === 'sql-context'
+    ? ['connection_status', 'run_query'].map(tool)
+    : id === 'a2-analytics'
+      ? [
+          'datanet_search', 'datanet_create_profile', 'datanet_create_job',
+          'datanet_get_latest_run', 'datanet_update_profile_sql',
+          'datanet_submit_run', 'datanet_get_job_run_status',
+          'datanet_alter_run', 'datanet_get_job_run_error', 'datanet_download_results',
+        ].map(tool)
+      : [];
   return {
     id,
     kind: 'managed',
@@ -28,8 +42,9 @@ function server(id: string, overrides: Partial<McpServerSnapshot> = {}): McpServ
     configured: true,
     state: 'running',
     packageVersion: '1.0.0',
-    tools: [],
+    tools,
     restartCount: 0,
+    lastHealthyAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...overrides,
   } as McpServerSnapshot;
@@ -102,16 +117,20 @@ describe('analytics dashboard lanes (A4)', () => {
     }));
   }
 
-  it('selectDashboardLane: sql-context primacy, ETL only when SQL is down and ETL usable', () => {
+  it('selectDashboardLane: SQL needs a fresh health/tool receipt; ETL needs a running capability-complete runtime', () => {
     const sqlUp = server('sql-context');
     const sqlDown = server('sql-context', { state: 'stopped' });
-    const etlOk = server('a2-analytics', { state: 'stopped' }); // state irrelevant: enabled+configured is the bar
+    const sqlStale = server('sql-context', { lastHealthyAt: '2026-01-01T00:00:00Z' });
+    const etlOk = server('a2-analytics');
+    const etlStopped = server('a2-analytics', { state: 'stopped' });
     const etlUnconfigured = server('a2-analytics', { configured: false });
     expect(selectDashboardLane([sqlUp, etlOk])).toBe('sql-mcp');
+    expect(selectDashboardLane([sqlStale, etlOk])).toBe('etl');
     expect(selectDashboardLane([sqlDown, etlOk])).toBe('etl');
-    expect(selectDashboardLane([sqlDown, etlUnconfigured])).toBe('sql-mcp'); // no lane to switch to
-    expect(selectDashboardLane([etlOk])).toBe('etl');                        // no sql server at all
-    expect(selectDashboardLane([])).toBe('sql-mcp');
+    expect(selectDashboardLane([sqlDown, etlStopped])).toBeNull();
+    expect(selectDashboardLane([sqlDown, etlUnconfigured])).toBeNull();
+    expect(selectDashboardLane([etlOk])).toBe('etl');
+    expect(selectDashboardLane([])).toBeNull();
   });
 
   it('recognizes only pre-execution runtime churn as safe for same-lane retry', () => {
@@ -173,7 +192,7 @@ describe('analytics dashboard lanes (A4)', () => {
   it('sql-context down + ETL usable: ALL widgets run through the composite in parallel, with lane provenance and coerced cells', async () => {
     const etl = fakeEtlRunner({ delayMs: 15 });
     const service = makeService(
-      [server('sql-context', { state: 'stopped' }), server('a2-analytics', { state: 'stopped' })],
+      [server('sql-context', { state: 'stopped' }), server('a2-analytics')],
       etl.runner,
     );
     const dashboard = service.createDashboard({
@@ -231,18 +250,18 @@ describe('analytics dashboard lanes (A4)', () => {
     expect(dash.status).toBe('degraded');
   });
 
-  it('without an ETL runner, behavior is exactly pre-A4 even when sql-context is down', async () => {
+  it('defers without calling data tools until one lane becomes ready', async () => {
     const service = makeService([server('sql-context', { state: 'stopped' })]);
     const dashboard = service.createDashboard({
-      title: 'Legacy',
+      title: 'No lane',
       widgets: [{ kind: 'metric', title: 'M', sql: 'SELECT 7' }],
     } as any);
     service.enqueueRefresh(dashboard.id, 'manual');
-    expect(await service.processQueuedRuns(1)).toBe(1);
-    // The sql lane was attempted (and, with this fake, succeeded) — no rerouting.
-    expect(sqlLaneCalls).toEqual(['SELECT 7']);
-    const [widget] = widgetResults(dashboard.id);
-    expect(widget.result.lane).toBe('sql-mcp');
+    expect(await service.processQueuedRuns(1)).toBe(0);
+    expect(sqlLaneCalls).toEqual([]);
+    const run = db().prepare('SELECT status, error FROM analytics_runs LIMIT 1').get() as any;
+    expect(run.status).toBe('queued');
+    expect(run.error).toContain('No analytics data lane is ready yet');
   });
 });
 
@@ -286,16 +305,9 @@ describe('cross-lane retry + escalation', () => {
 
   function servers(overrides: { sqlState?: string; etlConfigured?: boolean } = {}) {
     return [
-      {
-        id: 'sql-context', kind: 'managed', displayName: 'sql', enabled: true, configured: true,
-        state: overrides.sqlState ?? 'running', packageVersion: '1', tools: [], restartCount: 0, updatedAt: 'x',
-      },
-      {
-        id: 'a2-analytics', kind: 'managed', displayName: 'a2', enabled: true,
-        configured: overrides.etlConfigured ?? true,
-        state: 'stopped', packageVersion: '1', tools: [], restartCount: 0, updatedAt: 'x',
-      },
-    ] as unknown as McpServerSnapshot[];
+      server('sql-context', { state: (overrides.sqlState ?? 'running') as McpServerSnapshot['state'] }),
+      server('a2-analytics', { configured: overrides.etlConfigured ?? true }),
+    ];
   }
 
   it('infra failure on the sql lane retries once on the ETL lane and recovers', async () => {
@@ -453,7 +465,7 @@ describe('sql-lane empty error detail', () => {
 
   it('substitutes an actionable message when the connector returns no detail', async () => {
     const mcp = {
-      listServers: async () => [] as McpServerSnapshot[], // no other lane
+      listServers: async () => [server('sql-context')], // ready SQL lane, no alternate
       callTool: async () => ({ isError: true, text: 'Error: ' }),
     } as unknown as McpManager;
     const service = createAnalyticsDashboardService({ db: storage.getDb(), mcpManager: mcp });

@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import type Database from 'better-sqlite3';
 import type { McpManager } from './mcp-types.js';
 import { endpointContextTokens } from './limits.js';
+import { sqlDashboardLaneUsable } from './analytics-runners.js';
 import { listAnalyticsContext, loadAnalyticsContext } from './analytics-context.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -383,8 +384,8 @@ export function createAnalyticsSchemaBriefingLoader(
         serverStamp = String(server?.updatedAt ?? 'no-server');
         if (!server?.enabled || !server.configured) {
           sqlStatusLine = 'Managed SQL connector: not configured — schema presets unavailable this turn.';
-        } else if (server.state !== 'running' && server.state !== 'degraded') {
-          sqlStatusLine = `Managed SQL connector: ${server.state} — schema presets unavailable this turn (restore at #/connections/sql-context).`;
+        } else if (!sqlDashboardLaneUsable(server)) {
+          sqlStatusLine = `Managed SQL connector: ${server.state === 'running' ? 'not data-ready (warehouse health/tool receipt is stale or incomplete)' : server.state} — schema presets unavailable this turn; use local analytics knowledge and the active data lane.`;
         } else {
           try {
             const presetResult = await mcpManager.callTool('sql-context', 'list_presets', {}, { source: 'dashboard', timeoutMs: 90_000 });

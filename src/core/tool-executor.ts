@@ -375,9 +375,9 @@ export function createToolExecutor(
     }, null, 1);
   }
 
-  // Lazy ad-hoc runner: one scratch pair per user, reused across queries
-  // (etl-analytics.md A1). Shares rawEtlCall so Sentry self-heal applies to
-  // every step of the composite.
+  // Lazy ad-hoc runner over the shared scratch-pair pool. Concurrent callers
+  // claim distinct profile/job pairs; only calls sharing one job serialize.
+  // Shares rawEtlCall so Sentry self-heal applies to every composite step.
   let etlRunner: QueryRunner | null = null;
   function getEtlRunner(): QueryRunner {
     if (!etlRunner) etlRunner = createEtlQueryRunner({ db, call: rawEtlCall });

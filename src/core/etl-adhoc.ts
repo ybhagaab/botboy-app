@@ -133,10 +133,11 @@ export interface ScratchPair { profileId: number; jobId: string; slot: number }
 
 /**
  * Runaway fuse, NOT capacity policy: Datanet handles enormous parallel run
- * counts fine (owner ruling). This only stops a BotBoy bug from creating
- * profiles in a loop — same spirit as the local-folders EMFILE fuse.
+ * counts fine (owner ruling). 64 covers the supported two concurrent
+ * 24-widget dashboards plus interactive-chat headroom; this only stops a
+ * BotBoy bug from creating profiles in a loop.
  */
-export const SCRATCH_POOL_FUSE = 32;
+export const SCRATCH_POOL_FUSE = 64;
 
 /** Claim ledgers shared across ALL runner instances on one db (chat runner
  * and dashboard runner must never claim the same pair concurrently). */

@@ -12,12 +12,17 @@ export function createAnalyticsScheduler(options: {
   db: Database.Database;
   analyticsService: AnalyticsDashboardService;
   pollIntervalMs?: number;
+  /** Whole-dashboard concurrency. Two prevents head-of-line blocking while
+   * keeping aggregate warehouse/ETL pressure bounded. */
+  runConcurrency?: number;
 }): AnalyticsScheduler {
   const db = options.db;
   const analyticsService = options.analyticsService;
   const pollIntervalMs = Math.max(1_000, options.pollIntervalMs ?? 5_000);
+  const runConcurrency = Math.max(1, Math.min(2, Math.floor(options.runConcurrency ?? 2)));
   let timer: NodeJS.Timeout | null = null;
-  let currentRun: Promise<number> | null = null;
+  let fillOperation: Promise<number> | null = null;
+  let activeRunSlots = 0;
 
   function nextOccurrence(row: any): { nextRunAt: string; error: string | null } {
     try {
@@ -78,20 +83,36 @@ export function createAnalyticsScheduler(options: {
     return advanced;
   }
 
+  function launchRunSlot(): void {
+    activeRunSlots += 1;
+    let processed = 0;
+    void analyticsService.processQueuedRuns(1)
+      .then(count => { processed = count; })
+      .catch(error => console.error('[Analytics scheduler] run slot failed:', error))
+      .finally(() => {
+        activeRunSlots = Math.max(0, activeRunSlots - 1);
+        // A completed claimed run may have exposed another queued row. Refill
+        // immediately rather than waiting for the next 5s tick. Empty probes
+        // do not recurse.
+        if (processed > 0 && timer) {
+          void runDueNow().catch(error => console.error('[Analytics scheduler] refill failed:', error));
+        }
+      });
+  }
+
   function runDueNow(): Promise<number> {
-    if (currentRun) return Promise.resolve(0);
+    if (fillOperation) return Promise.resolve(0);
     const operation = (async () => {
       const runsRecovered = analyticsService.recoverInterruptedRuns();
       const schedulesAdvanced = enqueueDueSchedules();
-      // One whole run at a time protects the analytical source. The service
-      // also has an in-process lock and atomically claims the durable row.
-      const runsProcessed = await analyticsService.processQueuedRuns(1);
-      return runsRecovered + schedulesAdvanced + runsProcessed;
+      const slotsToFill = Math.max(0, runConcurrency - activeRunSlots);
+      for (let slot = 0; slot < slotsToFill; slot++) launchRunSlot();
+      return runsRecovered + schedulesAdvanced + slotsToFill;
     })();
-    currentRun = operation.finally(() => {
-      currentRun = null;
+    fillOperation = operation.finally(() => {
+      fillOperation = null;
     });
-    return currentRun;
+    return fillOperation;
   }
 
   function start(): void {

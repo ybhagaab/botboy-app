@@ -3,12 +3,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { createStorage, StorageLayer, setSetting } from './storage.js';
-import { createEtlQueryRunner, type EtlToolCall } from './etl-adhoc.js';
+import { createEtlQueryRunner, SCRATCH_POOL_FUSE, type EtlToolCall } from './etl-adhoc.js';
 
 /**
- * The mcp_etl_run_query composite (etl-analytics A1): one scratch pair per
- * user created once and reused via SQL revisions; structured errors that
- * name the next action; timeout ≠ failure; self-heal exactly once.
+ * The mcp_etl_run_query composite (etl-analytics A1): a shared scratch-pair
+ * pool gives concurrent callers distinct reusable profile/job pairs;
+ * structured errors name the next action; timeout ≠ failure; self-heal once.
  */
 describe('etl-adhoc query runner', () => {
   let storage: StorageLayer;
@@ -267,7 +267,7 @@ describe('etl-adhoc query runner', () => {
     const fake = fakeEtl();
     setSetting(storage.getDb(), 'etl.adhoc.alias', 'ybhagaab');
     setSetting(storage.getDb(), 'etl.adhoc.pairs',
-      Array.from({ length: 32 }, (_, i) => ({ profileId: 200 + i, jobId: String(7000 + i), slot: i + 1 })));
+      Array.from({ length: SCRATCH_POOL_FUSE }, (_, i) => ({ profileId: 200 + i, jobId: String(7000 + i), slot: i + 1 })));
     fake.when('datanet_get_latest_run', () => ({ isError: false, text: JSON.stringify({ id: 1, status: 'EXECUTING' }) }));
     const q = runner(fake);
     const result = await q.runQuery({ sql: 'select overload' });

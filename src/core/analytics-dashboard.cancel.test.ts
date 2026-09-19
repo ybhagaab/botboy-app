@@ -30,7 +30,16 @@ describe('analytics stop-refresh', () => {
   ].join('\n');
 
   function fakeMcp(): McpManager {
+    const sqlServer = {
+      id: 'sql-context', kind: 'managed', displayName: 'sql-context', enabled: true,
+      configured: true, state: 'running', packageVersion: '1', restartCount: 0,
+      lastHealthyAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      tools: ['connection_status', 'run_query'].map(name => ({ name, inputSchema: {}, risk: 'read' })),
+    } as any;
     return {
+      listServers: async () => [sqlServer],
+      getServer: async (id: string) => id === 'sql-context' ? sqlServer : null,
+      testConnection: async () => ({ isError: false, text: 'Connected\n', serverId: 'sql-context', toolName: 'connection_status', durationMs: 1 }),
       callTool: async (_server: string, _tool: string, args: any) => {
         const sql = String(args?.sql || '');
         sqlCalls.push(sql);

@@ -21,7 +21,15 @@ function runningMcp(overrides: Partial<Record<string, unknown>> = {}) {
   const manager = {
     calls,
     async getServer(_id: string) {
-      return { enabled: true, configured: true, state: 'running', updatedAt: '2026-09-04T00:00:00Z', ...overrides };
+      return {
+        enabled: true,
+        configured: true,
+        state: 'running',
+        lastHealthyAt: new Date().toISOString(),
+        updatedAt: '2026-09-04T00:00:00Z',
+        tools: ['connection_status', 'run_query'].map(name => ({ name, inputSchema: {}, risk: 'read' })),
+        ...overrides,
+      };
     },
     async callTool(_server: string, tool: string, args: any) {
       calls.push({ tool, args });

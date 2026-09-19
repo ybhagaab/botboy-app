@@ -30,6 +30,80 @@ export type DashboardLaneId = 'sql-mcp' | 'etl';
 
 export type WidgetFailureClass = 'content' | 'infra';
 
+const SQL_REQUIRED_TOOLS = ['connection_status', 'run_query'] as const;
+const ETL_REQUIRED_TOOLS = [
+  'datanet_search',
+  'datanet_create_profile',
+  'datanet_create_job',
+  'datanet_get_latest_run',
+  'datanet_update_profile_sql',
+  'datanet_submit_run',
+  'datanet_get_job_run_status',
+  'datanet_alter_run',
+  'datanet_get_job_run_error',
+  'datanet_download_results',
+] as const;
+/** Health runs every 60s and may spend 30s checking the warehouse. Anything
+ * older than 150s is not a current data-readiness receipt. */
+const SQL_HEALTH_FRESH_MS = 150_000;
+
+function requiredToolsAvailable(server: McpServerSnapshot | null | undefined, names: readonly string[]): boolean {
+  if (!server) return false;
+  const available = new Set((server.tools ?? []).map(tool => tool.name));
+  return names.every(name => available.has(name));
+}
+
+function timestampMs(value: string | undefined): number {
+  if (!value) return Number.NaN;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(' ', 'T')}Z`
+    : value;
+  return Date.parse(normalized);
+}
+
+/** Process/capability precondition for a fresh SQL connection probe. */
+export function sqlDashboardLaneCandidate(server: McpServerSnapshot | null | undefined): boolean {
+  return !!server
+    && server.enabled
+    && server.configured
+    && server.state === 'running'
+    && requiredToolsAvailable(server, SQL_REQUIRED_TOOLS);
+}
+
+/** Snapshot-only SQL readiness for prompt routing and retry eligibility. */
+export function sqlDashboardLaneUsable(
+  server: McpServerSnapshot | null | undefined,
+  nowMs = Date.now(),
+): boolean {
+  if (!sqlDashboardLaneCandidate(server)) return false;
+  const healthyAt = timestampMs(server?.lastHealthyAt);
+  return Number.isFinite(healthyAt) && nowMs - healthyAt <= SQL_HEALTH_FRESH_MS;
+}
+
+/** A2 runtime/capability readiness for the deterministic ETL composite. */
+export function etlDashboardLaneUsable(
+  server: McpServerSnapshot | null | undefined,
+  etlRunnerPresent = true,
+): boolean {
+  return etlRunnerPresent
+    && !!server
+    && server.enabled
+    && server.configured
+    && server.state === 'running'
+    && requiredToolsAvailable(server, ETL_REQUIRED_TOOLS);
+}
+
+export function dashboardLaneAvailability(
+  servers: McpServerSnapshot[] = [],
+  etlRunnerPresent = true,
+  nowMs = Date.now(),
+): { sqlUsable: boolean; etlUsable: boolean } {
+  return {
+    sqlUsable: sqlDashboardLaneUsable(servers.find(server => server.id === 'sql-context'), nowMs),
+    etlUsable: etlDashboardLaneUsable(servers.find(server => server.id === 'a2-analytics'), etlRunnerPresent),
+  };
+}
+
 /**
  * A runtime-generation mismatch discovered before the MCP tool call starts is
  * safe to retry once on the SAME lane: no remote side effect or query has run.
@@ -64,31 +138,65 @@ export function classifyWidgetFailure(error: string | null | undefined): WidgetF
   return 'infra';
 }
 
+export function isCrossLaneRetryableFailure(error: string | null | undefined): boolean {
+  return classifyWidgetFailure(error) === 'infra'
+    && !/\bretry also failed:/i.test(String(error ?? ''));
+}
+
+/** Strong lane-outage shapes that justify stopping new widget claims. Generic
+ * query timeouts are excluded because one expensive query does not prove the
+ * connector is unavailable. */
+export function isDashboardLaneUnavailable(error: unknown, lane: DashboardLaneId): boolean {
+  const lower = String((error as any)?.message ?? error ?? '').toLowerCase();
+  const common = [
+    'connection closed',
+    'connection refused',
+    'does not expose tool',
+    'managed mcp runtime unavailable',
+    'not running',
+    'is unavailable',
+    'profile is disabled',
+  ];
+  if (common.some(pattern => lower.includes(pattern))) return true;
+  if (lane === 'sql-mcp') {
+    return lower.includes('not connected')
+      || lower.includes('warehouse connection is down');
+  }
+  return lower.includes('needs re-authentication')
+    || lower.includes('datanet etl through a2 analytics is unavailable');
+}
+
 /** The other lane, for the post-run retry pass. */
 export function otherDashboardLane(lane: DashboardLaneId): DashboardLaneId {
   return lane === 'etl' ? 'sql-mcp' : 'etl';
 }
 
-/** Whether a SPECIFIC lane is usable right now (the retry pass asks about
- * the non-primary lane; `selectDashboardLane` answers a different question —
- * which lane to PREFER). `etlRunnerPresent` mirrors the service's own check. */
-export function laneUsable(lane: DashboardLaneId, servers: McpServerSnapshot[], etlRunnerPresent: boolean): boolean {
-  if (lane === 'sql-mcp') {
-    const sql = servers.find(server => server.id === 'sql-context');
-    return !!sql && sql.enabled && sql.state === 'running';
-  }
-  const etl = servers.find(server => server.id === 'a2-analytics');
-  return etlRunnerPresent && !!etl && etl.enabled && etl.configured;
+/** Whether a SPECIFIC lane is usable from the current persisted runtime
+ * receipt. SQL execution still performs one fresh connection probe at run
+ * selection; this snapshot predicate prevents stale/missing capabilities from
+ * being attempted at all. */
+export function laneUsable(
+  lane: DashboardLaneId,
+  servers: McpServerSnapshot[],
+  etlRunnerPresent: boolean,
+  nowMs = Date.now(),
+): boolean {
+  const availability = dashboardLaneAvailability(servers, etlRunnerPresent, nowMs);
+  return lane === 'sql-mcp' ? availability.sqlUsable : availability.etlUsable;
 }
 
-/** Availability switch — sql-context primacy, ETL only when SQL is down AND the ETL connection is usable. */
-export function selectDashboardLane(servers: McpServerSnapshot[]): DashboardLaneId {
-  const sql = servers.find(server => server.id === 'sql-context');
-  const etl = servers.find(server => server.id === 'a2-analytics');
-  const sqlUp = !!sql && sql.enabled && sql.state === 'running';
-  const etlUsable = !!etl && etl.enabled && etl.configured;
-  if (sqlUp || !etlUsable) return 'sql-mcp';
-  return 'etl';
+/** Availability switch shared with chat prompt routing. Null means neither
+ * lane has a current, capability-complete readiness receipt; callers must fail
+ * closed instead of attempting SQL by default. */
+export function selectDashboardLane(
+  servers: McpServerSnapshot[],
+  etlRunnerPresent = true,
+  nowMs = Date.now(),
+): DashboardLaneId | null {
+  const availability = dashboardLaneAvailability(servers, etlRunnerPresent, nowMs);
+  if (availability.sqlUsable) return 'sql-mcp';
+  if (availability.etlUsable) return 'etl';
+  return null;
 }
 
 /**

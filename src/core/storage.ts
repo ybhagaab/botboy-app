@@ -976,6 +976,23 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
     })();
   }
 
+  // Durable analytics lane receipts (2026-09-19 incident): recovery must
+  // know which lane already executed a child so it never resubmits the same
+  // SQL/ETL attempt after a crash. Add after every legacy table rebuild so
+  // old migrations cannot drop the new columns.
+  const analyticsRunLaneColumns = new Set(
+    (db.prepare('PRAGMA table_info(analytics_runs)').all() as Array<{ name: string }>).map(column => column.name),
+  );
+  if (!analyticsRunLaneColumns.has('primary_lane')) {
+    db.exec("ALTER TABLE analytics_runs ADD COLUMN primary_lane TEXT CHECK(primary_lane IS NULL OR primary_lane IN ('sql-mcp','etl')); ");
+  }
+  const analyticsRunWidgetLaneColumns = new Set(
+    (db.prepare('PRAGMA table_info(analytics_run_widgets)').all() as Array<{ name: string }>).map(column => column.name),
+  );
+  if (!analyticsRunWidgetLaneColumns.has('last_lane')) {
+    db.exec("ALTER TABLE analytics_run_widgets ADD COLUMN last_lane TEXT CHECK(last_lane IS NULL OR last_lane IN ('sql-mcp','etl')); ");
+  }
+
   // Every registry profile gets one durable state row. Adding a new MCP to
   // the registry seeds it here automatically; commands never enter SQLite.
   const seedMcpServer = db.prepare(`

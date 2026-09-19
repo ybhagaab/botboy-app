@@ -2,7 +2,16 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { McpManager } from './mcp-types.js';
 import { validateReadOnlySql } from './mcp-policy.js';
-import { selectDashboardLane, classifyWidgetFailure, isSafeRuntimeQueueChurn, otherDashboardLane, laneUsable, type DashboardLaneId } from './analytics-runners.js';
+import {
+  isCrossLaneRetryableFailure,
+  isDashboardLaneUnavailable,
+  isSafeRuntimeQueueChurn,
+  otherDashboardLane,
+  sqlDashboardLaneCandidate,
+  sqlDashboardLaneUsable,
+  etlDashboardLaneUsable,
+  type DashboardLaneId,
+} from './analytics-runners.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type {
   AnalyticsDashboard,
@@ -37,6 +46,13 @@ const FORBIDDEN_VEGA_KEYS = new Set([
   'prototype', 'signal', 'signals', 'url',
 ]);
 const EXTERNAL_VEGA_STRING_RE = /(?:\b(?:https?|data|javascript|file):|url\s*\(|^\/\/)/i;
+
+class DataLaneUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DataLaneUnavailableError';
+  }
+}
 
 function cleanText(value: unknown, label: string, max: number, required = false): string {
   if (value == null) {
@@ -371,7 +387,6 @@ export function createAnalyticsDashboardService(options: {
   const queryTimeoutMs = Number.isFinite(configuredQueryTimeoutMs)
     ? Math.max(30_000, Math.min(60 * 60_000, Math.floor(configuredQueryTimeoutMs)))
     : defaultQueryTimeoutMs;
-  let processingQueue = false;
   const workerId = `worker_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   function processIsAlive(pid: unknown): boolean {
@@ -482,6 +497,7 @@ export function createAnalyticsDashboardService(options: {
       widgetsCompleted: Number(row.widgets_completed || 0),
       widgetsSucceeded: Number(row.widgets_succeeded || 0),
       currentWidgetId: row.current_widget_id || undefined,
+      lane: row.primary_lane || undefined,
       cancelRequested: Boolean(row.cancel_requested),
       queuedAt: row.queued_at,
       startedAt: row.started_at || undefined,
@@ -730,9 +746,19 @@ export function createAnalyticsDashboardService(options: {
     }
   }
 
+  function inferAttemptedLane(error: string | null, primaryLane: string | null): DashboardLaneId {
+    const lower = String(error ?? '').toLowerCase();
+    if (/\|\s*etl retry also failed:/.test(lower)) return 'etl';
+    if (/\|\s*sql-mcp retry also failed:/.test(lower)) return 'sql-mcp';
+    if (primaryLane === 'etl' || primaryLane === 'sql-mcp') return primaryLane;
+    return /datanet|\betl\b|scratch pair|waiting_for_resources|run \d+ (?:error|killed|deleted)/.test(lower)
+      ? 'etl'
+      : 'sql-mcp';
+  }
+
   function recoverInterruptedRuns(): number {
     const candidates = db.prepare(`
-      SELECT id, dashboard_id, worker_id, worker_pid, lease_expires_at
+      SELECT id, dashboard_id, worker_id, worker_pid, lease_expires_at, primary_lane, current_widget_id
       FROM analytics_runs WHERE status = 'running'
       ORDER BY queued_at
     `).all() as Array<{
@@ -741,6 +767,8 @@ export function createAnalyticsDashboardService(options: {
       worker_id: string | null;
       worker_pid: number | null;
       lease_expires_at: string | null;
+      primary_lane: string | null;
+      current_widget_id: string | null;
     }>;
     const interrupted = candidates.filter(run => {
       const leaseExpiry = Date.parse(run.lease_expires_at || '');
@@ -752,34 +780,84 @@ export function createAnalyticsDashboardService(options: {
     let recovered = 0;
     db.transaction(() => {
       for (const run of interrupted) {
+        const childAttempts = db.prepare(`
+          SELECT widget_id, status, error, last_lane FROM analytics_run_widgets
+          WHERE run_id = ? AND status IN ('queued','running','failed')
+          ORDER BY position
+        `).all(run.id) as Array<{
+          widget_id: string;
+          status: string;
+          error: string | null;
+          last_lane: string | null;
+        }>;
+        const claimed = db.prepare(`
+          UPDATE analytics_runs SET status = 'queued',
+            widgets_completed = 0, widgets_succeeded = 0,
+            current_widget_id = NULL, started_at = NULL, heartbeat_at = NULL,
+            lease_expires_at = NULL, worker_id = NULL, worker_pid = NULL,
+            error = NULL, completed_at = NULL
+          WHERE id = ? AND status = 'running'
+            AND worker_id IS ? AND worker_pid IS ? AND lease_expires_at IS ?
+        `).run(run.id, run.worker_id, run.worker_pid, run.lease_expires_at);
+        if (claimed.changes !== 1) continue;
+
+        const backfillLane = db.prepare(`
+          UPDATE analytics_run_widgets SET last_lane = ?
+          WHERE run_id = ? AND widget_id = ? AND last_lane IS NULL
+        `);
+        const interruptAttempt = db.prepare(`
+          UPDATE analytics_run_widgets SET status = 'failed', error = ?,
+            last_lane = ?, completed_at = ?
+          WHERE run_id = ? AND widget_id = ? AND status = 'running'
+        `);
+        const interruptLegacyRetry = db.prepare(`
+          UPDATE analytics_run_widgets SET error = ?, last_lane = ?, completed_at = ?
+          WHERE run_id = ? AND widget_id = ? AND status = 'failed' AND last_lane IS NULL
+        `);
+        const interruptedAt = new Date().toISOString();
+        for (const child of childAttempts) {
+          const inferredLane = inferAttemptedLane(child.error, run.primary_lane);
+          // Pre-lane-receipt builds kept an alternate retry child `failed`
+          // while only parent.current_widget_id named the in-flight call.
+          // Treat that exact legacy shape as a possibly submitted retry and
+          // terminalize it on the alternate lane before clearing the parent.
+          if (!child.last_lane && child.status === 'failed' && run.current_widget_id === child.widget_id) {
+            const retryLane = otherDashboardLane(inferredLane);
+            const interruption = `${String(child.error ?? '').slice(0, 1200)} | ${retryLane} retry also failed: worker interrupted during a legacy in-flight retry; submission may still be running`;
+            interruptLegacyRetry.run(interruption.slice(0, 2000), retryLane, interruptedAt, run.id, child.widget_id);
+            continue;
+          }
+          const attemptedLane = child.last_lane === 'etl' || child.last_lane === 'sql-mcp'
+            ? child.last_lane
+            : inferredLane;
+          if (!child.last_lane && child.status === 'failed') {
+            backfillLane.run(attemptedLane, run.id, child.widget_id);
+          }
+          if (child.status !== 'running') continue;
+          // A non-null error is preserved while a cross-lane retry is running;
+          // primary claims clear it. If the retry worker dies, mark the second
+          // lane attempted so recovery never submits a third copy.
+          const interruption = child.error
+            ? `${String(child.error).slice(0, 1200)} | ${attemptedLane} retry also failed: worker interrupted while this lane might still be in flight`
+            : `Worker interrupted during ${attemptedLane} execution; that lane will not be resubmitted automatically`;
+          interruptAttempt.run(interruption.slice(0, 2000), attemptedLane, interruptedAt, run.id, child.widget_id);
+        }
+
         const progress = db.prepare(`
           SELECT COUNT(*) AS widget_count,
             SUM(CASE WHEN status IN ('completed','failed') THEN 1 ELSE 0 END) AS widgets_completed,
             SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS widgets_succeeded
           FROM analytics_run_widgets WHERE run_id = ?
         `).get(run.id) as any;
-        const claimed = db.prepare(`
-          UPDATE analytics_runs SET status = 'queued',
-            widget_count = ?, widgets_completed = ?, widgets_succeeded = ?,
-            current_widget_id = NULL, started_at = NULL, heartbeat_at = NULL,
-            lease_expires_at = NULL, worker_id = NULL, worker_pid = NULL,
-            error = NULL, completed_at = NULL
-          WHERE id = ? AND status = 'running'
-            AND worker_id IS ? AND worker_pid IS ? AND lease_expires_at IS ?
+        db.prepare(`
+          UPDATE analytics_runs SET widget_count = ?, widgets_completed = ?, widgets_succeeded = ?
+          WHERE id = ? AND status = 'queued'
         `).run(
           Number(progress.widget_count || 0),
           Number(progress.widgets_completed || 0),
           Number(progress.widgets_succeeded || 0),
           run.id,
-          run.worker_id,
-          run.worker_pid,
-          run.lease_expires_at,
         );
-        if (claimed.changes !== 1) continue;
-        db.prepare(`
-          UPDATE analytics_run_widgets SET status = 'queued', started_at = NULL
-          WHERE run_id = ? AND status = 'running'
-        `).run(run.id);
         db.prepare(`
           UPDATE analytics_dashboards SET status = 'refreshing', updated_at = datetime('now')
           WHERE id = ?
@@ -1044,6 +1122,27 @@ export function createAnalyticsDashboardService(options: {
     })();
   }
 
+  function deferClaimedRunForLane(runId: string, failure: unknown): void {
+    const message = String((failure as any)?.message ?? failure).slice(0, 4000)
+      || 'Waiting for an analytics data lane';
+    const deferred = db.prepare(`
+      UPDATE analytics_runs SET status = 'queued', primary_lane = NULL,
+        current_widget_id = NULL, started_at = NULL, heartbeat_at = NULL,
+        lease_expires_at = NULL, worker_id = NULL, worker_pid = NULL,
+        error = ?, completed_at = NULL
+      WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+    `).run(message, runId, workerId, process.pid);
+    if (deferred.changes !== 1) return;
+    const run = db.prepare('SELECT dashboard_id FROM analytics_runs WHERE id = ?').get(runId) as { dashboard_id: string } | undefined;
+    if (run) {
+      db.prepare(`
+        UPDATE analytics_dashboards SET status = 'refreshing', updated_at = datetime('now')
+        WHERE id = ?
+      `).run(run.dashboard_id);
+    }
+    console.warn(`[Analytics queue] run ${runId} deferred until a data lane is ready: ${message}`);
+  }
+
   function failClaimedRun(runId: string, failure: unknown): void {
     const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
     if (!run || run.status !== 'running' || run.worker_id !== workerId || run.worker_pid !== process.pid) return;
@@ -1115,28 +1214,66 @@ export function createAnalyticsDashboardService(options: {
    */
   const WIDGET_REFRESH_CONCURRENCY = 3;
 
-  /** The data lane for ONE run, decided at run start — never per widget, so
-   * a mid-run connector flip cannot mix lanes inside one refresh. Mirrors
-   * the chat prompt's DATA LANE NOTICE predicate (analytics-runners.ts). */
-  async function pickRunLane(): Promise<DashboardLaneId> {
-    if (!etlRunner) return 'sql-mcp';
-    try {
-      return selectDashboardLane(await mcpManager.listServers());
-    } catch {
-      return 'sql-mcp'; // unknowable state: keep pre-A4 behavior
+  async function currentServer(serverId: string) {
+    if (typeof (mcpManager as any).getServer === 'function') {
+      return mcpManager.getServer(serverId);
     }
+    return (await mcpManager.listServers()).find(server => server.id === serverId) ?? null;
+  }
+
+  /** A lane needs both a capability-complete runtime snapshot and, for SQL,
+   * one fresh warehouse connection receipt. Process liveness alone is not
+   * data readiness (2026-09-19 incident: 42 timed-out health checks while the
+   * process still advertised running). */
+  async function liveLaneUsable(lane: DashboardLaneId): Promise<boolean> {
+    try {
+      if (lane === 'etl') {
+        return etlDashboardLaneUsable(await currentServer('a2-analytics'), !!etlRunner);
+      }
+      const sql = await currentServer('sql-context');
+      if (!sqlDashboardLaneCandidate(sql)) return false;
+      // Production managers always expose the fresh probe. The fallback keeps
+      // isolated service fakes honest by requiring a current health receipt.
+      if (typeof (mcpManager as any).testConnection !== 'function') {
+        return sqlDashboardLaneUsable(sql);
+      }
+      const check = await mcpManager.testConnection('sql-context');
+      if (check.isError || !/^Connected(?:\n|$)/.test(check.text)) return false;
+      return sqlDashboardLaneCandidate(await currentServer('sql-context'));
+    } catch {
+      return false;
+    }
+  }
+
+  /** SQL keeps primacy only after a fresh warehouse probe. ETL is selected
+   * directly when SQL is not data-ready. No usable lane fails closed rather
+   * than generating one doomed SQL attempt per widget. */
+  async function pickRunLane(): Promise<DashboardLaneId> {
+    if (await liveLaneUsable('sql-mcp')) return 'sql-mcp';
+    if (await liveLaneUsable('etl')) return 'etl';
+    throw new DataLaneUnavailableError(
+      'No analytics data lane is ready yet: sql-context failed its live warehouse check and '
+      + 'the Datanet ETL composite is not running with its required tools. Waiting for a connection before retrying.',
+    );
   }
 
   async function processClaimedRun(runId: string): Promise<void> {
     let ownershipLost = false;
     let cancelSeen = false;
+    let primaryLaneUnavailable = false;
     const lane = await pickRunLane();
+    const laneReceipt = db.prepare(`
+      UPDATE analytics_runs SET primary_lane = ?, heartbeat_at = ?, lease_expires_at = ?
+      WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+    `).run(lane, new Date().toISOString(), leaseExpiresAt(), runId, workerId, process.pid);
+    if (laneReceipt.changes !== 1) return;
     if (lane === 'etl') {
       console.log(`[Analytics] run ${runId}: sql-context is down — refreshing through the Datanet ETL lane (all widgets in parallel over the scratch-pair pool; each is a minutes-scale Datanet run)`);
     }
 
     const claimNextWidget = (): any | 'stop' | null => {
       while (true) {
+        if (primaryLaneUnavailable) return null;
         // Cooperative stop point: the owner's cancel flag is honored at each
         // claim — queries already in flight run to completion and their
         // results persist. Only this worker transitions the run's status
@@ -1151,7 +1288,7 @@ export function createAnalyticsDashboardService(options: {
           SELECT rw.*, r.dashboard_id
           FROM analytics_run_widgets rw
           JOIN analytics_runs r ON r.id = rw.run_id
-          WHERE rw.run_id = ? AND rw.status = 'queued'
+          WHERE rw.run_id = ? AND rw.status = 'queued' AND rw.last_lane IS NULL
             AND r.status = 'running' AND r.worker_id = ? AND r.worker_pid = ?
           ORDER BY rw.position LIMIT 1
         `).get(runId, workerId, process.pid) as any;
@@ -1159,9 +1296,9 @@ export function createAnalyticsDashboardService(options: {
         const startedAt = new Date().toISOString();
         const claimed = db.transaction(() => {
           const result = db.prepare(`
-            UPDATE analytics_run_widgets SET status = 'running', started_at = ?, error = NULL
+            UPDATE analytics_run_widgets SET status = 'running', started_at = ?, error = NULL, last_lane = ?
             WHERE run_id = ? AND widget_id = ? AND status = 'queued'
-          `).run(startedAt, runId, widget.widget_id);
+          `).run(startedAt, lane, runId, widget.widget_id);
           if (result.changes !== 1) return false;
           const parent = db.prepare(`
             UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
@@ -1202,6 +1339,8 @@ export function createAnalyticsDashboardService(options: {
       } catch (error: any) {
         if (!ownsRun(runId)) { ownershipLost = true; return; }
         const message = String(error?.message ?? error).slice(0, 2000);
+        const laneUnavailable = isDashboardLaneUnavailable(error, lane);
+        if (laneUnavailable) primaryLaneUnavailable = true;
         const completedAt = new Date().toISOString();
         db.transaction(() => {
           const progressed = db.prepare(`
@@ -1219,6 +1358,31 @@ export function createAnalyticsDashboardService(options: {
             UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
             WHERE id = ? AND dashboard_id = ?
           `).run(message, widget.widget_id, widget.dashboard_id);
+
+          if (laneUnavailable) {
+            const skippedMessage = `${lane} became unavailable; this widget was not attempted on that lane. Trigger: ${message}`.slice(0, 2000);
+            const skipped = db.prepare(`
+              UPDATE analytics_run_widgets SET status = 'failed', error = ?,
+                started_at = COALESCE(started_at, ?), completed_at = ?,
+                last_lane = COALESCE(last_lane, ?)
+              WHERE run_id = ? AND status = 'queued'
+            `).run(skippedMessage, completedAt, completedAt, lane, runId);
+            if (skipped.changes > 0) {
+              db.prepare(`
+                UPDATE analytics_runs SET widgets_completed = MIN(widget_count, widgets_completed + ?),
+                  heartbeat_at = ?, lease_expires_at = ?
+                WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+              `).run(skipped.changes, completedAt, leaseExpiresAt(), runId, workerId, process.pid);
+              db.prepare(`
+                UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
+                WHERE dashboard_id = ? AND id IN (
+                  SELECT widget_id FROM analytics_run_widgets
+                  WHERE run_id = ? AND status = 'failed' AND error = ?
+                )
+              `).run(skippedMessage, widget.dashboard_id, runId, skippedMessage);
+              console.warn(`[Analytics] run ${runId}: ${lane} unavailable after widget ${String(widget.widget_id)}; skipped ${skipped.changes} further primary-lane call(s)`);
+            }
+          }
         })();
       }
     };
@@ -1253,68 +1417,220 @@ export function createAnalyticsDashboardService(options: {
   }
 
   /**
-   * Post-run cross-lane retry (incident 2026-09-04): widgets that failed
-   * for INFRA reasons (timeouts, dropped connections, transport errors) get
-   * ONE retry on the other lane when it is usable — both lanes read the
-   * same warehouse, so only infrastructure failures are lane-transferable.
-   * SQL/content failures are skipped: they fail identically everywhere.
-   * Serialized regardless of lane (the retry set is small; the ETL lane
-   * requires it — one scratch pair). Counters need no correction here:
-   * finalizeRun recomputes them from the widget table.
+   * Post-run cross-lane retry (incident 2026-09-04): only infrastructure
+   * failures move lanes. Retrying is a real durable phase: retryable child
+   * rows return to queued, run progress is decremented, and workers claim them
+   * into running so the UI never says N/N while recovery is still active.
+   * ETL uses one worker per retryable widget (distinct scratch pairs/jobs);
+   * SQL retains its measured 3-wide cap.
    */
   async function retryFailedWidgetsOnOtherLane(runId: string, primaryLane: DashboardLaneId): Promise<void> {
-    const retryLane = otherDashboardLane(primaryLane);
-    let usable = false;
-    try {
-      usable = laneUsable(retryLane, await mcpManager.listServers(), !!etlRunner);
-    } catch {
-      usable = false;
-    }
-    if (!usable) return;
-    const failed = db.prepare(`
+    const candidates = db.prepare(`
       SELECT rw.*, r.dashboard_id
       FROM analytics_run_widgets rw
       JOIN analytics_runs r ON r.id = rw.run_id
-      WHERE rw.run_id = ? AND rw.status = 'failed'
+      WHERE rw.run_id = ? AND (
+        rw.status = 'failed' OR (rw.status = 'queued' AND rw.last_lane IS NOT NULL)
+      )
       ORDER BY rw.position
     `).all(runId) as any[];
-    const retryable = failed.filter(widget => classifyWidgetFailure(widget.error) === 'infra');
-    if (!retryable.length) return;
-    console.log(`[Analytics] run ${runId}: retrying ${retryable.length} infra-failed widget(s) on the ${retryLane} lane`);
-    for (const widget of retryable) {
+    const groups = new Map<DashboardLaneId, any[]>();
+    for (const widget of candidates) {
+      if (widget.status === 'failed' && !isCrossLaneRetryableFailure(widget.error)) continue;
+      const attemptedLane: DashboardLaneId = widget.last_lane === 'etl' || widget.last_lane === 'sql-mcp'
+        ? widget.last_lane
+        : primaryLane;
+      const retryLane = otherDashboardLane(attemptedLane);
+      groups.set(retryLane, [...(groups.get(retryLane) ?? []), widget]);
+    }
+    for (const [retryLane, widgets] of groups) {
+      await retryFailedWidgetGroup(runId, retryLane, widgets);
       if (!ownsRun(runId)) return;
-      const heartbeat = new Date().toISOString();
-      db.prepare(`
-        UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
-        WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
-      `).run(widget.widget_id, heartbeat, leaseExpiresAt(), runId, workerId, process.pid);
+    }
+  }
+
+  async function retryFailedWidgetGroup(
+    runId: string,
+    retryLane: DashboardLaneId,
+    retryable: any[],
+  ): Promise<void> {
+    if (!retryable.length || !(await liveLaneUsable(retryLane))) return;
+    const attemptedLane = otherDashboardLane(retryLane);
+
+    const owned = db.prepare(`
+      SELECT cancel_requested FROM analytics_runs
+      WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+    `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
+    if (!owned) return;
+    if (owned.cancel_requested) {
+      finalizeCancelledRun(runId);
+      return;
+    }
+
+    const retryStartedAt = new Date().toISOString();
+    const resetRetry = db.transaction(() => {
+      const reset = db.prepare(`
+        UPDATE analytics_run_widgets SET status = 'queued', started_at = NULL,
+          completed_at = NULL, last_lane = COALESCE(last_lane, ?)
+        WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+      `);
+      let resetCount = 0;
+      let pendingCount = 0;
+      for (const widget of retryable) {
+        if (widget.status === 'queued') {
+          pendingCount += 1;
+        } else {
+          resetCount += reset.run(attemptedLane, runId, widget.widget_id).changes;
+        }
+      }
+      if (resetCount > 0) {
+        const parent = db.prepare(`
+          UPDATE analytics_runs SET widgets_completed = MAX(0, widgets_completed - ?),
+            current_widget_id = NULL, heartbeat_at = ?, lease_expires_at = ?
+          WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+        `).run(resetCount, retryStartedAt, leaseExpiresAt(), runId, workerId, process.pid);
+        if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed before cross-lane retry`);
+      }
+      return resetCount + pendingCount;
+    })();
+    if (!resetRetry) return;
+
+    console.log(`[Analytics] run ${runId}: retrying ${resetRetry} infra-failed widget(s) on the ${retryLane} lane in parallel`);
+    let retryOwnershipLost = false;
+    let retryCancelSeen = false;
+    let retryLaneUnavailable = false;
+
+    const claimRetryWidget = (): any | 'stop' | null => {
+      while (true) {
+        if (retryLaneUnavailable) return null;
+        const current = db.prepare(`
+          SELECT cancel_requested FROM analytics_runs
+          WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+        `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
+        if (!current) { retryOwnershipLost = true; return 'stop'; }
+        if (current.cancel_requested) { retryCancelSeen = true; return 'stop'; }
+        const widget = db.prepare(`
+          SELECT rw.*, r.dashboard_id
+          FROM analytics_run_widgets rw
+          JOIN analytics_runs r ON r.id = rw.run_id
+          WHERE rw.run_id = ? AND rw.status = 'queued' AND rw.last_lane = ?
+            AND r.status = 'running' AND r.worker_id = ? AND r.worker_pid = ?
+          ORDER BY rw.position LIMIT 1
+        `).get(runId, attemptedLane, workerId, process.pid) as any;
+        if (!widget) return null;
+        const startedAt = new Date().toISOString();
+        const claimed = db.transaction(() => {
+          const child = db.prepare(`
+            UPDATE analytics_run_widgets SET status = 'running', started_at = ?, completed_at = NULL, last_lane = ?
+            WHERE run_id = ? AND widget_id = ? AND status = 'queued'
+          `).run(startedAt, retryLane, runId, widget.widget_id);
+          if (child.changes !== 1) return false;
+          const parent = db.prepare(`
+            UPDATE analytics_runs SET current_widget_id = ?, heartbeat_at = ?, lease_expires_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+          `).run(widget.widget_id, startedAt, leaseExpiresAt(), runId, workerId, process.pid);
+          if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed during cross-lane claim`);
+          return true;
+        })();
+        if (claimed) return widget;
+      }
+    };
+
+    const retryWidgetToCompletion = async (widget: any): Promise<void> => {
       try {
         const result = await executeRunWidgetWithSafeRuntimeRetry(widget, retryLane);
         const completedAt = new Date().toISOString();
         db.transaction(() => {
-          const runWidget = db.prepare(`
+          const child = db.prepare(`
             UPDATE analytics_run_widgets SET status = 'completed', error = NULL, completed_at = ?
-            WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+            WHERE run_id = ? AND widget_id = ? AND status = 'running'
           `).run(completedAt, runId, widget.widget_id);
-          if (runWidget.changes !== 1) throw new Error('Widget progress changed while its cross-lane retry was running');
+          if (child.changes !== 1) throw new Error('Widget progress changed while its cross-lane retry was running');
           const updated = db.prepare(`
             UPDATE analytics_widgets SET result_json = ?, last_error = NULL,
               last_refreshed_at = ?, updated_at = datetime('now')
             WHERE id = ? AND dashboard_id = ?
           `).run(JSON.stringify(result), result.refreshedAt, widget.widget_id, widget.dashboard_id);
           if (updated.changes !== 1) throw new Error('Widget definition disappeared while its cross-lane retry was running');
+          const parent = db.prepare(`
+            UPDATE analytics_runs SET widgets_completed = MIN(widget_count, widgets_completed + 1),
+              widgets_succeeded = MIN(widget_count, widgets_succeeded + 1),
+              current_widget_id = NULL, heartbeat_at = ?, lease_expires_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+          `).run(completedAt, leaseExpiresAt(), runId, workerId, process.pid);
+          if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed after cross-lane success`);
         })();
         console.log(`[Analytics] run ${runId}: widget "${widget.title}" recovered on the ${retryLane} lane`);
       } catch (error: any) {
-        if (!ownsRun(runId)) return;
+        if (!ownsRun(runId)) { retryOwnershipLost = true; return; }
+        const laneUnavailable = isDashboardLaneUnavailable(error, retryLane);
+        if (laneUnavailable) retryLaneUnavailable = true;
+        const completedAt = new Date().toISOString();
         const message = `${String(widget.error ?? '').slice(0, 1200)} | ${retryLane} retry also failed: ${String(error?.message ?? error)}`.slice(0, 2000);
-        db.prepare(`
-          UPDATE analytics_run_widgets SET error = ? WHERE run_id = ? AND widget_id = ? AND status = 'failed'
-        `).run(message, runId, widget.widget_id);
-        db.prepare(`
-          UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now') WHERE id = ? AND dashboard_id = ?
-        `).run(message, widget.widget_id, widget.dashboard_id);
+        db.transaction(() => {
+          const child = db.prepare(`
+            UPDATE analytics_run_widgets SET status = 'failed', error = ?, completed_at = ?
+            WHERE run_id = ? AND widget_id = ? AND status = 'running'
+          `).run(message, completedAt, runId, widget.widget_id);
+          if (child.changes !== 1) throw new Error('Widget progress changed while recording cross-lane failure');
+          db.prepare(`
+            UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
+            WHERE id = ? AND dashboard_id = ?
+          `).run(message, widget.widget_id, widget.dashboard_id);
+          const parent = db.prepare(`
+            UPDATE analytics_runs SET widgets_completed = MIN(widget_count, widgets_completed + 1),
+              current_widget_id = NULL, heartbeat_at = ?, lease_expires_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+          `).run(completedAt, leaseExpiresAt(), runId, workerId, process.pid);
+          if (parent.changes !== 1) throw new Error(`Run ${runId} ownership changed after cross-lane failure`);
+
+          if (laneUnavailable) {
+            const skippedMessage = `${retryLane} became unavailable during cross-lane recovery; retry not attempted. Trigger: ${String(error?.message ?? error)}`.slice(0, 2000);
+            const skipped = db.prepare(`
+              UPDATE analytics_run_widgets SET status = 'failed', error = ?,
+                started_at = COALESCE(started_at, ?), completed_at = ?
+              WHERE run_id = ? AND status = 'queued'
+            `).run(skippedMessage, completedAt, completedAt, runId);
+            if (skipped.changes > 0) {
+              db.prepare(`
+                UPDATE analytics_runs SET widgets_completed = MIN(widget_count, widgets_completed + ?),
+                  heartbeat_at = ?, lease_expires_at = ?
+                WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+              `).run(skipped.changes, completedAt, leaseExpiresAt(), runId, workerId, process.pid);
+              db.prepare(`
+                UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
+                WHERE dashboard_id = ? AND id IN (
+                  SELECT widget_id FROM analytics_run_widgets
+                  WHERE run_id = ? AND status = 'failed' AND error = ?
+                )
+              `).run(skippedMessage, widget.dashboard_id, runId, skippedMessage);
+              console.warn(`[Analytics] run ${runId}: ${retryLane} unavailable during retry; skipped ${skipped.changes} further call(s)`);
+            }
+          }
+        })();
       }
+    };
+
+    const retryWorker = async (): Promise<void> => {
+      while (!retryOwnershipLost && !retryCancelSeen) {
+        const next = claimRetryWidget();
+        if (next === 'stop' || next === null) return;
+        await retryWidgetToCompletion(next);
+      }
+    };
+    const retryWidth = retryLane === 'etl'
+      ? Math.max(1, retryable.length)
+      : Math.min(WIDGET_REFRESH_CONCURRENCY, Math.max(1, retryable.length));
+    await Promise.all(Array.from({ length: retryWidth }, () => retryWorker()));
+
+    if (retryOwnershipLost || !ownsRun(runId)) return;
+    const afterRetry = db.prepare(`
+      SELECT cancel_requested FROM analytics_runs
+      WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+    `).get(runId, workerId, process.pid) as { cancel_requested: number } | undefined;
+    if (retryCancelSeen || afterRetry?.cancel_requested) {
+      finalizeCancelledRun(runId);
+      return;
     }
     db.prepare(`
       UPDATE analytics_runs SET current_widget_id = NULL, heartbeat_at = ?, lease_expires_at = ?
@@ -1351,39 +1667,44 @@ export function createAnalyticsDashboardService(options: {
   }
 
   async function processQueuedRuns(limit = 1): Promise<number> {
-    if (processingQueue) return 0;
-    processingQueue = true;
     const boundedLimit = Math.max(1, Math.min(20, Math.floor(Number(limit) || 1)));
-    let processed = 0;
-    try {
-      while (processed < boundedLimit) {
-        const claimedRunId = db.transaction(() => {
-          const queued = db.prepare(`
-            SELECT id FROM analytics_runs WHERE status = 'queued'
-            ORDER BY datetime(queued_at), id LIMIT 1
-          `).get() as { id: string } | undefined;
-          if (!queued) return null;
-          const startedAt = new Date().toISOString();
-          const claimed = db.prepare(`
-            UPDATE analytics_runs SET status = 'running', started_at = COALESCE(started_at, ?),
-              heartbeat_at = ?, lease_expires_at = ?, worker_id = ?, worker_pid = ?, error = NULL
-            WHERE id = ? AND status = 'queued'
-          `).run(startedAt, startedAt, leaseExpiresAt(), workerId, process.pid, queued.id);
-          return claimed.changes === 1 ? queued.id : null;
-        })();
-        if (!claimedRunId) break;
-        try {
-          await processClaimedRun(claimedRunId);
-        } catch (error) {
-          console.error(`[Analytics queue] run ${claimedRunId} failed unexpectedly:`, error);
-          failClaimedRun(claimedRunId, error);
-        }
-        processed++;
-      }
-      return processed;
-    } finally {
-      processingQueue = false;
+    // Claims are row-guarded transactions, so independent scheduler slots may
+    // invoke this concurrently without taking the same durable run.
+    const claimedRunIds: string[] = [];
+    while (claimedRunIds.length < boundedLimit) {
+      const claimedRunId = db.transaction(() => {
+        const queued = db.prepare(`
+          SELECT id FROM analytics_runs WHERE status = 'queued'
+          ORDER BY datetime(queued_at), id LIMIT 1
+        `).get() as { id: string } | undefined;
+        if (!queued) return null;
+        const startedAt = new Date().toISOString();
+        const claimed = db.prepare(`
+          UPDATE analytics_runs SET status = 'running', started_at = COALESCE(started_at, ?),
+            heartbeat_at = ?, lease_expires_at = ?, worker_id = ?, worker_pid = ?, error = NULL
+          WHERE id = ? AND status = 'queued'
+        `).run(startedAt, startedAt, leaseExpiresAt(), workerId, process.pid, queued.id);
+        return claimed.changes === 1 ? queued.id : null;
+      })();
+      if (!claimedRunId) break;
+      claimedRunIds.push(claimedRunId);
     }
+
+    const outcomes = await Promise.all(claimedRunIds.map(async claimedRunId => {
+      try {
+        await processClaimedRun(claimedRunId);
+        return true;
+      } catch (error) {
+        if (error instanceof DataLaneUnavailableError) {
+          deferClaimedRunForLane(claimedRunId, error);
+          return false;
+        }
+        console.error(`[Analytics queue] run ${claimedRunId} failed unexpectedly:`, error);
+        failClaimedRun(claimedRunId, error);
+        return true;
+      }
+    }));
+    return outcomes.filter(Boolean).length;
   }
 
   function deleteDashboard(id: string): void {
