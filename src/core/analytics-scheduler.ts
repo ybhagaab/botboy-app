@@ -22,6 +22,7 @@ export function createAnalyticsScheduler(options: {
   const runConcurrency = Math.max(1, Math.min(2, Math.floor(options.runConcurrency ?? 2)));
   let timer: NodeJS.Timeout | null = null;
   let fillOperation: Promise<number> | null = null;
+  let lateResultOperation: Promise<number> | null = null;
   let activeRunSlots = 0;
 
   function nextOccurrence(row: any): { nextRunAt: string; error: string | null } {
@@ -100,11 +101,26 @@ export function createAnalyticsScheduler(options: {
       });
   }
 
+  function launchLateResultPass(): void {
+    if (lateResultOperation) return;
+    lateResultOperation = analyticsService.processLateEtlResults(6)
+      .catch(error => {
+        console.error('[Analytics scheduler] late ETL reconciliation failed:', error);
+        return 0;
+      })
+      .finally(() => {
+        lateResultOperation = null;
+      });
+  }
+
   function runDueNow(): Promise<number> {
     if (fillOperation) return Promise.resolve(0);
     const operation = (async () => {
       const runsRecovered = analyticsService.recoverInterruptedRuns();
       const schedulesAdvanced = enqueueDueSchedules();
+      // Separate slot: multi-minute status/download calls must never consume a
+      // whole-dashboard scheduler slot or delay newly queued refreshes.
+      launchLateResultPass();
       const slotsToFill = Math.max(0, runConcurrency - activeRunSlots);
       for (let slot = 0; slot < slotsToFill; slot++) launchRunSlot();
       return runsRecovered + schedulesAdvanced + slotsToFill;

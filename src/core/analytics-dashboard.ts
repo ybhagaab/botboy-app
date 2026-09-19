@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { McpManager } from './mcp-types.js';
 import { validateReadOnlySql } from './mcp-policy.js';
 import {
@@ -18,6 +18,7 @@ import type {
   AnalyticsDashboardService,
   AnalyticsDashboardStatus,
   AnalyticsDashboardSummary,
+  AnalyticsLateEtlResult,
   AnalyticsRefreshTrigger,
   AnalyticsRun,
   AnalyticsSchedule,
@@ -53,6 +54,27 @@ class DataLaneUnavailableError extends Error {
     this.name = 'DataLaneUnavailableError';
   }
 }
+
+class EtlAliveHandoffError extends Error {
+  readonly runId: string;
+  readonly remoteStatus: string;
+
+  constructor(outcome: QueryRunResult) {
+    const runId = String(outcome.runId ?? '');
+    const remoteStatus = String(outcome.remoteStatus ?? 'RUNNING').toUpperCase();
+    super([
+      outcome.error,
+      'Late output is pending automatic reconciliation; do not rerun the dashboard solely to import it.',
+    ].filter(Boolean).join(' — '));
+    this.name = 'EtlAliveHandoffError';
+    this.runId = runId;
+    this.remoteStatus = remoteStatus;
+  }
+}
+
+const LATE_ETL_RECHECK_MS = 60_000;
+const LATE_ETL_RETRY_MS = 5 * 60_000;
+const LATE_ETL_LEASE_MS = 6 * 60_000;
 
 function cleanText(value: unknown, label: string, max: number, required = false): string {
   if (value == null) {
@@ -154,6 +176,15 @@ export function validateVisualizationSpec(value: unknown): Record<string, unknow
 function parseJson<T>(raw: string | null | undefined, fallback: T): T {
   if (!raw) return fallback;
   try { return JSON.parse(raw) as T; } catch { return fallback; }
+}
+
+function widgetDefinitionSha256(kind: unknown, sql: unknown, configJson: unknown): string {
+  const config = parseJson<Record<string, unknown>>(String(configJson ?? ''), {});
+  return createHash('sha256').update(JSON.stringify({
+    kind: String(kind ?? ''),
+    sql: String(sql ?? ''),
+    config,
+  })).digest('hex');
 }
 
 function shortId(prefix: string): string {
@@ -322,6 +353,15 @@ export function etlResultToWidgetResult(outcome: QueryRunResult, elapsedMs?: num
     rawPreview: columns.length ? undefined : 'The ETL run completed without tabular output.',
     refreshedAt: new Date().toISOString(),
     lane: 'etl',
+    ...(outcome.runId ? {
+      source: {
+        provider: 'datanet' as const,
+        runId: outcome.runId,
+        remoteStatus: 'SUCCESS' as const,
+        ...(outcome.resultSha256 ? { resultSha256: outcome.resultSha256 } : {}),
+        ...(outcome.resultBytes !== undefined ? { resultBytes: outcome.resultBytes } : {}),
+      },
+    } : {}),
   };
 }
 
@@ -477,6 +517,26 @@ export function createAnalyticsDashboardService(options: {
     };
   }
 
+  function mapLateEtlResult(row: any): AnalyticsLateEtlResult {
+    return {
+      runId: String(row.run_id),
+      widgetId: String(row.widget_id),
+      externalRunId: String(row.external_run_id),
+      state: row.state,
+      remoteStatus: row.remote_status || undefined,
+      nextCheckAt: row.next_check_at,
+      resultPath: row.result_path || undefined,
+      resultBytes: row.result_bytes == null ? undefined : Number(row.result_bytes),
+      resultSha256: row.result_sha256 || undefined,
+      rowCount: row.row_count == null ? undefined : Number(row.row_count),
+      receipt: parseJson<Record<string, unknown> | undefined>(row.receipt_json, undefined),
+      error: row.error || undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at || undefined,
+    };
+  }
+
   function mapRun(row: any): AnalyticsRun {
     // The pool runs several widgets at once; the UI names them all instead
     // of pretending one widget is "current" (owner confusion 2026-08-27:
@@ -487,8 +547,13 @@ export function createAnalyticsDashboardService(options: {
           WHERE run_id = ? AND status = 'running' ORDER BY position
         `).all(row.id) as any[]).map(widget => String(widget.widget_id))
       : undefined;
+    const lateEtlResults = (db.prepare(`
+      SELECT * FROM analytics_late_etl_results
+      WHERE run_id = ? ORDER BY created_at, external_run_id
+    `).all(row.id) as any[]).map(mapLateEtlResult);
     return {
       ...(runningWidgetIds?.length ? { runningWidgetIds } : {}),
+      ...(lateEtlResults.length ? { lateEtlResults } : {}),
       id: row.id,
       dashboardId: row.dashboard_id,
       trigger: row.trigger,
@@ -879,6 +944,419 @@ export function createAnalyticsDashboardService(options: {
     `).get(runId, workerId, process.pid));
   }
 
+  function recordLateEtlHandoff(
+    runId: string,
+    widget: any,
+    handoff: EtlAliveHandoffError,
+    observedAt: string,
+  ): void {
+    const definitionSha256 = widgetDefinitionSha256(widget.kind, widget.sql_query, widget.config_json);
+    const existing = db.prepare(`
+      SELECT external_run_id FROM analytics_late_etl_results
+      WHERE run_id = ? AND widget_id = ?
+    `).get(runId, widget.widget_id) as { external_run_id: string } | undefined;
+    if (existing) {
+      if (existing.external_run_id !== handoff.runId) {
+        throw new Error(`Late ETL identity changed for ${runId}/${widget.widget_id}`);
+      }
+      return;
+    }
+    const remoteBinding = db.prepare(`
+      SELECT run_id, widget_id FROM analytics_late_etl_results
+      WHERE external_run_id = ?
+    `).get(handoff.runId) as { run_id: string; widget_id: string } | undefined;
+    if (remoteBinding) {
+      throw new Error(`Datanet run ${handoff.runId} is already bound to ${remoteBinding.run_id}/${remoteBinding.widget_id}`);
+    }
+    db.prepare(`
+      INSERT INTO analytics_late_etl_results
+        (run_id, widget_id, external_run_id, definition_sha256, state,
+         remote_status, next_check_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    `).run(
+      runId,
+      widget.widget_id,
+      handoff.runId,
+      definitionSha256,
+      handoff.remoteStatus,
+      new Date(Date.parse(observedAt) + LATE_ETL_RECHECK_MS).toISOString(),
+      observedAt,
+      observedAt,
+    );
+  }
+
+  /** Exact-pattern compatibility for handoffs created before structured
+   * identity shipped. It only journals the numeric run id already recorded by
+   * BotBoy; all stale/current checks still run before any remote read/apply. */
+  function backfillLegacyLateEtlHandoffs(): number {
+    const rows = db.prepare(`
+      SELECT rw.*, r.dashboard_id
+      FROM analytics_run_widgets rw
+      JOIN analytics_runs r ON r.id = rw.run_id
+      LEFT JOIN analytics_late_etl_results late
+        ON late.run_id = rw.run_id AND late.widget_id = rw.widget_id
+      WHERE late.run_id IS NULL AND rw.status = 'failed' AND rw.last_lane = 'etl'
+        AND rw.error LIKE 'Run % still % after % minutes.%Do NOT resubmit%'
+      ORDER BY r.queued_at, rw.position
+    `).all() as any[];
+    let inserted = 0;
+    const now = new Date().toISOString();
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO analytics_late_etl_results
+        (run_id, widget_id, external_run_id, definition_sha256, state,
+         remote_status, next_check_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    `);
+    db.transaction(() => {
+      for (const row of rows) {
+        const match = String(row.error ?? '').match(/^Run (\d+) still ([A-Z_]+) after \d+ minutes\./i);
+        if (!match) continue;
+        inserted += insert.run(
+          row.run_id,
+          row.widget_id,
+          match[1],
+          widgetDefinitionSha256(row.kind, row.sql_query, row.config_json),
+          match[2].toUpperCase(),
+          now,
+          now,
+          now,
+        ).changes;
+      }
+    })();
+    if (inserted) console.log(`[Analytics late ETL] journaled ${inserted} legacy alive handoff(s)`);
+    return inserted;
+  }
+
+  type LateEligibility =
+    | { kind: 'eligible'; source: any; current: any }
+    | { kind: 'wait'; reason: string }
+    | { kind: 'terminal'; state: 'superseded' | 'cancelled' | 'definition_changed'; reason: string };
+
+  function inspectLateEligibility(record: any): LateEligibility {
+    const source = db.prepare(`
+      SELECT r.dashboard_id, r.status AS run_status, r.cancel_requested,
+        r.queued_at, r.schedule_id, rw.status AS child_status,
+        rw.kind AS child_kind, rw.sql_query AS child_sql_query,
+        rw.config_json AS child_config_json, rw.title AS child_title
+      FROM analytics_runs r
+      JOIN analytics_run_widgets rw ON rw.run_id = r.id
+      WHERE r.id = ? AND rw.widget_id = ?
+    `).get(record.run_id, record.widget_id) as any;
+    if (!source) {
+      return { kind: 'terminal', state: 'superseded', reason: 'The source dashboard run or widget no longer exists.' };
+    }
+    if (source.run_status === 'queued' || source.run_status === 'running') {
+      return { kind: 'wait', reason: 'The source dashboard run has not finalized yet.' };
+    }
+    if (source.run_status === 'cancelled' || Number(source.cancel_requested) === 1) {
+      return { kind: 'terminal', state: 'cancelled', reason: 'The owner cancelled the source dashboard run.' };
+    }
+    const newer = db.prepare(`
+      SELECT id FROM analytics_runs
+      WHERE dashboard_id = ? AND (
+        queued_at > ? OR (queued_at = ? AND id > ?)
+      )
+      LIMIT 1
+    `).get(source.dashboard_id, source.queued_at, source.queued_at, record.run_id) as { id: string } | undefined;
+    if (newer) {
+      return { kind: 'terminal', state: 'superseded', reason: `Newer dashboard run ${newer.id} exists.` };
+    }
+    if (source.child_status !== 'failed') {
+      return { kind: 'terminal', state: 'superseded', reason: `Source widget is already ${source.child_status}.` };
+    }
+    const current = db.prepare(`
+      SELECT w.*, d.status AS dashboard_status
+      FROM analytics_widgets w
+      JOIN analytics_dashboards d ON d.id = w.dashboard_id
+      WHERE w.id = ? AND w.dashboard_id = ?
+    `).get(record.widget_id, source.dashboard_id) as any;
+    if (!current || current.dashboard_status === 'archived') {
+      return { kind: 'terminal', state: 'superseded', reason: 'The current widget is absent or its dashboard is archived.' };
+    }
+    const sourceSha = widgetDefinitionSha256(source.child_kind, source.child_sql_query, source.child_config_json);
+    const currentSha = widgetDefinitionSha256(current.kind, current.sql_query, current.config_json);
+    if (sourceSha !== record.definition_sha256 || currentSha !== record.definition_sha256) {
+      return { kind: 'terminal', state: 'definition_changed', reason: 'The widget execution definition changed after submission.' };
+    }
+    return { kind: 'eligible', source, current };
+  }
+
+  function claimLateEtlResults(limit: number): any[] {
+    const claimed: any[] = [];
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + LATE_ETL_LEASE_MS).toISOString();
+    db.transaction(() => {
+      while (claimed.length < limit) {
+        const candidate = db.prepare(`
+          SELECT * FROM analytics_late_etl_results
+          WHERE (state = 'pending' AND julianday(next_check_at) <= julianday(?))
+             OR (state = 'checking' AND julianday(lease_expires_at) <= julianday(?))
+          ORDER BY julianday(next_check_at), created_at, external_run_id
+          LIMIT 1
+        `).get(now, now) as any;
+        if (!candidate) break;
+        const updated = db.prepare(`
+          UPDATE analytics_late_etl_results
+          SET state = 'checking', lease_owner = ?, lease_expires_at = ?, updated_at = ?
+          WHERE run_id = ? AND widget_id = ? AND (
+            (state = 'pending' AND julianday(next_check_at) <= julianday(?))
+            OR (state = 'checking' AND julianday(lease_expires_at) <= julianday(?))
+          )
+        `).run(
+          workerId,
+          leaseExpiresAt,
+          now,
+          candidate.run_id,
+          candidate.widget_id,
+          now,
+          now,
+        );
+        if (updated.changes === 1) claimed.push({ ...candidate, state: 'checking', lease_owner: workerId });
+      }
+    })();
+    return claimed;
+  }
+
+  function returnLateEtlPending(record: any, outcome: QueryRunResult | null, delayMs: number, reason?: string): void {
+    const now = new Date().toISOString();
+    db.prepare(`
+      UPDATE analytics_late_etl_results
+      SET state = 'pending', remote_status = COALESCE(?, remote_status),
+        next_check_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+        error = ?, updated_at = ?
+      WHERE run_id = ? AND widget_id = ? AND state = 'checking' AND lease_owner = ?
+    `).run(
+      outcome?.remoteStatus ?? null,
+      new Date(Date.now() + delayMs).toISOString(),
+      String(reason ?? outcome?.error ?? '').slice(0, 2000) || null,
+      now,
+      record.run_id,
+      record.widget_id,
+      workerId,
+    );
+  }
+
+  function finishLateEtlWithoutApply(
+    record: any,
+    state: 'superseded' | 'cancelled' | 'definition_changed' | 'remote_failed',
+    reason: string,
+    remoteStatus?: string,
+  ): void {
+    const now = new Date().toISOString();
+    const receipt = {
+      outcome: state,
+      sourceRunId: record.run_id,
+      widgetId: record.widget_id,
+      externalRunId: record.external_run_id,
+      ...(remoteStatus ? { remoteStatus } : {}),
+      reason,
+      completedAt: now,
+      submittedAgain: false,
+    };
+    db.prepare(`
+      UPDATE analytics_late_etl_results
+      SET state = ?, remote_status = COALESCE(?, remote_status),
+        lease_owner = NULL, lease_expires_at = NULL, receipt_json = ?,
+        error = ?, updated_at = ?, completed_at = ?
+      WHERE run_id = ? AND widget_id = ? AND state = 'checking' AND lease_owner = ?
+    `).run(
+      state,
+      remoteStatus ?? null,
+      JSON.stringify(receipt),
+      reason.slice(0, 2000),
+      now,
+      now,
+      record.run_id,
+      record.widget_id,
+      workerId,
+    );
+  }
+
+  function recomputeLateRunProjection(runId: string, observedAt: string, refreshApplied: boolean): void {
+    const run = db.prepare('SELECT * FROM analytics_runs WHERE id = ?').get(runId) as any;
+    if (!run) return;
+    const progress = db.prepare(`
+      SELECT COUNT(*) AS widget_count,
+        SUM(CASE WHEN status IN ('completed','failed') THEN 1 ELSE 0 END) AS widgets_completed,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS widgets_succeeded
+      FROM analytics_run_widgets WHERE run_id = ?
+    `).get(runId) as any;
+    const failures = db.prepare(`
+      SELECT title, error FROM analytics_run_widgets
+      WHERE run_id = ? AND status = 'failed' ORDER BY position
+    `).all(runId) as Array<{ title: string; error: string | null }>;
+    const errorSummary = failures.length
+      ? failures.map(item => `${item.title}: ${item.error || 'Unknown widget failure'}`).join('\n').slice(0, 4000)
+      : null;
+    const status = failures.length ? 'failed' : 'completed';
+    db.prepare(`
+      UPDATE analytics_runs SET status = ?, widget_count = ?, widgets_completed = ?,
+        widgets_succeeded = ?, error = ?, heartbeat_at = ?
+      WHERE id = ? AND status IN ('failed','completed')
+    `).run(
+      status,
+      Number(progress.widget_count || 0),
+      Number(progress.widgets_completed || 0),
+      Number(progress.widgets_succeeded || 0),
+      errorSummary,
+      observedAt,
+      runId,
+    );
+    db.prepare(`
+      UPDATE analytics_dashboards SET
+        status = CASE WHEN status = 'archived' THEN status ELSE ? END,
+        last_error = ?,
+        last_refreshed_at = CASE WHEN ? = 1 THEN ? ELSE last_refreshed_at END,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).run(failures.length ? 'degraded' : 'ready', errorSummary, refreshApplied ? 1 : 0, observedAt, run.dashboard_id);
+    if (run.schedule_id) {
+      const recoveredWholeRun = run.status === 'failed' && status === 'completed';
+      db.prepare(`
+        UPDATE analytics_schedules SET last_error = ?,
+          consecutive_failures = CASE WHEN ? = 1 THEN MAX(0, consecutive_failures - 1) ELSE consecutive_failures END,
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).run(errorSummary, recoveredWholeRun ? 1 : 0, run.schedule_id);
+    }
+  }
+
+  function applyLateEtlSuccess(record: any, outcome: QueryRunResult): void {
+    const appliedAt = new Date().toISOString();
+    let applied = false;
+    db.transaction(() => {
+      const eligibility = inspectLateEligibility(record);
+      if (eligibility.kind !== 'eligible') {
+        if (eligibility.kind === 'wait') {
+          returnLateEtlPending(record, outcome, LATE_ETL_RECHECK_MS, eligibility.reason);
+        } else {
+          finishLateEtlWithoutApply(record, eligibility.state, eligibility.reason, outcome.remoteStatus);
+        }
+        return;
+      }
+      const result = etlResultToWidgetResult(outcome);
+      if (result.source) result.source.reconciled = true;
+      const child = db.prepare(`
+        UPDATE analytics_run_widgets SET status = 'completed', error = NULL, completed_at = ?
+        WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+      `).run(appliedAt, record.run_id, record.widget_id);
+      if (child.changes !== 1) throw new Error('Late ETL source widget changed before apply');
+      const widget = db.prepare(`
+        UPDATE analytics_widgets SET result_json = ?, last_error = NULL,
+          last_refreshed_at = ?, updated_at = datetime('now')
+        WHERE id = ? AND dashboard_id = ?
+      `).run(JSON.stringify(result), result.refreshedAt, record.widget_id, eligibility.source.dashboard_id);
+      if (widget.changes !== 1) throw new Error('Late ETL current widget disappeared before apply');
+      const receipt = {
+        outcome: 'applied',
+        sourceRunId: record.run_id,
+        widgetId: record.widget_id,
+        widgetTitle: eligibility.source.child_title,
+        externalRunId: record.external_run_id,
+        remoteStatus: 'SUCCESS',
+        resultPath: outcome.savedTo,
+        resultBytes: outcome.resultBytes,
+        resultSha256: outcome.resultSha256,
+        rowCount: outcome.rowCount ?? outcome.rows?.length ?? 0,
+        definitionSha256: record.definition_sha256,
+        appliedAt,
+        submittedAgain: false,
+      };
+      const journal = db.prepare(`
+        UPDATE analytics_late_etl_results
+        SET state = 'applied', remote_status = 'SUCCESS', result_path = ?,
+          result_bytes = ?, result_sha256 = ?, row_count = ?, receipt_json = ?,
+          error = NULL, lease_owner = NULL, lease_expires_at = NULL,
+          updated_at = ?, completed_at = ?
+        WHERE run_id = ? AND widget_id = ? AND state = 'checking' AND lease_owner = ?
+      `).run(
+        outcome.savedTo ?? null,
+        outcome.resultBytes ?? null,
+        outcome.resultSha256 ?? null,
+        outcome.rowCount ?? outcome.rows?.length ?? 0,
+        JSON.stringify(receipt),
+        appliedAt,
+        appliedAt,
+        record.run_id,
+        record.widget_id,
+        workerId,
+      );
+      if (journal.changes !== 1) throw new Error('Late ETL journal lease changed before apply');
+      recomputeLateRunProjection(record.run_id, appliedAt, true);
+      applied = true;
+    })();
+    if (applied) {
+      console.log(`[Analytics late ETL] applied Datanet run ${record.external_run_id} to ${record.run_id}/${record.widget_id} without resubmission`);
+    }
+  }
+
+  function applyLateEtlRemoteFailure(record: any, outcome: QueryRunResult): void {
+    const observedAt = new Date().toISOString();
+    db.transaction(() => {
+      const eligibility = inspectLateEligibility(record);
+      if (eligibility.kind !== 'eligible') {
+        if (eligibility.kind === 'wait') {
+          returnLateEtlPending(record, outcome, LATE_ETL_RECHECK_MS, eligibility.reason);
+        } else {
+          finishLateEtlWithoutApply(record, eligibility.state, eligibility.reason, outcome.remoteStatus);
+        }
+        return;
+      }
+      const message = [outcome.error, outcome.nextAction].filter(Boolean).join(' — ').slice(0, 2000);
+      db.prepare(`
+        UPDATE analytics_run_widgets SET error = ?, completed_at = ?
+        WHERE run_id = ? AND widget_id = ? AND status = 'failed'
+      `).run(message, observedAt, record.run_id, record.widget_id);
+      db.prepare(`
+        UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
+        WHERE id = ? AND dashboard_id = ?
+      `).run(message, record.widget_id, eligibility.source.dashboard_id);
+      finishLateEtlWithoutApply(record, 'remote_failed', message, outcome.remoteStatus);
+      recomputeLateRunProjection(record.run_id, observedAt, false);
+    })();
+  }
+
+  async function processLateEtlRecord(record: any): Promise<void> {
+    const eligibility = inspectLateEligibility(record);
+    if (eligibility.kind === 'wait') {
+      returnLateEtlPending(record, null, LATE_ETL_RECHECK_MS, eligibility.reason);
+      return;
+    }
+    if (eligibility.kind === 'terminal') {
+      finishLateEtlWithoutApply(record, eligibility.state, eligibility.reason);
+      return;
+    }
+    if (!etlRunner?.readRun) {
+      returnLateEtlPending(record, null, LATE_ETL_RETRY_MS, 'The ETL runner cannot read an existing run yet.');
+      return;
+    }
+    const outcome = await etlRunner.readRun({ runId: String(record.external_run_id) });
+    if (outcome.ok) {
+      applyLateEtlSuccess(record, outcome);
+      return;
+    }
+    if (outcome.code === 'remote_failed') {
+      applyLateEtlRemoteFailure(record, outcome);
+      return;
+    }
+    const delay = outcome.code === 'alive_handoff' ? LATE_ETL_RECHECK_MS : LATE_ETL_RETRY_MS;
+    returnLateEtlPending(record, outcome, delay);
+  }
+
+  async function processLateEtlResults(limit = 4): Promise<number> {
+    const boundedLimit = Math.max(1, Math.min(12, Math.floor(Number(limit) || 1)));
+    const claimed = claimLateEtlResults(boundedLimit);
+    await Promise.all(claimed.map(async record => {
+      try {
+        await processLateEtlRecord(record);
+      } catch (error: any) {
+        console.warn(`[Analytics late ETL] ${record.external_run_id} reconciliation failed: ${error?.message ?? error}`);
+        returnLateEtlPending(record, null, LATE_ETL_RETRY_MS, String(error?.message ?? error));
+      }
+    }));
+    return claimed.length;
+  }
+
   async function executeRunWidget(row: any, lane: DashboardLaneId = 'sql-mcp'): Promise<AnalyticsWidgetResult> {
     const storedWidget = db.prepare(`
       SELECT 1 FROM analytics_widgets WHERE id = ? AND dashboard_id = ?
@@ -908,6 +1386,9 @@ export function createAnalyticsDashboardService(options: {
       const startedAtMs = Date.now();
       const outcome = await etlRunner.runQuery({ sql });
       if (!outcome.ok) {
+        if (outcome.code === 'alive_handoff' && /^\d+$/.test(String(outcome.runId ?? ''))) {
+          throw new EtlAliveHandoffError(outcome);
+        }
         throw new Error([outcome.error, outcome.nextAction].filter(Boolean).join(' — ') || 'Datanet ETL query failed');
       }
       return etlResultToWidgetResult(outcome, Date.now() - startedAtMs);
@@ -1338,6 +1819,7 @@ export function createAnalyticsDashboardService(options: {
         })();
       } catch (error: any) {
         if (!ownsRun(runId)) { ownershipLost = true; return; }
+        const lateHandoff = error instanceof EtlAliveHandoffError ? error : null;
         const message = String(error?.message ?? error).slice(0, 2000);
         const laneUnavailable = isDashboardLaneUnavailable(error, lane);
         if (laneUnavailable) primaryLaneUnavailable = true;
@@ -1354,6 +1836,7 @@ export function createAnalyticsDashboardService(options: {
             WHERE run_id = ? AND widget_id = ? AND status = 'running'
           `).run(message, completedAt, runId, widget.widget_id);
           if (runWidget.changes !== 1) throw new Error('Widget progress changed while recording its failure');
+          if (lateHandoff) recordLateEtlHandoff(runId, widget, lateHandoff, completedAt);
           db.prepare(`
             UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
             WHERE id = ? AND dashboard_id = ?
@@ -1436,6 +1919,11 @@ export function createAnalyticsDashboardService(options: {
     `).all(runId) as any[];
     const groups = new Map<DashboardLaneId, any[]>();
     for (const widget of candidates) {
+      const handedOff = db.prepare(`
+        SELECT 1 FROM analytics_late_etl_results
+        WHERE run_id = ? AND widget_id = ? AND state IN ('pending','checking')
+      `).get(runId, widget.widget_id);
+      if (handedOff) continue; // the original ETL run is alive; never submit another copy on either lane
       if (widget.status === 'failed' && !isCrossLaneRetryableFailure(widget.error)) continue;
       const attemptedLane: DashboardLaneId = widget.last_lane === 'etl' || widget.last_lane === 'sql-mcp'
         ? widget.last_lane
@@ -1563,6 +2051,7 @@ export function createAnalyticsDashboardService(options: {
         console.log(`[Analytics] run ${runId}: widget "${widget.title}" recovered on the ${retryLane} lane`);
       } catch (error: any) {
         if (!ownsRun(runId)) { retryOwnershipLost = true; return; }
+        const lateHandoff = error instanceof EtlAliveHandoffError ? error : null;
         const laneUnavailable = isDashboardLaneUnavailable(error, retryLane);
         if (laneUnavailable) retryLaneUnavailable = true;
         const completedAt = new Date().toISOString();
@@ -1573,6 +2062,7 @@ export function createAnalyticsDashboardService(options: {
             WHERE run_id = ? AND widget_id = ? AND status = 'running'
           `).run(message, completedAt, runId, widget.widget_id);
           if (child.changes !== 1) throw new Error('Widget progress changed while recording cross-lane failure');
+          if (lateHandoff) recordLateEtlHandoff(runId, widget, lateHandoff, completedAt);
           db.prepare(`
             UPDATE analytics_widgets SET last_error = ?, updated_at = datetime('now')
             WHERE id = ? AND dashboard_id = ?
@@ -1719,9 +2209,17 @@ export function createAnalyticsDashboardService(options: {
       WHERE dashboard_id = ? AND status = 'publishing' LIMIT 1
     `).get(id);
     if (publishing) throw new Error('Dashboard cannot be deleted while a snapshot is publishing');
-    const deleted = db.prepare('DELETE FROM analytics_dashboards WHERE id = ?').run(id);
+    const deleted = db.transaction(() => {
+      db.prepare(`
+        DELETE FROM analytics_late_etl_results
+        WHERE run_id IN (SELECT id FROM analytics_runs WHERE dashboard_id = ?)
+      `).run(id);
+      return db.prepare('DELETE FROM analytics_dashboards WHERE id = ?').run(id);
+    })();
     if (deleted.changes !== 1) throw new Error(`Dashboard ${id} not found`);
   }
+
+  backfillLegacyLateEtlHandoffs();
 
   return {
     listDashboards,
@@ -1735,5 +2233,6 @@ export function createAnalyticsDashboardService(options: {
     recoverInterruptedRuns,
     cancelActiveRun,
     processQueuedRuns,
+    processLateEtlResults,
   };
 }

@@ -993,6 +993,42 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
     db.exec("ALTER TABLE analytics_run_widgets ADD COLUMN last_lane TEXT CHECK(last_lane IS NULL OR last_lane IN ('sql-mcp','etl')); ");
   }
 
+  // Late ETL result journal (2026-09-19): a dashboard widget may outlive the
+  // bounded 55-minute foreground poll while its already-submitted Datanet run
+  // remains healthy. This separate table survives run finalization and records
+  // exactly one remote run → source child binding. It intentionally has no
+  // cascading FK: legacy analytics table rebuilds happen above, and stale
+  // records must fail closed through explicit source/current checks rather than
+  // being silently rebound by a migration.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS analytics_late_etl_results (
+      run_id TEXT NOT NULL,
+      widget_id TEXT NOT NULL,
+      external_run_id TEXT NOT NULL UNIQUE,
+      definition_sha256 TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','checking','applied','superseded','cancelled','definition_changed','remote_failed')),
+      remote_status TEXT,
+      next_check_at TEXT NOT NULL,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      result_path TEXT,
+      result_bytes INTEGER,
+      result_sha256 TEXT,
+      row_count INTEGER,
+      receipt_json TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      PRIMARY KEY (run_id, widget_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_analytics_late_etl_due
+      ON analytics_late_etl_results(state, next_check_at);
+    CREATE INDEX IF NOT EXISTS idx_analytics_late_etl_source
+      ON analytics_late_etl_results(run_id, widget_id);
+  `);
+
   // Every registry profile gets one durable state row. Adding a new MCP to
   // the registry seeds it here automatically; commands never enter SQLite.
   const seedMcpServer = db.prepare(`

@@ -30,6 +30,7 @@ import type Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { getSetting, setSetting } from './storage.js';
 import { resolveOwnerIdentity } from './owner-identity.js';
 import { isSentryAuthShapedError, primeDatanetSentrySession } from './sentry-session.js';
@@ -95,24 +96,33 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
   };
 }
 
+export type QueryRunResultCode = 'alive_handoff' | 'remote_failed' | 'status_unavailable' | 'download_failed';
+
 export interface QueryRunResult {
   ok: boolean;
   runId?: string;
+  /** Structured outcome for an already-submitted remote run. */
+  code?: QueryRunResultCode;
+  remoteStatus?: string;
   columns?: string[];
   rows?: string[][];
   rowCount?: number;
   truncated?: boolean;
   savedTo?: string;
+  resultBytes?: number;
+  resultSha256?: string;
   /** Non-ok: what happened, in one line the model can act on. */
   error?: string;
   /** Non-ok: the exact next action. Never leaves the model guessing. */
   nextAction?: string;
 }
 
-/** The A4 dashboard seam: implementations run one SQL statement chain. */
+/** The A4 dashboard seam: implementations run one SQL statement chain and
+ * may read an already-submitted run without any profile, SQL, or submit effect. */
 export interface QueryRunner {
   id: string;
   runQuery(input: { sql: string; datasetDate?: string; group?: string }): Promise<QueryRunResult>;
+  readRun?(input: { runId: string }): Promise<QueryRunResult>;
 }
 
 const KEYS = {
@@ -402,6 +412,109 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     }
   }
 
+  async function downloadRun(runId: string): Promise<QueryRunResult> {
+    fs.mkdirSync(downloadDir, { recursive: true });
+    const output = path.join(downloadDir, `adhoc_${runId}.tsv`);
+    const download = await call('datanet_download_results', { run_id: runId, output });
+    if (download.isError || !fs.existsSync(output)) {
+      return {
+        ok: false,
+        code: 'download_failed',
+        runId,
+        remoteStatus: 'SUCCESS',
+        error: `Run ${runId} succeeded but the download failed: ${firstLine(download.text)}`,
+        nextAction: `Retry reading this existing run once; do not resubmit it. Results purge over time, so recover it promptly.`,
+      };
+    }
+    const bytes = fs.readFileSync(output);
+    const raw = bytes.toString('utf8');
+    const lines = raw.split('\n').filter(line => line.length > 0);
+    const columns = (lines[0] ?? '').split('\t');
+    const body = lines.slice(1);
+    const rows = body.slice(0, maxRows).map(line => line.split('\t'));
+    return {
+      ok: true,
+      runId,
+      remoteStatus: 'SUCCESS',
+      columns,
+      rows,
+      rowCount: body.length,
+      truncated: body.length > maxRows,
+      savedTo: output,
+      resultBytes: bytes.length,
+      resultSha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+  }
+
+  /** Read and, only after verified SUCCESS, download an existing Datanet run.
+   * This capability cannot stage SQL, submit, prioritize, restart, or mutate a
+   * remote run; dashboard late-result reconciliation depends on that limit. */
+  async function readRun(input: { runId: string }): Promise<QueryRunResult> {
+    const runId = String(input.runId ?? '').trim();
+    if (!/^\d+$/.test(runId)) {
+      return {
+        ok: false,
+        code: 'status_unavailable',
+        error: 'Existing Datanet run id must be numeric.',
+        nextAction: 'Use the exact runId returned by the original submission; do not submit another run.',
+      };
+    }
+    const poll = await call('datanet_get_job_run_status', { run_id: runId });
+    if (poll.isError) {
+      return {
+        ok: false,
+        code: 'status_unavailable',
+        runId,
+        error: `Could not read existing run ${runId}: ${firstLine(poll.text)}`,
+        nextAction: 'Retry this read later; do not resubmit the query.',
+      };
+    }
+    const remoteStatus = String(parseJson(poll.text).status ?? '').toUpperCase();
+    if (!remoteStatus) {
+      return {
+        ok: false,
+        code: 'status_unavailable',
+        runId,
+        error: `Existing run ${runId} returned no status: ${firstLine(poll.text)}`,
+        nextAction: 'Retry this read later; do not resubmit the query.',
+      };
+    }
+    if (remoteStatus === 'SUCCESS') return downloadRun(runId);
+    if (remoteStatus === 'ERROR' || remoteStatus === 'KILLED') {
+      const diagnose = await call('datanet_get_job_run_error', { run_id: runId });
+      const diagnosed = parseJson(diagnose.text);
+      const detail = diagnose.isError
+        ? ''
+        : firstLine(String(diagnosed.error ?? diagnosed.message ?? diagnose.text), 600);
+      return {
+        ok: false,
+        code: 'remote_failed',
+        runId,
+        remoteStatus,
+        error: `Run ${runId} ${remoteStatus}. ${detail || 'No error detail returned.'}`,
+        nextAction: 'Fix the SQL before a future owner-requested refresh; this exact run is terminal and will not be resubmitted automatically.',
+      };
+    }
+    if (remoteStatus === 'DELETED') {
+      return {
+        ok: false,
+        code: 'remote_failed',
+        runId,
+        remoteStatus,
+        error: `Run ${runId} was deleted server-side; no late output can be recovered.`,
+        nextAction: 'A future refresh may run the widget again, but this reconciler will not submit anything.',
+      };
+    }
+    return {
+      ok: false,
+      code: 'alive_handoff',
+      runId,
+      remoteStatus,
+      error: `Run ${runId} is still ${remoteStatus}.`,
+      nextAction: 'Wait for automatic late-result reconciliation; do not resubmit or refresh solely to import this output.',
+    };
+  }
+
   async function runQuery(input: { sql: string; datasetDate?: string; group?: string }): Promise<QueryRunResult> {
     const sqlBody = String(input.sql ?? '').trim();
     if (!sqlBody) return { ok: false, error: 'sql required', nextAction: 'Call again with the SQL to run.' };
@@ -500,7 +613,9 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     if (status === 'DELETED') {
       return {
         ok: false,
+        code: 'remote_failed',
         runId,
+        remoteStatus: status,
         error: `Run ${runId} was deleted server-side while queued — usually a duplicate queued run for the same job and dataset date (Datanet collapses those).`,
         nextAction: 'Submit the query again ONCE, after confirming no other run is in flight for the ad-hoc job (mcp_etl_latest_run). If the new run is deleted too, stop and report.',
       };
@@ -513,7 +628,9 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         : firstLine(String(diagnosed.error ?? diagnosed.message ?? diagnose.text), 600);
       return {
         ok: false,
+        code: 'remote_failed',
         runId,
+        remoteStatus: status,
         error: `Run ${runId} ${status}. ${detail || 'No error detail returned.'}`,
         nextAction: 'Fix the SQL per the root cause and call mcp_etl_run_query again ONCE. If it fails again for the same reason, stop and report.',
       };
@@ -521,38 +638,15 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     if (status !== 'SUCCESS') {
       return {
         ok: false,
+        code: 'alive_handoff',
         runId,
+        remoteStatus: status,
         error: `Run ${runId} still ${status || 'running'} after ${Math.round(pollBudgetMs / 60000)} minutes.`,
-        nextAction: `Do NOT resubmit — the run is alive. Check later with mcp_etl_job_run (runId ${runId}) and download with mcp_etl_download_results when SUCCESS.`,
+        nextAction: `Do NOT resubmit — the run is alive. Dashboard consumers automatically reconcile this exact run when it succeeds; interactive callers can check it with mcp_etl_job_run (runId ${runId}).`,
       };
     }
 
-    // Download + parse TSV.
-    fs.mkdirSync(downloadDir, { recursive: true });
-    const output = path.join(downloadDir, `adhoc_${runId}.tsv`);
-    const download = await call('datanet_download_results', { run_id: runId, output });
-    if (download.isError || !fs.existsSync(output)) {
-      return {
-        ok: false,
-        runId,
-        error: `Run ${runId} succeeded but the download failed: ${firstLine(download.text)}`,
-        nextAction: `Retry mcp_etl_download_results with runId ${runId} once; results purge over time, so do it promptly.`,
-      };
-    }
-    const raw = fs.readFileSync(output, 'utf8');
-    const lines = raw.split('\n').filter(line => line.length > 0);
-    const columns = (lines[0] ?? '').split('\t');
-    const body = lines.slice(1);
-    const rows = body.slice(0, maxRows).map(line => line.split('\t'));
-    return {
-      ok: true,
-      runId,
-      columns,
-      rows,
-      rowCount: body.length,
-      truncated: body.length > maxRows,
-      savedTo: output,
-    };
+    return downloadRun(runId);
     } finally {
       // Pair goes back to the pool whatever happened. A run handed off
       // alive (budget exhausted) keeps its job busy SERVER-side — the next
@@ -561,5 +655,5 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     }
   }
 
-  return { id: 'etl', runQuery };
+  return { id: 'etl', runQuery, readRun };
 }

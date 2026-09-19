@@ -39,6 +39,15 @@ export interface AnalyticsWidgetResult {
   refreshedAt: string;
   /** Which data lane produced this result (etl-analytics A4). Absent on pre-A4 results = sql-mcp. */
   lane?: 'sql-mcp' | 'etl';
+  /** Immutable remote-result provenance for ETL outputs, including late reconciliation. */
+  source?: {
+    provider: 'datanet';
+    runId: string;
+    remoteStatus: 'SUCCESS';
+    resultSha256?: string;
+    resultBytes?: number;
+    reconciled?: boolean;
+  };
 }
 
 export interface AnalyticsWidget {
@@ -91,6 +100,25 @@ export interface AnalyticsPublication {
 }
 
 export type AnalyticsRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type AnalyticsLateEtlState = 'pending' | 'checking' | 'applied' | 'superseded' | 'cancelled' | 'definition_changed' | 'remote_failed';
+
+export interface AnalyticsLateEtlResult {
+  runId: string;
+  widgetId: string;
+  externalRunId: string;
+  state: AnalyticsLateEtlState;
+  remoteStatus?: string;
+  nextCheckAt: string;
+  resultPath?: string;
+  resultBytes?: number;
+  resultSha256?: string;
+  rowCount?: number;
+  receipt?: Record<string, unknown>;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
 
 export interface AnalyticsRun {
   id: string;
@@ -113,6 +141,8 @@ export interface AnalyticsRun {
   leaseExpiresAt?: string;
   error?: string;
   completedAt?: string;
+  /** Already-submitted ETL runs whose outputs may arrive after the foreground budget. */
+  lateEtlResults?: AnalyticsLateEtlResult[];
 }
 
 export interface AnalyticsDashboardSummary {
@@ -346,4 +376,6 @@ export interface AnalyticsDashboardService {
   cancelActiveRun(dashboardId: string): { result: 'cancelled' | 'stopping' | 'none'; run: AnalyticsRun | null };
   recoverInterruptedRuns(): number;
   processQueuedRuns(limit?: number): Promise<number>;
+  /** Poll/download only already-submitted ETL handoffs and guardedly project verified late outputs. */
+  processLateEtlResults(limit?: number): Promise<number>;
 }
