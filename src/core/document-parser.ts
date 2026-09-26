@@ -79,6 +79,10 @@ export interface SheetReadOptions {
   sheet?: string;
   maxRows?: number; // default 2000, cap 10000
   maxChars?: number; // default 60_000, cap 120_000
+  /** External cancellation for owner-scoped reads and bounded process shutdown. */
+  signal?: AbortSignal;
+  /** Import intake requires every declared sheet to resolve through workbook relationships. */
+  requireCompleteRelationships?: boolean;
 }
 
 export interface SheetReadResult {
@@ -120,11 +124,17 @@ function run(bin: string, args: string[], timeoutMs: number): string {
  * (Incident 2026-08-24: a password-protected PDF in a watched Downloads
  * folder made the dashboard time out — the sync exec held the event loop.)
  */
-async function runAsync(bin: string, args: string[], timeoutMs: number): Promise<string> {
+async function runAsync(
+  bin: string,
+  args: string[],
+  timeoutMs: number,
+  options: { signal?: AbortSignal; maxBuffer?: number } = {},
+): Promise<string> {
   const { stdout } = await execFileAsync(bin, args, {
     encoding: 'utf-8',
     timeout: timeoutMs,
-    maxBuffer: 1024 * 1024 * 512,
+    maxBuffer: options.maxBuffer ?? 1024 * 1024 * 512,
+    signal: options.signal,
   });
   return stdout.trim();
 }
@@ -565,16 +575,41 @@ export function createDocumentParser(): DocumentParser {
     member: string,
     onChunk: (chunk: string) => boolean,
     timeoutMs = 120_000,
+    signal?: AbortSignal,
   ): Promise<{ aborted: boolean }> {
     return new Promise((resolve, reject) => {
       const child = spawn('unzip', ['-p', filePath, member], { stdio: ['ignore', 'pipe', 'ignore'] });
       let aborted = false;
+      let externallyAborted = false;
       let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onExternalAbort);
+      };
+      const rejectOnce = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const onExternalAbort = (): void => {
+        externallyAborted = true;
+        aborted = true;
+        child.kill('SIGKILL');
+        const error = new Error('XLSX sheet read was aborted.');
+        error.name = 'AbortError';
+        rejectOnce(error);
+      };
       const timer = setTimeout(() => {
         aborted = true;
         child.kill('SIGKILL');
-        if (!settled) { settled = true; reject(new Error(`unzip ${member} timed out`)); }
+        rejectOnce(new Error(`unzip ${member} timed out`));
       }, timeoutMs);
+      if (signal?.aborted) {
+        onExternalAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onExternalAbort, { once: true });
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
         if (aborted) return;
@@ -583,14 +618,11 @@ export function createDocumentParser(): DocumentParser {
           child.kill('SIGKILL');
         }
       });
-      child.on('error', (error) => {
-        clearTimeout(timer);
-        if (!settled) { settled = true; reject(error); }
-      });
+      child.on('error', (error) => rejectOnce(error));
       child.on('close', (code) => {
-        clearTimeout(timer);
-        if (settled) return;
+        if (settled || externallyAborted) return;
         settled = true;
+        cleanup();
         if (!aborted && code !== 0) reject(new Error(`unzip ${member} exited with ${code}`));
         else resolve({ aborted });
       });
@@ -619,6 +651,7 @@ export function createDocumentParser(): DocumentParser {
     filePath: string,
     members: string[],
     budgetBytes: number,
+    signal?: AbortSignal,
   ): Promise<{ shared: string[]; budgetHit: boolean }> {
     if (!members.includes('xl/sharedStrings.xml')) return { shared: [], budgetHit: false };
     let acc = '';
@@ -629,7 +662,7 @@ export function createDocumentParser(): DocumentParser {
       bytes += Buffer.byteLength(chunk);
       if (bytes >= budgetBytes) { budgetHit = true; return false; }
       return true;
-    });
+    }, 120_000, signal);
     if (budgetHit) {
       // Trim to the budget FIRST (a small table can arrive in one chunk that
       // already overshoots), then cut back to the last complete entry so a
@@ -716,32 +749,118 @@ export function createDocumentParser(): DocumentParser {
 
   // ── Sheet-scoped deep read (xlsx-deep-reads X1) ────────────────────────────
 
+  function exactXmlAttributes(tag: string): Map<string, string[]> {
+    const attributes = new Map<string, string[]>();
+    for (const match of tag.matchAll(/\s([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) {
+      const name = match[1];
+      const value = decodeXmlEntities(match[2] ?? match[3] ?? '');
+      const values = attributes.get(name) ?? [];
+      values.push(value);
+      attributes.set(name, values);
+    }
+    return attributes;
+  }
+
+  function exactXmlAttribute(attributes: Map<string, string[]>, name: string): string | undefined {
+    const values = attributes.get(name);
+    return values?.length === 1 ? values[0] : undefined;
+  }
+
   /** workbook.xml sheets (name + r:id) joined to the rels part targets —
    * the ONLY correct name→member mapping (parts are freely reordered). */
-  async function resolveSheetMembers(filePath: string, members: string[]): Promise<Array<{ name: string; member: string }>> {
+  async function resolveSheetMembers(
+    filePath: string,
+    members: string[],
+    signal?: AbortSignal,
+    requireCompleteRelationships = false,
+  ): Promise<Array<{ name: string; member: string }>> {
     if (!members.includes('xl/workbook.xml')) return [];
-    const workbook = await runAsync('unzip', ['-p', filePath, 'xl/workbook.xml'], 30000);
+    const workbook = await runAsync('unzip', ['-p', filePath, 'xl/workbook.xml'], 30000, {
+      signal,
+      maxBuffer: 2 * 1024 * 1024,
+    });
     const relsXml = members.includes('xl/_rels/workbook.xml.rels')
-      ? await runAsync('unzip', ['-p', filePath, 'xl/_rels/workbook.xml.rels'], 30000)
+      ? await runAsync('unzip', ['-p', filePath, 'xl/_rels/workbook.xml.rels'], 30000, {
+          signal,
+          maxBuffer: 2 * 1024 * 1024,
+        })
       : '';
-    const relTargets = new Map<string, string>();
+    const worksheetRelationshipTypes = new Set([
+      'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet',
+      'http://purl.oclc.org/ooxml/officeDocument/relationships/worksheet',
+    ]);
+    const relTargets = new Map<string, { member: string | null; type: string; targetMode: string }>();
+    let duplicateRelationshipId = false;
+    let invalidRelationshipAttributes = false;
     for (const rel of relsXml.matchAll(/<Relationship\b[^>]*>/g)) {
-      const id = /Id="([^"]*)"/.exec(rel[0])?.[1];
-      const target = /Target="([^"]*)"/.exec(rel[0])?.[1];
-      if (id && target) relTargets.set(id, target.replace(/^\//, '').replace(/^(?!xl\/)/, 'xl/'));
+      const attributes = exactXmlAttributes(rel[0]);
+      const id = exactXmlAttribute(attributes, 'Id');
+      const rawTarget = exactXmlAttribute(attributes, 'Target');
+      const type = exactXmlAttribute(attributes, 'Type');
+      const targetMode = exactXmlAttribute(attributes, 'TargetMode') ?? '';
+      if (!id || !rawTarget || !type
+        || (attributes.has('TargetMode') && exactXmlAttribute(attributes, 'TargetMode') === undefined)) {
+        invalidRelationshipAttributes = true;
+        continue;
+      }
+      if (relTargets.has(id)) duplicateRelationshipId = true;
+      const target = rawTarget;
+      let member: string | null = null;
+      if (!target.includes('\\') && !target.includes('\0') && !/[?#]/.test(target)) {
+        const normalized = target.startsWith('/')
+          ? path.posix.normalize(target.slice(1))
+          : path.posix.normalize(path.posix.join('xl', target));
+        if (normalized && normalized !== '..' && !normalized.startsWith('../') && !path.posix.isAbsolute(normalized)) {
+          member = normalized;
+        }
+      }
+      relTargets.set(id, { member, type, targetMode });
     }
+    let invalidSheetAttributes = false;
+    const declarations = [...workbook.matchAll(/<sheet\b[^>]*>/g)].map(sheet => {
+      const attributes = exactXmlAttributes(sheet[0]);
+      const name = exactXmlAttribute(attributes, 'name');
+      const rid = exactXmlAttribute(attributes, 'r:id');
+      if (!name || !rid) invalidSheetAttributes = true;
+      return { name, rid };
+    });
     const out: Array<{ name: string; member: string }> = [];
-    for (const sheet of workbook.matchAll(/<sheet\b[^>]*>/g)) {
-      const name = /\sname="([^"]*)"/.exec(sheet[0])?.[1];
-      const rid = /r:id="([^"]*)"/.exec(sheet[0])?.[1];
-      if (name === undefined) continue;
-      const member = rid ? relTargets.get(rid) : undefined;
-      if (member && members.includes(member)) out.push({ name: decodeXmlEntities(name), member });
+    for (const declaration of declarations) {
+      if (declaration.name === undefined) continue;
+      const relationship = declaration.rid ? relTargets.get(declaration.rid) : undefined;
+      if (relationship?.member && members.includes(relationship.member)) {
+        out.push({ name: decodeXmlEntities(declaration.name), member: relationship.member });
+      }
     }
-    // Rels missing/odd: fall back to positional pairing (best effort).
+    if (requireCompleteRelationships) {
+      const uniqueMembers = new Set(out.map(sheet => sheet.member));
+      const uniqueNames = new Set(out.map(sheet => sheet.name.toLowerCase()));
+      const invalidRelationship = declarations.some(declaration => {
+        const relationship = declaration.rid ? relTargets.get(declaration.rid) : undefined;
+        return !relationship?.member
+          || !worksheetRelationshipTypes.has(relationship.type)
+          || (relationship.targetMode !== '' && relationship.targetMode.toLowerCase() !== 'internal')
+          || !/^xl\/worksheets\/[^/]+\.xml$/.test(relationship.member)
+          || !members.includes(relationship.member);
+      });
+      if (!declarations.length || duplicateRelationshipId || invalidRelationshipAttributes
+        || invalidSheetAttributes || invalidRelationship
+        || declarations.some(sheet => sheet.name === undefined || !sheet.rid)
+        || out.length !== declarations.length
+        || uniqueMembers.size !== out.length
+        || uniqueNames.size !== out.length) {
+        throw new Error('XLSX sheet relationships are missing, partial, or ambiguous');
+      }
+      return out;
+    }
+    // Legacy deep reads retain their best-effort fallback for older malformed
+    // workbooks. Import intake opts into the strict branch above because a
+    // positional fallback can relabel one sheet's bytes as another identity.
     if (out.length === 0) {
       const sheetMembers = xlsxSheetMembers(members);
-      const names = [...workbook.matchAll(/<sheet[^>]*\sname="([^"]*)"/g)].map(m => decodeXmlEntities(m[1]));
+      const names = declarations
+        .filter(sheet => sheet.name !== undefined)
+        .map(sheet => decodeXmlEntities(sheet.name!));
       return sheetMembers.map((member, index) => ({ name: names[index] ?? member.replace('xl/worksheets/', '').replace('.xml', ''), member }));
     }
     return out;
@@ -749,11 +868,14 @@ export function createDocumentParser(): DocumentParser {
 
   /** Style indexes whose number format is a date/time format: builtin ids
    * 14–22 and 45–47, plus custom formats containing date tokens. */
-  async function dateStyleIndexes(filePath: string, members: string[]): Promise<Set<number>> {
+  async function dateStyleIndexes(filePath: string, members: string[], signal?: AbortSignal): Promise<Set<number>> {
     const out = new Set<number>();
     if (!members.includes('xl/styles.xml')) return out;
     try {
-      const xml = await runAsync('unzip', ['-p', filePath, 'xl/styles.xml'], 30000);
+      const xml = await runAsync('unzip', ['-p', filePath, 'xl/styles.xml'], 30000, {
+        signal,
+        maxBuffer: 8 * 1024 * 1024,
+      });
       const customDateIds = new Set<number>();
       for (const fmt of xml.matchAll(/<numFmt\b[^>]*numFmtId="(\d+)"[^>]*formatCode="([^"]*)"/g)) {
         const code = fmt[2].replace(/\[[^\]]*\]/g, '').replace(/&quot;[^&]*&quot;/g, '');
@@ -768,7 +890,10 @@ export function createDocumentParser(): DocumentParser {
         }
         index++;
       }
-    } catch { /* dates render as raw serials — noted, never fatal */ }
+    } catch (error) {
+      if (signal?.aborted || (error as { name?: string })?.name === 'AbortError') throw error;
+      // Dates render as raw serials when style metadata is unreadable — noted, never fatal.
+    }
     return out;
   }
 
@@ -782,9 +907,17 @@ export function createDocumentParser(): DocumentParser {
   }
 
   async function parseXlsxSheet(filePath: string, options: SheetReadOptions = {}): Promise<SheetReadResult> {
-    const members = (await runAsync('unzip', ['-Z1', filePath], 30000))
+    const members = (await runAsync('unzip', ['-Z1', filePath], 30000, {
+      signal: options.signal,
+      maxBuffer: 2 * 1024 * 1024,
+    }))
       .split('\n').map(line => line.trim()).filter(Boolean);
-    const sheets = await resolveSheetMembers(filePath, members);
+    const sheets = await resolveSheetMembers(
+      filePath,
+      members,
+      options.signal,
+      options.requireCompleteRelationships === true,
+    );
     if (sheets.length === 0) throw new Error('XLSX contains no worksheets');
     if (!options.sheet) return { sheets };
 
@@ -794,8 +927,13 @@ export function createDocumentParser(): DocumentParser {
     }
     const maxRows = Math.max(1, Math.min(10_000, options.maxRows ?? 2000));
     const maxChars = Math.max(2_000, Math.min(120_000, options.maxChars ?? 60_000));
-    const { shared, budgetHit } = await readSharedStringsBudgeted(filePath, members, LARGE_SHARED_STRINGS_BUDGET);
-    const dateStyles = await dateStyleIndexes(filePath, members);
+    const { shared, budgetHit } = await readSharedStringsBudgeted(
+      filePath,
+      members,
+      LARGE_SHARED_STRINGS_BUDGET,
+      options.signal,
+    );
+    const dateStyles = await dateStyleIndexes(filePath, members, options.signal);
 
     const rows: string[][] = [];
     let rowsTotal: number | null = null;
@@ -850,7 +988,7 @@ export function createDocumentParser(): DocumentParser {
       carry = lastEnd >= 0 ? carry.slice(lastEnd) : carry;
       if (carry.length > STREAM_CARRY_CAP) carry = carry.slice(-STREAM_CARRY_CAP);
       return true;
-    });
+    }, 120_000, options.signal);
 
     return {
       sheets,

@@ -150,7 +150,7 @@ describe('parseXlsxSheet', () => {
   afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
 
   function relsXml(pairs: Array<[string, string]>): string {
-    return `<?xml version="1.0"?><Relationships>${pairs.map(([id, target]) => `<Relationship Id="${id}" Type="http://sheet" Target="${target}"/>`).join('')}</Relationships>`;
+    return `<?xml version="1.0"?><Relationships>${pairs.map(([id, target]) => `<Relationship Id="${id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="${target}"/>`).join('')}</Relationships>`;
   }
 
   it('resolves sheet NAMES through rels even when part numbering is reversed; reads typed cells', async () => {
@@ -203,6 +203,66 @@ describe('parseXlsxSheet', () => {
     expect(result.sheet!.truncation.rowsCut).toBe(true);
     expect(result.sheet!.truncation.charsCut).toBe(false);
     expect(result.sheet!.rowsTotal).toBe(50);
+  });
+
+  it('honors an external abort before workbook subprocess work starts', async () => {
+    const file = makeZip(dir, 'abort.xlsx', {
+      'xl/workbook.xml': workbookXml(['Data']),
+      'xl/_rels/workbook.xml.rels': relsXml([['rId1', 'worksheets/sheet1.xml']]),
+      'xl/worksheets/sheet1.xml': sheetXml([inlineRow(1, ['value'])], 1),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const parser = createDocumentParser();
+    await expect(parser.parseXlsxSheet!(file, { sheet: 'Data', signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('strict import mode rejects partial relationships while legacy deep reads retain best effort', async () => {
+    const file = makeZip(dir, 'partial-rels.xlsx', {
+      'xl/workbook.xml': workbookXml(['Mapped', 'Missing']),
+      'xl/_rels/workbook.xml.rels': relsXml([['rId1', 'worksheets/sheet1.xml']]),
+      'xl/worksheets/sheet1.xml': sheetXml([inlineRow(1, ['mapped'])], 1),
+      'xl/worksheets/sheet2.xml': sheetXml([inlineRow(1, ['must not be relabeled'])], 1),
+    });
+    const parser = createDocumentParser();
+    const legacy = await parser.parseXlsxSheet!(file);
+    expect(legacy.sheets.map(sheet => sheet.name)).toEqual(['Mapped']);
+    await expect(parser.parseXlsxSheet!(file, { requireCompleteRelationships: true }))
+      .rejects.toThrow(/relationships are missing, partial, or ambiguous/i);
+
+    const wrongType = makeZip(dir, 'wrong-type.xlsx', {
+      'xl/workbook.xml': workbookXml(['Claimed worksheet']),
+      'xl/_rels/workbook.xml.rels': '<?xml version="1.0"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="worksheets/sheet1.xml"/></Relationships>',
+      'xl/worksheets/sheet1.xml': sheetXml([inlineRow(1, ['must not be admitted'])], 1),
+    });
+    await expect(parser.parseXlsxSheet!(wrongType, { requireCompleteRelationships: true }))
+      .rejects.toThrow(/relationships are missing, partial, or ambiguous/i);
+
+    const wrongMember = makeZip(dir, 'wrong-member.xlsx', {
+      'xl/workbook.xml': workbookXml(['Claimed worksheet']),
+      'xl/_rels/workbook.xml.rels': '<?xml version="1.0"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="styles.xml"/></Relationships>',
+      'xl/styles.xml': sheetXml([inlineRow(1, ['must remain styles'])], 1),
+    });
+    await expect(parser.parseXlsxSheet!(wrongMember, { requireCompleteRelationships: true }))
+      .rejects.toThrow(/relationships are missing, partial, or ambiguous/i);
+
+    const shadowedTarget = makeZip(dir, 'shadowed-target.xlsx', {
+      'xl/workbook.xml': workbookXml(['Shadowed']),
+      'xl/_rels/workbook.xml.rels': '<?xml version="1.0"?><Relationships xmlns:x="urn:test"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" x:Target="worksheets/sheet1.xml" Target="styles.xml"/></Relationships>',
+      'xl/worksheets/sheet1.xml': sheetXml([inlineRow(1, ['shadow value'])], 1),
+      'xl/styles.xml': sheetXml([inlineRow(1, ['actual target'])], 1),
+    });
+    await expect(parser.parseXlsxSheet!(shadowedTarget, { requireCompleteRelationships: true }))
+      .rejects.toThrow(/relationships are missing, partial, or ambiguous/i);
+
+    const external = makeZip(dir, 'external-target.xlsx', {
+      'xl/workbook.xml': workbookXml(['External']),
+      'xl/_rels/workbook.xml.rels': '<?xml version="1.0"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml" TargetMode="External"/></Relationships>',
+      'xl/worksheets/sheet1.xml': sheetXml([inlineRow(1, ['must stay external'])], 1),
+    });
+    await expect(parser.parseXlsxSheet!(external, { requireCompleteRelationships: true }))
+      .rejects.toThrow(/relationships are missing, partial, or ambiguous/i);
   });
 });
 

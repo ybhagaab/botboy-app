@@ -139,8 +139,12 @@ fi
 # (folder-watch-scaling), but the server still juggles sockets, MCP child
 # processes, SQLite, and parser subprocesses — keep generous headroom.
 ulimit -n 10240 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
-LOG_FILE="/tmp/ppt.log"
-PID_FILE="/tmp/ppt.pid"
+LOG_FILE="${PPT_LOG_FILE:-/tmp/ppt.log}"
+PID_FILE="${PPT_PID_FILE:-/tmp/ppt.pid}"
+STARTUP_SAFETY_BLOCK="${PPT_STARTUP_SAFETY_BLOCK:-/tmp/ppt-startup-safety-block.json}"
+SHUTDOWN_RECEIPT_DIR="${PPT_SHUTDOWN_RECEIPT_DIR:-/tmp}"
+STARTUP_INT_GRACE_SECONDS="${PPT_STARTUP_INT_GRACE_SECONDS:-20}"
+STARTUP_TERM_GRACE_SECONDS="${PPT_STARTUP_TERM_GRACE_SECONDS:-10}"
 DEBUG_PROFILE="$HOME/.chrome-debug-profile"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 export PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
@@ -526,20 +530,128 @@ wait_for_server() {
   return 1
 }
 
+shutdown_receipt_path() {
+  printf '%s/ppt-shutdown-%s.json' "$SHUTDOWN_RECEIPT_DIR" "$1"
+}
+
+current_epoch_ms() {
+  "$NODE" -e 'process.stdout.write(String(Date.now()))'
+}
+
+# Persist the exact process set and original signal boundary before attempting
+# shutdown. If this launcher is interrupted, later starts remain fail-closed
+# until every target has a matching, fresh, DB-closed receipt.
+write_shutdown_safety_block() {
+  local reason="$1"
+  local not_before_ms="$2"
+  shift 2
+  [ "$#" -gt 0 ] || return 1
+  "$NODE" -e '
+    const fs = require("fs");
+    const path = require("path");
+    const file = process.argv[1];
+    const reason = process.argv[2];
+    const notBeforeMs = Number(process.argv[3]);
+    const pids = process.argv.slice(4).map(Number);
+    if (!Number.isFinite(notBeforeMs) || notBeforeMs <= 0
+        || pids.length === 0 || pids.some(pid => !Number.isInteger(pid) || pid <= 0)) {
+      process.exit(1);
+    }
+    const value = {
+      schemaVersion: 2,
+      reason,
+      createdAt: new Date().toISOString(),
+      targets: [...new Set(pids)].map(pid => ({ pid, notBeforeMs })),
+    };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+    const fd = fs.openSync(temporary, "w", 0o600);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temporary, file);
+    fs.chmodSync(file, 0o600);
+  ' "$STARTUP_SAFETY_BLOCK" "$reason" "$not_before_ms" "$@"
+}
+
+write_startup_safety_block() {
+  local server_pid="$1"
+  local not_before_ms="$2"
+  write_shutdown_safety_block "startup_child_shutdown_unverified" "$not_before_ms" "$server_pid"
+}
+
+# Stop an exact candidate child through the same 20/30-second DB-last contract
+# as ordinary takeover. Failed readiness/window settlement must never create a
+# five-second shortcut around the application's 25-second coordinator.
 stop_startup_child() {
   local server_pid="$1"
-  if kill -0 "$server_pid" 2>/dev/null; then
+  local receipt attempt_started_ms
+  receipt="$(shutdown_receipt_path "$server_pid")"
+  attempt_started_ms="$(current_epoch_ms)"
+  if ! write_startup_safety_block "$server_pid" "$attempt_started_ms"; then
+    echo "❌ Could not persist the failed-start shutdown guard; the child was not signalled."
+    return 1
+  fi
+
+  local killed=0
+  rm -f "$receipt"
+  if pid_is_live "$server_pid"; then
     kill -INT "$server_pid" 2>/dev/null || true
-    for _ in $(seq 1 5); do
-      kill -0 "$server_pid" 2>/dev/null || break
+    for _ in $(seq 1 "$STARTUP_INT_GRACE_SECONDS"); do
+      pid_is_live "$server_pid" || break
       sleep 1
     done
-    kill -9 "$server_pid" 2>/dev/null || true
+    if pid_is_live "$server_pid"; then
+      echo "⚠️  startup pid $server_pid exceeded the cooperative window — sending the real second signal"
+      kill -TERM "$server_pid" 2>/dev/null || true
+      for _ in $(seq 1 "$STARTUP_TERM_GRACE_SECONDS"); do
+        pid_is_live "$server_pid" || break
+        sleep 1
+      done
+    fi
+    if pid_is_live "$server_pid"; then
+      killed=1
+      echo "❌ startup pid $server_pid exceeded 30 seconds — sending SIGKILL; DB closure is unverified"
+      kill -9 "$server_pid" 2>/dev/null || true
+    fi
   fi
   wait "$server_pid" 2>/dev/null || true
   if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$server_pid" ]; then
     rm -f "$PID_FILE"
   fi
+
+  local state
+  state="$(shutdown_receipt_state "$receipt" "$server_pid" "$attempt_started_ms")"
+  case "$state" in
+    "complete|clean|closed")
+      if ! scrub_shutdown_receipt "$receipt" "$server_pid"; then
+        echo "❌ DB closure was proved, but private receipt fields could not be scrubbed."
+        return 1
+      fi
+      rm -f "$STARTUP_SAFETY_BLOCK"
+      echo "✅ startup pid $server_pid stopped cleanly after failed completion (receipt: $receipt)"
+      return 0
+      ;;
+    "complete|forced|closed"|"complete|failed|closed")
+      if ! scrub_shutdown_receipt "$receipt" "$server_pid"; then
+        echo "❌ DB closure was proved, but private receipt fields could not be scrubbed."
+        return 1
+      fi
+      rm -f "$STARTUP_SAFETY_BLOCK"
+      echo "⚠️  startup pid $server_pid required bounded cleanup but proved SQLite closed (receipt: $receipt)"
+      return 2
+      ;;
+    *)
+      echo "❌ Failed-start cleanup did not prove exact, fresh DB-last closure ($state)."
+      echo "    Replacement starts are blocked by: $STARTUP_SAFETY_BLOCK"
+      echo "    Preserve tracker.db + WAL + SHM together and inspect: $receipt"
+      [ "$killed" = "0" ] || echo "    The candidate required SIGKILL."
+      return 1
+      ;;
+  esac
 }
 
 # Teammate machines run the LLM through the gateway with per-person OAuth
@@ -574,44 +686,346 @@ install_app_bundle_if_missing() {
   fi
 }
 
-# Gracefully stop a server we are about to replace. SIGINT (not KILL) so the
-# app's shutdown handler flushes SQLite and stops the monitors.
+# A foreground child remains visible as a zombie until this launcher calls
+# wait(1); treat that as exited so the bounded stop path never escalates it.
+pid_is_live() {
+  local state
+  state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')"
+  [ -n "$state" ] && [[ "$state" != Z* ]]
+}
+
+# Accept only a receipt bound to this exact PID and shutdown-attempt boundary.
+# The application already emits schema-v1 PID and lifecycle timestamps, so
+# this strengthens validation without making a running prior build unreadable.
+shutdown_receipt_state() {
+  local receipt="$1"
+  local expected_pid="$2"
+  local not_before_ms="$3"
+  [ -f "$receipt" ] || { echo "missing"; return 0; }
+  "$NODE" -e '
+    const fs = require("fs");
+    const fail = reason => { process.stdout.write(reason); process.exit(0); };
+    try {
+      const file = process.argv[1];
+      const expectedPid = Number(process.argv[2]);
+      const notBeforeMs = Number(process.argv[3]);
+      const value = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (!Number.isInteger(expectedPid) || expectedPid <= 0 || !Number.isFinite(notBeforeMs) || notBeforeMs <= 0) {
+        fail("invalid_validator");
+      }
+      if (!value || value.schemaVersion !== 1 || !Number.isInteger(value.pid) || value.pid <= 0) {
+        fail("invalid_schema");
+      }
+      if (value.pid !== expectedPid) fail("pid_mismatch");
+      if (!["running", "complete", "incomplete"].includes(value.status)
+          || !["pending", "clean", "forced", "failed"].includes(value.outcome)) {
+        fail("invalid_state");
+      }
+      const startedAt = Date.parse(value.startedAt);
+      const updatedAt = Date.parse(value.updatedAt);
+      if (!Number.isFinite(startedAt) || !Number.isFinite(updatedAt) || startedAt > updatedAt) {
+        fail("invalid_timestamps");
+      }
+      let completedAt = null;
+      if (value.status === "complete") {
+        completedAt = Date.parse(value.completedAt);
+        if (!Number.isFinite(completedAt) || completedAt < startedAt || updatedAt < completedAt) {
+          fail("invalid_timestamps");
+        }
+      }
+      if (!Array.isArray(value.signals) || value.signals.length === 0) fail("invalid_signals");
+      const lifecycleEnd = completedAt ?? updatedAt;
+      const signalTimes = value.signals.map((signal, index) => {
+        const at = Date.parse(signal?.at);
+        if (!signal || typeof signal.name !== "string" || !/^SIG[A-Z0-9]+$/.test(signal.name)
+            || signal.ordinal !== index + 1 || !Number.isFinite(at)) {
+          fail("invalid_signals");
+        }
+        if (at < startedAt || at > lifecycleEnd || at > updatedAt) fail("invalid_signal_chronology");
+        return at;
+      });
+      for (let index = 1; index < signalTimes.length; index++) {
+        if (signalTimes[index] < signalTimes[index - 1]) fail("invalid_signal_chronology");
+      }
+      if (Math.max(...signalTimes) < notBeforeMs || updatedAt < notBeforeMs) fail("stale");
+      if (value.status === "complete" && value.database?.closed === true) {
+        const closeStartedAt = Date.parse(value.database.closeStartedAt);
+        const closedAt = Date.parse(value.database.closedAt);
+        if (!Number.isFinite(closeStartedAt) || !Number.isFinite(closedAt)
+            || closeStartedAt < startedAt || closedAt < closeStartedAt || closedAt > completedAt) {
+          fail("invalid_database_timestamps");
+        }
+      }
+      const mtimeMs = fs.statSync(file).mtimeMs;
+      if (!Number.isFinite(mtimeMs) || mtimeMs + 2 < notBeforeMs) fail("stale");
+      process.stdout.write(`${value.status}|${value.outcome}|${value.database?.closed === true ? "closed" : "open"}`);
+    } catch { fail("invalid"); }
+  ' "$receipt" "$expected_pid" "$not_before_ms"
+}
+
+# Current builds never serialize a private path. A process already running the
+# immediately previous build can still emit database.path once; after exact,
+# fresh closure is proved, remove that legacy field atomically before proceed.
+scrub_shutdown_receipt() {
+  local receipt="$1"
+  local expected_pid="$2"
+  "$NODE" -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    const expectedPid = Number(process.argv[2]);
+    try {
+      const value = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (value?.schemaVersion !== 1 || value?.pid !== expectedPid) process.exit(1);
+      if (!value.database || !Object.prototype.hasOwnProperty.call(value.database, "path")) process.exit(0);
+      delete value.database.path;
+      const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+      const fd = fs.openSync(temporary, "w", 0o600);
+      try {
+        fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      fs.renameSync(temporary, file);
+      fs.chmodSync(file, 0o600);
+    } catch { process.exit(1); }
+  ' "$receipt" "$expected_pid"
+}
+
+startup_safety_block_targets() {
+  [ -f "$STARTUP_SAFETY_BLOCK" ] || { echo ""; return 0; }
+  "$NODE" -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (value?.schemaVersion !== 2 || !Array.isArray(value.targets) || value.targets.length === 0) {
+        throw new Error("invalid guard");
+      }
+      const seen = new Set();
+      const lines = value.targets.map(target => {
+        const pid = Number(target?.pid);
+        const notBeforeMs = Number(target?.notBeforeMs);
+        if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(notBeforeMs) || notBeforeMs <= 0 || seen.has(pid)) {
+          throw new Error("invalid target");
+        }
+        seen.add(pid);
+        return `${pid}|${notBeforeMs}`;
+      });
+      process.stdout.write(lines.join("\n"));
+    } catch { process.stdout.write("invalid"); }
+  ' "$STARTUP_SAFETY_BLOCK"
+}
+
+# Gracefully stop every exact server in the pre-signal snapshot. The
+# application owns a 25-second bounded coordinator: first signal closes
+# admission, the second escalates local resources, and SQLite closes last.
+# Return 0=clean, 2=forced but DB-closed, 1=incomplete/unsafe.
 stop_existing_server() {
-  # Stop EVERY running tracker, not just the pid-file one. Crash/freeze cycles
-  # used to leak headless zombies (observed 2026-08-20: 12 stale processes,
-  # one frozen instance still holding :7778 while a newer one answered pings),
-  # because this used `pgrep | head -1`.
+  local exact_pid="${1:-}"
   local pids=""
-  pids="$(pgrep -f 'node dist/index.js' 2>/dev/null)"
-  [ -f "$PID_FILE" ] && pids="$pids $(cat "$PID_FILE" 2>/dev/null)"
-  pids="$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
-  local live_pids=""
-  for pid in $pids; do
-    ps -p "$pid" >/dev/null 2>&1 && live_pids="$live_pids $pid"
-  done
-  pids="$(echo "$live_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+  if [ -n "$exact_pid" ]; then
+    if ! [[ "$exact_pid" =~ ^[0-9]+$ ]]; then
+      echo "❌ Invalid exact shutdown PID"
+      return 1
+    fi
+    pids="$exact_pid"
+  else
+    pids="$(pgrep -f 'node dist/index.js' 2>/dev/null)"
+    [ -f "$PID_FILE" ] && pids="$pids $(cat "$PID_FILE" 2>/dev/null)"
+    pids="$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+    local live_pids=""
+    local discovered_pid=""
+    for discovered_pid in $pids; do
+      pid_is_live "$discovered_pid" && live_pids="$live_pids $discovered_pid"
+    done
+    pids="$(echo "$live_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+  fi
   if [ -z "$pids" ]; then
     rm -f "$PID_FILE"
     return 0
   fi
-  echo "ℹ️  Taking over from running tracker(s): $(echo "$pids" | tr '\n' ' ')— stopping gracefully"
-  for pid in $pids; do kill -INT "$pid" 2>/dev/null; done
-  for _ in $(seq 1 15); do
+
+  local attempt_started_ms
+  attempt_started_ms="$(current_epoch_ms)"
+  if ! write_shutdown_safety_block "tracker_shutdown_unverified" "$attempt_started_ms" $pids; then
+    echo "❌ Could not persist the shutdown guard; no process was signalled."
+    return 1
+  fi
+
+  echo "ℹ️  Taking over from running tracker(s): $(echo "$pids" | tr '\n' ' ')— requesting bounded shutdown"
+  local pid=""
+  for pid in $pids; do
+    rm -f "$(shutdown_receipt_path "$pid")"
+    pid_is_live "$pid" && kill -INT "$pid" 2>/dev/null || true
+  done
+
+  # Cooperative coordinator window. A healthy shutdown normally finishes in
+  # well under this; do not send the second signal while DB-last cleanup runs.
+  for _ in $(seq 1 "$STARTUP_INT_GRACE_SECONDS"); do
     local alive=0
-    for pid in $pids; do ps -p "$pid" >/dev/null 2>&1 && alive=1; done
+    for pid in $pids; do pid_is_live "$pid" && alive=1; done
     [ "$alive" = "0" ] && break
     sleep 1
   done
-  # Anything that survived graceful shutdown is wedged — force it off the port.
+
+  local second_signal=0
   for pid in $pids; do
-    if ps -p "$pid" >/dev/null 2>&1; then
-      echo "⚠️  pid $pid ignored SIGINT — killing"
-      kill -9 "$pid" 2>/dev/null
+    if pid_is_live "$pid"; then
+      second_signal=1
+      echo "⚠️  pid $pid exceeded the cooperative window — sending the real second signal"
+      kill -TERM "$pid" 2>/dev/null || true
     fi
   done
-  # Every process represented by this receipt was just handed over. Remove it
-  # now so the replacement path never announces or probes the dead PID twice.
+  if [ "$second_signal" = "1" ]; then
+    for _ in $(seq 1 "$STARTUP_TERM_GRACE_SECONDS"); do
+      local alive=0
+      for pid in $pids; do pid_is_live "$pid" && alive=1; done
+      [ "$alive" = "0" ] && break
+      sleep 1
+    done
+  fi
+
+  local killed=0
+  for pid in $pids; do
+    if pid_is_live "$pid"; then
+      killed=1
+      echo "❌ pid $pid exceeded 30 seconds — sending SIGKILL; shutdown is incomplete"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
   rm -f "$PID_FILE"
+
+  local forced=0
+  local failed=$killed
+  for pid in $pids; do
+    local receipt state
+    receipt="$(shutdown_receipt_path "$pid")"
+    state="$(shutdown_receipt_state "$receipt" "$pid" "$attempt_started_ms")"
+    case "$state" in
+      "complete|clean|closed")
+        if scrub_shutdown_receipt "$receipt" "$pid"; then
+          echo "✅ pid $pid stopped cleanly (receipt: $receipt)"
+        else
+          failed=1
+          echo "❌ pid $pid closed SQLite but its private receipt fields could not be scrubbed"
+        fi
+        ;;
+      "complete|forced|closed")
+        if scrub_shutdown_receipt "$receipt" "$pid"; then
+          forced=1
+          echo "⚠️  pid $pid required bounded escalation but closed SQLite (receipt: $receipt)"
+        else
+          failed=1
+          echo "❌ pid $pid closed SQLite but its private receipt fields could not be scrubbed"
+        fi
+        ;;
+      "complete|failed|closed")
+        if scrub_shutdown_receipt "$receipt" "$pid"; then
+          forced=1
+          echo "⚠️  pid $pid reported a shutdown-stage failure but proved SQLite closed (receipt: $receipt)"
+        else
+          failed=1
+          echo "❌ pid $pid closed SQLite but its private receipt fields could not be scrubbed"
+        fi
+        ;;
+      missing)
+        failed=1
+        echo "❌ pid $pid has no receipt for this shutdown attempt; process exit is not DB-closure proof"
+        ;;
+      *)
+        failed=1
+        echo "❌ pid $pid shutdown receipt is not exact, fresh, complete, and DB-closed ($state): $receipt"
+        ;;
+    esac
+  done
+
+  [ "$failed" = "0" ] || return 1
+  rm -f "$STARTUP_SAFETY_BLOCK"
+  [ "$forced" = "0" ] || return 2
+  return 0
+}
+
+startup_safety_allows_takeover() {
+  [ -f "$STARTUP_SAFETY_BLOCK" ] || return 0
+  local targets
+  targets="$(startup_safety_block_targets)"
+  if [ -z "$targets" ] || [ "$targets" = "invalid" ]; then
+    echo "❌ Replacement start blocked: the shutdown safety guard is invalid."
+    echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+    return 1
+  fi
+
+  local blocked=0
+  local blocked_pid=""
+  local not_before_ms=""
+  while IFS='|' read -r blocked_pid not_before_ms; do
+    local receipt blocked_state
+    receipt="$(shutdown_receipt_path "$blocked_pid")"
+    blocked_state="$(shutdown_receipt_state "$receipt" "$blocked_pid" "$not_before_ms")"
+    case "$blocked_state" in
+      "complete|clean|closed"|"complete|forced|closed"|"complete|failed|closed")
+        if ! scrub_shutdown_receipt "$receipt" "$blocked_pid"; then
+          blocked=1
+          echo "❌ Replacement start blocked: PID $blocked_pid receipt scrubbing failed."
+        fi
+        ;;
+      *)
+        blocked=1
+        echo "❌ Replacement start blocked: PID $blocked_pid lacks exact, fresh DB-last closure ($blocked_state)."
+        ;;
+    esac
+  done <<< "$targets"
+
+  if [ "$blocked" = "0" ]; then
+    rm -f "$STARTUP_SAFETY_BLOCK"
+    echo "✅ Cleared shutdown safety block from exact late DB-closure receipt(s)"
+    return 0
+  fi
+  echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+  return 1
+}
+
+safe_takeover() {
+  startup_safety_allows_takeover || return 1
+  stop_existing_server
+  local result=$?
+  if [ "$result" = "1" ]; then
+    echo "❌ Replacement start blocked: prior process did not prove exact, fresh DB-last closure."
+    echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+    return 1
+  fi
+  if [ "$result" = "2" ]; then
+    echo "⚠️  Continuing replacement because the forced receipt proves SQLite closed."
+  fi
+  return 0
+}
+
+# Executable test harness for the exact launcher state machine. All paths and
+# grace windows are environment-overridable; production never sets these.
+if [ -n "${BOTBOY_TEST_STARTUP_CLEANUP_PID:-}" ]; then
+  stop_startup_child "$BOTBOY_TEST_STARTUP_CLEANUP_PID"
+  exit $?
+fi
+if [ -n "${BOTBOY_TEST_EXISTING_CLEANUP_PID:-}" ]; then
+  stop_existing_server "$BOTBOY_TEST_EXISTING_CLEANUP_PID"
+  exit $?
+fi
+if [ "${BOTBOY_TEST_STARTUP_SAFETY_CHECK:-0}" = "1" ]; then
+  startup_safety_allows_takeover
+  exit $?
+fi
+
+foreground_shutdown() {
+  trap - TERM INT HUP
+  echo "🔻 BotBoy quitting — requesting bounded tracker shutdown (pid $SERVER_PID)" >> "$LOG_FILE"
+  # Always create a new attempt boundary, remove any stale receipt, and signal
+  # the exact child. A process-group Ctrl-C may make this a safe second signal;
+  # disappearance or a pre-existing file is never accepted as closure proof.
+  stop_existing_server "$SERVER_PID"
+  local result=$?
+  wait "$SERVER_PID" 2>/dev/null || true
+  [ "$result" = "0" ] && exit 0
+  exit "$result"
 }
 
 cd "$PROJ_DIR" || exit 1
@@ -631,9 +1045,17 @@ if [ "$STOP_ONLY" = "1" ]; then
     exit 0
   fi
   stop_existing_server
-  rm -f "$PID_FILE"
-  echo "✅ BotBoy stopped"
-  exit 0
+  STOP_RESULT=$?
+  if [ "$STOP_RESULT" = "0" ]; then
+    echo "✅ BotBoy stopped cleanly"
+    exit 0
+  fi
+  if [ "$STOP_RESULT" = "2" ]; then
+    echo "⚠️  BotBoy stopped with bounded escalation; SQLite closure is receipt-confirmed"
+    exit 2
+  fi
+  echo "❌ BotBoy stop is incomplete; automatic success is refused"
+  exit 1
 fi
 
 # ── --doctor: one-shot support report. Read-only; changes nothing ──
@@ -786,14 +1208,16 @@ if [ "$FOREGROUND" = "1" ]; then
   # tracker runs. Only one server may own port 7778, so an existing instance is
   # handed over first. This is unconditional: a provisional or wedged process
   # may own the port without satisfying the final-ready endpoint.
-  stop_existing_server
+  safe_takeover || exit 1
 
   "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"
 
-  # Forward Quit/Ctrl-C to the server so shutdown stays graceful.
-  trap 'echo "🔻 BotBoy quitting — stopping tracker (pid $SERVER_PID)" >> "$LOG_FILE"; kill -INT "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; exit 0' TERM INT HUP
+  # Forward Quit/Ctrl-C into the same receipt-aware bounded takeover path.
+  trap 'foreground_shutdown INT' INT
+  trap 'foreground_shutdown TERM' TERM
+  trap 'foreground_shutdown HUP' HUP
 
   if ! wait_for_server "$SERVER_PID"; then
     stop_startup_child "$SERVER_PID"
@@ -824,7 +1248,7 @@ fi
 # code — restart onto the new build.
 if [ -n "$NEED_BUILD" ] && server_is_ready; then
   echo "ℹ️  Restarting BotBoy on the new build"
-  stop_existing_server
+  safe_takeover || exit 1
 fi
 # 2. Start the tracker server if not already running
 SERVER_PID=""
@@ -832,7 +1256,7 @@ if ! server_is_ready; then
   # A failed final-ready check does NOT mean no process exists: a wedged or
   # half-booted server can hold :7778. Clear every old instance before the
   # replacement starts, then verify this exact child through final readiness.
-  stop_existing_server
+  safe_takeover || exit 1
   nohup "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"

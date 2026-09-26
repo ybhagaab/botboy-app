@@ -9,7 +9,10 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
-import { computeUiAssetsVersion } from './dashboard.js';
+import express from 'express';
+import request from 'supertest';
+import { createStorage } from '../../core/storage.js';
+import { computeUiAssetsVersion, createDashboardRouter, createDashboardState } from './dashboard.js';
 
 describe('computeUiAssetsVersion', () => {
   let dir: string;
@@ -59,5 +62,28 @@ describe('computeUiAssetsVersion', () => {
 
   it('returns the "0" sentinel instead of throwing on a missing directory', () => {
     expect(computeUiAssetsVersion(path.join(dir, 'does-not-exist'))).toBe('0');
+  });
+});
+
+describe('dashboard Data Room version receipt', () => {
+  it('publishes one opaque receipt and changes it when projected room state changes', async () => {
+    const storage = createStorage(':memory:');
+    storage.initialize();
+    try {
+      const app = express();
+      app.use('/api', createDashboardRouter(createDashboardState(), storage.getDb()));
+      const first = await request(app).get('/api/dashboard/version');
+      expect(first.status).toBe(200);
+      expect(first.body.dataRoomVersion).toMatch(/^[a-f0-9]{64}$/);
+      const stable = await request(app).get('/api/dashboard/version');
+      expect(stable.body.dataRoomVersion).toBe(first.body.dataRoomVersion);
+      storage.getDb().prepare(`
+        UPDATE analytics_data_room_state SET revision = revision + 1 WHERE singleton = 1
+      `).run();
+      const changed = await request(app).get('/api/dashboard/version');
+      expect(changed.body.dataRoomVersion).not.toBe(first.body.dataRoomVersion);
+    } finally {
+      storage.close();
+    }
   });
 });

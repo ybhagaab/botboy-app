@@ -28,6 +28,7 @@ import {
 } from './mcp-profiles.js';
 import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-session.js';
 import { createMcpTerminalEngine } from './mcp-terminal.js';
+import { modelProcessSandboxInvocation } from './protected-local-resources.js';
 import type {
   BuiltInMcpProfileId,
   McpCallOptions,
@@ -603,11 +604,16 @@ export function createMcpManager(options: {
         // must resolve the toolchain even under a minimal-PATH launch.
         childEnv.PATH = pathValueWithFallbackDirectories(childEnv.PATH ?? process.env.PATH);
         // aim-package-script launchers take no argv; both other branches
-        // carry their registry/user-declared args.
+        // carry their registry/user-declared args. Owner-reviewed custom
+        // servers remain agent-callable but run behind the same protected
+        // local-resource boundary as model-authored commands.
         const launchArgs = profile.launch.type === 'aim-package-script' ? [] : [...profile.launch.args];
+        const launch = profile.launch.type === 'custom-command'
+          ? modelProcessSandboxInvocation(executable, launchArgs)
+          : { executable, args: launchArgs };
         transport = new StdioClientTransport({
-          command: executable,
-          args: launchArgs,
+          command: launch.executable,
+          args: launch.args,
           env: childEnv,
           stderr: 'pipe',
         });

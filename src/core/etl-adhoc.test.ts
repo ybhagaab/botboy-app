@@ -125,12 +125,49 @@ describe('etl-adhoc query runner', () => {
     const fake = fakeEtl();
     fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'EXECUTING' }) }));
     const q = runner(fake, { pollBudgetMs: 10 });
-    const result = await q.runQuery({ sql: 'select long_running' });
+    const checkpoints: string[] = [];
+    const result = await q.runQuery({
+      sql: 'select long_running',
+      onSubmitted: runId => {
+        checkpoints.push(runId);
+        expect(fake.countOf('datanet_get_job_run_status')).toBe(0);
+      },
+    });
+    expect(checkpoints).toEqual(['555001']);
     expect(result.ok).toBe(false);
     expect(result.error).toContain('still');
     expect(result.nextAction).toContain('Do NOT resubmit');
     expect(result.nextAction).toContain('555001');
     expect(fake.countOf('datanet_download_results')).toBe(0);
+  });
+
+  it('returns the exact run without polling when the local submit checkpoint fails', async () => {
+    const fake = fakeEtl();
+    const q = runner(fake);
+    const result = await q.runQuery({
+      sql: 'select checkpoint_failure',
+      onSubmitted: () => { throw new Error('disk unavailable'); },
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      code: 'alive_handoff',
+      runId: '555001',
+      remoteStatus: 'SUBMITTED',
+    });
+    expect(result.nextAction).toContain('Do NOT resubmit');
+    expect(fake.countOf('datanet_submit_run')).toBe(1);
+    expect(fake.countOf('datanet_get_job_run_status')).toBe(0);
+  });
+
+  it('marks an ambiguous submit response unknown instead of authorizing a retry', async () => {
+    const fake = fakeEtl();
+    fake.when('datanet_submit_run', () => ({ isError: true, text: 'MCP transport timed out' }));
+    const q = runner(fake);
+    const result = await q.runQuery({ sql: 'select maybe_submitted' });
+    expect(result).toMatchObject({ ok: false, code: 'submission_unknown' });
+    expect(result.nextAction).toContain('Do not resubmit');
+    expect(fake.countOf('datanet_submit_run')).toBe(1);
+    expect(fake.countOf('datanet_get_job_run_status')).toBe(0);
   });
 
   it('self-heals a vanished scratch profile exactly once (recreate → restage → proceed)', async () => {

@@ -18,21 +18,21 @@ export function createItemsRouter(deps: RouterDeps): Router {
     if (!db) return res.status(503).json({ error: 'DB not available' });
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ query: '', totalResults: 0, results: [] });
-    const limit = Math.min(parseInt(String(req.query.limit)) || 50, 200);
+    const limit = Math.max(1, Math.min(parseInt(String(req.query.limit)) || 50, 200));
     const pattern = `%${q}%`;
 
     const rows = db.prepare(`
       SELECT wi.id, wi.type, wi.source, wi.source_app, wi.title, wi.summary,
              wi.url, wi.parsed_text, wi.captured_at,
-             json_extract(wi.metadata, '$.docKey') AS doc_key,
+             json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.docKey') AS doc_key,
              n.id as node_id, n.title as node_title
       FROM work_items wi
       LEFT JOIN node_work_items nwi ON wi.id = nwi.work_item_id
       LEFT JOIN nodes n ON nwi.node_id = n.id
       WHERE (wi.title LIKE ? OR wi.summary LIKE ? OR wi.parsed_text LIKE ?)
-        AND COALESCE(json_extract(wi.metadata, '$.publicationRetired'), '') != 'true'
-        AND COALESCE(json_extract(wi.metadata, '$.deletedFromDoc'), '') != 'true'
-      ORDER BY wi.captured_at DESC
+        AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
+        AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
+      ORDER BY wi.captured_at DESC, wi.id ASC, n.id ASC
       LIMIT ?
     `).all(pattern, pattern, pattern, limit) as any[];
 
@@ -118,7 +118,8 @@ export function createItemsRouter(deps: RouterDeps): Router {
       }
       const lq = q.toLowerCase();
       return [...groups.values()].flatMap(members => {
-        members.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+        members.sort((left, right) => right.createdAt.localeCompare(left.createdAt)
+          || right.artifactId.localeCompare(left.artifactId));
         const head = members[0];
         const project = head.projectId
           ? db.prepare('SELECT title FROM projects WHERE id = ?').get(head.projectId) as { title: string } | undefined
@@ -149,15 +150,68 @@ export function createItemsRouter(deps: RouterDeps): Router {
         }];
       });
     })();
-    const artifactSlots = artifactResults.length
-      ? results.length && limit > 1
-        ? Math.min(artifactResults.length, Math.max(1, Math.floor(limit / 3)), limit - 1)
-        : Math.min(artifactResults.length, limit)
-      : 0;
-    const combined = [
-      ...artifactResults.slice(0, artifactSlots),
-      ...results.slice(0, limit - artifactSlots),
-    ];
+    const datasetHits = (() => {
+      try { return deps.analyticsDataRoom?.searchDatasets(q, Math.min(limit, 100)) ?? []; }
+      catch { return []; } // Dataset projection failure must not strand legacy search.
+    })();
+    const datasetResults = datasetHits.map(hit => ({
+      item: {
+        id: hit.datasetId,
+        datasetId: hit.datasetId,
+        type: 'analytics_dataset',
+        source: 'analytics',
+        sourceApp: 'BotBoy',
+        title: hit.name,
+        summary: `${hit.kind} · ${hit.scope} · ${hit.domainKey} · ${hit.lifecycle}`,
+        capturedAt: hit.updatedAt,
+        ...(hit.currentVersion ? { currentVersion: hit.currentVersion } : {}),
+      },
+      node: null,
+      matchField: hit.matchField,
+      snippet: hit.description || `${hit.kind} dataset in ${hit.domainKey}`,
+    }));
+
+    let combined;
+    if (!datasetResults.length) {
+      // Preserve the established authored/evidence allocation exactly when
+      // the new logical-dataset bucket is empty.
+      const artifactSlots = artifactResults.length
+        ? results.length && limit > 1
+          ? Math.min(artifactResults.length, Math.max(1, Math.floor(limit / 3)), limit - 1)
+          : Math.min(artifactResults.length, limit)
+        : 0;
+      combined = [
+        ...artifactResults.slice(0, artifactSlots),
+        ...results.slice(0, limit - artifactSlots),
+      ];
+    } else {
+      const buckets = [datasetResults, artifactResults, results];
+      const take = [0, 0, 0];
+      let remaining = limit;
+      // Reserve one deterministic slot for every non-empty bucket whenever
+      // capacity permits. Dataset identity comes first, then authored, then evidence.
+      for (let index = 0; index < buckets.length && remaining > 0; index++) {
+        if (buckets[index].length) { take[index] = 1; remaining--; }
+      }
+      // Fixed-order round-robin backfills sparse buckets without title-based
+      // cross-deduplication; each ds_* remains a distinct logical hit.
+      while (remaining > 0) {
+        let advanced = false;
+        for (let index = 0; index < buckets.length && remaining > 0; index++) {
+          if (take[index] < buckets[index].length) {
+            take[index]++;
+            remaining--;
+            advanced = true;
+          }
+        }
+        if (!advanced) break;
+      }
+      combined = [
+        ...datasetResults.slice(0, take[0]),
+        ...artifactResults.slice(0, take[1]),
+        ...results.slice(0, take[2]),
+      ];
+    }
     res.json({ query: q, totalResults: combined.length, results: combined });
   });
   // ── Work Items ──

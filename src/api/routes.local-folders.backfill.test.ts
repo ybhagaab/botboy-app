@@ -363,4 +363,52 @@ describe('SSE backfill routes', () => {
     );
     expect(second.status).toBe(204);
   });
+
+  it('process shutdown aborts and unregisters an in-flight backfill without emitting an error', async () => {
+    let started = false;
+    const monitor = makeMonitor(async (id, opts): Promise<BackfillResult> => {
+      opts?.onProgress?.({ phase: 'started', folderId: id });
+      started = true;
+      await new Promise<void>(resolve => {
+        if (opts?.signal?.aborted) return resolve();
+        opts?.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      opts?.onProgress?.({ phase: 'aborted', folderId: id, processed: 0 });
+      return { aborted: true };
+    });
+    const processController = new AbortController();
+    const work = new Map<string, { abort?: () => void }>();
+    let shuttingDown = false;
+    const shutdown = {
+      signal: processController.signal,
+      isShuttingDown: () => shuttingDown,
+      registerWork: (entry: { id: string; abort?: () => void }) => {
+        work.set(entry.id, entry);
+        return () => { work.delete(entry.id); };
+      },
+    };
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createRouter({
+      nodeManager: {} as any,
+      db: storage.getDb(),
+      filesystemMonitor: monitor,
+      shutdown,
+    }));
+    const pending = new Promise<request.Response>((resolve, reject) => {
+      bufferSSE(request(app).post(`/api/local-folders/${folderId}/backfill`))
+        .end((error, response) => error ? reject(error) : resolve(response));
+    });
+    await waitFor(() => started && work.size === 1);
+
+    shuttingDown = true;
+    processController.abort(new Error('BotBoy process is shutting down'));
+    for (const entry of work.values()) entry.abort?.();
+    const response = await pending;
+    const events = parseSSE(response.body as string);
+
+    expect(events.map(event => event.event)).toEqual(['started', 'aborted']);
+    expect(work.size).toBe(0);
+    expect(monitor.backfill).toHaveBeenCalledTimes(1);
+  });
 });

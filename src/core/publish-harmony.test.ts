@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import {
@@ -17,11 +17,13 @@ import {
   probeHarmony,
   publishStaticArtifactToHarmony,
   publishToHarmony,
+  renderHarmonyDashboardListing,
   scaffoldHarmonyApp,
   type ExecFn,
   type HarmonySettings,
 } from './publish-harmony.js';
 import type { AnalyticsDashboard } from './analytics-types.js';
+import { renderDashboardBundle } from './publish-bundle.js';
 import { buildStaticArtifactBundle } from './publish-static-artifact.js';
 
 const BINDLE = 'amzn1.bindle.resource.4jm6ucxzuawo46cdjhua';
@@ -60,6 +62,14 @@ function dash(): AnalyticsDashboard {
     recentRuns: [],
     projects: [],
   } as unknown as AnalyticsDashboard;
+}
+
+function dashboardBundle() {
+  return renderDashboardBundle(dash(), '2026-09-09T00:00:00.000Z', { vendorDir });
+}
+
+function dashboardListing() {
+  return renderHarmonyDashboardListing([]);
 }
 
 /** Scripted exec: match on command + first args, record everything. */
@@ -161,8 +171,8 @@ describe('harmony adapter (reworked)', () => {
   it('first deploy carries --parentBindleId; subsequent deploys do not', async () => {
     const first = scriptedExec([cliOk, tarOk, appKnown(false), deployOk]);
     await publishToHarmony({
-      settings: settings(), dashboard: dash(), snapshotCreatedAt: '2026-09-09T00:00:00.000Z',
-      publishedEntries: [], vendorDir, appName: 'me-botboy-dashboard', appRoot, exec: first.exec,
+      settings: settings(), dashboardId: 'dash_x', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: first.exec,
     });
     const firstDeploy = first.calls.find(call => call.args[1] === 'deploy')!;
     expect(firstDeploy.args).toContain('--parentBindleId');
@@ -170,8 +180,8 @@ describe('harmony adapter (reworked)', () => {
 
     const again = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
     await publishToHarmony({
-      settings: settings(), dashboard: dash(), snapshotCreatedAt: '2026-09-09T00:00:00.000Z',
-      publishedEntries: [], vendorDir, appName: 'me-botboy-dashboard', appRoot, exec: again.exec,
+      settings: settings(), dashboardId: 'dash_x', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: again.exec,
     });
     const secondDeploy = again.calls.find(call => call.args[1] === 'deploy')!;
     expect(secondDeploy.args).not.toContain('--parentBindleId');
@@ -204,29 +214,177 @@ describe('harmony adapter (reworked)', () => {
     }
   });
 
+  it('discards a failed static-artifact candidate before it reaches the canonical app tree', async () => {
+    const filesRoot = mkdtempSync(path.join(os.tmpdir(), 'harmony-static-failed-source-'));
+    try {
+      writeFileSync(path.join(filesRoot, 'failed.html'), '<!doctype html><h1>Must not persist</h1>');
+      const bundle = buildStaticArtifactBundle({ filePath: 'failed.html', filesRoot });
+      const run = scriptedExec([
+        cliOk,
+        tarOk,
+        appKnown(true),
+        { match: (c, a) => c === 'harmony' && a[0] === 'app' && a[1] === 'deploy', result: { code: 1, stderr: 'synthetic deploy rejection' } },
+      ]);
+      await expect(publishStaticArtifactToHarmony({
+        settings: settings(), bundle, appName: 'me-botboy-dashboard', appRoot, exec: run.exec,
+      })).rejects.toThrow(/synthetic deploy rejection|Harmony deploy failed/);
+      expect(existsSync(path.join(appRoot, 'src', 'me-botboy-dashboard', 'src', 'a', 'failed'))).toBe(false);
+    } finally {
+      rmSync(filesRoot, { recursive: true, force: true });
+    }
+  });
+
   it('prod deploys run under /usr/bin/expect with a PTY script carrying the deploy args', async () => {
     const prod = scriptedExec([cliOk, tarOk, appKnown(true), { match: c => c === '/usr/bin/expect', result: { code: 0, stdout: 'Deployed' } }]);
+    let script = '';
+    const exec: ExecFn = async (command, args, options) => {
+      if (command === '/usr/bin/expect') script = readFileSync(args[0], 'utf8');
+      return prod.exec(command, args, options);
+    };
     const result = await publishToHarmony({
-      settings: settings({ stage: 'prod' }), dashboard: dash(), snapshotCreatedAt: '2026-09-09T00:00:00.000Z',
-      publishedEntries: [], vendorDir, appName: 'me-botboy-dashboard', appRoot, exec: prod.exec,
+      settings: settings({ stage: 'prod' }), dashboardId: 'dash_x', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec,
     });
     const expectCall = prod.calls.find(call => call.cmd === '/usr/bin/expect')!;
     expect(expectCall).toBeTruthy();
-    const script = readFileSync(expectCall.args[0], 'utf8');
     expect(script).toContain('spawn harmony app deploy --stage prod');
     expect(script).toContain('exit 124'); // unexpected prompt = timeout, never a guessed answer
     expect(result.url).toBe('https://me-botboy-dashboard.harmony.a2z.com/d/dash_x/');
   });
 
-  it('runs the injected viewer-access converger after a successful deploy', async () => {
-    const run = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
-    const seen: string[] = [];
-    await publishToHarmony({
-      settings: settings({ visibility: 'private' }), dashboard: dash(), snapshotCreatedAt: '2026-09-09T00:00:00.000Z',
-      publishedEntries: [], vendorDir, appName: 'me-botboy-dashboard', appRoot, exec: run.exec,
-      ensureViewerAccess: async ({ appName, settings: s }) => { seen.push(`${appName}:${s.visibility}`); },
+  it('restricts an existing private app before deploy and converges a deny-by-default first deploy afterward', async () => {
+    const existingRun = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    const existingOrder: string[] = [];
+    const existingExec: ExecFn = async (command, args, options) => {
+      if (command === 'harmony' && args[0] === 'app' && args[1] === 'deploy') existingOrder.push('deploy');
+      return existingRun.exec(command, args, options);
+    };
+    const existing = await publishToHarmony({
+      settings: settings({ visibility: 'private' }), dashboardId: 'dash_x', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: existingExec,
+      ensureViewerAccess: async () => { existingOrder.push('access'); },
     });
-    expect(seen).toEqual(['me-botboy-dashboard:private']);
+    expect(existingOrder).toEqual(['access', 'deploy']);
+    expect(existing.visibilityConverged).toBe(true);
+
+    const firstRoot = mkdtempSync(path.join(os.tmpdir(), 'harmony-first-private-'));
+    const firstRun = scriptedExec([cliOk, tarOk, appKnown(false), deployOk]);
+    const firstOrder: string[] = [];
+    const firstExec: ExecFn = async (command, args, options) => {
+      if (command === 'harmony' && args[0] === 'app' && args[1] === 'deploy') firstOrder.push('deploy');
+      return firstRun.exec(command, args, options);
+    };
+    try {
+      const first = await publishToHarmony({
+        settings: settings({ visibility: 'private' }), dashboardId: 'dash_x', bundle: dashboardBundle(),
+        listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot: firstRoot, exec: firstExec,
+        ensureViewerAccess: async () => { firstOrder.push('access'); },
+      });
+      expect(firstOrder).toEqual(['deploy', 'access']);
+      expect(first.deploy.appExisted).toBe(false);
+      expect(first.visibilityConverged).toBe(true);
+    } finally {
+      rmSync(firstRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reports whether viewer convergence failed before or after provider deployment', async () => {
+    const postRun = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    await expect(publishToHarmony({
+      settings: settings({ visibility: 'everyone' }), dashboardId: 'dash_x', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: postRun.exec,
+      ensureViewerAccess: async () => { throw new Error('synthetic access failure'); },
+    })).rejects.toMatchObject({ deployed: true, visibilityConverged: false });
+    expect(postRun.calls.some(call => call.args[1] === 'deploy')).toBe(true);
+
+    const preRoot = mkdtempSync(path.join(os.tmpdir(), 'harmony-existing-private-fail-'));
+    const preRun = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    try {
+      await expect(publishToHarmony({
+        settings: settings({ visibility: 'private' }), dashboardId: 'dash_x', bundle: dashboardBundle(),
+        listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot: preRoot, exec: preRun.exec,
+        ensureViewerAccess: async () => { throw new Error('synthetic restriction failure'); },
+      })).rejects.toThrow(/synthetic restriction failure/);
+      expect(preRun.calls.some(call => call.args[1] === 'deploy')).toBe(false);
+    } finally {
+      rmSync(preRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('discards a failed pre-deploy candidate so it cannot hitchhike on the next deploy', async () => {
+    const failed = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    await expect(publishToHarmony({
+      settings: settings({ visibility: 'private' }), dashboardId: 'dash_failed', bundle: dashboardBundle(),
+      listingHtml: renderHarmonyDashboardListing([{ dashboardId: 'dash_failed', title: 'Failed', description: '', publishedAt: '2026-09-09T00:00:00.000Z' }]),
+      appName: 'me-botboy-dashboard', appRoot, exec: failed.exec,
+      ensureViewerAccess: async () => { throw new Error('synthetic pre-deploy denial'); },
+    })).rejects.toThrow(/synthetic pre-deploy denial/);
+    const canonicalAssets = path.join(appRoot, 'src', 'me-botboy-dashboard', 'src');
+    expect(existsSync(path.join(canonicalAssets, 'd', 'dash_failed'))).toBe(false);
+
+    const next = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    await publishToHarmony({
+      settings: settings({ visibility: 'everyone' }), dashboardId: 'dash_next', bundle: dashboardBundle(),
+      listingHtml: renderHarmonyDashboardListing([{ dashboardId: 'dash_next', title: 'Next', description: '', publishedAt: '2026-09-09T00:01:00.000Z' }]),
+      appName: 'me-botboy-dashboard', appRoot, exec: next.exec,
+      ensureViewerAccess: async () => {},
+    });
+    expect(existsSync(path.join(canonicalAssets, 'd', 'dash_next'))).toBe(true);
+    expect(existsSync(path.join(canonicalAssets, 'd', 'dash_failed'))).toBe(false);
+    expect(readFileSync(path.join(canonicalAssets, 'index.html'), 'utf8')).not.toContain('dash_failed');
+  });
+
+  it('restores a marker-backed canonical mirror before allowing another whole-app deploy', async () => {
+    const base = path.basename(appRoot);
+    const parent = path.dirname(appRoot);
+    const backupRoot = `${appRoot}.previous-synthetic-recovery`;
+    const staleContainer = path.join(parent, `.${base}-candidate-synthetic-recovery`);
+    rmSync(appRoot, { recursive: true, force: true });
+    const priorPath = path.join(backupRoot, 'src', 'me-botboy-dashboard', 'src', 'd', 'prior', 'index.html');
+    mkdirSync(path.dirname(priorPath), { recursive: true });
+    writeFileSync(priorPath, '<!doctype html><h1>Prior route</h1>');
+    mkdirSync(path.join(staleContainer, base), { recursive: true });
+    writeFileSync(`${appRoot}.botboy-recovery.json`, JSON.stringify({
+      version: 1,
+      canonicalRoot: appRoot,
+      backupRoot,
+      candidateContainer: staleContainer,
+    }));
+
+    const next = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    await publishToHarmony({
+      settings: settings({ visibility: 'everyone' }), dashboardId: 'dash_after_recovery', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: next.exec,
+      ensureViewerAccess: async () => {},
+    });
+    expect(readFileSync(path.join(appRoot, 'src', 'me-botboy-dashboard', 'src', 'd', 'prior', 'index.html'), 'utf8'))
+      .toContain('Prior route');
+    expect(existsSync(path.join(appRoot, 'src', 'me-botboy-dashboard', 'src', 'd', 'dash_after_recovery'))).toBe(true);
+    expect(existsSync(`${appRoot}.botboy-recovery.json`)).toBe(false);
+    expect(existsSync(staleContainer)).toBe(false);
+  });
+
+  it('refuses an empty-tree deploy when a recovery marker has no valid backup', async () => {
+    const base = path.basename(appRoot);
+    const parent = path.dirname(appRoot);
+    const missingBackup = `${appRoot}.previous-missing`;
+    const staleContainer = path.join(parent, `.${base}-candidate-missing`);
+    rmSync(appRoot, { recursive: true, force: true });
+    mkdirSync(staleContainer, { recursive: true });
+    writeFileSync(`${appRoot}.botboy-recovery.json`, JSON.stringify({
+      version: 1,
+      canonicalRoot: appRoot,
+      backupRoot: missingBackup,
+      candidateContainer: staleContainer,
+    }));
+    const run = scriptedExec([cliOk, tarOk, appKnown(true), deployOk]);
+    await expect(publishToHarmony({
+      settings: settings(), dashboardId: 'must_not_deploy', bundle: dashboardBundle(),
+      listingHtml: dashboardListing(), appName: 'me-botboy-dashboard', appRoot, exec: run.exec,
+    })).rejects.toThrow(/backup is missing|refusing an empty-tree deploy/i);
+    expect(run.calls).toHaveLength(0);
+    rmSync(`${appRoot}.botboy-recovery.json`, { force: true });
+    rmSync(staleContainer, { recursive: true, force: true });
   });
 
   it('classifies failures into next actions', () => {

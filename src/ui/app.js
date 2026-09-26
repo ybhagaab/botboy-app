@@ -2,6 +2,14 @@
 // Spatial navigation: grid of node cards → zoom into node → see subnodes + items
 // Chat panel independent, never re-renders during navigation
 
+import {
+  acquireChatRequestId,
+  chatRequestReplayKey,
+  completeChatRequestId,
+  mergeChatRequestContexts,
+  normalizeChatRequestContext,
+} from './analytics-chat-scope.js';
+
 const API = '/api';
 const NOISE_KEYWORDS = ['misclassified', 'generic electron', 'noise'];
 
@@ -18,25 +26,6 @@ let state = {
 let chatRequestContext = null;
 let ambientChatRequestContext = null;
 
-function normalizeChatRequestContext(context) {
-  const projectId = typeof context?.projectId === 'string' && /^proj_[A-Za-z0-9_-]+$/.test(context.projectId)
-    ? context.projectId
-    : '';
-  const projectTitle = projectId && typeof context?.projectTitle === 'string'
-    ? context.projectTitle.replace(/\s+/g, ' ').trim().slice(0, 200)
-    : '';
-  const projectContext = projectId && projectTitle ? { projectId, projectTitle } : {};
-  if (context?.mode === 'analytics_dashboard') {
-    return {
-      mode: 'analytics_dashboard',
-      ...(context.intent === 'create' ? { intent: 'create' } : {}),
-      ...projectContext,
-    };
-  }
-  if (context?.mode === 'general') return { mode: 'general', ...projectContext };
-  return projectId ? projectContext : null;
-}
-
 function setChatRequestContext(context) {
   chatRequestContext = normalizeChatRequestContext(context);
 }
@@ -44,10 +33,14 @@ function setChatRequestContext(context) {
 function setAmbientChatRequestContext(context) {
   // Ambient context (a route merely being open) is sent as an advisory HINT,
   // never a hard mode — the server only honors it when the message itself
-  // corroborates. Explicit CTA buttons still send mode (a command).
+  // corroborates. Route scope contains locators only; the server rereads
+  // canonical dashboard membership before it can authorize any edit.
   const normalized = normalizeChatRequestContext(context);
   ambientChatRequestContext = normalized?.mode === 'analytics_dashboard'
-    ? { modeHint: 'analytics_dashboard' }
+    ? {
+        modeHint: 'analytics_dashboard',
+        ...(normalized.routeScope ? { routeScope: normalized.routeScope } : {}),
+      }
     : null;
 }
 
@@ -148,14 +141,7 @@ function initChatWidthControl() {
 }
 
 function activeChatRequestContext(message = '') {
-  const context = chatRequestContext || ambientChatRequestContext;
-  if (!context?.projectId) return context;
-  const expectedSeed = `About project ${String(context.projectTitle || '').replace(/\s+/g, ' ').trim()} (${context.projectId}):`;
-  return String(message).startsWith(expectedSeed) ? context : {
-    ...(context.mode ? { mode: context.mode } : {}),
-    ...(context.intent ? { intent: context.intent } : {}),
-    ...(context.modeHint ? { modeHint: context.modeHint } : {}),
-  };
+  return mergeChatRequestContexts(ambientChatRequestContext, chatRequestContext, message);
 }
 
 // ── API ──
@@ -321,6 +307,11 @@ async function sendChat(msg) {
   // the user bubble below.
   const turnAttachments = pendingChatAttachments.splice(0, pendingChatAttachments.length);
   renderChatAttachStrip();
+  const requestContext = activeChatRequestContext(msg) || {};
+  const replayKey = chatRequestReplayKey(msg, requestContext, turnAttachments.map(attachment => attachment.id));
+  // Keep one pending ID across a dropped response/manual resend. The server
+  // binds that ID to exact message/scope/intent and rejects any collision.
+  const requestId = acquireChatRequestId({ replayKey });
 
   // Append user bubble directly to DOM (no full rebuild — that would wipe frozen assistant bubbles from prior turns)
   const userBubble = document.createElement('div');
@@ -394,10 +385,13 @@ async function sendChat(msg) {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, stream: true, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...(activeChatRequestContext(msg) || {}) }),
+      body: JSON.stringify({ message: msg, stream: true, requestId, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...requestContext }),
     });
 
     if (!resp.ok) {
+      // Non-SSE failures occur before the server admits a turn/effect, so this
+      // request identity is safe to retire rather than replay indefinitely.
+      completeChatRequestId(requestId);
       // Server returned non-2xx (e.g. 400). Read error body and surface it on the bubble.
       let errText = `HTTP ${resp.status}`;
       try { errText = (await resp.text()).slice(0, 500) || errText; } catch {}
@@ -517,6 +511,9 @@ async function sendChat(msg) {
             scheduleRender();
 
           } else if (event.type === 'done') {
+            // Only the authoritative terminal event retires the pending ID.
+            // A dropped stream keeps it so an exact manual resend replays.
+            completeChatRequestId(requestId);
             // Close any open thinking
             segments.forEach(s => { if (s.type === 'thinking') s.complete = true; });
 

@@ -701,3 +701,67 @@ describe('chat visual asset manifest and grounding gate', () => {
     }
   });
 });
+
+describe('chat process shutdown lifecycle', () => {
+  it('aborts a model wait, makes no retry, and persists no synthetic failure after shutdown begins', async () => {
+    const storage = createStorage(':memory:');
+    storage.initialize();
+    const db = storage.getDb();
+    try {
+      const processController = new AbortController();
+      const work = new Map<string, { abort?: () => void }>();
+      let shuttingDown = false;
+      const shutdown = {
+        signal: processController.signal,
+        isShuttingDown: () => shuttingDown,
+        registerWork: (entry: { id: string; abort?: () => void }) => {
+          work.set(entry.id, entry);
+          return () => { work.delete(entry.id); };
+        },
+      };
+      const seenSignals: AbortSignal[] = [];
+      const llmClient = {
+        getActiveEndpoint: () => 'ecs',
+        chatCompletionStream: vi.fn((input: any) => {
+          seenSignals.push(input.signal);
+          return (async function* () {
+            await new Promise((_resolve, reject) => {
+              const signal = input.signal as AbortSignal;
+              const fail = () => reject(signal.reason ?? new Error('aborted'));
+              if (signal.aborted) fail();
+              else signal.addEventListener('abort', fail, { once: true });
+            });
+            return streamResult({ content: 'unreachable' });
+          })();
+        }),
+      };
+      const app = buildApp({
+        ...makeDeps(db, llmClient, { executeTool: vi.fn() }),
+        shutdown,
+      });
+
+      const pending = request(app)
+        .post('/api/chat/messages')
+        .send({ message: 'wait for a synthetic model response', stream: true })
+        .then(response => response);
+      await vi.waitFor(() => expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(1));
+      expect(work.size).toBe(1);
+
+      shuttingDown = true;
+      processController.abort(new Error('BotBoy process is shutting down'));
+      for (const entry of work.values()) entry.abort?.();
+      const response = await pending;
+
+      expect(response.status).toBe(200);
+      expect(response.text).not.toContain('"reason":"network"');
+      expect(response.text).not.toContain('This turn failed before I could finish');
+      expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(1);
+      expect(seenSignals[0]).toBeInstanceOf(AbortSignal);
+      expect(seenSignals[0].aborted).toBe(true);
+      expect(work.size).toBe(0);
+      expect((db.prepare("SELECT COUNT(*) AS count FROM chat_messages WHERE role='assistant'").get() as { count: number }).count).toBe(0);
+    } finally {
+      storage.close();
+    }
+  });
+});

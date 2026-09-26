@@ -31,8 +31,7 @@ import { execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import type { AnalyticsDashboard } from './analytics-types.js';
-import { renderDashboardBundle, writeBundle } from './publish-bundle.js';
+import { writeBundle, type DashboardBundle } from './publish-bundle.js';
 import { writeStaticArtifactBundle, type StaticArtifactBundle } from './publish-static-artifact.js';
 import { escapeHtml, SNAPSHOT_CSS } from './snapshot-render.js';
 
@@ -86,6 +85,19 @@ export interface PublishedEntry {
   title: string;
   description: string;
   publishedAt: string;
+}
+
+export class HarmonyDashboardPublishError extends Error {
+  readonly deployed = true;
+  constructor(
+    message: string,
+    readonly visibilityConverged: boolean,
+    readonly deploy: HarmonyDeployReceipt,
+    readonly canonicalMirrorSynchronized = true,
+  ) {
+    super(message);
+    this.name = 'HarmonyDashboardPublishError';
+  }
 }
 
 export type ExecResult = { code: number; stdout: string; stderr: string };
@@ -167,6 +179,145 @@ export function scaffoldHarmonyApp(settings: HarmonySettings, options: { appName
   return { appRoot, assetRoot, appName };
 }
 
+interface HarmonyAppCandidate {
+  canonicalRoot: string;
+  container: string;
+  candidateRoot: string;
+  assetRoot: string;
+  appName: string;
+}
+
+interface HarmonyMirrorRecoveryMarker {
+  version: 1;
+  canonicalRoot: string;
+  backupRoot: string;
+  candidateContainer: string;
+}
+
+function harmonyMirrorRecoveryPath(canonicalRoot: string): string {
+  return `${canonicalRoot}.botboy-recovery.json`;
+}
+
+function removeHarmonyRecoveryMarker(canonicalRoot: string): void {
+  try { fs.unlinkSync(harmonyMirrorRecoveryPath(canonicalRoot)); } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+function writeHarmonyRecoveryMarker(marker: HarmonyMirrorRecoveryMarker): void {
+  const markerPath = harmonyMirrorRecoveryPath(marker.canonicalRoot);
+  const temporaryPath = `${markerPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(temporaryPath, markerPath);
+  } catch (error) {
+    fs.rmSync(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+/** Restore a canonical root left between the two directory renames, or block. */
+function recoverHarmonyCanonicalMirror(canonicalRoot: string): void {
+  const markerPath = harmonyMirrorRecoveryPath(canonicalRoot);
+  if (!fs.existsSync(markerPath)) return;
+  let marker: HarmonyMirrorRecoveryMarker;
+  try {
+    marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as HarmonyMirrorRecoveryMarker;
+  } catch (error: any) {
+    throw new Error(`Harmony canonical mirror recovery marker is unreadable; refusing an empty-tree deploy: ${error?.message ?? String(error)}`);
+  }
+  const parent = path.dirname(canonicalRoot);
+  const base = path.basename(canonicalRoot);
+  const valid = marker.version === 1
+    && path.resolve(marker.canonicalRoot) === path.resolve(canonicalRoot)
+    && path.dirname(marker.backupRoot) === parent
+    && path.basename(marker.backupRoot).startsWith(`${base}.previous-`)
+    && path.dirname(marker.candidateContainer) === parent
+    && path.basename(marker.candidateContainer).startsWith(`.${base}-candidate-`);
+  if (!valid) throw new Error('Harmony canonical mirror recovery marker is invalid; refusing an empty-tree deploy.');
+
+  if (!fs.existsSync(canonicalRoot)) {
+    if (!fs.existsSync(marker.backupRoot)) {
+      throw new Error('Harmony canonical mirror is absent and its recovery backup is missing; refusing an empty-tree deploy.');
+    }
+    try {
+      fs.renameSync(marker.backupRoot, canonicalRoot);
+    } catch (error: any) {
+      throw new Error(`Harmony canonical mirror recovery is still blocked; refusing an empty-tree deploy: ${error?.message ?? String(error)}`);
+    }
+  }
+  fs.rmSync(marker.backupRoot, { recursive: true, force: true });
+  fs.rmSync(marker.candidateContainer, { recursive: true, force: true });
+  removeHarmonyRecoveryMarker(canonicalRoot);
+}
+
+/**
+ * Every deploy is assembled in an isolated sibling tree. A failed pre-deploy
+ * candidate is deleted rather than contaminating the persistent canonical
+ * tree and hitchhiking on a later dashboard/static publication.
+ */
+function createHarmonyAppCandidate(
+  settings: HarmonySettings,
+  options: { appName?: string; appRoot?: string },
+): HarmonyAppCandidate {
+  const appName = options.appName ?? harmonyAppName();
+  const canonicalRoot = options.appRoot ?? harmonyAppRoot(appName);
+  const parent = path.dirname(canonicalRoot);
+  fs.mkdirSync(parent, { recursive: true });
+  recoverHarmonyCanonicalMirror(canonicalRoot);
+  const container = fs.mkdtempSync(path.join(parent, `.${path.basename(canonicalRoot)}-candidate-`));
+  const candidateRoot = path.join(container, path.basename(canonicalRoot));
+  if (fs.existsSync(canonicalRoot)) {
+    fs.cpSync(canonicalRoot, candidateRoot, { recursive: true, preserveTimestamps: true });
+  }
+  const scaffold = scaffoldHarmonyApp(settings, { appName, appRoot: candidateRoot });
+  return { canonicalRoot, container, candidateRoot, assetRoot: scaffold.assetRoot, appName };
+}
+
+function discardHarmonyAppCandidate(candidate: HarmonyAppCandidate): void {
+  fs.rmSync(candidate.container, { recursive: true, force: true });
+}
+
+/** Promote only a deploy-receipted candidate to the canonical local mirror. */
+function promoteHarmonyAppCandidate(candidate: HarmonyAppCandidate): void {
+  const backupRoot = `${candidate.canonicalRoot}.previous-${path.basename(candidate.container)}`;
+  const marker: HarmonyMirrorRecoveryMarker = {
+    version: 1,
+    canonicalRoot: candidate.canonicalRoot,
+    backupRoot,
+    candidateContainer: candidate.container,
+  };
+  const hadCanonical = fs.existsSync(candidate.canonicalRoot);
+  let canonicalMoved = false;
+  let markerWritten = false;
+  try {
+    writeHarmonyRecoveryMarker(marker);
+    markerWritten = true;
+    if (hadCanonical) {
+      fs.renameSync(candidate.canonicalRoot, backupRoot);
+      canonicalMoved = true;
+    }
+    fs.renameSync(candidate.candidateRoot, candidate.canonicalRoot);
+  } catch (error) {
+    if (canonicalMoved && fs.existsSync(backupRoot) && !fs.existsSync(candidate.canonicalRoot)) {
+      try {
+        fs.renameSync(backupRoot, candidate.canonicalRoot);
+        canonicalMoved = false;
+      } catch (restoreError: any) {
+        // Marker + both exact trees stay in place. Every later candidate calls
+        // recoverHarmonyCanonicalMirror and must restore or refuse to deploy.
+        throw new Error(`Canonical Harmony mirror swap and rollback both failed: ${restoreError?.message ?? String(restoreError)}; original error: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (markerWritten) removeHarmonyRecoveryMarker(candidate.canonicalRoot);
+    discardHarmonyAppCandidate(candidate);
+    throw error;
+  }
+  fs.rmSync(backupRoot, { recursive: true, force: true });
+  discardHarmonyAppCandidate(candidate);
+  removeHarmonyRecoveryMarker(candidate.canonicalRoot);
+}
+
 /** Structured, next-action-bearing error strings (chat + UI both surface these). */
 export function classifyHarmonyFailure(stdout: string, stderr: string): string {
   const text = `${stdout}\n${stderr}`;
@@ -241,7 +392,7 @@ export function harmonyStaticArtifactUrl(settings: HarmonySettings, slug: string
   return `${base}/a/${encodeURIComponent(slug)}/`;
 }
 
-function renderListingPage(entries: PublishedEntry[]): string {
+export function renderHarmonyDashboardListing(entries: PublishedEntry[]): string {
   const items = entries
     .slice()
     .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt))
@@ -319,12 +470,15 @@ async function deployHarmonyAssetTree(options: {
   assetRoot: string;
   appName: string;
   exec: ExecFn;
+  /** Restrict an existing app before replacing its externally served bytes. */
+  beforeExistingDeploy?: () => Promise<void>;
 }): Promise<HarmonyDeployReceipt> {
   const probe = await probeHarmony(options.settings, options.exec);
   if (!probe.ready) throw new Error(probe.detail);
 
-  await buildAppTar(options.appRoot, options.assetRoot, options.exec);
   const existing = await appExists(options.appRoot, options.settings.stage, options.exec);
+  if (existing.exists && options.beforeExistingDeploy) await options.beforeExistingDeploy();
+  await buildAppTar(options.appRoot, options.assetRoot, options.exec);
   const deployArgs = ['app', 'deploy', '--stage', options.settings.stage, '-B'];
   if (!existing.exists) deployArgs.push('--parentBindleId', options.settings.bindleId);
 
@@ -349,44 +503,80 @@ async function deployHarmonyAssetTree(options: {
  */
 export async function publishToHarmony(options: {
   settings: HarmonySettings;
-  dashboard: AnalyticsDashboard;
-  snapshotCreatedAt: string;
-  /** All dashboards that should exist in the app (incl. this one) for the listing page. */
-  publishedEntries: PublishedEntry[];
-  vendorDir?: string;
+  dashboardId: string;
+  bundle: DashboardBundle;
+  /** Exact prebuilt listing bytes included in the caller's artifact identity. */
+  listingHtml: string;
   /** Test injection points. */
   appName?: string;
   appRoot?: string;
   exec?: ExecFn;
   /** Converge Can-view-app rows to settings.visibility (task 1c″ wires the real transport). */
   ensureViewerAccess?: (context: { appName: string; settings: HarmonySettings }) => Promise<unknown>;
-}): Promise<{ url: string }> {
-  const { settings, dashboard } = options;
+}): Promise<{ url: string; deploy: HarmonyDeployReceipt; visibilityConverged: boolean }> {
+  const { settings, dashboardId, bundle } = options;
   const exec = options.exec ?? defaultExec;
 
-  const { appRoot, assetRoot, appName } = scaffoldHarmonyApp(settings, { appName: options.appName, appRoot: options.appRoot });
-  const bundle = renderDashboardBundle(dashboard, options.snapshotCreatedAt, { vendorDir: options.vendorDir });
-  const dashboardDir = path.join(assetRoot, 'd', dashboard.id);
-  fs.rmSync(dashboardDir, { recursive: true, force: true });
-  fs.mkdirSync(dashboardDir, { recursive: true });
-  writeBundle(bundle, dashboardDir);
-  // Shared stylesheet + listing at the app root (listing links use it).
-  fs.mkdirSync(path.join(assetRoot, 'assets'), { recursive: true });
-  fs.writeFileSync(path.join(assetRoot, 'assets', 'style.css'), SNAPSHOT_CSS);
-  fs.writeFileSync(path.join(assetRoot, 'index.html'), renderListingPage(options.publishedEntries));
+  const candidate = createHarmonyAppCandidate(settings, { appName: options.appName, appRoot: options.appRoot });
+  const { candidateRoot: appRoot, assetRoot, appName } = candidate;
+  let visibilityConverged = false;
+  let deploy: HarmonyDeployReceipt;
+  try {
+    const dashboardDir = path.join(assetRoot, 'd', dashboardId);
+    fs.rmSync(dashboardDir, { recursive: true, force: true });
+    fs.mkdirSync(dashboardDir, { recursive: true });
+    writeBundle(bundle, dashboardDir);
+    // Shared stylesheet + exact prebuilt listing at the app root.
+    fs.mkdirSync(path.join(assetRoot, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(assetRoot, 'assets', 'style.css'), SNAPSHOT_CSS);
+    fs.writeFileSync(path.join(assetRoot, 'index.html'), options.listingHtml);
 
-  await deployHarmonyAssetTree({
-    settings,
-    appRoot,
-    assetRoot,
-    appName,
-    exec,
-  });
-  if (options.ensureViewerAccess) {
-    await options.ensureViewerAccess({ appName, settings });
+    deploy = await deployHarmonyAssetTree({
+      settings,
+      appRoot,
+      assetRoot,
+      appName,
+      exec,
+      // Tightening an existing app from everyone to private must happen before
+      // new bytes deploy. A first deploy is deny-by-default, so it converges
+      // immediately afterward instead.
+      ...(settings.visibility === 'private' && options.ensureViewerAccess
+        ? {
+            beforeExistingDeploy: async () => {
+              await options.ensureViewerAccess!({ appName, settings });
+              visibilityConverged = true;
+            },
+          }
+        : {}),
+    });
+  } catch (error) {
+    discardHarmonyAppCandidate(candidate);
+    throw error;
+  }
+  try {
+    promoteHarmonyAppCandidate(candidate);
+  } catch (error: any) {
+    throw new HarmonyDashboardPublishError(
+      `Harmony deployed the dashboard, but its canonical local mirror could not be promoted: ${error?.message ?? String(error)}`,
+      visibilityConverged,
+      deploy,
+      false,
+    );
+  }
+  if (options.ensureViewerAccess && !visibilityConverged) {
+    try {
+      await options.ensureViewerAccess({ appName, settings });
+      visibilityConverged = true;
+    } catch (error: any) {
+      throw new HarmonyDashboardPublishError(
+        `Harmony deployed the dashboard, but viewer access could not be verified: ${error?.message ?? String(error)}`,
+        false,
+        deploy,
+      );
+    }
   }
 
-  return { url: harmonyDashboardUrl(settings, dashboard.id, appName) };
+  return { url: harmonyDashboardUrl(settings, dashboardId, appName), deploy, visibilityConverged };
 }
 
 /**
@@ -401,25 +591,74 @@ export async function publishStaticArtifactToHarmony(options: {
   exec?: ExecFn;
 }): Promise<{ url: string; appName: string; artifactPath: string; deploy: HarmonyDeployReceipt }> {
   const exec = options.exec ?? defaultExec;
-  const { appRoot, assetRoot, appName } = scaffoldHarmonyApp(options.settings, {
+  const candidate = createHarmonyAppCandidate(options.settings, {
     appName: options.appName,
     appRoot: options.appRoot,
   });
-  const artifactPath = path.join(assetRoot, 'a', options.bundle.slug);
-  writeStaticArtifactBundle(options.bundle, artifactPath);
-
-  const deploy = await deployHarmonyAssetTree({
-    settings: options.settings,
-    appRoot,
-    assetRoot,
-    appName,
-    exec,
-  });
+  const { candidateRoot: appRoot, assetRoot, appName } = candidate;
+  let deploy: HarmonyDeployReceipt;
+  try {
+    const artifactPath = path.join(assetRoot, 'a', options.bundle.slug);
+    writeStaticArtifactBundle(options.bundle, artifactPath);
+    deploy = await deployHarmonyAssetTree({
+      settings: options.settings,
+      appRoot,
+      assetRoot,
+      appName,
+      exec,
+    });
+  } catch (error) {
+    discardHarmonyAppCandidate(candidate);
+    throw error;
+  }
+  try {
+    promoteHarmonyAppCandidate(candidate);
+  } catch (error: any) {
+    throw new HarmonyDashboardPublishError(
+      `Harmony deployed the static artifact, but its canonical local mirror could not be promoted: ${error?.message ?? String(error)}`,
+      false,
+      deploy,
+      false,
+    );
+  }
+  const artifactPath = path.join(harmonyAssetRoot(candidate.canonicalRoot, appName), 'a', options.bundle.slug);
 
   return {
     url: harmonyStaticArtifactUrl(options.settings, options.bundle.slug, appName),
     appName,
     artifactPath,
     deploy,
+  };
+}
+
+/**
+ * Add an already-verified remote static artifact to the canonical local app
+ * mirror without deploying. Used only by verifyExisting adoption so the next
+ * whole-app deploy cannot drop the adopted route.
+ */
+export function synchronizeStaticArtifactMirror(options: {
+  settings: HarmonySettings;
+  bundle: StaticArtifactBundle;
+  appName?: string;
+  appRoot?: string;
+}): { appName: string; artifactPath: string } {
+  const candidate = createHarmonyAppCandidate(options.settings, {
+    appName: options.appName,
+    appRoot: options.appRoot,
+  });
+  try {
+    const candidatePath = path.join(candidate.assetRoot, 'a', options.bundle.slug);
+    writeStaticArtifactBundle(options.bundle, candidatePath);
+    promoteHarmonyAppCandidate(candidate);
+  } catch (error) {
+    if (fs.existsSync(candidate.container)
+      && !fs.existsSync(harmonyMirrorRecoveryPath(candidate.canonicalRoot))) {
+      discardHarmonyAppCandidate(candidate);
+    }
+    throw error;
+  }
+  return {
+    appName: candidate.appName,
+    artifactPath: path.join(harmonyAssetRoot(candidate.canonicalRoot, candidate.appName), 'a', options.bundle.slug),
   };
 }

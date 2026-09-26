@@ -465,14 +465,13 @@ describe('run_command success does NOT append write_file guidance', () => {
   // Validates: Requirement 6.2
   // The guidance tip must only be appended on failure, never on successful execution.
   it('returns command output without guidance when a heredoc-style command succeeds', async () => {
-    const { exec } = await import('child_process');
+    const { execFile } = await import('child_process');
     const { createToolExecutor } = await import('./tool-executor.js');
 
-    // The module-level vi.mock makes exec fail by default. For this test,
-    // override the next call so the command succeeds and returns output
-    // rather than falling into the catch branch where guidance is appended.
-    // (The files-dir mkdir prelude uses fs.mkdirSync, not child_process.)
-    vi.mocked(exec).mockImplementationOnce(((_cmd: unknown, _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+    // The module-level vi.mock makes execFile fail by default. For this test,
+    // override the next sandboxed invocation so the command succeeds and
+    // returns output rather than falling into the guidance branch.
+    vi.mocked(execFile).mockImplementationOnce(((_cmd: unknown, _args: unknown, _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
       cb(null, 'hello world\n', '');
       return undefined as any;
     }) as any);

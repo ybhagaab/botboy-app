@@ -6,7 +6,7 @@
  * source degradation, fail-closed loads, and the clarification listing.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -85,6 +85,21 @@ describe('createAnalyticsSchemaBriefingLoader — union catalog', () => {
     expect(briefing.text).toContain('OTT streaming business brief');
     expect(briefing.text).toContain('source="knowledge-dir"');
     expect(briefing.text).toContain('[KNOWLEDGE FILE: presets/ott.md');
+  });
+
+  it('local-only direct-answer preflight makes zero SQL metadata and selector-model calls', async () => {
+    seedKnowledge();
+    const mcp = runningMcp();
+    const selector = vi.fn(async () => ({ presets: ['fatafat'], needsClarification: false }));
+    const loader = createAnalyticsSchemaBriefingLoader(mcp as any, {
+      db: db(), contextWindowTokens: WINDOW, selector,
+    });
+    const briefing = await loader.load('ott streaming playback metrics', { localOnly: true });
+    expect(briefing.ready).toBe(true);
+    expect(briefing.presets).toContain('presets/ott.md');
+    expect(briefing.text).toContain('deferred until the data room reports a local miss');
+    expect(mcp.calls).toEqual([]);
+    expect(selector).not.toHaveBeenCalled();
   });
 
   it('still resolves sql-context presets by exact name (regression)', async () => {

@@ -118,12 +118,16 @@ export function createAnalyticsScheduler(options: {
     const operation = (async () => {
       const runsRecovered = analyticsService.recoverInterruptedRuns();
       const schedulesAdvanced = enqueueDueSchedules();
+      // R4 head fan-out shares the durable dashboard queue. It groups stale
+      // bindings by dashboard and creates selective children only; no source
+      // acquisition, connector probe, or extra scheduler is introduced.
+      const bindingRunsQueued = analyticsService.enqueueChangedBindings(20);
       // Separate slot: multi-minute status/download calls must never consume a
       // whole-dashboard scheduler slot or delay newly queued refreshes.
       launchLateResultPass();
       const slotsToFill = Math.max(0, runConcurrency - activeRunSlots);
       for (let slot = 0; slot < slotsToFill; slot++) launchRunSlot();
-      return runsRecovered + schedulesAdvanced + slotsToFill;
+      return runsRecovered + schedulesAdvanced + bindingRunsQueued + slotsToFill;
     })();
     fillOperation = operation.finally(() => {
       fillOperation = null;

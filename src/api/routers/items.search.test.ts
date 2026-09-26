@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { createItemsRouter } from './items.js';
@@ -136,6 +136,83 @@ describe('GET /api/search', () => {
       node: { id: 'p1', title: 'Catalog unification' },
     });
     expect((storage.getDb().prepare("SELECT COUNT(*) AS count FROM work_items WHERE source = 'botboy'").get() as { count: number }).count).toBe(0);
+  });
+
+  it('treats malformed legacy metadata as empty JSON instead of aborting search', async () => {
+    const db = storage.getDb();
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, captured_at, process_state, metadata, raw_text)
+      VALUES ('bad-meta', 'slack_message', 'slack', 'malformed catalog metadata',
+        '2026-09-21T00:00:00Z', 'routed', '{not-json', 'catalog body')
+    `).run();
+    const response = await request(app()).get('/api/search').query({ q: 'malformed catalog' });
+    expect(response.status).toBe(200);
+    expect(response.body.results).toHaveLength(1);
+    expect(response.body.results[0].item).toMatchObject({ id: 'bad-meta', source: 'slack' });
+  });
+
+  it('merges exact typed datasets, authored chains, and evidence without writes or version hits', async () => {
+    const db = storage.getDb();
+    db.prepare(`
+      INSERT INTO work_items (id, type, source, title, captured_at, process_state, raw_text)
+      VALUES ('search-evidence', 'slack_message', 'slack', 'catalog shared title evidence',
+        '2026-09-21T00:00:00Z', 'routed', 'catalog')
+    `).run();
+    const searchDatasets = vi.fn((query: string, limit = 25) => {
+      if (query.startsWith('dsv_')) return [];
+      const hits = [
+        {
+          datasetId: 'ds_search_exact', name: 'Catalog shared title', description: 'Exact logical dataset',
+          kind: 'source', scope: 'workspace', domainKey: 'search', lifecycle: 'active',
+          updatedAt: '2026-09-21T02:00:00Z', matchField: query === 'ds_search_exact' ? 'id' : 'name',
+          currentVersion: { id: `dsv_${'a'.repeat(24)}`, ordinal: 2, materializedAt: '2026-09-21T02:00:00Z', integrityStatus: 'verified' },
+        },
+        {
+          datasetId: 'ds_search_same_title', name: 'Catalog shared title', description: 'Second logical dataset',
+          kind: 'derived', scope: 'workspace', domainKey: 'search', lifecycle: 'active',
+          updatedAt: '2026-09-21T01:00:00Z', matchField: 'name',
+        },
+      ];
+      return (query === 'ds_search_exact' ? hits : query.includes('catalog') ? hits : []).slice(0, limit);
+    });
+    const analyticsDataRoom = { searchDatasets } as never;
+    const productDocumentService = {
+      listArtifacts: () => [{
+        artifactId: 'artifact-search', title: 'Catalog authored document',
+        profileId: 'business_document/adaptive.v1', createdAt: '2026-09-21T01:00:00Z',
+        state: 'ready_for_review',
+      }],
+    } as never;
+    const beforeChanges = db.totalChanges;
+    const beforeItems = (db.prepare('SELECT COUNT(*) AS count FROM work_items').get() as { count: number }).count;
+
+    const exact = await request(app({ analyticsDataRoom })).get('/api/search').query({ q: 'ds_search_exact', limit: 5 });
+    expect(exact.body.results[0]).toMatchObject({
+      item: {
+        id: 'ds_search_exact', datasetId: 'ds_search_exact', type: 'analytics_dataset',
+        source: 'analytics', sourceApp: 'BotBoy', currentVersion: { ordinal: 2 },
+      },
+      node: null,
+      matchField: 'id',
+    });
+
+    const merged = await request(app({ analyticsDataRoom, productDocumentService }))
+      .get('/api/search').query({ q: 'catalog', limit: 6 });
+    expect(merged.status).toBe(200);
+    expect(merged.body.totalResults).toBe(4);
+    expect(merged.body.results.slice(0, 2).map((result: any) => result.item.datasetId))
+      .toEqual(['ds_search_exact', 'ds_search_same_title']);
+    expect(merged.body.results.some((result: any) => result.item.artifactId === 'artifact-search')).toBe(true);
+    expect(merged.body.results.some((result: any) => result.item.id === 'search-evidence')).toBe(true);
+    expect(new Set(merged.body.results.filter((result: any) => result.item.datasetId)
+      .map((result: any) => result.item.datasetId)).size).toBe(2);
+
+    const versionOnly = await request(app({ analyticsDataRoom })).get('/api/search')
+      .query({ q: `dsv_${'a'.repeat(24)}`, limit: 5 });
+    expect(versionOnly.body.results).toEqual([]);
+    expect(searchDatasets).toHaveBeenCalled();
+    expect(db.totalChanges).toBe(beforeChanges);
+    expect((db.prepare('SELECT COUNT(*) AS count FROM work_items').get() as { count: number }).count).toBe(beforeItems);
   });
 });
 

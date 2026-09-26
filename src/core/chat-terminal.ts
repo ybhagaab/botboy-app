@@ -12,13 +12,15 @@
  * Reuses the proven MCP setup-terminal PTY engine (bounded buffer, SSE
  * subscription, SIGTERM→SIGKILL stop, retention window) with one dedicated
  * engine instance, so chat sessions and MCP setup sessions cannot block each
- * other. Commands run under `/bin/zsh -lc` so pipes, globs, and login-shell
- * PATH behave exactly like the user's own terminal; the server's
- * toolchain-augmented PATH is inherited on top.
+ * other. Commands run under macOS Seatbelt and then `/bin/zsh -lc`: pipes,
+ * globs, and login-shell PATH still work, while BotBoy private state, its
+ * loopback control endpoints, and native UI automation remain unreachable.
  *
  * Safety model:
  *   - Opening a session and sending agent input require ownerRequested=true
  *     (the house policy for every write-classified chat tool).
+ *   - Seatbelt applies to the shell and every descendant; the files workspace
+ *     and its source/build links remain usable, but approval authority does not.
  *   - The exact command line is shown in the UI card before anything runs;
  *     the user is present by definition (they're chatting).
  *   - Catastrophic patterns stay blocked. `sudo` IS allowed here — unlike
@@ -32,6 +34,7 @@ import {
   type McpTerminalEngine,
   type McpTerminalSessionSnapshot,
 } from './mcp-terminal.js';
+import { modelCommandSandboxInvocation } from './protected-local-resources.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 // Source builds are real on machines whose Homebrew prefix disables bottles
@@ -127,15 +130,17 @@ export function createChatTerminalService(): ChatTerminalService {
       const problem = validateChatTerminalCommand(input.command);
       if (problem) throw new Error(problem);
       const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000), MAX_TIMEOUT_MS);
+      const invocation = modelCommandSandboxInvocation(input.command, { shell: '/bin/zsh' });
       const snapshot = engine.start({
         profileId: 'chat',
         commandId: 'chat-command',
         title: input.title || input.command.slice(0, 60),
-        executable: '/bin/zsh',
-        args: ['-lc', input.command],
+        executable: invocation.executable,
+        args: invocation.args,
         env: {
           ...(process.env as Record<string, string>),
           TERM: 'xterm-256color',
+          BOTBOY_FILES: invocation.filesDir,
           // Non-interactive-friendly defaults; prompts still work via PTY.
           HOMEBREW_NO_AUTO_UPDATE: '1',
         },

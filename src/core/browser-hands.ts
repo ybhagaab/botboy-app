@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
+import { isProtectedLocalHttpUrl } from './protected-local-resources.js';
 
 const DEFAULT_CDP_ENDPOINT = 'http://127.0.0.1:9222';
 const DEFAULT_ACTION_TIMEOUT_MS = 30_000;
@@ -107,6 +108,7 @@ export interface BrowserHandsOptions {
   cdpEndpoint?: string;
   stateDir?: string;
   filesDir?: string;
+  protectedAppPort?: number;
 }
 
 interface OwnedTab {
@@ -372,11 +374,34 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
   const stateDir = options.stateDir ?? path.join(os.homedir(), '.personal-productivity-tracker', 'browser-hands');
   const filesDir = options.filesDir ?? path.join(os.homedir(), '.personal-productivity-tracker', 'files', 'browser-hands');
   const registryFile = path.join(stateDir, 'tabs.json');
+  const cdpPort = (() => {
+    try {
+      const parsed = new URL(cdpEndpoint);
+      return Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+    } catch {
+      return 9222;
+    }
+  })();
+  const protectedUrlOptions = { appPort: options.protectedAppPort, cdpPort };
   const tabs = new Map<string, OwnedTab>();
   const targetToTab = new Map<string, string>();
   const refs = new Map<string, RefState>();
   const queues = new Map<string, Promise<void>>();
   let initializePromise: Promise<void> | null = null;
+
+  async function assertAllowedPageUrl(value: unknown, allowInternalBlank = false): Promise<string> {
+    const raw = String(value ?? '').trim();
+    if (allowInternalBlank && (!raw || raw === 'about:blank')) return raw || 'about:blank';
+    const normalized = normalizeHttpUrl(raw);
+    if (await isProtectedLocalHttpUrl(normalized, protectedUrlOptions)) {
+      throw new BrowserHandsError(
+        'PROTECTED_APP_ORIGIN',
+        'Browser hands cannot operate BotBoy owner surfaces or the debug-Chrome control endpoint.',
+        'Ask the owner to open the Data Room review and perform any approval themselves. Use self-eyes only for read-only BotBoy UI inspection.',
+      );
+    }
+    return normalized;
+  }
 
   async function cdpHttp(pathname: string, method: 'GET' | 'PUT' = 'GET'): Promise<any> {
     const response = await fetch(`${cdpEndpoint}${pathname}`, { method });
@@ -416,9 +441,20 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
     const byId = new Map(targets.map(target => [target.id, target]));
     let changed = false;
     for (const [tabId, entry] of tabs) {
-      if (!byId.has(entry.targetId)) {
+      const target = byId.get(entry.targetId);
+      if (!target) {
         tabs.delete(tabId);
         refs.delete(tabId);
+        changed = true;
+        continue;
+      }
+      try {
+        await assertAllowedPageUrl(target.url, true);
+      } catch {
+        await cdpHttp(`/json/close/${encodeURIComponent(entry.targetId)}`).catch(() => undefined);
+        tabs.delete(tabId);
+        refs.delete(tabId);
+        byId.delete(entry.targetId);
         changed = true;
       }
     }
@@ -493,6 +529,8 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
     try {
       await session.send('Page.enable').catch(() => undefined);
       await session.send('Runtime.enable').catch(() => undefined);
+      const currentState = await pageState(session, target);
+      await assertAllowedPageUrl(currentState.url, true);
       return await operation(session, entry, target);
     } finally {
       session.close();
@@ -572,6 +610,12 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
         if (info.type !== 'page' || !info.targetId || targetToTab.has(info.targetId) || !info.openerId) continue;
         const openerTabId = targetToTab.get(info.openerId);
         if (!openerTabId) continue;
+        try {
+          await assertAllowedPageUrl(info.url ?? '', true);
+        } catch {
+          await cdpHttp(`/json/close/${encodeURIComponent(info.targetId)}`).catch(() => undefined);
+          continue;
+        }
         const tabId = `tab_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
         const entry: OwnedTab = { tabId, targetId: info.targetId, openerTabId, createdAt: new Date().toISOString() };
         tabs.set(tabId, entry);
@@ -608,6 +652,7 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
           viewport: { width: 0, height: 0 },
         }
       : await pageState(session, target);
+    await assertAllowedPageUrl(state.url);
     return {
       ok: true,
       action,
@@ -857,7 +902,7 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
   async function actionOnTab(tabId: string, input: BrowserHandsInput): Promise<BrowserReceipt> {
     return enqueue(tabId, () => withSession(tabId, async (session, _entry, target) => {
       if (input.action === 'navigate') {
-        const url = normalizeHttpUrl(input.url);
+        const url = await assertAllowedPageUrl(input.url);
         refs.delete(tabId);
         await navigate(session, url);
         return settleAndReceipt('navigate', tabId, session, target);
@@ -1033,7 +1078,7 @@ export function createBrowserHandsService(options: BrowserHandsOptions = {}): Br
       }
 
       if (action === 'open') {
-        const url = normalizeHttpUrl(input.url);
+        const url = await assertAllowedPageUrl(input.url);
         const target = await createBlankTarget();
         const tabId = `tab_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
         tabs.set(tabId, { tabId, targetId: target.id, createdAt: new Date().toISOString() });

@@ -24,6 +24,7 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
    * and keeps parallel test routers isolated from each other.
    */
   const backfillControllers = new Map<number, AbortController>();
+  let backfillCounter = 0;
 
   // ── Local folders config ──
 
@@ -209,6 +210,13 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
 
     const controller = new AbortController();
     backfillControllers.set(id, controller);
+    const unregisterShutdownWork = deps.shutdown?.registerWork({
+      id: `backfill:${id}:${++backfillCounter}`,
+      kind: 'local_folder_backfill',
+      abort: () => {
+        if (!controller.signal.aborted) controller.abort(new Error('BotBoy process is shutting down'));
+      },
+    });
 
     const writeEvent = (phase: string, payload: Record<string, unknown>) => {
       try {
@@ -237,8 +245,11 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
         signal: controller.signal,
       });
     } catch (err: any) {
-      writeEvent('error', { folderId: id, error: err?.message ?? String(err) });
+      if (!deps.shutdown?.isShuttingDown()) {
+        writeEvent('error', { folderId: id, error: err?.message ?? String(err) });
+      }
     } finally {
+      unregisterShutdownWork?.();
       backfillControllers.delete(id);
       try { res.end(); } catch {}
     }

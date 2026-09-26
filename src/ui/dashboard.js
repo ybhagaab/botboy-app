@@ -35,6 +35,22 @@ import {
   syncDocumentReaderPresentation,
 } from './document-reader-presentation.js';
 import {
+  reconcileAnalyticsChatSelection,
+  toggleAnalyticsChatSelection,
+} from './analytics-chat-scope.js';
+import {
+  buildAnalyticsControlApplyPayload,
+  createAnalyticsControlDraft,
+  nextAnalyticsShownSort,
+  reconcileAnalyticsControlDraft,
+  sortAnalyticsShownRows,
+} from './analytics-data-room.js';
+import {
+  publicationConfirmationMustReprepare,
+  publicationDriftLabel,
+  publicationReceiptView,
+} from './analytics-publication-ui.js';
+import {
   beginRouteNavigation,
   enforceRootScrollOrigin,
   parseReloadScrollSnapshot,
@@ -96,8 +112,36 @@ const state = {
     polling: false,
     announcedRuns: new Set(),
     visualizationViews: new Map(),
+    dataRoomList: null,
+    dataRoomListError: '',
+    dataRoomListLoading: false,
+    dataRoomDetails: new Map(),
+    dataRoomVersions: new Map(),
+    dataRoomVersionDetails: new Map(),
+    dataRoomLoading: new Set(),
+    dataRoomErrors: new Map(),
+    dataRoomImportList: null,
+    dataRoomImportListError: '',
+    dataRoomImportDetails: new Map(),
+    dataRoomImportLoading: new Set(),
+    dataRoomImportErrors: new Map(),
+    dataRoomImportBusy: new Set(),
+    dataRoomImportFile: null,
+    dataRoomImportRequestId: '',
+    dataRoomImportSheets: new Map(),
+    dataRoomImportAnswers: new Map(),
+    dataRoomImportApprovalRequestIds: new Map(),
+    controlOpen: new Set(),
+    controlDrafts: new Map(),
+    controlBusy: new Set(),
+    controlErrors: new Map(),
+    controlPendingFocus: null,
+    shownRowSort: new Map(),
+    // Owner-visible, click-ordered 0–2 widget scope. It is never derived from
+    // refresh worker state and survives same-dashboard repaint only.
+    chatSelection: new Map(),
   },
-  publisher: { config: null, error: '', loading: false, saving: false, preparing: new Set(), pending: new Map(), publishing: new Set(), harmonyProbe: null, probing: false, installingCli: false, provisionPlan: null, provisioning: false, expandedProvider: undefined, mwinitOpening: false },
+  publisher: { config: null, error: '', loading: false, saving: false, preparing: new Set(), pending: new Map(), publishing: new Set(), confirmErrors: new Map(), pendingFocus: null, harmonyProbe: null, probing: false, installingCli: false, provisionPlan: null, provisioning: false, expandedProvider: undefined, mwinitOpening: false },
   channels: { data: null, error: '', loading: false, running: false },
   documents: {
     items: null,
@@ -163,6 +207,7 @@ const state = {
   commandTimer: null,
   lastVersion: null,
   lastAnalyticsVersion: null,
+  lastDataRoomVersion: null,
   lastDocumentsVersion: null,
   lastBootId: null,
   lastUiVersion: null,
@@ -202,13 +247,35 @@ async function request(path, options = {}) {
   });
   if (!response.ok) {
     let detail = '';
+    let payload = null;
     try {
-      const body = await response.json();
-      detail = body?.error || body?.message || body?.result?.message || '';
+      payload = await response.json();
+      detail = payload?.error || payload?.message || payload?.result?.message || '';
     } catch {}
-    throw new Error(`HTTP ${response.status}${detail ? ` — ${detail}` : ''}`);
+    const error = new Error(`HTTP ${response.status}${detail ? ` — ${detail}` : ''}`);
+    error.status = response.status;
+    error.code = payload?.code || '';
+    error.nextAction = payload?.nextAction || '';
+    error.payload = payload;
+    throw error;
   }
   if (response.status === 204) return null;
+  return response.json();
+}
+
+async function requestRaw(path, body, headers = {}) {
+  const response = await fetch(`${API}${path}`, { method: 'POST', headers, body });
+  if (!response.ok) {
+    let payload = null;
+    try { payload = await response.json(); } catch {}
+    const detail = payload?.error || payload?.message || '';
+    const error = new Error(`HTTP ${response.status}${detail ? ` — ${detail}` : ''}`);
+    error.status = response.status;
+    error.code = payload?.code || '';
+    error.nextAction = payload?.nextAction || '';
+    error.payload = payload;
+    throw error;
+  }
   return response.json();
 }
 
@@ -228,6 +295,18 @@ function parseRoute() {
   if (parts[0] === 'connections' && parts[1]) return { view: 'profile-settings', profileId: parts[1] };
   if (parts[0] === 'settings' && parts[1] === 'dashboard-sharing') return { view: 'publisher-settings' };
   if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
+  if (parts[0] === 'data-room') {
+    let id = parts[2] || parts[1] || '';
+    try { id = decodeURIComponent(id); } catch { id = ''; }
+    if (parts[1] === 'imports') return parts[2]
+      ? { view: 'data-room-import', importId: id }
+      : { view: 'data-room-imports' };
+    if (parts[1] === 'versions') return id && parts[2]
+      ? { view: 'data-room-version', versionId: id }
+      : { view: 'not-found' };
+    if (parts[1]) return { view: 'data-room-dataset', datasetId: id };
+    return { view: 'data-room' };
+  }
   if (parts[0] === 'dashboards') return { view: parts[1] ? 'analytics-dashboard' : 'dashboards', dashboardId: parts[1] || '' };
   if (parts[0] === 'documents') {
     let artifactId = parts[1] || '';
@@ -734,6 +813,7 @@ function renderSidebar() {
     ['inbox', 'inbox', 'Inbox', '#/inbox', inboxCount],
     ['channels', 'hash', 'Channels', '#/channels', ''],
     ['dashboards', 'activity', 'Dashboards', '#/dashboards', state.analytics.items?.length ? String(state.analytics.items.length) : ''],
+    ['data-room', 'database', 'Data Room', '#/data-room', state.analytics.dataRoomList?.datasets?.length ? String(state.analytics.dataRoomList.datasets.length) : ''],
     ['documents', 'file', 'Documents', '#/documents', state.documents.items?.length ? String(state.documents.items.length) : ''],
     ['connections', 'link', 'Connections', '#/connections', ''],
     ['pipeline', 'activity', 'System health', '#/pipeline', state.health?.totalFailures ? String(state.health.totalFailures) : ''],
@@ -745,6 +825,7 @@ function renderSidebar() {
       const active = route.view === view
         || (view === 'connections' && ['mcp-settings', 'profile-settings', 'mcp-add', 'mcp-edit'].includes(route.view))
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
+        || (view === 'data-room' && ['data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'].includes(route.view))
         || (view === 'settings' && ['publisher-settings', 'llm-usage-settings'].includes(route.view));
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
@@ -3445,59 +3526,630 @@ async function prepareDashboardShare(id) {
     return;
   }
   state.publisher.preparing.add(id);
-  renderRoute({ userAction: true });
+  state.publisher.pendingFocus = {
+    dashboardId: id,
+    target: state.publisher.pending.has(id) ? 'reprepare' : 'share',
+  };
+  renderRoute({ userAction: true, preserveScroll: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/share-request`, { method: 'POST', body: {} });
     state.publisher.pending.set(id, payload.shareRequest);
-    toast('Review the exact upload destination before confirming');
+    state.publisher.confirmErrors.delete(id);
+    state.publisher.pendingFocus = { dashboardId: id, target: 'confirm' };
+    toast('Review the exact publication receipt before confirming');
   } catch (error) {
+    state.publisher.pendingFocus = {
+      dashboardId: id,
+      target: state.publisher.pending.has(id) ? 'reprepare' : 'share',
+    };
     toast(`Could not prepare snapshot: ${error.message}`, 'bad');
   } finally {
     state.publisher.preparing.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) {
+      renderRoute({ userAction: true, preserveScroll: true });
+    }
   }
 }
 
 function cancelDashboardShare(id) {
   state.publisher.pending.delete(id);
-  renderRoute({ userAction: true });
+  state.publisher.confirmErrors.delete(id);
+  state.publisher.pendingFocus = { dashboardId: id, target: 'share' };
+  renderRoute({ userAction: true, preserveScroll: true });
 }
 
 async function publishDashboardShare(id) {
   const pending = state.publisher.pending.get(id);
   if (!pending || state.publisher.publishing.has(id)) return;
   state.publisher.publishing.add(id);
-  renderRoute({ userAction: true });
+  state.publisher.pendingFocus = { dashboardId: id, target: 'confirm' };
+  renderRoute({ userAction: true, preserveScroll: true });
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}/publish`, {
       method: 'POST',
       body: { confirmed: true, confirmationToken: pending.confirmationToken },
     });
     const dashboard = state.analytics.details.get(id);
-    if (dashboard) dashboard.latestPublication = payload.publication;
+    if (dashboard) {
+      dashboard.latestPublication = payload.publication;
+      dashboard.latestSuccessfulPublication = payload.publication;
+    }
     state.publisher.pending.delete(id);
+    state.publisher.confirmErrors.delete(id);
+    state.publisher.pendingFocus = { dashboardId: id, target: 'share' };
     await loadPublisherConfig({ force: true });
     toast('Dashboard snapshot published');
   } catch (error) {
-    state.publisher.pending.delete(id);
+    const retained = publicationConfirmationMustReprepare(error);
+    if (retained) {
+      state.publisher.confirmErrors.set(id, {
+        code: error.code,
+        message: error.payload?.error || error.message,
+        nextAction: error.nextAction,
+        drift: Array.isArray(error.payload?.drift) ? error.payload.drift.slice(0, 24) : [],
+      });
+      state.publisher.pendingFocus = { dashboardId: id, target: 'reprepare' };
+    } else {
+      state.publisher.pending.delete(id);
+      state.publisher.confirmErrors.delete(id);
+      state.publisher.pendingFocus = { dashboardId: id, target: 'share' };
+    }
     await loadPublisherConfig({ force: true });
-    toast(`Snapshot was not published: ${error.message}`, 'bad');
+    if (error.code === 'publication_provider_failed') {
+      await loadAnalyticsDashboard(id, { force: true, preserveScroll: true });
+      toast(`Publication completion is unverified: ${error.payload?.error || error.message}`, 'bad');
+    } else {
+      toast(`Snapshot was not published: ${error.message}`, 'bad');
+    }
   } finally {
     state.publisher.publishing.delete(id);
-    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) renderRoute({ userAction: true });
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === id) {
+      renderRoute({ userAction: true, preserveScroll: true });
+    }
   }
+}
+
+function renderPublicationHash(label, value) {
+  if (!value) return '';
+  return `<div><dt>${esc(label)}</dt><dd><code>${esc(value)}</code></dd></div>`;
 }
 
 function renderShareConfirmation(dashboard) {
   const pending = state.publisher.pending.get(dashboard.id);
   if (!pending) return '';
   const publishing = state.publisher.publishing.has(dashboard.id);
+  const preparing = state.publisher.preparing.has(dashboard.id);
   const activeRun = analyticsActiveRun(dashboard);
-  const blocked = publishing || Boolean(activeRun);
-  return `<section class="card share-confirmation" role="alert"><div class="share-warning-icon">${icon('alert', 22)}</div><div class="share-confirmation-copy"><div class="eyebrow">Production AWS write</div><h2>Confirm this exact snapshot upload</h2><p>${esc(pending.warning)}</p><dl><div><dt>Destination</dt><dd>${esc(pending.destination)}</dd></div><div><dt>Content SHA-256</dt><dd><code>${esc(pending.contentSha256)}</code></dd></div><div><dt>Confirmation expires</dt><dd>${esc(new Date(pending.expiresAt).toLocaleString())}</dd></div></dl><p class="share-fixed-note">${activeRun ? 'Wait for the active refresh to finish before uploading this snapshot.' : 'This fixed copy will not update when the local dashboard refreshes. BotBoy will not change any AWS safety or access settings.'}</p><div class="share-confirmation-actions"><button class="button" type="button" data-action="share-cancel" data-dashboard="${attr(dashboard.id)}" ${publishing ? 'disabled' : ''}>Cancel</button><button class="button primary" type="button" data-action="share-confirm" data-dashboard="${attr(dashboard.id)}" ${blocked ? 'disabled' : ''}>${icon('globe')} ${publishing ? 'Uploading snapshot…' : activeRun ? 'Refresh in progress' : 'Confirm and upload snapshot'}</button></div></div></section>`;
+  const error = state.publisher.confirmErrors.get(dashboard.id);
+  const stale = publicationConfirmationMustReprepare(error);
+  const receipt = publicationReceiptView(pending.receipt);
+  const blocked = publishing || Boolean(activeRun) || stale || !receipt;
+  const drift = (error?.drift || []).map(item => {
+    const suffix = item?.widgetId ? ` · ${item.widgetId}` : '';
+    return `<span class="pill warn">${esc(publicationDriftLabel(item?.scope))}${esc(suffix)}</span>`;
+  }).join('');
+  const errorPanel = error
+    ? `<div class="share-confirmation-error" role="alert"><strong>${stale ? 'This prepared snapshot is no longer confirmable.' : 'Publication could not continue.'}</strong><span>${esc(error.message)}</span>${error.nextAction ? `<span>${esc(error.nextAction)}</span>` : ''}${drift ? `<div class="share-drift-list" aria-label="Detected changes">${drift}</div>` : ''}</div>`
+    : !receipt
+      ? '<div class="share-confirmation-error" role="alert"><strong>Exact provenance is unavailable.</strong><span>Prepare a new snapshot before confirming an external publication.</span></div>'
+      : '';
+  const dataRoomRows = receipt?.widgets.map(widget => `<article class="share-provenance-row"><header><strong>${esc(widget.widgetId)}</strong><span>${esc(widget.datasetId)} · ${esc(widget.versionId)}</span></header><dl>${renderPublicationHash('Binding SHA-256', widget.bindingSha256)}${renderPublicationHash('Control values SHA-256', widget.controlSha256)}${renderPublicationHash('Query SHA-256', widget.querySha256)}${renderPublicationHash('Semantic receipt SHA-256', widget.semanticReceiptSha256)}</dl></article>`).join('') || '';
+  const provenance = receipt
+    ? `<div class="share-provenance"><div class="share-provenance-heading"><h3>Exact Data Room provenance</h3><span>${number(receipt.totalBoundWidgets)} bound widget${receipt.totalBoundWidgets === 1 ? '' : 's'}</span></div>${dataRoomRows || '<p>No Data Room-bound widgets are included; unbound persisted results retain their exact result hashes.</p>'}${receipt.truncated ? '<p>Only the first 24 bound widget receipts are shown.</p>' : ''}</div>`
+    : '';
+  const reprepare = stale || !receipt
+    ? `<button class="button primary" type="button" data-action="share-prepare" data-dashboard="${attr(dashboard.id)}" ${preparing || publishing || activeRun ? 'disabled' : ''}>${icon('refresh')} ${preparing ? 'Preparing updated snapshot…' : activeRun ? 'Wait for refresh' : 'Prepare updated snapshot'}</button>`
+    : '';
+  const confirmLabel = publishing ? 'Publishing snapshot…' : activeRun ? 'Refresh in progress' : stale || !receipt ? 'Prepared snapshot is stale' : 'Confirm external publication';
+  return `<section class="card share-confirmation" aria-labelledby="share-confirmation-title-${attr(dashboard.id)}"><div class="share-warning-icon">${icon('alert', 22)}</div><div class="share-confirmation-copy"><div class="eyebrow">External publication</div><h2 id="share-confirmation-title-${attr(dashboard.id)}">Confirm this exact snapshot</h2><p>${esc(pending.warning)}</p>${errorPanel}<dl class="share-receipt-summary"><div><dt>Destination</dt><dd>${esc(pending.destination)}</dd></div>${receipt ? `${renderPublicationHash('Snapshot manifest SHA-256', receipt.snapshotManifestSha256)}${renderPublicationHash('Artifact content SHA-256', receipt.artifactContentSha256)}${renderPublicationHash('Publisher config SHA-256', receipt.publisherConfigSha256)}${renderPublicationHash('Dashboard presentation SHA-256', receipt.dashboardPresentationSha256)}${renderPublicationHash('Dashboard result SHA-256', receipt.dashboardResultSha256)}` : ''}<div><dt>Confirmation expires</dt><dd>${esc(new Date(pending.expiresAt).toLocaleString())}</dd></div></dl>${provenance}<p class="share-fixed-note">${activeRun ? 'Wait for the active refresh to finish before preparing a replacement snapshot.' : stale ? 'The retained receipt is evidence only. Confirm is disabled until you prepare and review a replacement.' : 'This fixed copy will not update when the local dashboard refreshes. BotBoy will not change provider safety or access settings.'}</p><div class="share-confirmation-actions"><button class="button" type="button" data-action="share-cancel" data-dashboard="${attr(dashboard.id)}" ${publishing ? 'disabled' : ''}>Cancel</button>${reprepare}<button class="button primary" type="button" data-action="share-confirm" data-dashboard="${attr(dashboard.id)}" ${blocked ? 'disabled' : ''}>${icon('globe')} ${confirmLabel}</button></div></div></section>`;
+}
+
+function renderLatestDashboardPublication(dashboard) {
+  const publication = dashboard.latestPublication;
+  if (!publication) return '';
+  const receipt = publicationReceiptView(publication.receipt);
+  const complete = publication.status === 'published'
+    && publication.deployed && publication.contentVerified && publication.visibilityConverged;
+  const effectLabel = complete
+    ? 'Verified external publication'
+    : publication.deployed
+      ? 'Remote effect incomplete or unverified'
+      : publication.status === 'publishing'
+        ? 'Publication in progress'
+        : 'No deploy receipt recorded';
+  const tone = complete ? 'good' : publication.status === 'publishing' ? 'accent' : 'warn';
+  const successful = dashboard.latestSuccessfulPublication;
+  const retainedLink = !complete && successful?.url
+    ? `<a class="button" href="${attr(successful.url)}" target="_blank" rel="noopener noreferrer">${icon('link')} Open last verified copy</a>`
+    : '';
+  return `<details class="card share-attempt" ${publication.status !== 'published' ? 'open' : ''}><summary><span>${icon('globe', 14)}<strong>Latest publication attempt</strong></span><span class="pill ${tone}">${esc(effectLabel)}</span></summary><div class="share-attempt-body"><div class="share-effect-grid"><span>Provider deploy <strong>${publication.deployed ? 'recorded' : 'not recorded'}</strong></span><span>Served content <strong>${publication.contentVerified ? 'verified' : 'unverified'}</strong></span><span>Audience <strong>${publication.visibilityConverged ? 'verified' : 'unverified'}</strong></span></div>${publication.error ? `<div class="share-confirmation-error" role="status"><strong>Completion was not certified.</strong><span>${esc(publication.error)}</span></div>` : ''}${receipt ? `<dl class="share-receipt-summary">${renderPublicationHash('Snapshot manifest SHA-256', receipt.snapshotManifestSha256)}${renderPublicationHash('Artifact content SHA-256', receipt.artifactContentSha256)}${renderPublicationHash('Publisher config SHA-256', receipt.publisherConfigSha256)}</dl>` : '<p>Legacy attempt: exact publication provenance was not recorded.</p>'}<div class="share-attempt-actions"><span>Attempt ${esc(publication.id)} · ${esc(relativeTime(publication.publishedAt || publication.createdAt))}</span>${retainedLink}</div></div></details>`;
 }
 
 // ── Analytical dashboards ──
+const DATA_ROOM_CACHE_LIMIT = 12;
+
+function rememberDataRoomEntry(map, key, value) {
+  const current = map.get(key);
+  const incomingItem = value?.importItem;
+  const currentItem = current?.importItem;
+  if (incomingItem && currentItem) {
+    const incomingCandidateRevision = Number(incomingItem.revision || 0);
+    const currentCandidateRevision = Number(currentItem.revision || 0);
+    const incomingProposal = incomingItem.semanticReview;
+    const currentProposal = currentItem.semanticReview;
+    const staleCandidate = incomingCandidateRevision < currentCandidateRevision;
+    const staleProposal = incomingCandidateRevision === currentCandidateRevision && incomingProposal && currentProposal
+      && (Number(incomingProposal.proposalRevision || 0) < Number(currentProposal.proposalRevision || 0)
+        || (Number(incomingProposal.proposalRevision || 0) === Number(currentProposal.proposalRevision || 0)
+          && Number(incomingProposal.stateRevision || 0) < Number(currentProposal.stateRevision || 0)));
+    if (staleCandidate || staleProposal) return;
+  }
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > DATA_ROOM_CACHE_LIMIT) map.delete(map.keys().next().value);
+}
+
+function dataRoomRouteRelevant(kind, id = '') {
+  if (kind === 'list') return state.route.view === 'data-room';
+  if (kind === 'dataset') return state.route.view === 'data-room-dataset' && state.route.datasetId === id;
+  if (kind === 'version') return state.route.view === 'data-room-version' && state.route.versionId === id;
+  if (kind === 'imports') return state.route.view === 'data-room-imports';
+  if (kind === 'import') return state.route.view === 'data-room-import' && state.route.importId === id;
+  return false;
+}
+
+async function loadDataRoomList({ force = false, renderAfter = true } = {}) {
+  if (state.analytics.dataRoomListLoading || (state.analytics.dataRoomList && !force)) return state.analytics.dataRoomList;
+  state.analytics.dataRoomListLoading = true;
+  if (!force) state.analytics.dataRoomListError = '';
+  try {
+    const payload = await request('/analytics/data-room/datasets?limit=100');
+    state.analytics.dataRoomList = payload;
+    state.analytics.dataRoomListError = '';
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomListError = error.message;
+  } finally {
+    state.analytics.dataRoomListLoading = false;
+    if (renderAfter && (dataRoomRouteRelevant('list') || state.route.view === 'analytics-dashboard')) {
+      renderRoute({ preserveScroll: true });
+    }
+  }
+  return state.analytics.dataRoomList;
+}
+
+async function loadDataRoomDataset(datasetId, { force = false, renderAfter = true } = {}) {
+  const key = `dataset:${datasetId}`;
+  if (!datasetId || state.analytics.dataRoomLoading.has(key)
+    || (state.analytics.dataRoomDetails.has(datasetId) && !force)) return state.analytics.dataRoomDetails.get(datasetId) || null;
+  state.analytics.dataRoomLoading.add(key);
+  if (!force) state.analytics.dataRoomErrors.delete(key);
+  try {
+    const payload = await request(`/analytics/data-room/datasets/${encodeURIComponent(datasetId)}`);
+    rememberDataRoomEntry(state.analytics.dataRoomDetails, datasetId, payload);
+    state.analytics.dataRoomErrors.delete(key);
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomErrors.set(key, error.message);
+  } finally {
+    state.analytics.dataRoomLoading.delete(key);
+    if (renderAfter && dataRoomRouteRelevant('dataset', datasetId)) renderRoute({ preserveScroll: true });
+  }
+  return state.analytics.dataRoomDetails.get(datasetId) || null;
+}
+
+async function loadDataRoomVersions(datasetId, { force = false, renderAfter = true } = {}) {
+  const key = `versions:${datasetId}`;
+  if (!datasetId || state.analytics.dataRoomLoading.has(key)
+    || (state.analytics.dataRoomVersions.has(datasetId) && !force)) return state.analytics.dataRoomVersions.get(datasetId) || null;
+  state.analytics.dataRoomLoading.add(key);
+  if (!force) state.analytics.dataRoomErrors.delete(key);
+  try {
+    const payload = await request(`/analytics/data-room/datasets/${encodeURIComponent(datasetId)}/versions?limit=100`);
+    rememberDataRoomEntry(state.analytics.dataRoomVersions, datasetId, payload);
+    state.analytics.dataRoomErrors.delete(key);
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomErrors.set(key, error.message);
+  } finally {
+    state.analytics.dataRoomLoading.delete(key);
+    if (renderAfter && dataRoomRouteRelevant('dataset', datasetId)) renderRoute({ preserveScroll: true });
+  }
+  return state.analytics.dataRoomVersions.get(datasetId) || null;
+}
+
+async function loadDataRoomVersion(versionId, { force = false, renderAfter = true } = {}) {
+  const key = `version:${versionId}`;
+  if (!versionId || state.analytics.dataRoomLoading.has(key)
+    || (state.analytics.dataRoomVersionDetails.has(versionId) && !force)) return state.analytics.dataRoomVersionDetails.get(versionId) || null;
+  state.analytics.dataRoomLoading.add(key);
+  if (!force) state.analytics.dataRoomErrors.delete(key);
+  try {
+    const payload = await request(`/analytics/data-room/versions/${encodeURIComponent(versionId)}`);
+    rememberDataRoomEntry(state.analytics.dataRoomVersionDetails, versionId, payload);
+    state.analytics.dataRoomErrors.delete(key);
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomErrors.set(key, error.message);
+  } finally {
+    state.analytics.dataRoomLoading.delete(key);
+    if (renderAfter && dataRoomRouteRelevant('version', versionId)) renderRoute({ preserveScroll: true });
+  }
+  return state.analytics.dataRoomVersionDetails.get(versionId) || null;
+}
+
+async function loadDataRoomImports({ force = false, renderAfter = true } = {}) {
+  if (state.analytics.dataRoomImportLoading.has('list')
+    || (state.analytics.dataRoomImportList && !force)) return state.analytics.dataRoomImportList;
+  state.analytics.dataRoomImportLoading.add('list');
+  if (!force) state.analytics.dataRoomImportListError = '';
+  try {
+    const payload = await request('/analytics/data-room/imports?limit=100');
+    state.analytics.dataRoomImportList = payload;
+    state.analytics.dataRoomImportListError = '';
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomImportListError = error.message;
+  } finally {
+    state.analytics.dataRoomImportLoading.delete('list');
+    if (renderAfter && dataRoomRouteRelevant('imports')) renderRoute({ preserveScroll: true });
+  }
+  return state.analytics.dataRoomImportList;
+}
+
+async function loadDataRoomImport(importId, { force = false, renderAfter = true } = {}) {
+  const key = `import:${importId}`;
+  if (!importId || state.analytics.dataRoomImportLoading.has(key)
+    || (state.analytics.dataRoomImportDetails.has(importId) && !force)) {
+    return state.analytics.dataRoomImportDetails.get(importId) || null;
+  }
+  state.analytics.dataRoomImportLoading.add(key);
+  if (!force) state.analytics.dataRoomImportErrors.delete(key);
+  try {
+    const payload = await request(`/analytics/data-room/imports/${encodeURIComponent(importId)}`);
+    rememberDataRoomEntry(state.analytics.dataRoomImportDetails, importId, payload);
+    state.analytics.dataRoomImportErrors.delete(key);
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomImportErrors.set(key, error.message);
+  } finally {
+    state.analytics.dataRoomImportLoading.delete(key);
+    if (renderAfter && dataRoomRouteRelevant('import', importId)) renderRoute({ preserveScroll: true });
+  }
+  return state.analytics.dataRoomImportDetails.get(importId) || null;
+}
+
+function nextDataRoomImportRequestId() {
+  const value = globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+  return `import-${value}`;
+}
+
+async function uploadSelectedDataRoomImport() {
+  const file = state.analytics.dataRoomImportFile;
+  if (!file) {
+    toast('Choose an .xlsx workbook first.', 'warn');
+    return;
+  }
+  if (!String(file.name || '').toLowerCase().endsWith('.xlsx')) {
+    toast('Only .xlsx workbooks are supported in this first Import Inbox.', 'warn');
+    return;
+  }
+  if (!state.analytics.dataRoomImportRequestId) {
+    state.analytics.dataRoomImportRequestId = nextDataRoomImportRequestId();
+  }
+  const busyKey = 'upload';
+  if (state.analytics.dataRoomImportBusy.has(busyKey)) return;
+  state.analytics.dataRoomImportBusy.add(busyKey);
+  state.analytics.dataRoomImportErrors.delete(busyKey);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const params = new URLSearchParams({
+      filename: file.name,
+      requestId: state.analytics.dataRoomImportRequestId,
+    });
+    const payload = await requestRaw(`/analytics/data-room/imports/upload?${params.toString()}`, file, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'X-BotBoy-Owner-Requested': 'true',
+    });
+    const item = payload.importItem;
+    rememberDataRoomEntry(state.analytics.dataRoomImportDetails, item.id, payload);
+    state.analytics.dataRoomImportList = null;
+    state.analytics.dataRoomImportFile = null;
+    state.analytics.dataRoomImportRequestId = '';
+    if (payload.dataRoomVersion) state.lastDataRoomVersion = payload.dataRoomVersion;
+    location.hash = `#/data-room/imports/${encodeURIComponent(item.id)}`;
+  } catch (error) {
+    state.analytics.dataRoomImportErrors.set(busyKey, `${error.message}${error.nextAction ? ` ${error.nextAction}` : ''}`);
+    // A structured client rejection is conclusive: the next click must use a
+    // fresh owner request identity instead of replaying the retained failed
+    // candidate. Keep the ID only for ambiguous transport/server failures.
+    if ([400, 413, 415].includes(Number(error.status))
+      || (Number(error.status) === 409 && ['aborted', 'integrity_failed'].includes(error.code))) {
+      state.analytics.dataRoomImportRequestId = '';
+    }
+    if (dataRoomRouteRelevant('imports')) renderRoute({ preserveScroll: true, userAction: true });
+  } finally {
+    state.analytics.dataRoomImportBusy.delete(busyKey);
+    if (dataRoomRouteRelevant('imports')) renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+async function inspectDataRoomImport(importId) {
+  const payload = state.analytics.dataRoomImportDetails.get(importId);
+  const item = payload?.importItem;
+  const sheetName = state.analytics.dataRoomImportSheets.get(importId) || '';
+  if (!item || !sheetName) {
+    toast('Select one workbook sheet to inspect.', 'warn');
+    return;
+  }
+  const busyKey = `inspect:${importId}`;
+  if (state.analytics.dataRoomImportBusy.has(busyKey)) return;
+  state.analytics.dataRoomImportBusy.add(busyKey);
+  state.analytics.dataRoomImportErrors.delete(busyKey);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const updated = await request(`/analytics/data-room/imports/${encodeURIComponent(importId)}/inspect`, {
+      method: 'POST',
+      body: { ownerRequested: true, expectedRevision: item.revision, sheetName },
+    });
+    rememberDataRoomEntry(state.analytics.dataRoomImportDetails, importId, updated);
+    state.analytics.dataRoomImportList = null;
+    if (updated.dataRoomVersion) state.lastDataRoomVersion = updated.dataRoomVersion;
+  } catch (error) {
+    state.analytics.dataRoomImportErrors.set(busyKey, `${error.message}${error.nextAction ? ` ${error.nextAction}` : ''}`);
+    await loadDataRoomImport(importId, { force: true, renderAfter: false });
+  } finally {
+    state.analytics.dataRoomImportBusy.delete(busyKey);
+    if (dataRoomRouteRelevant('import', importId)) renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+async function mutateDataRoomImportReview(importId, action) {
+  const payload = state.analytics.dataRoomImportDetails.get(importId);
+  const item = payload?.importItem;
+  const review = item?.semanticReview;
+  if (!item || !review) {
+    toast('Reload the import review first.', 'warn');
+    return;
+  }
+  const busyKey = `proposal:${importId}`;
+  if (state.analytics.dataRoomImportBusy.has(busyKey)) return;
+  const common = {
+    ownerRequested: true,
+    proposalId: review.proposalId,
+    proposalSha256: review.receipts?.proposalSha256,
+    expectedStateRevision: review.stateRevision,
+  };
+  let endpoint = `/analytics/data-room/imports/${encodeURIComponent(importId)}/proposal/${action}`;
+  let body = common;
+  if (action === 'respond') {
+    const answers = state.analytics.dataRoomImportAnswers.get(review.proposalId) || {};
+    const required = (review.unresolved || []).map(field => field.field);
+    if (required.some(field => !String(answers[field] || '').trim())) {
+      toast('Answer each highlighted ambiguity before continuing.', 'warn');
+      return;
+    }
+    body = { ...common, answers };
+  }
+  if (action === 'accept') {
+    let ownerRequestId = state.analytics.dataRoomImportApprovalRequestIds.get(review.proposalId);
+    if (!ownerRequestId) {
+      ownerRequestId = `import-approval-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+      state.analytics.dataRoomImportApprovalRequestIds.set(review.proposalId, ownerRequestId);
+    }
+    body = {
+      ...common,
+      proposalId: review.proposalId,
+      proposalSha256: review.receipts?.proposalSha256,
+      ownerRequestId,
+    };
+  }
+  if (action === 'promotion-retry') {
+    endpoint = `/analytics/data-room/imports/${encodeURIComponent(importId)}/promotion/retry`;
+    body = { ...common, proposalId: review.proposalId };
+  }
+  state.analytics.dataRoomImportBusy.add(busyKey);
+  state.analytics.dataRoomImportErrors.delete(busyKey);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const updated = await request(endpoint, { method: 'POST', body });
+    rememberDataRoomEntry(state.analytics.dataRoomImportDetails, importId, updated);
+    if (updated.importItem?.semanticReview?.proposalId !== review.proposalId) {
+      state.analytics.dataRoomImportAnswers.delete(review.proposalId);
+    }
+    state.analytics.dataRoomImportList = null;
+    if (updated.dataRoomVersion) state.lastDataRoomVersion = updated.dataRoomVersion;
+    if (action === 'accept') {
+      state.analytics.dataRoomImportApprovalRequestIds.delete(review.proposalId);
+      if (updated.importItem?.semanticReview?.state === 'complete') toast('Workbook imported into shared Data Room memory.', 'good');
+    }
+  } catch (error) {
+    state.analytics.dataRoomImportErrors.set(busyKey, `${error.message}${error.nextAction ? ` ${error.nextAction}` : ''}`);
+    await loadDataRoomImport(importId, { force: true, renderAfter: false });
+  } finally {
+    state.analytics.dataRoomImportBusy.delete(busyKey);
+    if (dataRoomRouteRelevant('import', importId)) renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+function shortSha(value) {
+  const text = String(value || '');
+  return text ? `${text.slice(0, 10)}…` : '—';
+}
+
+function dataRoomTone(value) {
+  if (value === 'verified' || value === 'active' || value === 'completed' || value === 'compatible' || value === 'uploaded' || value === 'ready' || value === 'review_ready' || value === 'complete') return 'good';
+  if (value === 'quarantined' || value === 'failed' || value === 'conflict' || value === 'incompatible' || value === 'retired') return 'bad';
+  if (value === 'running' || value === 'staging' || value === 'verifying' || value === 'receiving' || value === 'inspecting' || value === 'processing' || value === 'approved' || value === 'promoting') return 'accent';
+  return value === 'deprecated' || value === 'waiting' || value === 'needs_input' ? 'warn' : '';
+}
+
+function dataRoomBoundedNote(page, noun) {
+  if (!page) return '';
+  return page.truncated
+    ? `<p class="data-room-bounded">Showing ${number(page.items.length)} of ${number(page.count)} ${esc(noun)}. The server bounds this view.</p>`
+    : '';
+}
+
+function renderDataRoomSchema(schema, key) {
+  const fields = Array.isArray(schema) ? schema : [];
+  return `<div class="data-room-table-wrap" data-scroll-key="${attr(key)}"><table class="data-room-table"><thead><tr><th>Field</th><th>Logical type</th><th>Nullable</th></tr></thead><tbody>${fields.map(field => `<tr><td><code>${esc(field.name)}</code></td><td>${esc(field.logicalType)}</td><td>${field.nullable ? 'Yes' : 'No'}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function renderDataRoomList() {
+  if (!state.analytics.dataRoomList && !state.analytics.dataRoomListError) {
+    void loadDataRoomList();
+    return loadingView();
+  }
+  const payload = state.analytics.dataRoomList;
+  const head = pageHead('Analytics', 'Data Room', 'Shared logical datasets, immutable versions, exact lineage, and current dashboard consumers. No rows or private storage paths are exposed.');
+  if (!payload) return `${head}${errorView(state.analytics.dataRoomListError || 'Data Room is unavailable.')}`;
+  return `${head}<div class="data-room-import-entry"><div><strong>Bring important workbooks into Data Room</strong><span>Stage exact .xlsx bytes, inspect one sheet, then review BotBoy’s automatically inferred analytical meaning before importing.</span></div><a class="button primary" href="#/data-room/imports">${icon('plus')} Import files</a></div><section class="data-room-grid">${(payload.datasets || []).map(dataset => `<a class="card data-room-card" href="#/data-room/${encodeURIComponent(dataset.id)}"><div class="data-room-card-top"><span class="source-icon">${icon('database', 18)}</span><span class="pill ${dataRoomTone(dataset.lifecycle)}"><span class="status-dot ${dataRoomTone(dataset.lifecycle)}"></span>${esc(dataset.lifecycle)}</span></div><h2>${esc(dataset.name)}</h2><p>${esc(dataset.description || 'Shared analytical dataset')}</p><div class="data-room-facts"><span><small>Kind</small><strong>${esc(dataset.kind)}</strong></span><span><small>Scope</small><strong>${esc(dataset.scope)}</strong></span><span><small>Rows</small><strong>${number(dataset.currentVersion?.rowCount)}</strong></span><span><small>Versions</small><strong>${number(dataset.currentVersion?.ordinal || 0)}</strong></span></div><div class="data-room-card-foot"><span>${dataset.currentVersion ? `Materialized ${esc(relativeTime(dataset.currentVersion.materializedAt))}` : 'No verified head'}</span>${icon('arrow-right', 14)}</div></a>`).join('') || `<article class="card empty-state data-room-empty"><span class="source-icon">${icon('database', 18)}</span><h3>No datasets yet</h3><p>Verified source or derived datasets will appear here after they are materialized.</p></article>`}</section>${payload.truncated ? `<p class="data-room-bounded">Showing ${number(payload.datasets.length)} of ${number(payload.count)} datasets.</p>` : ''}`;
+}
+
+function renderDataRoomImportSources(sources) {
+  const captured = sources?.captured || {};
+  const email = sources?.email || {};
+  return `<section class="data-room-import-sources" aria-label="Import sources"><article class="card data-room-import-source enabled"><div class="data-room-card-top"><span class="source-icon">${icon('file', 18)}</span><span class="pill good"><span class="status-dot good"></span>Available</span></div><h2>Upload from this Mac</h2><p>Stage one exact .xlsx workbook privately. Uploading does not create a dataset or change a dashboard.</p><small>Maximum ${number(Math.floor((sources?.upload?.maxBytes || 0) / 1024 / 1024))} MiB · .xlsx only</small></article><article class="card data-room-import-source"><div class="data-room-card-top"><span class="source-icon">${icon('database', 18)}</span><span class="pill warn"><span class="status-dot warn"></span>Not enabled</span></div><h2>Captured workbooks</h2><p>${esc(captured.reason || 'Exact original workbook bytes are not available to the import boundary yet.')}</p><small>${number(captured.observedWorkbookCount || 0)} workbook candidate${Number(captured.observedWorkbookCount || 0) === 1 ? '' : 's'} observed · ${esc(captured.nextAction || '')}</small></article><article class="card data-room-import-source"><div class="data-room-card-top"><span class="source-icon">${icon('inbox', 18)}</span><span class="pill warn"><span class="status-dot warn"></span>Not enabled</span></div><h2>Email attachments</h2><p>${esc(email.reason || 'Attachment identity and bytes are not available to the import boundary yet.')}</p><small>${number(email.reportedAttachmentMessages || 0)} message${Number(email.reportedAttachmentMessages || 0) === 1 ? '' : 's'} report attachments · ${esc(email.nextAction || '')}</small></article></section>`;
+}
+
+function renderDataRoomImportList() {
+  if (!state.analytics.dataRoomImportList && !state.analytics.dataRoomImportListError) {
+    void loadDataRoomImports();
+    return loadingView();
+  }
+  const payload = state.analytics.dataRoomImportList;
+  const head = pageHead('Data Room', 'Import Inbox', 'Stage exact workbook bytes, inspect one bounded sheet, and let BotBoy prepare a context-informed semantic review before explicit import. Preview is not a dataset.');
+  if (!payload) return `${head}${errorView(state.analytics.dataRoomImportListError || 'Import Inbox is unavailable.')}`;
+  const file = state.analytics.dataRoomImportFile;
+  const busy = state.analytics.dataRoomImportBusy.has('upload');
+  const actionError = state.analytics.dataRoomImportErrors.get('upload') || '';
+  const candidates = (payload.imports || []).map(item => `<a class="card data-room-import-item" href="#/data-room/imports/${encodeURIComponent(item.id)}"><div class="data-room-card-top"><span class="pill ${dataRoomTone(item.status)}"><span class="status-dot ${dataRoomTone(item.status)}"></span>${esc(item.status)}</span><code>${esc(item.id)}</code></div><h2>${esc(item.originalName)}</h2><p>${item.sourceSha256 ? `${number(item.sourceBytes)} bytes · SHA-256 ${esc(shortSha(item.sourceSha256))}` : esc(item.error?.message || 'Workbook bytes are still settling.')}</p><div class="data-room-facts"><span><small>Revision</small><strong>${number(item.revision)}</strong></span><span><small>Sheets</small><strong>${number(item.sheetCount)}</strong></span><span><small>Preview</small><strong>${item.selectedSheet ? esc(item.selectedSheet) : 'Not inspected'}</strong></span><span><small>Updated</small><strong>${esc(relativeTime(item.updatedAt))}</strong></span></div><div class="data-room-card-foot"><span>${item.error?.nextAction ? esc(item.error.nextAction) : 'Open candidate'}</span>${icon('arrow-right', 14)}</div></a>`).join('');
+  return `${head}<div class="breadcrumb data-room-import-breadcrumb"><a href="#/data-room">Data Room</a>${icon('chevron-right', 11)}<span>Import Inbox</span></div>${renderDataRoomImportSources(payload.sources)}<article class="card data-room-import-upload"><div><div class="eyebrow"><span class="eyebrow-dot"></span>Direct local intake</div><h2>Choose an Excel workbook</h2><p>The file is streamed as raw bytes into owner-only storage. BotBoy records its exact size and SHA-256 before showing it as uploaded.</p></div><label class="data-room-import-picker"><span>Workbook (.xlsx)</span><input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" data-data-room-import-file ${busy ? 'disabled' : ''}><small data-data-room-import-file-name>${file ? `${esc(file.name)} · ${number(file.size)} bytes selected` : 'No workbook selected'}</small></label>${actionError ? `<div class="data-room-import-error" role="alert">${esc(actionError)}</div>` : ''}<div class="data-room-import-actions"><span>Staging and preview create no dataset, dashboard run, connector call, or publication.</span><button class="button primary" type="button" data-action="data-room-import-upload" ${!file || busy ? 'disabled' : ''}>${icon(busy ? 'refresh' : 'plus')} ${busy ? 'Uploading and validating…' : 'Stage workbook'}</button></div></article><section class="data-room-import-candidates"><div class="data-room-import-heading"><div><div class="eyebrow">Private candidates</div><h2>Staged workbooks</h2></div><span>${number(payload.count)} total</span></div><div class="data-room-grid">${candidates || '<article class="card empty-state data-room-empty"><span class="source-icon">'+icon('file', 18)+'</span><h3>No staged workbooks</h3><p>Choose an .xlsx file above. Test workbooks are never added to this owner inbox during validation.</p></article>'}</div>${payload.truncated ? `<p class="data-room-bounded">Showing ${number(payload.imports.length)} of ${number(payload.count)} candidates.</p>` : ''}</section>`;
+}
+
+function renderDataRoomImportPreview(item) {
+  const preview = item.preview;
+  if (!preview) return `<article class="card data-room-section data-room-import-preview-empty"><div class="empty-state"><span class="source-icon">${icon('file', 18)}</span><h3>No sheet preview yet</h3><p>Select one sheet and inspect it. The bounded preview is not import evidence; complete semantic processing starts separately after inspection.</p></div></article>`;
+  const columnCount = preview.rows.reduce((max, row) => Math.max(max, row.length), 0);
+  const headers = Array.from({ length: columnCount }, (_value, index) => `<th>Column ${index + 1}</th>`).join('');
+  const rows = preview.rows.map(row => `<tr>${Array.from({ length: columnCount }, (_value, index) => `<td>${esc(row[index] || '')}</td>`).join('')}</tr>`).join('');
+  const cuts = [
+    preview.truncation?.rowsCut ? 'row limit reached' : '',
+    preview.truncation?.charsCut ? 'character limit reached' : '',
+    preview.truncation?.sharedStringsBudgetHit ? 'shared-string budget reached' : '',
+  ].filter(Boolean);
+  return `<article class="card data-room-section data-room-contract"><div class="card-header"><div><h2 class="card-title">Preview · ${esc(preview.sheetName)}</h2><div class="card-meta">${number(preview.rowsShown)} rows shown${preview.rowsTotal == null ? '' : ` of dimension estimate ${number(preview.rowsTotal)}`} · ${number(preview.charsShown)} characters · ${number(preview.formulaCellsInPreview)} cached formula value${preview.formulaCellsInPreview === 1 ? '' : 's'}</div></div><span class="pill warn">Preview only</span></div><div class="data-room-import-disclosure" role="note"><strong>This is not a complete typed import.</strong><span>${cuts.length ? `Inspection stopped because ${cuts.join(', ')}.` : 'The selected bounded read completed without hitting its row/character budget, but parser fidelity limits still apply.'}</span><ul>${(preview.limitations || []).map(value => `<li>${esc(value)}</li>`).join('')}</ul></div>${columnCount ? `<div class="data-room-table-wrap" data-scroll-key="data-room:import-preview:${attr(item.id)}:${attr(preview.sheetName)}"><table class="data-room-table"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="empty-state"><p>No non-empty cells appeared inside the bounded preview.</p></div>'}</article>`;
+}
+
+function renderDataRoomImportSemanticReview(item) {
+  const review = item.semanticReview;
+  if (!review) {
+    if (item.status !== 'ready') return '';
+    return `<article class="card data-room-import-review"><div class="data-room-import-review-head"><div><div class="eyebrow">Shared analytical memory</div><h2>Preparing semantic review</h2><p>BotBoy will complete the selected sheet, route one analytics context family, and prepare a review automatically.</p></div><span class="pill accent"><span class="status-dot accent"></span>queued</span></div></article>`;
+  }
+  const busyKey = `proposal:${item.id}`;
+  const busy = state.analytics.dataRoomImportBusy.has(busyKey);
+  const actionError = state.analytics.dataRoomImportErrors.get(busyKey) || '';
+  const proposal = review.proposal;
+  const draft = state.analytics.dataRoomImportAnswers.get(review.proposalId) || {};
+  const stateLabel = String(review.state || '').replaceAll('_', ' ');
+  const receipts = review.receipts || {};
+  const receiptRows = [
+    ['Source', receipts.sourceSha256], ['Parser', receipts.parseSha256], ['Context', receipts.contextBundleSha256],
+    ['Model response', receipts.responseSha256], ['Proposal', receipts.proposalSha256], ['Contract', receipts.contractSha256],
+  ].filter(([, value]) => value).map(([label, value]) => `<span><small>${esc(label)}</small><code title="${attr(value)}">${esc(shortSha(value))}</code></span>`).join('');
+  const provider = receipts.provider ? `${receipts.provider} · ${receipts.model || 'configured model'} · ${String(receipts.providerLocality || '').replaceAll('_', ' ')}` : 'Model has not run yet';
+  const structural = review.structural ? `<div class="data-room-import-review-facts"><span><small>Worksheet rows</small><strong>${number(review.structural.rowCount)} total · ${number(review.structural.nonEmptyRowCount)} non-empty</strong></span><span><small>Columns / cells</small><strong>${number(review.structural.columnCount)} · ${number(review.structural.cellCount)}</strong></span><span><small>Formula cells</small><strong>${number(review.structural.formulaCellCount)} · ${number(review.structural.formulaWithoutCachedValueCount)} without cache</strong></span><span><small>Merges / errors</small><strong>${number(review.structural.mergedRangeCount)} · ${number(review.structural.errorCellCount)}</strong></span><span><small>Date system</small><strong>${esc(review.structural.dateSystem || 'unknown')}</strong></span><span><small>Parser</small><strong>${esc(review.structural.parserVersion)}</strong></span><span><small>Provider</small><strong>${esc(provider)}</strong></span></div>` : '';
+  const unresolved = (review.unresolved || []).map(field => {
+    const value = draft[field.field] || '';
+    const choices = field.choices || [];
+    const choiceMode = choices.length > 0 && field.allowText !== true && new Set(choices.map(choice => choice.id)).size === choices.length;
+    const textMode = choices.length === 0 && field.allowText === true;
+    const control = choiceMode
+      ? `<select data-data-room-import-answer data-proposal="${attr(review.proposalId)}" data-field="${attr(field.field)}" ${busy ? 'disabled' : ''}><option value="">Choose one…</option>${choices.map(choice => `<option value="${attr(choice.id)}" ${value === choice.id ? 'selected' : ''}>${esc(choice.label)}</option>`).join('')}</select>`
+      : textMode
+        ? `<input type="text" data-data-room-import-answer data-proposal="${attr(review.proposalId)}" data-field="${attr(field.field)}" value="${attr(value)}" placeholder="Answer only this ambiguity" ${busy ? 'disabled' : ''}>`
+        : '<div class="data-room-import-error" role="alert">This ambiguity has no valid answer mode. Retry semantic processing.</div>';
+    return `<label class="data-room-import-unresolved"><span>${esc(field.field)}</span><small>${esc(field.reason)}</small>${control}</label>`;
+  }).join('');
+  const evidence = (review.evidence || []).map(entry => `<li><strong>${esc(entry.field)}</strong><span><b>${esc(entry.proposedValue)}</b> · ${Math.round(Number(entry.confidence || 0) * 100)}% · ${esc(entry.explanation)}${entry.contextTerms?.length ? `<small>Context: ${entry.contextTerms.map(esc).join(' · ')}</small>` : ''}${entry.profileCells?.length ? `<small>Cells: ${entry.profileCells.map(esc).join(', ')}</small>` : ''}</span></li>`).join('');
+  const details = proposal ? `<div class="data-room-import-proposal"><div><small>Dataset</small><strong>${esc(proposal.name)}</strong><span>${esc(proposal.description)}</span></div><div class="data-room-import-proposal-grid"><span><small>Domain</small><strong>${esc(proposal.domainKey)}</strong></span><span><small>Layout</small><strong>${esc(proposal.layout.replaceAll('_', ' '))}</strong></span><span><small>Metric</small><strong>${esc(proposal.metric.id)} · ${esc(proposal.metric.unit)}</strong></span><span><small>Regime</small><strong>${esc(proposal.regime.id)}</strong></span><span><small>Grain</small><strong>${esc(proposal.grain)}</strong></span><span><small>Counting key</small><strong>${esc(proposal.countingKey)}</strong></span><span><small>Time</small><strong>${esc(proposal.timeField)} · ${esc(proposal.timeZone)}</strong></span><span><small>Coverage</small><strong>${esc(proposal.coverage.first)} → ${esc(proposal.coverage.last)} · ${number(proposal.coverage.completePartitions)} complete/${number(proposal.coverage.observedPartitions)} observed</strong></span><span><small>Rows after transform</small><strong>${number(proposal.rowCount)}</strong></span><span><small>Handling</small><strong>${esc(proposal.classification)}</strong></span></div><div class="data-room-import-definitions"><div><small>Metric definition</small><p>${esc(proposal.metric.definition)}</p></div><div><small>Regime definition</small><p>${esc(proposal.regime.definition)}</p></div><div><small>Exact row dimensions</small><p>${(proposal.dimensions || []).map(value => `<code>${esc(value)}</code>`).join(' ') || 'None'}</p></div><div><small>Coverage, handling &amp; retention</small><p>${esc(proposal.coverage.basis)} Allowed uses: ${(proposal.handling?.allowedUses || []).map(esc).join(', ')}. Model rows pinned to ${(proposal.handling?.modelContextPolicy?.allowedProviderLocalities || []).map(value => esc(String(value).replaceAll('_', ' '))).join(', ')} / endpoint ${esc(shortSha(proposal.handling?.modelContextPolicy?.endpointSha256))}. Publication ${proposal.handling?.allowPublication ? 'allowed' : 'blocked'}; automatic expiry ${proposal.retention?.automaticExpiry ? 'enabled' : 'disabled'}.</p></div></div>${proposal.transform ? `<div class="data-room-import-transform"><strong>Transform receipt</strong><span>Source non-empty rows ${number(proposal.transform.sourceNonEmptyRows)} · admitted rows ${number(proposal.transform.admittedSourceRows)} · structural rows ${number(proposal.transform.structuralRows)} · missing observations ${number(proposal.transform.missingObservations)}</span><span>Approved data range ${number(proposal.transform.dataStartRow)}–${number(proposal.transform.dataEndRow)} (header ${number(proposal.transform.headerRow)})</span><span>Excluded source rows: ${proposal.transform.excludedSourceRows?.length ? proposal.transform.excludedSourceRows.map(number).join(', ') : 'none'} · omitted populated columns: ${proposal.transform.omittedSourceColumns?.length ? proposal.transform.omittedSourceColumns.map(esc).join(', ') : 'none'}</span><span>Heading roles: ${proposal.transform.headingRoles?.length ? proposal.transform.headingRoles.map(value => `${number(value.row)} ${esc(value.role)} “${esc(value.label)}”`).join(' · ') : 'not applicable'}</span></div>` : ''}${proposal.limitations?.length ? `<ul class="data-room-import-limitations">${proposal.limitations.map(value => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}</div>` : '';
+  let message = '';
+  if (review.state === 'processing') message = '<p>BotBoy is reading the complete worksheet, selecting one analytics context family, and validating a structured semantic proposal. The workbook is not yet a dataset.</p>';
+  if (review.state === 'needs_input') message = review.error?.code === 'integrity_failed'
+    ? '<p>The stored ambiguity failed integrity validation. No answer can be accepted; Retry will prepare a clean proposal revision.</p>'
+    : '<p>BotBoy stopped at a real ambiguity. Answer only the highlighted field; everything else remains inferred and receipt-bound.</p>';
+  if (review.state === 'review_ready') message = '<p>The proposal below is prepared from complete worksheet structure plus one analytics context family. Review it, then accept once.</p>';
+  if (review.state === 'approved' || review.state === 'promoting') message = '<p>Your exact approval is durable. BotBoy is rechecking every source, parser, context, model, proposal, contract, and head receipt before promotion.</p>';
+  if (review.state === 'complete') message = '<p>The approved workbook is now a verified shared Data Room version available to BotBoy and dashboard consumers.</p>';
+  if (review.state === 'failed') message = '<p>Semantic preparation failed without creating a dataset. The immutable workbook remains available for a safe retry.</p>';
+  if (review.state === 'conflict') message = '<p>Promotion stopped because an approved input or target changed. No second version was guessed.</p>';
+  if (review.state === 'dismissed') message = '<p>This proposal was dismissed. No dataset or dashboard effect occurred.</p>';
+  const buttons = [
+    review.actions?.dismiss ? `<button class="button" type="button" data-action="data-room-import-proposal-dismiss" data-import="${attr(item.id)}" ${busy ? 'disabled' : ''}>Dismiss</button>` : '',
+    review.actions?.retry ? `<button class="button" type="button" data-action="${review.state === 'conflict' ? 'data-room-import-promotion-retry' : 'data-room-import-proposal-retry'}" data-import="${attr(item.id)}" ${busy ? 'disabled' : ''}>${icon('refresh')} Retry</button>` : '',
+    review.actions?.respond ? `<button class="button primary" type="button" data-action="data-room-import-proposal-respond" data-import="${attr(item.id)}" ${busy ? 'disabled' : ''}>Continue review</button>` : '',
+    review.actions?.accept ? `<button class="button primary" type="button" data-action="data-room-import-proposal-accept" data-import="${attr(item.id)}" ${busy ? 'disabled' : ''}>${icon('check')} Accept &amp; Import</button>` : '',
+    review.result ? `<a class="button primary" href="#/data-room/${encodeURIComponent(review.result.datasetId)}">Open dataset ${icon('arrow-right', 13)}</a>` : '',
+  ].filter(Boolean).join('');
+  return `<article class="card data-room-import-review"><div class="data-room-import-review-head"><div><div class="eyebrow">Shared analytical memory</div><h2>${review.state === 'review_ready' ? 'Review inferred dataset' : review.state === 'complete' ? 'Import complete' : 'Semantic import'}</h2>${message}</div><span class="pill ${dataRoomTone(review.state)}"><span class="status-dot ${dataRoomTone(review.state)}"></span>${esc(stateLabel)}</span></div>${structural}${details}${unresolved ? `<div class="data-room-import-unresolved-grid">${unresolved}</div>` : ''}${evidence ? `<details class="data-room-import-evidence"><summary>Inference evidence (${number(review.evidence.length)})</summary><ul>${evidence}</ul></details>` : ''}${receiptRows ? `<div class="data-room-import-receipts">${receiptRows}</div>` : ''}${review.error ? `<div class="data-room-import-error" role="alert"><strong>${esc(review.error.message)}</strong>${review.error.nextAction ? `<span>${esc(review.error.nextAction)}</span>` : ''}</div>` : ''}${actionError ? `<div class="data-room-import-error" role="alert">${esc(actionError)}</div>` : ''}${buttons ? `<div class="data-room-import-actions"><span>Only a verified version/head completes import. Downstream actions remain separately approved.</span>${buttons}</div>` : ''}</article>`;
+}
+
+function renderDataRoomImport(importId) {
+  const payload = state.analytics.dataRoomImportDetails.get(importId);
+  const key = `import:${importId}`;
+  if (!payload && !state.analytics.dataRoomImportErrors.has(key)) void loadDataRoomImport(importId);
+  if (!payload) return state.analytics.dataRoomImportErrors.has(key)
+    ? errorView(state.analytics.dataRoomImportErrors.get(key))
+    : loadingView();
+  const item = payload.importItem;
+  const selected = state.analytics.dataRoomImportSheets.has(importId)
+    ? state.analytics.dataRoomImportSheets.get(importId)
+    : (item.selectedSheet || '');
+  const busyKey = `inspect:${importId}`;
+  const busy = state.analytics.dataRoomImportBusy.has(busyKey);
+  const actionError = state.analytics.dataRoomImportErrors.get(busyKey) || '';
+  const disclosure = item.semanticDisclosure;
+  const disclosureNote = disclosure ? `<div class="data-room-import-disclosure" role="note"><strong>Before semantic processing</strong><span>After inspection, BotBoy may send ${esc(disclosure.content)} to ${esc(disclosure.provider)} · ${esc(disclosure.model)} (${esc(String(disclosure.providerLocality).replaceAll('_', ' '))}) under ${esc(disclosure.policyVersion)}. Endpoint receipt ${esc(shortSha(disclosure.endpointSha256))}. ${disclosure.allowed ? 'This configured provider is permitted by the import disclosure policy.' : 'This provider is not permitted; processing will stop before sending workbook evidence.'}</span></div>` : '';
+  const canInspect = item.sourceSha256 && item.sheets.length && !busy && item.status !== 'receiving' && item.status !== 'inspecting';
+  const head = `<header class="analytics-dashboard-head"><div class="breadcrumb"><a href="#/data-room">Data Room</a>${icon('chevron-right', 11)}<a href="#/data-room/imports">Import Inbox</a>${icon('chevron-right', 11)}<span>${esc(item.originalName)}</span></div><div class="eyebrow"><span class="eyebrow-dot"></span>Private workbook candidate</div><h1 class="page-title">${esc(item.originalName)}</h1><p class="page-subtitle"><code>${esc(item.id)}</code> · private staged source and semantic review</p></header>`;
+  return `${head}<section class="data-room-summary card"><div class="data-room-summary-main"><span class="pill ${dataRoomTone(item.status)}"><span class="status-dot ${dataRoomTone(item.status)}"></span>${esc(item.status)}</span><code>${esc(item.id)}</code><h2>${number(item.sheetCount)} worksheet${item.sheetCount === 1 ? '' : 's'}</h2><p>${item.sourceSha256 ? `${number(item.sourceBytes)} exact bytes · uploaded ${esc(relativeTime(item.uploadedAt))}` : 'No verified source bytes are available.'}</p></div><div class="data-room-summary-facts"><span><small>Revision</small><strong>${number(item.revision)}</strong></span><span><small>SHA-256</small><strong title="${attr(item.sourceSha256 || '')}">${esc(shortSha(item.sourceSha256))}</strong></span><span><small>Selected sheet</small><strong>${esc(item.selectedSheet || 'None')}</strong></span><span><small>Inspected</small><strong>${item.inspectedAt ? esc(relativeTime(item.inspectedAt)) : 'Never'}</strong></span></div></section>${item.error ? `<div class="data-room-import-error" role="alert"><strong>${esc(item.error.message)}</strong>${item.error.nextAction ? `<span>${esc(item.error.nextAction)}</span>` : ''}</div>` : ''}${disclosureNote}<article class="card data-room-import-inspect"><div><div class="eyebrow">Bounded inspection</div><h2>Select one sheet</h2><p>BotBoy reads a bounded preview first. After inspection it automatically completes the selected sheet, applies one analytics context family, and prepares a semantic review.</p></div><label><span>Worksheet</span><select data-data-room-import-sheet data-import="${attr(importId)}" ${canInspect ? '' : 'disabled'}><option value="">Choose a sheet…</option>${item.sheets.map(sheet => `<option value="${attr(sheet)}" ${selected === sheet ? 'selected' : ''}>${esc(sheet)}</option>`).join('')}</select></label>${actionError ? `<div class="data-room-import-error" role="alert">${esc(actionError)}</div>` : ''}<div class="data-room-import-actions"><span>Inspection itself creates no dataset. Only a later exact Accept &amp; Import approval can promote the prepared proposal.</span><button class="button primary" type="button" data-action="data-room-import-inspect" data-import="${attr(importId)}" ${!canInspect || !selected ? 'disabled' : ''}>${icon(busy ? 'refresh' : 'file')} ${busy ? 'Inspecting…' : 'Inspect preview'}</button></div></article><section class="data-room-import-sheets" aria-label="Workbook sheets"><div class="data-room-import-heading"><div><div class="eyebrow">Workbook inventory</div><h2>${number(item.sheets.length)} relationship-resolved sheets</h2></div></div><div>${item.sheets.map(sheet => `<span class="pill ${sheet === item.selectedSheet ? 'good' : ''}">${esc(sheet)}</span>`).join('')}</div></section>${renderDataRoomImportSemanticReview(item)}${renderDataRoomImportPreview(item)}`;
+}
+
+function dataRoomRelationCard(title, page, renderItem) {
+  return `<article class="card data-room-section"><div class="card-header"><div><h2 class="card-title">${esc(title)}</h2><div class="card-meta">${number(page?.count || 0)} total</div></div></div><div class="data-room-rows">${(page?.items || []).map(renderItem).join('') || '<div class="empty-state"><p>None recorded.</p></div>'}</div>${dataRoomBoundedNote(page, title.toLowerCase())}</article>`;
+}
+
+function renderDataRoomDataset(datasetId) {
+  const detail = state.analytics.dataRoomDetails.get(datasetId);
+  const versions = state.analytics.dataRoomVersions.get(datasetId);
+  const detailKey = `dataset:${datasetId}`;
+  const versionsKey = `versions:${datasetId}`;
+  if (!detail && !state.analytics.dataRoomErrors.has(detailKey)) void loadDataRoomDataset(datasetId);
+  if (!versions && !state.analytics.dataRoomErrors.has(versionsKey)) void loadDataRoomVersions(datasetId);
+  if (!detail) return state.analytics.dataRoomErrors.has(detailKey)
+    ? errorView(state.analytics.dataRoomErrors.get(detailKey))
+    : loadingView();
+  const dataset = detail.dataset;
+  const head = `<header class="analytics-dashboard-head"><div class="breadcrumb"><a href="#/data-room">Data Room</a>${icon('chevron-right', 11)}<span>${esc(dataset.name)}</span></div><div class="eyebrow"><span class="eyebrow-dot"></span>${esc(dataset.kind)} dataset</div><h1 class="page-title">${esc(dataset.name)}</h1><p class="page-subtitle">${esc(dataset.description || dataset.id)}</p></header>`;
+  const versionRows = versions?.versions || [];
+  return `${head}<section class="data-room-summary card"><div class="data-room-summary-main"><span class="pill ${dataRoomTone(dataset.lifecycle)}">${esc(dataset.lifecycle)}</span><code>${esc(dataset.id)}</code><h2>${esc(dataset.metric?.id || 'Metric')} · ${esc(dataset.unit)}</h2><p>${esc(dataset.grain)} grain · counted by ${esc(dataset.countingKey)} · ${esc(dataset.timeZone)}</p></div><div class="data-room-summary-facts"><span><small>Definition</small><strong>r${number(dataset.definitionRevision)}</strong></span><span><small>Head</small><strong>${dataset.head ? `r${number(dataset.head.headRevision)}` : 'None'}</strong></span><span><small>Rows</small><strong>${number(dataset.currentVersion?.rowCount)}</strong></span><span><small>Watermark</small><strong>${esc(dataset.coverage?.watermark || '—')}</strong></span></div></section><section class="data-room-layout"><article class="card data-room-section data-room-contract"><div class="card-header"><div><h2 class="card-title">Contract & schema</h2><div class="card-meta">${esc(dataset.schema?.length || 0)} fields · ${esc(dataset.contractSha256 ? shortSha(dataset.contractSha256) : '—')}</div></div></div>${renderDataRoomSchema(dataset.schema, `data-room:schema:${dataset.id}`)}<div class="data-room-hashes"><span>Definition <code title="${attr(dataset.definitionSha256)}">${esc(shortSha(dataset.definitionSha256))}</code></span><span>Schema <code title="${attr(dataset.schemaSha256)}">${esc(shortSha(dataset.schemaSha256))}</code></span><span>Contract <code title="${attr(dataset.contractSha256)}">${esc(shortSha(dataset.contractSha256))}</code></span></div></article><article class="card data-room-section"><div class="card-header"><div><h2 class="card-title">Immutable versions</h2><div class="card-meta">${number(versions?.count || 0)} retained</div></div></div><div class="data-room-rows">${versionRows.map(version => `<a class="data-room-row" href="#/data-room/versions/${encodeURIComponent(version.id)}"><span class="status-dot ${dataRoomTone(version.integrityStatus)}"></span><span><strong>Version ${number(version.ordinal)}</strong><small>${number(version.rowCount)} rows · ${esc(relativeTime(version.materializedAt))}</small></span><code>${esc(shortSha(version.materializedSha256))}</code></a>`).join('') || (state.analytics.dataRoomLoading.has(versionsKey) ? '<div class="skeleton"></div>' : '<div class="empty-state"><p>No versions recorded.</p></div>')}</div>${versions ? (versions.truncated ? `<p class="data-room-bounded">Showing ${number(versionRows.length)} of ${number(versions.count)} versions.</p>` : '') : ''}</article>${dataRoomRelationCard('Projects', dataset.projects, item => `<a class="data-room-row" href="#/projects/${encodeURIComponent(item.projectId)}"><span class="status-dot ${dataRoomTone(item.status)}"></span><span><strong>${esc(item.title)}</strong><small>${esc(item.status)} · linked ${esc(relativeTime(item.linkedAt))}</small></span>${icon('arrow-right', 13)}</a>`)}${dataRoomRelationCard('Inputs', dataset.dependencies, item => `<a class="data-room-row" href="#/data-room/${encodeURIComponent(item.datasetId)}"><span class="status-dot"></span><span><strong>${esc(item.name)}</strong><small>${esc(item.alias)} · ${esc(item.versionPolicy)}</small></span>${icon('arrow-right', 13)}</a>`)}${dataRoomRelationCard('Dependents', dataset.dependents, item => `<a class="data-room-row" href="#/data-room/${encodeURIComponent(item.datasetId)}"><span class="status-dot"></span><span><strong>${esc(item.name)}</strong><small>${esc(item.alias)} · definition r${number(item.definitionRevision)}</small></span>${icon('arrow-right', 13)}</a>`)}${dataRoomRelationCard('Dashboard consumers', dataset.consumers, item => `<a class="data-room-row" href="#/dashboards/${encodeURIComponent(item.dashboardId)}"><span class="status-dot ${dataRoomTone(item.compatibilityState)}"></span><span><strong>${esc(item.widgetTitle)}</strong><small>${esc(item.dashboardTitle)} · binding r${number(item.bindingRevision)}</small></span>${icon('arrow-right', 13)}</a>`)}${dataRoomRelationCard('Recent activity', dataset.activity, item => `<div class="data-room-row"><span class="status-dot ${dataRoomTone(item.status)}"></span><span><strong>${esc(item.kind)} · ${esc(item.status)}</strong><small>${esc(item.id)} · ${esc(relativeTime(item.startedAt || item.queuedAt))}</small></span>${item.outputVersionId ? `<a href="#/data-room/versions/${encodeURIComponent(item.outputVersionId)}">Output</a>` : ''}</div>`)}</section>`;
+}
+
+function renderDataRoomVersion(versionId) {
+  const entry = state.analytics.dataRoomVersionDetails.get(versionId);
+  const key = `version:${versionId}`;
+  if (!entry && !state.analytics.dataRoomErrors.has(key)) void loadDataRoomVersion(versionId);
+  if (!entry) return state.analytics.dataRoomErrors.has(key)
+    ? errorView(state.analytics.dataRoomErrors.get(key))
+    : loadingView();
+  const version = entry.version;
+  const head = `<header class="analytics-dashboard-head"><div class="breadcrumb"><a href="#/data-room">Data Room</a>${icon('chevron-right', 11)}<a href="#/data-room/${encodeURIComponent(version.datasetId)}">${esc(version.datasetId)}</a>${icon('chevron-right', 11)}<span>Version ${number(version.ordinal)}</span></div><div class="eyebrow"><span class="eyebrow-dot"></span>Immutable dataset version</div><h1 class="page-title">Version ${number(version.ordinal)}</h1><p class="page-subtitle"><code>${esc(version.id)}</code></p></header>`;
+  return `${head}<section class="data-room-summary card"><div class="data-room-summary-main"><span class="pill ${dataRoomTone(version.integrityStatus)}">${esc(version.integrityStatus)}</span><h2>${number(version.rowCount)} rows</h2><p>Materialized ${esc(relativeTime(version.materializedAt))} · ${esc(version.sourceFormat)}</p></div><div class="data-room-summary-facts"><span><small>Source bytes</small><strong>${number(version.sourceBytes)}</strong></span><span><small>Materialized bytes</small><strong>${number(version.materializedBytes)}</strong></span><span><small>Partitions</small><strong>${number(version.coverage?.completePartitions?.length || 0)}</strong></span><span><small>Watermark</small><strong>${esc(version.coverage?.watermark || '—')}</strong></span></div></section><section class="data-room-layout"><article class="card data-room-section data-room-contract"><div class="card-header"><div><h2 class="card-title">Observed schema</h2><div class="card-meta">Exact immutable receipt</div></div></div>${renderDataRoomSchema(version.observedSchema, `data-room:version-schema:${version.id}`)}<div class="data-room-hashes"><span>Materialized <code title="${attr(version.materializedSha256)}">${esc(shortSha(version.materializedSha256))}</code></span><span>Manifest <code title="${attr(version.manifestSha256)}">${esc(shortSha(version.manifestSha256))}</code></span><span>Contract <code title="${attr(version.contractSha256)}">${esc(shortSha(version.contractSha256))}</code></span></div></article>${dataRoomRelationCard('Quality checks', version.quality, item => `<div class="data-room-row"><span class="status-dot ${item.success ? 'good' : dataRoomTone(item.severity === 'error' ? 'failed' : 'waiting')}"></span><span><strong>${esc(item.assertionId)}</strong><small>${esc(item.severity)} · v${esc(item.assertionVersion)}</small></span><span class="pill ${item.success ? 'good' : 'warn'}">${item.success ? 'pass' : 'fail'}</span></div>`)}${dataRoomRelationCard('Input versions', version.inputs, item => `<a class="data-room-row" href="#/data-room/versions/${encodeURIComponent(item.versionId)}"><span class="status-dot"></span><span><strong>${esc(item.alias)}</strong><small>${esc(item.datasetId)}</small></span>${icon('arrow-right', 13)}</a>`)}${dataRoomRelationCard('Derived outputs', version.outputs, item => `<a class="data-room-row" href="#/data-room/versions/${encodeURIComponent(item.versionId)}"><span class="status-dot good"></span><span><strong>${esc(item.datasetName)}</strong><small>Version ${number(item.ordinal)} · ${esc(item.alias)}</small></span>${icon('arrow-right', 13)}</a>`)}</section>`;
+}
+
 async function loadAnalyticsDashboards({ force = false } = {}) {
   if (state.analytics.loading || (state.analytics.items && !force)) return;
   state.analytics.loading = true;
@@ -3549,6 +4201,32 @@ function updateAnalyticsSummary(dashboard) {
     lastRefreshedAt: dashboard.lastRefreshedAt,
     updatedAt: dashboard.updatedAt,
   } : summary);
+}
+
+function analyticsChatSelection(dashboard) {
+  if (!dashboard?.id) return [];
+  const current = state.analytics.chatSelection.get(dashboard.id) || [];
+  const reconciled = reconcileAnalyticsChatSelection(current, (dashboard.widgets || []).map(widget => widget.id));
+  if (reconciled.length) state.analytics.chatSelection.set(dashboard.id, reconciled);
+  else state.analytics.chatSelection.delete(dashboard.id);
+  return reconciled;
+}
+
+function analyticsChatRouteScope(dashboardId) {
+  const dashboard = state.analytics.details.get(dashboardId);
+  return {
+    kind: 'analytics_dashboard',
+    dashboardId,
+    selectedWidgetIds: dashboard ? analyticsChatSelection(dashboard) : [],
+  };
+}
+
+function focusAnalyticsChatSelector(dashboardId, widgetId) {
+  requestAnimationFrame(() => {
+    const control = [...document.querySelectorAll('[data-action="analytics-chat-select"]')]
+      .find(button => button.dataset.dashboard === dashboardId && button.dataset.widget === widgetId);
+    control?.focus();
+  });
 }
 
 function analyticsCurrentWidget(dashboard, run) {
@@ -3760,13 +4438,18 @@ function renderAnalyticsText(raw) {
   return blocks.join('') || '<p>—</p>';
 }
 
-function renderAnalyticsTable(result) {
+function renderAnalyticsTable(widget, result) {
   const columns = Array.isArray(result.columns) ? result.columns : [];
-  const rows = Array.isArray(result.rows) ? result.rows : [];
+  const canonicalRows = Array.isArray(result.rows) ? result.rows : [];
   if (!columns.length) return `<pre class="analytics-raw">${esc(result.rawPreview || 'The query returned no tabular data.')}</pre>`;
-  // Numeric columns (any numeric cell) right-align header and body together.
-  const numericColumn = columns.map((_, index) => rows.some(row => typeof row?.[index] === 'number'));
-  return `<div class="analytics-table-wrap"><table class="analytics-table"><thead><tr>${columns.map((column, index) => `<th${numericColumn[index] ? ' class="analytics-cell-number"' : ''}>${esc(column)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map((_, index) => analyticsCell(row[index])).join('')}</tr>`).join('')}</tbody></table></div>${result.rowCount > rows.length ? `<div class="analytics-truncated">Showing ${number(rows.length)} of ${number(result.rowCount)} rows returned by the connector.</div>` : ''}`;
+  const activeSort = state.analytics.shownRowSort.get(widget.id) || null;
+  const rows = activeSort ? sortAnalyticsShownRows(canonicalRows, activeSort.columnIndex, activeSort.direction) : [...canonicalRows];
+  const numericColumn = columns.map((_, index) => canonicalRows.some(row => typeof row?.[index] === 'number'));
+  return `<div class="analytics-table-wrap" data-scroll-key="analytics:table:${attr(widget.id)}"><table class="analytics-table"><thead><tr>${columns.map((column, index) => {
+    const selected = activeSort?.columnIndex === index;
+    const ariaSort = selected ? ` aria-sort="${activeSort.direction === 'desc' ? 'descending' : 'ascending'}"` : '';
+    return `<th${numericColumn[index] ? ' class="analytics-cell-number"' : ''}${ariaSort}><button type="button" data-action="analytics-shown-sort" data-widget="${attr(widget.id)}" data-column="${index}" title="Sort only the rows currently shown">${esc(column)}${selected ? `<span aria-hidden="true">${activeSort.direction === 'desc' ? '↓' : '↑'}</span>` : ''}</button></th>`;
+  }).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map((_, index) => analyticsCell(row[index])).join('')}</tr>`).join('')}</tbody></table></div>${result.rowCount > canonicalRows.length ? `<div class="analytics-truncated">Showing ${number(canonicalRows.length)} of ${number(result.rowCount)} rows. Header sorting reorders only these shown rows; use Dataset order in Manage data to change which rows are selected before the limit.</div>` : activeSort ? '<div class="analytics-truncated">Header sorting changes only this local view and never runs a query.</div>' : ''}`;
 }
 
 function analyticsSeries(widget, result) {
@@ -3949,20 +4632,122 @@ async function hydrateAnalyticsVisualizations(dashboardId, expectedEpoch) {
   }
 }
 
-function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0) {
+function analyticsControlDraft(widget) {
+  const existing = state.analytics.controlDrafts.get(widget.id);
+  const next = reconcileAnalyticsControlDraft(existing, widget);
+  if (next) state.analytics.controlDrafts.set(widget.id, next);
+  else state.analytics.controlDrafts.delete(widget.id);
+  return next;
+}
+
+function analyticsControlField(definition, name) {
+  return (definition?.filters || []).find(field => field.field === name) || null;
+}
+
+function renderAnalyticsControlFilter(widget, draft, filter, index) {
+  const definition = widget.controls.definition;
+  const field = analyticsControlField(definition, filter.field) || definition.filters?.[0];
+  const operators = field?.operators || ['eq'];
+  return `<div class="analytics-control-filter" data-control-filter="${index}"><label><span>Field</span><select data-control-input="filter-field" data-index="${index}">${(definition.filters || []).map(item => `<option value="${attr(item.field)}" ${item.field === filter.field ? 'selected' : ''}>${esc(item.field)} · ${esc(item.logicalType)}</option>`).join('')}</select></label><label><span>Operator</span><select data-control-input="filter-operator" data-index="${index}">${operators.map(operator => `<option value="${attr(operator)}" ${operator === filter.operator ? 'selected' : ''}>${esc(operator)}</option>`).join('')}</select></label><label class="analytics-control-filter-value"><span>Value${filter.operator === 'in' || filter.operator === 'between' ? ' · comma separated' : ''}</span><input data-control-input="filter-value" data-index="${index}" value="${attr(filter.valueText)}" autocomplete="off"></label><button class="button analytics-control-remove" type="button" data-action="analytics-control-remove-filter" data-widget="${attr(widget.id)}" data-index="${index}" aria-label="Remove filter ${index + 1}">${icon('x', 12)}</button></div>`;
+}
+
+function renderAnalyticsManageData(widget) {
+  if (!state.analytics.controlOpen.has(widget.id)) return '';
+  const panelId = `analytics-controls-${widget.id}`;
+  const busy = state.analytics.controlBusy.has(widget.id);
+  const error = state.analytics.controlErrors.get(widget.id) || '';
+  const configuredSource = widget.config?.dataSource;
+  if (!widget.binding && configuredSource) {
+    const label = configuredSource.kind === 'data_room_query'
+      ? `${configuredSource.datasetId} · ${configuredSource.versionId}`
+      : 'Independent warehouse SQL';
+    return `<section class="analytics-controls" id="${attr(panelId)}" aria-label="Source for ${attr(widget.title)}">${error ? `<div class="analytics-control-error" role="alert">${esc(error)}</div>` : ''}<div class="analytics-controls-heading"><div><strong>Independent widget source</strong><span>${esc(label)} · configured without a dataset binding or shared controls.</span></div>${configuredSource.kind === 'data_room_query' ? `<a href="#/data-room/${encodeURIComponent(configuredSource.datasetId)}">Dataset details</a>` : ''}</div><p class="analytics-control-note">Ask BotBoy to configure a different source for this selected widget. Other widgets are unaffected.</p></section>`;
+  }
+  if (!widget.binding) {
+    if (!state.analytics.dataRoomList && !state.analytics.dataRoomListLoading) void loadDataRoomList();
+    const datasets = (state.analytics.dataRoomList?.datasets || []).filter(dataset => dataset.bindingTemplate);
+    return `<section class="analytics-controls" id="${attr(panelId)}" aria-label="Connect ${attr(widget.title)} to the Data Room">${error ? `<div class="analytics-control-error" role="alert">${esc(error)}</div>` : ''}<form class="analytics-bind-form" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}" data-revision="${number(widget.bindingRevision || 0)}"><div class="analytics-controls-heading"><div><strong>Connect a dataset</strong><span>The server supplies the complete binding contract; no SQL or source lane is selected here.</span></div></div><label class="mcp-field"><span>Dataset</span><select name="datasetId" required ${busy ? 'disabled' : ''}><option value="">Choose a compatible dataset…</option>${datasets.map(dataset => `<option value="${attr(dataset.id)}">${esc(dataset.name)} · ${esc(dataset.grain)}</option>`).join('')}</select></label>${state.analytics.dataRoomListLoading ? '<p class="analytics-control-note">Loading bounded dataset catalog…</p>' : !datasets.length ? '<p class="analytics-control-note">No verified dataset currently has a server-issued binding template.</p>' : ''}<div class="analytics-control-actions"><a class="button" href="#/data-room">Open Data Room</a><button class="button primary" type="submit" ${busy || !datasets.length ? 'disabled' : ''}>${busy ? 'Connecting…' : 'Connect dataset'}</button></div></form></section>`;
+  }
+  if (!widget.controls) {
+    return `<section class="analytics-controls" id="${attr(panelId)}"><div class="analytics-controls-heading"><div><strong>Dataset binding</strong><span>${esc(widget.binding.compatibility || 'waiting')} · controls become available when one exact version is compatible.</span></div><button class="button danger" type="button" data-action="analytics-control-unbind" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}" ${busy ? 'disabled' : ''}>Disconnect</button></div>${error ? `<div class="analytics-control-error" role="alert">${esc(error)}</div>` : ''}</section>`;
+  }
+  const draft = analyticsControlDraft(widget);
+  const definition = widget.controls.definition;
+  const conflict = draft?.conflict;
+  const maxFilters = Number(definition.limits?.maxFilters || 0);
+  return `<section class="analytics-controls" id="${attr(panelId)}" aria-label="Manage data for ${attr(widget.title)}">${error ? `<div class="analytics-control-error" role="alert">${esc(error)}</div>` : ''}${conflict ? `<div class="analytics-control-conflict" role="status">${draft.definitionChanged ? 'The dataset definition changed. Review and reset this draft before applying.' : 'Canonical controls changed while you were editing. Your values were kept and the CAS receipt was refreshed.'}</div>` : ''}<form class="analytics-control-form" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}"><div class="analytics-controls-heading"><div><strong>Manage data</strong><span>${esc(widget.binding.datasetId)} · binding r${number(widget.binding.revision)} · controls r${number(widget.controls.controlRevision)}</span></div><a href="#/data-room/${encodeURIComponent(widget.binding.datasetId)}">Dataset details</a></div><fieldset ${busy ? 'disabled' : ''}><legend class="visually-hidden">Typed dataset controls</legend><div class="analytics-control-dates"><label><span>Start · ${esc(definition.date?.timeZone || 'UTC')}</span><input type="date" data-control-input="date-start" value="${attr(draft?.dateRange?.start || '')}"></label><label><span>End · inclusive</span><input type="date" data-control-input="date-end" value="${attr(draft?.dateRange?.end || '')}"></label></div><div class="analytics-control-group"><div class="analytics-control-group-head"><span>Filters</span><button class="button" type="button" data-action="analytics-control-add-filter" data-widget="${attr(widget.id)}" ${!definition.filters?.length || (draft?.filters?.length || 0) >= maxFilters ? 'disabled' : ''}>${icon('plus', 12)} Add filter</button></div>${(draft?.filters || []).map((filter, index) => renderAnalyticsControlFilter(widget, draft, filter, index)).join('') || '<p class="analytics-control-note">No editable filters. Binding-only predicates remain fixed in the effective request.</p>'}</div><div class="analytics-control-order"><label><span>Dataset order <small>applied before the row limit</small></span><select data-control-input="sort-field"><option value="">Definition order</option>${(definition.sort?.fields || []).map(field => `<option value="${attr(field.field)}" ${draft?.sort?.field === field.field ? 'selected' : ''}>${esc(field.field)}</option>`).join('')}</select></label><label><span>Direction</span><select data-control-input="sort-direction" ${draft?.sort?.field ? '' : 'disabled'}><option value="asc" ${draft?.sort?.direction !== 'desc' ? 'selected' : ''}>Ascending</option><option value="desc" ${draft?.sort?.direction === 'desc' ? 'selected' : ''}>Descending</option></select></label></div></fieldset><div class="analytics-control-actions"><button class="button danger" type="button" data-action="analytics-control-unbind" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}" ${busy ? 'disabled' : ''}>Disconnect</button><span></span><button class="button" type="button" data-action="analytics-control-reset" data-widget="${attr(widget.id)}" ${busy || !draft?.dirty ? 'disabled' : ''}>Reset</button><button class="button primary" type="submit" ${busy || draft?.definitionChanged ? 'disabled' : ''}>${busy ? 'Applying…' : 'Apply'}</button></div></form></section>`;
+}
+
+function renderAnalyticsDataRoomProvenance(widget) {
+  const source = widget.result?.source;
+  const receipt = source?.semanticReceipt;
+  if (!widget.binding) return '';
+  const versionId = source?.versionId || widget.binding.lastAppliedVersionId || '';
+  const warnings = [...(receipt?.qualityWarnings || []), ...(receipt?.limitations || [])];
+  return `<details class="analytics-provenance analytics-data-provenance"><summary>${icon('database', 12)}<span>Data Room provenance</span><b>${esc(widget.binding.compatibility || 'waiting')}</b></summary><div><span>Dataset</span><strong><a href="#/data-room/${encodeURIComponent(widget.binding.datasetId)}">${esc(widget.binding.datasetId)}</a></strong></div>${versionId ? `<div><span>Applied version</span><strong><a href="#/data-room/versions/${encodeURIComponent(versionId)}">${esc(versionId)}</a></strong></div>` : ''}${receipt?.requestedRange ? `<div><span>Requested range</span><strong>${esc(receipt.requestedRange.start)} – ${esc(receipt.requestedRange.end)}</strong></div>` : ''}${receipt?.watermark ? `<div><span>Watermark</span><strong>${esc(receipt.watermark)}</strong></div>` : ''}${receipt?.metric ? `<div><span>Metric</span><strong>${esc(receipt.metric.id)} · ${esc(receipt.unit || receipt.metric.unit)}</strong></div>` : ''}${receipt?.regime ? `<div><span>Regime</span><strong>${esc(receipt.regime.id)}</strong></div>` : ''}${receipt?.grain ? `<div><span>Grain / counting key</span><strong>${esc(receipt.grain)} · ${esc(receipt.countingKey)}</strong></div>` : ''}${warnings.length ? `<div class="analytics-provenance-warnings"><span>Warnings</span><strong>${warnings.map(esc).join(' · ')}</strong></div>` : ''}</details>`;
+}
+
+function restoreDashboardShareFocus() {
+  const pending = state.publisher.pendingFocus;
+  if (!pending || state.route.view !== 'analytics-dashboard' || state.route.dashboardId !== pending.dashboardId) return;
+  const dashboardId = CSS.escape(pending.dashboardId);
+  const selector = pending.target === 'confirm'
+    ? `.share-confirmation [data-action="share-confirm"][data-dashboard="${dashboardId}"]`
+    : pending.target === 'reprepare'
+      ? `.share-confirmation [data-action="share-prepare"][data-dashboard="${dashboardId}"]`
+      : `[data-action="share-prepare"][data-dashboard="${dashboardId}"]`;
+  document.querySelector(selector)?.focus({ preventScroll: true });
+  state.publisher.pendingFocus = null;
+}
+
+function restoreAnalyticsControlFocus() {
+  const pending = state.analytics.controlPendingFocus;
+  if (!pending || state.route.view !== 'analytics-dashboard' || state.route.dashboardId !== pending.dashboardId) return;
+  const selector = pending.target === 'panel'
+    ? `#analytics-controls-${CSS.escape(pending.widgetId)} select, #analytics-controls-${CSS.escape(pending.widgetId)} input`
+    : `[data-action="analytics-manage-data"][data-widget="${CSS.escape(pending.widgetId)}"]`;
+  document.querySelector(selector)?.focus({ preventScroll: true });
+  state.analytics.controlPendingFocus = null;
+}
+
+function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelection = []) {
   const result = widget.result;
+  const configuredSource = widget.config?.dataSource;
   const running = widget.id === currentWidgetId;
-  const chip = running
-    ? '<span class="analytics-chip accent"><span class="status-dot accent"></span>running</span>'
-    : widget.lastError
-      ? `<span class="analytics-chip warn" title="${attr(widget.lastError)}"><span class="status-dot warn"></span>${result ? 'stale' : 'error'}</span>`
-      : result
-        ? `<span class="analytics-chip good" title="Refreshed ${attr(relativeTime(result.refreshedAt))}"><span class="status-dot good"></span>fresh</span>`
-        : '<span class="analytics-chip"><span class="status-dot"></span>not run</span>';
+  const dataStatus = widget.binding
+    ? running ? 'updating'
+      : widget.binding.compatibility === 'incompatible' ? 'incompatible'
+        : widget.binding.compatibility === 'waiting' ? 'waiting'
+          : widget.lastError && result ? 'stale'
+            : result ? 'ready' : 'waiting'
+    : running ? 'running' : widget.lastError ? (result ? 'stale' : 'error') : result ? 'fresh' : 'not run';
+  const chipTone = dataStatus === 'ready' || dataStatus === 'fresh' ? 'good'
+    : dataStatus === 'updating' || dataStatus === 'running' ? 'accent'
+      : ['stale', 'incompatible', 'error'].includes(dataStatus) ? 'warn' : '';
+  const chipTitle = widget.binding
+    ? `Data Room binding ${widget.binding.compatibility}`
+    : configuredSource?.kind === 'data_room_query'
+      ? `Independent Data Room source ${configuredSource.datasetId} / ${configuredSource.versionId}`
+      : configuredSource?.kind === 'warehouse_sql'
+        ? 'Independent warehouse SQL source'
+        : result ? `Refreshed ${relativeTime(result.refreshedAt)}` : dataStatus;
+  const chip = `<span class="analytics-chip ${chipTone}" title="${attr(chipTitle)}"><span class="status-dot ${chipTone}"></span>${esc(dataStatus)}</span>`;
+  const selectedOrdinal = chatSelection.indexOf(widget.id) + 1;
+  const selectedForChat = selectedOrdinal > 0;
+  const selectionAtLimit = !selectedForChat && chatSelection.length >= 2;
+  const selectionText = selectedForChat ? `BotBoy ${selectedOrdinal}` : 'Use in BotBoy';
+  const selectionLabel = selectedForChat
+    ? `Remove ${widget.title} from BotBoy widget selection`
+    : selectionAtLimit
+      ? `Two widgets are already selected. Remove one before selecting ${widget.title}`
+      : `Use ${widget.title} in the next BotBoy request`;
+  const chatSelector = `<button class="analytics-chat-select" type="button" data-action="analytics-chat-select" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}" aria-pressed="${selectedForChat}" aria-disabled="${selectionAtLimit}" aria-label="${attr(selectionLabel)}" title="${attr(selectionLabel)}">${icon('sparkles', 12)}<span>${esc(selectionText)}</span></button>`;
+  const manageOpen = state.analytics.controlOpen.has(widget.id);
+  const manageButton = `<button class="analytics-manage-data" type="button" data-action="analytics-manage-data" data-dashboard="${attr(widget.dashboardId)}" data-widget="${attr(widget.id)}" aria-expanded="${manageOpen}" aria-controls="analytics-controls-${attr(widget.id)}">${icon('database', 12)}<span>${widget.binding ? 'Manage data' : configuredSource ? 'Source set' : 'Connect data'}</span></button>`;
   let body = '<div class="analytics-empty">Run a refresh to load this widget.</div>';
   if (result) {
     if (widget.kind === 'metric') body = renderAnalyticsMetric(widget, result);
-    if (widget.kind === 'table') body = renderAnalyticsTable(result);
+    if (widget.kind === 'table') body = renderAnalyticsTable(widget, result);
     if (widget.kind === 'bar') body = renderAnalyticsBars(widget, result);
     if (widget.kind === 'line') body = renderAnalyticsLine(widget, result);
     if (widget.kind === 'visualization') body = `<div class="analytics-vega" data-scroll-key="analytics:vega:${attr(widget.id)}" data-analytics-visualization="${attr(widget.id)}" role="img" aria-label="${attr(widget.title)}"><span>Preparing interactive visualization…</span></div>`;
@@ -3970,11 +4755,18 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0) {
   }
   const spanClass = span ? ` analytics-span-${span}` : '';
   const wideMetric = widget.kind === 'metric' && span >= 8 ? ' analytics-metric-wide' : '';
+  const selectedClass = selectedForChat ? ' is-botboy-selected' : '';
   // Text widgets have no query — a provenance strip under a guide is noise.
   // Data lane (etl-analytics A4): absent on pre-A4 results = managed SQL.
   const laneLabel = result?.lane === 'etl' ? 'via Datanet ETL' : '';
-  const provenance = widget.kind === 'text' && !widget.sql ? '' : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc([String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase(), laneLabel].filter(Boolean).join(' · '))}</b></summary>${laneLabel ? `<div><span>Data lane</span><strong>Datanet ETL (SQL warehouse connection was down)</strong></div>` : ''}${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
-  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div>${chip}</div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${provenance}</article>`;
+  const provenance = widget.binding
+    ? renderAnalyticsDataRoomProvenance(widget)
+    : configuredSource?.kind === 'data_room_query'
+      ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Independent Data Room source</span><b>verified local query</b></summary><div><span>Dataset</span><strong>${esc(configuredSource.datasetId)}</strong></div><div><span>Version</span><strong>${esc(configuredSource.versionId)}</strong></div>${result?.source?.sourceConfigSha256 ? `<div><span>Source receipt</span><strong>${esc(result.source.sourceConfigSha256)}</strong></div>` : ''}<pre>${esc(configuredSource.sql)}</pre></details>`
+      : widget.kind === 'text' && !widget.sql ? ''
+        : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc([String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase(), laneLabel].filter(Boolean).join(' · '))}</b></summary>${configuredSource?.kind === 'warehouse_sql' ? '<div><span>Source</span><strong>Independent warehouse SQL</strong></div>' : ''}${laneLabel ? `<div><span>Data lane</span><strong>Datanet ETL (SQL warehouse connection was down)</strong></div>` : ''}${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
+  const manage = renderAnalyticsManageData(widget);
+  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}${selectedClass}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${chip}${chatSelector}${manageButton}</div></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${manage}${provenance}</article>`;
 }
 
 function renderAnalyticsList() {
@@ -4049,17 +4841,21 @@ function renderAnalyticsDashboard(id) {
     return loadingView();
   }
   if (!dashboard) return errorView(state.analytics.error || 'Dashboard not found.');
+  const chatSelection = analyticsChatSelection(dashboard);
   if (!state.publisher.config && !state.publisher.loading && !state.publisher.error) void loadPublisherConfig();
   const activeRun = analyticsActiveRun(dashboard);
   const refreshing = state.analytics.refreshing.has(id) || Boolean(activeRun);
   const preparing = state.publisher.preparing.has(id);
+  const publishing = state.publisher.publishing.has(id);
   const publisherReady = state.publisher.config?.enabled && state.publisher.config?.configured;
   const tone = analyticsStatusTone(dashboard.status);
   const shareAction = publisherReady
-    ? `<button class="button" type="button" data-action="share-prepare" data-dashboard="${attr(id)}" ${preparing || refreshing ? 'disabled' : ''}>${icon('globe')} ${preparing ? 'Preparing…' : 'Share snapshot'}</button>`
+    ? `<button class="button" type="button" data-action="share-prepare" data-dashboard="${attr(id)}" ${preparing || publishing || refreshing ? 'disabled' : ''}>${icon('globe')} ${preparing ? 'Preparing…' : publishing ? 'Publishing…' : 'Share snapshot'}</button>`
     : `<a class="button" href="#/settings/dashboard-sharing">${icon('globe')} Configure sharing</a>`;
-  const publishedAction = dashboard.latestPublication?.status === 'published' && dashboard.latestPublication?.url
-    ? `<a class="button" href="${attr(dashboard.latestPublication.url)}" target="_blank" rel="noopener noreferrer">${icon('link')} Open shared copy</a>`
+  const successfulPublication = dashboard.latestSuccessfulPublication
+    || (dashboard.latestPublication?.status === 'published' ? dashboard.latestPublication : null);
+  const publishedAction = successfulPublication?.url
+    ? `<a class="button" href="${attr(successfulPublication.url)}" target="_blank" rel="noopener noreferrer">${icon('link')} Open shared copy</a>`
     : '';
   const refreshLabel = activeRun?.status === 'queued'
     ? 'Queued…'
@@ -4074,7 +4870,162 @@ function renderAnalyticsDashboard(id) {
     : '';
   const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const schedule = dashboard.schedule;
-  return `<header class="analytics-dashboard-head"><div class="analytics-dashboard-utility"><div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div><div class="head-actions">${actions}</div></div><div class="analytics-dashboard-heading"><div class="eyebrow"><span class="eyebrow-dot"></span>Analytical dashboard</div><h1 class="page-title">${esc(dashboard.title)}</h1>${dashboard.description ? `<p class="page-subtitle">${esc(dashboard.description)}</p>` : ''}</div></header><div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${dashboard.latestPublication?.status === 'published' ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(dashboard.latestPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}<section class="analytics-widget-grid">${(spans => dashboard.widgets.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, spans.get(widget.id))).join(''))(analyticsWidgetSpans(dashboard.widgets))}</section><section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
+  return `<header class="analytics-dashboard-head"><div class="analytics-dashboard-utility"><div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div><div class="head-actions">${actions}</div></div><div class="analytics-dashboard-heading"><div class="eyebrow"><span class="eyebrow-dot"></span>Analytical dashboard</div><h1 class="page-title">${esc(dashboard.title)}</h1>${dashboard.description ? `<p class="page-subtitle">${esc(dashboard.description)}</p>` : ''}</div></header><div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${successfulPublication ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(successfulPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}${renderLatestDashboardPublication(dashboard)}<section class="analytics-widget-grid">${(spans => dashboard.widgets.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, spans.get(widget.id), chatSelection)).join(''))(analyticsWidgetSpans(dashboard.widgets))}</section><section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
+}
+
+function currentAnalyticsWidget(dashboardId, widgetId) {
+  return state.analytics.details.get(dashboardId)?.widgets?.find(widget => widget.id === widgetId) || null;
+}
+
+function markAnalyticsControlDraft(widgetId, change) {
+  const dashboard = state.route.view === 'analytics-dashboard' ? state.analytics.details.get(state.route.dashboardId) : null;
+  const widget = dashboard?.widgets?.find(item => item.id === widgetId);
+  if (!widget?.controls) return null;
+  const draft = analyticsControlDraft(widget);
+  if (!draft) return null;
+  change(draft, widget);
+  draft.dirty = true;
+  state.analytics.controlErrors.delete(widgetId);
+  return draft;
+}
+
+function updateAnalyticsControlDraft(target) {
+  const widgetId = target.closest('[data-widget]')?.dataset?.widget
+    || target.closest('.analytics-control-form')?.dataset?.widget
+    || '';
+  const kind = target.dataset.controlInput;
+  const index = Number(target.dataset.index);
+  let structural = false;
+  const draft = markAnalyticsControlDraft(widgetId, (value, widget) => {
+    if (kind === 'date-start') value.dateRange.start = target.value;
+    if (kind === 'date-end') value.dateRange.end = target.value;
+    if (kind === 'sort-field') {
+      value.sort = target.value ? { field: target.value, direction: value.sort?.direction || 'asc' } : null;
+      structural = true;
+    }
+    if (kind === 'sort-direction' && value.sort) value.sort.direction = target.value === 'desc' ? 'desc' : 'asc';
+    if (Number.isInteger(index) && value.filters?.[index]) {
+      if (kind === 'filter-value') value.filters[index].valueText = target.value;
+      if (kind === 'filter-field') {
+        const field = analyticsControlField(widget.controls.definition, target.value);
+        value.filters[index] = { field: target.value, operator: field?.operators?.[0] || 'eq', valueText: '' };
+        structural = true;
+      }
+      if (kind === 'filter-operator') {
+        value.filters[index].operator = target.value;
+        value.filters[index].valueText = '';
+        structural = true;
+      }
+    }
+  });
+  if (!draft) return;
+  target.defaultValue = target.value;
+  if (structural) {
+    state.analytics.controlPendingFocus = { target: 'panel', dashboardId: state.route.dashboardId, widgetId };
+    renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+async function applyAnalyticsControls(form) {
+  const dashboardId = form?.dataset?.dashboard || '';
+  const widgetId = form?.dataset?.widget || '';
+  const widget = currentAnalyticsWidget(dashboardId, widgetId);
+  const draft = widget ? analyticsControlDraft(widget) : null;
+  if (!widget || !draft || state.analytics.controlBusy.has(widgetId)) return;
+  let body;
+  try {
+    body = buildAnalyticsControlApplyPayload(widget, draft);
+  } catch (error) {
+    state.analytics.controlErrors.set(widgetId, error.message);
+    renderRoute({ preserveScroll: true, userAction: true });
+    return;
+  }
+  state.analytics.controlBusy.add(widgetId);
+  state.analytics.controlErrors.delete(widgetId);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const payload = await request(`/analytics/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}/controls`, {
+      method: 'PUT', body,
+    });
+    if (payload.dashboard) {
+      state.analytics.details.set(dashboardId, payload.dashboard);
+      updateAnalyticsSummary(payload.dashboard);
+    }
+    state.analytics.controlDrafts.delete(widgetId);
+    state.analytics.controlErrors.delete(widgetId);
+    state.analytics.controlPendingFocus = { target: 'panel', dashboardId, widgetId };
+    toast(payload.outcome === 'no_op' ? 'Controls already match the saved view' : 'Dataset controls applied; last good result remains visible while the local view updates');
+  } catch (error) {
+    state.analytics.controlErrors.set(widgetId, [error.message, error.nextAction].filter(Boolean).join(' '));
+    if (error.status === 409) {
+      await loadAnalyticsDashboard(dashboardId, { force: true, preserveScroll: true });
+      const refreshed = currentAnalyticsWidget(dashboardId, widgetId);
+      if (refreshed) state.analytics.controlDrafts.set(widgetId, reconcileAnalyticsControlDraft(draft, refreshed));
+    }
+    state.analytics.controlPendingFocus = { target: 'panel', dashboardId, widgetId };
+  } finally {
+    state.analytics.controlBusy.delete(widgetId);
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === dashboardId) {
+      renderRoute({ preserveScroll: true, userAction: true });
+      syncAnalyticsPolling();
+    }
+  }
+}
+
+async function bindAnalyticsDataset(form) {
+  const dashboardId = form?.dataset?.dashboard || '';
+  const widgetId = form?.dataset?.widget || '';
+  const datasetId = String(new FormData(form).get('datasetId') || '');
+  const selected = state.analytics.dataRoomList?.datasets?.find(dataset => dataset.id === datasetId);
+  if (!dashboardId || !widgetId || !selected?.bindingTemplate || state.analytics.controlBusy.has(widgetId)) return;
+  state.analytics.controlBusy.add(widgetId);
+  state.analytics.controlErrors.delete(widgetId);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const payload = await request(`/analytics/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}/binding`, {
+      method: 'PUT',
+      body: { expectedRevision: Number(form.dataset.revision || 0), binding: selected.bindingTemplate },
+    });
+    state.analytics.details.set(dashboardId, payload.dashboard);
+    updateAnalyticsSummary(payload.dashboard);
+    state.analytics.controlDrafts.delete(widgetId);
+    state.analytics.controlPendingFocus = { target: 'panel', dashboardId, widgetId };
+    toast(`Connected ${selected.name}; the exact local view is updating`);
+  } catch (error) {
+    state.analytics.controlErrors.set(widgetId, error.message);
+    await loadAnalyticsDashboard(dashboardId, { force: true, preserveScroll: true });
+  } finally {
+    state.analytics.controlBusy.delete(widgetId);
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === dashboardId) {
+      renderRoute({ preserveScroll: true, userAction: true });
+      syncAnalyticsPolling();
+    }
+  }
+}
+
+async function unbindAnalyticsDataset(dashboardId, widgetId) {
+  const widget = currentAnalyticsWidget(dashboardId, widgetId);
+  if (!widget?.binding || state.analytics.controlBusy.has(widgetId)) return;
+  if (!window.confirm(`Disconnect ${widget.title} from ${widget.binding.datasetId}? The current local result will be cleared and no refresh will run.`)) return;
+  state.analytics.controlBusy.add(widgetId);
+  state.analytics.controlErrors.delete(widgetId);
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const payload = await request(`/analytics/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}/binding`, {
+      method: 'PUT', body: { expectedRevision: widget.binding.revision, binding: null },
+    });
+    state.analytics.details.set(dashboardId, payload.dashboard);
+    updateAnalyticsSummary(payload.dashboard);
+    state.analytics.controlDrafts.delete(widgetId);
+    state.analytics.controlPendingFocus = { target: 'manage', dashboardId, widgetId };
+    toast('Dataset disconnected; no refresh was queued');
+  } catch (error) {
+    state.analytics.controlErrors.set(widgetId, error.message);
+    await loadAnalyticsDashboard(dashboardId, { force: true, preserveScroll: true });
+  } finally {
+    state.analytics.controlBusy.delete(widgetId);
+    if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === dashboardId) renderRoute({ preserveScroll: true, userAction: true });
+  }
 }
 
 async function saveAnalyticsSchedule(form) {
@@ -4127,7 +5078,7 @@ async function saveAnalyticsProjectLinks(form) {
 async function deleteAnalyticsDashboard(id) {
   const dashboard = state.analytics.details.get(id);
   if (!id || !dashboard || state.analytics.deleting.has(id) || analyticsActiveRun(dashboard)) return;
-  const remoteWarning = dashboard.latestPublication?.status === 'published'
+  const remoteWarning = dashboard.latestSuccessfulPublication?.url || dashboard.latestPublication?.status === 'published'
     ? '\n\nIts already-published remote snapshot will remain at the external destination.'
     : '';
   const confirmed = window.confirm(`Permanently delete "${dashboard.title}" and all of its local widgets, refresh history, schedule, and project links?\n\nThis cannot be undone.${remoteWarning}`);
@@ -4137,6 +5088,7 @@ async function deleteAnalyticsDashboard(id) {
   try {
     await request(`/analytics/dashboards/${encodeURIComponent(id)}`, { method: 'DELETE' });
     state.analytics.details.delete(id);
+    state.analytics.chatSelection.delete(id);
     if (Array.isArray(state.analytics.items)) {
       state.analytics.items = state.analytics.items.filter(item => item.id !== id);
     }
@@ -5588,9 +6540,14 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   const workspace = document.getElementById('workspace');
   const previousScrollTop = workspace?.scrollTop || 0;
   const previousNestedScroll = captureKeyedScrollPositions();
-  const previousRouteKey = JSON.stringify(state.route ?? {});
+  const previousRoute = state.route;
+  const previousRouteKey = JSON.stringify(previousRoute ?? {});
   state.route = parseRoute();
   const routeChanged = JSON.stringify(state.route) !== previousRouteKey;
+  if (routeChanged && previousRoute?.view === 'analytics-dashboard'
+    && (state.route.view !== 'analytics-dashboard' || state.route.dashboardId !== previousRoute.dashboardId)) {
+    state.analytics.chatSelection.delete(previousRoute.dashboardId);
+  }
   if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
@@ -5619,8 +6576,12 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
     const panel = document.getElementById(id);
     return panel && panel.style.display === 'block';
   });
-  const analyticsRoute = state.route.view === 'dashboards' || state.route.view === 'analytics-dashboard';
-  window.setAmbientChatContext?.(analyticsRoute ? { mode: 'analytics_dashboard' } : null);
+  const analyticsAmbientContext = state.route.view === 'analytics-dashboard'
+    ? { mode: 'analytics_dashboard', routeScope: analyticsChatRouteScope(state.route.dashboardId) }
+    : state.route.view === 'dashboards'
+      ? { mode: 'analytics_dashboard' }
+      : null;
+  window.setAmbientChatContext?.(analyticsAmbientContext);
   syncAnalyticsPolling();
   renderSidebar();
   if (!overlayOpen) closeIntegration({ keepLegacy: state.route.view === 'nodes' });
@@ -5633,11 +6594,12 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
     showIntegration('nodes', state.route.nodeId);
     return;
   }
-  if (state.loading && state.route.view !== 'documents') {
+  const dataRoomViews = ['data-room', 'data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'];
+  if (state.loading && !dataRoomViews.includes(state.route.view) && state.route.view !== 'documents') {
     view.innerHTML = loadingView();
     return;
   }
-  if (state.coreError && state.route.view !== 'documents') {
+  if (state.coreError && !dataRoomViews.includes(state.route.view) && state.route.view !== 'documents') {
     view.innerHTML = errorView(state.coreError);
     return;
   }
@@ -5657,6 +6619,11 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'profile-settings') html = renderProfileSettings(state.route.profileId);
   if (state.route.view === 'dashboards') html = renderAnalyticsList();
   if (state.route.view === 'analytics-dashboard') html = renderAnalyticsDashboard(state.route.dashboardId);
+  if (state.route.view === 'data-room') html = renderDataRoomList();
+  if (state.route.view === 'data-room-dataset') html = renderDataRoomDataset(state.route.datasetId);
+  if (state.route.view === 'data-room-version') html = renderDataRoomVersion(state.route.versionId);
+  if (state.route.view === 'data-room-imports') html = renderDataRoomImportList();
+  if (state.route.view === 'data-room-import') html = renderDataRoomImport(state.route.importId);
   if (state.route.view === 'documents') html = renderDocuments();
   if (state.route.view === 'pipeline') html = renderPipeline();
   if (state.route.view === 'settings') html = renderSettings();
@@ -5671,7 +6638,11 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
     restoreDocumentRouteFocus();
   }
   if (state.route.view === 'analytics-dashboard') {
-    requestAnimationFrame(() => void hydrateAnalyticsVisualizations(state.route.dashboardId, visualizationEpoch));
+    requestAnimationFrame(() => {
+      restoreDashboardShareFocus();
+      restoreAnalyticsControlFocus();
+      void hydrateAnalyticsVisualizations(state.route.dashboardId, visualizationEpoch);
+    });
   }
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
   // Scroll ownership: only USER-INITIATED renders may reset to top (real
@@ -5743,6 +6714,13 @@ function updateAssistantContext() {
   let label = 'Workspace context';
   if (state.route.view === 'project') label = projectById(state.route.projectId)?.title || 'Project context';
   else if (state.route.view === 'area') label = state.areas.find(area => area.id === state.route.areaId)?.title || 'Area context';
+  else if (state.route.view === 'analytics-dashboard') {
+    const dashboard = state.analytics.details.get(state.route.dashboardId);
+    const selectedCount = dashboard ? analyticsChatSelection(dashboard).length : 0;
+    label = dashboard
+      ? `${dashboard.title} · ${selectedCount ? `${selectedCount} widget${selectedCount === 1 ? '' : 's'} selected` : 'select a widget for BotBoy'}`
+      : 'Dashboard context';
+  }
   else if (state.route.view !== 'today') label = `${state.route.view.charAt(0).toUpperCase()}${state.route.view.slice(1)} context`;
   const element = document.getElementById('assistant-context');
   if (element) element.textContent = label;
@@ -5780,6 +6758,7 @@ function baseCommandItems() {
     ['Go to Today', 'Workspace overview', 'home', '#/today'],
     ['Open Inbox', `${state.inbox.count == null ? 'Unassigned' : number(state.inbox.count)} evidence items`, 'inbox', '#/inbox'],
     ['Open Documents', `${state.documents.items?.length ?? 'Generated'} product documents`, 'file', '#/documents'],
+    ['Open Data Room', `${state.analytics.dataRoomList?.count ?? 'Shared'} logical datasets`, 'database', '#/data-room'],
     ['View Connections', 'Slack, folders, and browser capture', 'link', '#/connections'],
     ['View Pipeline Health', `${number(state.health?.totalFailures)} unresolved failures`, 'activity', '#/pipeline'],
     ['Open Settings', 'Appearance and diagnostics', 'settings', '#/settings'],
@@ -5802,8 +6781,14 @@ async function updateCommandResults(query = '') {
       // Synced documents route to the STAGED reader (#/doc/…), grouped under
       // their own label; runCommand prefers route over url, so these never
       // pop an external tab (owner report 2026-08-27).
-      const evidenceItems = (result.results || []).map(entry => (entry.item?.artifactId
+      const evidenceItems = (result.results || []).map(entry => (entry.item?.datasetId
         ? {
+            title: entry.item?.title || entry.item.datasetId,
+            meta: `Logical dataset · ${entry.item?.summary || entry.item.datasetId}${entry.item?.currentVersion ? ` · version ${entry.item.currentVersion.ordinal}` : ''}`,
+            icon: 'database', route: `#/data-room/${encodeURIComponent(entry.item.datasetId)}`, kind: 'Data Room',
+          }
+        : entry.item?.artifactId
+          ? {
             title: entry.item?.title || '(untitled authored document)',
             meta: `Authored in BotBoy${entry.node?.title ? ` · ${entry.node.title}` : ''}${entry.snippet ? ` — ${entry.snippet}` : ''}`,
             icon: 'file', route: `#/documents/${encodeURIComponent(entry.item.artifactId)}`, kind: 'Documents',
@@ -6630,6 +7615,87 @@ function bindEvents() {
     }
     if (action === 'task-set-state') void projectTaskSetState(target.dataset.project, target.dataset.taskB64, target.dataset.state);
     if (action === 'task-discard') void projectTaskDiscard(target.dataset.project, target.dataset.taskB64);
+    if (action === 'data-room-import-upload') void uploadSelectedDataRoomImport();
+    if (action === 'data-room-import-inspect') void inspectDataRoomImport(target.dataset.import || '');
+    if (action === 'data-room-import-proposal-retry') void mutateDataRoomImportReview(target.dataset.import || '', 'retry');
+    if (action === 'data-room-import-proposal-respond') void mutateDataRoomImportReview(target.dataset.import || '', 'respond');
+    if (action === 'data-room-import-proposal-dismiss') void mutateDataRoomImportReview(target.dataset.import || '', 'dismiss');
+    if (action === 'data-room-import-proposal-accept') void mutateDataRoomImportReview(target.dataset.import || '', 'accept');
+    if (action === 'data-room-import-promotion-retry') void mutateDataRoomImportReview(target.dataset.import || '', 'promotion-retry');
+    if (action === 'analytics-chat-select') {
+      const dashboardId = target.dataset.dashboard || '';
+      const widgetId = target.dataset.widget || '';
+      const dashboard = state.analytics.details.get(dashboardId);
+      if (!dashboard || state.route.view !== 'analytics-dashboard' || state.route.dashboardId !== dashboardId) {
+        toast('That widget selection is stale. Reopen the dashboard and select it again.', 'bad');
+        return;
+      }
+      const availableWidgetIds = (dashboard.widgets || []).map(widget => widget.id);
+      const next = toggleAnalyticsChatSelection(
+        state.analytics.chatSelection.get(dashboardId) || [],
+        widgetId,
+        availableWidgetIds,
+      );
+      if (!next.changed) {
+        toast(next.reason === 'limit'
+          ? 'BotBoy can target at most two widgets. Remove one selection first.'
+          : 'That widget is no longer on this dashboard.', 'bad');
+        return;
+      }
+      if (next.selectedWidgetIds.length) state.analytics.chatSelection.set(dashboardId, next.selectedWidgetIds);
+      else state.analytics.chatSelection.delete(dashboardId);
+      renderRoute({ userAction: true, preserveScroll: true });
+      focusAnalyticsChatSelector(dashboardId, widgetId);
+    }
+    if (action === 'analytics-manage-data') {
+      const dashboardId = target.dataset.dashboard || '';
+      const widgetId = target.dataset.widget || '';
+      if (state.analytics.controlOpen.has(widgetId)) state.analytics.controlOpen.delete(widgetId);
+      else state.analytics.controlOpen.add(widgetId);
+      state.analytics.controlPendingFocus = {
+        target: state.analytics.controlOpen.has(widgetId) ? 'panel' : 'manage', dashboardId, widgetId,
+      };
+      if (state.analytics.controlOpen.has(widgetId) && !state.analytics.dataRoomList) void loadDataRoomList();
+      renderRoute({ userAction: true, preserveScroll: true });
+    }
+    if (action === 'analytics-control-add-filter') {
+      const widgetId = target.dataset.widget || '';
+      const widget = currentAnalyticsWidget(state.route.dashboardId, widgetId);
+      const first = widget?.controls?.definition?.filters?.[0];
+      if (first) {
+        markAnalyticsControlDraft(widgetId, draft => {
+          draft.filters.push({ field: first.field, operator: first.operators?.[0] || 'eq', valueText: '' });
+        });
+        state.analytics.controlPendingFocus = { target: 'panel', dashboardId: state.route.dashboardId, widgetId };
+        renderRoute({ userAction: true, preserveScroll: true });
+      }
+    }
+    if (action === 'analytics-control-remove-filter') {
+      const widgetId = target.dataset.widget || '';
+      const index = Number(target.dataset.index);
+      markAnalyticsControlDraft(widgetId, draft => { if (Number.isInteger(index)) draft.filters.splice(index, 1); });
+      state.analytics.controlPendingFocus = { target: 'panel', dashboardId: state.route.dashboardId, widgetId };
+      renderRoute({ userAction: true, preserveScroll: true });
+    }
+    if (action === 'analytics-control-reset') {
+      const widgetId = target.dataset.widget || '';
+      state.analytics.controlDrafts.delete(widgetId);
+      state.analytics.controlErrors.delete(widgetId);
+      state.analytics.controlPendingFocus = { target: 'panel', dashboardId: state.route.dashboardId, widgetId };
+      renderRoute({ userAction: true, preserveScroll: true });
+    }
+    if (action === 'analytics-control-unbind') {
+      void unbindAnalyticsDataset(target.dataset.dashboard || state.route.dashboardId, target.dataset.widget || '');
+    }
+    if (action === 'analytics-shown-sort') {
+      const widgetId = target.dataset.widget || '';
+      const columnIndex = Number(target.dataset.column);
+      const next = nextAnalyticsShownSort(state.analytics.shownRowSort.get(widgetId) || null, columnIndex);
+      if (next) state.analytics.shownRowSort.set(widgetId, next);
+      else state.analytics.shownRowSort.delete(widgetId);
+      renderRoute({ userAction: true, preserveScroll: true });
+      requestAnimationFrame(() => document.querySelector(`[data-action="analytics-shown-sort"][data-widget="${CSS.escape(widgetId)}"][data-column="${columnIndex}"]`)?.focus({ preventScroll: true }));
+    }
     if (action === 'analytics-refresh') void refreshAnalyticsDashboard(target.dataset.dashboard);
     if (action === 'analytics-cancel-refresh') void cancelAnalyticsRefresh(target.dataset.dashboard);
     if (action === 'analytics-delete') void deleteAnalyticsDashboard(target.dataset.dashboard);
@@ -6656,6 +7722,16 @@ function bindEvents() {
   });
 
   document.addEventListener('submit', event => {
+    if (event.target?.matches('.analytics-control-form')) {
+      event.preventDefault();
+      void applyAnalyticsControls(event.target);
+      return;
+    }
+    if (event.target?.matches('.analytics-bind-form')) {
+      event.preventDefault();
+      void bindAnalyticsDataset(event.target);
+      return;
+    }
     if (event.target?.matches('.analytics-project-form')) {
       event.preventDefault();
       void saveAnalyticsProjectLinks(event.target);
@@ -6720,6 +7796,10 @@ function bindEvents() {
   });
 
   document.addEventListener('input', event => {
+    if (event.target?.matches?.('[data-control-input]')) {
+      updateAnalyticsControlDraft(event.target);
+      return;
+    }
     if (event.target?.matches?.('[data-document-search]')) {
       state.documents.libraryQuery = event.target.value;
       // This field is a synchronized view filter, not unsaved authored text.
@@ -6764,6 +7844,37 @@ function bindEvents() {
   });
 
   document.addEventListener('change', event => {
+    if (event.target?.matches?.('[data-data-room-import-file]')) {
+      const file = event.target.files?.[0] || null;
+      state.analytics.dataRoomImportFile = file;
+      state.analytics.dataRoomImportRequestId = '';
+      state.analytics.dataRoomImportErrors.delete('upload');
+      const label = event.target.closest('.data-room-import-picker')?.querySelector('[data-data-room-import-file-name]');
+      if (label) label.textContent = file ? `${file.name} · ${number(file.size)} bytes selected` : 'No workbook selected';
+      const button = document.querySelector('[data-action="data-room-import-upload"]');
+      if (button) button.disabled = !file;
+      return;
+    }
+    if (event.target?.matches?.('[data-data-room-import-sheet]')) {
+      const importId = event.target.dataset.import || '';
+      if (event.target.value) state.analytics.dataRoomImportSheets.set(importId, event.target.value);
+      else state.analytics.dataRoomImportSheets.delete(importId);
+      renderRoute({ preserveScroll: true, userAction: true });
+      return;
+    }
+    if (event.target?.matches?.('[data-data-room-import-answer]')) {
+      const proposalId = event.target.dataset.proposal || '';
+      const field = event.target.dataset.field || '';
+      const answers = { ...(state.analytics.dataRoomImportAnswers.get(proposalId) || {}) };
+      if (event.target.value) answers[field] = event.target.value;
+      else delete answers[field];
+      state.analytics.dataRoomImportAnswers.set(proposalId, answers);
+      return;
+    }
+    if (event.target?.matches?.('[data-control-input]')) {
+      updateAnalyticsControlDraft(event.target);
+      return;
+    }
     if (event.target?.matches?.('[data-publication-format], [data-publication-destination-mode], [data-publication-base]')) {
       const artifact = state.documents.details.get(state.route.artifactId || '');
       const draft = { ...(state.documents.publicationDraft || defaultPublicationDraft(artifact?.publicationState, artifact?.publicationDestinationDefault)) };
@@ -6893,11 +8004,13 @@ async function pollVersion() {
     const payload = await request('/dashboard/version');
     const previousVersion = state.lastVersion;
     const previousAnalyticsVersion = state.lastAnalyticsVersion;
+    const previousDataRoomVersion = state.lastDataRoomVersion;
     const previousDocumentsVersion = state.lastDocumentsVersion;
     const previousBootId = state.lastBootId;
     const previousUiVersion = state.lastUiVersion;
     state.lastVersion = payload.version;
     state.lastAnalyticsVersion = payload.analyticsVersion ?? '0';
+    state.lastDataRoomVersion = payload.dataRoomVersion ?? '0';
     state.lastDocumentsVersion = payload.documentsVersion ?? '0';
     state.lastBootId = payload.bootId ?? null;
     state.lastUiVersion = payload.uiVersion ?? null;
@@ -6994,6 +8107,52 @@ async function pollVersion() {
         state.documents.items = null;
         state.documents.total = null;
         state.documents.error = '';
+      }
+    }
+
+    if (previousDataRoomVersion !== null && state.lastDataRoomVersion !== previousDataRoomVersion) {
+      if (state.analytics.dataRoomListLoading || state.analytics.dataRoomLoading.size
+        || state.analytics.dataRoomImportLoading.size || state.analytics.dataRoomImportBusy.size) {
+        state.lastDataRoomVersion = previousDataRoomVersion;
+      } else if (state.route.view === 'data-room') {
+        await loadDataRoomList({ force: true, renderAfter: false });
+        if (state.analytics.dataRoomListError) state.lastDataRoomVersion = previousDataRoomVersion;
+        if (state.route.view === 'data-room') renderRoute({ preserveScroll: true });
+      } else if (state.route.view === 'data-room-dataset') {
+        const id = state.route.datasetId;
+        await Promise.all([
+          loadDataRoomDataset(id, { force: true, renderAfter: false }),
+          loadDataRoomVersions(id, { force: true, renderAfter: false }),
+        ]);
+        if (state.analytics.dataRoomErrors.has(`dataset:${id}`) || state.analytics.dataRoomErrors.has(`versions:${id}`)) {
+          state.lastDataRoomVersion = previousDataRoomVersion;
+        }
+        if (state.route.view === 'data-room-dataset' && state.route.datasetId === id) renderRoute({ preserveScroll: true });
+      } else if (state.route.view === 'data-room-version') {
+        const id = state.route.versionId;
+        await loadDataRoomVersion(id, { force: true, renderAfter: false });
+        if (state.analytics.dataRoomErrors.has(`version:${id}`)) state.lastDataRoomVersion = previousDataRoomVersion;
+        if (state.route.view === 'data-room-version' && state.route.versionId === id) renderRoute({ preserveScroll: true });
+      } else if (state.route.view === 'data-room-imports') {
+        await loadDataRoomImports({ force: true, renderAfter: false });
+        if (state.analytics.dataRoomImportListError) state.lastDataRoomVersion = previousDataRoomVersion;
+        if (state.route.view === 'data-room-imports') renderRoute({ preserveScroll: true });
+      } else if (state.route.view === 'data-room-import') {
+        const id = state.route.importId;
+        await loadDataRoomImport(id, { force: true, renderAfter: false });
+        if (state.analytics.dataRoomImportErrors.has(`import:${id}`)) state.lastDataRoomVersion = previousDataRoomVersion;
+        if (state.route.view === 'data-room-import' && state.route.importId === id) renderRoute({ preserveScroll: true });
+      } else {
+        state.analytics.dataRoomList = null;
+        state.analytics.dataRoomListError = '';
+        state.analytics.dataRoomDetails.clear();
+        state.analytics.dataRoomVersions.clear();
+        state.analytics.dataRoomVersionDetails.clear();
+        state.analytics.dataRoomErrors.clear();
+        state.analytics.dataRoomImportList = null;
+        state.analytics.dataRoomImportListError = '';
+        state.analytics.dataRoomImportDetails.clear();
+        state.analytics.dataRoomImportErrors.clear();
       }
     }
 

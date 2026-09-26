@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './analytics-dashboard.js';
-import { selectDashboardLane, classifyWidgetFailure, isSafeRuntimeQueueChurn } from './analytics-runners.js';
+import {
+  selectDashboardLane,
+  classifyWidgetFailure,
+  isCrossLaneRetryableFailure,
+  isSafeRuntimeQueueChurn,
+} from './analytics-runners.js';
 import type { AnalyticsDashboardService } from './analytics-types.js';
 import type { McpManager, McpServerSnapshot } from './mcp-types.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
@@ -300,6 +305,9 @@ describe('cross-lane retry + escalation', () => {
     expect(classifyWidgetFailure('Numeric value out of range: int4 overflow')).toBe('content');
     expect(classifyWidgetFailure('Run 777 still WAITING_FOR_RESOURCES after 30 minutes.')).toBe('infra');
     expect(classifyWidgetFailure('Error: the Datanet ETL call datanet_submit_run timed out after 5 min — the transport, not the query.')).toBe('infra');
+    expect(isCrossLaneRetryableFailure(
+      'Run submission failed without a checkpointed run ID. Do not resubmit; reconcile the exact Datanet run first.',
+    )).toBe(false);
     expect(classifyWidgetFailure(null)).toBe('infra'); // unknown defaults to the cheap retry
   });
 

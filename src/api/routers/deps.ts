@@ -30,6 +30,12 @@ import type { McpManager } from '../../core/mcp-types.js';
 import type { GraspSync } from '../../monitors/grasp-sync.js';
 import type { SharePointSync } from '../../monitors/sharepoint-sync.js';
 import type { AnalyticsDashboardService, DashboardPublisherService } from '../../core/analytics-types.js';
+import type { AnalyticsScheduler } from '../../core/analytics-scheduler.js';
+import type { AnalyticsDataRoomCatalogReader } from '../../core/analytics-data-room-service.js';
+import type { AnalyticsImportInbox } from '../../core/analytics-import-inbox.js';
+import type { AnalyticsImportSemanticProposalService } from '../../core/analytics-import-semantic-proposal.js';
+import type { AnalyticsImportPromotionService } from '../../core/analytics-import-promotion.js';
+import type { AnalyticsAnswerService } from '../../core/analytics-data-room-answer.js';
 import type { ProductDocumentService, WritingConfigStore } from '../../product-manager/types.js';
 import type { ProductDocumentPublicationService } from '../../product-manager/product-document-publications.js';
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
@@ -39,6 +45,7 @@ import type { EtlOnboardingService } from '../../core/etl-onboarding.js';
 import type { VisualAssetRegistry } from '../../core/visual-assets.js';
 import type { VisualInspector } from '../../core/visual-inspector.js';
 import type { ProjectArtifactService } from '../../core/project-artifacts.js';
+import type { ShutdownRuntimeContext } from '../../core/shutdown-coordinator.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -65,6 +72,17 @@ export interface RouterDeps {
   graspSync?: GraspSync;
   sharePointSync?: SharePointSync;
   analyticsService?: AnalyticsDashboardService;
+  analyticsScheduler?: AnalyticsScheduler;
+  /** R1 read-only shared dataset/version catalog. */
+  analyticsDataRoom?: AnalyticsDataRoomCatalogReader;
+  /** R6 owner-only immutable workbook intake and bounded preview; no dataset writer authority. */
+  analyticsImportInbox?: AnalyticsImportInbox;
+  /** R6.2 background complete-profile/context/inference proposal; no Data Room writer authority. */
+  analyticsImportSemantic?: AnalyticsImportSemanticProposalService;
+  /** R6.2 exact owner approval and narrow import promotion coordinator. */
+  analyticsImportPromotion?: AnalyticsImportPromotionService;
+  /** R2 deterministic room→SQL→ETL answer composite. */
+  analyticsAnswerService?: AnalyticsAnswerService;
   dashboardPublisher?: DashboardPublisherService;
   productDocumentService?: ProductDocumentService;
   productDocumentPublications?: ProductDocumentPublicationService;
@@ -80,6 +98,8 @@ export interface RouterDeps {
   visualAssets?: VisualAssetRegistry;
   visualInspector?: VisualInspector;
   projectArtifacts?: ProjectArtifactService;
+  /** Process-local admission/abort/work registry for bounded shutdown. */
+  shutdown?: ShutdownRuntimeContext;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

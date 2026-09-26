@@ -10,18 +10,28 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
 import { resolveBlessedModelId } from '../../core/inference-provider.js';
 import { createLlmUsageOperationId } from '../../core/llm-usage.js';
+import { normalizeAnalyticsSearchText } from '../../core/analytics-search-normalization.js';
 import {
   createAnalyticsSchemaBriefingLoader,
   resolveConversationMode,
   detectAnalyticsCreateIntent,
   isAnalyticsReplyGrounded,
   type AnalyticsSchemaBriefing,
+  type AnalyticsTaskGrounding,
 } from '../../core/analytics-chat-context.js';
+import {
+  analyticsWidgetEditActionAllowed,
+  analyticsWidgetEditExactIds,
+  analyticsWidgetEditSelectionCount,
+  exactAnalyticsWidgetEditTargetMatches,
+  routeAnalyticsWidgetEditAction,
+} from '../../core/analytics-widget-edit-intent.js';
 import {
   saveChatAttachment,
   loadChatAttachment,
@@ -33,6 +43,83 @@ import {
   prepareImageFreePayloadRecovery,
   type ToolImageEvidence,
 } from '../../core/vision-payload.js';
+import {
+  createDataRoomToolFailure,
+  dataRoomIssue,
+  dataRoomNoEffect,
+  type DataRoomToolName,
+} from '../../core/data-room-tool-failure.js';
+import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
+
+const DATA_ROOM_CHAT_TOOL_NAMES = new Set<DataRoomToolName>([
+  'list_data_room_datasets',
+  'query_data_room',
+  'create_data_room_dataset',
+  'configure_analytics_widget_source',
+]);
+
+function dataRoomChatToolName(value: unknown): DataRoomToolName | undefined {
+  const name = String(value ?? '') as DataRoomToolName;
+  return DATA_ROOM_CHAT_TOOL_NAMES.has(name) ? name : undefined;
+}
+
+function dataRoomWriteEffectConfirmed(tool: DataRoomToolName, content: unknown): boolean {
+  if (tool === 'list_data_room_datasets' || tool === 'query_data_room') return false;
+  try {
+    const receipt = JSON.parse(String(content ?? '{}'));
+    if (receipt?.type === 'data_room_tool_failure') return receipt.effect?.mutationApplied === true;
+    if (tool === 'create_data_room_dataset') {
+      return receipt?.trust === 'verified_analytics_job_receipt'
+        && /^aj_[a-f0-9]{32}$/.test(String(receipt?.jobId ?? ''));
+    }
+    return receipt?.mutationApplied === true;
+  } catch {
+    return false;
+  }
+}
+
+function dataRoomDatasetAction(argumentsJson: string): string | undefined {
+  try {
+    const value = JSON.parse(argumentsJson);
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? String(value.action ?? '')
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function repeatCallArguments(toolName: string, argumentsJson: string): string {
+  if (toolName !== 'create_data_room_dataset') return argumentsJson;
+  try {
+    return stableAnalyticsJson(JSON.parse(argumentsJson));
+  } catch {
+    return argumentsJson;
+  }
+}
+
+function dataRoomDurableJobId(content: unknown): string | undefined {
+  try {
+    const receipt = JSON.parse(String(content ?? '{}'));
+    const candidate = receipt?.type === 'data_room_tool_failure'
+      ? receipt?.effect?.jobId
+      : receipt?.jobId;
+    return /^aj_[a-f0-9]{32}$/.test(String(candidate ?? '')) ? String(candidate) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function dataRoomCreateEffectNeedsObservation(content: unknown): boolean {
+  try {
+    const receipt = JSON.parse(String(content ?? '{}'));
+    return receipt?.type === 'data_room_tool_failure'
+      && receipt?.effect?.state !== undefined
+      && receipt.effect.state !== 'none';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Transient-error detector for the chat stream retry: network hiccups,
@@ -62,6 +149,307 @@ export function isTransientStreamError(err: unknown): boolean {
 export function normalizeThinkingLevel(value: unknown): 'off' | 'low' | 'high' | 'max' | null {
   if (value === undefined || value === null || value === '') return 'off';
   return value === 'off' || value === 'low' || value === 'high' || value === 'max' ? value : null;
+}
+
+function exactMatches(message: string, pattern: RegExp): string[] {
+  return [...new Set(message.match(pattern) ?? [])];
+}
+
+interface CanonicalAnalyticsRouteScope {
+  dashboardId: string;
+  orderedWidgetIds: string[];
+  source: 'dashboard_widget_selection';
+}
+
+function canonicalAnalyticsRouteScope(
+  req: Request,
+  body: Record<string, any>,
+  deps: RouterDeps,
+): CanonicalAnalyticsRouteScope | undefined {
+  if (body.routeScope === undefined) return undefined;
+  const isLoopback = (address: string | undefined): boolean =>
+    address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+  if (!isLoopback(req.socket.remoteAddress) || !isLoopback(req.socket.localAddress)) {
+    throw Object.assign(new Error('Analytics route scope is available only through the local BotBoy dashboard.'), { statusCode: 403 });
+  }
+  const origin = req.get('origin');
+  const host = req.get('host');
+  if (!origin) {
+    throw Object.assign(new Error('Analytics route scope requires same-origin dashboard attestation.'), { statusCode: 403 });
+  }
+  {
+    let sameOrigin = false;
+    try {
+      sameOrigin = Boolean(host)
+        && new URL(origin).origin === new URL(`${req.protocol}://${host}`).origin;
+    } catch {}
+    if (!sameOrigin) {
+      throw Object.assign(new Error('Analytics route scope origin does not match this BotBoy instance.'), { statusCode: 403 });
+    }
+  }
+  const value = body.routeScope;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw Object.assign(new Error('routeScope must be a plain object.'), { statusCode: 400 });
+  }
+  const unexpected = Object.keys(value).filter(key => !['kind', 'dashboardId', 'selectedWidgetIds'].includes(key));
+  if (unexpected.length || value.kind !== 'analytics_dashboard') {
+    throw Object.assign(new Error('routeScope has unsupported fields or kind.'), { statusCode: 400 });
+  }
+  const dashboardId = typeof value.dashboardId === 'string' ? value.dashboardId.trim() : '';
+  if (!/^dash_[a-zA-Z0-9_-]{1,96}$/.test(dashboardId)) {
+    throw Object.assign(new Error('routeScope.dashboardId is invalid.'), { statusCode: 400 });
+  }
+  const selected: string[] = Array.isArray(value.selectedWidgetIds)
+    ? value.selectedWidgetIds.map((item: unknown) => typeof item === 'string' ? item.trim() : '')
+    : [];
+  if (selected.length > 2 || new Set(selected).size !== selected.length
+    || selected.some(id => !/^widget_[a-zA-Z0-9_-]{1,96}$/.test(id))) {
+    throw Object.assign(new Error('routeScope.selectedWidgetIds must contain zero to two unique widget IDs.'), { statusCode: 400 });
+  }
+  const dashboard = deps.analyticsService?.getDashboard(dashboardId);
+  if (!dashboard) throw Object.assign(new Error(`Dashboard ${dashboardId} was not found.`), { statusCode: 409 });
+  const widgetIds = new Set(dashboard.widgets.map(widget => widget.id));
+  const stale = selected.filter(id => !widgetIds.has(id));
+  if (stale.length) {
+    throw Object.assign(new Error(`Selected widget scope is stale or belongs to another dashboard: ${stale.join(', ')}.`), { statusCode: 409 });
+  }
+  return { dashboardId, orderedWidgetIds: selected, source: 'dashboard_widget_selection' };
+}
+
+function buildAnalyticsTaskGrounding(
+  message: string,
+  deps: RouterDeps,
+  routeScope?: CanonicalAnalyticsRouteScope,
+): AnalyticsTaskGrounding | undefined {
+  const messageDashboardIds = exactMatches(message, /\bdash_[a-zA-Z0-9_-]{1,96}\b/g);
+  const messageWidgetIds = exactMatches(message, /\bwidget_[a-zA-Z0-9_-]{1,96}\b/g);
+  // Explicit owner IDs remain authoritative. Route locators fill only the
+  // deictic gaps and can never replace a target the owner actually named.
+  const dashboardIds = messageDashboardIds.length
+    ? messageDashboardIds
+    : routeScope ? [routeScope.dashboardId] : [];
+  const explicitWidgetIds = messageWidgetIds.length
+    ? messageWidgetIds
+    : routeScope?.orderedWidgetIds ?? [];
+  if (!dashboardIds.length && !explicitWidgetIds.length) return undefined;
+
+  const requiredExactAnchors = [...dashboardIds, ...explicitWidgetIds];
+  const canonicalSemanticAnchors = new Set<string>();
+  // Dataset authority comes only from canonical widget bindings. A ds_* token
+  // in owner/model prose is never permission to retrieve another dataset.
+  const datasetIds = new Set<string>();
+  const resolved: Array<Record<string, unknown>> = [];
+  const unresolved: string[] = [];
+
+  for (const dashboardId of dashboardIds) {
+    const dashboard = deps.analyticsService?.getDashboard(dashboardId);
+    if (!dashboard) {
+      unresolved.push(dashboardId);
+      continue;
+    }
+    canonicalSemanticAnchors.add(dashboard.title);
+    const requestedWidgets = explicitWidgetIds.length
+      ? explicitWidgetIds.map(widgetId => dashboard.widgets.find(widget => widget.id === widgetId)).filter(Boolean)
+      : [];
+    for (const widgetId of explicitWidgetIds) {
+      if (!dashboard.widgets.some(widget => widget.id === widgetId)) unresolved.push(widgetId);
+    }
+    for (const widget of requestedWidgets) {
+      if (!widget) continue;
+      canonicalSemanticAnchors.add(widget.title);
+      if (widget.binding?.datasetId) datasetIds.add(widget.binding.datasetId);
+    }
+    resolved.push({
+      dashboardId: dashboard.id,
+      dashboardTitle: dashboard.title,
+      widgets: requestedWidgets.map(widget => ({
+        widgetId: widget!.id,
+        title: widget!.title,
+        revision: widget!.revision,
+        bindingRevision: widget!.bindingRevision,
+        datasetId: widget!.binding?.datasetId ?? null,
+      })),
+    });
+  }
+
+  for (const datasetId of datasetIds) {
+    const detail = deps.analyticsDataRoom?.getDataset(datasetId);
+    if (!detail) {
+      unresolved.push(datasetId);
+      continue;
+    }
+    canonicalSemanticAnchors.add(detail.name);
+    canonicalSemanticAnchors.add(detail.domainKey);
+    canonicalSemanticAnchors.add(detail.contract.metric.id);
+    canonicalSemanticAnchors.add(detail.contract.grain);
+    resolved.push({
+      datasetId: detail.id,
+      datasetName: detail.name,
+      currentVerifiedVersionId: detail.head?.versionId ?? null,
+      domainKey: detail.domainKey,
+      metricId: detail.contract.metric.id,
+      grain: detail.contract.grain,
+      availableDimensions: detail.contract.availableDimensions,
+    });
+  }
+
+  const semantic = [...canonicalSemanticAnchors]
+    .map(value => String(value).trim())
+    .filter(value => value.length >= 4)
+    .slice(0, 40);
+  return {
+    requiredExactAnchors,
+    canonicalSemanticAnchors: semantic,
+    datasetIds: [...datasetIds],
+    promptBlock: [
+      'EXACT EXISTING-DASHBOARD TASK. This scope overrides unrelated global business contexts.',
+      `Required exact response anchors: ${requiredExactAnchors.join(', ') || '(none)'}`,
+      `Unresolved exact anchors: ${[...new Set(unresolved)].join(', ') || '(none)'}`,
+      `Canonical scoped state: ${JSON.stringify(resolved)}`,
+      'For a supported owner edit, call edit_analytics_dashboard once. Otherwise state that no mutation completed and name the exact unresolved/unsupported target. Never discuss another business domain.',
+    ].join('\n'),
+  };
+}
+
+function normalizeOwnerRequestId(value: unknown): string {
+  if (value === undefined || value === null || value === '') return randomUUID();
+  if (typeof value !== 'string') {
+    throw Object.assign(new Error('requestId must be an opaque string.'), { statusCode: 400 });
+  }
+  const requestId = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(requestId)) {
+    throw Object.assign(new Error('requestId must contain 8 to 128 safe opaque characters.'), { statusCode: 400 });
+  }
+  return requestId;
+}
+
+function sameOrderedStrings(left: unknown, right: string[]): boolean {
+  return Array.isArray(left)
+    && left.length === right.length
+    && left.every((value, index) => typeof value === 'string' && value === right[index]);
+}
+
+function trustedAnalyticsEditReceipt(input: {
+  toolCall: any;
+  result: any;
+  ownerRequestId: string;
+  ownerMessage: string;
+  routeScope?: CanonicalAnalyticsRouteScope;
+}): Record<string, any> | undefined {
+  const { toolCall, result, ownerRequestId, ownerMessage, routeScope } = input;
+  if (toolCall?.function?.name !== 'edit_analytics_dashboard' || result?.toolCallId !== toolCall.id) return undefined;
+  let args: Record<string, any>;
+  let receipt: Record<string, any>;
+  try {
+    args = JSON.parse(String(toolCall.function.arguments ?? '{}'));
+    receipt = JSON.parse(String(result.content ?? '{}'));
+  } catch {
+    return undefined;
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args) || !receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return undefined;
+  const action = String(args.action ?? '');
+  const dashboardId = String(args.dashboardId ?? '');
+  const widgetIds = Array.isArray(args.widgetIds) && args.widgetIds.every((id: unknown) => typeof id === 'string')
+    ? args.widgetIds as string[]
+    : [];
+  if (!['presentation', 'date_range', 'add_from_widget', 'combine_compatible_widgets'].includes(action)
+    || !/^dash_[a-zA-Z0-9_-]{1,96}$/.test(dashboardId)
+    || widgetIds.length < 1 || widgetIds.length > 2
+    || new Set(widgetIds).size !== widgetIds.length
+    || widgetIds.some(id => !/^widget_[a-zA-Z0-9_-]{1,96}$/.test(id))) return undefined;
+  if (receipt.requestId !== ownerRequestId || receipt.action !== action
+    || receipt.dashboard?.id !== dashboardId || !sameOrderedStrings(receipt.sourceWidgetIds, widgetIds)) return undefined;
+
+  const literalScopeMatch = exactAnalyticsWidgetEditTargetMatches(ownerMessage, action, dashboardId, widgetIds);
+  if (!literalScopeMatch) {
+    if (!routeScope || routeScope.dashboardId !== dashboardId || !sameOrderedStrings(routeScope.orderedWidgetIds, widgetIds)
+      || !analyticsWidgetEditActionAllowed(ownerMessage, action, { requireDeictic: true })) return undefined;
+  }
+
+  const status = String(receipt.status ?? '');
+  if (!['completed', 'pending', 'blocked', 'failed', 'cancelled'].includes(status)) return undefined;
+  if ((status === 'completed' || status === 'pending') && receipt.mutationApplied !== true) return undefined;
+  if (status === 'blocked' && receipt.mutationApplied !== false) return undefined;
+  if (receipt.mutationApplied !== true && receipt.mutationApplied !== false) return undefined;
+  const expectedClaim = status === 'completed' ? 'completed' : status === 'pending' ? 'still_running' : 'not_completed';
+  if (receipt.responseGuidance?.claim !== expectedClaim) return undefined;
+  const requiredAnchors = receipt.responseGuidance?.requiredAnchors;
+  if (!Array.isArray(requiredAnchors) || requiredAnchors.some((anchor: unknown) => typeof anchor !== 'string' || !anchor)) return undefined;
+  if (![dashboardId, ...widgetIds].every(anchor => requiredAnchors.includes(anchor))) return undefined;
+
+  if (receipt.mutationApplied) {
+    if (!receipt.widget || !/^widget_[a-zA-Z0-9_-]{1,96}$/.test(String(receipt.widget.id ?? ''))) return undefined;
+    if (!['preserved', 'refresh_queued'].includes(String(receipt.resultDisposition ?? ''))) return undefined;
+    if (action === 'presentation' || action === 'date_range') {
+      if (receipt.widget.id !== widgetIds[0]) return undefined;
+    } else {
+      if (receipt.createdWidgetId !== receipt.widget.id
+        || !/^aedit_[a-f0-9]{16}$/.test(String(receipt.receiptId ?? ''))
+        || receipt.intentVersion !== 1
+        || !/^[a-f0-9]{64}$/.test(String(receipt.intentSha256 ?? ''))
+        || !/^[a-f0-9]{64}$/.test(String(receipt.effectSha256 ?? ''))
+        || typeof receipt.explicitNew !== 'boolean'
+        || typeof receipt.idempotentReplay !== 'boolean'
+        || typeof receipt.effectAppliedThisCall !== 'boolean'
+        || receipt.effectAppliedThisCall === receipt.idempotentReplay
+        || (receipt.idempotentReplay && !['same_request', 'semantic_intent'].includes(String(receipt.replayReason ?? '')))
+        || (!receipt.idempotentReplay && receipt.replayReason !== undefined)
+        || !requiredAnchors.includes(receipt.receiptId)) return undefined;
+    }
+    if (!requiredAnchors.includes(receipt.widget.id)) return undefined;
+  }
+  if (status === 'pending') {
+    if (!/^run_[a-zA-Z0-9_-]{1,96}$/.test(String(receipt.run?.id ?? ''))
+      || !['queued', 'running'].includes(String(receipt.run?.status ?? ''))
+      || !requiredAnchors.includes(receipt.run.id)) return undefined;
+  }
+  if (status === 'completed' && receipt.run && receipt.run.status !== 'completed') return undefined;
+  if ((status === 'failed' || status === 'cancelled') && receipt.run && receipt.run.status !== status) return undefined;
+  return receipt;
+}
+
+function formatAnalyticsEditCompletion(receipt: Record<string, any>): string | undefined {
+  const dashboardTitle = String(receipt.dashboard?.title ?? '').trim();
+  const dashboard = dashboardTitle
+    ? `dashboard “${dashboardTitle}” (${receipt.dashboard.id})`
+    : `dashboard ${receipt.dashboard.id}`;
+  const sourceIds = (receipt.sourceWidgetIds as string[]).join(', ');
+  const actionLabel = String(receipt.action).replaceAll('_', ' ');
+  const widgetTitle = String(receipt.widget?.title ?? '').trim();
+  const widget = receipt.widget?.id
+    ? `${widgetTitle ? `“${widgetTitle}” ` : ''}(${receipt.widget.id})`
+    : '';
+  const dataset = receipt.widget?.datasetId
+    ? ` Dataset ${receipt.widget.datasetId}${receipt.widget.versionId ? ` at version ${receipt.widget.versionId}` : ''}.`
+    : '';
+  const run = receipt.run?.id ? ` Exact local run ${receipt.run.id} is ${receipt.run.status}.` : '';
+  const reason = String(receipt.reason ?? '').trim();
+  const nextAction = String(receipt.nextAction ?? receipt.responseGuidance?.nextAction ?? '').trim();
+  const durableNote = receipt.receiptId
+    ? receipt.idempotentReplay
+      ? ` Durable receipt ${receipt.receiptId} replayed the existing committed widget/run; no duplicate effect was created.`
+      : ` Durable receipt ${receipt.receiptId} committed with this widget/run.`
+    : '';
+  let content: string;
+  if (receipt.status === 'completed') {
+    const disposition = receipt.resultDisposition === 'preserved'
+      ? 'The existing verified result was preserved; no data query or refresh was started.'
+      : `The resulting widget ${widget} is ready.${run}`;
+    content = `Completed the ${actionLabel} edit for ${dashboard}, using source widget${receipt.sourceWidgetIds.length === 1 ? '' : 's'} ${sourceIds}. ${disposition}${dataset}${durableNote}`;
+  } else if (receipt.status === 'pending') {
+    content = `The ${actionLabel} mutation is committed for ${dashboard}, using source widget${receipt.sourceWidgetIds.length === 1 ? '' : 's'} ${sourceIds}. Result widget ${widget}.${run} Do not resubmit this edit; inspect that exact run later.${dataset}${durableNote}`;
+  } else if (receipt.status === 'blocked') {
+    content = `No dashboard mutation was applied. The ${actionLabel || 'requested'} edit for ${dashboard}, source widget${receipt.sourceWidgetIds.length === 1 ? '' : 's'} ${sourceIds || '(none)'}, was blocked${reason ? `: ${reason}` : '.'}${nextAction ? ` Next: ${nextAction}` : ''}`;
+  } else {
+    const mutation = receipt.mutationApplied
+      ? 'The structural mutation was committed, but its exact local run did not complete.'
+      : 'No dashboard mutation was applied.';
+    content = `The ${actionLabel} edit for ${dashboard}, using source widget${receipt.sourceWidgetIds.length === 1 ? '' : 's'} ${sourceIds}, is ${receipt.status}. ${mutation}${run}${reason ? ` ${reason}` : ''}${nextAction ? ` Next: ${nextAction}` : ''}${durableNote}`;
+  }
+  const anchors = receipt.responseGuidance.requiredAnchors as string[];
+  const missing = anchors.filter(anchor => !content.includes(anchor));
+  if (missing.length) content += ` Receipt anchors: ${missing.join(', ')}.`;
+  return anchors.every(anchor => content.includes(anchor)) ? content : undefined;
 }
 
 export function createChatRouter(deps: RouterDeps, dashboardState: DashboardState): Router {
@@ -187,17 +575,27 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   // ── Cooperative stop for the in-flight chat turn ──
   // One SSE turn runs at a time in practice (single-owner app); the registry
   // still keys by turn id so a stale stop cannot cancel a NEWER turn. The
-  // stop is cooperative: the loop checks at iteration boundaries, lets the
-  // current LLM/tool call finish, then closes the turn honestly with
-  // whatever was gathered. Stopping is a user decision, not a failure —
+  // stop is cooperative for remote/model work and actively aborts bounded
+  // local data-room query workers; remote submissions are never killed or
+  // resubmitted implicitly. Stopping is a user decision, not a failure —
   // mirrors the dashboard refresh cancel semantics (2026-08-27).
-  const activeChatTurns = new Map<string, { stopRequested: boolean; startedAt: number }>();
+  const activeChatTurns = new Map<string, {
+    stopRequested: boolean;
+    shutdownRequested: boolean;
+    disconnected: boolean;
+    startedAt: number;
+    abortController: AbortController;
+  }>();
   let chatTurnCounter = 0;
 
   router.post('/chat/stop', (_req: Request, res: Response) => {
     let stopped = 0;
     for (const turn of activeChatTurns.values()) {
-      if (!turn.stopRequested) { turn.stopRequested = true; stopped++; }
+      if (!turn.stopRequested) {
+        turn.stopRequested = true;
+        turn.abortController.abort();
+        stopped++;
+      }
     }
     res.json({ ok: true, stopped, active: activeChatTurns.size });
   });
@@ -279,8 +677,40 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     const analyticsIntent = conversationMode === 'analytics_dashboard' && (
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
+    const routeEditAction = analyticsIntent === 'create'
+      ? undefined
+      : routeAnalyticsWidgetEditAction(message);
+    let ownerRequestId: string | undefined;
+    let authoritativeAnalyticsScope: CanonicalAnalyticsRouteScope | undefined;
+    let analyticsSelectionClarification: string | undefined;
+    if (stream) {
+      try {
+        ownerRequestId = normalizeOwnerRequestId(body.requestId);
+        // Ambient scope is promoted only for an affirmative deictic edit.
+        // Direct Data Room reads and generic work ignore it, so stale selection
+        // cannot hijack query_data_room or unrelated tools.
+        if (conversationMode === 'analytics_dashboard' && routeEditAction) {
+          const explicitIds = analyticsWidgetEditExactIds(message);
+          // Any complete exact-ID owner target stays on the legacy authority
+          // path. Ambiguity is rejected later; ambient locators cannot block it.
+          if (!explicitIds.dashboardIds.length || !explicitIds.widgetIds.length) {
+            authoritativeAnalyticsScope = canonicalAnalyticsRouteScope(req, body, deps);
+            if (authoritativeAnalyticsScope) {
+              const expectedCount = analyticsWidgetEditSelectionCount(routeEditAction);
+              if (authoritativeAnalyticsScope.orderedWidgetIds.length !== expectedCount) {
+                analyticsSelectionClarification = expectedCount === 2
+                  ? `Select exactly two widgets with “Use in BotBoy,” then ask me to combine these widgets. Nothing was changed on dashboard ${authoritativeAnalyticsScope.dashboardId}.`
+                  : `Select exactly one widget with “Use in BotBoy,” then refer to this selected widget. Nothing was changed on dashboard ${authoritativeAnalyticsScope.dashboardId}.`;
+              }
+            }
+          }
+        }
+      } catch (error: any) {
+        return res.status(Number(error?.statusCode) || 400).json({ error: error?.message ?? String(error) });
+      }
+    }
 
-  const projectScope = (() => {
+    const projectScope = (() => {
     const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : '';
     const suppliedTitle = typeof body.projectTitle === 'string' ? body.projectTitle.replace(/\s+/g, ' ').trim() : '';
     if (!projectId || !suppliedTitle || !deps.db) return null;
@@ -307,13 +737,69 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         `user-${Date.now()}`, 'user', message, attachmentIds.length ? JSON.stringify(attachmentIds) : null,
       );
 
+      if (analyticsSelectionClarification) {
+        const convManager = deps.conversationManager;
+        let sessionId = convManager?.getActiveSessionId('chat');
+        if (!sessionId && convManager) sessionId = convManager.createSession('chat');
+        if (convManager && sessionId) {
+          const sessionContent = attachmentIds.length
+            ? `${message}\n\n[${attachmentIds.length} image attachment(s) were stored locally for that turn; the edit stopped before pixel inspection because the required visible widget selection was incomplete]`
+            : message;
+          convManager.appendUser(sessionId, sessionContent);
+          convManager.appendAssistant(sessionId, analyticsSelectionClarification);
+        }
+        const assistantId = `asst-${Date.now()}`;
+        if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(
+          assistantId, 'assistant', analyticsSelectionClarification,
+        );
+        res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content: analyticsSelectionClarification, createdAt: new Date().toISOString() } })}\n\n`);
+        res.end();
+        return;
+      }
+
       const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
-      activeChatTurns.set(turnId, { stopRequested: false, startedAt: Date.now() });
+      const turnState = {
+        stopRequested: false,
+        shutdownRequested: false,
+        disconnected: false,
+        startedAt: Date.now(),
+        abortController: new AbortController(),
+      };
+      activeChatTurns.set(turnId, turnState);
+      const unregisterShutdownWork = deps.shutdown?.registerWork({
+        id: turnId,
+        kind: 'chat_turn',
+        abort: () => {
+          turnState.shutdownRequested = true;
+          if (!turnState.abortController.signal.aborted) {
+            turnState.abortController.abort(new Error('BotBoy process is shutting down'));
+          }
+        },
+      });
+      const handleResponseClose = () => {
+        if (res.writableEnded) return;
+        turnState.disconnected = true;
+        if (!turnState.abortController.signal.aborted) {
+          turnState.abortController.abort(new Error('Chat client disconnected'));
+        }
+      };
+      res.once('close', handleResponseClose);
       try {
         const llmClient = deps.llmClient;
         const toolExecutor = deps.toolExecutor;
         const promptManager = deps.promptManager;
         const convManager = deps.conversationManager;
+        const toolExecutionContext = {
+          currentUserMessage: message,
+          callerKind: 'interactive' as const,
+          abortSignal: activeChatTurns.get(turnId)?.abortController.signal,
+          ...(ownerRequestId ? { ownerRequestId } : {}),
+          ...(authoritativeAnalyticsScope ? { authoritativeAnalyticsScope } : {}),
+          ...(projectScope ? {
+            authoritativeProjectIds: [projectScope.projectId],
+            projectContextSource: projectScope.source,
+          } : {}),
+        };
 
         if (!llmClient || !toolExecutor) {
           const result = await chat.sendMessage(message);
@@ -330,6 +816,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // Build the system prompt. Dashboard creation has an explicit mode:
         // its managed MCP/schema preflight is mechanical, so iteration-zero
         // prose cannot bypass discovery just because the model chose no tool.
+        const analyticsTaskGrounding = conversationMode === 'analytics_dashboard'
+          ? buildAnalyticsTaskGrounding(message, deps, authoritativeAnalyticsScope)
+          : undefined;
         const nodes = deps.nodeManager.listNodes('active');
         let analyticsBriefing: AnalyticsSchemaBriefing | undefined;
         if (conversationMode === 'analytics_dashboard') {
@@ -341,7 +830,21 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             // This completes before the first analytical planning call. The
             // loader performs a catalog-only routing pass, then injects every
             // selected context response in full or fails closed — never excerpts.
-            analyticsBriefing = await analyticsSchemaLoader.load(message);
+            analyticsBriefing = analyticsTaskGrounding
+              ? {
+                  ready: true,
+                  complete: true,
+                  text: 'Exact existing-dashboard task: unrelated global business/schema contexts were intentionally omitted. Use only the canonical task scope and local data-room semantic cards.',
+                  groundingTerms: analyticsTaskGrounding.canonicalSemanticAnchors,
+                  presets: [],
+                  files: [],
+                  estimatedTokens: 40,
+                  selectionStatus: 'selected',
+                  selectionRationale: 'exact_dashboard_task',
+                }
+              : await analyticsSchemaLoader.load(message, {
+                  localOnly: analyticsIntent !== 'create' && Boolean(deps.analyticsDataRoom),
+                });
           } catch (error: any) {
             console.error(`[Chat] Analytics schema preflight failed: ${error?.message ?? error}`);
             analyticsBriefing = {
@@ -362,6 +865,64 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             .join(',') || '(none)';
           console.log(`[Chat] Analytics context preflight: ready=${analyticsBriefing.ready}, complete=${analyticsBriefing.complete}, status=${analyticsBriefing.selectionStatus}, presets=${analyticsBriefing.presets.join(',') || '(none)'}, contextChars=${analyticsBriefing.text.length}, estimatedTokens=${analyticsBriefing.estimatedTokens}, files=${fileReceipts}`);
         }
+        let analyticsDataRoomBriefing: string | undefined;
+        if (conversationMode === 'analytics_dashboard' && analyticsIntent !== 'create' && deps.analyticsDataRoom) {
+          try {
+            const formatDetail = (detail: any): string => {
+              const contract = detail.contract;
+              return JSON.stringify({
+                datasetId: detail.id,
+                currentVerifiedVersionId: detail.head?.versionId ?? null,
+                name: detail.name,
+                description: detail.description,
+                domainKey: detail.domainKey,
+                metric: contract.metric,
+                regime: contract.regime,
+                countingKey: contract.countingKey,
+                unit: contract.unit,
+                grain: contract.grain,
+                availableDimensions: contract.availableDimensions,
+                timeField: contract.timeField,
+                timeZone: contract.timeZone,
+                coverage: contract.coverage,
+                contractSha256: contract.contractSha256,
+                answerRecipe: detail.definition.answer ?? null,
+                allowedUses: contract.handling.allowedUses,
+              });
+            };
+            if (analyticsTaskGrounding) {
+              const scopedDetails = analyticsTaskGrounding.datasetIds
+                .map(datasetId => deps.analyticsDataRoom!.getDataset(datasetId))
+                .filter(Boolean);
+              analyticsDataRoomBriefing = scopedDetails.length
+                ? scopedDetails.map(formatDetail).join('\n')
+                : 'No canonical data-room dataset is bound to the exact dashboard/widget scope; unrelated catalog datasets were intentionally omitted.';
+            } else {
+              const summaries = deps.analyticsDataRoom.listDatasets({ limit: 100 });
+              const messageKey = normalizeAnalyticsSearchText(message);
+              const scored = summaries.map(summary => {
+                const detail = deps.analyticsDataRoom!.getDataset(summary.id);
+                const terms = detail
+                  ? [detail.id, detail.name, detail.description, detail.domainKey, detail.contract.metric.id]
+                  : [summary.id, summary.name, summary.description, summary.domainKey];
+                const score = terms.reduce((total, term) => {
+                  const normalized = normalizeAnalyticsSearchText(term);
+                  return total + (normalized && messageKey.includes(normalized) ? 1 : 0);
+                }, 0);
+                return { detail, score };
+              }).filter(item => item.detail);
+              const selected = scored.filter(item => item.score > 0)
+                .sort((left, right) => right.score - left.score || left.detail!.id.localeCompare(right.detail!.id))
+                .slice(0, 5);
+              const effective = selected.length ? selected : scored.length === 1 ? scored : [];
+              analyticsDataRoomBriefing = effective.length
+                ? effective.map(({ detail }) => formatDetail(detail)).join('\n')
+                : `No unambiguous local semantic card matched this message (${summaries.length} active dataset(s)); rely on the selected domain context and exact request semantics.`;
+            }
+          } catch {
+            analyticsDataRoomBriefing = 'Local data-room semantic-card preload failed; list_data_room_datasets remains the authoritative on-demand discovery path.';
+          }
+        }
         // Live MCP inventory for the system prompt: the agent always knows
         // its callable servers and tools without a discovery round-trip. A
         // failed snapshot degrades to the prompt's mcp_status fallback line.
@@ -376,6 +937,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           conversationMode,
           analyticsIntent,
           analyticsSchemaBriefing: analyticsBriefing?.text,
+          analyticsDataRoomBriefing,
+          analyticsTaskGrounding: analyticsTaskGrounding?.promptBlock,
           mcpServers,
         };
         const systemPrompt = promptManager
@@ -435,8 +998,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 temperature: 0.3,
                 maxTokens: 2000,
                 usageContext: { workload: 'background' },
+                ...(deps.shutdown ? { signal: deps.shutdown.signal } : {}),
               });
 
+              if (deps.shutdown?.signal.aborted) return;
               if (summaryResp.content && summaryResp.content.length > 50) {
                 const allMsgs = convManager.getMessagesWithIds(sid, 100_000);
                 const legacyFrom = prevSummary && /^msg-\d+$/.test(prevSummary.coversFromMsgId);
@@ -448,7 +1013,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 console.log(`[Chat] Summary generated: ${summaryResp.content.length} chars, ${estimateTokens(summaryResp.content)} tokens, covers ${firstId}..${lastId}`);
               }
             } catch (err: any) {
-              console.error(`[Chat] Summary generation failed: ${err.message}`);
+              if (!deps.shutdown?.signal.aborted) {
+                console.error(`[Chat] Summary generation failed: ${err.message}`);
+              }
             }
           })();
         }
@@ -524,6 +1091,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // Repeat-call ledger for the breaker below + tools kill-switch.
         const seenToolCalls = new Map<string, number>();
         let toolsDisabled = false;
+        // Data Room creation may reveal prerequisite-aware validation waves.
+        // Permit bounded material corrections, but never an unbounded source
+        // resubmission loop; hash derivation and status observation do not
+        // consume this create-only budget.
+        const MAX_DATA_ROOM_CREATE_ATTEMPTS = 4;
+        let dataRoomCreateAttempts = 0;
+        let admittedDataRoomJobId: string | undefined;
+        let dataRoomCreateEffectNeedsRefresh = false;
 
         // Action-integrity gate (post-mortems 2026-08-04, twice in one day):
         // the model claimed "Saved! Item ID: ..." with ZERO tool calls — the
@@ -533,10 +1108,11 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // force one corrective pass; if it still claims falsely, append an
         // honest system note so the user is never misled.
         const WRITE_TOOLS = new Set([
-          'create_item', 'update_item', 'execute_db', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
-          'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
+          'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
+          'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony',
         ]);
+        const toolCallMayWrite = (toolCall: any): boolean => WRITE_TOOLS.has(toolCall?.function?.name);
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked)\b)/i;
         // Read-only SQL tools that may run as a concurrent batch (the
         // connector's profile allows 4 in-flight calls; the manager's
@@ -548,6 +1124,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         let writeToolCalled = false;
         let integrityRetryUsed = false;
         let analyticsGroundingRetryUsed = false;
+        let analyticsCompositeReceiptSeen = false;
+        let analyticsWidgetEditReceipt: Record<string, any> | undefined;
+        let totalModelToolCalls = 0;
         let visualInspectionRetryUsed = false;
         const pendingVisualAssetIds = new Set<string>(attachmentVisualAssets.map(asset => String(asset.assetId)));
         // One semantic rebuild per live turn. Unlike the transient retry, this
@@ -577,7 +1156,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const CHECKPOINT_EVERY = 40;
         let stoppedByUser = false;
 
-        for (let i = 0; i < HARD_ITERATION_CEILING; i++) {
+        toolLoop: for (let i = 0; i < HARD_ITERATION_CEILING; i++) {
           if (activeChatTurns.get(turnId)?.stopRequested) {
             stoppedByUser = true;
             console.log(`[Chat] Stop requested — ending turn at iteration ${i}`);
@@ -731,6 +1310,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 operationId,
                 ...(attempt === 2 ? { retryReason: 'stream_retry' as const } : {}),
               },
+              signal: turnState.abortController.signal,
               ...(payloadConstraint ? { payloadConstraint } : {}),
             });
             let iterResult = await gen.next();
@@ -780,6 +1360,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             try {
               streamResult = await runStream(1);
             } catch (firstErr: any) {
+              const interrupted = activeChatTurns.get(turnId);
+              if (interrupted?.shutdownRequested || interrupted?.disconnected) throw firstErr;
+              if (interrupted?.stopRequested) {
+                stoppedByUser = true;
+                break toolLoop;
+              }
               const payloadRecovery = await tryPayloadRecovery(firstErr);
               if (payloadRecovery.handled) {
                 streamResult = payloadRecovery.result;
@@ -787,12 +1373,25 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 console.warn(`[Chat] Transient stream error on attempt 1, retrying once: ${firstErr?.message || firstErr}`);
                 // Notify frontend so it can reset any partial bubble state for this iteration
                 try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'network', message: 'Stream interrupted, retrying...' })}\n\n`); } catch {}
-                // Small backoff to let DNS/wifi recover
+                // Small backoff to let DNS/wifi recover. Shutdown/Stop is
+                // checked again before a second provider request.
                 await new Promise(r => setTimeout(r, 1000));
+                const afterBackoff = activeChatTurns.get(turnId);
+                if (afterBackoff?.shutdownRequested || afterBackoff?.disconnected) throw firstErr;
+                if (afterBackoff?.stopRequested) {
+                  stoppedByUser = true;
+                  break toolLoop;
+                }
                 try {
                   streamResult = await runStream(2);
                   console.log(`[Chat] Retry attempt 2 succeeded`);
                 } catch (secondErr: any) {
+                  const secondInterruption = activeChatTurns.get(turnId);
+                  if (secondInterruption?.shutdownRequested || secondInterruption?.disconnected) throw secondErr;
+                  if (secondInterruption?.stopRequested) {
+                    stoppedByUser = true;
+                    break toolLoop;
+                  }
                   // The first attempt may die transiently before the provider
                   // can reject the deterministic payload. Normalize/rebuild if
                   // the retry reveals that payload limit; never send it a third
@@ -853,29 +1452,49 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }
 
             // ── Analytics grounding gate ──
-            // The schema preflight happened server-side before inference. If
-            // the model still emits an iteration-zero generic questionnaire,
-            // discard that streamed text and give it one corrective pass.
-            if (
-              conversationMode === 'analytics_dashboard' &&
-              analyticsBriefing?.ready &&
-              !writeToolCalled &&
-              !isAnalyticsReplyGrounded(content, analyticsBriefing)
-            ) {
+            // Exact dashboard tasks use their canonical IDs/bindings instead
+            // of the global any-business-term proposal gate. One retry is
+            // allowed; the second miss becomes a deterministic scoped receipt.
+            const taskUngrounded = Boolean(analyticsTaskGrounding)
+              && !isAnalyticsReplyGrounded(content, analyticsBriefing, analyticsTaskGrounding);
+            const proposalUngrounded = !analyticsTaskGrounding
+              && Boolean(analyticsBriefing?.ready)
+              && !writeToolCalled
+              && !analyticsCompositeReceiptSeen
+              && !isAnalyticsReplyGrounded(content, analyticsBriefing);
+            if (conversationMode === 'analytics_dashboard' && (taskUngrounded || proposalUngrounded)) {
               if (!analyticsGroundingRetryUsed) {
                 analyticsGroundingRetryUsed = true;
-                console.warn('[Chat] Analytics grounding gate: ungrounded reply — forcing schema-grounded pass');
-                try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'analytics_grounding', message: 'Grounding the proposal in your connected schema...' })}\n\n`); } catch {}
+                console.warn(`[Chat] Analytics grounding gate: ungrounded ${analyticsTaskGrounding ? 'dashboard task' : 'proposal'} — forcing scoped pass`);
+                try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'analytics_grounding', message: analyticsTaskGrounding ? 'Grounding the edit in the exact dashboard...' : 'Grounding the proposal in your connected schema...' })}\n\n`); } catch {}
                 messages.push({ role: 'assistant', content });
                 messages.push({
                   role: 'user',
-                  content: 'CONTEXT GROUNDING CHECK (internal system message — the owner cannot see it and you must not mention it): your previous draft did not name anything from the complete selected analytics contexts and was therefore rejected. Re-read the ACTIVE WORKFLOW context files. Respond using discovered presets, business domains, tables, measures, dimensions, filters, or analysis patterns. Recommend a concrete dashboard direction and ask no more than one targeted business-semantic question. Do not repeat a generic decision/metrics questionnaire.',
+                  content: analyticsTaskGrounding
+                    ? [
+                        'EXACT DASHBOARD GROUNDING CHECK (internal system message — the owner cannot see it and you must not mention it): the previous draft did not stay inside the canonical dashboard scope.',
+                        analyticsTaskGrounding.promptBlock,
+                        analyticsWidgetEditReceipt ? `Canonical edit receipt: ${JSON.stringify(analyticsWidgetEditReceipt)}` : 'No canonical edit receipt exists; nothing was changed.',
+                        'If the edit is supported and no receipt exists, call edit_analytics_dashboard once. Otherwise state the exact scoped limitation. Include every required exact anchor and one canonical scoped title/dataset term. Do not discuss another business domain.',
+                      ].join('\n')
+                    : 'CONTEXT GROUNDING CHECK (internal system message — the owner cannot see it and you must not mention it): your previous draft did not name anything from the complete selected analytics contexts and was therefore rejected. Re-read the ACTIVE WORKFLOW context files. Respond using discovered presets, business domains, tables, measures, dimensions, filters, or analysis patterns. Recommend a concrete dashboard direction and ask no more than one targeted business-semantic question. Do not repeat a generic decision/metrics questionnaire.',
                 });
                 continue;
               }
-              const loadedPresets = analyticsBriefing.presets.join(', ');
-              console.warn('[Chat] Analytics grounding gate: second ungrounded reply — replacing it with an honest failure');
-              content = `I loaded the selected business/schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable knowledge-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check the knowledge sources (#/connections/sql-context, analytics knowledge directory) and the BotBoy log.`;
+              console.warn('[Chat] Analytics grounding gate: second ungrounded reply — replacing it with an honest scoped failure/receipt');
+              if (analyticsTaskGrounding) {
+                const scope = analyticsTaskGrounding.requiredExactAnchors.join(', ');
+                const semantic = analyticsTaskGrounding.canonicalSemanticAnchors[0] || 'the exact dashboard';
+                const receiptStatus = String(analyticsWidgetEditReceipt?.status ?? 'not_completed');
+                const receiptAction = String(analyticsWidgetEditReceipt?.action ?? 'requested edit');
+                const mutationApplied = analyticsWidgetEditReceipt?.mutationApplied === true;
+                content = analyticsWidgetEditReceipt
+                  ? `Dashboard edit ${receiptAction} is ${receiptStatus} for ${scope} (${semantic}). ${mutationApplied ? 'The canonical tool receipt records the mutation.' : 'The canonical tool receipt records no mutation.'} ${receiptStatus === 'pending' ? 'Do not resubmit; inspect the exact run from the receipt.' : 'No unrelated source or business context was used.'}`
+                  : `I could not complete the requested dashboard edit for ${scope} (${semantic}). Nothing was changed, and no unrelated analytics domain was substituted. Please inspect the exact dashboard/widget IDs and supported edit actions.`;
+              } else {
+                const loadedPresets = analyticsBriefing?.presets.join(', ') || '';
+                content = `I loaded the selected business/schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable knowledge-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check the knowledge sources (#/connections/sql-context, analytics knowledge directory) and the BotBoy log.`;
+              }
             }
 
             // ── Action-integrity gate ──
@@ -905,6 +1524,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             return;
           }
 
+          totalModelToolCalls += streamResult.toolCalls.length;
           // Validate tool call arguments are valid JSON before pushing back into history.
           // If the model streamed malformed JSON (unterminated string, missing brace), vLLM will
           // reject the NEXT request with HTTP 400 because it strictly validates tool_call args.
@@ -979,14 +1599,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }, 10_000);
             try {
               const settled = await Promise.all(sanitizedToolCalls.map((tc: any) =>
-                toolExecutor.executeTool(tc as any, {
-                  currentUserMessage: message,
-                  callerKind: 'interactive',
-                  ...(projectScope ? {
-                    authoritativeProjectIds: [projectScope.projectId],
-                    projectContextSource: projectScope.source,
-                  } : {}),
-                })
+                toolExecutor.executeTool(tc as any, toolExecutionContext)
                   .catch((error: any) => ({ content: `Error: ${error?.message ?? String(error)}` }))));
               for (const [index, tc] of sanitizedToolCalls.entries()) {
                 toolResults.push({ tc, result: settled[index] });
@@ -1006,7 +1619,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             let result: any;
             const argsUntrustworthy =
               unrecoverableArgs.has(tc.id) ||
-              (repairedArgs.has(tc.id) && WRITE_TOOLS.has(tc.function.name));
+              (repairedArgs.has(tc.id) && toolCallMayWrite(tc));
             if (argsUntrustworthy) {
               // Never execute a truncated call, and never let it feed the
               // repeat-breaker: every truncated attempt sanitizes to the same
@@ -1017,14 +1630,42 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 ? ` Re-issue write_file with SMALLER content: first chunk with mode="overwrite" (≤${limit} chars), then further chunks with mode="append".`
                 : ' Re-issue the call with smaller arguments.';
               console.warn(`[Chat] Truncated tool args for ${tc.function.name} — not executing, asking model to retry smaller`);
-              result = {
-                content: `Error: your ${tc.function.name} call was cut off mid-JSON (the arguments exceeded the output limit), so NOTHING was written or changed.${advice}`,
-              };
+              const dataRoomTool = dataRoomChatToolName(tc.function.name);
+              result = dataRoomTool
+                ? {
+                    content: JSON.stringify(createDataRoomToolFailure({
+                      tool: dataRoomTool,
+                      code: 'invalid_input',
+                      message: `${tc.function.name} arguments were malformed or cut off, so the call was not executed.`,
+                      issues: [dataRoomIssue({
+                        code: 'malformed_json',
+                        path: '$arguments',
+                        message: 'Tool arguments must be one complete valid JSON object.',
+                        expected: { kind: 'relation', description: 'Complete JSON object matching the advertised tool schema.' },
+                        received: tc.function.arguments,
+                      })],
+                      nextAction: tc.function.name === 'create_data_room_dataset'
+                        ? 'Re-issue one complete JSON call with the fully specified plan; preserve every valid field and do not use placeholders.'
+                        : 'Re-issue the call once with one complete JSON object matching the advertised schema.',
+                      phase: 'arguments',
+                      category: 'validation',
+                      retryClass: 'correct_arguments',
+                      effect: dataRoomNoEffect(),
+                    })),
+                    isError: true,
+                  }
+                : {
+                    content: `Error: your ${tc.function.name} call was cut off mid-JSON (the arguments exceeded the output limit), so NOTHING was written or changed.${advice}`,
+                  };
               toolResults.push({ tc, result });
               res.write(`data: ${JSON.stringify({ type: 'tool_result', name: tc.function.name, preview: 'arguments truncated — retry smaller' })}\n\n`);
               continue;
             }
-            const repeatKey = `${tc.function.name}:${tc.function.arguments}`;
+            const datasetAction = tc.function.name === 'create_data_room_dataset'
+              ? dataRoomDatasetAction(tc.function.arguments)
+              : undefined;
+            const isDataRoomCreateAttempt = datasetAction === 'create';
+            const repeatKey = `${tc.function.name}:${repeatCallArguments(tc.function.name, tc.function.arguments)}`;
             // wait_for_terminal is exempt: calling it repeatedly with the same
             // arguments IS the designed monitoring loop (each call returns
             // fresh progress), so the repeat-breaker must not nudge or
@@ -1037,7 +1678,78 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               tc.function.name === 'publish_static_artifact_to_harmony';
             const repeats = repeatExempt ? 0 : (seenToolCalls.get(repeatKey) ?? 0);
             if (!repeatExempt) seenToolCalls.set(repeatKey, repeats + 1);
-            if (repeats === 0) {
+            if (repeats === 0 && isDataRoomCreateAttempt && admittedDataRoomJobId) {
+              result = {
+                content: JSON.stringify(createDataRoomToolFailure({
+                  tool: 'create_data_room_dataset',
+                  code: 'durable_job_already_admitted',
+                  message: `This owner turn already admitted durable job ${admittedDataRoomJobId}; another create plan was not executed.`,
+                  issues: [dataRoomIssue({
+                    code: 'status_required_after_admission',
+                    path: 'action',
+                    message: 'Once a durable job ID exists, the source/plan is immutable for this owner request.',
+                    expected: { kind: 'relation', description: `Use {"action":"status","jobId":"${admittedDataRoomJobId}"}.` },
+                    received: 'create',
+                    includeReceivedValue: true,
+                  })],
+                  nextAction: `Observe ${admittedDataRoomJobId} with action=status; never resubmit or replace its source in this owner turn.`,
+                  status: 'blocked',
+                  phase: 'admission',
+                  category: 'conflict',
+                  retryClass: 'observe_existing',
+                  effect: dataRoomNoEffect(),
+                  target: { jobId: admittedDataRoomJobId },
+                })),
+                isError: true,
+              };
+            } else if (repeats === 0 && isDataRoomCreateAttempt && dataRoomCreateEffectNeedsRefresh) {
+              result = {
+                content: JSON.stringify(createDataRoomToolFailure({
+                  tool: 'create_data_room_dataset',
+                  code: 'effect_observation_required',
+                  message: 'An earlier creation attempt reported a committed or unknown effect without a usable durable job ID; this additional create plan was not executed.',
+                  issues: [dataRoomIssue({
+                    code: 'unknown_prior_effect',
+                    path: 'action',
+                    message: 'Creation may continue only after the prior effect is resolved from canonical Data Room state.',
+                    expected: { kind: 'relation', description: 'Refresh canonical Data Room/catalog state and do not resubmit a source while the prior effect remains unknown.' },
+                    received: 'create',
+                    includeReceivedValue: true,
+                  })],
+                  nextAction: 'Stop creating in this turn and refresh canonical Data Room state. Resume only from a later ordinary owner request after the prior effect is known; no special confirmation phrase is required.',
+                  status: 'blocked',
+                  phase: 'observation',
+                  category: 'conflict',
+                  retryClass: 'refresh_state',
+                  effect: dataRoomNoEffect(),
+                })),
+                isError: true,
+              };
+            } else if (repeats === 0 && isDataRoomCreateAttempt && dataRoomCreateAttempts >= MAX_DATA_ROOM_CREATE_ATTEMPTS) {
+              result = {
+                content: JSON.stringify(createDataRoomToolFailure({
+                  tool: 'create_data_room_dataset',
+                  code: 'repair_budget_exhausted',
+                  message: `The bounded ${MAX_DATA_ROOM_CREATE_ATTEMPTS}-attempt Data Room creation budget is exhausted; this additional plan was not executed.`,
+                  issues: [dataRoomIssue({
+                    code: 'too_many_create_attempts',
+                    path: 'action',
+                    message: 'This turn permits at most four distinct executed create attempts; semantic-hash derivation and status calls do not count.',
+                    expected: { kind: 'range', type: 'integer', maximum: MAX_DATA_ROOM_CREATE_ATTEMPTS },
+                    received: dataRoomCreateAttempts + 1,
+                    includeReceivedValue: true,
+                  })],
+                  nextAction: 'Stop creating in this turn and report the latest unresolved structured issue paths. A later ordinary owner request may resume from the corrected plan; no special confirmation phrase is required.',
+                  status: 'blocked',
+                  phase: 'admission',
+                  category: 'conflict',
+                  retryClass: 'new_owner_request',
+                  effect: dataRoomNoEffect(),
+                })),
+                isError: true,
+              };
+            } else if (repeats === 0) {
+              if (isDataRoomCreateAttempt) dataRoomCreateAttempts += 1;
               let blockingKeepalive: ReturnType<typeof setInterval> | undefined;
               if (tc.function.name === 'wait_for_terminal') {
                 // Blocking waits can hold this tool call for up to 10 minutes;
@@ -1055,6 +1767,34 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: harmony-publish ${Date.now()}\n\n`); } catch {}
                 }, 10000);
+              } else if (tc.function.name === 'query_data_room') {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '📊 Reading the verified Data Room rows...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: data-room-query ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (tc.function.name === 'create_data_room_dataset') {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🧱 Preparing the governed Data Room dataset...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: data-room-prepare ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (tc.function.name === 'configure_analytics_widget_source') {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🔌 Configuring this widget source...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: widget-source ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (tc.function.name === 'edit_analytics_dashboard') {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🧩 Applying the exact local dashboard edit...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: analytics-edit ${Date.now()}\n\n`); } catch {}
+                }, 10000);
               } else if (PARALLEL_SQL_TOOLS.has(tc.function.name)) {
                 // Warehouse queries now run on a 35-minute budget — the SSE
                 // stream must not go silent for that long or the browser
@@ -1064,29 +1804,56 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 }, 10000);
               }
               try {
-                result = await toolExecutor.executeTool(tc as any, {
-                  currentUserMessage: message,
-                  callerKind: 'interactive',
-                  ...(projectScope ? {
-                    authoritativeProjectIds: [projectScope.projectId],
-                    projectContextSource: projectScope.source,
-                  } : {}),
-                });
+                result = await toolExecutor.executeTool(tc as any, toolExecutionContext);
               } finally {
                 if (blockingKeepalive) clearInterval(blockingKeepalive);
               }
               if (tc.function.name === 'get_document_writing_guide') {
                 documentAuthoringThink = true;
               }
-              if (WRITE_TOOLS.has(tc.function.name)) {
-                writeToolCalled = true;
+              if (toolCallMayWrite(tc)) {
+                const dataRoomTool = dataRoomChatToolName(tc.function.name);
+                writeToolCalled ||= dataRoomTool
+                  ? dataRoomWriteEffectConfirmed(dataRoomTool, result?.content)
+                  : true;
+              }
+              if (isDataRoomCreateAttempt) {
+                admittedDataRoomJobId ??= dataRoomDurableJobId(result?.content);
+                dataRoomCreateEffectNeedsRefresh ||= dataRoomCreateEffectNeedsObservation(result?.content);
               }
             } else {
               if (repeats >= 2) toolsDisabled = true;
               console.warn(`[Chat] Repeated tool call blocked (x${repeats + 1}): ${repeatKey.slice(0, 120)}`);
-              result = {
-                content: `REPEATED CALL BLOCKED: you already called ${tc.function.name} with these exact arguments this turn and the result has not changed. Do not repeat it. Either call a tool with materially different arguments, or answer the user now using what you already have.`,
-              };
+              const dataRoomTool = dataRoomChatToolName(tc.function.name);
+              result = dataRoomTool
+                ? {
+                    content: JSON.stringify(createDataRoomToolFailure({
+                      tool: dataRoomTool,
+                      code: 'repeated_call',
+                      message: 'This canonically identical call already ran in the current turn, so the duplicate was not executed.',
+                      issues: [dataRoomIssue({
+                        code: 'unchanged_arguments',
+                        path: '$arguments',
+                        message: 'Arguments are canonically identical to an earlier call whose result is already in this tool loop.',
+                        expected: { kind: 'relation', description: 'Use the prior result, or correct the exact listed fields before a materially different retry.' },
+                        received: tc.function.arguments,
+                      })],
+                      nextAction: tc.function.name === 'create_data_room_dataset'
+                        ? 'Read the immediately preceding structured result: correct its exact issues, or use action=status with its jobId if durable work was admitted. Do not repeat create unchanged.'
+                        : tc.function.name === 'configure_analytics_widget_source'
+                          ? 'Use the preceding source-change receipt. If it committed, observe its run; if it was rejected, correct the exact listed issue before retrying.'
+                          : 'Use the preceding read result, or change only the argument identified by that result before retrying.',
+                      status: 'blocked',
+                      phase: 'admission',
+                      category: 'conflict',
+                      retryClass: 'observe_existing',
+                      effect: dataRoomNoEffect(),
+                    })),
+                    isError: true,
+                  }
+                : {
+                    content: `REPEATED CALL BLOCKED: you already called ${tc.function.name} with these exact arguments this turn and the result has not changed. Do not repeat it. Either call a tool with materially different arguments, or answer the user now using what you already have.`,
+                  };
             }
             toolResults.push({ tc, result });
           }
@@ -1151,6 +1918,27 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           });
           const toolImageEvidence: ToolImageEvidence[] = [];
           for (const { tc, result } of toolResults) {
+            if (tc.function.name === 'query_data_room') {
+              try {
+                const receipt = JSON.parse(String(result.content ?? '{}'));
+                analyticsCompositeReceiptSeen ||= receipt.status === 'ok'
+                  && receipt.trust === 'verified_data_room_rows'
+                  && typeof receipt.receipt?.querySha256 === 'string';
+              } catch {
+                // Malformed query output adds no evidence and never changes prose.
+              }
+            }
+            if (tc.function.name === 'edit_analytics_dashboard') {
+              try {
+                const receipt = JSON.parse(String(result.content ?? '{}'));
+                analyticsWidgetEditReceipt = ['completed', 'pending', 'blocked', 'failed', 'cancelled']
+                  .includes(String(receipt.status ?? ''))
+                  ? receipt
+                  : undefined;
+              } catch {
+                analyticsWidgetEditReceipt = undefined;
+              }
+            }
             if (tc.function.name === 'browser_screenshot') {
               try {
                 const receipt = JSON.parse(String(result.content ?? '{}'));
@@ -1186,6 +1974,39 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             console.log(`[Chat] Tool result: ${tc.function.name} resultLen=${(result.content || '').length} argsLen=${(tc.function.arguments || '').length}`);
             res.write(`data: ${JSON.stringify({ type: 'tool_result', name: tc.function.name, preview: result.content.slice(0, 200) })}\n\n`);
           }
+          // A sole, request-bound dashboard edit already has a complete
+          // deterministic receipt. Persist and finish it directly instead of
+          // spending another model stream on narration that can drop anchors
+          // and trigger an avoidable grounding retry.
+          if (conversationMode === 'analytics_dashboard'
+            && analyticsIntent !== 'create'
+            && analyticsTaskGrounding
+            && ownerRequestId
+            && totalModelToolCalls === 1
+            && sanitizedToolCalls.length === 1
+            && toolResults.length === 1
+            && pendingVisualAssetIds.size === 0
+            && unsupportedAttachmentIds.length === 0
+            && !unrecoverableArgs.has(sanitizedToolCalls[0].id)
+            && !repairedArgs.has(sanitizedToolCalls[0].id)) {
+            const receipt = trustedAnalyticsEditReceipt({
+              toolCall: sanitizedToolCalls[0],
+              result: toolResults[0].result,
+              ownerRequestId,
+              ownerMessage: message,
+              routeScope: authoritativeAnalyticsScope,
+            });
+            const content = receipt ? formatAnalyticsEditCompletion(receipt) : undefined;
+            if (receipt && content) {
+              analyticsWidgetEditReceipt = receipt;
+              const assistantId = `asst-${Date.now()}`;
+              if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
+              if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
+              res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content, createdAt: new Date().toISOString() } })}\n\n`);
+              res.end();
+              return;
+            }
+          }
           // Tool outputs must precede the following user image item. The shared
           // manager preserves the latest screenshot per tab through close/final
           // synthesis, supersedes older same-tab captures, and evicts oldest
@@ -1212,7 +2033,15 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ? 'SYSTEM (internal): the user pressed Stop. Do not request any more tools. Briefly and honestly report: what you completed, what is in progress or unverified, and the natural next step if they want you to continue. Keep it short.'
               : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
           });
-          const gen = llmClient.chatCompletionStream({ messages, maxTokens: CHAT_MAX_COMPLETION_TOKENS, think: false, usageContext: { workload: 'interactive' }, ...(modelOverride ? { model: modelOverride } : {}) });
+          const synthesisSignal = stoppedByUser ? deps.shutdown?.signal : turnState.abortController.signal;
+          const gen = llmClient.chatCompletionStream({
+            messages,
+            maxTokens: CHAT_MAX_COMPLETION_TOKENS,
+            think: false,
+            usageContext: { workload: 'interactive' },
+            ...(modelOverride ? { model: modelOverride } : {}),
+            ...(synthesisSignal ? { signal: synthesisSignal } : {}),
+          });
           let iterResult = await gen.next();
           while (!iterResult.done) {
             const chunk = iterResult.value;
@@ -1237,22 +2066,36 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         res.write(`data: ${JSON.stringify({ type: 'done', message: { id: capId, role: 'assistant', content: finalContent, createdAt: new Date().toISOString() } })}\n\n`);
         res.end();
       } catch (err: any) {
-        console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
-        // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
-        // and the user saw pure silence after reload). Persist a visible
-        // assistant message so the failed turn exists in history — work done
-        // by earlier tool iterations (file edits, submitted runs) is real and
-        // survives even though the turn died.
-        try {
-          const failId = `asst-${Date.now()}`;
-          const failText = `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`;
-          if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(failId, 'assistant', failText);
-          try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: failId, role: 'assistant', content: failText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
-        } catch {
-          try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
+        const interrupted = activeChatTurns.get(turnId);
+        if (interrupted?.shutdownRequested || interrupted?.disconnected || deps.shutdown?.isShuttingDown()) {
+          console.log(`[Chat] Turn ${turnId} ended during ${interrupted?.disconnected ? 'client disconnect' : 'process shutdown'}; no retry or synthetic failure was persisted`);
+          try { res.end(); } catch {}
+        } else if (interrupted?.stopRequested) {
+          const stopId = `asst-${Date.now()}`;
+          const stopText = '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.';
+          if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(stopId, 'assistant', stopText);
+          try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: stopId, role: 'assistant', content: stopText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
+          try { res.end(); } catch {}
+        } else {
+          console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
+          // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
+          // and the user saw pure silence after reload). Persist a visible
+          // assistant message so the failed turn exists in history — work done
+          // by earlier tool iterations (file edits, submitted runs) is real and
+          // survives even though the turn died.
+          try {
+            const failId = `asst-${Date.now()}`;
+            const failText = `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`;
+            if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(failId, 'assistant', failText);
+            try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: failId, role: 'assistant', content: failText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
+          } catch {
+            try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
+          }
+          try { res.end(); } catch {}
         }
-        try { res.end(); } catch {}
       } finally {
+        res.off('close', handleResponseClose);
+        unregisterShutdownWork?.();
         activeChatTurns.delete(turnId);
       }
       return;

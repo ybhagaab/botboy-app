@@ -21,6 +21,11 @@ describe('resolveConversationMode', () => {
       'did my sharepoint sync finish?',
       'summarize the comments on the HLD document',
       'whats on my plate today',
+      'create a task to review this chart',
+      'update the task about this chart',
+      'add this chart to a document',
+      'regarding the document about this selected chart, update its title',
+      'in the task about this selected chart, change its title',
     ]) {
       expect(resolveConversationMode({ modeHint: HINT, message })).toEqual({ mode: 'general', via: 'default' });
     }
@@ -31,6 +36,9 @@ describe('resolveConversationMode', () => {
       'why is this number trending down?',
       'refresh it and tell me what changed',
       'add a chart of weekly captures',
+      'change this selected widget to an area view',
+      'combine these two widgets into an hconcat view',
+      'combine both widgets into one view',
       'what did the query return for last month',
     ]) {
       expect(resolveConversationMode({ modeHint: HINT, message })).toEqual({ mode: 'analytics_dashboard', via: 'page-hint' });

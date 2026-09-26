@@ -96,7 +96,7 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
   };
 }
 
-export type QueryRunResultCode = 'alive_handoff' | 'remote_failed' | 'status_unavailable' | 'download_failed';
+export type QueryRunResultCode = 'alive_handoff' | 'submission_unknown' | 'remote_failed' | 'status_unavailable' | 'download_failed';
 
 export interface QueryRunResult {
   ok: boolean;
@@ -121,7 +121,13 @@ export interface QueryRunResult {
  * may read an already-submitted run without any profile, SQL, or submit effect. */
 export interface QueryRunner {
   id: string;
-  runQuery(input: { sql: string; datasetDate?: string; group?: string }): Promise<QueryRunResult>;
+  runQuery(input: {
+    sql: string;
+    datasetDate?: string;
+    group?: string;
+    /** Awaited immediately after submit returns the exact remote run identity. */
+    onSubmitted?: (runId: string) => Promise<void> | void;
+  }): Promise<QueryRunResult>;
   readRun?(input: { runId: string }): Promise<QueryRunResult>;
 }
 
@@ -515,7 +521,12 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     };
   }
 
-  async function runQuery(input: { sql: string; datasetDate?: string; group?: string }): Promise<QueryRunResult> {
+  async function runQuery(input: {
+    sql: string;
+    datasetDate?: string;
+    group?: string;
+    onSubmitted?: (runId: string) => Promise<void> | void;
+  }): Promise<QueryRunResult> {
     const sqlBody = String(input.sql ?? '').trim();
     if (!sqlBody) return { ok: false, error: 'sql required', nextAction: 'Call again with the SQL to run.' };
     const sql = DEP_HEADER_RE.test(sqlBody.slice(0, 500))
@@ -571,8 +582,9 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     if (submit.isError) {
       return {
         ok: false,
-        error: `Run submission failed: ${firstLine(submit.text)}`,
-        nextAction: 'Report the reason to the user; do not resubmit blindly.',
+        code: 'submission_unknown',
+        error: `Run submission failed without a checkpointed run ID: ${firstLine(submit.text)}`,
+        nextAction: 'Do not resubmit. Inspect the scratch job run history and reconcile an exact run ID first.',
       };
     }
     const submitted = parseJson(submit.text);
@@ -580,9 +592,24 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     if (!/^\d+$/.test(runId)) {
       return {
         ok: false,
-        error: `Submission returned no run id: ${firstLine(submit.text)}`,
-        nextAction: 'Check the job with mcp_etl_latest_run before retrying.',
+        code: 'submission_unknown',
+        error: `Submission returned no checkpointable run ID: ${firstLine(submit.text)}`,
+        nextAction: 'Do not resubmit. Check the scratch job run history and reconcile an exact run ID first.',
       };
+    }
+    if (input.onSubmitted) {
+      try {
+        await input.onSubmitted(runId);
+      } catch {
+        return {
+          ok: false,
+          code: 'alive_handoff',
+          runId,
+          remoteStatus: 'SUBMITTED',
+          error: `Run ${runId} was submitted, but BotBoy could not persist its local continuation checkpoint.`,
+          nextAction: `Do NOT resubmit. Preserve runId ${runId} and retry status/download continuation only.`,
+        };
+      }
     }
 
     // Poll to a terminal state within the budget. WAITING_FOR_RESOURCES is a

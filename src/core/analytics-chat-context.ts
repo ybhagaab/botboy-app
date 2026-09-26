@@ -4,6 +4,7 @@ import type { McpManager } from './mcp-types.js';
 import { endpointContextTokens } from './limits.js';
 import { sqlDashboardLaneUsable } from './analytics-runners.js';
 import { listAnalyticsContext, loadAnalyticsContext } from './analytics-context.js';
+import { isGenericWorkArtifactRequest } from './analytics-widget-edit-intent.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 /** Kimi-era floor for analytics operating knowledge; the old path allowed only 16K characters. */
@@ -88,7 +89,7 @@ export interface AnalyticsSchemaBriefing {
 }
 
 export interface AnalyticsSchemaBriefingLoader {
-  load(message?: string): Promise<AnalyticsSchemaBriefing>;
+  load(message?: string, options?: { localOnly?: boolean }): Promise<AnalyticsSchemaBriefing>;
 }
 
 export interface AnalyticsSchemaBriefingLoaderOptions {
@@ -117,6 +118,7 @@ export function detectAnalyticsConversation(message: string): boolean {
   const text = message.trim();
   if (!text) return false;
 
+  if (isGenericWorkArtifactRequest(text)) return false;
   if (SOFTWARE_IMPLEMENTATION_RE.test(text) && !BUSINESS_ANALYTICS_RE.test(text)) return false;
   if (ANALYTICS_STRONG_SIGNAL_RE.test(text)) return true;
   if (DASHBOARD_CREATE_RE.test(text)) return true;
@@ -136,7 +138,7 @@ export function detectAnalyticsCreateIntent(message: string): boolean {
  * so unrelated questions asked while a dashboard happens to be open stay in
  * general mode (owner report 2026-08-27).
  */
-const PAGE_DEIXIS_RE = /\b(?:this|these|that|those|the)\s+(?:dashboards?|reports?|charts?|graphs?|widgets?|tables?|numbers?|figures?|metrics?|views?|pages?|queries|query|runs?)\b|\brefresh(?:ing|es)?\b|\bre-?run(?:ning)?\b/i;
+const PAGE_DEIXIS_RE = /\b(?:this|these|that|those|the)\s+(?:(?:selected|visible|current|two)\s+)?(?:dashboards?|reports?|charts?|graphs?|widgets?|tables?|numbers?|figures?|metrics?|views?|pages?|queries|query|runs?)\b|\bboth(?:\s+(?:selected|visible|current))?\s+(?:dashboards?|reports?|charts?|graphs?|widgets?|tables?|numbers?|figures?|metrics?|views?|queries|query|runs?)\b|\brefresh(?:ing|es)?\b|\bre-?run(?:ning)?\b/i;
 
 /**
  * Detection when an analytics view is OPEN (ambient page hint). The open page
@@ -148,6 +150,7 @@ const PAGE_DEIXIS_RE = /\b(?:this|these|that|those|the)\s+(?:dashboards?|reports
 export function detectAnalyticsConversationWithPageHint(message: string): boolean {
   const text = message.trim();
   if (!text) return false;
+  if (isGenericWorkArtifactRequest(text)) return false;
   if (SOFTWARE_IMPLEMENTATION_RE.test(text) && !BUSINESS_ANALYTICS_RE.test(text)) return false;
   return detectAnalyticsConversation(text) || DASHBOARD_ARTIFACT_RE.test(text) || PAGE_DEIXIS_RE.test(text);
 }
@@ -367,7 +370,7 @@ export function createAnalyticsSchemaBriefingLoader(
   const cache = new Map<string, { expiresAt: number; value: AnalyticsSchemaBriefing }>();
 
   return {
-    async load(message = ''): Promise<AnalyticsSchemaBriefing> {
+    async load(message = '', runtimeOptions: { localOnly?: boolean } = {}): Promise<AnalyticsSchemaBriefing> {
       // ── Source 1: managed SQL connector schema presets ──
       // Connector trouble degrades to the knowledge-dir source with an
       // honest note instead of failing the whole briefing (teammates run
@@ -377,7 +380,10 @@ export function createAnalyticsSchemaBriefingLoader(
       let sqlStatusLine = '';
       let sqlPresetListText = '';
       let serverStamp = 'no-connector';
-      if (!mcpManager) {
+      if (runtimeOptions.localOnly) {
+        serverStamp = 'local-only';
+        sqlStatusLine = 'Managed SQL schema discovery: deferred until the data room reports a local miss.';
+      } else if (!mcpManager) {
         sqlStatusLine = 'Managed SQL connector: unavailable (MCP runtime not running).';
       } else {
         const server = await mcpManager.getServer('sql-context');
@@ -442,7 +448,7 @@ export function createAnalyticsSchemaBriefingLoader(
       }
 
       let selection: AnalyticsContextSelection;
-      if (options.selector) {
+      if (options.selector && !runtimeOptions.localOnly) {
         try {
           selection = await options.selector({ message, catalog });
         } catch (error: any) {
@@ -530,8 +536,25 @@ export function createAnalyticsSchemaBriefingLoader(
   };
 }
 
-export function isAnalyticsReplyGrounded(content: string, briefing: AnalyticsSchemaBriefing): boolean {
-  if (!briefing.ready) return true;
+export interface AnalyticsTaskGrounding {
+  requiredExactAnchors: string[];
+  canonicalSemanticAnchors: string[];
+  datasetIds: string[];
+  promptBlock: string;
+}
+
+export function isAnalyticsReplyGrounded(
+  content: string,
+  briefing: AnalyticsSchemaBriefing | undefined,
+  task?: AnalyticsTaskGrounding,
+): boolean {
   const normalized = content.toLowerCase();
+  if (task) {
+    const exact = task.requiredExactAnchors.every(anchor => normalized.includes(anchor.toLowerCase()));
+    const semantic = task.canonicalSemanticAnchors.length === 0
+      || task.canonicalSemanticAnchors.some(anchor => normalized.includes(anchor.toLowerCase()));
+    return exact && semantic;
+  }
+  if (!briefing?.ready) return true;
   return briefing.groundingTerms.some(term => normalized.includes(term));
 }

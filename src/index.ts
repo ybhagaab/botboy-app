@@ -11,10 +11,25 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
 import { createMcpManager } from './core/mcp-manager.js';
-import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
+import { createAnalyticsDashboardService, parseSqlMcpResult, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
 import { createDashboardEtlRunner } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
+import { createAnalyticsDataRoomStore } from './core/analytics-data-room-store.js';
+import { createAnalyticsDataRoomBackupService } from './core/analytics-data-room-backup.js';
+import { createAnalyticsDataRoomService } from './core/analytics-data-room-service.js';
+import { createAnalyticsLocalQueryEngine } from './core/analytics-data-room-query.js';
+import { createAnalyticsDataRoomReadService } from './core/analytics-data-room-read.js';
+import { createAnalyticsDashboardDataRoomBridge } from './core/analytics-dashboard-data-room.js';
+import { createAnalyticsDerivationService } from './core/analytics-data-room-derivation.js';
+import { createAnalyticsDataRoomScheduler } from './core/analytics-data-room-scheduler.js';
+import { createAnalyticsJobStore } from './core/analytics-job-store.js';
+import { createAnalyticsJobPlanner } from './core/analytics-job-planner.js';
+import { createAnalyticsJobService, type AnalyticsJobService } from './core/analytics-job-service.js';
+import { createAnalyticsAnswerService, createManagedAnalyticsAnswerRuntime } from './core/analytics-data-room-answer.js';
+import { createAnalyticsImportInbox } from './core/analytics-import-inbox.js';
+import { analyticsImportProviderReceipt, createAnalyticsImportSemanticProposalService } from './core/analytics-import-semantic-proposal.js';
+import { createAnalyticsImportPromotionService } from './core/analytics-import-promotion.js';
 import { createCdpProvisionTransport, ensureHarmonyViewerAccess, provisionHarmonyIdentity, verifyHarmonyArtifactContent } from './core/harmony-provision.js';
 import { createNodeManager } from './core/node-manager.js';
 import { createEventBus } from './core/event-bus.js';
@@ -25,6 +40,7 @@ import { createScreenshotStore } from './core/screenshot-store.js';
 import { createDocumentParser } from './core/document-parser.js';
 import { createAcpClient } from './core/acp-client.js';
 import { createInferenceProviderFromEnv } from './core/inference-provider.js';
+import { resolveOwnerIdentity } from './core/owner-identity.js';
 import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
@@ -33,7 +49,7 @@ import { createBrowserHandsService } from './core/browser-hands.js';
 import { createVisualAssetRegistry } from './core/visual-assets.js';
 import { createVisualInspector } from './core/visual-inspector.js';
 import { createProjectArtifactService } from './core/project-artifacts.js';
-import { createEtlToolCall } from './core/etl-adhoc.js';
+import { createEtlQueryRunner, createEtlToolCall } from './core/etl-adhoc.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
 import { createMidwaySentinel } from './core/midway-sentinel.js';
@@ -92,6 +108,7 @@ import { createBackfiller } from './core/backfill.js';
 import { checkDependencies } from './core/deps-check.js';
 import { initToolchain } from './core/toolchain.js';
 import { createChatTerminalService } from './core/chat-terminal.js';
+import { createShutdownCoordinator } from './core/shutdown-coordinator.js';
 import { getSetting, setSetting } from './core/storage.js';
 import { addLocalFolder, listLocalFolders } from './core/local-folders-config.js';
 import { WebClient } from '@slack/web-api';
@@ -280,6 +297,41 @@ async function main() {
   const mcpManager = createMcpManager({ db });
   startInBackground('Managed MCP runtime', () => mcpManager.start(), '✅ Managed MCP runtime initialized');
 
+  // R0–R4 analytics data room: one private immutable store, bounded local
+  // reader, exact-input derivation coordinator, source-neutral answer path,
+  // and stable dashboard binding bridge. The data-room materializer keeps its
+  // independent slot; bound widget fan-out uses selective dashboard children.
+  // R5 controls/UI/search/publication remain absent.
+  const analyticsDataRoomStore = createAnalyticsDataRoomStore({ db });
+  const analyticsJobStore = createAnalyticsJobStore({ db });
+  let analyticsJobService!: AnalyticsJobService;
+  const analyticsDataRoomBackups = createAnalyticsDataRoomBackupService({
+    db,
+    store: analyticsDataRoomStore,
+  });
+  const analyticsDataRoom = createAnalyticsDataRoomService({
+    store: analyticsDataRoomStore,
+    backups: analyticsDataRoomBackups,
+  });
+  const analyticsLocalQuery = createAnalyticsLocalQueryEngine({ store: analyticsDataRoomStore });
+  const analyticsDashboardDataRoomRead = createAnalyticsDataRoomReadService({
+    store: analyticsDataRoomStore,
+  });
+  const analyticsDashboardDataRoom = createAnalyticsDashboardDataRoomBridge({
+    db,
+    store: analyticsDataRoomStore,
+    localQuery: analyticsLocalQuery,
+  });
+  const analyticsDerivation = createAnalyticsDerivationService({
+    db,
+    store: analyticsDataRoomStore,
+  });
+  const analyticsDataRoomScheduler = createAnalyticsDataRoomScheduler({
+    derivation: analyticsDerivation,
+    jobLane: { processNext: () => analyticsJobService?.processNext() ?? Promise.resolve(0) },
+    onError: error => console.warn('[AnalyticsDataRoom] scheduler failed:', error instanceof Error ? error.message : error),
+  });
+
   // Dashboards remain canonical in local SQLite. MCP query results are
   // persisted through this single service for API, agent, and scheduler use.
   // The ETL runner is the A4 fallback lane: used only when sql-context is
@@ -293,6 +345,8 @@ async function main() {
     db,
     mcpManager,
     etlRunner: createDashboardEtlRunner({ db, mcpManager }),
+    dataRoom: analyticsDashboardDataRoom,
+    dataRoomRead: analyticsDashboardDataRoomRead,
     onRunFailure: async event => {
       if (!analyticsRunFailureHandler) {
         console.warn(`[Analytics] run ${event.runId} failed before the escalation agent was ready — not escalated`);
@@ -304,6 +358,7 @@ async function main() {
   const dashboardPublisher = createDashboardPublisherService({
     db,
     analyticsService,
+    dataRoom: analyticsDashboardDataRoom,
     harmonyHooks: {
       provision: () => provisionHarmonyIdentity(createCdpProvisionTransport()),
       ensureViewerAccess: context => ensureHarmonyViewerAccess(createCdpProvisionTransport(), context),
@@ -321,6 +376,9 @@ async function main() {
   const dedup = createDeduplicator();
   const screenshotStore = createScreenshotStore();
   const documentParser = createDocumentParser();
+  // R6 intake remains a separate, owner-only capability: exact workbook
+  // bytes and bounded preview, with no dataset/dashboard/connector authority.
+  const analyticsImportInbox = createAnalyticsImportInbox({ db, documentParser });
 
   // ── Shared inference provider ──
   // One provider creates the single client used by chat, rolling summaries,
@@ -346,6 +404,87 @@ async function main() {
   if (inferenceProvider.localFallbackEnabled) {
     console.warn('⚠️  Local LLM fallback is enabled; background output may use a different model when the primary provider is unavailable.');
   }
+
+  // R6.2 import semantics remains separate from intake and from the governed
+  // writer: one no-tools background proposal service prepares owner review;
+  // only the promotion coordinator receives the narrow Data Room writer.
+  const ownerIdentity = resolveOwnerIdentity(db);
+  const analyticsImportSemantic = createAnalyticsImportSemanticProposalService({
+    db,
+    candidateReader: analyticsImportInbox,
+    importRootDir: analyticsImportInbox.rootDir,
+    documentParser,
+    llm: llmClient,
+    provider: {
+      id: inferenceProvider.id,
+      endpoint: inferenceProvider.endpoint,
+      model: inferenceProvider.model,
+      apiMode: inferenceProvider.apiMode,
+    },
+    ownerId: ownerIdentity.alias || ownerIdentity.email || 'local-owner',
+  });
+  const analyticsImportPromotion = createAnalyticsImportPromotionService({
+    db,
+    candidateReader: analyticsImportInbox,
+    proposalService: analyticsImportSemantic,
+    dataRoom: analyticsDataRoom,
+  });
+  const analyticsAnswerEtlRunner = createEtlQueryRunner({
+    db,
+    call: createEtlToolCall(mcpManager),
+  });
+  const analyticsAnswerRemote = createManagedAnalyticsAnswerRuntime({
+    mcpManager,
+    etlRunner: analyticsAnswerEtlRunner,
+  });
+  const answerProviderReceipt = analyticsImportProviderReceipt(inferenceProvider);
+  const analyticsDataRoomRead = createAnalyticsDataRoomReadService({
+    store: analyticsDataRoomStore,
+    modelContextRuntime: answerProviderReceipt,
+  });
+  const analyticsJobPlanner = createAnalyticsJobPlanner({
+    db,
+    store: analyticsDataRoomStore,
+    llm: llmClient,
+  });
+  analyticsJobService = createAnalyticsJobService({
+    db,
+    store: analyticsDataRoomStore,
+    jobStore: analyticsJobStore,
+    planner: analyticsJobPlanner,
+    derivation: analyticsDerivation,
+    localQuery: analyticsLocalQuery,
+    dataRoom: analyticsDataRoom,
+    etlRunner: analyticsAnswerEtlRunner,
+    sqlRunner: {
+      execute: async sql => {
+        const call = await mcpManager.callTool(
+          'sql-context',
+          'run_query',
+          { sql },
+          { source: 'agent', timeoutMs: 35 * 60_000 },
+        );
+        if (call.isError) throw new Error(call.text || 'SQL preparation query failed.');
+        const parsed = parseSqlMcpResult(call.text);
+        return {
+          columns: parsed.columns,
+          rows: parsed.rows,
+          rowCount: parsed.rowCount,
+          displayedRowCount: parsed.displayedRowCount,
+          truncated: parsed.displayedRowCount !== parsed.rowCount,
+        };
+      },
+    },
+    modelContextRuntime: answerProviderReceipt,
+  });
+  const analyticsAnswerService = createAnalyticsAnswerService({
+    db,
+    store: analyticsDataRoomStore,
+    localQuery: analyticsLocalQuery,
+    derivation: analyticsDerivation,
+    remote: analyticsAnswerRemote,
+    modelContextRuntime: answerProviderReceipt,
+  });
 
   // ── Conversation Manager + Prompt Manager + Tool Executor ──
   const conversationManager = createConversationManager(db);
@@ -430,7 +569,7 @@ async function main() {
   // General browser hands: persistent BotBoy-created tabs in the same debug
   // Chrome profile used by ambient capture. Initialization is best-effort at
   // boot and retried lazily by the tools if Chrome becomes available later.
-  const browserHands = createBrowserHandsService();
+  const browserHands = createBrowserHandsService({ protectedAppPort: PORT });
   await browserHands.initialize().catch((error: any) => {
     console.warn(`[BrowserHands] Debug Chrome not ready at boot: ${error?.message ?? error}`);
   });
@@ -438,6 +577,13 @@ async function main() {
     brainStore,
     mcpManager,
     analyticsService,
+    analyticsScheduler,
+    analyticsAnswerService,
+    analyticsJobService,
+    analyticsJobOwnerId: ownerIdentity.alias || ownerIdentity.email || 'local-owner',
+    analyticsDataRoom,
+    analyticsDataRoomRead,
+    modelContextRuntime: answerProviderReceipt,
     dashboardPublisher,
     chatTerminal,
     contentStore,
@@ -1018,6 +1164,110 @@ async function main() {
       .catch((err) => console.warn(`[fs] initial backfill failed for ${folder.path}:`, err?.message ?? err));
   }
 
+  // ── Bounded process shutdown ──
+  // One coordinator owns admission, locally abortable work, HTTP sockets,
+  // bounded subsystem close, and the DB-last receipt. Durable analytics work
+  // is never cancelled remotely; it is named for startup recovery instead.
+  const shutdownCoordinator = createShutdownCoordinator({
+    server: httpServer,
+    databasePath: db.name,
+    flushQueue: () => storage.flushQueue(),
+    closeDatabase: () => storage.close(),
+    quiesce: () => {
+      const failures: string[] = [];
+      const stop = (name: string, operation: () => void) => {
+        try { operation(); } catch (error: any) {
+          failures.push(`${name}: ${String(error?.message ?? error).slice(0, 160)}`);
+        }
+      };
+      stop('grasp', () => graspSync.stop());
+      stop('sharepoint', () => sharePointSync.stop());
+      stop('pipeline', () => pipelineOrchestrator.stop());
+      stop('data-room-scheduler', () => analyticsDataRoomScheduler.stop());
+      stop('analytics-jobs', () => analyticsJobService?.stop());
+      stop('import-semantic', () => analyticsImportSemantic.stop());
+      stop('import-promotion', () => analyticsImportPromotion.stop());
+      stop('analytics-scheduler', () => analyticsScheduler.stop());
+      stop('background-processor', () => backgroundProcessor?.stop());
+      stop('browser-monitor', () => browserMonitor.stop());
+      stop('app-monitor', () => appMonitor.stop());
+      stop('clipboard-monitor', () => clipboardMonitor.stop());
+      stop('slack-monitor', () => slackMonitor.stop());
+      stop('context-sync', () => contextManager?.stopAutoSync());
+      stop('midway-sentinel', () => midwaySentinel.stop());
+      stop('chat-terminal', () => chatTerminal.shutdown());
+      if (failures.length) throw new Error(`Quiesce failures: ${failures.join('; ')}`);
+    },
+    closeStages: [
+      {
+        name: 'analytics-job-processing',
+        timeoutMs: 12_000,
+        close: async () => {
+          await analyticsJobService?.drain();
+        },
+      },
+      {
+        name: 'import-processing',
+        timeoutMs: 12_000,
+        close: async () => {
+          await Promise.all([analyticsImportSemantic.drain(), analyticsImportPromotion.drain()]);
+        },
+      },
+      { name: 'filesystem', timeoutMs: 3_000, close: () => filesystemMonitor.stop() },
+      { name: 'mcp', timeoutMs: 10_000, close: () => mcpManager.stop() },
+      {
+        name: 'terminal',
+        timeoutMs: 6_000,
+        close: async () => {
+          const before = chatTerminal.current();
+          if (!before || before.status !== 'running') return;
+          const after = await chatTerminal.waitForEnd(5_500);
+          if (after?.status === 'running') throw new Error(`Terminal ${after.id} did not exit after shutdown`);
+        },
+        force: () => chatTerminal.shutdown(),
+      },
+    ],
+    beforeDatabaseClose: () => {
+      llmClient.close();
+      conversationManager.pruneOldSessions();
+    },
+    onEscalate: () => chatTerminal.shutdown(),
+    durableWorkSnapshot: () => db.prepare(`
+      SELECT id, 'dashboard_run' AS kind, 'startup_recovery' AS disposition
+      FROM analytics_runs WHERE status IN ('queued','running')
+      UNION ALL
+      SELECT id, 'dataset_run', 'startup_recovery'
+      FROM analytics_dataset_runs WHERE status IN ('staging','verifying')
+      UNION ALL
+      SELECT id, 'derived_run', 'startup_recovery'
+      FROM analytics_derived_runs WHERE status IN ('queued','running')
+      UNION ALL
+      SELECT id, 'analytics_job', 'startup_recovery'
+      FROM analytics_jobs WHERE status IN ('planning','running','delivering','cancel_requested')
+      UNION ALL
+      SELECT id, 'analytics_job_node', 'startup_recovery'
+      FROM analytics_job_nodes WHERE state IN ('ready','running','waiting_external')
+      UNION ALL
+      SELECT id, 'import_inbox', 'startup_recovery'
+      FROM analytics_import_inbox_items WHERE status IN ('receiving','inspecting')
+      UNION ALL
+      SELECT id, 'import_semantic', 'startup_recovery'
+      FROM analytics_import_semantic_proposals WHERE status = 'processing'
+      UNION ALL
+      SELECT id, 'import_promotion', 'startup_recovery'
+      FROM analytics_import_promotions WHERE status IN ('approved','promoting')
+      ORDER BY kind, id
+    `).all() as Array<{ id: string; kind: string; disposition: string }>,
+    limitations: [
+      'In-flight GRASP/SharePoint/Slack/pipeline operations stop with the process but are not centrally drainable in F3.',
+      'Managed MCP close is bounded by the coordinator; a timeout is forced/incomplete resource evidence, never clean.',
+      'Shared debug Chrome is launcher-owned and is never terminated by application shutdown.',
+    ],
+    httpGraceMs: 5_000,
+    httpSettleMs: 2_000,
+    hardDeadlineMs: 25_000,
+  });
+
   // ── Express API ──
   const app = express();
   // 16mb: chat image attachments arrive as base64 data URLs (8MB binary cap
@@ -1050,6 +1300,12 @@ async function main() {
     contentStore,
     documentParser,
     analyticsService,
+    analyticsScheduler,
+    analyticsDataRoom,
+    analyticsImportInbox,
+    analyticsImportSemantic,
+    analyticsImportPromotion,
+    analyticsAnswerService,
     dashboardPublisher,
     productDocumentService,
     productDocumentPublications,
@@ -1059,6 +1315,7 @@ async function main() {
     visualAssets,
     visualInspector,
     projectArtifacts,
+    shutdown: shutdownCoordinator.context,
   };
   app.use('/api', createRouter(routerDeps));
 
@@ -1104,6 +1361,12 @@ async function main() {
     console.log('✅ Midway sentinel active (auto re-auth flow for session-backed MCPs)');
   }
 
+  analyticsImportSemantic.start();
+  analyticsImportPromotion.start();
+  console.log('✅ Data Room import semantic review initialized');
+  analyticsJobService.start();
+  analyticsDataRoomScheduler.start();
+  console.log('✅ Analytics data-room derivation and job scheduler initialized');
   analyticsScheduler.start();
   console.log('✅ Durable analytics scheduler initialized');
 
@@ -1111,43 +1374,21 @@ async function main() {
   // succeeded. Swap the listener last: this turns the version endpoint from
   // provisional 503 into the launcher's receipt-backed final-ready signal.
   httpServer.removeListener('request', bootHandler);
-  httpServer.on('request', app);
+  httpServer.on('request', shutdownCoordinator.wrapRequestHandler(app));
   console.log(`✅ API server running on http://${HOST}:${PORT} — dashboard ready in ${((Date.now() - bootStartedAt) / 1000).toFixed(1)}s`);
   console.log(`🔍 Tracking your activity. Dashboard: http://${HOST}:${PORT}`);
 
-  // Use one guarded path for both terminal interrupts and process termination.
-  // The MCP manager stops its child processes before local storage closes.
-  let shutdownPromise: Promise<void> | null = null;
-  const shutdown = (signal: NodeJS.Signals): Promise<void> => {
-    if (shutdownPromise) return shutdownPromise;
-    shutdownPromise = (async () => {
+  // Every signal enters the same state machine. The first closes admission
+  // and starts bounded cleanup; any later signal performs real escalation
+  // instead of returning an already-stuck promise.
+  const handleShutdownSignal = (signal: NodeJS.Signals) => {
+    if (!shutdownCoordinator.context.isShuttingDown()) {
       console.log(`\n🔍 Shutting down after ${signal}...`);
-      graspSync.stop();
-      sharePointSync.stop();
-      pipelineOrchestrator.stop();
-      analyticsScheduler.stop();
-      const serverClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
-      backgroundProcessor?.stop();
-      browserMonitor.stop();
-      appMonitor.stop();
-      clipboardMonitor.stop();
-      slackMonitor.stop();
-      await filesystemMonitor.stop().catch(() => {});
-      contextManager?.stopAutoSync();
-      midwaySentinel.stop();
-      chatTerminal.shutdown();
-      await mcpManager.stop().catch((error) => console.warn('[MCP] shutdown failed:', error?.message ?? error));
-      await serverClosed;
-      llmClient.close();
-      conversationManager.pruneOldSessions();
-      storage.close();
-      process.exit(0);
-    })();
-    return shutdownPromise;
+    }
+    void shutdownCoordinator.begin(signal);
   };
-
-  process.on('SIGINT', () => { void shutdown('SIGINT'); });
-  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.on('SIGINT', () => handleShutdownSignal('SIGINT'));
+  process.on('SIGTERM', () => handleShutdownSignal('SIGTERM'));
 }
 
 main().catch(err => {

@@ -1,8 +1,57 @@
 import { Router, Request, Response } from 'express';
 import { hasLiveMidwayCliSession } from '../../core/publish-harmony.js';
+import { DashboardPublicationError } from '../../core/analytics-publisher.js';
+import { AnalyticsDashboardDataRoomError } from '../../core/analytics-dashboard-data-room.js';
 import { paramStr, type RouterDeps } from './deps.js';
+import { requireLocalOwnerMutation } from './local-owner.js';
+import type { DashboardState } from './dashboard.js';
 
-export function createAnalyticsRouter(deps: RouterDeps): Router {
+function analyticsMutationStatus(error: unknown): number {
+  if (error instanceof AnalyticsDashboardDataRoomError) {
+    if (error.code === 'not_found') return 404;
+    if (error.code === 'conflict') return 409;
+    return 400;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/not found/i.test(message)) return 404;
+  if (/revision changed|conflicts with active|cannot change while|changed during/i.test(message)) return 409;
+  return 400;
+}
+
+function analyticsControlMutationStatus(error: unknown): number {
+  if (error instanceof AnalyticsDashboardDataRoomError) {
+    if (error.code === 'not_found') return 404;
+    if (error.code === 'conflict' || error.code === 'waiting_for_data') return 409;
+    return 422;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (/not found|no data-room binding/i.test(message)) return 404;
+  if (/changed|conflict|cannot change while|active refresh/i.test(message)) return 409;
+  return 422;
+}
+
+function dashboardPublicationStatus(error: unknown): number {
+  if (!(error instanceof DashboardPublicationError)) return 400;
+  if (error.code === 'not_found') return 404;
+  if (error.code === 'policy_denied') return 403;
+  if (error.code === 'publication_not_ready' || error.code === 'publication_snapshot_drift') return 409;
+  if (error.code === 'publication_provider_failed') return 502;
+  return 400;
+}
+
+function dashboardPublicationErrorBody(error: unknown): Record<string, unknown> {
+  if (error instanceof DashboardPublicationError) {
+    return {
+      code: error.code,
+      error: error.message,
+      nextAction: error.nextAction,
+      drift: error.drift,
+    };
+  }
+  return { error: error instanceof Error ? error.message : String(error) };
+}
+
+export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: DashboardState): Router {
   const router = Router();
 
   router.get('/analytics/publisher', (_req: Request, res: Response) => {
@@ -145,6 +194,104 @@ export function createAnalyticsRouter(deps: RouterDeps): Router {
     }
   });
 
+  router.put('/analytics/dashboards/:id/widgets/:widgetId', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
+    try {
+      const dashboardId = paramStr(req.params.id);
+      const widget = deps.analyticsService.updateWidget(
+        dashboardId,
+        paramStr(req.params.widgetId),
+        req.body,
+      );
+      res.json({ widget, dashboard: deps.analyticsService.getDashboard(dashboardId) });
+    } catch (error) {
+      res.status(analyticsMutationStatus(error)).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.put('/analytics/dashboards/:id/widgets/:widgetId/binding', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
+    try {
+      const dashboardId = paramStr(req.params.id);
+      const result = deps.analyticsService.updateWidgetBinding(
+        dashboardId,
+        paramStr(req.params.widgetId),
+        req.body,
+      );
+      if (result.run) {
+        void deps.analyticsScheduler?.runDueNow().catch(error => {
+          console.warn(`[Analytics controls] scheduler wake failed: ${error instanceof Error ? error.message : error}`);
+        });
+      }
+      res.status(result.run ? 202 : 200).json({ ...result, dashboard: deps.analyticsService.getDashboard(dashboardId) });
+    } catch (error) {
+      res.status(analyticsMutationStatus(error)).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.get('/analytics/dashboards/:id/widgets/:widgetId/controls', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    try {
+      const controls = deps.analyticsService.getWidgetControls(
+        paramStr(req.params.id),
+        paramStr(req.params.widgetId),
+      );
+      res.set('Cache-Control', 'no-store');
+      res.json({ controls });
+    } catch (error) {
+      const status = analyticsControlMutationStatus(error);
+      res.status(status).json({
+        code: error instanceof AnalyticsDashboardDataRoomError ? error.code : status === 404 ? 'not_found' : 'invalid_input',
+        error: error instanceof Error ? error.message : String(error),
+        nextAction: status === 409 ? 'Reload the current widget controls and retry once.' : 'Use only the server-returned control definition and current CAS receipt.',
+      });
+    }
+  });
+
+  router.put('/analytics/dashboards/:id/widgets/:widgetId/controls', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
+    try {
+      const dashboardId = paramStr(req.params.id);
+      const result = deps.analyticsService.applyWidgetControls(
+        dashboardId,
+        paramStr(req.params.widgetId),
+        req.body,
+      );
+      if (result.run) {
+        void deps.analyticsScheduler?.runDueNow().catch(error => {
+          console.warn(`[Analytics controls] scheduler wake failed: ${error instanceof Error ? error.message : error}`);
+        });
+      }
+      res.status(result.run ? 202 : 200).json({ ...result, dashboard: deps.analyticsService.getDashboard(dashboardId) });
+    } catch (error) {
+      const status = analyticsControlMutationStatus(error);
+      res.status(status).json({
+        code: error instanceof AnalyticsDashboardDataRoomError ? error.code : status === 404 ? 'not_found' : status === 409 ? 'conflict' : 'invalid_input',
+        error: error instanceof Error ? error.message : String(error),
+        nextAction: status === 409 ? 'Reload the current widget controls and retry once.' : 'Use only the server-returned control definition and bounded typed values.',
+      });
+    }
+  });
+
+  router.post('/analytics/dashboards/:id/refresh/widgets', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
+    try {
+      const dashboardId = paramStr(req.params.id);
+      const run = deps.analyticsService.enqueueSelectiveRefresh(
+        dashboardId,
+        req.body?.widgetIds,
+        'manual',
+      );
+      res.status(202).json({ run, dashboard: deps.analyticsService.getDashboard(dashboardId) });
+    } catch (error) {
+      res.status(analyticsMutationStatus(error)).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   router.delete('/analytics/dashboards/:id', (req: Request, res: Response) => {
     if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
     try {
@@ -158,31 +305,41 @@ export function createAnalyticsRouter(deps: RouterDeps): Router {
   });
 
   router.post('/analytics/dashboards/:id/share-request', (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store');
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
     try {
       const shareRequest = deps.dashboardPublisher.createShareRequest(paramStr(req.params.id));
       res.status(201).json({ shareRequest });
-    } catch (error: any) {
-      const status = /not found/i.test(error?.message ?? '') ? 404 : 400;
-      res.status(status).json({ error: error?.message ?? String(error) });
+    } catch (error) {
+      res.status(dashboardPublicationStatus(error)).json(dashboardPublicationErrorBody(error));
     }
   });
 
   router.post('/analytics/dashboards/:id/publish', async (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store');
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
+    if (!requireLocalOwnerMutation(req, res)) return;
     if (req.body?.confirmed !== true) {
-      return res.status(400).json({ error: 'confirmed must be true after the user reviews the exact upload destination and impact' });
+      return res.status(400).json({
+        code: 'invalid_confirmation',
+        error: 'confirmed must be true after the user reviews the exact upload destination and impact',
+        nextAction: 'Prepare or review the current snapshot, then explicitly confirm that exact receipt.',
+        drift: [],
+      });
     }
     try {
       const result = await deps.dashboardPublisher.publish(
         paramStr(req.params.id),
         String(req.body?.confirmationToken ?? ''),
       );
+      dashboardState?.bump();
       res.status(201).json(result);
-    } catch (error: any) {
-      const message = error?.message ?? String(error);
-      const status = /not found/i.test(message) ? 404 : /upload failed/i.test(message) ? 502 : 400;
-      res.status(status).json({ error: message });
+    } catch (error) {
+      if (error instanceof DashboardPublicationError && error.code === 'publication_provider_failed') {
+        dashboardState?.bump();
+      }
+      res.status(dashboardPublicationStatus(error)).json(dashboardPublicationErrorBody(error));
     }
   });
 

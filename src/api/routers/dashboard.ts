@@ -13,6 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import type Database from 'better-sqlite3';
 import { getToolchainSnapshot, initToolchain, loadPersistedToolchain } from '../../core/toolchain.js';
+import { readAnalyticsDataRoomVersion } from '../../core/analytics-data-room-version.js';
 import type { ChatTerminalService } from '../../core/chat-terminal.js';
 
 /** Identity of this server process — new on every restart. */
@@ -160,6 +161,7 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
     res.json({
       version: currentVersion(),
       analyticsVersion: currentAnalyticsVersion(),
+      dataRoomVersion: readAnalyticsDataRoomVersion(db),
       documentsVersion: currentDocumentsVersion(),
       bootId: BOOT_ID,
       // Non-secret local receipt used by start.sh to prove that readiness came

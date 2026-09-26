@@ -140,7 +140,8 @@ export function classifyWidgetFailure(error: string | null | undefined): WidgetF
 
 export function isCrossLaneRetryableFailure(error: string | null | undefined): boolean {
   return classifyWidgetFailure(error) === 'infra'
-    && !/\bretry also failed:/i.test(String(error ?? ''));
+    && !/\bretry also failed:/i.test(String(error ?? ''))
+    && !/\bdo not resubmit\b/i.test(String(error ?? ''));
 }
 
 /** Strong lane-outage shapes that justify stopping new widget claims. Generic

@@ -537,6 +537,16 @@ export function createWorkspaceCatalogService(options: {
     const brainPath = row.brain_path;
     let detachedEvidence = 0;
     db.transaction(() => {
+      const activeDashboard = db.prepare(`
+        SELECT run.id AS run_id, link.dashboard_id
+        FROM analytics_dashboard_projects link
+        JOIN analytics_runs run ON run.dashboard_id = link.dashboard_id
+        WHERE link.project_id = ? AND run.status IN ('queued','running')
+        ORDER BY run.queued_at, run.id LIMIT 1
+      `).get(id) as { run_id: string; dashboard_id: string } | undefined;
+      if (activeDashboard) {
+        throw new Error(`Project cannot be deleted while analytics refresh ${activeDashboard.run_id} is active on dashboard ${activeDashboard.dashboard_id}`);
+      }
       if (itemCount > 0) {
         detachedEvidence = db.prepare(`
           UPDATE work_items SET project_id = NULL,

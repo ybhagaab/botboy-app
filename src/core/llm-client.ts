@@ -85,12 +85,154 @@ export interface LlmClient {
   close(): void;
 }
 
+export interface LlmJsonSchemaResponseFormat {
+  type: 'json_schema';
+  /** Provider-safe identifier for the structured output contract. */
+  name: string;
+  /** Closed JSON Schema enforced by supporting providers before local validation. */
+  schema: Record<string, unknown>;
+  /** Structured outputs are useful here only when the provider enforces the schema exactly. */
+  strict: true;
+}
+
+export type LlmResponseFormat =
+  | { type: 'json_object' }
+  | { type: 'text' }
+  | LlmJsonSchemaResponseFormat;
+
+const STRICT_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
+const STRICT_SCHEMA_KEYS = new Set([
+  'type', 'enum', 'properties', 'required', 'additionalProperties', 'items',
+  'minimum', 'maximum', 'minItems', 'maxItems', 'description',
+]);
+
+function plainSchemaObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Validate the closed JSON-Schema subset BotBoy can map identically across its
+ * supported providers. This is a transport boundary, not business validation:
+ * callers must still parse and verify every returned value independently.
+ */
+function validateStrictJsonSchema(schema: Record<string, unknown>): void {
+  const ancestors = new WeakSet<object>();
+  const totals = { nodes: 0, properties: 0 };
+
+  const fail = (path: string, reason: string): never => {
+    throw new Error(`Structured output schema is invalid at ${path}: ${reason}.`);
+  };
+  const typesAt = (value: unknown, path: string): string[] => {
+    const values = Array.isArray(value) ? value : [value];
+    if (values.length < 1 || values.length > 2
+      || values.some(item => typeof item !== 'string' || !STRICT_SCHEMA_TYPES.has(item))
+      || new Set(values).size !== values.length
+      || (values.length === 2 && (!values.includes('null') || values.includes('object') || values.includes('array')))) {
+      fail(path, 'type must be one supported type or one primitive type plus null');
+    }
+    return values as string[];
+  };
+  const matchesType = (value: unknown, types: string[]): boolean => types.some(type => {
+    if (type === 'null') return value === null;
+    if (type === 'integer') return Number.isSafeInteger(value);
+    if (type === 'number') return typeof value === 'number' && Number.isFinite(value);
+    if (type === 'array') return Array.isArray(value);
+    if (type === 'object') return plainSchemaObject(value);
+    return typeof value === type;
+  });
+
+  const visit = (candidate: unknown, path: string, depth: number): void => {
+    if (!plainSchemaObject(candidate)) fail(path, 'schema node must be a plain object');
+    const value = candidate as Record<string, unknown>;
+    if (depth > 8 || ++totals.nodes > 256) fail(path, 'schema exceeds structural limits');
+    if (ancestors.has(value)) fail(path, 'schema must not contain a cycle');
+    ancestors.add(value);
+    try {
+      const keys = Object.keys(value);
+      const unsupported = keys.filter(key => !STRICT_SCHEMA_KEYS.has(key));
+      if (unsupported.length) fail(path, `unsupported keyword ${unsupported[0]}`);
+      if (!('type' in value)) fail(path, 'type is required');
+      const types = typesAt(value.type, `${path}.type`);
+      if (depth === 0 && (types.length !== 1 || types[0] !== 'object')) fail(path, 'root type must be object');
+      if (value.description !== undefined && (typeof value.description !== 'string' || value.description.length > 1_000)) {
+        fail(`${path}.description`, 'description must be a bounded string');
+      }
+
+      if (value.enum !== undefined) {
+        if (!Array.isArray(value.enum) || value.enum.length < 1 || value.enum.length > 100
+          || value.enum.some(item => !matchesType(item, types))
+          || new Set(value.enum.map(item => JSON.stringify(item))).size !== value.enum.length) {
+          fail(`${path}.enum`, 'enum must contain unique values matching type');
+        }
+      }
+
+      const objectType = types.length === 1 && types[0] === 'object';
+      if (objectType) {
+        const rawProperties = value.properties;
+        if (!plainSchemaObject(rawProperties)) fail(`${path}.properties`, 'closed objects require properties');
+        const properties = rawProperties as Record<string, unknown>;
+        const propertyNames = Object.keys(properties);
+        totals.properties += propertyNames.length;
+        if (propertyNames.length > 100 || totals.properties > 100
+          || propertyNames.some(name => !name || name.length > 128)) {
+          fail(`${path}.properties`, 'property limits were exceeded');
+        }
+        if (value.additionalProperties !== false) fail(`${path}.additionalProperties`, 'closed objects require false');
+        const rawRequired = value.required;
+        if (!Array.isArray(rawRequired) || rawRequired.some(item => typeof item !== 'string')) {
+          fail(`${path}.required`, 'required must be a string array');
+        }
+        const required = rawRequired as string[];
+        if (new Set(required).size !== required.length
+          || required.length !== propertyNames.length
+          || propertyNames.some(name => !required.includes(name))) {
+          fail(`${path}.required`, 'every property must be required exactly once');
+        }
+        for (const name of propertyNames) visit(properties[name], `${path}.properties.${name}`, depth + 1);
+      } else if ('properties' in value || 'required' in value || 'additionalProperties' in value) {
+        fail(path, 'object keywords require type object');
+      }
+
+      const arrayType = types.length === 1 && types[0] === 'array';
+      if (arrayType) {
+        if (!plainSchemaObject(value.items)) fail(`${path}.items`, 'arrays require one item schema');
+        if ((value.minItems !== undefined && (!Number.isSafeInteger(value.minItems) || Number(value.minItems) < 0 || Number(value.minItems) > 1_000))
+          || (value.maxItems !== undefined && (!Number.isSafeInteger(value.maxItems) || Number(value.maxItems) < 0 || Number(value.maxItems) > 1_000))
+          || (typeof value.minItems === 'number' && typeof value.maxItems === 'number' && value.minItems > value.maxItems)) {
+          fail(path, 'array bounds are invalid');
+        }
+        visit(value.items, `${path}.items`, depth + 1);
+      } else if ('items' in value || 'minItems' in value || 'maxItems' in value) {
+        fail(path, 'array keywords require type array');
+      }
+
+      const numericType = types.includes('number') || types.includes('integer');
+      if (value.minimum !== undefined || value.maximum !== undefined) {
+        if (!numericType) fail(path, 'numeric bounds require number or integer type');
+        if ((value.minimum !== undefined && (typeof value.minimum !== 'number' || !Number.isFinite(value.minimum)))
+          || (value.maximum !== undefined && (typeof value.maximum !== 'number' || !Number.isFinite(value.maximum)))
+          || (typeof value.minimum === 'number' && typeof value.maximum === 'number' && value.minimum > value.maximum)
+          || (types.includes('integer') && ((typeof value.minimum === 'number' && !Number.isSafeInteger(value.minimum))
+            || (typeof value.maximum === 'number' && !Number.isSafeInteger(value.maximum))))) {
+          fail(path, 'numeric bounds are invalid');
+        }
+      }
+    } finally {
+      ancestors.delete(value);
+    }
+  };
+
+  visit(schema, '$', 0);
+}
+
 export interface ChatCompletionRequest {
   messages: LlmMessage[];
   tools?: ToolDefinition[];
   temperature?: number;
   maxTokens?: number;
-  responseFormat?: { type: 'json_object' } | { type: 'text' };
+  responseFormat?: LlmResponseFormat;
   think?: boolean; // enable thinking mode (default: false for speed)
   /**
    * Per-request reasoning-effort override for think:true calls. Takes
@@ -116,6 +258,8 @@ export interface ChatCompletionRequest {
   payloadConstraint?: ProviderRequestConstraint;
   /** Local-only accounting metadata. Body builders must never serialize it. */
   usageContext?: LlmUsageContext;
+  /** Local cancellation only; never serialized or treated as endpoint failure. */
+  signal?: AbortSignal;
 }
 
 export interface ChatCompletionResponse {
@@ -927,11 +1071,39 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     }
   }
 
+  function strictJsonSchemaFormat(format: LlmResponseFormat): LlmJsonSchemaResponseFormat | null {
+    if (format.type !== 'json_schema') return null;
+    if (format.strict !== true || !/^[A-Za-z0-9_-]{1,64}$/.test(format.name)
+      || !plainSchemaObject(format.schema)) {
+      throw new Error('Structured output requires strict mode, a provider-safe name, and an object JSON Schema.');
+    }
+    validateStrictJsonSchema(format.schema);
+    return format;
+  }
+
+  function openAIResponseFormat(format: LlmResponseFormat): LlmResponseFormat | {
+    type: 'json_schema';
+    json_schema: { name: string; strict: true; schema: Record<string, unknown> };
+  } {
+    const structured = strictJsonSchemaFormat(format);
+    return structured ? {
+      type: 'json_schema',
+      json_schema: { name: structured.name, strict: true, schema: structured.schema },
+    } : format;
+  }
+
+  function responsesTextFormat(format: LlmResponseFormat): LlmResponseFormat {
+    strictJsonSchemaFormat(format);
+    return format;
+  }
+
   // Build request body for Ollama native API
   function buildOllamaBody(ep: Endpoint, req: ChatCompletionRequest): any {
     if (req.messages.some(message => message.images?.length)) {
       throw new Error('OLLAMA_VISION_UNSUPPORTED: local fallback cannot preserve image evidence; retry on the configured vision endpoint');
     }
+    const structured = req.responseFormat ? strictJsonSchemaFormat(req.responseFormat) : null;
+    const ollamaFormat = structured?.schema ?? (req.responseFormat?.type === 'json_object' ? 'json' : undefined);
     return {
       model: ep.model,
       messages: req.messages.map(m => ({ role: m.role, content: m.content || '' })),
@@ -940,7 +1112,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       keep_alive: '30m',
       options: { num_predict: req.maxTokens ?? config.defaults.maxCompletionTokens, temperature: req.temperature ?? config.defaults.temperature },
       ...(req.tools?.length ? { tools: req.tools } : {}),
-      ...(req.responseFormat?.type === 'json_object' ? { format: 'json' } : {}),
+      ...(ollamaFormat !== undefined ? { format: ollamaFormat } : {}),
     };
   }
 
@@ -971,7 +1143,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       max_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
       ...dialectFields(ep, req),
       ...(req.tools?.length ? { tools: req.tools } : {}),
-      ...(req.responseFormat ? { response_format: req.responseFormat } : {}),
+      ...(req.responseFormat ? { response_format: openAIResponseFormat(req.responseFormat) } : {}),
       stream: false,
     };
   }
@@ -1000,7 +1172,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           parameters: tool.function.parameters,
         })),
       } : {}),
-      ...(req.responseFormat ? { text: { format: req.responseFormat } } : {}),
+      ...(req.responseFormat ? { text: { format: responsesTextFormat(req.responseFormat) } } : {}),
       store: false,
       stream,
     };
@@ -1170,7 +1342,13 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         size,
         fallback: options.fallback,
       },
-      ep.timeoutMs > 0 ? { signal: AbortSignal.timeout(ep.timeoutMs) } : {},
+      (() => {
+        const timeoutSignal = ep.timeoutMs > 0 ? AbortSignal.timeout(ep.timeoutMs) : undefined;
+        const signal = req.signal && timeoutSignal
+          ? AbortSignal.any([req.signal, timeoutSignal])
+          : req.signal ?? timeoutSignal;
+        return signal ? { signal } : {};
+      })(),
     );
 
     if (resp.status === 429 || resp.status === 503) {
@@ -1237,7 +1415,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       max_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
       ...dialectFields(ep, req),
       ...(req.tools?.length ? { tools: req.tools } : {}),
-      ...(req.responseFormat ? { response_format: req.responseFormat } : {}),
+      ...(req.responseFormat ? { response_format: openAIResponseFormat(req.responseFormat) } : {}),
       stream: true,
       stream_options: { include_usage: true },
     };
@@ -1260,6 +1438,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
 
     const idleMs = config.streamIdleTimeoutMs ?? 120000;
     const controller = new AbortController();
+    const streamSignal = req.signal
+      ? AbortSignal.any([controller.signal, req.signal])
+      : controller.signal;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const resetIdleTimer = () => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -1280,7 +1461,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         apiMode: 'responses',
         stream: true,
         size,
-      }, { signal: controller.signal });
+      }, { signal: streamSignal });
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
@@ -1582,6 +1763,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     // as retryable and restarts the stream once, same as a network flap.
     const idleMs = config.streamIdleTimeoutMs ?? 120000;
     const controller = new AbortController();
+    const streamSignal = req.signal
+      ? AbortSignal.any([controller.signal, req.signal])
+      : controller.signal;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const resetIdleTimer = () => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -1602,7 +1786,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         apiMode: 'chat-completions',
         stream: true,
         size,
-      }, { signal: controller.signal });
+      }, { signal: streamSignal });
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
@@ -1918,6 +2102,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
             fallback: ep.useOllamaApi,
           });
         } catch (err: any) {
+          // Owner/process cancellation is local control flow, not endpoint
+          // health and never authorizes fallback to another provider.
+          if (request.signal?.aborted) throw err;
           // Payload limits are request-specific, not endpoint health. Never
           // poison health or fall through to a transport that would lose
           // image evidence; the owning loop gets one smaller recovery pass.
@@ -1939,6 +2126,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       try {
         return yield* streamEndpoint(ecsEp, request, context);
       } catch (err: any) {
+        // External cancellation is local control flow. Preserve endpoint
+        // health and never let the chat loop classify it as a retryable flap.
+        if (request.signal?.aborted) throw err;
         // A request-specific payload rejection says nothing about endpoint
         // health; preserve the endpoint and let the chat loop rebuild once.
         if (isLlmPayloadTooLargeError(err)) throw err;

@@ -1,5 +1,13 @@
+import type {
+  AnalyticsControlApplyInput,
+  AnalyticsDatasetControlState,
+  AnalyticsDateRange,
+  AnalyticsRequest,
+  AnalyticsSemanticReceipt,
+} from './analytics-data-room-types.js';
+
 export type AnalyticsWidgetKind = 'metric' | 'table' | 'bar' | 'line' | 'text' | 'visualization';
-export type AnalyticsDashboardStatus = 'draft' | 'ready' | 'refreshing' | 'degraded' | 'archived';
+export type AnalyticsDashboardStatus = 'draft' | 'ready' | 'refreshing' | 'degraded' | 'waiting_for_data' | 'archived';
 export type AnalyticsRefreshTrigger = 'manual' | 'scheduled' | 'agent';
 
 export interface AnalyticsWidgetInput {
@@ -9,6 +17,178 @@ export interface AnalyticsWidgetInput {
   sql?: string;
   preset?: string;
   config?: Record<string, unknown>;
+}
+
+export type AnalyticsWidgetSourceInput =
+  | { kind: 'warehouse_sql'; sql: string; preset?: string }
+  | {
+      kind: 'data_room_query';
+      datasetId: string;
+      sql: string;
+      params?: Array<string | number | boolean | null>;
+      limit?: number;
+    };
+
+export type AnalyticsWidgetSourceV1 =
+  | { version: 1; kind: 'warehouse_sql' }
+  | {
+      version: 1;
+      kind: 'data_room_query';
+      datasetId: string;
+      versionId: string;
+      sql: string;
+      params: Array<string | number | boolean | null>;
+      limit: number;
+    };
+
+export interface ConfigureAnalyticsWidgetSourceInput {
+  expectedWidgetRevision: number;
+  source: AnalyticsWidgetSourceInput;
+}
+
+export interface AnalyticsWidgetSourceMutationResult {
+  widget: AnalyticsWidget;
+  run: AnalyticsRun;
+  sourceConfigSha256: string;
+}
+
+export type AnalyticsWidgetBindingVersionPolicy = 'pinned' | 'latest_compatible' | 'latest_fresh';
+export type AnalyticsWidgetBindingCompatibility = 'compatible' | 'waiting' | 'incompatible';
+
+/** Owner-authored, deterministic local-view contract. The request is normalized
+ * with use=dashboard and exact dataset/version identity by the binding service. */
+export interface AnalyticsWidgetDataRoomBindingInput {
+  datasetId: string;
+  versionPolicy: AnalyticsWidgetBindingVersionPolicy;
+  pinnedVersionId?: string;
+  expectedSchemaSha256: string;
+  expectedContractSha256?: string;
+  requiredColumns: string[];
+  request: AnalyticsRequest;
+  presentationLimit: number;
+}
+
+export interface AnalyticsWidgetDataRoomBinding {
+  widgetId: string;
+  datasetId: string;
+  revision: number;
+  versionPolicy: AnalyticsWidgetBindingVersionPolicy;
+  pinnedVersionId?: string;
+  expectedSchemaSha256: string;
+  expectedContractSha256?: string;
+  requiredColumns: string[];
+  request: AnalyticsRequest;
+  requestSha256: string;
+  presentationLimit: number;
+  compatibility: AnalyticsWidgetBindingCompatibility;
+  compatibilityError?: string;
+  observedHeadRevision: number;
+  lastQueuedVersionId?: string;
+  lastAppliedVersionId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpdateAnalyticsWidgetInput {
+  expectedRevision: number;
+  widget: AnalyticsWidgetInput;
+}
+
+export interface UpdateAnalyticsWidgetBindingInput {
+  /** Zero creates the first binding; a positive exact revision updates/removes it. */
+  expectedRevision: number;
+  binding: AnalyticsWidgetDataRoomBindingInput | null;
+}
+
+export interface AnalyticsWidgetBindingMutationResult {
+  outcome: 'queued' | 'cleared';
+  widget: AnalyticsWidget;
+  /** Monotonic generation, including removals; use this for the next CAS. */
+  bindingRevision: number;
+  run?: AnalyticsRun;
+}
+
+export interface AnalyticsWidgetControlMutationResult {
+  outcome: 'queued' | 'no_op';
+  widget: AnalyticsWidget;
+  controls: AnalyticsDatasetControlState;
+  run?: AnalyticsRun;
+}
+
+export type AnalyticsWidgetEditAction =
+  | 'presentation'
+  | 'date_range'
+  | 'add_from_widget'
+  | 'combine_compatible_widgets';
+
+export type AnalyticsWidgetEditRenderer = 'line' | 'bar' | 'area' | 'point';
+
+/** Model-visible presentation intent. SQL, bindings, semantic hashes, and
+ * revisions are deliberately server-owned. */
+export interface AnalyticsWidgetEditPresentation {
+  renderer?: AnalyticsWidgetEditRenderer;
+  title?: string;
+  subtitle?: string;
+  layout?: 'vconcat' | 'hconcat';
+}
+
+export interface AnalyticsWidgetEditInput {
+  action: AnalyticsWidgetEditAction;
+  dashboardId: string;
+  /** One exact source/target for presentation/date/add; exactly two for combine. */
+  widgetIds: string[];
+  presentation?: AnalyticsWidgetEditPresentation;
+  dateRange?: AnalyticsDateRange;
+}
+
+export interface AnalyticsWidgetEditOwnerScope {
+  source: 'dashboard_widget_selection' | 'owner_exact_ids';
+  dashboardId: string;
+  orderedWidgetIds: string[];
+}
+
+export interface AnalyticsWidgetEditRequestIdentity {
+  ownerRequestId: string;
+  ownerMessage: string;
+  ownerScope: AnalyticsWidgetEditOwnerScope;
+  /** Derived from trusted owner wording; never accepted from model arguments. */
+  explicitNew: boolean;
+}
+
+export type AnalyticsWidgetEditReplayReason = 'same_request' | 'semantic_intent';
+
+export type AnalyticsWidgetEditErrorCode =
+  | 'invalid_input'
+  | 'data_room_unavailable'
+  | 'not_found'
+  | 'archived'
+  | 'active_run'
+  | 'binding_required'
+  | 'binding_not_compatible'
+  | 'result_provenance_mismatch'
+  | 'max_widgets'
+  | 'derived_data_required'
+  | 'request_identity_conflict'
+  | 'replay_target_invalid'
+  | 'conflict';
+
+export interface AnalyticsWidgetEditMutationResult {
+  action: AnalyticsWidgetEditAction;
+  dashboardId: string;
+  sourceWidgetIds: string[];
+  widget: AnalyticsWidget;
+  createdWidgetId?: string;
+  resultDisposition: 'preserved' | 'refresh_queued';
+  run?: AnalyticsRun;
+  /** Durable add/combine identity. Absent for presentation/date edits. */
+  receiptId?: string;
+  intentVersion?: 1;
+  intentSha256?: string;
+  effectSha256?: string;
+  explicitNew?: boolean;
+  idempotentReplay?: boolean;
+  replayReason?: AnalyticsWidgetEditReplayReason;
+  effectAppliedThisCall?: boolean;
 }
 
 export interface CreateAnalyticsDashboardInput {
@@ -29,7 +209,7 @@ export interface UpdateAnalyticsDashboardInput {
 }
 
 export interface AnalyticsWidgetResult {
-  trust: 'external_untrusted_data' | 'local_static_content';
+  trust: 'external_untrusted_data' | 'local_static_content' | 'local_verified_data';
   columns: string[];
   rows: Array<Array<string | number | boolean | null>>;
   rowCount: number;
@@ -37,22 +217,60 @@ export interface AnalyticsWidgetResult {
   executionTimeMs?: number;
   rawPreview?: string;
   refreshedAt: string;
-  /** Which data lane produced this result (etl-analytics A4). Absent on pre-A4 results = sql-mcp. */
+  /** Which remote lane produced a legacy result. Absent for local/static results. */
   lane?: 'sql-mcp' | 'etl';
-  /** Immutable remote-result provenance for ETL outputs, including late reconciliation. */
-  source?: {
-    provider: 'datanet';
-    runId: string;
-    remoteStatus: 'SUCCESS';
-    resultSha256?: string;
-    resultBytes?: number;
-    reconciled?: boolean;
-  };
+  /** Exact source receipt. The data-room branch never contains private paths. */
+  source?:
+    | {
+        provider: 'datanet';
+        runId: string;
+        remoteStatus: 'SUCCESS';
+        resultSha256?: string;
+        resultBytes?: number;
+        reconciled?: boolean;
+      }
+    | {
+        provider: 'data-room-query';
+        datasetId: string;
+        versionId: string;
+        widgetRevision: number;
+        sourceConfigSha256: string;
+        querySha256: string;
+        compilerVersion: string;
+        contentSha256: string;
+        schemaSha256: string;
+        contractSha256: string;
+        definitionSha256: string;
+        integrityVerifiedAt: string;
+      }
+    | {
+        provider: 'data-room';
+        datasetId: string;
+        versionId: string;
+        bindingRevision: number;
+        widgetRevision: number;
+        querySha256: string;
+        compilerVersion: string;
+        contentSha256: string;
+        schemaSha256: string;
+        contractSha256: string;
+        definitionSha256: string;
+        requestSha256?: string;
+        controlRevision?: number;
+        controlDefinitionSha256?: string;
+        controlValuesSha256?: string;
+        effectiveViewRequestSha256?: string;
+        semanticReceipt: AnalyticsSemanticReceipt;
+      };
 }
 
 export interface AnalyticsWidget {
   id: string;
   dashboardId: string;
+  /** Optimistic mutation token; unrelated widget edits never change it. */
+  revision: number;
+  /** Monotonic binding generation; advances even when the binding is removed. */
+  bindingRevision: number;
   position: number;
   kind: AnalyticsWidgetKind;
   title: string;
@@ -60,6 +278,8 @@ export interface AnalyticsWidget {
   sql?: string;
   preset?: string;
   config: Record<string, unknown>;
+  binding?: AnalyticsWidgetDataRoomBinding;
+  controls?: AnalyticsDatasetControlState;
   result?: AnalyticsWidgetResult;
   lastError?: string;
   lastRefreshedAt?: string;
@@ -86,14 +306,93 @@ export interface UpdateAnalyticsScheduleInput {
   timezone: string;
 }
 
+export interface DashboardPublicationDataRoomIdentityV1 {
+  datasetId: string;
+  datasetDefinitionRevision: number;
+  bindingRevision: number;
+  bindingSha256: string;
+  versionPolicy: AnalyticsWidgetDataRoomBinding['versionPolicy'];
+  pinnedVersionId?: string;
+  lastAppliedVersionId: string;
+  head: {
+    versionId?: string;
+    headRevision: number;
+    definitionRevision?: number;
+  };
+  control: {
+    revision: number;
+    projected: boolean;
+    definitionSha256: string;
+    valuesSha256: string;
+    effectiveViewRequestSha256: string;
+  };
+  versionId: string;
+  requestSha256: string;
+  querySha256: string;
+  compilerVersion: string;
+  contentSha256: string;
+  schemaSha256: string;
+  contractSha256: string;
+  definitionSha256: string;
+  semanticReceiptSha256: string;
+}
+
+export interface DashboardPublicationWidgetSnapshotV1 {
+  widgetId: string;
+  position: number;
+  widgetRevision: number;
+  bindingGeneration: number;
+  presentationSha256: string;
+  resultSha256?: string;
+  dataRoom?: DashboardPublicationDataRoomIdentityV1;
+}
+
+export interface DashboardPublicationSnapshotV1 {
+  version: 1;
+  dashboardId: string;
+  snapshotCreatedAt: string;
+  presentationSha256: string;
+  resultSha256: string;
+  widgets: DashboardPublicationWidgetSnapshotV1[];
+}
+
+export interface DashboardPublicationReceiptV1 {
+  snapshot: DashboardPublicationSnapshotV1;
+  snapshotManifestSha256: string;
+  artifactContentSha256: string;
+  publisherConfigSha256: string;
+}
+
+export type DashboardPublicationDriftScope =
+  | 'publisher_config'
+  | 'dashboard'
+  | 'widget'
+  | 'binding'
+  | 'control'
+  | 'dataset_head'
+  | 'dataset_version'
+  | 'result'
+  | 'semantic_receipt'
+  | 'artifact';
+
+export interface DashboardPublicationDrift {
+  scope: DashboardPublicationDriftScope;
+  widgetId?: string;
+}
+
 export interface AnalyticsPublication {
   id: string;
   dashboardId: string;
   publisherId: string;
   objectKey: string;
+  shareRequestId?: string;
   url?: string;
   status: 'publishing' | 'published' | 'failed';
   contentSha256: string;
+  deployed: boolean;
+  contentVerified: boolean;
+  visibilityConverged: boolean;
+  receipt?: DashboardPublicationReceiptV1;
   error?: string;
   createdAt: string;
   publishedAt?: string;
@@ -125,6 +424,7 @@ export interface AnalyticsRun {
   dashboardId: string;
   trigger: AnalyticsRefreshTrigger;
   status: AnalyticsRunStatus;
+  refreshScope: 'full' | 'selective';
   widgetCount: number;
   widgetsCompleted: number;
   widgetsSucceeded: number;
@@ -164,6 +464,7 @@ export interface AnalyticsDashboard extends AnalyticsDashboardSummary {
   widgets: AnalyticsWidget[];
   schedule?: AnalyticsSchedule;
   latestPublication?: AnalyticsPublication;
+  latestSuccessfulPublication?: AnalyticsPublication;
   recentRuns: AnalyticsRun[];
 }
 
@@ -241,6 +542,7 @@ export interface DashboardShareRequest {
   destination: string;
   objectKey: string;
   contentSha256: string;
+  receipt: DashboardPublicationReceiptV1;
   warning: string;
 }
 
@@ -287,6 +589,7 @@ export interface StaticArtifactPublishResult {
   deployed: boolean;
   contentVerified: boolean;
   visibilityConverged: boolean;
+  canonicalMirrorSynchronized: boolean;
   appName: string;
   stage: HarmonyPublisherSettings['stage'];
   visibility: HarmonyPublisherSettings['visibility'];
@@ -364,9 +667,44 @@ export interface AnalyticsDashboardService {
   getDashboard(id: string): AnalyticsDashboard | null;
   createDashboard(input: CreateAnalyticsDashboardInput, refreshTrigger?: AnalyticsRefreshTrigger): AnalyticsDashboard;
   updateDashboard(id: string, input: UpdateAnalyticsDashboardInput): AnalyticsDashboard;
+  /** Replace exactly one widget under optimistic revision control; its ID and siblings remain stable. */
+  updateWidget(dashboardId: string, widgetId: string, input: UpdateAnalyticsWidgetInput): AnalyticsWidget;
+  /** Configure one widget's independent lightweight source and queue only that widget. */
+  configureWidgetSource(
+    dashboardId: string,
+    widgetId: string,
+    input: ConfigureAnalyticsWidgetSourceInput,
+  ): AnalyticsWidgetSourceMutationResult;
+  /** Create/update/remove one exact data-room binding and queue only that widget when resolvable. */
+  updateWidgetBinding(
+    dashboardId: string,
+    widgetId: string,
+    input: UpdateAnalyticsWidgetBindingInput,
+  ): AnalyticsWidgetBindingMutationResult;
+  /** Read the exact persisted controls, or a revision-zero projection for a legacy binding. */
+  getWidgetControls(dashboardId: string, widgetId: string): AnalyticsDatasetControlState;
+  /** Apply one server-validated control state and queue at most one local selected run. */
+  applyWidgetControls(
+    dashboardId: string,
+    widgetId: string,
+    input: AnalyticsControlApplyInput,
+  ): AnalyticsWidgetControlMutationResult;
+  /** One deterministic exact data-room edit. Query-bound actions atomically
+   * append/rebind and queue one selective snapshot; presentation preserves data. */
+  editDataRoomWidget(
+    input: AnalyticsWidgetEditInput,
+    identity?: AnalyticsWidgetEditRequestIdentity,
+  ): AnalyticsWidgetEditMutationResult;
   deleteDashboard(id: string): void;
   setSchedule(id: string, input: UpdateAnalyticsScheduleInput): AnalyticsSchedule;
   enqueueRefresh(id: string, trigger?: AnalyticsRefreshTrigger): AnalyticsRun;
+  enqueueSelectiveRefresh(
+    dashboardId: string,
+    widgetIds: string[],
+    trigger?: AnalyticsRefreshTrigger,
+  ): AnalyticsRun;
+  /** Poll hook: queue at most `limit` dashboards whose compatible bound head changed. */
+  enqueueChangedBindings(limit?: number): number;
   getRun(id: string): AnalyticsRun | null;
   /**
    * Stop the dashboard's active refresh. A queued run cancels immediately;
