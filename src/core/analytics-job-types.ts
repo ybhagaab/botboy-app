@@ -104,6 +104,33 @@ export interface AnalyticsDatasetPreparationTargetV1 {
   quality?: AnalyticsQualityAssertionEvaluation[];
 }
 
+export interface AnalyticsLocalFileIntoV1 {
+  datasetId: string;
+  /** replace: the file is the complete new version; merge_partitions: the file replaces only its own time partitions. */
+  mode: 'replace' | 'merge_partitions';
+  /** Coverage of the file's own rows (observed/complete/watermark). */
+  coverage: AnalyticsDatasetContract['coverage'];
+  expectedHeadRevision?: number;
+}
+
+export interface AnalyticsLocalFileAdmissionV1 {
+  resolvedPath: string;
+  fileName: string;
+  format: 'csv' | 'tsv' | 'xlsx';
+  sha256: string;
+  bytes: number;
+  sheet?: string;
+  headerRow?: number;
+  fileRowCount: number;
+  base?: {
+    definitionRevision: number;
+    contractSha256: string;
+    headRevision: number;
+    versionId?: string;
+    contentSha256?: string;
+  };
+}
+
 export type AnalyticsDatasetPreparationSourceV1 =
   | ({ kind: 'existing_version' } & AnalyticsJobExistingInputV1)
   | {
@@ -120,13 +147,20 @@ export type AnalyticsDatasetPreparationSourceV1 =
       target: AnalyticsDatasetPreparationTargetV1;
     }
   | {
-      kind: 'botboy_csv';
+      kind: 'local_file';
       alias: string;
-      filename: string;
-      sha256: string;
-      bytes: number;
-      nullToken: string;
-      target: AnalyticsDatasetPreparationTargetV1;
+      /** Absolute, ~/..., or relative to BotBoy's files workspace. */
+      path: string;
+      format?: 'csv' | 'tsv' | 'xlsx';
+      sheet?: string;
+      headerRow?: number;
+      /** Exact text treated as null; default '' (empty cells are null). */
+      nullToken?: string;
+      /** Exactly one of target (new dataset) or into (new version of an existing dataset). */
+      target?: AnalyticsDatasetPreparationTargetV1;
+      into?: AnalyticsLocalFileIntoV1;
+      /** Code-pinned at admission from the exact bytes read; never model-supplied. */
+      admitted?: AnalyticsLocalFileAdmissionV1;
     }
   | {
       kind: 'import_inbox';

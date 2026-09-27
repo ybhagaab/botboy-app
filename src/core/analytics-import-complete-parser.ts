@@ -168,7 +168,11 @@ function validateXmlDocument(xml: string, expectedRoot: string): void {
   for (const match of xml.matchAll(token)) {
     const index = match.index ?? 0;
     const between = xml.slice(cursor, index);
-    if (between.trim()) {
+    // Office extension lists (<extLst><ext …>) carry optional features such as
+    // x15:workbookPr or x14 conditional formats. No cell data is ever read from
+    // them, so their namespaced children are opaque here rather than shadows.
+    const inExtension = stack.some(element => localName(element) === 'extLst');
+    if (between.trim() && !inExtension) {
       if (!stack.length) fail('Workbook XML contains text outside its root element.', 'integrity_failed');
       const parent = localName(stack.at(-1)!);
       if (!['t', 'v', 'f', 'definedName'].includes(parent)) {
@@ -192,8 +196,8 @@ function validateXmlDocument(xml: string, expectedRoot: string): void {
     const attrText = (opening[2] ?? '').trim();
     if (attrText) attributes(attrText);
     const critical = new Set(['workbook', 'workbookPr', 'worksheet', 'sheetData', 'row', 'c', 'v', 'f', 'is', 't', 'si', 'cellXfs', 'xf', 'numFmt', 'mergeCell']);
-    if (name.includes(':') && critical.has(localName(name))) fail(`Prefixed SpreadsheetML element ${name} is not supported by the complete parser.`, 'invalid_input');
-    if (expectedRoot === 'worksheet') {
+    if (!inExtension && name.includes(':') && critical.has(localName(name))) fail(`Prefixed SpreadsheetML element ${name} is not supported by the complete parser.`, 'invalid_input');
+    if (expectedRoot === 'worksheet' && !inExtension) {
       const child = localName(name);
       const parent = stack.length ? localName(stack.at(-1)!) : '';
       if ((child === 'sheetData' && parent !== 'worksheet')

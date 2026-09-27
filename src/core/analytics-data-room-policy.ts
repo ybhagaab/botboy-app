@@ -230,6 +230,31 @@ export function enumerateAnalyticsPartitions(
   return partitions;
 }
 
+/**
+ * Inverse of enumerateAnalyticsPartitions for reporting: compress canonical
+ * day (YYYY-MM-DD) or month (YYYY-MM-01) keys into sorted inclusive
+ * contiguous ranges. Pure formatting; never used to widen coverage.
+ */
+export function compactAnalyticsPartitionRanges(
+  partitions: Iterable<string>,
+  partitionKind: 'day' | 'month' = 'day',
+): Array<{ start: string; end: string }> {
+  const sorted = [...new Set(partitions)].sort();
+  const ranges: Array<{ start: string; end: string }> = [];
+  const next = (key: string): string => {
+    const date = new Date(`${key}T00:00:00.000Z`);
+    return partitionKind === 'month'
+      ? new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1)).toISOString().slice(0, 10)
+      : new Date(date.getTime() + 24 * 60 * 60_000).toISOString().slice(0, 10);
+  };
+  for (const key of sorted) {
+    const last = ranges.at(-1);
+    if (last && next(last.end) === key) last.end = key;
+    else ranges.push({ start: key, end: key });
+  }
+  return ranges;
+}
+
 function validateSha(value: unknown, field: string): string {
   const sha = cleanText(value, field).toLowerCase();
   if (!SHA256_RE.test(sha)) {

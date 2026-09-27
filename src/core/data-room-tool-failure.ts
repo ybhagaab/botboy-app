@@ -2,8 +2,7 @@ export type DataRoomToolName =
   | 'list_data_room_datasets'
   | 'query_data_room'
   | 'create_data_room_dataset'
-  | 'configure_analytics_widget_source'
-  | 'write_file.dataRoomCsvSource';
+  | 'configure_analytics_widget_source';
 
 export type DataRoomFailurePhase =
   | 'arguments'

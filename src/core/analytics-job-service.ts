@@ -1,28 +1,43 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
+import SqliteDatabase from 'better-sqlite3';
 import {
+  analyticsCoveragePartition,
   analyticsDatasetContractSha256,
   analyticsDatasetSchemaSha256,
   AnalyticsDataRoomError,
   isAnalyticsIsoTimestamp,
   type AnalyticsDataRoomStore,
 } from './analytics-data-room-store.js';
+import {
+  ANALYTICS_LOCAL_FILE_FORMATS,
+  ANALYTICS_LOCAL_FILE_PARSER_VERSION,
+  AnalyticsLocalFileError,
+  defaultAnalyticsLocalFilePolicy,
+  profileAnalyticsLocalTable,
+  readAnalyticsLocalFile,
+  readAnalyticsLocalTable,
+  resolveAnalyticsLocalFile,
+  typeAnalyticsLocalTable,
+  type AnalyticsLocalFileColumnProfile,
+  type AnalyticsLocalFileFormat,
+  type AnalyticsLocalFileLocator,
+  type AnalyticsLocalFilePolicy,
+} from './analytics-local-file-source.js';
+import type { DocumentParser } from './document-parser.js';
 import type { AnalyticsDerivationService } from './analytics-data-room-derivation.js';
 import {
   parseAnalyticsDerivedDefinition,
   validateAnalyticsRelationalContract,
 } from './analytics-data-room-derived-contract.js';
 import type { AnalyticsLocalQueryEngine } from './analytics-data-room-query.js';
-import type { AnalyticsDataRoomService } from './analytics-data-room-service.js';
+import type { AnalyticsDataRoomService, AnalyticsLocalFileCompleteReceipt } from './analytics-data-room-service.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import {
   analyticsHandlingAllowsModelContext,
   analyticsRequestSha256,
   analyticsSha256,
   AnalyticsDataRoomContractError,
+  compactAnalyticsPartitionRanges,
   enumerateAnalyticsPartitions,
   normalizeAnalyticsRequest,
   stableAnalyticsJson,
@@ -35,6 +50,7 @@ import {
 } from './data-room-tool-failure.js';
 import type {
   AnalyticsCanonicalResult,
+  AnalyticsDataCell,
   AnalyticsDataRoomUse,
   AnalyticsDatasetContract,
   AnalyticsDatasetDefinitionInput,
@@ -48,6 +64,7 @@ import type {
 import type { AnalyticsJobPlanner } from './analytics-job-planner.js';
 import { AnalyticsJobError } from './analytics-job-store.js';
 import type {
+  AnalyticsLocalFileAdmissionV1,
   AnalyticsDatasetPreparationIntentV1,
   AnalyticsDatasetPreparationPlanV1,
   AnalyticsDatasetPreparationSourceV1,
@@ -75,8 +92,7 @@ const DATASET_ID_RE = /^ds_[a-zA-Z0-9_-]{1,96}$/;
 const VERSION_ID_RE = /^dsv_[a-f0-9]{24}$/;
 const IMPORT_ID_RE = /^dri_[a-f0-9]{24}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
-const MAX_BOTBOY_CSV_BYTES = 16 * 1024 * 1024;
-const BOTBOY_CSV_PARSER_VERSION = 'botboy-csv-parser-v1';
+const PREPARATION_SOURCE_KINDS = ['existing_version', 'import_inbox', 'local_file', 'sql_query', 'etl_query'];
 const SOURCE_ALIAS_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
 const DEFAULT_WAIT_MS = 24_000;
 const JOB_RESULT_LIMIT = 200;
@@ -100,9 +116,27 @@ export interface AnalyticsPreparationSqlRunner {
   execute(sql: string, options?: { signal?: AbortSignal }): Promise<AnalyticsCanonicalResult>;
 }
 
+/** Zero-effect profile of one local file table, from the exact create-time reader and cell converter. */
+export interface AnalyticsLocalFileInspection {
+  file: { name: string; format: AnalyticsLocalFileFormat; bytes: number; sha256: string };
+  sheets?: string[];
+  sheet?: string;
+  headerRow?: number;
+  nullToken: string;
+  rowCount: number;
+  blankRowsSkipped: number;
+  rowsAboveHeader: number;
+  formulaCells: number;
+  /** Delimited records that omitted trailing fields; those cells read as null. */
+  shortRows: number;
+  samplesWithheld: boolean;
+  columns: AnalyticsLocalFileColumnProfile[];
+}
+
 export interface AnalyticsJobService {
   startOrJoinAndWait(owner: AnalyticsJobOwnerRequest, options?: { waitSignal?: AbortSignal }): Promise<AnalyticsJobToolReceipt>;
   prepareOrJoinAndWait(owner: AnalyticsJobOwnerRequest, plan: AnalyticsDatasetPreparationPlanV1, options?: { waitSignal?: AbortSignal }): Promise<AnalyticsJobToolReceipt>;
+  inspectLocalFile(locator: AnalyticsLocalFileLocator, options?: { signal?: AbortSignal }): Promise<AnalyticsLocalFileInspection>;
   observe(jobId: string, actionRequestId?: string, options?: { includeAnswer?: boolean }): AnalyticsJobToolReceipt;
   resume(jobId: string, owner: AnalyticsJobOwnerRequest, options?: { waitSignal?: AbortSignal }): Promise<AnalyticsJobToolReceipt>;
   respond(jobId: string, response: string, owner: AnalyticsJobOwnerRequest, options?: { waitSignal?: AbortSignal }): Promise<AnalyticsJobToolReceipt>;
@@ -293,54 +327,85 @@ function uniqueTextArray(value: unknown, label: string, maximum = 100): string[]
   return values;
 }
 
-function normalizeBotboyCsvFilename(value: unknown, label: string): string {
-  const filename = cleanText(value, label, 500);
-  const segments = filename.split('/');
-  if (path.isAbsolute(filename) || filename.includes('\\')
-    || segments.some(segment => !segment || segment === '.' || segment === '..')
-    || !/\.csv$/i.test(filename)) {
-    fail('invalid_input', `${label} must be a relative .csv filename inside BotBoy's files workspace.`, dataRoomIssue({
-      code: 'invalid_relative_csv', path: label,
-      message: `${label} must be the relative .csv filename from write_file.dataRoomCsvSource.`,
-      expected: { kind: 'pattern', type: 'string', pattern: '^(?!/)(?!.*(?:^|/)\\.\\.?/).+\\.csv$', example: 'monthly-data.csv' },
-      received: value,
+type LocalFileSource = Extract<AnalyticsDatasetPreparationSourceV1, { kind: 'local_file' }>;
+
+function normalizeLocalFileSource(raw: Record<string, unknown>, alias: string, sourcePath: string): LocalFileSource {
+  exactKeys(raw, ['kind', 'alias', 'path', 'format', 'sheet', 'headerRow', 'nullToken', 'target', 'into'], sourcePath);
+  const filePath = cleanText(raw.path, `${sourcePath}.path`, 4096);
+  const issues: DataRoomFailureIssueV1[] = [];
+  if (raw.format !== undefined && !(ANALYTICS_LOCAL_FILE_FORMATS as readonly unknown[]).includes(raw.format)) issues.push(dataRoomIssue({
+    code: 'invalid_enum', path: `${sourcePath}.format`, message: 'format is optional (inferred from .csv/.tsv/.xlsx) and otherwise csv, tsv, or xlsx.',
+    expected: { kind: 'enum', values: [...ANALYTICS_LOCAL_FILE_FORMATS] }, received: raw.format, includeReceivedValue: true,
+  }));
+  if (raw.sheet !== undefined && (typeof raw.sheet !== 'string' || !raw.sheet || raw.sheet.length > 255)) issues.push(dataRoomIssue({
+    code: 'invalid_type', path: `${sourcePath}.sheet`, message: 'sheet is the exact worksheet name (xlsx only; optional when the workbook has one sheet).',
+    expected: { kind: 'range', type: 'string', minimum: 1, maximum: 255 }, received: raw.sheet, includeReceivedValue: true,
+  }));
+  if (raw.headerRow !== undefined && (!Number.isSafeInteger(raw.headerRow) || Number(raw.headerRow) < 1 || Number(raw.headerRow) > 50_000)) issues.push(dataRoomIssue({
+    code: 'out_of_range', path: `${sourcePath}.headerRow`, message: 'headerRow is the 1-based worksheet row with column names (xlsx only; default 1).',
+    expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 50_000 }, received: raw.headerRow, includeReceivedValue: true,
+  }));
+  if (raw.nullToken !== undefined && (typeof raw.nullToken !== 'string' || raw.nullToken.length > 32 || /["\r\n\0]/.test(raw.nullToken))) issues.push(dataRoomIssue({
+    code: 'invalid_null_token', path: `${sourcePath}.nullToken`,
+    message: 'nullToken is optional; omit it (empty cells are null) or give the exact ≤32-character text that marks null, such as NULL or \\N.',
+    expected: { kind: 'range', type: 'string', minimum: 0, maximum: 32 }, received: raw.nullToken, includeReceivedValue: true,
+  }));
+  if ((raw.target === undefined) === (raw.into === undefined)) issues.push(dataRoomIssue({
+    code: 'exactly_one_required', path: raw.target === undefined ? `${sourcePath}.target` : `${sourcePath}.into`,
+    message: 'A local_file source needs exactly one of target (create a new dataset) or into (add a new version to one existing catalog dataset).',
+    expected: { kind: 'relation', description: 'Exactly one of target or into is present.' }, received: raw.target ?? raw.into,
+  }));
+  if (issues.length) fail('invalid_input', `${sourcePath} local file locator is malformed.`, issues);
+  const locator = {
+    kind: 'local_file' as const,
+    alias,
+    path: filePath,
+    ...(raw.format !== undefined ? { format: raw.format as AnalyticsLocalFileFormat } : {}),
+    ...(raw.sheet !== undefined ? { sheet: raw.sheet as string } : {}),
+    ...(raw.headerRow !== undefined ? { headerRow: Number(raw.headerRow) } : {}),
+    ...(raw.nullToken !== undefined ? { nullToken: raw.nullToken as string } : {}),
+  };
+  if (raw.target !== undefined) return { ...locator, target: normalizePreparationTarget(raw.target, `${sourcePath}.target`) };
+  const intoPath = `${sourcePath}.into`;
+  if (!isRecord(raw.into)) {
+    fail('invalid_input', `${intoPath} must be an object.`, dataRoomIssue({
+      code: 'invalid_type', path: intoPath, message: 'into is {datasetId, mode, coverage[, expectedHeadRevision]}.',
+      expected: { kind: 'shape', requiredKeys: ['datasetId', 'mode', 'coverage'], allowedKeys: ['datasetId', 'mode', 'coverage', 'expectedHeadRevision'] }, received: raw.into,
     }));
   }
-  return filename;
+  const into = raw.into as Record<string, unknown>;
+  exactKeys(into, ['datasetId', 'mode', 'coverage', 'expectedHeadRevision'], intoPath);
+  const datasetId = cleanText(into.datasetId, `${intoPath}.datasetId`, 100);
+  const intoIssues: DataRoomFailureIssueV1[] = [];
+  if (!DATASET_ID_RE.test(datasetId)) intoIssues.push(dataRoomIssue({
+    code: 'invalid_pattern', path: `${intoPath}.datasetId`, message: 'datasetId is the exact ds_* ID from list_data_room_datasets.',
+    expected: { kind: 'pattern', type: 'string', pattern: '^ds_[a-zA-Z0-9_-]{1,96}$' }, received: into.datasetId, includeReceivedValue: true,
+  }));
+  if (into.mode !== 'replace' && into.mode !== 'merge_partitions') intoIssues.push(dataRoomIssue({
+    code: 'invalid_enum', path: `${intoPath}.mode`,
+    message: 'mode is replace (the file becomes the complete new version) or merge_partitions (the file replaces only its own time partitions; all other rows stay).',
+    expected: { kind: 'enum', values: ['replace', 'merge_partitions'] }, received: into.mode, includeReceivedValue: true,
+  }));
+  if (into.expectedHeadRevision !== undefined
+    && (!Number.isSafeInteger(into.expectedHeadRevision) || Number(into.expectedHeadRevision) < 1)) intoIssues.push(dataRoomIssue({
+    code: 'out_of_range', path: `${intoPath}.expectedHeadRevision`, message: 'expectedHeadRevision is optional; when present it is the exact current positive head revision.',
+    expected: { kind: 'range', type: 'integer', minimum: 1 }, received: into.expectedHeadRevision, includeReceivedValue: true,
+  }));
+  if (intoIssues.length) fail('invalid_input', `${intoPath} is malformed.`, intoIssues);
+  return {
+    ...locator,
+    into: {
+      datasetId,
+      mode: into.mode as 'replace' | 'merge_partitions',
+      coverage: normalizePreparationCoverage(into.coverage, `${intoPath}.coverage`),
+      ...(into.expectedHeadRevision !== undefined ? { expectedHeadRevision: Number(into.expectedHeadRevision) } : {}),
+    },
+  };
 }
 
-function readVerifiedBotboyCsv(source: Extract<AnalyticsDatasetPreparationSourceV1, { kind: 'botboy_csv' }>): {
-  savedTo: string;
-  fileBytes: number;
-  fileSha256: string;
-} {
-  const filesRoot = path.resolve(os.homedir(), '.personal-productivity-tracker', 'files');
-  const resolved = path.resolve(filesRoot, ...source.filename.split('/'));
-  const lexicalRelative = path.relative(filesRoot, resolved);
-  if (!lexicalRelative || lexicalRelative === '..' || lexicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(lexicalRelative)) {
-    fail('policy_denied', 'BotBoy CSV source escapes the files workspace.');
-  }
-  let stat: fs.Stats;
-  let realRoot: string;
-  let realFile: string;
-  try {
-    stat = fs.lstatSync(resolved);
-    realRoot = fs.realpathSync(filesRoot);
-    realFile = fs.realpathSync(resolved);
-  } catch {
-    fail('integrity_failed', 'BotBoy CSV source does not exist. Rewrite it to obtain a fresh exact receipt.');
-  }
-  const realRelative = path.relative(realRoot, realFile);
-  if (!stat.isFile() || stat.isSymbolicLink() || !realRelative
-    || realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
-    fail('policy_denied', 'BotBoy CSV source must be a regular non-symlink file inside the files workspace.');
-  }
-  const bytes = fs.readFileSync(realFile);
-  const sha256 = createHash('sha256').update(bytes).digest('hex');
-  if (bytes.length !== source.bytes || sha256 !== source.sha256) {
-    fail('integrity_failed', 'BotBoy CSV no longer matches its exact byte/SHA receipt. Rewrite it and use the new final receipt.');
-  }
-  return { savedTo: realFile, fileBytes: bytes.length, fileSha256: sha256 };
+function localFileFailure(error: unknown): never {
+  if (error instanceof AnalyticsLocalFileError) fail(error.code, error.message, error.issues);
+  throw error;
 }
 
 function addPreparationIssue(issues: DataRoomFailureIssueV1[], issue: DataRoomFailureIssueV1): void {
@@ -380,6 +445,50 @@ function collectShapeIssues(
   return true;
 }
 
+const COUNTING_KEY_HINT = 'countingKey is the one field each row counts (in a long table with one row per date and metric, the metric-name field); describe composite row identity in grain/requiredGrain instead.';
+const ISO_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/*
+ * The grouped pre-flight below reports the same scalar rules the normalizers
+ * enforce (strings, field references, ISO forms) in one wave, so a plan with
+ * several independent mistakes is corrected in one call instead of one
+ * fail-fast issue per create attempt.
+ */
+function collectTextIssue(value: unknown, path: string, issues: DataRoomFailureIssueV1[], maximum: number): void {
+  if (value === undefined) return;
+  if (typeof value !== 'string' || !value.trim() || value.includes('\0') || value.length > maximum) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_type', path, message: `${path} must be a non-empty string of at most ${maximum} characters.`,
+      expected: { kind: 'range', type: 'string', minimum: 1, maximum }, received: value,
+    }));
+  }
+}
+
+function collectFieldReferenceIssue(
+  value: unknown,
+  path: string,
+  issues: DataRoomFailureIssueV1[],
+  fields: Map<string, Record<string, unknown>> | undefined,
+  hint: string,
+): void {
+  if (value === undefined) return;
+  if (typeof value !== 'string' || !value.trim()) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_field_reference', path,
+      message: `${path} must be ONE exact schema field name, not ${Array.isArray(value) ? 'an array' : typeof value}. ${hint}`,
+      expected: { kind: 'range', type: 'string', minimum: 1, maximum: 160 }, received: value,
+    }));
+    return;
+  }
+  if (fields && !fields.has(value)) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'unknown_field_reference', path,
+      message: `${path} names ${JSON.stringify(value)}, which is not a schema field. Use one of: ${[...fields.keys()].slice(0, 40).join(', ')}. ${hint}`,
+      expected: { kind: 'enum', values: [...fields.keys()].slice(0, 40) }, received: value, includeReceivedValue: true,
+    }));
+  }
+}
+
 function collectPreparationRequestIssues(value: unknown, issues: DataRoomFailureIssueV1[]): void {
   const path = 'plan.request';
   const required = [
@@ -413,6 +522,25 @@ function collectPreparationRequestIssues(value: unknown, issues: DataRoomFailure
       expected: { kind: 'literal', value: 'local_answer' }, received: value.use, includeReceivedValue: true,
     }));
   }
+  collectTextIssue(value.domainKey, `${path}.domainKey`, issues, 160);
+  collectTextIssue(value.timeZone, `${path}.timeZone`, issues, 160);
+  collectTextIssue(value.requiredGrain, `${path}.requiredGrain`, issues, 160);
+  collectFieldReferenceIssue(value.countingKey, `${path}.countingKey`, issues, undefined, COUNTING_KEY_HINT);
+  if (Array.isArray(value.dimensions) && value.dimensions.some(dimension => typeof dimension !== 'string' || !dimension.trim())) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_type', path: `${path}.dimensions`, message: 'Every request dimension must be one exact field-name string.',
+      expected: { kind: 'type', type: 'array' }, received: value.dimensions,
+    }));
+  }
+  if (isRecord(value.dateRange)) {
+    for (const edge of ['start', 'end'] as const) {
+      const day = value.dateRange[edge];
+      if (day !== undefined && (typeof day !== 'string' || !ISO_DAY_RE.test(day))) addPreparationIssue(issues, dataRoomIssue({
+        code: 'invalid_date_format', path: `${path}.dateRange.${edge}`, message: `dateRange.${edge} must use the exact YYYY-MM-DD form.`,
+        expected: { kind: 'pattern', type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', example: '2026-09-25' }, received: day, includeReceivedValue: true,
+      }));
+    }
+  }
 }
 
 function collectCoverageIssues(value: unknown, path: string, issues: DataRoomFailureIssueV1[]): void {
@@ -442,6 +570,14 @@ function collectCoverageIssues(value: unknown, path: string, issues: DataRoomFai
     ? ['partitionKind', 'observedPartitions', 'completePartitions', 'watermark']
     : ['partitionKind', 'observedRanges', 'completeRanges', 'watermark'];
   collectShapeIssues(value, path, required, allowed, issues);
+  if (value.watermark !== undefined && (typeof value.watermark !== 'string' || !isAnalyticsIsoTimestamp(value.watermark))) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_timestamp', path: `${path}.watermark`,
+      message: 'watermark must be an exact ISO timestamp with timezone (a date alone is not enough): the instant through which the source evidence is current.',
+      expected: { kind: 'pattern', type: 'string', pattern: '^YYYY-MM-DDTHH:mm:ss(.fraction)?(Z|±HH:mm)$', example: '2026-09-25T23:59:59+05:30' },
+      received: value.watermark, includeReceivedValue: true,
+    }));
+  }
   if (value.partitionKind !== undefined && value.partitionKind !== 'day' && value.partitionKind !== 'month') {
     addPreparationIssue(issues, dataRoomIssue({
       code: 'invalid_enum', path: `${path}.partitionKind`, message: 'partitionKind must be day or month.',
@@ -470,6 +606,16 @@ function collectCoverageIssues(value: unknown, path: string, issues: DataRoomFai
           expected: { kind: 'shape', requiredKeys: ['start', 'end'], allowedKeys: ['start', 'end'] }, received: value[field],
         }));
       }
+      const badDays = (value[field] as unknown[]).map((range, index) => ({ range, index }))
+        .filter(({ range }) => isRecord(range) && [range.start, range.end].some(day => day !== undefined && (typeof day !== 'string' || !ISO_DAY_RE.test(day))))
+        .map(({ index }) => index);
+      if (badDays.length) {
+        addPreparationIssue(issues, dataRoomIssue({
+          code: 'invalid_date_format', path: `${path}.${field}`,
+          message: `${field} entries at indices ${badDays.join(', ')} must use YYYY-MM-DD start/end days (month coverage uses YYYY-MM-01).`,
+          expected: { kind: 'pattern', type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', example: '2026-09-25' }, received: value[field],
+        }));
+      }
     }
   }
 }
@@ -491,6 +637,27 @@ function collectAnswerIssues(value: unknown, path: string, issues: DataRoomFailu
       }));
     }
   }
+  collectTextIssue(value.metricId, `${path}.metricId`, issues, 160);
+  collectTextIssue(value.metricValueColumn, `${path}.metricValueColumn`, issues, 160);
+  for (const field of ['rowDimensions', 'filterableFields']) {
+    if (Array.isArray(value[field]) && (value[field] as unknown[]).some(item => typeof item !== 'string' || !item.trim())) {
+      addPreparationIssue(issues, dataRoomIssue({
+        code: 'invalid_type', path: `${path}.${field}`, message: `Every ${field} entry must be one exact field-name string.`,
+        expected: { kind: 'type', type: 'array' }, received: value[field],
+      }));
+    }
+  }
+  if (Array.isArray(value.stableOrder)) {
+    const malformed = value.stableOrder.map((entry, index) => ({ entry, index })).filter(({ entry }) => (
+      !isRecord(entry) || typeof entry.field !== 'string' || (entry.direction !== 'asc' && entry.direction !== 'desc')
+      || Object.keys(entry).some(key => key !== 'field' && key !== 'direction')
+    )).map(({ index }) => index);
+    if (malformed.length) addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_stable_order', path: `${path}.stableOrder`,
+      message: `stableOrder entries at indices ${malformed.join(', ')} must each be {field:"schema field", direction:"asc"|"desc"}, not a bare field name.`,
+      expected: { kind: 'shape', requiredKeys: ['field', 'direction'], allowedKeys: ['field', 'direction'] }, received: value.stableOrder,
+    }));
+  }
 }
 
 function collectTargetIssues(value: unknown, path: string, issues: DataRoomFailureIssueV1[]): void {
@@ -511,6 +678,30 @@ function collectTargetIssues(value: unknown, path: string, issues: DataRoomFailu
     addPreparationIssue(issues, dataRoomIssue({
       code: 'invalid_type', path: `${path}.availableDimensions`, message: 'availableDimensions must be an array.',
       expected: { kind: 'type', type: 'array' }, received: value.availableDimensions,
+    }));
+  }
+  for (const [field, maximum] of [['name', 300], ['description', 4000], ['domainKey', 160], ['grain', 160], ['timeZone', 160]] as const) {
+    collectTextIssue(value[field], `${path}.${field}`, issues, maximum);
+  }
+  const fields = Array.isArray(value.schema)
+    ? new Map(value.schema.filter(isRecord).filter(field => typeof field.name === 'string').map(field => [field.name as string, field]))
+    : undefined;
+  collectFieldReferenceIssue(value.countingKey, `${path}.countingKey`, issues, fields, COUNTING_KEY_HINT);
+  collectFieldReferenceIssue(value.timeField, `${path}.timeField`, issues, fields, 'timeField is the one non-nullable date or timestamp column.');
+  const timeField = typeof value.timeField === 'string' ? fields?.get(value.timeField) : undefined;
+  if (timeField && ((timeField.logicalType !== 'date' && timeField.logicalType !== 'timestamp') || timeField.nullable !== false)) {
+    addPreparationIssue(issues, dataRoomIssue({
+      code: 'invalid_field_type_reference', path: `${path}.timeField`,
+      message: `timeField ${JSON.stringify(value.timeField)} must reference a schema field with logicalType date or timestamp and nullable:false.`,
+      expected: { kind: 'relation', description: 'Referenced schema field logicalType is date or timestamp and nullable=false.' }, received: value.timeField, includeReceivedValue: true,
+    }));
+  }
+  if (Array.isArray(value.availableDimensions) && fields) {
+    const unknown = value.availableDimensions.filter(dimension => typeof dimension !== 'string' || !fields.has(dimension));
+    if (unknown.length) addPreparationIssue(issues, dataRoomIssue({
+      code: 'unknown_field_reference', path: `${path}.availableDimensions`,
+      message: `availableDimensions entries must be schema field names; not fields: ${unknown.slice(0, 10).map(item => JSON.stringify(item)).join(', ')}.`,
+      expected: { kind: 'relation', description: 'Every value equals one schema[].name.' }, received: value.availableDimensions,
     }));
   }
   if (value.schema === undefined) return;
@@ -602,20 +793,35 @@ function collectPreparationPlanIssues(value: unknown): DataRoomFailureIssueV1[] 
         return;
       }
       const kind = source.kind;
-      if (!['existing_version', 'import_inbox', 'botboy_csv', 'sql_query', 'etl_query'].includes(String(kind))) {
+      if (!PREPARATION_SOURCE_KINDS.includes(String(kind))) {
         addPreparationIssue(issues, dataRoomIssue({
           code: 'invalid_enum', path: `${path}.kind`, message: 'Source kind must be one advertised adapter literal.',
-          expected: { kind: 'enum', values: ['existing_version', 'import_inbox', 'botboy_csv', 'sql_query', 'etl_query'] }, received: kind, includeReceivedValue: true,
+          expected: { kind: 'enum', values: [...PREPARATION_SOURCE_KINDS] }, received: kind, includeReceivedValue: true,
         }));
         return;
       }
-      if (kind === 'botboy_csv' || kind === 'sql_query' || kind === 'etl_query') {
-        if (kind === 'botboy_csv' && (typeof source.nullToken !== 'string' || !source.nullToken)) {
+      if (kind === 'local_file') {
+        const hasTarget = source.target !== undefined;
+        const hasInto = source.into !== undefined;
+        if (hasTarget === hasInto) {
           addPreparationIssue(issues, dataRoomIssue({
-            code: 'required', path: `${path}.nullToken`, message: 'nullToken must be a non-empty CSV token such as NULL.',
-            expected: { kind: 'pattern', type: 'string', pattern: '^[^,"\\r\\n\\u0000]+$', example: 'NULL' }, received: source.nullToken,
+            code: 'exactly_one_required', path: hasTarget ? `${path}.into` : `${path}.target`,
+            message: 'A local_file source needs exactly one of target (create a new dataset) or into (add a new version to one existing catalog dataset).',
+            expected: { kind: 'relation', description: 'Exactly one of target or into is present.' }, received: hasTarget ? source.into : source.target,
           }));
+        } else if (hasTarget) {
+          collectTargetIssues(source.target, `${path}.target`, issues);
+        } else if (collectShapeIssues(source.into, `${path}.into`, ['datasetId', 'mode', 'coverage'], ['datasetId', 'mode', 'coverage', 'expectedHeadRevision'], issues)) {
+          const into = source.into as Record<string, unknown>;
+          if (into.mode !== 'replace' && into.mode !== 'merge_partitions') addPreparationIssue(issues, dataRoomIssue({
+            code: 'invalid_enum', path: `${path}.into.mode`,
+            message: 'into.mode is replace (the file becomes the complete new version) or merge_partitions (the file replaces only its own time partitions; all other rows stay).',
+            expected: { kind: 'enum', values: ['replace', 'merge_partitions'] }, received: into.mode, includeReceivedValue: true,
+          }));
+          collectCoverageIssues(into.coverage, `${path}.into.coverage`, issues);
         }
+      }
+      if (kind === 'sql_query' || kind === 'etl_query') {
         collectTargetIssues(source.target, `${path}.target`, issues);
       }
     });
@@ -627,6 +833,25 @@ function collectPreparationPlanIssues(value: unknown): DataRoomFailureIssueV1[] 
     }));
   }
   collectShapeIssues(value.terminal, 'plan.terminal', ['kind'], ['kind', 'alias', 'fragmentId'], issues);
+  // Cheap request↔direct-target agreement in the same wave (full semantic
+  // identity/coverage consistency still runs after normalization).
+  const terminalAlias = isRecord(value.terminal) && value.terminal.kind === 'source' ? value.terminal.alias : undefined;
+  const terminalSource = Array.isArray(value.sources)
+    ? value.sources.find(source => isRecord(source) && source.alias === terminalAlias) as Record<string, unknown> | undefined
+    : undefined;
+  if (isRecord(value.request) && isRecord(terminalSource?.target)) {
+    const target = terminalSource.target;
+    for (const [requestField, targetField] of [['domainKey', 'domainKey'], ['countingKey', 'countingKey'], ['requiredGrain', 'grain'], ['timeZone', 'timeZone']] as const) {
+      const requested = value.request[requestField];
+      const declared = target[targetField];
+      if (typeof requested === 'string' && typeof declared === 'string' && requested !== declared) addPreparationIssue(issues, dataRoomIssue({
+        code: `terminal_${requestField === 'requiredGrain' ? 'grain' : requestField === 'countingKey' ? 'counting_key' : requestField === 'timeZone' ? 'timezone' : 'domain'}_mismatch`,
+        path: `plan.request.${requestField}`,
+        message: `request.${requestField} must equal the terminal target ${targetField} ${JSON.stringify(declared)}.`,
+        expected: { kind: 'literal', value: declared }, received: requested, includeReceivedValue: true,
+      }));
+    }
+  }
   return issues;
 }
 
@@ -1034,10 +1259,33 @@ function normalizePreparationTarget(value: unknown, label: string): AnalyticsDat
   return target;
 }
 
+interface TerminalSemantics {
+  domainKey: string;
+  metric: AnalyticsDatasetContract['metric'];
+  regime: AnalyticsDatasetContract['regime'];
+  countingKey: string;
+  grain: string;
+  timeZone: string;
+  availableDimensions: string[];
+  coverage: AnalyticsDatasetContract['coverage'];
+  /** Where the exact metric/regime identity objects come from. */
+  identitySource: string;
+}
+
 function directPreparationRequestIssues(
   request: AnalyticsRequest,
   target: AnalyticsDatasetPreparationTargetV1,
 ): DataRoomFailureIssueV1[] {
+  const semanticIdentities = derivePreparationSemanticIdentities(target.metric, target.regime);
+  return terminalRequestIssues(request, {
+    ...target,
+    metric: semanticIdentities.metric,
+    regime: semanticIdentities.regime,
+    identitySource: `action=derive_semantic_hashes (receipt ${semanticIdentities.receiptSha256})`,
+  });
+}
+
+function terminalRequestIssues(request: AnalyticsRequest, target: TerminalSemantics): DataRoomFailureIssueV1[] {
   const issues: DataRoomFailureIssueV1[] = [];
   const add = (issue: DataRoomFailureIssueV1): void => { if (issues.length < 8) issues.push(issue); };
   if (request.domainKey !== target.domainKey) add(dataRoomIssue({
@@ -1045,24 +1293,23 @@ function directPreparationRequestIssues(
     message: `request.domainKey must equal the direct terminal target domainKey ${target.domainKey}.`,
     expected: { kind: 'literal', value: target.domainKey }, received: request.domainKey, includeReceivedValue: true,
   }));
-  const semanticIdentities = derivePreparationSemanticIdentities(target.metric, target.regime);
-  const expectedMetric = semanticIdentities.metric;
+  const expectedMetric = target.metric;
   if (stableAnalyticsJson(request.metric) !== stableAnalyticsJson(expectedMetric)) add(dataRoomIssue({
     code: 'terminal_metric_mismatch', path: 'plan.request.metric',
     message: 'request.metric must exactly match the direct terminal target metric identity and hash.',
     expected: {
       kind: 'relation',
-      description: `Copy this exact object from action=derive_semantic_hashes: ${stableAnalyticsJson(expectedMetric)} (receipt ${semanticIdentities.receiptSha256}).`,
+      description: `Copy this exact object from ${target.identitySource}: ${stableAnalyticsJson(expectedMetric)}.`,
     },
     received: request.metric,
   }));
-  const expectedRegime = semanticIdentities.regime;
+  const expectedRegime = target.regime;
   if (stableAnalyticsJson(request.regime) !== stableAnalyticsJson(expectedRegime)) add(dataRoomIssue({
     code: 'terminal_regime_mismatch', path: 'plan.request.regime',
     message: 'request.regime must exactly match the direct terminal target regime identity and hash.',
     expected: {
       kind: 'relation',
-      description: `Copy this exact object from action=derive_semantic_hashes: ${stableAnalyticsJson(expectedRegime)} (receipt ${semanticIdentities.receiptSha256}).`,
+      description: `Copy this exact object from ${target.identitySource}: ${stableAnalyticsJson(expectedRegime)}.`,
     },
     received: request.regime,
   }));
@@ -1200,34 +1447,11 @@ function normalizePreparationPlan(value: AnalyticsDatasetPreparationPlanV1): Ana
       }
       return { kind, alias, importId, requiredColumns: uniqueTextArray(raw.requiredColumns, `${sourcePath}.requiredColumns`) };
     }
-    if (kind === 'botboy_csv') {
-      exactKeys(raw, ['kind', 'alias', 'filename', 'sha256', 'bytes', 'nullToken', 'target'], sourcePath);
-      const filename = normalizeBotboyCsvFilename(raw.filename, `${sourcePath}.filename`);
-      const sha256 = cleanText(raw.sha256, `${sourcePath}.sha256`, 64);
-      const bytes = Number(raw.bytes);
-      const nullToken = cleanText(raw.nullToken, `${sourcePath}.nullToken`, 32);
-      const receiptIssues: DataRoomFailureIssueV1[] = [];
-      if (!SHA256_RE.test(sha256)) receiptIssues.push(dataRoomIssue({
-        code: 'invalid_sha256', path: `${sourcePath}.sha256`, message: 'sha256 must be the final lowercase 64-hex write_file receipt.',
-        expected: { kind: 'pattern', type: 'string', pattern: '^[a-f0-9]{64}$' }, received: raw.sha256,
-      }));
-      if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_BOTBOY_CSV_BYTES) receiptIssues.push(dataRoomIssue({
-        code: 'out_of_range', path: `${sourcePath}.bytes`, message: 'bytes must equal the final write_file receipt and be 1 to 16 MiB.',
-        expected: { kind: 'range', type: 'integer', minimum: 1, maximum: MAX_BOTBOY_CSV_BYTES }, received: raw.bytes, includeReceivedValue: true,
-      }));
-      if (receiptIssues.length) fail('invalid_input', `${sourcePath} BotBoy CSV receipt is malformed.`, receiptIssues);
-      if (/[,"\r\n\0]/.test(nullToken)) {
-        fail('invalid_input', `${sourcePath}.nullToken is invalid for CSV.`, dataRoomIssue({
-          code: 'invalid_csv_null_token', path: `${sourcePath}.nullToken`, message: 'nullToken must be a non-empty token without comma, quote, CR, LF, or NUL.',
-          expected: { kind: 'pattern', type: 'string', pattern: '^[^,"\\r\\n\\u0000]+$', example: 'NULL' }, received: raw.nullToken,
-        }));
-      }
-      return { kind, alias, filename, sha256, bytes, nullToken, target: normalizePreparationTarget(raw.target, `${sourcePath}.target`) };
-    }
+    if (kind === 'local_file') return normalizeLocalFileSource(raw, alias, sourcePath);
     if (kind !== 'sql_query' && kind !== 'etl_query') {
       fail('invalid_input', `${sourcePath}.kind is unsupported.`, dataRoomIssue({
         code: 'invalid_enum', path: `${sourcePath}.kind`, message: 'Source kind must be one advertised adapter literal.',
-        expected: { kind: 'enum', values: ['existing_version', 'import_inbox', 'botboy_csv', 'sql_query', 'etl_query'] }, received: kind, includeReceivedValue: true,
+        expected: { kind: 'enum', values: [...PREPARATION_SOURCE_KINDS] }, received: kind, includeReceivedValue: true,
       }));
     }
     exactKeys(raw, kind === 'sql_query'
@@ -1300,10 +1524,25 @@ function normalizePreparationPlan(value: AnalyticsDatasetPreparationPlanV1): Ana
       expected: { kind: 'relation', description: 'Value equals one plan.fragments[].id.' }, received: terminal.fragmentId, includeReceivedValue: true,
     }));
   }
+  sources.forEach((source, index) => {
+    // A new version of an existing dataset is itself the outcome; it cannot
+    // be an intermediate input that silently moves a catalog head.
+    if (source.kind === 'local_file' && source.into
+      && (terminal.kind !== 'source' || terminal.alias !== source.alias)) {
+      fail('invalid_input', 'An into local_file source must be the plan terminal.', dataRoomIssue({
+        code: 'into_source_must_be_terminal', path: `plan.sources[${index}].into`,
+        message: 'A local_file source with into publishes a new version of an existing dataset, so plan.terminal must be {kind:"source", alias:<this alias>} with fragments [].',
+        expected: { kind: 'relation', description: 'plan.terminal selects this into source.' }, received: terminal,
+      }));
+    }
+  });
   if (terminal.kind === 'source') {
     const terminalSource = sources.find(source => source.alias === terminal.alias)!;
-    if (terminalSource.kind === 'botboy_csv' || terminalSource.kind === 'sql_query' || terminalSource.kind === 'etl_query') {
-      const consistencyIssues = directPreparationRequestIssues(request, terminalSource.target);
+    const directTarget = terminalSource.kind === 'sql_query' || terminalSource.kind === 'etl_query'
+      ? terminalSource.target
+      : terminalSource.kind === 'local_file' ? terminalSource.target : undefined;
+    if (directTarget) {
+      const consistencyIssues = directPreparationRequestIssues(request, directTarget);
       if (consistencyIssues.length) {
         fail('invalid_input', `Direct terminal request has ${consistencyIssues.length} semantic/coverage mismatch(es).`, consistencyIssues);
       }
@@ -1312,6 +1551,7 @@ function normalizePreparationPlan(value: AnalyticsDatasetPreparationPlanV1): Ana
   return { version: 1, mode: 'dataset_preparation', request, sources, fragments, terminal };
 }
 
+/** `plan` is already normalized and, for local files, admitted with exact byte pins. */
 function preparationIntent(owner: AnalyticsJobOwnerRequest, plan: AnalyticsDatasetPreparationPlanV1): AnalyticsDatasetPreparationIntentV1 {
   const message = cleanText(owner.message, 'owner message');
   return {
@@ -1319,7 +1559,7 @@ function preparationIntent(owner: AnalyticsJobOwnerRequest, plan: AnalyticsDatas
     mode: 'dataset_preparation',
     goal: message,
     ownerMessageSha256: analyticsSha256(message),
-    plan: normalizePreparationPlan(plan),
+    plan,
   };
 }
 
@@ -1412,8 +1652,8 @@ function nodesForPreparation(plan: AnalyticsDatasetPreparationPlanV1) {
           ? 'sql-context-to-data-room-v1'
           : source.kind === 'etl_query'
             ? 'datanet-etl-to-data-room-v1'
-            : source.kind === 'botboy_csv'
-              ? 'botboy-csv-to-data-room-v1'
+            : source.kind === 'local_file'
+              ? 'local-file-to-data-room-v1'
               : 'import-inbox-to-data-room-v1',
       spec: source.kind === 'existing_version'
         ? { type: 'existing_version', input: source }
@@ -1427,14 +1667,17 @@ function nodesForPreparation(plan: AnalyticsDatasetPreparationPlanV1) {
           }
         : source.kind === 'import_inbox'
           ? { importId: source.importId, requiredColumns: source.requiredColumns }
-          : source.kind === 'botboy_csv'
+          : source.kind === 'local_file'
             ? {
                 sourceKind: source.kind,
-                filename: source.filename,
-                fileSha256: source.sha256,
-                fileBytes: source.bytes,
-                nullTokenSha256: analyticsSha256(source.nullToken),
-                targetSha256: analyticsSha256(source.target),
+                fileSha256: source.admitted?.sha256 ?? null,
+                fileBytes: source.admitted?.bytes ?? null,
+                format: source.admitted?.format ?? source.format ?? null,
+                sheet: source.admitted?.sheet ?? null,
+                headerRow: source.admitted?.headerRow ?? null,
+                nullTokenSha256: analyticsSha256(source.nullToken ?? ''),
+                ...(source.target ? { targetSha256: analyticsSha256(source.target) } : {}),
+                ...(source.into ? { intoSha256: analyticsSha256({ into: source.into, base: source.admitted?.base ?? null }) } : {}),
               }
             : {
                 sourceKind: source.kind,
@@ -1655,8 +1898,8 @@ function preparationSourceDefinition(input: {
           ? 'datanet_etl_query'
           : input.sourceKind === 'sql_context'
             ? 'sql_context_query'
-            : 'botboy_csv',
-        adapterVersion: input.sourceKind === 'import' ? BOTBOY_CSV_PARSER_VERSION : 'analytics-dataset-preparation-v1',
+            : 'local_file',
+        adapterVersion: input.sourceKind === 'import' ? ANALYTICS_LOCAL_FILE_PARSER_VERSION : 'analytics-dataset-preparation-v1',
         sourceQueryOwner: 'analytics-job',
         answer: target.answer,
       },
@@ -1796,11 +2039,18 @@ export function createAnalyticsJobService(input: {
   sqlRunner?: AnalyticsPreparationSqlRunner;
   etlRunner?: QueryRunner;
   modelContextRuntime?: AnalyticsModelContextRuntime;
+  /** Strict XLSX workbook reader for local-file sources. */
+  documentParser?: DocumentParser;
+  localFilePolicy?: AnalyticsLocalFilePolicy;
   now?: () => Date;
   waitMs?: number;
 }): AnalyticsJobService {
   const now = input.now ?? (() => new Date());
   const waitMs = Math.max(100, Math.min(30_000, input.waitMs ?? DEFAULT_WAIT_MS));
+  const localFilePolicy = input.localFilePolicy ?? defaultAnalyticsLocalFilePolicy();
+  // Same model-context rule as newly prepared datasets: without a local or
+  // managed provider, file facts reach the model as structure only.
+  const withholdFileValues = !input.modelContextRuntime || input.modelContextRuntime.providerLocality === 'external_remote';
   let active: Promise<number> | null = null;
   let activeController: AbortController | null = null;
   let activeJobId: string | null = null;
@@ -1960,7 +2210,452 @@ export function createAnalyticsJobService(input: {
     });
   }
 
-  async function executeSource(observation: AnalyticsJobObservation, node: AnalyticsJobNodeRecord, attemptId: string): Promise<void> {
+  interface PreparedLocalFile {
+    admission: AnalyticsLocalFileAdmissionV1;
+    columns: string[];
+    rows: AnalyticsDataCell[][];
+    fileRowCount: number;
+    /** Coverage of the version that will be published. */
+    coverage: AnalyticsDatasetContract['coverage'];
+    nullToken: string;
+    table: AnalyticsLocalFileCompleteReceipt['table'];
+    base?: { versionId?: string; contentSha256?: string; keptRows: number; replacedPartitions: string[] };
+  }
+
+  function laterTimestamp(left: string, right: string): string {
+    return Date.parse(right) > Date.parse(left) ? right : left;
+  }
+
+  function readVersionRows(versionId: string, schema: AnalyticsDatasetContract['schema']): AnalyticsDataCell[][] {
+    const database = new SqliteDatabase(input.store.getVerifiedMaterializedPath(versionId, 'local_answer'), { readonly: true, fileMustExist: true });
+    try {
+      database.pragma('query_only = ON');
+      const raw = database.prepare('SELECT * FROM data').all() as Array<Record<string, AnalyticsDataCell>>;
+      return raw.map(row => schema.map(field => {
+        const value = row[field.name] ?? null;
+        return field.logicalType === 'boolean' && value !== null ? value === 1 : value;
+      }));
+    } finally {
+      database.close();
+    }
+  }
+
+  /**
+   * Read, type, and coverage-check one local file against its contract. Used
+   * identically at admission (no pins; zero effects) and at execution (pins
+   * must still match). Failures before a job exist are invalid_input or
+   * policy_denied with exact issues; nothing here authors plan semantics.
+   */
+  async function prepareLocalFile(
+    request: AnalyticsRequest,
+    source: LocalFileSource,
+    label: string,
+    signal: AbortSignal | undefined,
+    pinned: AnalyticsLocalFileAdmissionV1 | undefined,
+    options: { readBaseRows: boolean },
+  ): Promise<PreparedLocalFile> {
+    let snapshot: ReturnType<typeof readAnalyticsLocalFile>;
+    let table: Awaited<ReturnType<typeof readAnalyticsLocalTable>>;
+    try {
+      snapshot = readAnalyticsLocalFile(resolveAnalyticsLocalFile(source, localFilePolicy, label), label);
+      if (pinned && (snapshot.sha256 !== pinned.sha256 || snapshot.size !== pinned.bytes)) {
+        fail('integrity_failed', `${source.alias}: the file changed after this import was admitted. Call create again so BotBoy imports its current exact bytes.`);
+      }
+      table = await readAnalyticsLocalTable(snapshot, source, { documentParser: input.documentParser, signal, tempRoot: localFilePolicy.tempRoot }, label);
+    } catch (error) {
+      return localFileFailure(error);
+    }
+    const into = source.into;
+    let dataset: AnalyticsDatasetDetail | null = null;
+    let schema: AnalyticsDatasetContract['schema'];
+    let timeFieldName: string;
+    let timeZone: string;
+    let fileCoverage: AnalyticsDatasetContract['coverage'];
+    if (source.target) {
+      schema = source.target.schema;
+      timeFieldName = source.target.timeField;
+      timeZone = source.target.timeZone;
+      fileCoverage = source.target.coverage;
+    } else {
+      dataset = input.store.getDataset(into!.datasetId);
+      const intoPath = `${label}.into`;
+      if (!dataset || dataset.catalogVisibility !== 'catalog' || dataset.lifecycle !== 'active') {
+        fail('invalid_input', `${intoPath}.datasetId is not one active catalog dataset.`, dataRoomIssue({
+          code: 'unknown_dataset', path: `${intoPath}.datasetId`,
+          message: 'into.datasetId must be the exact ds_* ID of one active ready dataset from list_data_room_datasets; use target to create a new dataset instead.',
+          expected: { kind: 'relation', description: 'An active catalog dataset ID.' }, received: into!.datasetId, includeReceivedValue: true,
+        }));
+      }
+      if (dataset.kind !== 'source' || dataset.sourceKind !== 'import' || dataset.sourceFormat !== 'canonical_json') {
+        fail('invalid_input', `${intoPath}.datasetId is not a file-born dataset.`, dataRoomIssue({
+          code: 'dataset_adapter_mismatch', path: `${intoPath}.datasetId`,
+          message: `Dataset ${dataset.id} is acquired by its own ${dataset.kind === 'derived' ? 'derivation' : `${dataset.sourceKind} query`} adapter, so a file cannot become its next version. Refresh it through that adapter, or create a new dataset from this file with target.`,
+          expected: { kind: 'relation', description: 'A source dataset whose versions come from files (sourceKind import, canonical rows).' }, received: dataset.sourceKind, includeReceivedValue: true,
+        }));
+      }
+      const headRevision = dataset.head?.headRevision ?? 0;
+      if (pinned?.base && (dataset.definitionRevision !== pinned.base.definitionRevision
+        || dataset.contractSha256 !== pinned.base.contractSha256
+        || headRevision !== pinned.base.headRevision)) {
+        fail('conflict', `Dataset ${dataset.id} changed after this import was admitted. Call create again against its current head.`);
+      }
+      if (into!.expectedHeadRevision !== undefined && into!.expectedHeadRevision !== headRevision) {
+        fail('invalid_input', `${intoPath}.expectedHeadRevision is stale.`, dataRoomIssue({
+          code: 'head_revision_mismatch', path: `${intoPath}.expectedHeadRevision`,
+          message: `Dataset ${dataset.id} is at head revision ${headRevision}. Use that value or omit expectedHeadRevision.`,
+          expected: { kind: 'literal', value: headRevision }, received: into!.expectedHeadRevision, includeReceivedValue: true,
+        }));
+      }
+      if (into!.coverage.partitionKind !== dataset.contract.coverage.partitionKind) {
+        fail('invalid_input', `${intoPath}.coverage.partitionKind differs from the dataset.`, dataRoomIssue({
+          code: 'partition_kind_mismatch', path: `${intoPath}.coverage.partitionKind`,
+          message: `Dataset ${dataset.id} uses ${dataset.contract.coverage.partitionKind} coverage partitions.`,
+          expected: { kind: 'literal', value: dataset.contract.coverage.partitionKind }, received: into!.coverage.partitionKind, includeReceivedValue: true,
+        }));
+      }
+      schema = dataset.contract.schema;
+      timeFieldName = dataset.contract.timeField;
+      timeZone = dataset.contract.timeZone;
+      fileCoverage = into!.coverage;
+    }
+    let typed: ReturnType<typeof typeAnalyticsLocalTable>;
+    try {
+      typed = typeAnalyticsLocalTable(table, schema, source.nullToken, {
+        source: label,
+        schema: source.target ? `${label}.target.schema` : `${label}.into.datasetId`,
+        ...(dataset ? { fixedDatasetId: dataset.id } : {}),
+      }, { withholdValues: withholdFileValues });
+    } catch (error) {
+      return localFileFailure(error);
+    }
+    const coveragePath = source.target ? `${label}.target.coverage` : `${label}.into.coverage`;
+    if (!typed.rows.length) {
+      fail('invalid_input', `${label}.path has no data rows.`, dataRoomIssue({
+        code: 'empty_table', path: `${label}.path`,
+        message: `${table.sheet ? `Sheet ${JSON.stringify(table.sheet)}` : 'The file'} has a header but no data rows${table.blankRowsSkipped ? ` (${table.blankRowsSkipped} blank rows skipped)` : ''}; there is nothing to import.`,
+        expected: { kind: 'range', type: 'integer', minimum: 1 }, received: 0, includeReceivedValue: true,
+      }));
+    }
+    const timeIndex = schema.findIndex(field => field.name === timeFieldName);
+    const timeField = schema[timeIndex];
+    const partitionOf = (row: AnalyticsDataCell[]): string => analyticsCoveragePartition(row[timeIndex], timeField, timeZone, fileCoverage.partitionKind)!;
+    const filePartitions = new Set(typed.rows.map(partitionOf));
+    const declaredObserved = new Set(fileCoverage.observedPartitions ?? fileCoverage.completePartitions);
+    const undeclared = [...filePartitions].filter(value => !declaredObserved.has(value)).sort();
+    const absent = [...declaredObserved].filter(value => !filePartitions.has(value)).sort();
+    const coverageIssues: DataRoomFailureIssueV1[] = [];
+    if (undeclared.length || absent.length) {
+      const actual = compactAnalyticsPartitionRanges(filePartitions, fileCoverage.partitionKind);
+      coverageIssues.push(dataRoomIssue({
+        code: 'observed_coverage_mismatch', path: coveragePath,
+        message: `The file's ${timeFieldName} values cover exactly ${filePartitions.size} ${fileCoverage.partitionKind} partition(s) in ${actual.length} range(s): ${actual.slice(0, 40).map(range => range.start === range.end ? range.start : `${range.start}..${range.end}`).join(', ')}${actual.length > 40 ? ', …' : ''}. Declare observed coverage exactly (completeRanges may be stricter).${undeclared.length ? ` Present but undeclared: ${undeclared.slice(0, 5).join(', ')}.` : ''}${absent.length ? ` Declared but absent: ${absent.slice(0, 5).join(', ')}.` : ''}`,
+        expected: { kind: 'relation', description: 'Declared observed partitions equal the file rows\u2019 actual partitions.' }, received: fileCoverage.observedPartitions?.length ?? fileCoverage.completePartitions.length, includeReceivedValue: true,
+      }));
+    }
+    const latest = [...filePartitions].sort().at(-1)!;
+    const watermarkPartition = analyticsCoveragePartition(fileCoverage.watermark, { name: 'watermark', logicalType: 'timestamp', nullable: false }, timeZone, fileCoverage.partitionKind);
+    if (watermarkPartition !== null && watermarkPartition < latest) coverageIssues.push(dataRoomIssue({
+      code: 'watermark_before_data', path: `${coveragePath}.watermark`,
+      message: `The latest ${timeFieldName} partition is ${latest}; the watermark must be at or after it.`,
+      expected: { kind: 'relation', description: `An ISO timestamp on or after ${latest} in ${timeZone}.` }, received: fileCoverage.watermark, includeReceivedValue: true,
+    }));
+    if (coverageIssues.length) fail('invalid_input', `${coveragePath} does not match the file rows.`, coverageIssues);
+
+    let rows = typed.rows;
+    let coverage = fileCoverage;
+    let base: PreparedLocalFile['base'];
+    let baseVersion: AnalyticsDatasetVersionDetail | null = null;
+    if (dataset && into!.mode === 'merge_partitions' && dataset.head) {
+      baseVersion = input.store.getDatasetVersion(dataset.head.versionId);
+      if (!baseVersion) fail('integrity_failed', `Dataset ${dataset.id} head version disappeared.`);
+      if (pinned?.base && pinned.base.versionId !== baseVersion.id) {
+        fail('conflict', `Dataset ${dataset.id} changed after this import was admitted. Call create again against its current head.`);
+      }
+      const baseObserved = baseVersion.coverage.observedPartitions ?? baseVersion.coverage.completePartitions;
+      const replacedPartitions = baseObserved.filter(value => filePartitions.has(value)).sort();
+      coverage = {
+        partitionKind: fileCoverage.partitionKind,
+        observedPartitions: [...new Set([...baseObserved, ...filePartitions])].sort(),
+        completePartitions: [...new Set([
+          ...baseVersion.coverage.completePartitions.filter(value => !filePartitions.has(value)),
+          ...fileCoverage.completePartitions,
+        ])].sort(),
+        watermark: laterTimestamp(baseVersion.coverage.watermark, fileCoverage.watermark),
+      };
+      let keptRows = 0;
+      if (options.readBaseRows) {
+        const kept = readVersionRows(baseVersion.id, schema).filter(row => !filePartitions.has(partitionOf(row)));
+        keptRows = kept.length;
+        const ordered = [...kept, ...typed.rows].map((row, index) => ({ row, index, partition: partitionOf(row) }));
+        ordered.sort((left, right) => (left.partition < right.partition ? -1 : left.partition > right.partition ? 1 : left.index - right.index));
+        rows = ordered.map(value => value.row);
+      }
+      base = { versionId: baseVersion.id, contentSha256: baseVersion.materializedSha256, keptRows, replacedPartitions };
+    }
+    if (dataset) {
+      const issues = terminalRequestIssues(request, {
+        domainKey: dataset.contract.domainKey,
+        metric: dataset.contract.metric,
+        regime: dataset.contract.regime,
+        countingKey: dataset.contract.countingKey,
+        grain: dataset.contract.grain,
+        timeZone: dataset.contract.timeZone,
+        availableDimensions: dataset.contract.availableDimensions,
+        coverage,
+        identitySource: `dataset ${dataset.id} (its list_data_room_datasets card metric/regime objects)`,
+      });
+      if (issues.length) fail('invalid_input', `plan.request does not match dataset ${dataset.id} after this import.`, issues);
+    }
+    return {
+      admission: {
+        resolvedPath: snapshot.resolvedPath,
+        fileName: snapshot.fileName,
+        format: snapshot.format,
+        sha256: snapshot.sha256,
+        bytes: snapshot.size,
+        ...(table.sheet !== undefined ? { sheet: table.sheet } : {}),
+        ...(table.headerRow !== undefined ? { headerRow: table.headerRow } : {}),
+        fileRowCount: typed.rows.length,
+        ...(dataset ? {
+          base: {
+            definitionRevision: dataset.definitionRevision,
+            contractSha256: dataset.contractSha256,
+            headRevision: dataset.head?.headRevision ?? 0,
+            ...(dataset.head ? { versionId: dataset.head.versionId } : {}),
+            ...(baseVersion ? { contentSha256: baseVersion.materializedSha256 } : {}),
+          },
+        } : {}),
+      },
+      columns: typed.columns,
+      rows,
+      fileRowCount: typed.rows.length,
+      coverage,
+      nullToken: source.nullToken ?? '',
+      table: {
+        shortRows: table.shortRows,
+        blankRowsSkipped: table.blankRowsSkipped,
+        rowsAboveHeader: table.rowsAboveHeader,
+        formulaCells: table.formulaCells,
+      },
+      ...(base ? { base } : {}),
+    };
+  }
+
+  /** Pin every local file's exact bytes and base head before any durable job exists. */
+  async function admitLocalFileSources(
+    plan: AnalyticsDatasetPreparationPlanV1,
+    signal: AbortSignal | undefined,
+  ): Promise<AnalyticsDatasetPreparationPlanV1> {
+    if (!plan.sources.some(source => source.kind === 'local_file')) return plan;
+    const sources: AnalyticsDatasetPreparationSourceV1[] = [];
+    for (const [index, source] of plan.sources.entries()) {
+      if (source.kind !== 'local_file') {
+        sources.push(source);
+        continue;
+      }
+      const label = `plan.sources[${index}]`;
+      let prepared: PreparedLocalFile;
+      try {
+        prepared = await prepareLocalFile(plan.request, source, label, signal, undefined, { readBaseRows: false });
+      } catch (error) {
+        const carrier = error as { issues?: unknown[] } | null;
+        if (Array.isArray(carrier?.issues) && carrier!.issues.length) throw error;
+        // No job exists yet, so even an infrastructure read failure has zero
+        // effects; say so structurally instead of implying unknown work.
+        fail('invalid_input', `${label} could not be read for admission.`, dataRoomIssue({
+          code: 'local_file_unreadable', path: `${label}.path`,
+          message: `BotBoy could not read or stage this file for import: ${error instanceof Error ? error.message : String(error)} Nothing was created; retry, or name another copy of the file.`,
+          expected: { kind: 'relation', description: 'A readable local file BotBoy can snapshot.' }, received: source.path,
+        }));
+      }
+      sources.push({ ...source, admitted: prepared.admission });
+    }
+    return { ...plan, sources };
+  }
+
+  async function inspectLocalFile(locator: AnalyticsLocalFileLocator, options: { signal?: AbortSignal } = {}): Promise<AnalyticsLocalFileInspection> {
+    try {
+      const snapshot = readAnalyticsLocalFile(resolveAnalyticsLocalFile(locator, localFilePolicy, 'file'), 'file');
+      const table = await readAnalyticsLocalTable(snapshot, locator, {
+        documentParser: input.documentParser,
+        signal: options.signal,
+        tempRoot: localFilePolicy.tempRoot,
+      }, 'file');
+      const profile = profileAnalyticsLocalTable(table, locator.nullToken);
+      const samplesWithheld = withholdFileValues;
+      return {
+        file: { name: table.fileName, format: table.format, bytes: table.size, sha256: table.sha256 },
+        ...(table.sheets ? { sheets: table.sheets } : {}),
+        ...(table.sheet !== undefined ? { sheet: table.sheet } : {}),
+        ...(table.headerRow !== undefined ? { headerRow: table.headerRow } : {}),
+        nullToken: locator.nullToken ?? '',
+        rowCount: profile.rowCount,
+        blankRowsSkipped: table.blankRowsSkipped,
+        rowsAboveHeader: table.rowsAboveHeader,
+        formulaCells: table.formulaCells,
+        shortRows: table.shortRows,
+        samplesWithheld,
+        columns: samplesWithheld
+          ? profile.columns.map(({ samples: _samples, minimum: _minimum, maximum: _maximum, ...column }) => ({ ...column, samples: [] }))
+          : profile.columns,
+      };
+    } catch (error) {
+      return localFileFailure(error);
+    }
+  }
+
+  async function executeLocalFileSource(
+    observation: AnalyticsJobObservation,
+    node: AnalyticsJobNodeRecord,
+    attemptId: string,
+    source: LocalFileSource,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    if (!input.dataRoom) fail('unsupported', 'The Data Room writer is unavailable to the existing analytics job service.');
+    const intent = observation.job.intent;
+    if (!('mode' in intent) || intent.mode !== 'dataset_preparation') fail('integrity_failed', 'Local-file source belongs to a non-preparation job.');
+    if (!source.admitted) fail('integrity_failed', 'Local-file source lacks its admission byte pins; call create again.');
+    if (source.into && source.admitted.base) {
+      // A crash after the store commit but before succeedNode must converge on
+      // this job's own version instead of reporting the moved head as a conflict.
+      const base = source.admitted.base;
+      const head = input.store.getDataset(source.into.datasetId)?.head;
+      const receipt = head?.promotionReceipt as { previousHeadRevision?: number; previousVersionId?: string | null } | undefined;
+      const ownCommit = head && head.headRevision === base.headRevision + 1
+        && receipt?.previousHeadRevision === base.headRevision
+        && (receipt.previousVersionId ?? undefined) === base.versionId
+        && input.db.prepare(`
+          SELECT 1 FROM analytics_dataset_runs
+          WHERE dataset_id = ? AND output_version_id = ? AND request_sha256 = ? AND status = 'completed'
+        `).get(source.into.datasetId, head.versionId, observation.job.intentSha256);
+      const version = ownCommit ? input.store.getDatasetVersion(head!.versionId) : null;
+      if (version) {
+        input.store.verifyVersion(version.id, 'local_answer');
+        input.jobStore.succeedNode({
+          nodeId: node.id,
+          attemptId,
+          outputDatasetId: version.datasetId,
+          outputVersionId: version.id,
+          receipt: {
+            kind: 'local_file', fileName: source.admitted.fileName, format: source.admitted.format,
+            inputSha256: source.admitted.sha256, inputBytes: source.admitted.bytes,
+            parserVersion: ANALYTICS_LOCAL_FILE_PARSER_VERSION, mode: source.into.mode,
+            fileRows: source.admitted.fileRowCount, rowCount: version.rowCount,
+            datasetId: version.datasetId, versionId: version.id,
+            contentSha256: version.materializedSha256, idempotent: true, replayedCommittedVersion: true,
+          },
+        });
+        return;
+      }
+    }
+    const index = intent.plan.sources.findIndex(value => value.alias === source.alias);
+    const prepared = await prepareLocalFile(intent.plan.request, source, `plan.sources[${index}]`, signal, source.admitted, { readBaseRows: true });
+    const admitted = prepared.admission;
+    const mode = source.target ? 'new_dataset' as const : source.into!.mode;
+    const complete: AnalyticsLocalFileCompleteReceipt = {
+      parserVersion: ANALYTICS_LOCAL_FILE_PARSER_VERSION,
+      completeToEof: true as const,
+      format: admitted.format,
+      fileName: admitted.fileName,
+      inputSha256: admitted.sha256,
+      inputBytes: admitted.bytes,
+      ...(admitted.sheet !== undefined ? { sheet: admitted.sheet } : {}),
+      ...(admitted.headerRow !== undefined ? { headerRow: admitted.headerRow } : {}),
+      nullToken: prepared.nullToken,
+      fileRowCount: prepared.fileRowCount,
+      rowCount: prepared.rows.length,
+      rowsetSha256: analyticsSha256({ columns: prepared.columns, rows: prepared.rows, rowCount: prepared.rows.length }),
+      schemaSha256: '',
+      mode,
+      table: prepared.table,
+      ...(prepared.base?.versionId ? {
+        base: {
+          versionId: prepared.base.versionId,
+          contentSha256: prepared.base.contentSha256!,
+          keptRows: prepared.base.keptRows,
+          replacedPartitions: prepared.base.replacedPartitions,
+        },
+      } : {}),
+    };
+    const sourceReceipt = {
+      sourceKind: 'import' as const,
+      sourceId: admitted.sha256,
+      producerVersion: ANALYTICS_LOCAL_FILE_PARSER_VERSION,
+      acquiredAt: timestamp(),
+    };
+    let promoted: ReturnType<AnalyticsDataRoomService['ingestLocalFileRows']>;
+    if (source.target) {
+      const definition = preparationSourceDefinition({
+        job: observation.job,
+        alias: source.alias,
+        sourceKind: 'import',
+        target: source.target,
+        modelContextRuntime: input.modelContextRuntime,
+      });
+      const existing = input.store.getDataset(definition.definition.id);
+      const expectedHeadRevision = source.target.expectedHeadRevision ?? existing?.head?.headRevision ?? definition.expectedHeadRevision;
+      input.dataRoom.registerDataset(definition.definition);
+      promoted = input.dataRoom.ingestLocalFileRows({
+        datasetId: definition.definition.id,
+        expectedHeadRevision,
+        materializedAt: timestamp(),
+        sourceReceipt,
+        quality: definition.quality ?? [],
+        trigger: 'agent',
+        requestSha256: observation.job.intentSha256,
+        columns: prepared.columns,
+        rows: prepared.rows,
+        complete: { ...complete, schemaSha256: definition.definition.contract.schemaSha256 },
+      });
+    } else {
+      const dataset = input.store.getDataset(source.into!.datasetId)!;
+      promoted = input.dataRoom.ingestLocalFileRows({
+        datasetId: dataset.id,
+        expectedHeadRevision: admitted.base!.headRevision,
+        materializedAt: timestamp(),
+        sourceReceipt,
+        quality: [],
+        trigger: 'agent',
+        requestSha256: observation.job.intentSha256,
+        columns: prepared.columns,
+        rows: prepared.rows,
+        complete: { ...complete, schemaSha256: dataset.contract.schemaSha256 },
+        coverageRevision: {
+          expectedDefinitionRevision: admitted.base!.definitionRevision,
+          coverage: prepared.coverage,
+        },
+      });
+    }
+    input.store.verifyVersion(promoted.version.id, 'local_answer');
+    input.jobStore.succeedNode({
+      nodeId: node.id,
+      attemptId,
+      outputDatasetId: promoted.datasetId,
+      outputVersionId: promoted.version.id,
+      receipt: {
+        kind: 'local_file', fileName: admitted.fileName, format: admitted.format,
+        ...(admitted.sheet !== undefined ? { sheet: admitted.sheet } : {}),
+        inputSha256: admitted.sha256, inputBytes: admitted.bytes,
+        parserVersion: ANALYTICS_LOCAL_FILE_PARSER_VERSION, mode,
+        fileRows: prepared.fileRowCount, rowCount: promoted.version.rowCount,
+        ...(prepared.base?.versionId ? {
+          baseVersionId: prepared.base.versionId,
+          keptRows: prepared.base.keptRows,
+          replacedPartitions: prepared.base.replacedPartitions.length,
+        } : {}),
+        datasetId: promoted.datasetId, versionId: promoted.version.id,
+        contentSha256: promoted.version.materializedSha256,
+        sourceRunId: promoted.run.id, idempotent: promoted.idempotent,
+      },
+    });
+  }
+
+  async function executeSource(
+    observation: AnalyticsJobObservation,
+    node: AnalyticsJobNodeRecord,
+    attemptId: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const spec = node.spec;
     if (spec.type === 'existing_version' && isRecord(spec.input)) {
       const source = spec.input as unknown as AnalyticsJobExistingInputV1;
@@ -2064,15 +2759,18 @@ export function createAnalyticsJobService(input: {
       scheduleWake(5_000);
       return;
     }
-    if (source.kind !== 'botboy_csv' && source.kind !== 'sql_query' && source.kind !== 'etl_query') {
+    if (source.kind === 'local_file') {
+      await executeLocalFileSource(observation, node, attemptId, source, signal);
+      return;
+    }
+    if (source.kind !== 'sql_query' && source.kind !== 'etl_query') {
       fail('integrity_failed', 'Preparation source adapter is unsupported.');
     }
     if (!input.dataRoom) fail('unsupported', 'The Data Room writer is unavailable to the existing analytics job service.');
-    const csvFile = source.kind === 'botboy_csv' ? readVerifiedBotboyCsv(source) : undefined;
     const prepared = preparationSourceDefinition({
       job: observation.job,
       alias: source.alias,
-      sourceKind: source.kind === 'sql_query' ? 'sql_context' : source.kind === 'etl_query' ? 'datanet_etl' : 'import',
+      sourceKind: source.kind === 'sql_query' ? 'sql_context' : 'datanet_etl',
       target: source.target,
       modelContextRuntime: input.modelContextRuntime,
     });
@@ -2081,43 +2779,6 @@ export function createAnalyticsJobService(input: {
       ?? existing?.head?.headRevision
       ?? prepared.expectedHeadRevision;
     input.dataRoom.registerDataset(prepared.definition);
-    if (source.kind === 'botboy_csv') {
-      if (!csvFile) fail('integrity_failed', 'BotBoy CSV verification did not return exact bytes.');
-      const promoted = input.dataRoom.ingestBotboyCsv({
-        datasetId: prepared.definition.id,
-        expectedHeadRevision,
-        materializedAt: timestamp(),
-        sourceReceipt: {
-          sourceKind: 'import',
-          sourceId: source.sha256,
-          producerVersion: BOTBOY_CSV_PARSER_VERSION,
-          acquiredAt: timestamp(),
-        },
-        quality: prepared.quality ?? [],
-        trigger: 'agent',
-        requestSha256: observation.job.intentSha256,
-        savedTo: csvFile.savedTo,
-        fileBytes: csvFile.fileBytes,
-        fileSha256: csvFile.fileSha256,
-        nullToken: source.nullToken,
-      });
-      input.store.verifyVersion(promoted.version.id, 'local_answer');
-      input.jobStore.succeedNode({
-        nodeId: node.id,
-        attemptId,
-        outputDatasetId: promoted.datasetId,
-        outputVersionId: promoted.version.id,
-        receipt: {
-          kind: 'botboy_csv', filename: source.filename, inputSha256: source.sha256,
-          inputBytes: source.bytes, parserVersion: BOTBOY_CSV_PARSER_VERSION,
-          datasetId: promoted.datasetId, versionId: promoted.version.id,
-          contentSha256: promoted.version.materializedSha256,
-          rowCount: promoted.version.rowCount, sourceRunId: promoted.run.id,
-          idempotent: promoted.idempotent,
-        },
-      });
-      return;
-    }
     const querySha256 = analyticsSha256(source.sql);
     if (source.kind === 'sql_query') {
       if (!input.sqlRunner) fail('unsupported', 'The SQL preparation adapter is unavailable.');
@@ -2623,7 +3284,7 @@ export function createAnalyticsJobService(input: {
   }
 
   async function executeClaim(observation: AnalyticsJobObservation, node: AnalyticsJobNodeRecord, attemptId: string, signal: AbortSignal): Promise<void> {
-    if (node.kind === 'source_resolution') await executeSource(observation, node, attemptId);
+    if (node.kind === 'source_resolution') await executeSource(observation, node, attemptId, signal);
     else if (node.kind === 'transform_fragment') await executeFragment(observation, node, attemptId, signal);
     else if (node.kind === 'result_publication') await executeResult(observation, node, attemptId);
     else if (node.kind === 'answer_delivery') await executeAnswer(observation, node, attemptId, signal);
@@ -2780,7 +3441,10 @@ export function createAnalyticsJobService(input: {
   ): Promise<AnalyticsJobToolReceipt> {
     const ownerId = cleanText(owner.ownerId, 'ownerId', 240);
     const requestId = cleanText(owner.requestId, 'ownerRequestId', 128);
-    const intent = preparationIntent({ ...owner, ownerId, requestId }, plan);
+    // Local files are read, typed, and coverage-checked against their contract
+    // before any durable job exists, so a mismatch has zero effects.
+    const admitted = await admitLocalFileSources(normalizePreparationPlan(plan), options.waitSignal);
+    const intent = preparationIntent({ ...owner, ownerId, requestId }, admitted);
     const created = input.jobStore.createOrJoin({
       ownerId,
       ownerRequestId: requestId,
@@ -2873,6 +3537,7 @@ export function createAnalyticsJobService(input: {
   return {
     startOrJoinAndWait,
     prepareOrJoinAndWait,
+    inspectLocalFile,
     observe,
     resume,
     respond,

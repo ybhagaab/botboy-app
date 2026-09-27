@@ -1776,7 +1776,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 }, 10000);
               } else if (tc.function.name === 'create_data_room_dataset') {
                 try {
-                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🧱 Preparing the governed Data Room dataset...' })}\n\n`);
+                  const statusText = datasetAction === 'inspect_local_file'
+                    ? '📄 Reading the file’s columns and date ranges...'
+                    : '🧱 Preparing the governed Data Room dataset...';
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: statusText })}\n\n`);
                 } catch {}
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: data-room-prepare ${Date.now()}\n\n`); } catch {}

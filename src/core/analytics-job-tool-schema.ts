@@ -4,6 +4,11 @@ const IDENTIFIER_PATTERN = '^[A-Za-z_][A-Za-z0-9_]{0,159}$';
 const SOURCE_ALIAS_PATTERN = '^[A-Za-z][A-Za-z0-9_]{0,31}$';
 const SHA256_PATTERN = '^[a-f0-9]{64}$';
 const ISO_DAY_PATTERN = '^\\d{4}-\\d{2}-\\d{2}$';
+const WATERMARK_SCHEMA = {
+  type: 'string', minLength: 20, maxLength: 80,
+  pattern: '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$',
+  description: 'Exact ISO timestamp WITH time and timezone (a date alone is invalid) through which source evidence is current, e.g. "2026-09-25T23:59:59+05:30".',
+};
 
 function scalarSchema(): JsonSchema {
   return {
@@ -195,9 +200,9 @@ function analyticsRequestSchema(): JsonSchema {
         required: ['start', 'end'],
       },
       timeZone: { type: 'string', minLength: 1, maxLength: 160, description: 'Exact IANA time zone, for example UTC.' },
-      countingKey: identifierSchema('Exact row/counting key.'),
+      countingKey: identifierSchema('ONE exact schema field name that each row counts; must equal the terminal target countingKey. In a long table with one row per date and metric, use the metric-name field. Never an array or expression.'),
       regime: exactRegimeSchema(),
-      requiredGrain: { type: 'string', minLength: 1, maxLength: 160 },
+      requiredGrain: { type: 'string', minLength: 1, maxLength: 160, description: 'Row-grain label; must equal the terminal target grain exactly (e.g. "day_metric").' },
       freshness: freshnessSchema(),
       use: { type: 'string', enum: ['local_answer'], description: 'Dataset preparation always validates for local_answer use.' },
       datasetId: { type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$', description: 'Optional exact existing/target dataset pin.' },
@@ -240,7 +245,7 @@ function coverageSchema(): JsonSchema {
             type: 'array', maxItems: 10000, uniqueItems: true, items: day,
             description: 'Only canonical partitions proven complete; each must also be observed.',
           },
-          watermark: { type: 'string', minLength: 1, maxLength: 80, description: 'Exact ISO timestamp through which source evidence is current.' },
+          watermark: WATERMARK_SCHEMA,
         },
         required: ['partitionKind', 'completePartitions', 'watermark'],
       },
@@ -252,7 +257,7 @@ function coverageSchema(): JsonSchema {
           partitionKind: { type: 'string', enum: ['day', 'month'], description: 'Canonical coverage key granularity. Month keys use YYYY-MM-01.' },
           observedRanges: { ...ranges, description: 'Inclusive ranges for all observed source partitions, including partial periods.' },
           completeRanges: { ...ranges, description: 'Inclusive ranges containing only proven-complete source partitions.' },
-          watermark: { type: 'string', minLength: 1, maxLength: 80, description: 'Exact ISO timestamp through which source evidence is current.' },
+          watermark: WATERMARK_SCHEMA,
         },
         required: ['partitionKind', 'observedRanges', 'completeRanges', 'watermark'],
       },
@@ -349,7 +354,7 @@ function sourceTargetSchema(): JsonSchema {
   return {
     type: 'object',
     additionalProperties: false,
-    description: 'Complete target contract for a fresh SQL, ETL, or BotBoy CSV source. Columns must exactly match acquired source order and types.',
+    description: 'Complete target contract for a NEW dataset from a fresh SQL, ETL, or local-file source. SQL/ETL columns must match acquired order and types; local-file schema names must equal the file header set (any order) and every cell must satisfy its declared type.',
     properties: {
       datasetId: { type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$', description: 'Optional exact target dataset ID. Omit to create one deterministically.' },
       expectedHeadRevision: { type: 'integer', minimum: 0, description: 'Optional exact CAS revision when updating a known dataset.' },
@@ -359,8 +364,8 @@ function sourceTargetSchema(): JsonSchema {
       schema: { type: 'array', minItems: 1, maxItems: 200, items: fieldSchema() },
       metric: metricDefinitionSchema(),
       regime: regimeDefinitionSchema(),
-      countingKey: identifierSchema('Schema field used as the counting key.'),
-      grain: { type: 'string', minLength: 1, maxLength: 160 },
+      countingKey: identifierSchema('ONE schema field used as the counting key (same value as request.countingKey); composite row identity belongs in grain.'),
+      grain: { type: 'string', minLength: 1, maxLength: 160, description: 'Row-grain label such as "day_metric" (one row per date and metric); request.requiredGrain must equal it.' },
       availableDimensions: uniqueIdentifiers('Schema fields available as dimensions.', 0, 100),
       timeField: identifierSchema('Non-nullable date/timestamp schema field.'),
       timeZone: { type: 'string', minLength: 1, maxLength: 160 },
@@ -556,6 +561,37 @@ function fragmentSchema(): JsonSchema {
   };
 }
 
+/** Shared by the local_file source and the read-only inspect_local_file action. */
+function localFileLocatorProperties(): Record<string, JsonSchema> {
+  return {
+    path: {
+      type: 'string', minLength: 1, maxLength: 4096,
+      description: 'Any readable local file: an absolute path, a ~/ path, or a path relative to BotBoy’s files workspace (a write_file filename). Use exactly the path a download, attachment, or ETL tool returned. BotBoy’s own private state (database, secrets, Data Room internals) is not importable; its artifact folders (files, etl-results, chat-attachments, slack-attachments, sharepoint-cache) are.',
+    },
+    format: { type: 'string', enum: ['csv', 'tsv', 'xlsx'], description: 'Optional; inferred from .csv, .tsv/.tab, .xlsx/.xlsm. Required only for other extensions.' },
+    sheet: { type: 'string', minLength: 1, maxLength: 255, description: 'XLSX only: exact worksheet name; optional when the workbook has exactly one sheet.' },
+    headerRow: { type: 'integer', minimum: 1, maximum: 50000, description: 'XLSX only: 1-based row holding the column names (default 1). Rows above it are ignored; every populated cell below it must sit under a named column. Blank rows are skipped.' },
+    nullToken: { type: 'string', maxLength: 32, description: 'Optional exact cell text meaning null. Default "" = empty CSV/TSV cells and blank XLSX cells are null. Datanet TSV downloads use "\\N".' },
+  };
+}
+
+function localFileIntoSchema(): JsonSchema {
+  return {
+    type: 'object', additionalProperties: false,
+    description: 'Add this file as the next immutable version of ONE existing file-born catalog dataset (from list_data_room_datasets). The file must carry exactly that dataset’s columns and cell types; its contract is reused unchanged except coverage, which updates atomically with the new head.',
+    properties: {
+      datasetId: { type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$', description: 'Exact existing catalog dataset ID.' },
+      mode: {
+        type: 'string', enum: ['merge_partitions', 'replace'],
+        description: 'merge_partitions: rows in the file’s time partitions replace those partitions; every other existing row stays (adding new days/months). replace: the file becomes the complete new version.',
+      },
+      coverage: { ...coverageSchema(), description: 'Coverage of the FILE rows only, in the dataset’s partitionKind. For merge_partitions BotBoy unions it with the existing coverage; request.dateRange must be observed in the result.' },
+      expectedHeadRevision: { type: 'integer', minimum: 1, description: 'Optional CAS guard: the dataset’s current head revision.' },
+    },
+    required: ['datasetId', 'mode', 'coverage'],
+  };
+}
+
 function sourceSchema(): JsonSchema {
   const alias = { type: 'string', pattern: SOURCE_ALIAS_PATTERN, maxLength: 32 };
   const requiredColumns = {
@@ -586,20 +622,18 @@ function sourceSchema(): JsonSchema {
       },
       {
         type: 'object', additionalProperties: false,
-        description: 'BotBoy CSV source mini-shape: {kind:"botboy_csv", alias:"source_alias", filename:"relative.csv", sha256:"64 lowercase hex", bytes:123, nullToken:"NULL", target:{complete target object from this schema}}. Copy filename/sha256/bytes from the final write_file receipt; arbitrary or absolute paths are rejected. Replace every illustrative value with exact evidence.',
+        description: 'Local-file source mini-shapes. NEW dataset: {kind:"local_file", alias:"source_alias", path:"~/path/file.xlsx", sheet:"Exact sheet", target:{complete target}}. EXISTING dataset: {kind:"local_file", alias, path, into:{datasetId:"ds_…", mode:"merge_partitions", coverage:{coverage of the file rows}}}. Exactly one of target or into. CSV/TSV/XLSX; the file is read, typed against the contract, and coverage-checked before any job exists, and its exact bytes are pinned by BotBoy. First call action=inspect_local_file for exact columns, compatibleTypes, and time ranges.',
         properties: {
-          kind: { type: 'string', enum: ['botboy_csv'] }, alias,
-          filename: {
-            type: 'string', minLength: 5, maxLength: 500,
-            pattern: '^(?!/)(?!.*\\\\)(?!\\.\\.?/)(?!.*\\/\\.\\.?\\/)(?!.*\\/\\.\\.?$)(?!.*//).+\\.[cC][sS][vV]$',
-            description: 'Relative .csv filename inside BotBoy’s files workspace; absolute paths, backslashes, empty segments, and dot segments are forbidden.',
-          },
-          sha256: { type: 'string', pattern: SHA256_PATTERN },
-          bytes: { type: 'integer', minimum: 1, maximum: 16777216 },
-          nullToken: { type: 'string', minLength: 1, maxLength: 32, pattern: '^[^,\\r\\n"\\u0000]+$', description: 'Exact token interpreted as null; empty CSV cells remain empty strings.' },
+          kind: { type: 'string', enum: ['local_file'] }, alias,
+          ...localFileLocatorProperties(),
           target: sourceTargetSchema(),
+          into: localFileIntoSchema(),
         },
-        required: ['kind', 'alias', 'filename', 'sha256', 'bytes', 'nullToken', 'target'],
+        required: ['kind', 'alias', 'path'],
+        oneOf: [
+          { required: ['target'], not: { required: ['into'] } },
+          { required: ['into'], not: { required: ['target'] } },
+        ],
       },
       {
         type: 'object', additionalProperties: false,
@@ -612,6 +646,7 @@ function sourceSchema(): JsonSchema {
       },
       {
         type: 'object', additionalProperties: false,
+        description: 'ETL source mini-shape: {kind:"etl_query", alias:"source_alias", sql:"complete warehouse query", datasetDate:"YYYY-MM-DD" (optional), target:{complete target}}. It submits one NEW checkpointed Datanet run; there is no runId field. To import the result of a run that already succeeded, use local_file with the downloaded .tsv path and nullToken "\\N" instead of re-running SQL.',
         properties: {
           kind: { type: 'string', enum: ['etl_query'] }, alias,
           sql: { type: 'string', minLength: 1, maxLength: 100000, description: 'Complete warehouse query submitted through checkpointed Datanet ETL.' },
@@ -677,12 +712,18 @@ export function createDataRoomDatasetParametersSchema(): JsonSchema {
   return {
     type: 'object',
     additionalProperties: false,
-    description: 'Exactly one of three forms: derive_semantic_hashes={action:"derive_semantic_hashes", metric:{id,version,unit,definition}, regime:{id,version,definition}}; create={action:"create", ownerRequested:true, plan:{version:1, mode:"dataset_preparation", request:{...}, sources:[...], fragments:[], terminal:{kind:"source", alias:"same_source_alias"}}}; status={action:"status", jobId:"aj_..."}. Derivation is read-only and returns exact request.metric/request.regime identities; it never authors or mutates a plan. Illustrative ellipses are not valid call values; fill every required nested field from this complete schema.',
+    description: 'Exactly one of four forms: inspect_local_file={action:"inspect_local_file", file:{path:"~/Downloads/data.xlsx", sheet:"optional exact sheet"}}; derive_semantic_hashes={action:"derive_semantic_hashes", metric:{id,version,unit,definition}, regime:{id,version,definition}}; create={action:"create", ownerRequested:true, plan:{version:1, mode:"dataset_preparation", request:{...}, sources:[...], fragments:[], terminal:{kind:"source", alias:"same_source_alias"}}}; status={action:"status", jobId:"aj_..."}. inspect_local_file and derive_semantic_hashes are read-only with zero effects and never author or mutate a plan. Illustrative ellipses are not valid call values; fill every required nested field from this complete schema.',
     properties: {
       action: {
         type: 'string',
-        enum: ['derive_semantic_hashes', 'create', 'status'],
-        description: 'For a new target, derive both semantic hashes first, then create. Continue only materially corrected no-effect create retries within the advertised four-attempt turn budget. Use status after a jobId.',
+        enum: ['inspect_local_file', 'derive_semantic_hashes', 'create', 'status'],
+        description: 'To import a local file, inspect it first; for a new target, derive both semantic hashes; then create. Continue only materially corrected no-effect create retries within the advertised four-attempt turn budget. Use status after a jobId.',
+      },
+      file: {
+        type: 'object', additionalProperties: false,
+        description: 'inspect_local_file only: the same locator the local_file source will use. Returns sheets, exact header, per-column compatibleTypes/empties/distinct counts, and day/month ranges of date columns, read by the exact create-time parser.',
+        properties: localFileLocatorProperties(),
+        required: ['path'],
       },
       metric: metricDefinitionSchema(),
       regime: regimeDefinitionSchema(),
@@ -693,19 +734,24 @@ export function createDataRoomDatasetParametersSchema(): JsonSchema {
     required: ['action'],
     oneOf: [
       {
+        properties: { action: { type: 'string', enum: ['inspect_local_file'] } },
+        required: ['file'],
+        not: { anyOf: [{ required: ['jobId'] }, { required: ['plan'] }, { required: ['ownerRequested'] }, { required: ['metric'] }, { required: ['regime'] }] },
+      },
+      {
         properties: { action: { type: 'string', enum: ['derive_semantic_hashes'] } },
         required: ['metric', 'regime'],
-        not: { anyOf: [{ required: ['jobId'] }, { required: ['plan'] }, { required: ['ownerRequested'] }] },
+        not: { anyOf: [{ required: ['jobId'] }, { required: ['plan'] }, { required: ['ownerRequested'] }, { required: ['file'] }] },
       },
       {
         properties: { action: { type: 'string', enum: ['create'] } },
         required: ['plan', 'ownerRequested'],
-        not: { anyOf: [{ required: ['jobId'] }, { required: ['metric'] }, { required: ['regime'] }] },
+        not: { anyOf: [{ required: ['jobId'] }, { required: ['metric'] }, { required: ['regime'] }, { required: ['file'] }] },
       },
       {
         properties: { action: { type: 'string', enum: ['status'] } },
         required: ['jobId'],
-        not: { anyOf: [{ required: ['plan'] }, { required: ['ownerRequested'] }, { required: ['metric'] }, { required: ['regime'] }] },
+        not: { anyOf: [{ required: ['plan'] }, { required: ['ownerRequested'] }, { required: ['metric'] }, { required: ['regime'] }, { required: ['file'] }] },
       },
     ],
   };

@@ -5,6 +5,7 @@ import {
   AnalyticsDataRoomError,
   isAnalyticsIsoTimestamp,
   type AnalyticsDataRoomStore,
+  type AnalyticsParsedSourceIngest,
 } from './analytics-data-room-store.js';
 import type {
   AnalyticsDataRoomCatalogDatasetEnvelope,
@@ -32,8 +33,8 @@ import type {
 import type { AnalyticsDataRoomBackupService } from './analytics-data-room-backup.js';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
-const MAX_BOTBOY_CSV_BYTES = 16 * 1024 * 1024;
-const BOTBOY_CSV_PARSER_VERSION = 'botboy-csv-parser-v1';
+export const ANALYTICS_LOCAL_FILE_PARSER_VERSION = 'botboy-local-file-table-v1';
+const MAX_LOCAL_FILE_CANONICAL_BYTES = 32 * 1024 * 1024;
 
 export interface AnalyticsEtlTsvIngestRequest extends AnalyticsVersionIngestContext {
   savedTo: string;
@@ -42,11 +43,37 @@ export interface AnalyticsEtlTsvIngestRequest extends AnalyticsVersionIngestCont
   nullToken?: string;
 }
 
-export interface AnalyticsBotboyCsvIngestRequest extends AnalyticsVersionIngestContext {
-  savedTo: string;
-  fileBytes: number;
-  fileSha256: string;
+/** Complete receipt for one exact local file typed into a declared schema. */
+export interface AnalyticsLocalFileCompleteReceipt {
+  parserVersion: typeof ANALYTICS_LOCAL_FILE_PARSER_VERSION;
+  completeToEof: true;
+  format: 'csv' | 'tsv' | 'xlsx';
+  fileName: string;
+  inputSha256: string;
+  inputBytes: number;
+  sheet?: string;
+  headerRow?: number;
   nullToken: string;
+  fileRowCount: number;
+  rowCount: number;
+  rowsetSha256: string;
+  schemaSha256: string;
+  mode: 'new_dataset' | 'replace' | 'merge_partitions';
+  /** Disclosed read facts: omitted trailing fields, skipped blank/title rows, cached formula results. */
+  table: { shortRows: number; blankRowsSkipped: number; rowsAboveHeader: number; formulaCells: number };
+  base?: {
+    versionId: string;
+    contentSha256: string;
+    keptRows: number;
+    replacedPartitions: string[];
+  };
+}
+
+export interface AnalyticsLocalFileRowsIngestRequest extends AnalyticsVersionIngestContext {
+  columns: string[];
+  rows: AnalyticsDataCell[][];
+  complete: AnalyticsLocalFileCompleteReceipt;
+  coverageRevision?: AnalyticsParsedSourceIngest['coverageRevision'];
 }
 
 export interface AnalyticsDataRoomCatalogReader {
@@ -71,7 +98,7 @@ export interface AnalyticsDataRoomService extends AnalyticsDataRoomCatalogReader
   reviseDataset(input: AnalyticsDatasetRevisionInput): AnalyticsDatasetDetail;
   listDependencies(datasetId: string, definitionRevision?: number): AnalyticsDatasetDependencyRecord[];
   ingestEtlTsv(input: AnalyticsEtlTsvIngestRequest): AnalyticsVersionPromotionReceipt;
-  ingestBotboyCsv(input: AnalyticsBotboyCsvIngestRequest): AnalyticsVersionPromotionReceipt;
+  ingestLocalFileRows(input: AnalyticsLocalFileRowsIngestRequest): AnalyticsVersionPromotionReceipt;
   ingestSqlRows(input: AnalyticsSqlRowsIngestRequest): AnalyticsVersionPromotionReceipt;
   ingestImportRows(input: AnalyticsImportRowsIngestRequest): AnalyticsVersionPromotionReceipt;
   backupDataset(datasetId: string, targetRoot: string): AnalyticsDatasetBackupReceipt;
@@ -166,7 +193,18 @@ function parseDelimitedRows(text: string, delimiter: '\t' | ',', label: string):
   return rows;
 }
 
-function parseAnalyticsDelimited(bytes: Uint8Array, delimiter: '\t' | ',', label: string): { columns: string[]; rawRows: string[][] } {
+/**
+ * Strict complete UTF-8 delimited-table parser shared by ETL TSV and local-file
+ * import. `raggedRight` accepts exporters that omit trailing empty fields
+ * (such rows come back shorter than the header; absent cells carry no value),
+ * except for an unterminated final record, which may be a truncated file.
+ */
+export function parseAnalyticsDelimited(
+  bytes: Uint8Array,
+  delimiter: '\t' | ',',
+  label: string,
+  options: { raggedRight?: boolean } = {},
+): { columns: string[]; rawRows: string[][] } {
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -186,8 +224,11 @@ function parseAnalyticsDelimited(bytes: Uint8Array, delimiter: '\t' | ',', label
   if (rawRows.length > 50_000 || rawRows.length * columns.length > 500_000) {
     incomplete(`${label} exceeds the 50000-row or 500000-cell complete-source limit.`);
   }
+  const terminated = text.endsWith('\n');
   for (const [index, row] of rawRows.entries()) {
-    if (row.length !== columns.length) {
+    const shortAllowed = options.raggedRight === true && row.length < columns.length
+      && (terminated || index < rawRows.length - 1);
+    if (row.length !== columns.length && !shortAllowed) {
       incomplete(`${label} row ${index + 1} has ${row.length} cells; expected ${columns.length}.`);
     }
     if (row.some(cell => cell.length > 1_000_000)) incomplete(`${label} row ${index + 1} contains a cell above 1000000 characters.`);
@@ -199,11 +240,9 @@ export function parseAnalyticsTsv(bytes: Uint8Array): { columns: string[]; rawRo
   return parseAnalyticsDelimited(bytes, '\t', 'ETL TSV');
 }
 
-export function parseAnalyticsCsv(bytes: Uint8Array): { columns: string[]; rawRows: string[][] } {
-  return parseAnalyticsDelimited(bytes, ',', 'BotBoy CSV');
-}
 
-function parseDelimitedCell(
+/** One strict text-cell grammar for every delimited or text-typed source cell. */
+export function parseDelimitedCell(
   raw: string,
   field: AnalyticsFieldContract,
   rowIndex: number,
@@ -309,67 +348,58 @@ export function createAnalyticsDataRoomService(input: {
     });
   }
 
-  function ingestBotboyCsv(request: AnalyticsBotboyCsvIngestRequest): AnalyticsVersionPromotionReceipt {
+  /**
+   * Publish rows typed from one exact local file. The store remains the
+   * authority for schema/type/coverage validation and the immutable writer;
+   * this boundary only re-proves the complete rowset receipt.
+   */
+  function ingestLocalFileRows(request: AnalyticsLocalFileRowsIngestRequest): AnalyticsVersionPromotionReceipt {
+    const complete = request.complete;
     if (request.sourceReceipt.sourceKind !== 'import'
-      || request.sourceReceipt.producerVersion !== BOTBOY_CSV_PARSER_VERSION
-      || !request.sourceReceipt.sourceId?.trim()) {
-      throw new AnalyticsDataRoomError('invalid_input', 'BotBoy CSV ingestion requires an exact import source receipt and parser version.');
+      || request.sourceReceipt.producerVersion !== ANALYTICS_LOCAL_FILE_PARSER_VERSION
+      || request.sourceReceipt.sourceId !== complete?.inputSha256) {
+      throw new AnalyticsDataRoomError('invalid_input', 'Local-file ingestion requires an exact import source receipt bound to the file SHA.');
     }
-    if (!Number.isSafeInteger(request.fileBytes) || request.fileBytes < 1
-      || request.fileBytes > MAX_BOTBOY_CSV_BYTES || !SHA256_RE.test(request.fileSha256)) {
-      throw new AnalyticsDataRoomError('invalid_input', 'BotBoy CSV byte/SHA receipt is malformed or exceeds 16 MiB.');
-    }
-    let stat: fs.Stats;
-    try {
-      stat = fs.lstatSync(request.savedTo);
-    } catch {
-      return incomplete('BotBoy CSV file does not exist. Rewrite it to obtain a fresh exact receipt.');
-    }
-    if (!stat.isFile() || stat.isSymbolicLink()) incomplete('BotBoy CSV source is not a regular non-symlink file.');
-    const bytes = fs.readFileSync(request.savedTo);
-    const directSha256 = createHash('sha256').update(bytes).digest('hex');
-    if (bytes.length !== request.fileBytes || directSha256 !== request.fileSha256) {
-      incomplete('BotBoy CSV no longer matches its exact byte/SHA receipt. Rewrite it and use the new final receipt.');
+    if (!complete || complete.completeToEof !== true
+      || complete.parserVersion !== ANALYTICS_LOCAL_FILE_PARSER_VERSION
+      || !['csv', 'tsv', 'xlsx'].includes(complete.format)
+      || !['new_dataset', 'replace', 'merge_partitions'].includes(complete.mode)
+      || !SHA256_RE.test(complete.inputSha256)
+      || !SHA256_RE.test(complete.rowsetSha256)
+      || !SHA256_RE.test(complete.schemaSha256)
+      || !Number.isSafeInteger(complete.inputBytes) || complete.inputBytes < 1
+      || !Number.isSafeInteger(complete.rowCount) || complete.rowCount !== request.rows.length) {
+      return incomplete('Local-file rows lack a complete parser/rowset/schema receipt.');
     }
     const dataset = store.getDataset(request.datasetId);
     if (!dataset) throw new AnalyticsDataRoomError('not_found', `Dataset ${request.datasetId} was not found.`);
-    if (dataset.sourceKind !== 'import' || dataset.sourceFormat !== 'canonical_json'
-      || dataset.definition.adapter !== 'botboy_csv'
-      || dataset.definition.adapterVersion !== BOTBOY_CSV_PARSER_VERSION) {
-      throw new AnalyticsDataRoomError('invalid_input', 'BotBoy CSV source differs from the admitted dataset definition.');
+    if (dataset.kind !== 'source' || dataset.sourceKind !== 'import' || dataset.sourceFormat !== 'canonical_json') {
+      throw new AnalyticsDataRoomError('invalid_input', 'Local-file rows require a file-born import/canonical_json source dataset.');
     }
-    const parsed = parseAnalyticsCsv(bytes);
-    const expectedColumns = dataset.contract.schema.map(field => field.name);
-    if (stableAnalyticsJson(parsed.columns) !== stableAnalyticsJson(expectedColumns)) {
-      incomplete('BotBoy CSV headers do not exactly match the dataset contract.');
+    if (complete.schemaSha256 !== dataset.contract.schemaSha256) {
+      throw new AnalyticsDataRoomError('invalid_input', 'Local-file schema receipt differs from the dataset contract.');
     }
-    const rows = typedDelimitedRows(parsed.rawRows, dataset.contract.schema, request.nullToken, ',', 'BotBoy CSV');
-    const rowsetSha256 = analyticsSha256({ columns: parsed.columns, rows, rowCount: rows.length });
+    const rowsetSha256 = analyticsSha256({ columns: request.columns, rows: request.rows, rowCount: request.rows.length });
+    if (rowsetSha256 !== complete.rowsetSha256) {
+      throw new AnalyticsDataRoomError('integrity_failed', 'Local-file rowset differs from its complete parser receipt.');
+    }
     const sourceBytes = Buffer.from(`${stableAnalyticsJson({
-      format: 'botboy-canonical-csv-rows-v1',
-      complete: {
-        parserVersion: BOTBOY_CSV_PARSER_VERSION,
-        completeToEof: true,
-        inputSha256: directSha256,
-        inputBytes: bytes.length,
-        rowsetSha256,
-        schemaSha256: dataset.contract.schemaSha256,
-        rowCount: rows.length,
-      },
-      columns: parsed.columns,
-      rows,
-      rowCount: rows.length,
+      format: 'botboy-canonical-local-file-rows-v1',
+      complete,
+      columns: request.columns,
+      rows: request.rows,
+      rowCount: request.rows.length,
     })}\n`, 'utf8');
-    if (sourceBytes.length > MAX_BOTBOY_CSV_BYTES) {
-      incomplete('Canonical BotBoy CSV rows exceed the 16 MiB immutable-source limit. Reduce or split the dataset.');
+    if (sourceBytes.length > MAX_LOCAL_FILE_CANONICAL_BYTES) {
+      incomplete('Canonical local-file rows exceed the 32 MiB immutable-source limit. Split the file into smaller datasets.');
     }
-    const { savedTo: _savedTo, fileBytes: _fileBytes, fileSha256: _fileSha256, nullToken: _nullToken, ...ingest } = request;
+    const { complete: _complete, ...ingest } = request;
     return store.publishParsedSource({
       ...ingest,
       sourceFormat: 'canonical_json',
       sourceBytes,
-      columns: parsed.columns,
-      rows,
+      columns: request.columns,
+      rows: request.rows,
     });
   }
 
@@ -464,7 +494,7 @@ export function createAnalyticsDataRoomService(input: {
     listCatalogDatasetVersions: (datasetId, value) => store.listCatalogDatasetVersions(datasetId, value?.limit),
     getCatalogDatasetVersion: versionId => store.getCatalogDatasetVersion(versionId),
     ingestEtlTsv,
-    ingestBotboyCsv,
+    ingestLocalFileRows,
     ingestSqlRows,
     ingestImportRows,
     backupDataset: (datasetId, targetRoot) => backups.backupDataset(datasetId, targetRoot),

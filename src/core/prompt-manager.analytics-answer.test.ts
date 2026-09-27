@@ -24,7 +24,19 @@ describe('direct Data Room chat prompt and tool contract', () => {
     const createSchema = byName('create_data_room_dataset')[0].function.parameters as any;
     expect(createSchema.additionalProperties).toBe(false);
     expect(createSchema.required).toEqual(['action']);
-    expect(createSchema.properties.action.enum).toEqual(['derive_semantic_hashes', 'create', 'status']);
+    expect(createSchema.properties.action.enum).toEqual(['inspect_local_file', 'derive_semantic_hashes', 'create', 'status']);
+    expect(createSchema.properties.file.required).toEqual(['path']);
+    const planSources = createSchema.properties.plan.properties.sources.items.oneOf as any[];
+    const kinds = planSources.map(source => source.properties.kind.enum[0]);
+    expect(kinds).toEqual(['existing_version', 'import_inbox', 'local_file', 'sql_query', 'etl_query']);
+    const localFile = planSources.find(source => source.properties.kind.enum[0] === 'local_file');
+    expect(localFile.required).toEqual(['kind', 'alias', 'path']);
+    expect(Object.keys(localFile.properties)).toEqual(['kind', 'alias', 'path', 'format', 'sheet', 'headerRow', 'nullToken', 'target', 'into']);
+    expect(localFile.properties.into.properties.mode.enum).toEqual(['merge_partitions', 'replace']);
+    const etl = planSources.find(source => source.properties.kind.enum[0] === 'etl_query');
+    expect(etl.properties.runId).toBeUndefined();
+    expect(etl.description).toContain('use local_file with the downloaded .tsv path');
+    expect(JSON.stringify(createSchema)).not.toContain('botboy_csv');
 
     const sourceSchema = byName('configure_analytics_widget_source')[0].function.parameters as any;
     expect(sourceSchema.additionalProperties).toBe(false);
@@ -56,6 +68,9 @@ describe('direct Data Room chat prompt and tool contract', () => {
     expect(prompt).toContain('“Analyze this,” “read it,” or “tell me what the data says”');
     expect(prompt).toContain('use create_data_room_dataset');
     expect(prompt).toContain('derive_semantic_hashes');
+    expect(prompt).toContain('To import ANY local file');
+    expect(prompt).toContain('inspect_local_file');
+    expect(prompt).not.toContain('botboy_csv');
     expect(prompt).toContain('up to four create attempts total');
     expect(prompt).toContain('existing durable AnalyticsJobService lifecycle');
     expect(prompt).toContain('Never use the old answer planner, choice workflow');

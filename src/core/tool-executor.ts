@@ -134,19 +134,66 @@ function unexpectedDataRoomFields(
 }
 
 function createDataRoomDatasetEnvelopeIssues(value: unknown): DataRoomFailureIssueV1[] {
+  const allowedKeys = ['action', 'file', 'metric', 'regime', 'jobId', 'plan', 'ownerRequested'];
   if (!isDataRoomRecord(value)) {
     return [dataRoomIssue({
       code: 'invalid_type', path: '$', message: 'Arguments must be one object.',
-      expected: { kind: 'shape', requiredKeys: ['action'], allowedKeys: ['action', 'metric', 'regime', 'jobId', 'plan', 'ownerRequested'] }, received: value,
+      expected: { kind: 'shape', requiredKeys: ['action'], allowedKeys }, received: value,
     })];
   }
-  const issues = unexpectedDataRoomFields(value, ['action', 'metric', 'regime', 'jobId', 'plan', 'ownerRequested']);
+  const issues = unexpectedDataRoomFields(value, allowedKeys);
   const action = value.action;
-  if (action !== 'derive_semantic_hashes' && action !== 'create' && action !== 'status') {
+  const actions = ['inspect_local_file', 'derive_semantic_hashes', 'create', 'status'];
+  if (typeof action !== 'string' || !actions.includes(action)) {
     issues.push(dataRoomIssue({
-      code: 'invalid_enum', path: 'action', message: 'action must be exactly derive_semantic_hashes, create, or status.',
-      expected: { kind: 'enum', values: ['derive_semantic_hashes', 'create', 'status'] }, received: action, includeReceivedValue: true,
+      code: 'invalid_enum', path: 'action', message: 'action must be exactly inspect_local_file, derive_semantic_hashes, create, or status.',
+      expected: { kind: 'enum', values: actions }, received: action, includeReceivedValue: true,
     }));
+    return issues.slice(0, 8);
+  }
+  if (action !== 'inspect_local_file' && value.file !== undefined) {
+    issues.push(dataRoomIssue({
+      code: 'field_forbidden_for_action', path: 'file', message: `file is inspect_local_file-only and forbidden for action=${action}; a create plan names the file in its local_file source.`,
+      expected: { kind: 'absent' }, received: value.file,
+    }));
+  }
+  if (action === 'inspect_local_file') {
+    const file = value.file;
+    const locatorKeys = ['path', 'format', 'sheet', 'headerRow', 'nullToken'];
+    if (!isDataRoomRecord(file)) {
+      issues.push(dataRoomIssue({
+        code: 'invalid_type', path: 'file', message: 'inspect_local_file requires file:{path[, format, sheet, headerRow, nullToken]}.',
+        expected: { kind: 'shape', requiredKeys: ['path'], allowedKeys: locatorKeys }, received: file,
+      }));
+    } else {
+      issues.push(...unexpectedDataRoomFields(file, locatorKeys, 'file'));
+      if (typeof file.path !== 'string' || !file.path.trim()) issues.push(dataRoomIssue({
+        code: 'required', path: 'file.path', message: 'file.path must name one local file (absolute, ~/..., or relative to BotBoy’s files workspace).',
+        expected: { kind: 'range', type: 'string', minimum: 1, maximum: 4096 }, received: file.path,
+      }));
+      if (file.format !== undefined && !['csv', 'tsv', 'xlsx'].includes(String(file.format))) issues.push(dataRoomIssue({
+        code: 'invalid_enum', path: 'file.format', message: 'file.format is optional and otherwise csv, tsv, or xlsx.',
+        expected: { kind: 'enum', values: ['csv', 'tsv', 'xlsx'] }, received: file.format, includeReceivedValue: true,
+      }));
+      if (file.sheet !== undefined && (typeof file.sheet !== 'string' || !file.sheet)) issues.push(dataRoomIssue({
+        code: 'invalid_type', path: 'file.sheet', message: 'file.sheet is an exact worksheet name.',
+        expected: { kind: 'range', type: 'string', minimum: 1, maximum: 255 }, received: file.sheet,
+      }));
+      if (file.headerRow !== undefined && (!Number.isSafeInteger(file.headerRow) || Number(file.headerRow) < 1)) issues.push(dataRoomIssue({
+        code: 'out_of_range', path: 'file.headerRow', message: 'file.headerRow is a positive 1-based row number.',
+        expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 50000 }, received: file.headerRow, includeReceivedValue: true,
+      }));
+      if (file.nullToken !== undefined && typeof file.nullToken !== 'string') issues.push(dataRoomIssue({
+        code: 'invalid_type', path: 'file.nullToken', message: 'file.nullToken is optional exact text (default "").',
+        expected: { kind: 'range', type: 'string', minimum: 0, maximum: 32 }, received: file.nullToken,
+      }));
+    }
+    for (const field of ['metric', 'regime', 'jobId', 'plan', 'ownerRequested'] as const) {
+      if (value[field] !== undefined) issues.push(dataRoomIssue({
+        code: 'field_forbidden_for_action', path: field, message: `${field} is forbidden for action=inspect_local_file.`,
+        expected: { kind: 'absent' }, received: value[field], includeReceivedValue: field === 'jobId' || field === 'ownerRequested',
+      }));
+    }
     return issues.slice(0, 8);
   }
   if (action === 'derive_semantic_hashes') {
@@ -408,38 +455,10 @@ export function writeFileHandler(filesDir: string, args: { filename: string; con
       chunkNumber: stats.chunks,
       totalCallsForThisFile: stats.chunks,
     };
-    if (/\.csv$/i.test(normalizedFilename)) {
-      const csvBytes = fs.readFileSync(resolved);
-      if (csvBytes.length <= 16 * 1024 * 1024) {
-        result.dataRoomCsvSource = {
-          kind: 'botboy_csv',
-          filename: normalizedFilename,
-          sha256: createHash('sha256').update(csvBytes).digest('hex'),
-          bytes: csvBytes.length,
-        };
-        result.dataRoomCsvNextAction = 'Copy dataRoomCsvSource exactly into one create_data_room_dataset source; add alias, nullToken, and the complete target required by that tool schema.';
-      } else {
-        const failure = createDataRoomToolFailure({
-          tool: 'write_file.dataRoomCsvSource',
-          code: 'invalid_input',
-          message: 'The file was written, but it is too large to become one BotBoy CSV Data Room source.',
-          issues: [dataRoomIssue({
-            code: 'out_of_range', path: 'dataRoomCsvSource.bytes',
-            message: 'A BotBoy CSV Data Room source must be no larger than 16 MiB.',
-            expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 16 * 1024 * 1024 },
-            received: csvBytes.length, includeReceivedValue: true,
-          })],
-          nextAction: 'Reduce or split the CSV below 16 MiB, write the final file, and use only its new exact filename/SHA/bytes receipt.',
-          effect: {
-            state: 'committed',
-            mutationApplied: true,
-            durable: 'none',
-            externalCalls: 0,
-          },
-        });
-        result.dataRoomCsvSource = null;
-        result.dataRoomCsvFailure = failure;
-      }
+    if (/\.(?:csv|tsv|tab)$/i.test(normalizedFilename)) {
+      // Like any other local file, a written table imports by path; the
+      // create call reads and pins its exact bytes itself.
+      result.dataRoomSource = { kind: 'local_file', path: normalizedFilename };
     }
 
     // For append mode, include lastLines and lineCount for multi-chunk verification
@@ -2375,6 +2394,34 @@ export function createToolExecutor(
           nextAction: 'Restore the local Data Room lifecycle service, then retry without changing the fully specified plan.',
           effect: dataRoomNoEffect(),
         }));
+      }
+      if (action === 'inspect_local_file') {
+        try {
+          const profile = await analyticsJobService.inspectLocalFile(
+            args.file as Parameters<AnalyticsJobService['inspectLocalFile']>[0],
+            { signal: context?.abortSignal },
+          );
+          return {
+            content: JSON.stringify({
+              version: 1,
+              type: 'data_room_local_file_profile',
+              ok: true,
+              trust: 'deterministic_create_time_reader',
+              ...profile,
+              effect: dataRoomNoEffect(),
+              nextAction: 'Author the contract from these facts: declare every header column once (schema names must equal the header; logicalType from compatibleTypes; nullable when empty>0), take coverage from the time column dayRanges/monthRanges, keep request.dateRange inside observed data, then use the same path/sheet/headerRow/nullToken in one local_file source: target for a new dataset, or into:{datasetId, mode, coverage} for an existing file-born dataset.',
+            }),
+            isError: false,
+          };
+        } catch (error) {
+          return dataRoomFailureOutput(dataRoomFailureFromError({
+            tool,
+            error,
+            nextAction: 'Correct every listed file path/format/sheet/headerRow/nullToken issue and inspect again. This read-only action never creates a dataset or job.',
+            phase: 'arguments',
+            effect: dataRoomNoEffect(),
+          }));
+        }
       }
       const projectReceiptFailure = (
         receipt: Awaited<ReturnType<AnalyticsJobService['prepareOrJoinAndWait']>>,

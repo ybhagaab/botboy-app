@@ -95,6 +95,22 @@ export interface AnalyticsParsedSourceIngest extends AnalyticsVersionIngestConte
   rows: AnalyticsDataCell[][];
   /** R3 immutable exact-input lineage. Required for derived datasets and forbidden for sources. */
   derivation?: AnalyticsDerivationLineageReceipt;
+  /**
+   * Source-only coverage revision for a new version of an existing dataset.
+   * Only contract.coverage may change; the definition revision, version row,
+   * and head move commit in one transaction so readers never observe a
+   * revised definition without its matching head.
+   */
+  coverageRevision?: {
+    expectedDefinitionRevision: number;
+    coverage: AnalyticsDatasetContract['coverage'];
+  };
+}
+
+interface PendingCoverageRevision {
+  fromRevision: number;
+  fromContractSha256: string;
+  contract: AnalyticsDatasetContract;
 }
 
 export interface AnalyticsVersionDeletionEligibility {
@@ -293,6 +309,22 @@ function timestampDayInZone(value: string, timeZone: string): string {
   } catch {
     return fail('invalid_input', `Timezone ${timeZone} is invalid.`);
   }
+}
+
+/**
+ * The one canonical row → coverage-partition rule: date fields are literal
+ * days, timestamps resolve to the contract business day, and month coverage
+ * keys are YYYY-MM-01. Shared by publication validation and file merges.
+ */
+export function analyticsCoveragePartition(
+  value: AnalyticsDataCell,
+  timeField: AnalyticsFieldContract,
+  timeZone: string,
+  partitionKind: 'day' | 'month',
+): string | null {
+  if (typeof value !== 'string') return null;
+  const day = timeField.logicalType === 'date' ? value : timestampDayInZone(value, timeZone);
+  return partitionKind === 'month' ? `${day.slice(0, 7)}-01` : day;
 }
 
 function strictJson<T>(raw: string, field: string): T {
@@ -1878,14 +1910,8 @@ export function createAnalyticsDataRoomStore(input: {
     const actualObserved = new Set<string>();
     let latestObservedDay = '';
     for (const [rowIndex, row] of rows.entries()) {
-      const value = row[timeIndex];
-      if (typeof value !== 'string') fail('integrity_failed', `Row ${rowIndex} has no usable time partition.`);
-      const observedDay = timeField.logicalType === 'date'
-        ? value
-        : timestampDayInZone(value, contract.timeZone);
-      const partition = contract.coverage.partitionKind === 'month'
-        ? `${observedDay.slice(0, 7)}-01`
-        : observedDay;
+      const partition = analyticsCoveragePartition(row[timeIndex], timeField, contract.timeZone, contract.coverage.partitionKind);
+      if (partition === null) fail('integrity_failed', `Row ${rowIndex} has no usable time partition.`);
       if (!declaredObserved.has(partition)) {
         fail('integrity_failed', `Observed row partition ${partition} is absent from declared observed coverage.`);
       }
@@ -2225,6 +2251,7 @@ export function createAnalyticsDataRoomStore(input: {
     runId: string,
     expectedHeadRevision: number,
     idempotent: boolean,
+    pendingRevision?: PendingCoverageRevision,
   ): AnalyticsVersionPromotionReceipt {
     const versionDirectory = path.join(datasetDirectory(dataset.id), 'versions', manifest.versionId);
     const sourceRelPath = relative(path.join(versionDirectory, manifest.sourceFile.fileName));
@@ -2232,10 +2259,13 @@ export function createAnalyticsDataRoomStore(input: {
     const manifestRelPath = relative(path.join(versionDirectory, 'manifest.json'));
     const at = timestamp();
     db.transaction(() => {
+      // A coverage revision and its first version/head commit together.
+      if (pendingRevision) applyCoverageRevision(dataset, pendingRevision, at);
       const currentDataset = getDatasetRow(dataset.id);
       if (!currentDataset
         || currentDataset.definition_revision !== dataset.definitionRevision
-        || currentDataset.definition_sha256 !== dataset.definitionSha256) {
+        || currentDataset.definition_sha256 !== dataset.definitionSha256
+        || currentDataset.contract_sha256 !== dataset.contractSha256) {
         fail('definition_changed', 'Dataset definition changed before version promotion.');
       }
       const existing = db.prepare(`
@@ -2483,12 +2513,71 @@ export function createAnalyticsDataRoomStore(input: {
     return { ...lineage, inputs: sortedInputs };
   }
 
-  function publishParsedSource(ingest: AnalyticsParsedSourceIngest): AnalyticsVersionPromotionReceipt {
-    const dataset = getDataset(ingest.datasetId);
-    if (!dataset) fail('not_found', `Dataset ${ingest.datasetId} was not found.`);
-    if (dataset.lifecycle !== 'active' || dataset.contract.status !== 'active') {
-      fail('conflict', `Dataset ${dataset.id} is not active.`);
+  function prepareCoverageRevision(
+    current: AnalyticsDatasetDetail,
+    revision: NonNullable<AnalyticsParsedSourceIngest['coverageRevision']>,
+  ): { dataset: AnalyticsDatasetDetail; pending?: PendingCoverageRevision } {
+    if (current.kind !== 'source') fail('invalid_input', 'Only source datasets accept a coverage revision.');
+    if (!Number.isInteger(revision.expectedDefinitionRevision) || revision.expectedDefinitionRevision < 1) {
+      fail('invalid_input', 'expectedDefinitionRevision must be a positive integer.');
     }
+    const draft = { ...current.contract, coverage: revision.coverage, contractSha256: '' } as AnalyticsDatasetContract;
+    draft.contractSha256 = analyticsDatasetContractSha256(draft);
+    const contract = validateContract(draft, current.id);
+    // Already applied (crash replay) or a same-coverage refresh: publish normally.
+    if (contract.contractSha256 === current.contractSha256) return { dataset: current };
+    if (current.definitionRevision !== revision.expectedDefinitionRevision) {
+      fail('conflict', `Dataset definition revision changed from expected ${revision.expectedDefinitionRevision} to ${current.definitionRevision}.`);
+    }
+    return {
+      dataset: {
+        ...current,
+        contract,
+        contractSha256: contract.contractSha256,
+        definitionRevision: current.definitionRevision + 1,
+      },
+      pending: {
+        fromRevision: current.definitionRevision,
+        fromContractSha256: current.contractSha256,
+        contract,
+      },
+    };
+  }
+
+  function applyCoverageRevision(dataset: AnalyticsDatasetDefinitionRecord, pending: PendingCoverageRevision, at: string): void {
+    const row = getDatasetRow(dataset.id);
+    if (!row || row.definition_revision !== pending.fromRevision || row.contract_sha256 !== pending.fromContractSha256
+      || row.definition_sha256 !== dataset.definitionSha256) {
+      fail('definition_changed', 'Dataset definition changed before the coverage revision could be applied.');
+    }
+    const contractJson = stableAnalyticsJson(pending.contract);
+    const changed = db.prepare(`
+      UPDATE analytics_datasets
+      SET contract_json = ?, contract_sha256 = ?, definition_revision = ?, updated_at = ?
+      WHERE id = ? AND definition_revision = ? AND contract_sha256 = ?
+    `).run(contractJson, pending.contract.contractSha256, pending.fromRevision + 1, at,
+      dataset.id, pending.fromRevision, pending.fromContractSha256);
+    if (changed.changes !== 1) fail('definition_changed', 'Dataset definition changed during the coverage revision.');
+    db.prepare(`
+      INSERT INTO analytics_dataset_definition_revisions
+        (dataset_id, revision, definition_json, definition_sha256, contract_json,
+         contract_sha256, schema_sha256, retention_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(dataset.id, pending.fromRevision + 1, row.definition_json, row.definition_sha256, contractJson,
+      pending.contract.contractSha256, pending.contract.schemaSha256, row.retention_json, at);
+  }
+
+  function publishParsedSource(ingest: AnalyticsParsedSourceIngest): AnalyticsVersionPromotionReceipt {
+    const current = getDataset(ingest.datasetId);
+    if (!current) fail('not_found', `Dataset ${ingest.datasetId} was not found.`);
+    if (current.lifecycle !== 'active' || current.contract.status !== 'active') {
+      fail('conflict', `Dataset ${current.id} is not active.`);
+    }
+    const prepared = ingest.coverageRevision
+      ? prepareCoverageRevision(current, ingest.coverageRevision)
+      : { dataset: current };
+    const dataset = prepared.dataset;
+    const pendingRevision = prepared.pending;
     const derivation = validateDerivationLineage(dataset, ingest);
     if (ingest.sourceFormat !== dataset.sourceFormat
       || ingest.sourceReceipt.sourceKind !== dataset.sourceKind) {
@@ -2550,6 +2639,7 @@ export function createAnalyticsDataRoomStore(input: {
           run.id,
           ingest.expectedHeadRevision,
           true,
+          pendingRevision,
         );
       } catch (error) {
         failRun(run.id, error);
@@ -2581,6 +2671,7 @@ export function createAnalyticsDataRoomStore(input: {
           run.id,
           ingest.expectedHeadRevision,
           true,
+          pendingRevision,
         );
       } catch (error) {
         failRun(run.id, error);
@@ -2674,6 +2765,7 @@ export function createAnalyticsDataRoomStore(input: {
         run.id,
         ingest.expectedHeadRevision,
         false,
+        pendingRevision,
       );
     } catch (error) {
       failRun(run.id, error);

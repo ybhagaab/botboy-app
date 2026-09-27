@@ -476,6 +476,7 @@ async function main() {
       },
     },
     modelContextRuntime: answerProviderReceipt,
+    documentParser,
   });
   const analyticsAnswerService = createAnalyticsAnswerService({
     db,
