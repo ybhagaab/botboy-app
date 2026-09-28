@@ -95,6 +95,8 @@ const SHA256_RE = /^[a-f0-9]{64}$/;
 const PREPARATION_SOURCE_KINDS = ['existing_version', 'import_inbox', 'local_file', 'sql_query', 'etl_query'];
 const SOURCE_ALIAS_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
 const DEFAULT_WAIT_MS = 24_000;
+/** Upper bound of one foreground wait for a job outcome; tool budgets must exceed it. */
+export const ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS = 30_000;
 const JOB_RESULT_LIMIT = 200;
 const RETENTION: AnalyticsDatasetRetentionPolicy = {
   minimumVersions: 1,
@@ -156,6 +158,15 @@ function fail(
 ): never {
   const list = Array.isArray(issues) ? issues : [issues];
   throw Object.assign(new AnalyticsJobError(code, message), { issues: list.slice(0, 8) });
+}
+
+/** Fail with recovery guidance specific to this failure; errorProjection keeps it verbatim. */
+function failWithNextAction(
+  code: ConstructorParameters<typeof AnalyticsJobError>[0],
+  message: string,
+  nextAction: string,
+): never {
+  throw Object.assign(new AnalyticsJobError(code, message), { issues: [], nextAction: nextAction.slice(0, 1000) });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1456,7 +1467,7 @@ function normalizePreparationPlan(value: AnalyticsDatasetPreparationPlanV1): Ana
     }
     exactKeys(raw, kind === 'sql_query'
       ? ['kind', 'alias', 'sql', 'target']
-      : ['kind', 'alias', 'sql', 'datasetDate', 'target'], sourcePath);
+      : ['kind', 'alias', 'sql', 'datasetDate', 'nullToken', 'target'], sourcePath);
     const sql = cleanText(raw.sql, `${sourcePath}.sql`, 100_000);
     if (kind === 'sql_query' && (!/^(?:SELECT|WITH)\b/i.test(sql)
       || /\b(?:INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|COPY|UNLOAD)\b/i.test(sql))) {
@@ -1474,7 +1485,19 @@ function normalizePreparationPlan(value: AnalyticsDatasetPreparationPlanV1): Ana
           expected: { kind: 'pattern', type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', example: '2026-09-26' }, received: raw.datasetDate, includeReceivedValue: true,
         }));
       }
-      return { kind, alias, sql, ...(datasetDate ? { datasetDate } : {}), target };
+      if (raw.nullToken !== undefined && (typeof raw.nullToken !== 'string' || raw.nullToken.length > 32 || /["\t\r\n\0]/.test(raw.nullToken))) {
+        fail('invalid_input', `${sourcePath}.nullToken is invalid.`, dataRoomIssue({
+          code: 'invalid_null_token', path: `${sourcePath}.nullToken`,
+          message: 'nullToken is optional; omit it (Datanet writes null as an empty cell) or give the exact ≤32-character marker the query emits for null, such as \\N, without tab, quote, CR, LF, or NUL.',
+          expected: { kind: 'range', type: 'string', minimum: 0, maximum: 32 }, received: raw.nullToken, includeReceivedValue: true,
+        }));
+      }
+      return {
+        kind, alias, sql,
+        ...(datasetDate ? { datasetDate } : {}),
+        ...(raw.nullToken !== undefined ? { nullToken: raw.nullToken as string } : {}),
+        target,
+      };
     }
     return { kind, alias, sql, target };
   });
@@ -1684,6 +1707,7 @@ function nodesForPreparation(plan: AnalyticsDatasetPreparationPlanV1) {
                 querySha256: analyticsSha256(source.sql),
                 targetSha256: analyticsSha256(source.target),
                 ...(source.kind === 'etl_query' && source.datasetDate ? { datasetDate: source.datasetDate } : {}),
+                ...(source.kind === 'etl_query' && source.nullToken !== undefined ? { nullTokenSha256: analyticsSha256(source.nullToken) } : {}),
               },
       ...(source.kind === 'existing_version' ? { inputContractSha256: source.expectedContractSha256 } : {}),
     })),
@@ -1990,6 +2014,17 @@ function predecessors(observation: AnalyticsJobObservation, node: AnalyticsJobNo
 }
 
 function errorProjection(error: unknown): { code: string; message: string; retryClass: 'transient' | 'definition_change'; nextAction: string } {
+  // A failure that names its own recovery keeps it: its message may quote
+  // result columns (e.g. "network") that the transient regex would misread.
+  const specific = error instanceof AnalyticsJobError ? (error as AnalyticsJobError & { nextAction?: unknown }).nextAction : undefined;
+  if (error instanceof AnalyticsJobError && typeof specific === 'string' && specific.trim()) {
+    return {
+      code: error.code,
+      message: error.message,
+      retryClass: error.code === 'conflict' ? 'transient' : 'definition_change',
+      nextAction: specific,
+    };
+  }
   const rawMessage = error instanceof Error ? error.message : String(error);
   if (/timeout|timed out|ECONN|EAI_AGAIN|fetch failed|network|HTTP 5|service unavailable|overloaded/i.test(rawMessage)) {
     return {
@@ -2046,7 +2081,7 @@ export function createAnalyticsJobService(input: {
   waitMs?: number;
 }): AnalyticsJobService {
   const now = input.now ?? (() => new Date());
-  const waitMs = Math.max(100, Math.min(30_000, input.waitMs ?? DEFAULT_WAIT_MS));
+  const waitMs = Math.max(100, Math.min(ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS, input.waitMs ?? DEFAULT_WAIT_MS));
   const localFilePolicy = input.localFilePolicy ?? defaultAnalyticsLocalFilePolicy();
   // Same model-context rule as newly prepared datasets: without a local or
   // managed provider, file facts reach the model as structure only.
@@ -2857,24 +2892,40 @@ export function createAnalyticsJobService(input: {
     if (!outcome.runId || !outcome.savedTo || outcome.resultBytes === undefined || !outcome.resultSha256) {
       fail('integrity_failed', 'Datanet ETL success lacks an exact result file receipt.');
     }
-    const promoted = input.dataRoom.ingestEtlTsv({
-      datasetId: prepared.definition.id,
-      expectedHeadRevision,
-      materializedAt: timestamp(),
-      sourceReceipt: {
-        sourceKind: 'datanet_etl',
-        sourceId: outcome.runId,
-        querySha256,
-        producerVersion: input.etlRunner.id,
-        acquiredAt: timestamp(),
-      },
-      quality: prepared.quality ?? [],
-      trigger: 'agent',
-      requestSha256: observation.job.intentSha256,
-      savedTo: outcome.savedTo,
-      resultBytes: outcome.resultBytes,
-      resultSha256: outcome.resultSha256,
-    });
+    let promoted: ReturnType<AnalyticsDataRoomService['ingestEtlTsv']>;
+    try {
+      promoted = input.dataRoom.ingestEtlTsv({
+        datasetId: prepared.definition.id,
+        expectedHeadRevision,
+        materializedAt: timestamp(),
+        sourceReceipt: {
+          sourceKind: 'datanet_etl',
+          sourceId: outcome.runId,
+          querySha256,
+          producerVersion: input.etlRunner.id,
+          acquiredAt: timestamp(),
+        },
+        quality: prepared.quality ?? [],
+        trigger: 'agent',
+        requestSha256: observation.job.intentSha256,
+        savedTo: outcome.savedTo,
+        resultBytes: outcome.resultBytes,
+        resultSha256: outcome.resultSha256,
+        ...(source.nullToken !== undefined ? { nullToken: source.nullToken } : {}),
+      });
+    } catch (error) {
+      // The run is complete and its exact result is saved: a result that does
+      // not fit the declared target must never lead to resubmitting the SQL.
+      // A head conflict stays transient (resume re-reads the same run).
+      if (!(error instanceof AnalyticsDataRoomError) || error.code === 'conflict') throw error;
+      const home = localFilePolicy.homeDir;
+      const saved = outcome.savedTo.startsWith(`${home}/`) ? `~/${outcome.savedTo.slice(home.length + 1)}` : outcome.savedTo;
+      failWithNextAction(
+        'invalid_input',
+        `Datanet run ${outcome.runId} succeeded, but its result could not become a version of this target: ${error.message}`,
+        `Run ${outcome.runId} is complete and its exact result is saved at ${saved}; never resubmit this SQL to get it again. Tell the owner the reason above. On the owner's request, call inspect_local_file on that path, then create with one local_file source whose target matches the reported columns, types, and coverage. Resubmit SQL only if the query itself must change.`,
+      );
+    }
     input.store.verifyVersion(promoted.version.id, 'local_answer');
     input.jobStore.succeedNode({
       nodeId: node.id,

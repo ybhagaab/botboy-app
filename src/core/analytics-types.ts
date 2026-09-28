@@ -16,6 +16,12 @@ export interface AnalyticsWidgetInput {
   subtitle?: string;
   sql?: string;
   preset?: string;
+  /**
+   * Optional data source for dashboard create/update. data_room_query reads
+   * one ready Data Room dataset locally (resolved to its current verified
+   * version); warehouse_sql is equivalent to top-level sql/preset.
+   */
+  source?: AnalyticsWidgetSourceInput;
   config?: Record<string, unknown>;
 }
 
@@ -142,7 +148,12 @@ export interface AnalyticsWidgetEditInput {
 }
 
 export interface AnalyticsWidgetEditOwnerScope {
-  source: 'dashboard_widget_selection' | 'owner_exact_ids';
+  /**
+   * Provenance of the edit target: IDs the owner typed, the owner's visible
+   * widget selection, or targets the chat model resolved from the owner's
+   * natural-language request. The server validates every target identically.
+   */
+  source: 'dashboard_widget_selection' | 'owner_exact_ids' | 'model_resolved';
   dashboardId: string;
   orderedWidgetIds: string[];
 }
@@ -151,7 +162,7 @@ export interface AnalyticsWidgetEditRequestIdentity {
   ownerRequestId: string;
   ownerMessage: string;
   ownerScope: AnalyticsWidgetEditOwnerScope;
-  /** Derived from trusted owner wording; never accepted from model arguments. */
+  /** Owner asked for another copy even if identical (the edit tool's createNew argument). */
   explicitNew: boolean;
 }
 

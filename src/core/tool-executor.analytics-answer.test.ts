@@ -190,7 +190,6 @@ describe('tool executor edit_analytics_dashboard boundary', () => {
   it.each([
     ['missing owner attestation', false, 'Change widget_exact on dash_exact.', 'interactive'],
     ['background caller', true, 'Change widget_exact on dash_exact.', 'background'],
-    ['missing exact target in owner turn', true, 'Change this chart.', 'interactive'],
   ])('refuses %s before service invocation', async (_label, ownerRequested, message, callerKind) => {
     const editDataRoomWidget = vi.fn();
     const executor = createToolExecutor(storage.getDb(), createNodeManager(storage.getDb()), {
@@ -238,7 +237,7 @@ describe('tool executor route-derived analytics edit scope', () => {
     });
   }
 
-  it('accepts explicit deictic wording only for the exact canonical ordered selection', async () => {
+  it('accepts an edit of the selected widget', async () => {
     const editDataRoomWidget = vi.fn(() => ({
       action: 'presentation', dashboardId: 'dash_selected', sourceWidgetIds: ['widget_selected'],
       widget: scopedWidget, resultDisposition: 'preserved',
@@ -272,40 +271,25 @@ describe('tool executor route-derived analytics edit scope', () => {
   });
 
   it.each([
-    ['substituted widget', 'Change this selected widget to an area visualization.', 'interactive', ['widget_other'], 'owner_scope_mismatch'],
-    ['no widget selected', 'Change this selected widget to an area visualization.', 'interactive', [], 'owner_scope_mismatch'],
-    ['read-only wording', 'Just explain what would happen if this selected widget changed.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['hypothetical wording', 'How would you change this selected widget to an area chart?', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['conditional wording', 'What if you change this selected widget to an area chart?', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['other-tool wording', 'Update the task about this selected chart.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['artifact-first pronoun wording', 'Regarding the document about this selected chart, update its title.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['action-first wrong object', 'Change the title of the document about this selected chart.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['explicit no-op wording', 'Change nothing about this selected widget.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['possessive wrong object', "Change this selected widget's document title to Quarterly.", 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['copy to document', 'Copy this selected widget to a document.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['trailing approval condition', 'Change this selected widget only if I approve later.', 'interactive', ['widget_selected'], 'owner_action_mismatch'],
-    ['wrong cardinality', 'Combine this selected widget.', 'interactive', ['widget_selected'], 'owner_selection_required'],
-    ['background caller', 'Change this selected widget to an area visualization.', 'background', ['widget_selected'], 'owner_context_required'],
-  ])('blocks %s before the service', async (_label, message, callerKind, selectedIds, expectedCode) => {
+    ['one widget for combine', 'combine_compatible_widgets', ['widget_selected'], 'interactive', 'invalid_widget_count'],
+    ['two widgets for a presentation edit', 'presentation', ['widget_selected', 'widget_other'], 'interactive', 'invalid_widget_count'],
+    ['background caller', 'presentation', ['widget_selected'], 'background', 'owner_context_required'],
+  ])('blocks %s before the service', async (_label, action, widgetIds, callerKind, expectedCode) => {
     const editDataRoomWidget = vi.fn();
     const executor = createScopedExecutor(editDataRoomWidget);
     const result = await executor.executeTool({
       id: 'edit-route-denied', type: 'function', function: {
         name: 'edit_analytics_dashboard',
         arguments: JSON.stringify({
-          action: _label === 'wrong cardinality' ? 'combine_compatible_widgets' : 'presentation',
-          dashboardId: 'dash_selected', widgetIds: ['widget_selected'],
-          ...(_label === 'wrong cardinality' ? { presentation: { layout: 'vconcat' } } : { presentation: { renderer: 'area' } }),
+          action, dashboardId: 'dash_selected', widgetIds,
+          presentation: action === 'combine_compatible_widgets' ? { layout: 'vconcat' } : { renderer: 'area' },
           ownerRequested: true,
         }),
       },
     }, {
-      currentUserMessage: message,
+      currentUserMessage: 'Please make that change.',
       callerKind: callerKind as any,
       ownerRequestId: 'request-route-denied',
-      authoritativeAnalyticsScope: {
-        dashboardId: 'dash_selected', orderedWidgetIds: selectedIds, source: 'dashboard_widget_selection',
-      },
     });
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content)).toMatchObject({
@@ -313,82 +297,13 @@ describe('tool executor route-derived analytics edit scope', () => {
     });
     expect(editDataRoomWidget).not.toHaveBeenCalled();
   });
-
-  it('rejects singular combine wording even when two widgets are selected', async () => {
-    const editDataRoomWidget = vi.fn();
-    const executor = createScopedExecutor(editDataRoomWidget);
-    const result = await executor.executeTool({
-      id: 'edit-singular-combine', type: 'function', function: {
-        name: 'edit_analytics_dashboard',
-        arguments: JSON.stringify({
-          action: 'combine_compatible_widgets', dashboardId: 'dash_selected',
-          widgetIds: ['widget_selected', 'widget_other'], presentation: { layout: 'hconcat' }, ownerRequested: true,
-        }),
-      },
-    }, {
-      currentUserMessage: 'Combine this selected widget.', callerKind: 'interactive',
-      ownerRequestId: 'request-singular-combine',
-      authoritativeAnalyticsScope: {
-        dashboardId: 'dash_selected', orderedWidgetIds: ['widget_selected', 'widget_other'], source: 'dashboard_widget_selection',
-      },
-    });
-    expect(JSON.parse(result.content)).toMatchObject({ code: 'owner_action_mismatch', mutationApplied: false });
-    expect(editDataRoomWidget).not.toHaveBeenCalled();
-  });
-
-  it('rejects copy-to-document destinations for route and exact-ID add actions', async () => {
-    const editDataRoomWidget = vi.fn();
-    const executor = createScopedExecutor(editDataRoomWidget);
-    for (const [message, authoritativeAnalyticsScope] of [
-      ['Copy this selected widget to a document.', {
-        dashboardId: 'dash_selected', orderedWidgetIds: ['widget_selected'], source: 'dashboard_widget_selection' as const,
-      }],
-      ['Copy this selected widget as a new chart in a document.', {
-        dashboardId: 'dash_selected', orderedWidgetIds: ['widget_selected'], source: 'dashboard_widget_selection' as const,
-      }],
-      ['Copy widget_selected on dash_selected to a document.', undefined],
-      ['Copy widget_selected on dash_selected as a new chart in a document.', undefined],
-    ] as const) {
-      const result = await executor.executeTool({
-        id: `edit-copy-document-${authoritativeAnalyticsScope ? 'route' : 'exact'}`, type: 'function', function: {
-          name: 'edit_analytics_dashboard',
-          arguments: JSON.stringify({
-            action: 'add_from_widget', dashboardId: 'dash_selected', widgetIds: ['widget_selected'],
-            presentation: { title: 'Copy' }, ownerRequested: true,
-          }),
-        },
-      }, {
-        currentUserMessage: message, callerKind: 'interactive', ownerRequestId: 'request-copy-document',
-        ...(authoritativeAnalyticsScope ? { authoritativeAnalyticsScope } : {}),
-      });
-      expect(JSON.parse(result.content)).toMatchObject({ code: 'owner_action_mismatch', mutationApplied: false });
-    }
-    expect(editDataRoomWidget).not.toHaveBeenCalled();
-  });
-
-  it('uses exact ID tokens rather than substring matches', async () => {
-    const editDataRoomWidget = vi.fn();
-    const executor = createScopedExecutor(editDataRoomWidget);
-    const result = await executor.executeTool({
-      id: 'edit-token-collision', type: 'function', function: {
-        name: 'edit_analytics_dashboard',
-        arguments: JSON.stringify({
-          action: 'presentation', dashboardId: 'dash_selected', widgetIds: ['widget_selected'],
-          presentation: { renderer: 'area' }, ownerRequested: true,
-        }),
-      },
-    }, {
-      currentUserMessage: 'Change widget_selected_extra on dash_selected to area.',
-      callerKind: 'interactive',
-      ownerRequestId: 'request-token-collision',
-    });
-    expect(JSON.parse(result.content).code).toBe('owner_scope_mismatch');
-    expect(editDataRoomWidget).not.toHaveBeenCalled();
-  });
 });
 
 
-describe('tool executor analytics edit affirmative exact-target gate', () => {
+// Owner-directed 2026-09-28: no exact ID or keyword matching on owner input.
+// Authority is the live owner turn + ownerRequested; the model resolves the
+// target and the service validates it.
+describe('tool executor analytics edit natural-language targets', () => {
   let storage: StorageLayer;
 
   beforeEach(() => {
@@ -399,38 +314,40 @@ describe('tool executor analytics edit affirmative exact-target gate', () => {
   afterEach(() => storage.close());
 
   it.each([
-    ['negated exact edit', 'Do not change widget_selected on dash_selected; just explain it.', ['widget_selected'], 'owner_action_mismatch'],
-    ['negated exact make', "Don't make widget_selected on dash_selected an area chart.", ['widget_selected'], 'owner_action_mismatch'],
-    ['hypothetical exact edit', 'How would you change widget_selected on dash_selected to an area chart?', ['widget_selected'], 'owner_action_mismatch'],
-    ['conditional exact edit', 'What if you change widget_selected on dash_selected to an area chart?', ['widget_selected'], 'owner_action_mismatch'],
-    ['other-tool exact wording', 'Update the task about widget_selected on dash_selected.', ['widget_selected'], 'owner_action_mismatch'],
-    ['artifact-first exact pronoun', 'Regarding the document about widget_selected on dash_selected, update its title.', ['widget_selected'], 'owner_action_mismatch'],
-    ['action-first exact wrong object', 'Change the title of the document about widget_selected on dash_selected.', ['widget_selected'], 'owner_action_mismatch'],
-    ['explicit exact no-op', 'Change nothing about widget_selected on dash_selected.', ['widget_selected'], 'owner_action_mismatch'],
-    ['possessive exact wrong object', "Change widget_selected's document title on dash_selected to Quarterly.", ['widget_selected'], 'owner_action_mismatch'],
-    ['copy exact target to document', 'Copy widget_selected on dash_selected to a document.', ['widget_selected'], 'owner_action_mismatch'],
-    ['trailing exact approval condition', 'Change widget_selected on dash_selected only if I approve later.', ['widget_selected'], 'owner_action_mismatch'],
-    ['ambiguous multi-ID edit', 'On dash_selected, change widget_selected to match widget_other.', ['widget_other'], 'owner_scope_mismatch'],
-  ])('blocks %s before mutation', async (_label, message, widgetIds, expectedCode) => {
-    const editDataRoomWidget = vi.fn();
+    ['a title, no IDs or selection', 'Make the core funnel trend an area chart.', undefined],
+    ['a loose confirmation', 'yes please do that for all of them', undefined],
+    ['an ID-bearing sentence the old wording rule rejected', 'Connect widget_selected on dash_selected to the Fatafat MXP Ingress Daily Flash Data Room dataset view as an area chart.', undefined],
+    ['a selection that differs from the target', 'Change the other chart to an area view.', ['widget_other']],
+  ])('delegates %s to the service', async (_label, message, selected) => {
+    const editDataRoomWidget = vi.fn(() => ({
+      action: 'presentation', dashboardId: 'dash_selected', sourceWidgetIds: ['widget_selected'],
+      widget: { id: 'widget_selected', title: 'Trend', revision: 5, bindingRevision: 2 }, resultDisposition: 'preserved',
+    }));
     const executor = createToolExecutor(storage.getDb(), createNodeManager(storage.getDb()), {
-      analyticsService: { editDataRoomWidget } as any,
+      analyticsService: {
+        editDataRoomWidget,
+        getDashboard: () => ({ id: 'dash_selected', title: 'Selected dashboard', widgets: [] }),
+      } as any,
     });
     const result = await executor.executeTool({
-      id: 'edit-exact-denied', type: 'function', function: {
+      id: 'edit-natural', type: 'function', function: {
         name: 'edit_analytics_dashboard',
         arguments: JSON.stringify({
-          action: 'presentation', dashboardId: 'dash_selected', widgetIds,
+          action: 'presentation', dashboardId: 'dash_selected', widgetIds: ['widget_selected'],
           presentation: { renderer: 'area' }, ownerRequested: true,
         }),
       },
     }, {
       currentUserMessage: message,
       callerKind: 'interactive',
-      ownerRequestId: 'request-exact-denied',
+      ownerRequestId: 'request-natural-1',
+      ...(selected ? {
+        authoritativeAnalyticsScope: { dashboardId: 'dash_selected', orderedWidgetIds: selected, source: 'dashboard_widget_selection' as const },
+      } : {}),
     });
-    expect(JSON.parse(result.content)).toMatchObject({ code: expectedCode, mutationApplied: false });
-    expect(editDataRoomWidget).not.toHaveBeenCalled();
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ status: 'completed', mutationApplied: true });
+    expect(editDataRoomWidget).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -445,22 +362,22 @@ describe('tool executor durable analytics edit identity', () => {
 
   afterEach(() => storage.close());
 
-  it('passes trusted request/scope identity and derives explicit-new only from owner wording', async () => {
-    const createdWidget = {
-      id: 'widget_created_f2', dashboardId: 'dash_selected', revision: 1, bindingRevision: 1,
-      position: 2, kind: 'visualization', title: 'Another point view', subtitle: '', sql: 'SELECT 1', config: {},
-      createdAt: '2026-09-21T00:00:00.000Z', updatedAt: '2026-09-21T00:00:00.000Z',
-    } as any;
-    const run = {
-      id: 'run_created_f2', dashboardId: 'dash_selected', trigger: 'agent', status: 'completed',
-      refreshScope: 'selective', widgetCount: 1, widgetsCompleted: 1, widgetsSucceeded: 1,
-      cancelRequested: false, queuedAt: '2026-09-21T00:00:00.000Z', completedAt: '2026-09-21T00:00:01.000Z',
-    } as any;
+  const createdWidget = {
+    id: 'widget_created_f2', dashboardId: 'dash_selected', revision: 1, bindingRevision: 1,
+    position: 2, kind: 'visualization', title: 'Another point view', subtitle: '', sql: 'SELECT 1', config: {},
+    createdAt: '2026-09-21T00:00:00.000Z', updatedAt: '2026-09-21T00:00:00.000Z',
+  } as any;
+  const completedRun = {
+    id: 'run_created_f2', dashboardId: 'dash_selected', trigger: 'agent', status: 'completed',
+    refreshScope: 'selective', widgetCount: 1, widgetsCompleted: 1, widgetsSucceeded: 1,
+    cancelRequested: false, queuedAt: '2026-09-21T00:00:00.000Z', completedAt: '2026-09-21T00:00:01.000Z',
+  } as any;
+  const durableEditHarness = (explicitNew: boolean) => {
     const editDataRoomWidget = vi.fn(() => ({
       action: 'add_from_widget', dashboardId: 'dash_selected', sourceWidgetIds: ['widget_selected'],
-      widget: createdWidget, createdWidgetId: createdWidget.id, resultDisposition: 'refresh_queued', run,
+      widget: createdWidget, createdWidgetId: createdWidget.id, resultDisposition: 'refresh_queued', run: completedRun,
       receiptId: 'aedit_aaaaaaaaaaaaaaaa', intentVersion: 1, intentSha256: '1'.repeat(64),
-      effectSha256: '2'.repeat(64), explicitNew: true, idempotentReplay: false, effectAppliedThisCall: true,
+      effectSha256: '2'.repeat(64), explicitNew, idempotentReplay: false, effectAppliedThisCall: true,
     }));
     const runDueNow = vi.fn();
     const executor = createToolExecutor(storage.getDb(), createNodeManager(storage.getDb()), {
@@ -470,16 +387,22 @@ describe('tool executor durable analytics edit identity', () => {
       } as any,
       analyticsScheduler: { runDueNow } as any,
     });
-    const result = await executor.executeTool({
-      id: 'edit-durable-f2', type: 'function', function: {
+    const call = (args: Record<string, unknown>) => ({
+      id: 'edit-durable-f2', type: 'function' as const, function: {
         name: 'edit_analytics_dashboard',
         arguments: JSON.stringify({
           action: 'add_from_widget', dashboardId: 'dash_selected', widgetIds: ['widget_selected'],
           presentation: { renderer: 'point', title: 'Another point view' }, ownerRequested: true,
-          explicitNew: false,
+          ...args,
         }),
       },
-    }, {
+    });
+    return { editDataRoomWidget, runDueNow, executor, call };
+  };
+
+  it('takes explicit-new from the createNew argument and records selection provenance', async () => {
+    const { editDataRoomWidget, runDueNow, executor, call } = durableEditHarness(true);
+    const result = await executor.executeTool(call({ createNew: true }), {
       currentUserMessage: 'Create another new point chart from this selected widget.',
       callerKind: 'interactive', ownerRequestId: 'request-executor-f2-0001',
       authoritativeAnalyticsScope: {
@@ -503,6 +426,35 @@ describe('tool executor durable analytics edit identity', () => {
       responseGuidance: { requiredAnchors: expect.arrayContaining(['aedit_aaaaaaaaaaaaaaaa']) },
     });
     expect(runDueNow).not.toHaveBeenCalled();
+  });
+
+  it('ignores owner wording for explicit-new and records model-resolved targets', async () => {
+    const { editDataRoomWidget, executor, call } = durableEditHarness(false);
+    const result = await executor.executeTool(call({}), {
+      // "another new" in the wording no longer implies a duplicate; only createNew does.
+      currentUserMessage: 'Create another new point chart from the funnel trend.',
+      callerKind: 'interactive', ownerRequestId: 'request-executor-f2-0002',
+    });
+    expect(result.isError).toBe(false);
+    expect(editDataRoomWidget).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      ownerScope: { source: 'model_resolved', dashboardId: 'dash_selected', orderedWidgetIds: ['widget_selected'] },
+      explicitNew: false,
+    }));
+  });
+
+  it('labels literal owner-typed IDs as owner_exact_ids provenance only', async () => {
+    const { editDataRoomWidget, executor, call } = durableEditHarness(false);
+    await executor.executeTool(call({}), {
+      currentUserMessage: 'Copy widget_selected on dash_selected as a point chart.',
+      callerKind: 'interactive', ownerRequestId: 'request-executor-f2-0003',
+      // The ambient selection points elsewhere; typed IDs are the better provenance.
+      authoritativeAnalyticsScope: {
+        dashboardId: 'dash_selected', orderedWidgetIds: ['widget_other'], source: 'dashboard_widget_selection',
+      },
+    });
+    expect(editDataRoomWidget).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      ownerScope: { source: 'owner_exact_ids', dashboardId: 'dash_selected', orderedWidgetIds: ['widget_selected'] },
+    }));
   });
 
   it('requires a server request ID for add/combine before service invocation', async () => {

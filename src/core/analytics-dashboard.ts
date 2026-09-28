@@ -14,6 +14,7 @@ import {
 } from './analytics-runners.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type { AnalyticsDataRoomReadService, DataRoomQueryInput } from './analytics-data-room-read.js';
+import { AnalyticsDataRoomError } from './analytics-data-room-store.js';
 import {
   AnalyticsDashboardDataRoomError,
   type AnalyticsDashboardDataRoomBridge,
@@ -448,32 +449,77 @@ export function etlResultToWidgetResult(outcome: QueryRunResult, elapsedMs?: num
   };
 }
 
-function normalizeWidget(input: AnalyticsWidgetInput, position: number): AnalyticsWidgetInput {
+/** Resolves one model/owner Data Room source into the exact stored descriptor. */
+type DataRoomWidgetSourceResolver = (
+  source: Record<string, unknown>,
+  path: string,
+  label: string,
+) => Extract<AnalyticsWidgetSourceV1, { kind: 'data_room_query' }>;
+
+function normalizeWidget(
+  input: AnalyticsWidgetInput,
+  position: number,
+  resolveDataRoomSource?: DataRoomWidgetSourceResolver,
+): AnalyticsWidgetInput {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error(`Widget ${position + 1} must be an object`);
   if (!WIDGET_KINDS.has(input.kind)) throw new Error(`Widget ${position + 1} has invalid kind`);
   const title = cleanText(input.title, `Widget ${position + 1} title`, 200, true);
   const subtitle = cleanText(input.subtitle, `Widget ${position + 1} subtitle`, 500);
-  const preset = cleanText(input.preset, `Widget ${position + 1} preset`, 256);
+  let preset = cleanText(input.preset, `Widget ${position + 1} preset`, 256);
   const config = jsonObject(input.config);
   if (Object.prototype.hasOwnProperty.call(config, 'dataSource')) {
-    throw new Error(`Widget ${position + 1} dataSource is reserved for configure_analytics_widget_source`);
+    throw new Error(`Widget ${position + 1} config.dataSource is server-owned; give the widget's data source as widget.source instead ({kind:"data_room_query", datasetId, sql} for a Data Room dataset)`);
   }
+  const source = input.source as unknown;
   if (input.kind === 'text') {
+    if (source !== undefined) throw new Error(`Widget ${position + 1} is a text widget; remove source`);
     const text = cleanText(config.text, `Widget ${position + 1} text`, 20_000, true);
     return { kind: input.kind, title, subtitle, preset, config: { ...config, text } };
   }
-  const sql = validateReadOnlySql(input.sql);
-  if (input.kind === 'visualization') {
-    const spec = validateVisualizationSpec(config.spec);
-    return { kind: input.kind, title, subtitle, sql, preset, config: { ...config, spec } };
+  let sql: string | undefined;
+  let nextConfig: Record<string, unknown> = config;
+  if (source === undefined) {
+    sql = validateReadOnlySql(input.sql);
+  } else {
+    if (!isPlainObject(source)) throw new Error(`Widget ${position + 1} source must be an object`);
+    const topLevelSql = typeof input.sql === 'string' ? input.sql.trim() : '';
+    if (source.kind === 'data_room_query') {
+      if (topLevelSql) {
+        throw new Error(`Widget ${position + 1} reads a Data Room dataset; put its SQLite query in source.sql and omit widget.sql`);
+      }
+      if (preset) throw new Error(`Widget ${position + 1} preset applies only to warehouse widgets; omit it for a Data Room source`);
+      if (!resolveDataRoomSource) {
+        throw new Error(`Widget ${position + 1} Data Room sources are set through dashboard create/update or configure_analytics_widget_source`);
+      }
+      nextConfig = { ...config, dataSource: resolveDataRoomSource(source, `widgets[${position}].source`, `Widget ${position + 1} "${title}"`) };
+      preset = '';
+    } else if (source.kind === 'warehouse_sql') {
+      const extras = Object.keys(source).filter(key => !['kind', 'sql', 'preset'].includes(key)).sort();
+      if (extras.length) throw new Error(`Widget ${position + 1} warehouse source contains unsupported fields: ${extras.join(', ')}`);
+      if (topLevelSql && topLevelSql !== String(source.sql ?? '').trim()) {
+        throw new Error(`Widget ${position + 1} gives two different warehouse queries; use either widget.sql or source.sql`);
+      }
+      sql = validateReadOnlySql(source.sql);
+      preset = cleanText(source.preset ?? input.preset, `Widget ${position + 1} preset`, 256);
+    } else {
+      throw new Error(`Widget ${position + 1} source.kind must be data_room_query or warehouse_sql`);
+    }
   }
-  return { kind: input.kind, title, subtitle, sql, preset, config };
+  if (input.kind === 'visualization') {
+    nextConfig = { ...nextConfig, spec: validateVisualizationSpec(config.spec) };
+  }
+  return { kind: input.kind, title, subtitle, ...(sql ? { sql } : {}), preset, config: nextConfig };
 }
 
-function normalizeWidgets(value: unknown): AnalyticsWidgetInput[] {
+function normalizeWidgets(value: unknown, resolveDataRoomSource?: DataRoomWidgetSourceResolver): AnalyticsWidgetInput[] {
   if (!Array.isArray(value) || value.length === 0) throw new Error('At least one dashboard widget is required');
   if (value.length > MAX_WIDGETS) throw new Error(`A dashboard can contain at most ${MAX_WIDGETS} widgets`);
-  return value.map((widget, position) => normalizeWidget(widget as AnalyticsWidgetInput, position));
+  return value.map((widget, position) => normalizeWidget(widget as AnalyticsWidgetInput, position, resolveDataRoomSource));
+}
+
+function isDataRoomQueryWidget(widget: { config?: Record<string, unknown> }): boolean {
+  const dataSource = widget.config?.dataSource;
+  return isPlainObject(dataSource) && dataSource.kind === 'data_room_query';
 }
 
 function widgetSourceFromConfig(configValue: unknown): AnalyticsWidgetSourceV1 | null {
@@ -844,7 +890,7 @@ export function createAnalyticsDashboardService(options: {
     const title = cleanText(input.title, 'title', 200, true);
     const description = cleanText(input.description, 'description', 2000);
     const theme = cleanText(input.theme || 'executive', 'theme', 80, true);
-    const widgets = normalizeWidgets(input.widgets);
+    const widgets = normalizeWidgets(input.widgets, resolveDataRoomWidgetSource);
     const projectIds = validateProjects(input.projectIds);
     const id = shortId('dash');
     db.transaction(() => {
@@ -854,7 +900,10 @@ export function createAnalyticsDashboardService(options: {
       `).run(id, title, description, theme);
       insertWidgets(id, widgets);
       replaceProjectLinks(id, projectIds);
+      // A full refresh covers every widget. Otherwise Data Room widgets still
+      // load now: their local run needs no warehouse lane or remote call.
       if (refreshTrigger) enqueueDashboard(getDashboard(id)!, refreshTrigger);
+      else queueDataRoomWidgetRun(id);
     })();
     return getDashboard(id)!;
   }
@@ -865,7 +914,11 @@ export function createAnalyticsDashboardService(options: {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Dashboard update must be an object');
     const running = activeRun(id);
     if (running && (input.widgets !== undefined || input.status !== undefined || input.projectIds !== undefined)) {
-      throw new Error(`Dashboard widgets, status, or project links cannot change while refresh ${running.id} is ${running.status}`);
+      throw Object.assign(new AnalyticsWidgetEditError(
+        'active_run',
+        `Dashboard widgets, status, or project links cannot change while refresh ${running.id} is ${running.status}`,
+        `Wait for run ${running.id} to finish (get_analytics_dashboard shows it), then send the same update once.`,
+      ), { mutationApplied: false });
     }
     const title = input.title === undefined ? current.title : cleanText(input.title, 'title', 200, true);
     const description = input.description === undefined ? current.description : cleanText(input.description, 'description', 2000);
@@ -876,7 +929,7 @@ export function createAnalyticsDashboardService(options: {
     }
     const status = input.status === undefined ? persistedStatus : input.status;
     if (!EDITABLE_DASHBOARD_STATUSES.has(status)) throw new Error('Invalid dashboard status');
-    const widgets = input.widgets === undefined ? null : normalizeWidgets(input.widgets);
+    const widgets = input.widgets === undefined ? null : normalizeWidgets(input.widgets, resolveDataRoomWidgetSource);
     const projectIds = input.projectIds === undefined ? null : validateProjects(input.projectIds);
     if (widgets && db.prepare(`
       SELECT 1 FROM analytics_widget_dataset_bindings binding
@@ -895,6 +948,8 @@ export function createAnalyticsDashboardService(options: {
       if (widgets) {
         db.prepare('DELETE FROM analytics_widgets WHERE dashboard_id = ?').run(id);
         insertWidgets(id, widgets);
+        // Replaced Data Room widgets load immediately (local-only run).
+        if (status !== 'archived') queueDataRoomWidgetRun(id);
       }
       if (projectIds) replaceProjectLinks(id, projectIds);
       if (persistedStatus === 'archived' && status !== 'archived') {
@@ -972,23 +1027,128 @@ export function createAnalyticsDashboardService(options: {
     return mapWidget(db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(widgetId));
   }
 
+  function widgetSourceError(
+    code: AnalyticsWidgetEditErrorCode,
+    message: string,
+    nextAction: string,
+    issues: DataRoomFailureIssueV1 | DataRoomFailureIssueV1[] = [],
+  ): never {
+    const list = Array.isArray(issues) ? issues : [issues];
+    throw Object.assign(new AnalyticsWidgetEditError(code, message, nextAction), {
+      issues: list.slice(0, 8),
+      mutationApplied: false,
+    });
+  }
+
+  /**
+   * One Data Room widget source → the exact stored descriptor, pinned to the
+   * dataset's current ready version. Shared by dashboard create/update and
+   * configure_analytics_widget_source so every entry point validates alike.
+   * Throws before any write, so a failure has zero effects.
+   */
+  function resolveDataRoomWidgetSource(
+    source: Record<string, unknown>,
+    path: string,
+    label = '',
+  ): Extract<AnalyticsWidgetSourceV1, { kind: 'data_room_query' }> {
+    const prefix = label ? `${label}: ` : '';
+    const extras = Object.keys(source).filter(key => !['kind', 'datasetId', 'sql', 'params', 'limit'].includes(key)).sort();
+    if (extras.length) {
+      widgetSourceError('invalid_input', `${prefix}Data Room source contains unsupported fields: ${extras.join(', ')}`, 'Use only kind, datasetId, sql, optional params, and optional limit for data_room_query.', extras.map(key => dataRoomIssue({
+        code: 'unsupported_field', path: `${path}.${key}`, message: `${key} is not allowed for data_room_query.`,
+        expected: { kind: 'absent' }, received: source[key],
+      })));
+    }
+    const dataRoomReader = dataRoomRead;
+    if (!dataRoomReader) {
+      widgetSourceError('data_room_unavailable', 'Independent Data Room widget source service is unavailable', 'Restore the local Data Room read service before retrying.');
+    }
+    const datasetId = String(source.datasetId ?? '').trim();
+    if (!DATASET_ID_RE.test(datasetId)) {
+      widgetSourceError('invalid_input', `${prefix}Data Room source datasetId is malformed`, 'Use the exact datasetId returned by list_data_room_datasets.', dataRoomIssue({
+        code: 'invalid_pattern', path: `${path}.datasetId`, message: `${path}.datasetId must be an exact Data Room dataset ID.`,
+        expected: { kind: 'pattern', type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$' }, received: source.datasetId, includeReceivedValue: true,
+      }));
+    }
+    // Exact lookup with dashboard-use eligibility (the same check its runs
+    // use), not the model catalog search.
+    let pinned: { datasetId: string; versionId: string } | undefined;
+    try {
+      pinned = dataRoomReader!.resolveDashboardSource(datasetId);
+    } catch (error) {
+      const readerIssues = error && typeof error === 'object' && Array.isArray((error as { issues?: unknown }).issues)
+        ? prefixDataRoomIssues(path, (error as { issues: DataRoomFailureIssueV1[] }).issues)
+        : [];
+      if (!(error instanceof AnalyticsDataRoomError)) {
+        widgetSourceError('data_room_unavailable', `${prefix}Data Room lookup failed unexpectedly`, 'Retry this call once; if it fails again, report that the Data Room is unavailable.', readerIssues);
+      }
+      widgetSourceError(
+        error.code === 'policy_denied' ? 'invalid_input' : 'not_found',
+        `${prefix}${error.message}`,
+        'Choose one exact ready dataset from list_data_room_datasets that allows dashboard use, then call again once.',
+        readerIssues,
+      );
+    }
+    if (!pinned || pinned.datasetId !== datasetId || !VERSION_ID_RE.test(pinned.versionId)) {
+      widgetSourceError('not_found', `${prefix}Dataset ${datasetId} has no exact ready version`, 'Choose one exact ready dataset from list_data_room_datasets, then call again once.', dataRoomIssue({
+        code: 'dataset_not_ready', path: `${path}.datasetId`, message: `${path}.datasetId must identify one exact ready dataset version.`,
+        expected: { kind: 'relation', description: 'Dataset has one current verified head that allows dashboard use.' }, received: datasetId, includeReceivedValue: true,
+      }));
+    }
+    const query = String(source.sql ?? '').trim();
+    if (!/^(?:SELECT|WITH)\b/i.test(query) || !new RegExp(`\\b${SOURCE_ALIAS}\\s*\\.\\s*data\\b`, 'i').test(query)) {
+      widgetSourceError('invalid_input', `${prefix}Data Room widget SQL must be one read-only SELECT/WITH over ${SOURCE_ALIAS}.data`, `Correct ${path}.sql to one read-only query that references ${SOURCE_ALIAS}.data.`, dataRoomIssue({
+        code: 'data_room_sql_required', path: `${path}.sql`, message: `${path}.sql must be one read-only SELECT/WITH over ${SOURCE_ALIAS}.data.`,
+        expected: { kind: 'relation', description: `One SELECT/WITH statement references ${SOURCE_ALIAS}.data.` }, received: source.sql,
+      }));
+    }
+    const params = source.params ?? [];
+    if (!Array.isArray(params) || params.length > 100
+      || params.some(value => value !== null && (!['string', 'number', 'boolean'].includes(typeof value)
+        || (typeof value === 'number' && !Number.isFinite(value))))) {
+      widgetSourceError('invalid_input', `${prefix}Data Room widget params must contain at most 100 finite scalar values`, 'Use an array of at most 100 strings, finite numbers, booleans, or null values.', dataRoomIssue({
+        code: 'invalid_params', path: `${path}.params`, message: `${path}.params must contain at most 100 finite scalar values.`,
+        expected: { kind: 'range', type: 'array', minimum: 0, maximum: 100 }, received: source.params,
+      }));
+    }
+    const limit = source.limit ?? 100;
+    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 200) {
+      widgetSourceError('invalid_input', `${prefix}Data Room widget limit must be from 1 to 200`, `Use an integer ${path}.limit from 1 to 200.`, dataRoomIssue({
+        code: 'out_of_range', path: `${path}.limit`, message: `${path}.limit must be an integer from 1 to 200.`,
+        expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 200 }, received: source.limit, includeReceivedValue: true,
+      }));
+    }
+    return {
+      version: 1,
+      kind: 'data_room_query',
+      datasetId,
+      versionId: pinned.versionId,
+      sql: query,
+      params: params as Array<string | number | boolean | null>,
+      limit: limit as number,
+    };
+  }
+
+  /**
+   * Queue one local-only run for a dashboard that reads Data Room datasets:
+   * its Data Room widgets plus its static text. Warehouse widgets wait for a
+   * refresh; a dashboard without Data Room widgets queues nothing.
+   */
+  function queueDataRoomWidgetRun(dashboardId: string): AnalyticsRun | undefined {
+    const dashboard = getDashboard(dashboardId);
+    if (!dashboard?.widgets.some(isDataRoomQueryWidget)) return undefined;
+    const widgetIds = dashboard.widgets
+      .filter(widget => isDataRoomQueryWidget(widget) || widget.kind === 'text')
+      .map(widget => widget.id);
+    return enqueueDashboard(dashboard, 'agent', widgetIds);
+  }
+
   function configureWidgetSource(
     dashboardId: string,
     widgetId: string,
     input: ConfigureAnalyticsWidgetSourceInput,
   ): AnalyticsWidgetSourceMutationResult {
-    const sourceError = (
-      code: AnalyticsWidgetEditErrorCode,
-      message: string,
-      nextAction: string,
-      issues: DataRoomFailureIssueV1 | DataRoomFailureIssueV1[] = [],
-    ): never => {
-      const list = Array.isArray(issues) ? issues : [issues];
-      throw Object.assign(new AnalyticsWidgetEditError(code, message, nextAction), {
-        issues: list.slice(0, 8),
-        mutationApplied: false,
-      });
-    };
+    const sourceError = widgetSourceError;
     const dashboard = getDashboard(dashboardId);
     if (!dashboard) {
       sourceError('not_found', `Dashboard ${dashboardId} not found`, 'Refresh the dashboard list and use one exact current dashboard ID.', dataRoomIssue({
@@ -1080,74 +1240,7 @@ export function createAnalyticsDashboardService(options: {
       }
       preset = cleanText(source.preset, 'source.preset', 256) || null;
     } else if (source.kind === 'data_room_query') {
-      const extras = sourceKeys.filter(key => !['kind', 'datasetId', 'sql', 'params', 'limit'].includes(key)).sort();
-      if (extras.length) {
-        sourceError('invalid_input', `Data Room source contains unsupported fields: ${extras.join(', ')}`, 'Use only kind, datasetId, sql, optional params, and optional limit for data_room_query.', extras.map(key => dataRoomIssue({
-          code: 'unsupported_field', path: `source.${key}`, message: `${key} is not allowed for data_room_query.`,
-          expected: { kind: 'absent' }, received: (source as unknown as Record<string, unknown>)[key],
-        })));
-      }
-      const dataRoomReader = dataRoomRead;
-      if (!dataRoomReader) {
-        sourceError('data_room_unavailable', 'Independent Data Room widget source service is unavailable', 'Restore the local Data Room read service before retrying.');
-      }
-      const datasetId = String(source.datasetId ?? '').trim();
-      if (!DATASET_ID_RE.test(datasetId)) {
-        sourceError('invalid_input', 'Data Room source datasetId is malformed', 'Use the exact datasetId returned by list_data_room_datasets.', dataRoomIssue({
-          code: 'invalid_pattern', path: 'source.datasetId', message: 'source.datasetId must be an exact Data Room dataset ID.',
-          expected: { kind: 'pattern', type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$' }, received: source.datasetId, includeReceivedValue: true,
-        }));
-      }
-      let catalog: any;
-      try {
-        catalog = dataRoomReader!.list({ query: datasetId });
-      } catch (error) {
-        const issues = error && typeof error === 'object' && Array.isArray((error as { issues?: unknown }).issues)
-          ? prefixDataRoomIssues('source', (error as { issues: DataRoomFailureIssueV1[] }).issues)
-          : [];
-        sourceError('data_room_unavailable', error instanceof Error ? error.message : 'Data Room catalog lookup failed.', 'Refresh the Data Room catalog and retry only with an exact ready dataset.', issues);
-      }
-      const exact = Array.isArray(catalog.datasets)
-        ? catalog.datasets.find((dataset: any) => dataset?.datasetId === datasetId)
-        : undefined;
-      if (!exact || !VERSION_ID_RE.test(String(exact.versionId ?? ''))) {
-        sourceError('not_found', `Dataset ${datasetId} has no exact ready catalog version`, 'Refresh list_data_room_datasets and choose one exact ready dataset.', dataRoomIssue({
-          code: 'dataset_not_ready', path: 'source.datasetId', message: 'source.datasetId must identify one exact ready catalog version.',
-          expected: { kind: 'relation', description: 'ID appears in the current list_data_room_datasets result.' }, received: datasetId, includeReceivedValue: true,
-        }));
-      }
-      const query = String(source.sql ?? '').trim();
-      if (!/^(?:SELECT|WITH)\b/i.test(query) || !new RegExp(`\\b${SOURCE_ALIAS}\\s*\\.\\s*data\\b`, 'i').test(query)) {
-        sourceError('invalid_input', `Data Room widget SQL must be one read-only SELECT/WITH over ${SOURCE_ALIAS}.data`, `Correct source.sql to one read-only query that references ${SOURCE_ALIAS}.data.`, dataRoomIssue({
-          code: 'data_room_sql_required', path: 'source.sql', message: `source.sql must be one read-only SELECT/WITH over ${SOURCE_ALIAS}.data.`,
-          expected: { kind: 'relation', description: `One SELECT/WITH statement references ${SOURCE_ALIAS}.data.` }, received: source.sql,
-        }));
-      }
-      const params = source.params ?? [];
-      if (!Array.isArray(params) || params.length > 100
-        || params.some(value => value !== null && (!['string', 'number', 'boolean'].includes(typeof value)
-          || (typeof value === 'number' && !Number.isFinite(value))))) {
-        sourceError('invalid_input', 'Data Room widget params must contain at most 100 finite scalar values', 'Use an array of at most 100 strings, finite numbers, booleans, or null values.', dataRoomIssue({
-          code: 'invalid_params', path: 'source.params', message: 'source.params must contain at most 100 finite scalar values.',
-          expected: { kind: 'range', type: 'array', minimum: 0, maximum: 100 }, received: source.params,
-        }));
-      }
-      const limit = source.limit ?? 100;
-      if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
-        sourceError('invalid_input', 'Data Room widget limit must be from 1 to 200', 'Use an integer source.limit from 1 to 200.', dataRoomIssue({
-          code: 'out_of_range', path: 'source.limit', message: 'source.limit must be an integer from 1 to 200.',
-          expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 200 }, received: source.limit, includeReceivedValue: true,
-        }));
-      }
-      descriptor = {
-        version: 1,
-        kind: 'data_room_query',
-        datasetId,
-        versionId: String(exact.versionId),
-        sql: query,
-        params,
-        limit,
-      };
+      descriptor = resolveDataRoomWidgetSource(source as unknown as Record<string, unknown>, 'source');
       sqlQuery = null;
       preset = null;
     } else {
@@ -1410,7 +1503,7 @@ export function createAnalyticsDashboardService(options: {
       editError('invalid_input', 'ownerScope is required.', 'Use the server-canonical owner scope.');
     }
     const scope = identity.ownerScope;
-    if (!['dashboard_widget_selection', 'owner_exact_ids'].includes(scope.source)
+    if (!['dashboard_widget_selection', 'owner_exact_ids', 'model_resolved'].includes(scope.source)
       || scope.dashboardId !== input.dashboardId
       || !Array.isArray(scope.orderedWidgetIds)
       || scope.orderedWidgetIds.length !== input.widgetIds.length
@@ -1418,7 +1511,7 @@ export function createAnalyticsDashboardService(options: {
       editError('invalid_input', 'Owner scope does not exactly match the normalized edit target.', 'Use the exact server-authorized dashboard and ordered widgets.');
     }
     if (typeof identity.explicitNew !== 'boolean') {
-      editError('invalid_input', 'explicitNew must be derived by the trusted owner-intent gate.', 'Do not accept explicit-new intent from model arguments.');
+      editError('invalid_input', 'explicitNew must be a boolean.', 'Pass createNew=true only when the owner asked for another copy; otherwise omit it.');
     }
     const ownerMessageValue = { version: 1, text: ownerMessage };
     const ownerScopeValue = {
@@ -2309,7 +2402,8 @@ export function createAnalyticsDashboardService(options: {
               SELECT 1 FROM analytics_run_widget_data_room_snapshots snapshot
               WHERE snapshot.run_id = child.run_id AND snapshot.widget_id = child.widget_id
             ) AS data_room_snapshot,
-            json_extract(child.config_json, '$.dataSource.kind') = 'data_room_query' AS independent_data_source
+            json_extract(child.config_json, '$.dataSource.kind') = 'data_room_query' AS independent_data_source,
+            child.kind = 'text' AS static_text
           FROM analytics_run_widgets child
           WHERE child.run_id = ? AND child.status IN ('queued','running','failed')
           ORDER BY child.position
@@ -2320,6 +2414,7 @@ export function createAnalyticsDashboardService(options: {
           last_lane: string | null;
           data_room_snapshot: number;
           independent_data_source: number;
+          static_text: number;
         }>;
         const claimed = db.prepare(`
           UPDATE analytics_runs SET status = 'queued',
@@ -2354,11 +2449,13 @@ export function createAnalyticsDashboardService(options: {
         `);
         const interruptedAt = new Date().toISOString();
         for (const child of childAttempts) {
-          // Local snapshots and independent Data Room sources are immutable
-          // read-only work. Requeue an interrupted local worker; no remote lane
-          // attempt may be fabricated or resubmitted.
-          if ((child.data_room_snapshot || child.independent_data_source) && !child.last_lane) {
-            const localCapabilityReady = child.independent_data_source ? Boolean(dataRoomRead) : dataRoomEnabled;
+          // Local snapshots, independent Data Room sources, and static text
+          // are read-only local work. Requeue an interrupted local worker; no
+          // remote lane attempt may be fabricated or resubmitted.
+          if ((child.data_room_snapshot || child.independent_data_source || child.static_text) && !child.last_lane) {
+            const localCapabilityReady = child.static_text
+              ? true
+              : child.independent_data_source ? Boolean(dataRoomRead) : dataRoomEnabled;
             if (child.status === 'running' || (!localCapabilityReady && child.status === 'failed')) {
               resetLocalAttempt.run(run.id, child.widget_id, localCapabilityReady ? 0 : 1);
             }
@@ -2894,8 +2991,12 @@ export function createAnalyticsDashboardService(options: {
     const configuredSource = widgetSourceFromConfig(parseJson<Record<string, unknown>>(row.config_json, {}));
     if (configuredSource?.kind === 'data_room_query') {
       if (!dataRoomRead) throw new Error('Independent Data Room widget source service is unavailable');
+      // Each run reads the dataset's current ready head, so a refresh shows new
+      // versions. config.dataSource.versionId only records the head at
+      // configuration; pinning it failed every refresh once the head moved.
+      // The result receipt names the exact version this run used.
       const executed = await dataRoomRead.queryForDashboard({
-        datasets: [{ alias: SOURCE_ALIAS, datasetId: configuredSource.datasetId, versionId: configuredSource.versionId }],
+        datasets: [{ alias: SOURCE_ALIAS, datasetId: configuredSource.datasetId }],
         sql: configuredSource.sql,
         params: configuredSource.params,
         limit: configuredSource.limit,
@@ -2908,7 +3009,7 @@ export function createAnalyticsDashboardService(options: {
       }
       const source = Array.isArray(executed.sources) ? executed.sources[0] as any : undefined;
       const receipt = executed.receipt as any;
-      if (!source || source.datasetId !== configuredSource.datasetId || source.versionId !== configuredSource.versionId
+      if (!source || source.datasetId !== configuredSource.datasetId || !VERSION_ID_RE.test(String(source.versionId ?? ''))
         || typeof receipt?.querySha256 !== 'string') {
         throw new Error('Independent Data Room widget query receipt differs from its configured source');
       }
@@ -3295,6 +3396,9 @@ export function createAnalyticsDashboardService(options: {
    * one fresh warehouse connection receipt. Process liveness alone is not
    * data readiness (2026-09-19 incident: 42 timed-out health checks while the
    * process still advertised running). */
+  // Local phase: Data Room snapshots, independent Data Room queries, and
+  // static text. None of them needs a warehouse lane, so a dashboard built
+  // only from these loads with SQL/ETL down.
   async function processLocalSnapshotWidgets(runId: string): Promise<{ ownershipLost: boolean; cancelSeen: boolean }> {
     let ownershipLost = false;
     let cancelSeen = false;
@@ -3308,6 +3412,7 @@ export function createAnalyticsDashboardService(options: {
             WHERE snapshot.run_id = child.run_id AND snapshot.widget_id = child.widget_id
           ))
           OR json_extract(child.config_json, '$.dataSource.kind') = 'data_room_query'
+          OR child.kind = 'text'
         )
     `).get(runId, dataRoomEnabled ? 1 : 0) as { count: number }).count);
     if (!count) return { ownershipLost, cancelSeen };
@@ -3332,6 +3437,7 @@ export function createAnalyticsDashboardService(options: {
                 WHERE snapshot.run_id = run_widget.run_id AND snapshot.widget_id = run_widget.widget_id
               ))
               OR json_extract(run_widget.config_json, '$.dataSource.kind') = 'data_room_query'
+              OR run_widget.kind = 'text'
             )
             AND run.worker_id = ? AND run.worker_pid = ?
           ORDER BY run_widget.position LIMIT 1
@@ -3364,7 +3470,9 @@ export function createAnalyticsDashboardService(options: {
           const source = result.source?.provider === 'data-room' || result.source?.provider === 'data-room-query'
             ? result.source
             : null;
-          if (!source) throw new Error('Local Data Room execution returned no exact source receipt');
+          // Static text carries no data source receipt; everything else must.
+          const staticText = child.kind === 'text' && result.trust === 'local_static_content';
+          if (!source && !staticText) throw new Error('Local Data Room execution returned no exact source receipt');
           const runWidget = db.prepare(`
             UPDATE analytics_run_widgets SET status = 'completed', error = NULL, completed_at = ?
             WHERE run_id = ? AND widget_id = ? AND status = 'running' AND last_lane IS NULL
@@ -3374,9 +3482,12 @@ export function createAnalyticsDashboardService(options: {
             UPDATE analytics_widgets SET result_json = ?, last_error = NULL,
               last_refreshed_at = ?, updated_at = datetime('now')
             WHERE id = ? AND dashboard_id = ? AND revision = ?
-          `).run(JSON.stringify(result), result.refreshedAt, child.widget_id, child.dashboard_id, source.widgetRevision);
+          `).run(
+            JSON.stringify(result), result.refreshedAt, child.widget_id, child.dashboard_id,
+            source ? source.widgetRevision : Number(child.widget_revision),
+          );
           if (widget.changes !== 1) throw new Error('Widget revision changed before local result apply');
-          if (source.provider === 'data-room') dataRoom?.markApplied(runId, child.widget_id, result);
+          if (source?.provider === 'data-room') dataRoom?.markApplied(runId, child.widget_id, result);
           const parent = db.prepare(`
             UPDATE analytics_runs SET widgets_completed = MIN(widget_count, widgets_completed + 1),
               widgets_succeeded = MIN(widget_count, widgets_succeeded + 1),

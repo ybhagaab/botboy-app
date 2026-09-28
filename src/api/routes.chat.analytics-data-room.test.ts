@@ -479,9 +479,9 @@ describe('streamed chat analytics route-scope admission', () => {
     expect((db.prepare('SELECT COUNT(*) AS count FROM chat_messages').get() as { count: number }).count).toBe(0);
   });
 
-  it('returns one deterministic no-effect clarification when an affirmative deictic edit has no selection', async () => {
+  it('hands a deictic edit with no selection to the model instead of a canned "select a widget" reply', async () => {
     const getDashboard = vi.fn(() => ({ id: 'dash_scope', widgets: [{ id: 'widget_scope' }] }));
-    const { app, db, sendMessage } = appWithScope(getDashboard);
+    const { app, sendMessage } = appWithScope(getDashboard);
     const response = await request(app).post('/api/chat/messages')
       .set('Host', 'localhost:7778')
       .set('Origin', 'http://localhost:7778')
@@ -492,10 +492,9 @@ describe('streamed chat analytics route-scope admission', () => {
         stream: true,
       });
     expect(response.status).toBe(200);
-    expect(response.text).toContain('Select exactly one widget with');
-    expect(response.text).toContain('Nothing was changed on dashboard dash_scope');
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect((db.prepare('SELECT COUNT(*) AS count FROM chat_messages').get() as { count: number }).count).toBe(2);
+    expect(response.text).not.toContain('Select exactly one widget');
+    expect(response.text).toContain('General fallback reply.');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it('keeps generic task creation general and ignores ambient route scope', async () => {

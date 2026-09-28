@@ -12,8 +12,8 @@ if [ -z "${BASH_VERSION:-}" ]; then
 fi
 #
 # Modes:
-#   ./start.sh               background: start server detached, open the
-#                            dashboard window, exit (CLI use)
+#   ./start.sh               background: rebuild local source when needed,
+#                            start/restart detached, open dashboard, exit
 #   ./start.sh --stop        stop every running BotBoy server and exit
 #   ./start.sh --doctor      print a diagnostic report (paste it when asking
 #                            for help) and exit; changes nothing
@@ -1187,9 +1187,16 @@ elif [ ! -f "$PROJ_DIR/dist/index.js" ]; then
   NEED_BUILD="first run"
 else
   CURRENT_COMMIT=$(git -C "$PROJ_DIR" rev-parse HEAD 2>/dev/null || echo "")
-  BUILT_COMMIT=$(cat "$PROJ_DIR/dist/.build-commit" 2>/dev/null || echo "")
+  BUILD_MARKER="$PROJ_DIR/dist/.build-commit"
+  BUILT_COMMIT=$(cat "$BUILD_MARKER" 2>/dev/null || echo "")
   if [ -n "$CURRENT_COMMIT" ] && [ "$CURRENT_COMMIT" != "$BUILT_COMMIT" ]; then
     NEED_BUILD="new code since last build"
+  elif [ ! -f "$BUILD_MARKER" ] \
+    || [ -n "$(find "$PROJ_DIR/src" -type f -newer "$BUILD_MARKER" -print -quit 2>/dev/null)" ] \
+    || [ "$PROJ_DIR/package.json" -nt "$BUILD_MARKER" ] \
+    || [ "$PROJ_DIR/tsconfig.json" -nt "$BUILD_MARKER" ] \
+    || [ "$PROJ_DIR/scripts/copy-ui-assets.mjs" -nt "$BUILD_MARKER" ]; then
+    NEED_BUILD="local source changes"
   fi
 fi
 if [ -n "$NEED_BUILD" ]; then
@@ -1244,13 +1251,18 @@ if [ "$FOREGROUND" = "1" ]; then
 fi
 
 # ── Background mode (CLI default) ──
-# A fresh build with the old server still running would serve last week's
-# code — restart onto the new build.
-if [ -n "$NEED_BUILD" ] && server_is_ready; then
-  echo "ℹ️  Restarting BotBoy on the new build"
+# Bare ./start.sh is the real start/restart path. Focus-only callers use the
+# explicit --open-window branch above, so a healthy old process must not keep
+# serving modules loaded before the current build.
+if server_is_ready; then
+  if [ -n "$NEED_BUILD" ]; then
+    echo "ℹ️  Restarting BotBoy on the new build"
+  else
+    echo "ℹ️  Restarting BotBoy"
+  fi
   safe_takeover || exit 1
 fi
-# 2. Start the tracker server if not already running
+# 2. Start the tracker server after any exact old-process handoff.
 SERVER_PID=""
 if ! server_is_ready; then
   # A failed final-ready check does NOT mean no process exists: a wedged or

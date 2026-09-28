@@ -4659,7 +4659,7 @@ function renderAnalyticsManageData(widget) {
   const configuredSource = widget.config?.dataSource;
   if (!widget.binding && configuredSource) {
     const label = configuredSource.kind === 'data_room_query'
-      ? `${configuredSource.datasetId} · ${configuredSource.versionId}`
+      ? `${configuredSource.datasetId} · ${independentSourceVersion(widget)}`
       : 'Independent warehouse SQL';
     return `<section class="analytics-controls" id="${attr(panelId)}" aria-label="Source for ${attr(widget.title)}">${error ? `<div class="analytics-control-error" role="alert">${esc(error)}</div>` : ''}<div class="analytics-controls-heading"><div><strong>Independent widget source</strong><span>${esc(label)} · configured without a dataset binding or shared controls.</span></div>${configuredSource.kind === 'data_room_query' ? `<a href="#/data-room/${encodeURIComponent(configuredSource.datasetId)}">Dataset details</a>` : ''}</div><p class="analytics-control-note">Ask BotBoy to configure a different source for this selected widget. Other widgets are unaffected.</p></section>`;
   }
@@ -4710,6 +4710,12 @@ function restoreAnalyticsControlFocus() {
   state.analytics.controlPendingFocus = null;
 }
 
+// Independent Data Room widgets read the dataset's current head on every run;
+// show the version the displayed result came from, else the configured one.
+function independentSourceVersion(widget) {
+  return widget.result?.source?.versionId || widget.config?.dataSource?.versionId || '';
+}
+
 function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelection = []) {
   const result = widget.result;
   const configuredSource = widget.config?.dataSource;
@@ -4727,7 +4733,7 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelec
   const chipTitle = widget.binding
     ? `Data Room binding ${widget.binding.compatibility}`
     : configuredSource?.kind === 'data_room_query'
-      ? `Independent Data Room source ${configuredSource.datasetId} / ${configuredSource.versionId}`
+      ? `Independent Data Room source ${configuredSource.datasetId} / ${independentSourceVersion(widget)}`
       : configuredSource?.kind === 'warehouse_sql'
         ? 'Independent warehouse SQL source'
         : result ? `Refreshed ${relativeTime(result.refreshedAt)}` : dataStatus;
@@ -4762,7 +4768,7 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelec
   const provenance = widget.binding
     ? renderAnalyticsDataRoomProvenance(widget)
     : configuredSource?.kind === 'data_room_query'
-      ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Independent Data Room source</span><b>verified local query</b></summary><div><span>Dataset</span><strong>${esc(configuredSource.datasetId)}</strong></div><div><span>Version</span><strong>${esc(configuredSource.versionId)}</strong></div>${result?.source?.sourceConfigSha256 ? `<div><span>Source receipt</span><strong>${esc(result.source.sourceConfigSha256)}</strong></div>` : ''}<pre>${esc(configuredSource.sql)}</pre></details>`
+      ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Independent Data Room source</span><b>verified local query</b></summary><div><span>Dataset</span><strong>${esc(configuredSource.datasetId)}</strong></div><div><span>Version</span><strong>${esc(independentSourceVersion(widget))}</strong></div>${result?.source?.sourceConfigSha256 ? `<div><span>Source receipt</span><strong>${esc(result.source.sourceConfigSha256)}</strong></div>` : ''}<pre>${esc(configuredSource.sql)}</pre></details>`
       : widget.kind === 'text' && !widget.sql ? ''
         : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc([String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase(), laneLabel].filter(Boolean).join(' · '))}</b></summary>${configuredSource?.kind === 'warehouse_sql' ? '<div><span>Source</span><strong>Independent warehouse SQL</strong></div>' : ''}${laneLabel ? `<div><span>Data lane</span><strong>Datanet ETL (SQL warehouse connection was down)</strong></div>` : ''}${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
   const manage = renderAnalyticsManageData(widget);

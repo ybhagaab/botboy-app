@@ -26,10 +26,7 @@ import {
   type AnalyticsTaskGrounding,
 } from '../../core/analytics-chat-context.js';
 import {
-  analyticsWidgetEditActionAllowed,
   analyticsWidgetEditExactIds,
-  analyticsWidgetEditSelectionCount,
-  exactAnalyticsWidgetEditTargetMatches,
   routeAnalyticsWidgetEditAction,
 } from '../../core/analytics-widget-edit-intent.js';
 import {
@@ -306,7 +303,7 @@ function buildAnalyticsTaskGrounding(
       `Required exact response anchors: ${requiredExactAnchors.join(', ') || '(none)'}`,
       `Unresolved exact anchors: ${[...new Set(unresolved)].join(', ') || '(none)'}`,
       `Canonical scoped state: ${JSON.stringify(resolved)}`,
-      'For a supported owner edit, call edit_analytics_dashboard once. Otherwise state that no mutation completed and name the exact unresolved/unsupported target. Never discuss another business domain.',
+      'For a supported owner edit, call edit_analytics_dashboard once; to change a widget’s data source, call configure_analytics_widget_source. Otherwise state that no mutation completed and name the unresolved/unsupported target. Never discuss another business domain.',
     ].join('\n'),
   };
 }
@@ -333,10 +330,8 @@ function trustedAnalyticsEditReceipt(input: {
   toolCall: any;
   result: any;
   ownerRequestId: string;
-  ownerMessage: string;
-  routeScope?: CanonicalAnalyticsRouteScope;
 }): Record<string, any> | undefined {
-  const { toolCall, result, ownerRequestId, ownerMessage, routeScope } = input;
+  const { toolCall, result, ownerRequestId } = input;
   if (toolCall?.function?.name !== 'edit_analytics_dashboard' || result?.toolCallId !== toolCall.id) return undefined;
   let args: Record<string, any>;
   let receipt: Record<string, any>;
@@ -360,12 +355,8 @@ function trustedAnalyticsEditReceipt(input: {
   if (receipt.requestId !== ownerRequestId || receipt.action !== action
     || receipt.dashboard?.id !== dashboardId || !sameOrderedStrings(receipt.sourceWidgetIds, widgetIds)) return undefined;
 
-  const literalScopeMatch = exactAnalyticsWidgetEditTargetMatches(ownerMessage, action, dashboardId, widgetIds);
-  if (!literalScopeMatch) {
-    if (!routeScope || routeScope.dashboardId !== dashboardId || !sameOrderedStrings(routeScope.orderedWidgetIds, widgetIds)
-      || !analyticsWidgetEditActionAllowed(ownerMessage, action, { requireDeictic: true })) return undefined;
-  }
-
+  // Trust comes from the server receipt matching this exact call and request,
+  // not from how the owner phrased the request.
   const status = String(receipt.status ?? '');
   if (!['completed', 'pending', 'blocked', 'failed', 'cancelled'].includes(status)) return undefined;
   if ((status === 'completed' || status === 'pending') && receipt.mutationApplied !== true) return undefined;
@@ -682,27 +673,19 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       : routeAnalyticsWidgetEditAction(message);
     let ownerRequestId: string | undefined;
     let authoritativeAnalyticsScope: CanonicalAnalyticsRouteScope | undefined;
-    let analyticsSelectionClarification: string | undefined;
     if (stream) {
       try {
         ownerRequestId = normalizeOwnerRequestId(body.requestId);
-        // Ambient scope is promoted only for an affirmative deictic edit.
-        // Direct Data Room reads and generic work ignore it, so stale selection
-        // cannot hijack query_data_room or unrelated tools.
+        // Ambient scope is promoted only for a deictic edit ("this widget").
+        // It is context for the model, never an authority gate: whatever the
+        // selection count, the model resolves the target (or asks), and the
+        // edit tool validates it. Direct Data Room reads and generic work
+        // ignore it, so stale selection cannot steer unrelated tools.
         if (conversationMode === 'analytics_dashboard' && routeEditAction) {
           const explicitIds = analyticsWidgetEditExactIds(message);
-          // Any complete exact-ID owner target stays on the legacy authority
-          // path. Ambiguity is rejected later; ambient locators cannot block it.
+          // Owner-typed IDs take precedence over the ambient selection.
           if (!explicitIds.dashboardIds.length || !explicitIds.widgetIds.length) {
             authoritativeAnalyticsScope = canonicalAnalyticsRouteScope(req, body, deps);
-            if (authoritativeAnalyticsScope) {
-              const expectedCount = analyticsWidgetEditSelectionCount(routeEditAction);
-              if (authoritativeAnalyticsScope.orderedWidgetIds.length !== expectedCount) {
-                analyticsSelectionClarification = expectedCount === 2
-                  ? `Select exactly two widgets with “Use in BotBoy,” then ask me to combine these widgets. Nothing was changed on dashboard ${authoritativeAnalyticsScope.dashboardId}.`
-                  : `Select exactly one widget with “Use in BotBoy,” then refer to this selected widget. Nothing was changed on dashboard ${authoritativeAnalyticsScope.dashboardId}.`;
-              }
-            }
           }
         }
       } catch (error: any) {
@@ -736,26 +719,6 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       if (db) db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json) VALUES (?, ?, ?, ?)').run(
         `user-${Date.now()}`, 'user', message, attachmentIds.length ? JSON.stringify(attachmentIds) : null,
       );
-
-      if (analyticsSelectionClarification) {
-        const convManager = deps.conversationManager;
-        let sessionId = convManager?.getActiveSessionId('chat');
-        if (!sessionId && convManager) sessionId = convManager.createSession('chat');
-        if (convManager && sessionId) {
-          const sessionContent = attachmentIds.length
-            ? `${message}\n\n[${attachmentIds.length} image attachment(s) were stored locally for that turn; the edit stopped before pixel inspection because the required visible widget selection was incomplete]`
-            : message;
-          convManager.appendUser(sessionId, sessionContent);
-          convManager.appendAssistant(sessionId, analyticsSelectionClarification);
-        }
-        const assistantId = `asst-${Date.now()}`;
-        if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(
-          assistantId, 'assistant', analyticsSelectionClarification,
-        );
-        res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content: analyticsSelectionClarification, createdAt: new Date().toISOString() } })}\n\n`);
-        res.end();
-        return;
-      }
 
       const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
       const turnState = {
@@ -1490,7 +1453,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 const mutationApplied = analyticsWidgetEditReceipt?.mutationApplied === true;
                 content = analyticsWidgetEditReceipt
                   ? `Dashboard edit ${receiptAction} is ${receiptStatus} for ${scope} (${semantic}). ${mutationApplied ? 'The canonical tool receipt records the mutation.' : 'The canonical tool receipt records no mutation.'} ${receiptStatus === 'pending' ? 'Do not resubmit; inspect the exact run from the receipt.' : 'No unrelated source or business context was used.'}`
-                  : `I could not complete the requested dashboard edit for ${scope} (${semantic}). Nothing was changed, and no unrelated analytics domain was substituted. Please inspect the exact dashboard/widget IDs and supported edit actions.`;
+                  : `I could not complete the requested dashboard edit for ${scope} (${semantic}). Nothing was changed, and no unrelated analytics domain was substituted. Tell me again which widget (its title is enough) and what should change, and I will apply it.`;
               } else {
                 const loadedPresets = analyticsBriefing?.presets.join(', ') || '';
                 content = `I loaded the selected business/schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable knowledge-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check the knowledge sources (#/connections/sql-context, analytics knowledge directory) and the BotBoy log.`;
@@ -1996,8 +1959,6 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               toolCall: sanitizedToolCalls[0],
               result: toolResults[0].result,
               ownerRequestId,
-              ownerMessage: message,
-              routeScope: authoritativeAnalyticsScope,
             });
             const content = receipt ? formatAnalyticsEditCompletion(receipt) : undefined;
             if (receipt && content) {

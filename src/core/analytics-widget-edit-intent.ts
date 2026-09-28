@@ -1,5 +1,12 @@
 import type { AnalyticsWidgetEditAction } from './analytics-types.js';
 
+/**
+ * Routing heuristics only. These patterns decide whether a chat turn gets
+ * dashboard-edit context (the visible widget selection and scoped grounding).
+ * They never authorize or block a write: dashboard tools rely on the live
+ * owner turn plus ownerRequested, and the service validates exact targets.
+ */
+
 const DASHBOARD_ID_RE = /\bdash_[a-zA-Z0-9_-]{1,96}\b/g;
 const WIDGET_ID_RE = /\bwidget_[a-zA-Z0-9_-]{1,96}\b/g;
 const DEICTIC_TARGET_SOURCE = '(?:(?:this|that|these|those)\\s+(?:(?:selected|visible|current|two)\\s+)?(?:widgets?|charts?|views?|visualizations?|graphs?|figures?)|(?:the\\s+)?selected\\s+(?:widgets?|charts?|views?|visualizations?|graphs?|figures?)|both(?:\\s+(?:widgets?|charts?|views?|visualizations?|graphs?|figures?))?)';
@@ -135,43 +142,6 @@ export function routeAnalyticsWidgetEditAction(message: string): AnalyticsWidget
   return ordered.find(action => analyticsWidgetEditActionAllowed(message, action, { requireDeictic: true }));
 }
 
-export function exactAnalyticsWidgetEditTargetMatches(
-  message: string,
-  action: AnalyticsWidgetEditAction | string,
-  dashboardId: string,
-  widgetIds: string[],
-): boolean {
-  const exact = analyticsWidgetEditExactIds(message);
-  const expectedWidgetCount = action === 'combine_compatible_widgets' ? 2 : 1;
-  return exact.dashboardIds.length === 1
-    && exact.dashboardIds[0] === dashboardId
-    && exact.widgetIds.length === expectedWidgetCount
-    && exact.widgetIds.length === widgetIds.length
-    && exact.widgetIds.every((id, index) => id === widgetIds[index])
-    && analyticsWidgetEditActionAllowed(message, action);
-}
-
 export function analyticsWidgetEditSelectionCount(action: AnalyticsWidgetEditAction | string): 1 | 2 {
   return action === 'combine_compatible_widgets' ? 2 : 1;
-}
-
-export function analyticsWidgetEditExplicitNewRequested(
-  message: string,
-  action: AnalyticsWidgetEditAction | string,
-  options: { requireDeictic?: boolean } = {},
-): boolean {
-  if (action !== 'add_from_widget' && action !== 'combine_compatible_widgets') return false;
-  if (!analyticsWidgetEditActionAllowed(message, action, options)) return false;
-  const body = directInstructionBody(message);
-  if (/\beven\s+if\s+(?:(?:it|they)(?:['’]re|\s+are)?\s+)?identical\b/i.test(body)) return true;
-  const resultNoun = '(?:widget|chart|view|visualization)';
-  const renderer = '(?:(?:line|bar|area|point)\\s+)?';
-  if (action === 'add_from_widget') {
-    if (/^duplicate\b/i.test(body)) return true;
-    if (new RegExp(`^(?:create|add|make)\\s+(?:(?:a|an)\\s+)?(?:another|duplicate)\\s+(?:new\\s+)?${renderer}${resultNoun}\\b`, 'i').test(body)) return true;
-    if (new RegExp(`^(?:copy|clone)\\b[^;.!?\\n]{0,100}\\b(?:as|into)\\s+(?:(?:a|an)\\s+)?(?:another|duplicate)\\s+${renderer}${resultNoun}\\b`, 'i').test(body)) return true;
-    return new RegExp(`^(?:create|add|make)\\b[^;.!?\\n]{0,80}\\bseparate\\s+copy\\s+(?:of\\s+)?${resultNoun}?`, 'i').test(body);
-  }
-  return new RegExp(`\\b(?:as|into|to\\s+create)\\s+(?:(?:a|an)\\s+)?(?:another|duplicate)\\s+${renderer}${resultNoun}\\b`, 'i').test(body)
-    || /\b(?:as|into|to\s+create)\s+(?:(?:a|an)\s+)?separate\s+copy\b/i.test(body);
 }

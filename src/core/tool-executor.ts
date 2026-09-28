@@ -12,17 +12,19 @@ import type { NodeManager } from './node-manager.js';
 import type { BrainStore } from './brain-store.js';
 import { setBrainTaskState } from './brain-tasks.js';
 import type { McpManager } from './mcp-types.js';
-import type { AnalyticsDashboardService, DashboardPublisherService } from './analytics-types.js';
+import type { AnalyticsDashboardService, AnalyticsRun, DashboardPublisherService } from './analytics-types.js';
 import { AnalyticsWidgetEditError } from './analytics-dashboard.js';
 import {
-  analyticsWidgetEditActionAllowed,
   analyticsWidgetEditExactIds,
-  analyticsWidgetEditExplicitNewRequested,
   analyticsWidgetEditSelectionCount,
 } from './analytics-widget-edit-intent.js';
 import type { AnalyticsScheduler } from './analytics-scheduler.js';
 import type { AnalyticsAnswerService } from './analytics-data-room-answer.js';
-import { derivePreparationSemanticIdentities, type AnalyticsJobService } from './analytics-job-service.js';
+import {
+  ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS,
+  derivePreparationSemanticIdentities,
+  type AnalyticsJobService,
+} from './analytics-job-service.js';
 import type { AnalyticsDatasetPreparationPlanV1 } from './analytics-job-types.js';
 import type { AnalyticsDataRoomCatalogReader } from './analytics-data-room-service.js';
 import type { AnalyticsDataRoomReadService } from './analytics-data-room-read.js';
@@ -538,6 +540,32 @@ const SQL_DATA_TOOLS = new Set(['run_query', 'get_sample_data']);
  * from parking a chat turn.
  */
 
+/**
+ * `create_data_room_dataset` may read and type a 32 MiB local file during
+ * admission, then waits up to ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS for the
+ * durable job and returns an honest in_progress/waiting receipt when work
+ * continues (a queued Datanet run takes minutes). Its budget must exceed that
+ * wait: under the 10s default a healthy checkpointed ETL job surfaced as an
+ * unknown-effect timeout without its job ID (live canary 2026-09-27).
+ */
+export const DATA_ROOM_CREATE_TIMEOUT_MS = ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS + 60_000;
+
+/** Foreground wait for the one selective run a widget source change queues. */
+export const WIDGET_SOURCE_FOREGROUND_WAIT_MS = 30_000;
+/**
+ * `configure_analytics_widget_source` commits one widget change, then waits up
+ * to WIDGET_SOURCE_FOREGROUND_WAIT_MS for its selective run and returns
+ * `pending` with the exact run when it continues. Same invariant as create:
+ * under the 10s default, a committed change whose warehouse run took longer
+ * would be reported as an unknown-effect timeout.
+ */
+export const WIDGET_SOURCE_TIMEOUT_MS = WIDGET_SOURCE_FOREGROUND_WAIT_MS + 30_000;
+
+/** Longest dashboard create/update waits for its local Data Room widgets to load. */
+export const DASHBOARD_LOCAL_RUN_WAIT_MS = 30_000;
+/** Dashboard create/update budget; like every composite, it exceeds its own wait. */
+export const DASHBOARD_WRITE_TIMEOUT_MS = DASHBOARD_LOCAL_RUN_WAIT_MS + 30_000;
+
 export function sqlToolTimeoutMs(toolName: string): number {
   if (!SQL_DATA_TOOLS.has(toolName)) return 90_000;
   const fallback = 35 * 60_000; // parity with analytics-dashboard.ts defaultQueryTimeoutMs (owner: 35 min, 2026-08-27)
@@ -626,6 +654,124 @@ export function createToolExecutor(
         };
       }),
     } as T;
+  }
+
+  /** Wake the scheduler and observe one run until it is terminal or the wait ends. */
+  async function waitForAnalyticsRun(run: AnalyticsRun, waitMs: number, signal?: AbortSignal): Promise<AnalyticsRun> {
+    const deadline = Date.now() + waitMs;
+    let current = run;
+    let nextWakeAt = 0;
+    while ((current.status === 'queued' || current.status === 'running') && !signal?.aborted) {
+      if (analyticsScheduler && Date.now() >= nextWakeAt) {
+        await analyticsScheduler.runDueNow().catch(() => 0);
+        nextWakeAt = Date.now() + 500;
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      current = analyticsService?.getRun(current.id) ?? current;
+    }
+    return current;
+  }
+
+  /** A create/update that threw validated before its transaction: nothing changed. */
+  function dashboardWriteFailure(error: unknown, noEffect: string): { content: string; isError: true } {
+    const known = error instanceof AnalyticsWidgetEditError ? error : null;
+    const issues = known ? (known as AnalyticsWidgetEditError & { issues?: unknown[] }).issues : undefined;
+    return {
+      content: JSON.stringify({
+        ok: false,
+        ...(known ? { code: known.code } : {}),
+        error: error instanceof Error ? error.message : String(error),
+        mutationApplied: false,
+        nextAction: known?.nextAction
+          ? `${noEffect} ${known.nextAction}`
+          : `${noEffect} Correct the reported widget and call again once.`,
+        ...(Array.isArray(issues) && issues.length ? { issues } : {}),
+      }, null, 1),
+      isError: true,
+    };
+  }
+
+  /**
+   * Completion receipt for dashboard create/update. Data Room widgets load in
+   * this call (one local run, bounded wait); warehouse widgets keep the queued
+   * refresh semantics. Summary first so a size cap never hides it.
+   */
+  async function dashboardWriteResult(
+    dashboardId: string,
+    fullRefreshRequested: boolean,
+    verb: 'created' | 'updated',
+    context?: ToolExecutionContext,
+  ): Promise<string> {
+    let dashboard = analyticsService!.getDashboard(dashboardId)!;
+    const active = dashboard.recentRuns.find(run => run.status === 'queued' || run.status === 'running');
+    const refresh = fullRefreshRequested ? active : undefined;
+    let localRun = !fullRefreshRequested && active?.refreshScope === 'selective' ? active : undefined;
+    if (localRun) {
+      localRun = await waitForAnalyticsRun(localRun, DASHBOARD_LOCAL_RUN_WAIT_MS, context?.abortSignal);
+      dashboard = analyticsService!.getDashboard(dashboardId)!;
+    }
+    const localActive = Boolean(localRun && (localRun.status === 'queued' || localRun.status === 'running'));
+    const widgets = dashboard.widgets.map(widget => {
+      const dataSource = isDataRoomRecord(widget.config?.dataSource) ? widget.config!.dataSource as Record<string, unknown> : undefined;
+      const source = widget.kind === 'text' ? 'text' : dataSource?.kind === 'data_room_query' ? 'data_room' : 'warehouse';
+      const state = source === 'text' ? 'static'
+        : widget.lastError ? 'failed'
+          : widget.result ? 'loaded'
+            : source === 'data_room' ? (localActive ? 'loading' : 'not_loaded')
+              : refresh ? 'refresh_queued' : 'awaiting_refresh';
+      return {
+        widgetId: widget.id,
+        revision: widget.revision,
+        title: widget.title,
+        kind: widget.kind,
+        source,
+        ...(source === 'data_room' ? {
+          datasetId: dataSource!.datasetId,
+          // The version the loaded result came from (runs follow the head).
+          versionId: (widget.result?.source as { versionId?: string } | undefined)?.versionId ?? dataSource!.versionId,
+        } : {}),
+        state,
+        ...(widget.result && source !== 'text' ? { rowCount: widget.result.rowCount } : {}),
+        ...(widget.lastError ? { error: String(widget.lastError).slice(0, 500) } : {}),
+      };
+    });
+    const dataRoomWidgets = widgets.filter(widget => widget.source === 'data_room');
+    const count = (state: string) => dataRoomWidgets.filter(widget => widget.state === state).length;
+    const warehouseCount = widgets.filter(widget => widget.source === 'warehouse').length;
+    const parts = [`Dashboard ${verb}.`];
+    if (dataRoomWidgets.length) {
+      parts.push(`${count('loaded')} of ${dataRoomWidgets.length} Data Room widgets loaded`
+        + (count('failed') ? `; ${count('failed')} failed (see widgets[].error)` : '')
+        + (count('loading') ? `; ${count('loading')} still loading in run ${localRun!.id}` : '')
+        + '.');
+    }
+    if (warehouseCount) {
+      parts.push(refresh
+        ? `Warehouse widgets: refresh ${refresh.id} is ${refresh.status} and runs in the background.`
+        : `${warehouseCount} warehouse widget(s) wait for a refresh.`);
+    }
+    const nextAction = count('failed')
+      ? 'Fix each failed Data Room widget with configure_analytics_widget_source (its widgetId and revision are above), then report.'
+      : count('loading')
+        ? `Do not recreate or resubmit; run ${localRun!.id} continues. Check get_analytics_dashboard if the owner asks.`
+        : 'Report the dashboard link and what it shows; no further dashboard call is needed.';
+    return JSON.stringify({
+      ok: true,
+      message: parts.join(' '),
+      widgets,
+      ...(localRun ? { localRun } : {}),
+      ...(refresh ? { refresh } : {}),
+      localUrl: `#/dashboards/${dashboard.id}`,
+      responseGuidance: { nextAction },
+      dashboard: {
+        id: dashboard.id,
+        title: dashboard.title,
+        description: dashboard.description,
+        status: dashboard.status,
+        widgetCount: dashboard.widgets.length,
+      },
+    }, null, 1);
   }
 
   // Full body returned — handlers compact/parse first and cap afterwards.
@@ -2716,22 +2862,16 @@ export function createToolExecutor(
           target: { dashboardId, widgetId },
         }));
       }
+      // Authority is the live owner turn plus the ownerRequested attestation,
+      // the same bar as dashboard create/update. The owner never has to type
+      // IDs or particular wording: the model resolves the widget, and the
+      // service validates the exact target, revision, and binding state.
       const ownerMessage = context?.currentUserMessage?.trim() || '';
       const hasInteractiveTurn = context?.callerKind === 'interactive' && Boolean(ownerMessage);
       const hasAttestation = args.ownerRequested === true;
-      const exactIds = analyticsWidgetEditExactIds(ownerMessage);
-      const literalIdsMatch = exactIds.dashboardIds.length === 1 && exactIds.dashboardIds[0] === dashboardId
-        && exactIds.widgetIds.length === 1 && exactIds.widgetIds[0] === widgetId;
-      const routeScope = context?.authoritativeAnalyticsScope;
-      const routeScopeMatch = exactIds.dashboardIds.length === 0 && exactIds.widgetIds.length === 0
-        && routeScope?.dashboardId === dashboardId
-        && routeScope.orderedWidgetIds.length === 1 && routeScope.orderedWidgetIds[0] === widgetId;
-      const exactScope = Boolean(literalIdsMatch || routeScopeMatch);
-      const affirmativeAction = /\b(?:configure|set|change|switch|replace|use|connect)\b[\s\S]{0,80}\b(?:source|data|dataset|sql|query)\b|\b(?:source|data|dataset|sql|query)\b[\s\S]{0,80}\b(?:configure|set|change|switch|replace|use|connect)\b/i.test(ownerMessage)
-        && !/\b(?:do not|don't|dont|without changing|preview|hypothetical|what if)\b/i.test(ownerMessage);
       const authorization = dataRoomAuthorization({
         callerKind: context?.callerKind,
-        requiredAuthority: 'Current interactive owner request, temporary ownerRequested attestation, one exact server-validated widget target, and affirmative source-change intent.',
+        requiredAuthority: 'Current interactive owner request plus the ownerRequested attestation; the service validates the exact widget target and revision.',
         checks: [
           {
             gate: 'interactive_owner_turn',
@@ -2743,41 +2883,18 @@ export function createToolExecutor(
             passed: hasAttestation,
             reason: hasAttestation ? 'The call carries ownerRequested=true.' : 'ownerRequested is missing or false.',
           },
-          {
-            gate: 'exact_target_scope',
-            passed: exactScope,
-            reason: exactScope ? 'The target is one exact owner-named or server-validated selected widget.' : 'The target is neither one exact owner-named widget nor the one validated selected widget.',
-          },
-          {
-            gate: 'affirmative_owner_action',
-            passed: affirmativeAction,
-            reason: affirmativeAction ? 'The current owner turn affirmatively requests a source change.' : 'The current owner turn does not affirmatively authorize changing this widget source.',
-          },
         ],
       });
-      if (!hasInteractiveTurn || !hasAttestation || !exactScope || !affirmativeAction) {
-        const onlyAttestationMissing = hasInteractiveTurn && !hasAttestation && exactScope && affirmativeAction;
-        const code = !hasInteractiveTurn
-          ? 'owner_context_required'
-          : !hasAttestation
-            ? 'owner_request_required'
-            : !exactScope
-              ? 'owner_scope_mismatch'
-              : 'owner_action_mismatch';
-        const nextAction = onlyAttestationMissing
-          ? 'Because the server confirms this exact owner turn and target, set ownerRequested=true and retry the unchanged source once.'
-          : !hasInteractiveTurn
-            ? 'Use this capability only from a new live owner chat request.'
-            : !exactScope
-              ? 'Select exactly one widget or name its exact dashboard/widget IDs, then ask for that source change.'
-              : 'Ask the owner to affirmatively request changing the source of this exact widget.';
+      if (!hasInteractiveTurn || !hasAttestation) {
         return dataRoomAuthorizationFailure({
           tool,
-          code,
+          code: !hasInteractiveTurn ? 'owner_context_required' : 'owner_request_required',
           message: 'Widget source configuration did not satisfy every authorization gate.',
-          nextAction,
+          nextAction: !hasInteractiveTurn
+            ? 'Use this capability only from a live owner chat request.'
+            : 'If the owner asked for this change in this turn, set ownerRequested=true and retry the unchanged call once; otherwise leave the widget unchanged.',
           authorization,
-          retryClass: onlyAttestationMissing ? 'correct_arguments' : 'new_owner_request',
+          retryClass: !hasInteractiveTurn ? 'new_owner_request' : 'correct_arguments',
           target: { dashboardId, widgetId },
         });
       }
@@ -2787,7 +2904,7 @@ export function createToolExecutor(
           source: args.source,
         });
         let run = mutation.run;
-        const deadline = Date.now() + 30_000;
+        const deadline = Date.now() + WIDGET_SOURCE_FOREGROUND_WAIT_MS;
         while ((run.status === 'queued' || run.status === 'running') && Date.now() < deadline && !context.abortSignal?.aborted) {
           await analyticsScheduler?.runDueNow().catch(() => 0);
           await new Promise(resolve => setTimeout(resolve, 100));
@@ -2915,50 +3032,34 @@ export function createToolExecutor(
           'Use this capability only from the live owner chat turn.',
         );
       }
+      // Authority is the live owner turn plus ownerRequested (checked above).
+      // The model resolves which widget(s) the owner meant; the service
+      // validates the exact targets. Provenance records how they were found.
       const expectedSelectionCount = analyticsWidgetEditSelectionCount(action);
+      if (widgetIds.length !== expectedSelectionCount) {
+        return blocked(
+          'invalid_widget_count',
+          action === 'combine_compatible_widgets'
+            ? 'combine_compatible_widgets needs exactly two widgetIds.'
+            : `${action || 'This edit'} needs exactly one widgetId.`,
+          action === 'combine_compatible_widgets'
+            ? 'Pass the two widgets to combine, resolved from get_analytics_dashboard or the owner’s selection.'
+            : 'Pass the one widget to change, resolved from get_analytics_dashboard or the owner’s selection.',
+        );
+      }
       const exactIds = analyticsWidgetEditExactIds(ownerMessage);
       const literalIdsMatch = exactIds.dashboardIds.length === 1
         && exactIds.dashboardIds[0] === dashboardId
-        && exactIds.widgetIds.length === expectedSelectionCount
         && exactIds.widgetIds.length === widgetIds.length
         && exactIds.widgetIds.every((id, index) => id === widgetIds[index]);
       const routeScope = context?.authoritativeAnalyticsScope;
-      const routeScopeMatch = exactIds.dashboardIds.length === 0
-        && exactIds.widgetIds.length === 0
-        && Boolean(routeScope)
+      const routeScopeMatch = Boolean(routeScope)
         && routeScope!.dashboardId === dashboardId
         && routeScope!.orderedWidgetIds.length === widgetIds.length
         && routeScope!.orderedWidgetIds.every((id, index) => id === widgetIds[index]);
-      if (!literalIdsMatch && !routeScopeMatch) {
-        return blocked(
-          'owner_scope_mismatch',
-          'The requested targets match neither one unambiguous exact-ID owner target nor the server-validated visible widget selection.',
-          'Select the exact widget(s), or name exactly one dashboard and the action-appropriate number of widget IDs; never infer or substitute targets.',
-        );
-      }
-      if (widgetIds.length !== expectedSelectionCount) {
-        return blocked(
-          'owner_selection_required',
-          action === 'combine_compatible_widgets'
-            ? 'Select or name exactly two widgets before asking BotBoy to combine them.'
-            : 'Select or name exactly one widget before asking BotBoy to change it.',
-          action === 'combine_compatible_widgets'
-            ? 'Use “Use in BotBoy” on two widgets, then ask to combine these widgets.'
-            : 'Use “Use in BotBoy” on one widget, then refer to this selected widget.',
-        );
-      }
-      const actionAllowed = analyticsWidgetEditActionAllowed(ownerMessage, action, {
-        requireDeictic: routeScopeMatch,
-      });
-      if (!actionAllowed) {
-        return blocked(
-          'owner_action_mismatch',
-          'The current owner message does not affirmatively authorize this exact dashboard edit action.',
-          literalIdsMatch
-            ? 'Ask for an explicit affirmative presentation/date/add/combine instruction for the exact IDs; hypotheticals, previews, and negated requests never authorize writes.'
-            : 'Ask for an explicit affirmative change/date/add/combine instruction that refers to the selected widget(s); never treat route presence as consent.',
-        );
-      }
+      const scopeSource = literalIdsMatch
+        ? 'owner_exact_ids' as const
+        : routeScopeMatch ? 'dashboard_widget_selection' as const : 'model_resolved' as const;
       try {
         const durableAction = action === 'add_from_widget' || action === 'combine_compatible_widgets';
         if (durableAction && !requestId) {
@@ -2980,13 +3081,12 @@ export function createToolExecutor(
               ownerRequestId: requestId!,
               ownerMessage,
               ownerScope: {
-                source: literalIdsMatch ? 'owner_exact_ids' : 'dashboard_widget_selection',
+                source: scopeSource,
                 dashboardId,
                 orderedWidgetIds: [...widgetIds],
               },
-              explicitNew: analyticsWidgetEditExplicitNewRequested(ownerMessage, action, {
-                requireDeictic: routeScopeMatch,
-              }),
+              // Default replays an identical earlier add/combine instead of duplicating it.
+              explicitNew: args.createNew === true,
             })
           : analyticsService.editDataRoomWidget(editInput);
         let run = mutation.run;
@@ -3095,48 +3195,46 @@ export function createToolExecutor(
       return dashboard ? JSON.stringify(dashboardForModel(dashboard, context), null, 1) : `Error: dashboard ${dashboardId} not found`;
     },
 
-    create_analytics_dashboard: (args, context) => {
+    create_analytics_dashboard: async (args, context) => {
       if (!analyticsService) return 'Error: analytics dashboard service unavailable';
       if (args.ownerRequested !== true) {
         return 'Error: ownerRequested must be true, and may only be set when the user explicitly asked to create this dashboard';
       }
-      const dashboard = analyticsService.createDashboard({
-        title: args.title,
-        description: args.description,
-        theme: args.theme,
-        projectIds: args.projectIds,
-        widgets: args.widgets,
-      }, args.refresh === true ? 'agent' : undefined);
-      const refresh = args.refresh === true
-        ? dashboard.recentRuns.find(run => run.status === 'queued' || run.status === 'running')
-        : undefined;
-      return JSON.stringify({
-        ok: true,
-        dashboard: dashboardForModel(analyticsService.getDashboard(dashboard.id), context),
-        refresh,
-        message: refresh
-          ? `Dashboard created. Refresh ${refresh.id} is ${refresh.status} and will run in the background.`
-          : 'Dashboard created without starting a refresh.',
-        localUrl: `#/dashboards/${dashboard.id}`,
-      }, null, 1);
+      let dashboard: ReturnType<AnalyticsDashboardService['createDashboard']>;
+      try {
+        dashboard = analyticsService.createDashboard({
+          title: args.title,
+          description: args.description,
+          theme: args.theme,
+          projectIds: args.projectIds,
+          widgets: args.widgets,
+        }, args.refresh === true ? 'agent' : undefined);
+      } catch (error) {
+        return dashboardWriteFailure(error, 'No dashboard was created.');
+      }
+      return dashboardWriteResult(dashboard.id, args.refresh === true, 'created', context);
     },
 
-    update_analytics_dashboard: (args, context) => {
+    update_analytics_dashboard: async (args, context) => {
       if (!analyticsService) return 'Error: analytics dashboard service unavailable';
       if (args.ownerRequested !== true) {
         return 'Error: ownerRequested must be true, and may only be set when the user explicitly asked to change this dashboard';
       }
       const dashboardId = String(args.dashboardId ?? '').trim();
       if (!dashboardId) return 'Error: dashboardId required';
-      const dashboard = analyticsService.updateDashboard(dashboardId, {
-        title: args.title,
-        description: args.description,
-        theme: args.theme,
-        status: args.status,
-        projectIds: args.projectIds,
-        widgets: args.widgets,
-      });
-      return JSON.stringify({ ok: true, dashboard: dashboardForModel(dashboard, context), localUrl: `#/dashboards/${dashboard.id}` }, null, 1);
+      try {
+        analyticsService.updateDashboard(dashboardId, {
+          title: args.title,
+          description: args.description,
+          theme: args.theme,
+          status: args.status,
+          projectIds: args.projectIds,
+          widgets: args.widgets,
+        });
+      } catch (error) {
+        return dashboardWriteFailure(error, 'The dashboard was not changed.');
+      }
+      return dashboardWriteResult(dashboardId, false, 'updated', context);
     },
 
     configure_analytics_schedule: (args) => {
@@ -3796,6 +3894,12 @@ export function createToolExecutor(
               ? 60_000
             : name === 'edit_analytics_dashboard'
               ? 60_000
+            : name === 'create_data_room_dataset'
+              ? DATA_ROOM_CREATE_TIMEOUT_MS
+            : name === 'configure_analytics_widget_source'
+              ? WIDGET_SOURCE_TIMEOUT_MS
+            : name === 'create_analytics_dashboard' || name === 'update_analytics_dashboard'
+              ? DASHBOARD_WRITE_TIMEOUT_MS
             : name.startsWith('mcp_')
             ? 95_000
             : name.startsWith('browser_') ? 65_000 : TIMEOUT;

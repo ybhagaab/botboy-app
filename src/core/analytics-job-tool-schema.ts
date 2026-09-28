@@ -571,7 +571,7 @@ function localFileLocatorProperties(): Record<string, JsonSchema> {
     format: { type: 'string', enum: ['csv', 'tsv', 'xlsx'], description: 'Optional; inferred from .csv, .tsv/.tab, .xlsx/.xlsm. Required only for other extensions.' },
     sheet: { type: 'string', minLength: 1, maxLength: 255, description: 'XLSX only: exact worksheet name; optional when the workbook has exactly one sheet.' },
     headerRow: { type: 'integer', minimum: 1, maximum: 50000, description: 'XLSX only: 1-based row holding the column names (default 1). Rows above it are ignored; every populated cell below it must sit under a named column. Blank rows are skipped.' },
-    nullToken: { type: 'string', maxLength: 32, description: 'Optional exact cell text meaning null. Default "" = empty CSV/TSV cells and blank XLSX cells are null. Datanet TSV downloads use "\\N".' },
+    nullToken: { type: 'string', maxLength: 32, description: 'Optional exact cell text meaning null. Default "" = empty CSV/TSV cells (including Datanet ETL downloads) and blank XLSX cells are null. Set it only when the file writes another marker, such as "\\N" or "NULL".' },
   };
 }
 
@@ -646,11 +646,12 @@ function sourceSchema(): JsonSchema {
       },
       {
         type: 'object', additionalProperties: false,
-        description: 'ETL source mini-shape: {kind:"etl_query", alias:"source_alias", sql:"complete warehouse query", datasetDate:"YYYY-MM-DD" (optional), target:{complete target}}. It submits one NEW checkpointed Datanet run; there is no runId field. To import the result of a run that already succeeded, use local_file with the downloaded .tsv path and nullToken "\\N" instead of re-running SQL.',
+        description: 'ETL source mini-shape: {kind:"etl_query", alias:"source_alias", sql:"complete warehouse query", datasetDate:"YYYY-MM-DD" (optional), target:{complete target}}. It submits one NEW checkpointed Datanet run; there is no runId field. The complete result reads like a local TSV: target.schema names match the query columns (any order), and empty cells or omitted trailing fields are null. To import the result of a run that already succeeded, use local_file with the downloaded .tsv path instead of re-running SQL.',
         properties: {
           kind: { type: 'string', enum: ['etl_query'] }, alias,
           sql: { type: 'string', minLength: 1, maxLength: 100000, description: 'Complete warehouse query submitted through checkpointed Datanet ETL.' },
           datasetDate: { type: 'string', pattern: ISO_DAY_PATTERN },
+          nullToken: { type: 'string', maxLength: 32, description: 'Optional exact result-cell text meaning null. Default "" (Datanet writes null as an empty cell); set it only if the query itself emits a marker such as "\\N".' },
           target: sourceTargetSchema(),
         },
         required: ['kind', 'alias', 'sql', 'target'],

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import { createAnalyticsJobService, derivePreparationSemanticIdentities } from '
 import type { AnalyticsJobPlanner } from './analytics-job-planner.js';
 import type { AnalyticsDatasetPreparationPlanV1 } from './analytics-job-types.js';
 import { createDocumentParser } from './document-parser.js';
+import type { QueryRunner } from './etl-adhoc.js';
 import {
   AnalyticsLocalFileError,
   defaultAnalyticsLocalFilePolicy,
@@ -231,6 +233,7 @@ describe('local-file Data Room lifecycle', () => {
   function environment(
     home: string,
     modelContextRuntime: { providerLocality: 'device_local' | 'amazon_managed_remote' | 'external_remote'; endpointSha256: string } = { providerLocality: 'amazon_managed_remote', endpointSha256: 'a'.repeat(64) },
+    etlRunner?: QueryRunner,
   ) {
     const storage = createStorage(':memory:');
     storage.initialize();
@@ -250,6 +253,7 @@ describe('local-file Data Room lifecycle', () => {
       documentParser: createDocumentParser(),
       localFilePolicy: policyFor(home),
       modelContextRuntime,
+      etlRunner,
       waitMs: 20_000,
     });
     const counts = () => ({
@@ -427,5 +431,79 @@ describe('local-file Data Room lifecycle', () => {
     )).catch(error => error);
     expect(failure.issues[0].message).toContain('holds text (value withheld)');
     expect(JSON.stringify(failure.issues)).not.toContain('N/A');
+  });
+
+  const etlTarget = (start: string, end: string) => ({
+    ...target(start, end),
+    schema: [...schema, { name: 'hours', logicalType: 'number', nullable: true }],
+  });
+  /** A Datanet runner that saves one exact result where the real runner does. */
+  function fakeEtl(home: string, runId: string, result: string) {
+    const calls: string[] = [];
+    const runner: QueryRunner = {
+      id: 'etl-fixture',
+      runQuery: async ({ sql, onSubmitted }) => {
+        calls.push(sql);
+        await onSubmitted?.(runId);
+        const savedTo = write(path.join(home, '.personal-productivity-tracker', 'etl-results', `adhoc_${runId}.tsv`), result);
+        const bytes = fs.readFileSync(savedTo);
+        return { ok: true, runId, savedTo, resultBytes: bytes.length, resultSha256: createHash('sha256').update(bytes).digest('hex') };
+      },
+    };
+    return { runner, calls };
+  }
+
+  it('publishes a real-shaped Datanet result (SQL column order, omitted trailing field, empty null) through etl_query', async () => {
+    const home = tempDir('local-file-home-');
+    const result = 'metrics_name\tdate\ttotal\thours\napp_open\t2026-09-01\t5\t1.5\napp_open\t2026-09-02\t6\napp_open\t2026-09-03\t7\t\n';
+    const etl = fakeEtl(home, '4242', result);
+    const env = environment(home, undefined, etl.runner);
+    const created = await env.service.prepareOrJoinAndWait(owner('etl-ok'), plan(
+      { kind: 'etl_query', alias: 'report', sql: 'SELECT metrics_name, date, total, hours FROM fixture', target: etlTarget('2026-09-01', '2026-09-03') },
+      request('2026-09-01', '2026-09-03'),
+    ));
+    expect(created.status).toBe('completed');
+    expect(etl.calls).toHaveLength(1);
+    const { datasetId, versionId } = created.result!.primary;
+    expect(env.store.getDataset(datasetId)).toMatchObject({ sourceKind: 'datanet_etl', sourceFormat: 'tsv' });
+    expect(env.store.getDatasetVersion(versionId)!.sourceSha256).toBe(createHash('sha256').update(result).digest('hex'));
+    const sidecar = new Database(env.store.getVerifiedMaterializedPath(versionId, 'local_answer'), { readonly: true });
+    try {
+      expect(sidecar.prepare('SELECT date, metrics_name, total, hours FROM data ORDER BY date').all()).toEqual([
+        { date: '2026-09-01', metrics_name: 'app_open', total: 5, hours: 1.5 },
+        { date: '2026-09-02', metrics_name: 'app_open', total: 6, hours: null },
+        { date: '2026-09-03', metrics_name: 'app_open', total: 7, hours: null },
+      ]);
+    } finally {
+      sidecar.close();
+    }
+  });
+
+  it('fails a finished Datanet result that misfits its target without resubmitting, naming the saved-result recovery', async () => {
+    const home = tempDir('local-file-home-');
+    // An undeclared column literally named "network" must not read as a transient network failure.
+    const etl = fakeEtl(home, '4243', 'metrics_name\tdate\ttotal\thours\tnetwork\napp_open\t2026-09-01\t5\t1.5\twifi\n');
+    const env = environment(home, undefined, etl.runner);
+    const failed = await env.service.prepareOrJoinAndWait(owner('etl-misfit'), plan(
+      { kind: 'etl_query', alias: 'report', sql: 'SELECT 1', target: etlTarget('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ));
+    expect(failed.status).not.toBe('completed');
+    expect(failed.error).toMatchObject({ code: 'invalid_input' });
+    expect(failed.error!.message).toContain('Datanet run 4243 succeeded');
+    expect(failed.error!.message).toContain('Not declared: network');
+    expect(failed.error!.nextAction).toContain('never resubmit this SQL');
+    expect(failed.error!.nextAction).toContain('~/.personal-productivity-tracker/etl-results/adhoc_4243.tsv');
+    expect(etl.calls).toHaveLength(1);
+    expect(env.counts()).toMatchObject({ jobs: 1, versions: 0 });
+    // The named recovery is actionable: the saved result reads as a local file.
+    const profile = await env.service.inspectLocalFile({ path: '~/.personal-productivity-tracker/etl-results/adhoc_4243.tsv' });
+    expect(profile.columns.map(column => column.name)).toEqual(['metrics_name', 'date', 'total', 'hours', 'network']);
+
+    await expect(env.service.prepareOrJoinAndWait(owner('etl-bad-token'), plan(
+      { kind: 'etl_query', alias: 'report', sql: 'SELECT 1', nullToken: 'a\tb', target: etlTarget('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ))).rejects.toMatchObject({ code: 'invalid_input', issues: [expect.objectContaining({ code: 'invalid_null_token' })] });
+    expect(env.counts().jobs).toBe(1);
   });
 });

@@ -15,9 +15,9 @@ import {
 import { createAnalyticsDataRoomBackupService } from './analytics-data-room-backup.js';
 import {
   createAnalyticsDataRoomService,
-  parseAnalyticsTsv,
   type AnalyticsDataRoomService,
 } from './analytics-data-room-service.js';
+import { parseAnalyticsDelimited } from './analytics-delimited.js';
 import type {
   AnalyticsDatasetContract,
   AnalyticsDatasetDefinitionInput,
@@ -228,13 +228,88 @@ describe('analytics data-room R1 immutable catalog and ingestion', () => {
     const sidecar = new Database(materializedPath, { readonly: true, fileMustExist: true });
     sidecars.push(sidecar);
     expect((sidecar.prepare('SELECT COUNT(*) AS count FROM data').get() as { count: number }).count).toBe(250);
+    // Datanet writes NULL as an empty cell: the nullable note reads as null.
     expect(sidecar.prepare('SELECT event_count, note FROM data WHERE user_id = ?').get('user_249'))
-      .toEqual({ event_count: 250, note: '' });
+      .toEqual({ event_count: 250, note: null });
     const assertions = environment.storage.getDb().prepare(`
       SELECT assertion_id, severity, success FROM analytics_dataset_assertion_evaluations
       WHERE version_id = ?
     `).all(receipt.version.id);
     expect(assertions).toEqual([{ assertion_id: 'row_count_positive', severity: 'error', success: 1 }]);
+  });
+
+  it('REGRESSION (349 real downloads, 2026-09-26): reads Datanet ragged rows and empty-cell nulls by column name', () => {
+    const datasetId = 'ds_r1_datanet_shape';
+    environment.service.registerDataset(definition(datasetId));
+    // Column order follows the SQL, NULL is an empty cell, and a trailing
+    // empty field may be omitted entirely. No real download contains \N.
+    const bytes = Buffer.from([
+      'user_id\tevent_date\tevent_count\tnote',
+      'user_a\t2026-09-01\t1\tok',
+      'user_b\t2026-09-01\t2',
+      'user_c\t2026-09-01\t3\t',
+      '',
+    ].join('\n'), 'utf8');
+    const receipt = environment.service.ingestEtlTsv(etlInput(datasetId, writeResult(sourceDirectory, 'adhoc_1.tsv', bytes), bytes, 0));
+    expect(receipt.version.rowCount).toBe(3);
+    // The raw Datanet bytes stay the immutable source.
+    expect(receipt.version.sourceSha256).toBe(sha256(bytes));
+    const sidecar = new Database(environment.store.getVerifiedMaterializedPath(receipt.version.id, 'dashboard'), { readonly: true, fileMustExist: true });
+    sidecars.push(sidecar);
+    expect(sidecar.prepare('SELECT event_date, user_id, event_count, note FROM data ORDER BY user_id').all()).toEqual([
+      { event_date: '2026-09-01', user_id: 'user_a', event_count: 1, note: 'ok' },
+      { event_date: '2026-09-01', user_id: 'user_b', event_count: 2, note: null },
+      { event_date: '2026-09-01', user_id: 'user_c', event_count: 3, note: null },
+    ]);
+
+    // An explicit marker still serves exporters that write one.
+    const markedId = 'ds_r1_datanet_marker';
+    environment.service.registerDataset(definition(markedId));
+    const marked = Buffer.from('event_date\tuser_id\tevent_count\tnote\n2026-09-01\tuser_a\t1\t\\N\n', 'utf8');
+    const markedReceipt = environment.service.ingestEtlTsv({
+      ...etlInput(markedId, writeResult(sourceDirectory, 'marked.tsv', marked), marked, 0),
+      nullToken: '\\N',
+    });
+    const markedSidecar = new Database(environment.store.getVerifiedMaterializedPath(markedReceipt.version.id, 'dashboard'), { readonly: true, fileMustExist: true });
+    sidecars.push(markedSidecar);
+    expect(markedSidecar.prepare('SELECT note FROM data').get()).toEqual({ note: null });
+
+    // Truncation, typing, and nullability failures name the exact cell and publish nothing.
+    const failedId = 'ds_r1_datanet_rejects';
+    environment.service.registerDataset(definition(failedId));
+    const attempt = (name: string, text: string) => {
+      const failing = Buffer.from(text, 'utf8');
+      return () => environment.service.ingestEtlTsv(etlInput(failedId, writeResult(sourceDirectory, name, failing), failing, 0));
+    };
+    expect(attempt('cut.tsv', 'event_date\tuser_id\tevent_count\tnote\n2026-09-01\tuser_a\t1\tok\n2026-09-01\tuser_b'))
+      .toThrow(/TSV row 2 has 2 cells; expected 4/);
+    expect(attempt('typed.tsv', 'event_date\tuser_id\tevent_count\tnote\n2026-09-01\tuser_a\tmany\tok\n'))
+      .toThrow(/"event_count" is declared integer but row 2 column 3 holds text "many"/);
+    expect(attempt('empty-key.tsv', 'event_date\tuser_id\tevent_count\tnote\n2026-09-01\t\t1\tok\n'))
+      .toThrow(/"user_id" is declared non-nullable but row 2 column 2 is empty/);
+    expect(attempt('extra.tsv', 'event_date\tuser_id\tevent_count\tnote\tregion\n2026-09-01\tuser_a\t1\tok\tIN\n'))
+      .toThrow(/Not declared: region/);
+    expect(environment.service.listDatasetVersions(failedId)).toHaveLength(0);
+  });
+
+  it('withholds ETL cell values from failures when the dataset forbids model context', () => {
+    const datasetId = 'ds_r1_datanet_withheld';
+    environment.service.registerDataset(definition(datasetId, 'datanet_etl', 'tsv', {
+      handling: { classification: 'restricted', allowedUses: ['dashboard'], allowModelContext: false, allowPublication: false },
+    }));
+    const bytes = Buffer.from('event_date\tuser_id\tevent_count\tnote\n2026-09-01\tuser_a\tsecret-count\tok\n', 'utf8');
+    const failure = (() => {
+      try {
+        environment.service.ingestEtlTsv(etlInput(datasetId, writeResult(sourceDirectory, 'withheld.tsv', bytes), bytes, 0));
+      } catch (error) {
+        return error as AnalyticsDataRoomError;
+      }
+      throw new Error('expected the typed failure');
+    })();
+    expect(failure).toBeInstanceOf(AnalyticsDataRoomError);
+    expect(failure.code).toBe('incomplete_source');
+    expect(failure.message).toContain('holds text (value withheld)');
+    expect(failure.message).not.toContain('secret-count');
   });
 
   it('deduplicates an exact acquisition and attaches a verified orphan after a stale-head conflict', () => {
@@ -735,30 +810,30 @@ describe('analytics data-room R1 immutable catalog and ingestion', () => {
   });
 });
 
-describe('analytics data-room R1 TSV parser', () => {
-  it('preserves quoted tabs/newlines, CRLF rows, and trailing empty cells', () => {
-    const parsed = parseAnalyticsTsv(Buffer.from(
-      'a\tb\tc\r\n"x\ty"\t"line 1\r\nline 2"\t\r\n',
-      'utf8',
-    ));
-    expect(parsed).toEqual({
+describe('analytics data-room delimited grammar', () => {
+  const tsvRead = (bytes: Uint8Array) => parseAnalyticsDelimited(bytes, '\t', 'TSV');
+
+  it('preserves quoted tabs/newlines, CRLF rows, trailing empty cells, and omitted trailing fields', () => {
+    expect(tsvRead(Buffer.from('a\tb\tc\r\n"x\ty"\t"line 1\r\nline 2"\t\r\n', 'utf8'))).toEqual({
       columns: ['a', 'b', 'c'],
       rawRows: [['x\ty', 'line 1\nline 2', '']],
     });
+    expect(tsvRead(Buffer.from('a\tb\n1\n2\t3\n', 'utf8'))).toEqual({ columns: ['a', 'b'], rawRows: [['1'], ['2', '3']] });
   });
 
-  it('fails closed on invalid UTF-8, NUL, duplicate headers, ragged rows, and malformed quoting', () => {
+  it('fails closed on invalid UTF-8, NUL, duplicate headers, extra fields, truncation, and malformed quoting', () => {
     const cases: Array<[string, Uint8Array]> = [
       ['invalid UTF-8', Buffer.from([0xff])],
       ['NUL', Buffer.from('a\tb\n1\u0000\t2\n')],
       ['duplicate header', Buffer.from('a\ta\n1\t2\n')],
-      ['ragged row', Buffer.from('a\tb\n1\n')],
+      ['extra field', Buffer.from('a\tb\n1\t2\t3\n')],
+      ['short unterminated final record', Buffer.from('a\tb\n1\t2\n3')],
       ['single-column blank record', Buffer.from('a\n\n')],
       ['unclosed quote', Buffer.from('a\tb\n"1\t2\n')],
       ['lone carriage return', Buffer.from('a\tb\r1\t2')],
     ];
     for (const [name, bytes] of cases) {
-      expect(() => parseAnalyticsTsv(bytes), name).toThrow();
+      expect(() => tsvRead(bytes), name).toThrow();
     }
   });
 });

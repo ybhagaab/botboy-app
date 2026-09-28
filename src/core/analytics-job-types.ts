@@ -144,6 +144,8 @@ export type AnalyticsDatasetPreparationSourceV1 =
       alias: string;
       sql: string;
       datasetDate?: string;
+      /** Exact result-cell text treated as null; default '' (Datanet writes null as an empty cell). */
+      nullToken?: string;
       target: AnalyticsDatasetPreparationTargetV1;
     }
   | {

@@ -1,12 +1,19 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { analyticsSha256, stableAnalyticsJson } from './analytics-data-room-policy.js';
 import {
   AnalyticsDataRoomError,
-  isAnalyticsIsoTimestamp,
   type AnalyticsDataRoomStore,
   type AnalyticsParsedSourceIngest,
 } from './analytics-data-room-store.js';
+import {
+  ANALYTICS_LOCAL_FILE_PARSER_VERSION,
+  AnalyticsLocalFileError,
+  readAnalyticsDelimitedTable,
+  typeAnalyticsLocalTable,
+  validateAnalyticsNullToken,
+} from './analytics-local-file-source.js';
 import type {
   AnalyticsDataRoomCatalogDatasetEnvelope,
   AnalyticsDataRoomCatalogDatasetList,
@@ -23,7 +30,6 @@ import type {
   AnalyticsDatasetSummary,
   AnalyticsDatasetVersionDetail,
   AnalyticsDatasetVersionSummary,
-  AnalyticsFieldContract,
   AnalyticsImportRowsIngestRequest,
   AnalyticsQualityAssertionEvaluation,
   AnalyticsSqlRowsIngestRequest,
@@ -33,13 +39,13 @@ import type {
 import type { AnalyticsDataRoomBackupService } from './analytics-data-room-backup.js';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
-export const ANALYTICS_LOCAL_FILE_PARSER_VERSION = 'botboy-local-file-table-v1';
 const MAX_LOCAL_FILE_CANONICAL_BYTES = 32 * 1024 * 1024;
 
 export interface AnalyticsEtlTsvIngestRequest extends AnalyticsVersionIngestContext {
   savedTo: string;
   resultBytes: number;
   resultSha256: string;
+  /** Exact cell text meaning null; default '' (Datanet writes null as an empty cell). */
   nullToken?: string;
 }
 
@@ -109,201 +115,6 @@ function incomplete(message: string): never {
   throw new AnalyticsDataRoomError('incomplete_source', message);
 }
 
-function parseDelimitedRows(text: string, delimiter: '\t' | ',', label: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = '';
-  let quoted = false;
-  let closedQuote = false;
-
-  const pushCell = (): void => {
-    row.push(cell);
-    cell = '';
-    closedQuote = false;
-  };
-  const pushRow = (): void => {
-    pushCell();
-    rows.push(row);
-    row = [];
-  };
-
-  for (let index = 0; index < text.length; index++) {
-    const character = text[index];
-    if (quoted) {
-      if (character === '"') {
-        if (text[index + 1] === '"') {
-          cell += '"';
-          index++;
-        } else {
-          quoted = false;
-          closedQuote = true;
-        }
-      } else if (character === '\r' && text[index + 1] === '\n') {
-        cell += '\n';
-        index++;
-      } else {
-        cell += character;
-      }
-      continue;
-    }
-
-    if (closedQuote) {
-      if (character === delimiter) {
-        pushCell();
-        continue;
-      }
-      if (character === '\n') {
-        pushRow();
-        continue;
-      }
-      if (character === '\r' && text[index + 1] === '\n') {
-        pushRow();
-        index++;
-        continue;
-      }
-      incomplete(`Unexpected character after a quoted ${label} field at offset ${index}.`);
-    }
-
-    if (character === '"') {
-      if (cell.length !== 0) incomplete(`Unexpected quote in an unquoted ${label} field at offset ${index}.`);
-      quoted = true;
-      continue;
-    }
-    if (character === delimiter) {
-      pushCell();
-      continue;
-    }
-    if (character === '\n') {
-      if (row.length === 0 && cell.length === 0) incomplete(`Blank ${label} record at offset ${index}.`);
-      pushRow();
-      continue;
-    }
-    if (character === '\r') {
-      if (text[index + 1] !== '\n') incomplete(`Lone carriage return in ${label} input at offset ${index}.`);
-      if (row.length === 0 && cell.length === 0) incomplete(`Blank ${label} record at offset ${index}.`);
-      pushRow();
-      index++;
-      continue;
-    }
-    cell += character;
-  }
-
-  if (quoted) incomplete(`${label} input ends inside a quoted field.`);
-  if (closedQuote || cell.length > 0 || row.length > 0) pushRow();
-  return rows;
-}
-
-/**
- * Strict complete UTF-8 delimited-table parser shared by ETL TSV and local-file
- * import. `raggedRight` accepts exporters that omit trailing empty fields
- * (such rows come back shorter than the header; absent cells carry no value),
- * except for an unterminated final record, which may be a truncated file.
- */
-export function parseAnalyticsDelimited(
-  bytes: Uint8Array,
-  delimiter: '\t' | ',',
-  label: string,
-  options: { raggedRight?: boolean } = {},
-): { columns: string[]; rawRows: string[][] } {
-  let text: string;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    return incomplete(`${label} is not valid UTF-8.`);
-  }
-  if (text.includes('\0')) incomplete(`${label} contains a NUL byte.`);
-  if (text.startsWith('\uFEFF')) text = text.slice(1);
-  const rows = parseDelimitedRows(text, delimiter, label);
-  if (rows.length === 0) incomplete(`${label} is empty.`);
-  const columns = rows[0];
-  if (columns.length === 0 || columns.length > 200 || columns.some(column => !column || column.trim() !== column)) {
-    incomplete(`${label} headers must contain 1 to 200 non-empty names without surrounding whitespace.`);
-  }
-  if (new Set(columns).size !== columns.length) incomplete(`${label} contains duplicate headers.`);
-  const rawRows = rows.slice(1);
-  if (rawRows.length > 50_000 || rawRows.length * columns.length > 500_000) {
-    incomplete(`${label} exceeds the 50000-row or 500000-cell complete-source limit.`);
-  }
-  const terminated = text.endsWith('\n');
-  for (const [index, row] of rawRows.entries()) {
-    const shortAllowed = options.raggedRight === true && row.length < columns.length
-      && (terminated || index < rawRows.length - 1);
-    if (row.length !== columns.length && !shortAllowed) {
-      incomplete(`${label} row ${index + 1} has ${row.length} cells; expected ${columns.length}.`);
-    }
-    if (row.some(cell => cell.length > 1_000_000)) incomplete(`${label} row ${index + 1} contains a cell above 1000000 characters.`);
-  }
-  return { columns, rawRows };
-}
-
-export function parseAnalyticsTsv(bytes: Uint8Array): { columns: string[]; rawRows: string[][] } {
-  return parseAnalyticsDelimited(bytes, '\t', 'ETL TSV');
-}
-
-
-/** One strict text-cell grammar for every delimited or text-typed source cell. */
-export function parseDelimitedCell(
-  raw: string,
-  field: AnalyticsFieldContract,
-  rowIndex: number,
-  nullToken: string,
-  label: string,
-): AnalyticsDataCell {
-  if (raw === nullToken) {
-    if (!field.nullable) incomplete(`${label} row ${rowIndex} field ${field.name} may not be null.`);
-    return null;
-  }
-  if (field.logicalType === 'string') return raw;
-  if (field.logicalType === 'integer') {
-    if (!/^-?(?:0|[1-9]\d*)$/.test(raw)) incomplete(`${label} row ${rowIndex} field ${field.name} is not an integer.`);
-    const value = Number(raw);
-    if (!Number.isSafeInteger(value)) incomplete(`${label} row ${rowIndex} field ${field.name} exceeds safe integer precision.`);
-    return value;
-  }
-  if (field.logicalType === 'number') {
-    if (!raw || !/^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) {
-      incomplete(`${label} row ${rowIndex} field ${field.name} is not a finite number.`);
-    }
-    const value = Number(raw);
-    if (!Number.isFinite(value)) incomplete(`${label} row ${rowIndex} field ${field.name} is not a finite number.`);
-    return value;
-  }
-  if (field.logicalType === 'boolean') {
-    if (raw === 'true' || raw === '1') return true;
-    if (raw === 'false' || raw === '0') return false;
-    return incomplete(`${label} row ${rowIndex} field ${field.name} is not a boolean.`);
-  }
-  if (field.logicalType === 'date') {
-    const parsed = new Date(`${raw}T00:00:00.000Z`);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)
-      || !Number.isFinite(parsed.getTime())
-      || parsed.toISOString().slice(0, 10) !== raw) {
-      incomplete(`${label} row ${rowIndex} field ${field.name} is not an ISO calendar date.`);
-    }
-    return raw;
-  }
-  if (!isAnalyticsIsoTimestamp(raw)) {
-    incomplete(`${label} row ${rowIndex} field ${field.name} is not an ISO timestamp.`);
-  }
-  return raw;
-}
-
-function typedDelimitedRows(
-  rawRows: string[][],
-  schema: AnalyticsFieldContract[],
-  nullToken: string,
-  delimiter: '\t' | ',',
-  label: string,
-): AnalyticsDataCell[][] {
-  if (!nullToken || nullToken.includes(delimiter) || nullToken.includes('"')
-    || nullToken.includes('\n') || nullToken.includes('\r') || nullToken.includes('\0')) {
-    throw new AnalyticsDataRoomError('invalid_input', `${label} null token is invalid.`);
-  }
-  return rawRows.map((row, rowIndex) => row.map((cell, columnIndex) => (
-    parseDelimitedCell(cell, schema[columnIndex], rowIndex + 1, nullToken, label)
-  )));
-}
-
 export function createAnalyticsDataRoomService(input: {
   store: AnalyticsDataRoomStore;
   backups: AnalyticsDataRoomBackupService;
@@ -333,18 +144,34 @@ export function createAnalyticsDataRoomService(input: {
     }
     const dataset = store.getDataset(request.datasetId);
     if (!dataset) throw new AnalyticsDataRoomError('not_found', `Dataset ${request.datasetId} was not found.`);
-    const parsed = parseAnalyticsTsv(bytes);
-    const expectedColumns = dataset.contract.schema.map(field => field.name);
-    if (stableAnalyticsJson(parsed.columns) !== stableAnalyticsJson(expectedColumns)) {
-      incomplete('ETL TSV headers do not exactly match the dataset contract.');
+    // Same reader and cell typing as a local-file TSV: columns match the
+    // schema by name, omitted trailing fields and empty cells are null unless
+    // nullToken names another marker. The raw result stays the source bytes.
+    const nullToken = request.nullToken ?? '';
+    let typed: { columns: string[]; rows: AnalyticsDataCell[][] };
+    try {
+      validateAnalyticsNullToken(nullToken, 'tsv', 'etl_query');
+      const table = readAnalyticsDelimitedTable({
+        format: 'tsv',
+        fileName: path.basename(request.savedTo),
+        sha256: directSha256,
+        size: bytes.length,
+        bytes,
+      }, 'etl_query');
+      typed = typeAnalyticsLocalTable(table, dataset.contract.schema, nullToken, {
+        source: 'etl_query',
+        schema: 'target.schema',
+      }, { withholdValues: !dataset.contract.handling.allowModelContext });
+    } catch (error) {
+      if (!(error instanceof AnalyticsLocalFileError)) throw error;
+      return incomplete(error.issues.map(issue => issue.message).join(' ') || error.message);
     }
-    const rows = typedDelimitedRows(parsed.rawRows, dataset.contract.schema, request.nullToken ?? '\\N', '\t', 'ETL TSV');
     return store.publishParsedSource({
       ...request,
       sourceFormat: 'tsv',
       sourceBytes: bytes,
-      columns: parsed.columns,
-      rows,
+      columns: typed.columns,
+      rows: typed.rows,
     });
   }
 

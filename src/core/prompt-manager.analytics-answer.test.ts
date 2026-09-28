@@ -35,7 +35,13 @@ describe('direct Data Room chat prompt and tool contract', () => {
     expect(localFile.properties.into.properties.mode.enum).toEqual(['merge_partitions', 'replace']);
     const etl = planSources.find(source => source.properties.kind.enum[0] === 'etl_query');
     expect(etl.properties.runId).toBeUndefined();
+    expect(Object.keys(etl.properties)).toEqual(['kind', 'alias', 'sql', 'datasetDate', 'nullToken', 'target']);
     expect(etl.description).toContain('use local_file with the downloaded .tsv path');
+    // Datanet writes null as an empty cell; no real download contains \N.
+    expect(JSON.stringify(createSchema)).not.toContain('Datanet TSV downloads use');
+    const createDescription = byName('create_data_room_dataset')[0].function.description;
+    expect(createDescription).toContain('nullToken?, target:{complete target}');
+    expect(createDescription).not.toContain('Datanet TSV uses');
     expect(JSON.stringify(createSchema)).not.toContain('botboy_csv');
 
     const sourceSchema = byName('configure_analytics_widget_source')[0].function.parameters as any;
@@ -77,7 +83,11 @@ describe('direct Data Room chat prompt and tool contract', () => {
     expect(prompt).not.toContain('call answer_analytics ONCE');
     expect(prompt).not.toContain('No request-matching local data-room semantic card');
     expect(prompt).toContain('"datasetId":"ds_ott"');
-    expect(prompt).toContain('Dashboard design/creation remains the separate');
+    // A Data Room dashboard is one create call with per-widget Data Room sources.
+    expect(prompt).toContain('To build or rebuild a dashboard over ready Data Room data');
+    expect(prompt).toContain('do not write placeholder warehouse SQL');
+    expect(prompt).toContain('Never ask the owner to type IDs, exact phrases');
+    expect(prompt).toContain('Warehouse-backed dashboard design remains the schema-inspection and queued-refresh workflow');
   });
 });
 

@@ -63,6 +63,12 @@ export interface AnalyticsDataRoomReadService {
   query(input: DataRoomQueryInput, options?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
   /** Code-only dashboard consumer; never exposed as a model tool. */
   queryForDashboard(input: DataRoomQueryInput, options?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
+  /**
+   * Code-only: the exact ready head one dashboard widget may pin. Gated on
+   * dashboard use, not model context: dashboard rows reach a model only
+   * through dashboard reads, which apply the model-context policy themselves.
+   */
+  resolveDashboardSource(datasetId: string): { datasetId: string; versionId: string };
 }
 
 interface ResolvedSource {
@@ -710,5 +716,27 @@ export function createAnalyticsDataRoomReadService(input: {
     queryForUse(value, 'dashboard', false, options)
   );
 
-  return { list, query, queryForDashboard };
+  // Same eligibility as queryForDashboard, so a pinned widget source is one
+  // its runs can read. list() is the model catalog and applies model-context
+  // policy; using it here hid provider-pinned datasets (live canary 2026-09-28).
+  function resolveDashboardSource(datasetId: string): { datasetId: string; versionId: string } {
+    const { dataset, version } = queryEligibleDataset(
+      input.store,
+      input.modelContextRuntime,
+      datasetId,
+      undefined,
+      false,
+      'dashboard',
+      false,
+    );
+    if (!version.handling.allowedUses.includes('dashboard')) {
+      fail('policy_denied', `Dataset ${datasetId} is not approved for dashboard use.`, dataRoomIssue({
+        code: 'dashboard_use_denied', path: 'datasetId', message: 'The dataset handling policy does not allow dashboard use.',
+        expected: { kind: 'relation', description: 'Dataset handling allowedUses includes dashboard.' }, received: datasetId, includeReceivedValue: true,
+      }));
+    }
+    return { datasetId: dataset.id, versionId: version.id };
+  }
+
+  return { list, query, queryForDashboard, resolveDashboardSource };
 }

@@ -3,11 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { AnalyticsDataCell, AnalyticsFieldContract, AnalyticsLogicalType } from './analytics-data-room-types.js';
-import {
-  ANALYTICS_LOCAL_FILE_PARSER_VERSION,
-  parseAnalyticsDelimited,
-  parseDelimitedCell,
-} from './analytics-data-room-service.js';
+import { parseAnalyticsDelimited, parseDelimitedCell } from './analytics-delimited.js';
 import {
   parseAnalyticsImportSheet,
   type AnalyticsImportCompleteCell,
@@ -20,16 +16,16 @@ import type { DocumentParser } from './document-parser.js';
  * Generic local-file source for Data Room creation.
  *
  * Any regular file the owner can read becomes one strict, complete table:
- * CSV/TSV through the same UTF-8 delimited grammar as ETL/CSV ingestion, XLSX
- * through the same complete coordinate-preserving parser as Import Inbox. The
- * dataset contract (schema/types/nullability/coverage) remains the admission
- * authority; this module only reads, snapshots, and types exact cells.
+ * CSV/TSV through the one UTF-8 delimited reader that Datanet ETL results also
+ * use, XLSX through the same complete coordinate-preserving parser as Import
+ * Inbox. The dataset contract (schema/types/nullability/coverage) remains the
+ * admission authority; this module only reads, snapshots, and types exact cells.
  *
  * The single boundary mirrors the model shell sandbox: BotBoy's private state
  * root is unreadable except for BotBoy's owner-artifact download directories.
  */
 
-export { ANALYTICS_LOCAL_FILE_PARSER_VERSION };
+export const ANALYTICS_LOCAL_FILE_PARSER_VERSION = 'botboy-local-file-table-v1';
 export const MAX_ANALYTICS_LOCAL_FILE_BYTES = 32 * 1024 * 1024;
 export const ANALYTICS_LOCAL_FILE_FORMATS = ['csv', 'tsv', 'xlsx'] as const;
 export type AnalyticsLocalFileFormat = typeof ANALYTICS_LOCAL_FILE_FORMATS[number];
@@ -268,7 +264,7 @@ function sample(value: unknown): string {
   return text.length > SAMPLE_CHARS ? `${text.slice(0, SAMPLE_CHARS)}…` : text;
 }
 
-function validateNullToken(nullToken: string, format: AnalyticsLocalFileFormat, label: string): void {
+export function validateAnalyticsNullToken(nullToken: string, format: AnalyticsLocalFileFormat, label: string): void {
   const delimiter = format === 'tsv' ? '\t' : ',';
   if (typeof nullToken !== 'string' || nullToken.length > 32 || /["\r\n\0]/.test(nullToken)
     || (format !== 'xlsx' && nullToken.includes(delimiter))) {
@@ -289,6 +285,52 @@ function parseMergedRange(reference: string): { top: number; bottom: number; lef
   return { top, bottom, left, right };
 }
 
+/** Exact bytes of one delimited table: a local-file snapshot or a verified Datanet result. */
+export interface AnalyticsDelimitedTableSource {
+  format: 'csv' | 'tsv';
+  fileName: string;
+  sha256: string;
+  size: number;
+  bytes: Uint8Array;
+}
+
+/**
+ * Read one complete CSV/TSV table. Local-file imports and Datanet ETL results
+ * both read here, so the same bytes type identically in either lane: line 1 is
+ * the header, and records that omit trailing fields carry absent cells.
+ */
+export function readAnalyticsDelimitedTable(source: AnalyticsDelimitedTableSource, label: string): AnalyticsLocalTable {
+  const kind = source.format.toUpperCase();
+  let parsed: { columns: string[]; rawRows: string[][] };
+  try {
+    parsed = parseAnalyticsDelimited(source.bytes, source.format === 'tsv' ? '\t' : ',', kind);
+  } catch (error) {
+    return reject('invalid_input', `${label}.path is not one strict complete ${kind} table.`, dataRoomIssue({
+      code: 'delimited_parse_failed', path: `${label}.path`,
+      message: `${error instanceof Error ? error.message : String(error)} The file must be UTF-8 with one unique non-blank header line; records may omit only trailing fields.`,
+      expected: { kind: 'relation', description: `A complete UTF-8 ${kind} table.` }, received: source.fileName,
+    }));
+  }
+  const width = parsed.columns.length;
+  return {
+    format: source.format,
+    fileName: source.fileName,
+    sha256: source.sha256,
+    size: source.size,
+    header: parsed.columns,
+    rows: parsed.rawRows.map((row, index) => ({
+      rowNumber: index + 2,
+      cells: Array.from({ length: width }, (_unused, column): LocalTableCell => (
+        column < row.length ? { kind: 'text', text: row[column] } : { kind: 'absent' }
+      )),
+    })),
+    blankRowsSkipped: 0,
+    rowsAboveHeader: 0,
+    formulaCells: 0,
+    shortRows: parsed.rawRows.filter(row => row.length < width).length,
+  };
+}
+
 /**
  * Read one complete table from exact file bytes. XLSX bytes are parsed from a
  * private 0600 snapshot so the parser sees exactly the hashed bytes.
@@ -300,8 +342,7 @@ export async function readAnalyticsLocalTable(
   label: string,
 ): Promise<AnalyticsLocalTable> {
   const nullToken = locator.nullToken ?? '';
-  validateNullToken(nullToken, snapshot.format, label);
-  const base = { format: snapshot.format, fileName: snapshot.fileName, sha256: snapshot.sha256, size: snapshot.size };
+  validateAnalyticsNullToken(nullToken, snapshot.format, label);
   if (snapshot.format !== 'xlsx') {
     for (const field of ['sheet', 'headerRow'] as const) {
       if (locator[field] !== undefined) {
@@ -312,32 +353,9 @@ export async function readAnalyticsLocalTable(
         }));
       }
     }
-    let parsed: { columns: string[]; rawRows: string[][] };
-    try {
-      parsed = parseAnalyticsDelimited(snapshot.bytes, snapshot.format === 'tsv' ? '\t' : ',', snapshot.format.toUpperCase(), { raggedRight: true });
-    } catch (error) {
-      return reject('invalid_input', `${label}.path is not one strict complete ${snapshot.format.toUpperCase()} table.`, dataRoomIssue({
-        code: 'delimited_parse_failed', path: `${label}.path`,
-        message: `${error instanceof Error ? error.message : String(error)} The file must be UTF-8 with one unique non-blank header line; records may omit only trailing fields.`,
-        expected: { kind: 'relation', description: `A complete UTF-8 ${snapshot.format.toUpperCase()} table.` }, received: snapshot.fileName,
-      }));
-    }
-    const width = parsed.columns.length;
-    return {
-      ...base,
-      header: parsed.columns,
-      rows: parsed.rawRows.map((row, index) => ({
-        rowNumber: index + 2,
-        cells: Array.from({ length: width }, (_unused, column): LocalTableCell => (
-          column < row.length ? { kind: 'text', text: row[column] } : { kind: 'absent' }
-        )),
-      })),
-      blankRowsSkipped: 0,
-      rowsAboveHeader: 0,
-      formulaCells: 0,
-      shortRows: parsed.rawRows.filter(row => row.length < width).length,
-    };
+    return readAnalyticsDelimitedTable({ ...snapshot, format: snapshot.format }, label);
   }
+  const base = { format: snapshot.format, fileName: snapshot.fileName, sha256: snapshot.sha256, size: snapshot.size };
 
   if (!deps.documentParser?.parseXlsxSheet) {
     reject('invalid_input', 'XLSX reading is unavailable.', dataRoomIssue({

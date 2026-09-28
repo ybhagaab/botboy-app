@@ -9,11 +9,12 @@ import { createAnalyticsDataRoomBackupService } from './analytics-data-room-back
 import { createAnalyticsDataRoomService } from './analytics-data-room-service.js';
 import { createAnalyticsLocalQueryEngine } from './analytics-data-room-query.js';
 import { createAnalyticsAnswerService } from './analytics-data-room-answer.js';
+import { createAnalyticsDataRoomReadService } from './analytics-data-room-read.js';
 import {
   AnalyticsDashboardDataRoomError,
   createAnalyticsDashboardDataRoomBridge,
 } from './analytics-dashboard-data-room.js';
-import { createAnalyticsDashboardService } from './analytics-dashboard.js';
+import { AnalyticsWidgetEditError, createAnalyticsDashboardService } from './analytics-dashboard.js';
 import { analyticsRequestSha256 } from './analytics-data-room-policy.js';
 import { createWorkspaceCatalogService } from './workspace-catalog.js';
 import type {
@@ -192,6 +193,7 @@ function openEnvironment(options: {
     mcpManager: mcp.manager,
     etlRunner: options.etlRunner,
     dataRoom: bridge,
+    dataRoomRead: createAnalyticsDataRoomReadService({ store }),
     dataRoomEnabled: options.dataRoomEnabled,
   });
   return { directory, databasePath, roomRoot, storage, db, store, room, localQuery, bridge, mcp, dashboards };
@@ -1971,5 +1973,276 @@ describe('analytics dashboard publication verifier', () => {
     const failure = capturedError(() => environment.bridge.validatePublicationResult(targetId, widget.result!));
     expect(failure.code).toBe('conflict');
     expect(failure.message).toMatch(/result identity differs|publication-ready/i);
+  });
+});
+
+// Owner directive 2026-09-28: dashboard create/update read Data Room datasets
+// directly. One call pins each widget to the dataset's ready head and loads it
+// locally; no placeholder SQL, binding, lane, or per-widget configure step.
+describe('analytics dashboard direct Data Room widget sources', () => {
+  const DAILY_SQL = 'SELECT event_date, SUM(events) AS events FROM source.data GROUP BY event_date ORDER BY event_date';
+  const DAILY_ROWS = [['2026-09-01', 30], ['2026-09-02', 70]];
+  const roomSource = (overrides: Record<string, unknown> = {}) => ({
+    kind: 'data_room_query', datasetId: 'ds_r4_events', sql: DAILY_SQL, ...overrides,
+  });
+
+  function readyEnvironment(handling: Partial<AnalyticsDatasetContract['handling']> = {}) {
+    const environment = openEnvironment();
+    const definition = sourceDefinition();
+    environment.room.registerDataset({
+      ...definition,
+      contract: withSha({ ...definition.contract, handling: { ...definition.contract.handling, ...handling } }),
+    });
+    ingest(environment, V1_ROWS);
+    return environment;
+  }
+
+  function counts(environment: ReturnType<typeof openEnvironment>) {
+    return environment.db.prepare(`
+      SELECT (SELECT COUNT(*) FROM analytics_dashboards) AS dashboards,
+        (SELECT COUNT(*) FROM analytics_widgets) AS widgets,
+        (SELECT COUNT(*) FROM analytics_runs) AS runs
+    `).get();
+  }
+
+  function captured(work: () => unknown): any {
+    try { work(); } catch (error) { return error; }
+    throw new Error('Expected the call to throw');
+  }
+
+  it('creates Data Room and text widgets that load in one local run with no lane or binding', async () => {
+    const environment = readyEnvironment();
+    const head = environment.store.getHead('ds_r4_events')!;
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Direct Data Room',
+      widgets: [
+        { kind: 'text', title: 'About', config: { text: 'Daily events from the Data Room.' } },
+        { kind: 'line', title: 'Daily events', source: roomSource() },
+        { kind: 'metric', title: 'Warehouse total', sql: 'SELECT 7' },
+      ] as any,
+    });
+    const [about, daily, warehouse] = dashboard.widgets;
+    expect(daily.sql).toBeUndefined();
+    expect(daily.preset).toBeUndefined();
+    expect(daily.config.dataSource).toEqual({
+      version: 1, kind: 'data_room_query', datasetId: 'ds_r4_events', versionId: head.versionId,
+      sql: DAILY_SQL, params: [], limit: 100,
+    });
+    const run = dashboard.recentRuns[0];
+    expect(run).toMatchObject({ status: 'queued', refreshScope: 'selective', trigger: 'agent', widgetCount: 2 });
+
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    const current = environment.dashboards.getDashboard(dashboard.id)!;
+    expect(current.recentRuns[0]).toMatchObject({ id: run.id, status: 'completed', widgetsSucceeded: 2 });
+    const byId = new Map(current.widgets.map(widget => [widget.id, widget]));
+    expect(byId.get(daily.id)!.result).toMatchObject({
+      trust: 'local_verified_data',
+      columns: ['event_date', 'events'],
+      rows: DAILY_ROWS,
+      source: { provider: 'data-room-query', datasetId: 'ds_r4_events', versionId: head.versionId, widgetRevision: daily.revision },
+    });
+    expect(byId.get(about.id)!.result).toMatchObject({ trust: 'local_static_content', rows: [['Daily events from the Data Room.']] });
+    expect(byId.get(warehouse.id)!.result).toBeUndefined();
+    expect(byId.get(daily.id)!.binding).toBeUndefined();
+    expect(environment.db.prepare('SELECT COUNT(*) AS count FROM analytics_widget_dataset_bindings').get()).toEqual({ count: 0 });
+    expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
+  });
+
+  // REGRESSION (live canary 2026-09-28): imported datasets pin model context
+  // to one provider/endpoint. The resolver used the model catalog, which hides
+  // them without that runtime, so create rejected a ready dataset.
+  it('pins and loads a dataset whose model context is pinned to one provider', async () => {
+    const environment = readyEnvironment({
+      modelContextPolicy: {
+        allowedProviderLocalities: ['amazon_managed_remote'],
+        disclosurePolicyVersion: 'botboy-data-room-v1',
+        endpointSha256: '4'.repeat(64),
+      },
+    });
+    const head = environment.store.getHead('ds_r4_events')!;
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Provider pinned', widgets: [{ kind: 'line', title: 'Daily events', source: roomSource() }] as any,
+    });
+    expect(dashboard.widgets[0].config.dataSource).toMatchObject({ datasetId: 'ds_r4_events', versionId: head.versionId });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    expect(environment.dashboards.getDashboard(dashboard.id)!.widgets[0].result).toMatchObject({
+      rows: DAILY_ROWS, source: { provider: 'data-room-query', versionId: head.versionId },
+    });
+  });
+
+  it('rejects a dataset that does not allow dashboard use, with zero effect', () => {
+    const environment = readyEnvironment({ allowedUses: ['local_answer'] });
+    const failure = captured(() => environment.dashboards.createDashboard({
+      title: 'Denied', widgets: [{ kind: 'line', title: 'Daily events', source: roomSource() }] as any,
+    }));
+    expect(failure).toMatchObject({ code: 'invalid_input', mutationApplied: false });
+    expect(failure.message).toBe('Widget 1 "Daily events": Dataset ds_r4_events is not approved for dashboard use.');
+    expect(failure.issues[0]).toMatchObject({ code: 'dashboard_use_denied', path: 'widgets[0].source.datasetId' });
+    expect(counts(environment)).toEqual({ dashboards: 0, widgets: 0, runs: 0 });
+  });
+
+  // REGRESSION (found 2026-09-28): runs requested the configure-time version,
+  // so once the dataset gained a version every refresh failed with "not the
+  // current ready head". Runs now read the current head and record it.
+  it('refreshes onto the dataset head after a new version lands', async () => {
+    const environment = readyEnvironment();
+    const first = environment.store.getHead('ds_r4_events')!;
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Follows head', widgets: [{ kind: 'line', title: 'Daily events', source: roomSource() }] as any,
+    });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+
+    const second = ingest(environment, [...V1_ROWS.slice(0, 3), ['2026-09-02', 'US', 41]], 1);
+    expect(second.version.id).not.toBe(first.versionId);
+    const refresh = environment.dashboards.enqueueRefresh(dashboard.id, 'manual');
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+
+    expect(environment.dashboards.getRun(refresh.id)).toMatchObject({ status: 'completed', widgetsSucceeded: 1 });
+    const widget = environment.dashboards.getDashboard(dashboard.id)!.widgets[0];
+    expect(widget.lastError).toBeFalsy();
+    expect(widget.result).toMatchObject({
+      rows: [['2026-09-01', 30], ['2026-09-02', 71]],
+      source: { provider: 'data-room-query', versionId: second.version.id },
+    });
+    expect((widget.config.dataSource as any).versionId).toBe(first.versionId);
+    expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
+  });
+
+  it('queues nothing for a warehouse-only dashboard and keeps refresh=true a full run', () => {
+    const environment = readyEnvironment();
+    const warehouseOnly = environment.dashboards.createDashboard({
+      title: 'Warehouse only',
+      widgets: [
+        { kind: 'text', title: 'About', config: { text: 'Notes' } },
+        { kind: 'metric', title: 'Total', sql: 'SELECT 7' },
+      ],
+    });
+    expect(warehouseOnly.recentRuns).toEqual([]);
+
+    const refreshed = environment.dashboards.createDashboard({
+      title: 'Full refresh',
+      widgets: [
+        { kind: 'line', title: 'Daily events', source: roomSource() },
+        { kind: 'metric', title: 'Total', sql: 'SELECT 7' },
+      ] as any,
+    }, 'agent');
+    expect(refreshed.recentRuns).toHaveLength(1);
+    expect(refreshed.recentRuns[0]).toMatchObject({ status: 'queued', refreshScope: 'full', widgetCount: 2 });
+  });
+
+  it('refreshes a Data Room + text dashboard fully with no warehouse lane available', async () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Local only',
+      widgets: [
+        { kind: 'text', title: 'About', config: { text: 'Local.' } },
+        { kind: 'line', title: 'Daily events', source: roomSource() },
+      ] as any,
+    });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+
+    const full = environment.dashboards.enqueueRefresh(dashboard.id, 'manual');
+    expect(full).toMatchObject({ refreshScope: 'full', widgetCount: 2 });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    expect(environment.dashboards.getRun(full.id)).toMatchObject({ status: 'completed', widgetsSucceeded: 2 });
+    expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
+  });
+
+  it.each([
+    ['an unknown dataset', { kind: 'line', title: 'Missing', source: roomSource({ datasetId: 'ds_missing' }) }, 'not_found', 'widgets[1].source.datasetId'],
+    ['SQL that does not read source.data', { kind: 'line', title: 'Wrong table', source: roomSource({ sql: 'SELECT 1' }) }, 'invalid_input', 'widgets[1].source.sql'],
+    ['an unsupported source field', { kind: 'line', title: 'Pinned', source: roomSource({ versionId: 'dsv_x' }) }, 'invalid_input', 'widgets[1].source.versionId'],
+    ['an out-of-range limit', { kind: 'table', title: 'Big', source: roomSource({ limit: 500 }) }, 'invalid_input', 'widgets[1].source.limit'],
+  ])('rejects %s with its issue path and zero effect', (_label, widget, code, path) => {
+    const environment = readyEnvironment();
+    const failure = captured(() => environment.dashboards.createDashboard({
+      title: 'Rejected',
+      widgets: [{ kind: 'metric', title: 'Total', sql: 'SELECT 7' }, widget] as any,
+    }));
+    expect(failure).toBeInstanceOf(AnalyticsWidgetEditError);
+    expect(failure).toMatchObject({ code, mutationApplied: false, nextAction: expect.any(String) });
+    expect(failure.message).toMatch(/^Widget 2 "/);
+    expect(failure.issues[0].path).toBe(path);
+    expect(counts(environment)).toEqual({ dashboards: 0, widgets: 0, runs: 0 });
+  });
+
+  it.each([
+    ['widget.sql beside a Data Room source', { kind: 'line', title: 'Both', sql: 'SELECT 1', source: roomSource() }, /omit widget\.sql/],
+    ['a caller-supplied config.dataSource', { kind: 'line', title: 'Raw', sql: 'SELECT 1', config: { dataSource: { kind: 'data_room_query' } } }, /config\.dataSource is server-owned; give the widget's data source as widget\.source/],
+    ['a source on a text widget', { kind: 'text', title: 'Notes', config: { text: 'x' }, source: roomSource() }, /text widget; remove source/],
+  ])('rejects %s before any write', (_label, widget, message) => {
+    const environment = readyEnvironment();
+    expect(() => environment.dashboards.createDashboard({ title: 'Rejected', widgets: [widget] as any })).toThrow(message);
+    expect(counts(environment)).toEqual({ dashboards: 0, widgets: 0, runs: 0 });
+  });
+
+  it('replaces widgets on update and loads the new Data Room widgets locally', async () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Update me', widgets: [{ kind: 'metric', title: 'Total', sql: 'SELECT 7' }],
+    });
+    expect(dashboard.recentRuns).toEqual([]);
+
+    const updated = environment.dashboards.updateDashboard(dashboard.id, {
+      widgets: [{ kind: 'bar', title: 'Events by day', source: roomSource() }] as any,
+    });
+    expect(updated.recentRuns[0]).toMatchObject({ status: 'queued', refreshScope: 'selective', widgetCount: 1 });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    expect(environment.dashboards.getDashboard(dashboard.id)!.widgets[0].result).toMatchObject({
+      rows: DAILY_ROWS, source: { provider: 'data-room-query', datasetId: 'ds_r4_events' },
+    });
+    expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
+  });
+
+  it('rejects a widget update while the local run is active and names the wait', () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Busy', widgets: [{ kind: 'line', title: 'Daily events', source: roomSource() }] as any,
+    });
+    const run = dashboard.recentRuns[0];
+    const failure = captured(() => environment.dashboards.updateDashboard(dashboard.id, {
+      widgets: [{ kind: 'bar', title: 'Events by day', source: roomSource() }] as any,
+    }));
+    expect(failure).toBeInstanceOf(AnalyticsWidgetEditError);
+    expect(failure).toMatchObject({ code: 'active_run', mutationApplied: false });
+    expect(failure.nextAction).toBe(`Wait for run ${run.id} to finish (get_analytics_dashboard shows it), then send the same update once.`);
+    expect(environment.dashboards.getDashboard(dashboard.id)!.widgets.map(widget => widget.id)).toEqual(dashboard.widgets.map(widget => widget.id));
+  });
+
+  it('leaves the dashboard unchanged when an update source is rejected', () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Keep me', widgets: [{ kind: 'metric', title: 'Total', sql: 'SELECT 7' }],
+    });
+    expect(() => environment.dashboards.updateDashboard(dashboard.id, {
+      widgets: [{ kind: 'bar', title: 'Missing', source: roomSource({ datasetId: 'ds_missing' }) }] as any,
+    })).toThrow(/^Widget 1 "Missing": Dataset ds_missing is not an active ready workspace dataset/);
+    const current = environment.dashboards.getDashboard(dashboard.id)!;
+    expect(current.widgets.map(widget => widget.id)).toEqual(dashboard.widgets.map(widget => widget.id));
+    expect(current.recentRuns).toEqual([]);
+  });
+
+  it('configures one widget through the same resolver and loads it locally', async () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Configure', widgets: [{ kind: 'line', title: 'Daily', sql: 'SELECT 1' }],
+    });
+    const [widget] = dashboard.widgets;
+    const failure = captured(() => environment.dashboards.configureWidgetSource(dashboard.id, widget.id, {
+      expectedWidgetRevision: widget.revision, source: roomSource({ datasetId: 'ds_missing' }) as any,
+    }));
+    expect(failure).toMatchObject({ code: 'not_found', mutationApplied: false });
+    expect(failure.issues[0].path).toBe('source.datasetId');
+
+    const mutation = environment.dashboards.configureWidgetSource(dashboard.id, widget.id, {
+      expectedWidgetRevision: widget.revision, source: roomSource() as any,
+    });
+    expect(mutation.run).toMatchObject({ refreshScope: 'selective', widgetCount: 1 });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    expect(environment.dashboards.getDashboard(dashboard.id)!.widgets[0]).toMatchObject({
+      revision: widget.revision + 1,
+      sql: undefined,
+      result: { rows: DAILY_ROWS, source: { provider: 'data-room-query' } },
+    });
   });
 });
