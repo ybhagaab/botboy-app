@@ -71,26 +71,82 @@ function initChatThinkingControl() {
   });
 }
 
-// Model picker (chat panel dropdown, 2026-09-03). 'default' = Terra, the
-// team default every background lane also uses; luna/sol are same-family
-// alternates resolved server-side against the blessed registry. Persisted
-// per browser like the thinking level.
+// Model picker. The server owns the provider-aware catalog; the browser keeps
+// only the selected stable key. Until the catalog arrives, `default` preserves
+// old-client behavior and cannot route to an unadvertised model.
 const CHAT_MODEL_KEY = 'botboy.chat.model';
-const CHAT_MODEL_CHOICES = ['default', 'luna', 'sol'];
+// Mixed-build compatibility only: an already-running older server can serve
+// freshly copied UI assets before it knows GET /chat/models. Keep the proven
+// GPT-5.6 choices usable in that narrow window; GPT-6 is never browser-baked.
+let chatModelChoices = ['default', 'luna', 'sol'];
+let chatDefaultModelKey = 'default';
 
-function chatModelChoice() {
-  try {
-    const stored = localStorage.getItem(CHAT_MODEL_KEY);
-    return CHAT_MODEL_CHOICES.includes(stored) ? stored : 'default';
-  } catch { return 'default'; }
+function storedChatModelChoice() {
+  try { return localStorage.getItem(CHAT_MODEL_KEY) || 'default'; }
+  catch { return 'default'; }
 }
 
-function initChatModelControl() {
+function chatModelChoice() {
+  const stored = storedChatModelChoice();
+  if (stored === 'default') return chatDefaultModelKey;
+  return chatModelChoices.includes(stored) ? stored : chatDefaultModelKey;
+}
+
+function parseChatModelCatalog(value) {
+  if (!value || typeof value !== 'object' || !Array.isArray(value.models)) return null;
+  const seen = new Set();
+  const models = value.models.filter(model => {
+    if (!model || typeof model !== 'object'
+      || typeof model.key !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(model.key)
+      || typeof model.label !== 'string' || !model.label.trim()
+      || seen.has(model.key)) return false;
+    seen.add(model.key);
+    return true;
+  }).map(model => ({
+    key: model.key,
+    label: model.label.trim().slice(0, 80),
+    isDefault: model.isDefault === true,
+    preview: model.preview === true,
+  }));
+  if (!models.length) return null;
+  const defaultKey = typeof value.defaultKey === 'string' && seen.has(value.defaultKey)
+    ? value.defaultKey
+    : models.find(model => model.isDefault)?.key ?? models[0].key;
+  return { defaultKey, models };
+}
+
+async function initChatModelControl() {
   const select = document.getElementById('chat-model');
   if (!select) return;
-  select.value = chatModelChoice();
+
+  try {
+    const catalog = parseChatModelCatalog(await api('/chat/models'));
+    if (!catalog) throw new Error('model catalog response was invalid');
+    chatModelChoices = catalog.models.map(model => model.key);
+    chatDefaultModelKey = catalog.defaultKey;
+    select.replaceChildren(...catalog.models.map(model => {
+      const option = document.createElement('option');
+      option.value = model.key;
+      option.textContent = `Model · ${model.label}${model.isDefault ? ' (default)' : ''}${model.preview ? ' · Preview' : ''}`;
+      return option;
+    }));
+    select.value = chatModelChoice();
+    select.disabled = false;
+  } catch (error) {
+    console.warn('[chat-model] Could not load model catalog; retaining GPT-5.6 compatibility choices', error);
+    chatModelChoices = ['default', 'luna', 'sol'];
+    chatDefaultModelKey = 'default';
+    select.replaceChildren(
+      new Option('Model · GPT-5.6 Terra (default)', 'default'),
+      new Option('Model · GPT-5.6 Luna', 'luna'),
+      new Option('Model · GPT-5.6 Sol', 'sol'),
+    );
+    select.value = chatModelChoice();
+    select.disabled = false;
+  }
+
   select.addEventListener('change', () => {
-    const value = CHAT_MODEL_CHOICES.includes(select.value) ? select.value : 'default';
+    const value = chatModelChoices.includes(select.value) ? select.value : chatDefaultModelKey;
     try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
   });
 }

@@ -88,7 +88,75 @@ describe('chat streaming loop safety', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     storage.close();
+  });
+
+  it('serves only the existing GPT-5.6 catalog while GPT-6 rollout is off', async () => {
+    vi.stubEnv('BOTBOY_INFERENCE_GPT6_ROLLOUT', 'off');
+    const llmClient = {
+      getDefaultModel: () => 'bedrock-mantle-luna/openai.gpt-5.6-terra',
+      getActiveEndpoint: () => 'ecs',
+      chatCompletionStream: vi.fn(),
+    };
+    const app = buildApp(makeDeps(db, llmClient, { executeTool: vi.fn() }));
+
+    const response = await request(app).get('/api/chat/models');
+
+    expect(response.status).toBe(200);
+    expect(response.body.defaultKey).toBe('terra');
+    expect(response.body.models.map((model: any) => model.key)).toEqual(['terra', 'luna', 'sol']);
+    expect(JSON.stringify(response.body)).not.toContain('bedrock-mantle-luna');
+  });
+
+  it('admits a configured GPT-6 preview key and sends only its exact qualified route', async () => {
+    vi.stubEnv('BOTBOY_INFERENCE_GPT6_ROLLOUT', 'preview');
+    vi.stubEnv('BOTBOY_INFERENCE_GPT6_EAST_TARGET', 'botboy-gpt6-east');
+    vi.stubEnv('BOTBOY_INFERENCE_GPT6_ASTRA_TARGET', 'botboy-gpt6-astra-west');
+    vi.stubEnv(
+      'BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT',
+      'https://botboy-astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+    );
+    vi.stubEnv('BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT', 'proj_gcag2sv5e6z2eni2azsx');
+    const seenRequests: any[] = [];
+    const llmClient = {
+      getDefaultModel: () => 'bedrock-mantle-luna/openai.gpt-5.6-terra',
+      getActiveEndpoint: () => 'ecs',
+      chatCompletionStream: vi.fn((input: any) => {
+        seenRequests.push(input);
+        return (async function* () {
+          yield { type: 'content', text: 'Astra ready' };
+          return streamResult({ content: 'Astra ready' });
+        })();
+      }),
+    };
+    const app = buildApp(makeDeps(db, llmClient, { executeTool: vi.fn() }));
+
+    const catalog = await request(app).get('/api/chat/models');
+    expect(catalog.body.models.map((model: any) => model.key)).toEqual([
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+    ]);
+    expect(JSON.stringify(catalog.body)).not.toContain('botboy-gpt6-east');
+
+    const response = await request(app).post('/api/chat/messages').send({
+      message: 'Use Astra',
+      stream: true,
+      model: 'gpt6-astra',
+    });
+    expect(response.status).toBe(200);
+    expect(seenRequests[0].route).toEqual({
+      model: 'botboy-gpt6-astra-west/openai.gpt-6-astra',
+      endpoint: 'https://botboy-astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+      headers: { 'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx' },
+    });
+
+    const rejected = await request(app).post('/api/chat/messages').send({
+      message: 'Use an arbitrary model',
+      stream: true,
+      model: 'openai.gpt-6-unknown',
+    });
+    expect(rejected.status).toBe(400);
+    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(1);
   });
 
   it('breaks a repeated identical tool call: 1 execution, nudges, then tools-off answer', async () => {

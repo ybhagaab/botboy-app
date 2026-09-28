@@ -14,7 +14,10 @@ import { randomUUID } from 'node:crypto';
 import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
-import { resolveBlessedModelId } from '../../core/inference-provider.js';
+import {
+  getChatModelCatalog,
+  resolveBlessedModelRoute,
+} from '../../core/inference-provider.js';
 import { createLlmUsageOperationId } from '../../core/llm-usage.js';
 import { normalizeAnalyticsSearchText } from '../../core/analytics-search-normalization.js';
 import {
@@ -446,6 +449,16 @@ function formatAnalyticsEditCompletion(receipt: Record<string, any>): string | u
 export function createChatRouter(deps: RouterDeps, dashboardState: DashboardState): Router {
   const router = Router();
   const chat = deps.chatInterface;
+  const chatModelDefault = deps.llmClient?.getDefaultModel?.() ?? '';
+  const chatModelCatalog = getChatModelCatalog(chatModelDefault);
+
+  // The browser renders this server-owned, provider-aware catalog. It never
+  // carries endpoint, target, or credential details and cannot invent ids.
+  router.get('/chat/models', (_req: Request, res: Response) => {
+    if (!deps.llmClient) return res.status(503).json({ error: 'Chat models are unavailable' });
+    return res.json(chatModelCatalog);
+  });
+
   const analyticsSchemaLoader = createAnalyticsSchemaBriefingLoader(deps.mcpManager, {
     db: deps.db,
     contextWindowTokens: deps.llmClient?.getContextWindow?.(),
@@ -644,20 +657,21 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         if (visual) attachmentVisualAssets.push(visual);
       }
     }
-    // Model picker (chat panel, 2026-09-03): a blessed gpt-5.6 sibling per
-    // message. Absent/empty = the provider default (Terra everywhere,
-    // background lanes included). Unknown values are rejected, and the
-    // resolved id inherits the provider's gateway prefix — arbitrary model
-    // strings never reach the wire.
-    let modelOverride: string | undefined;
+    // Model picker: the server-owned catalog admits only routes available to
+    // this provider. `default` preserves old clients; current clients send the
+    // stable catalog key. GPT-6 remains absent unless its separate target has
+    // an explicit preview attestation, so dead/unapproved ids never hit wire.
+    let modelRoute: ReturnType<typeof resolveBlessedModelRoute> | undefined;
     if (body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
-      const resolved = deps.llmClient
-        ? resolveBlessedModelId(deps.llmClient.getDefaultModel(), body.model)
+      const allowedModelKeys = new Set(chatModelCatalog.models.map(model => model.key));
+      const resolved = allowedModelKeys.has(body.model)
+        ? resolveBlessedModelRoute(chatModelDefault, body.model)
         : null;
       if (!resolved) {
-        return res.status(400).json({ error: 'model must be terra, luna, or sol when provided' });
+        const allowed = ['default', ...allowedModelKeys].filter((key, index, keys) => keys.indexOf(key) === index);
+        return res.status(400).json({ error: `model must be one of: ${allowed.join(', ')}` });
       }
-      modelOverride = resolved;
+      modelRoute = resolved;
     }
     // modeHint is ambient page context (an analytics route being open). It is
     // advisory — the message must corroborate — unlike mode, which commands.
@@ -1266,8 +1280,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ...(documentAuthoringThink
                 ? { reasoningEffort: 'max' as const }
                 : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
-              // Blessed sibling override — same family/profile, body-only change.
-              ...(modelOverride ? { model: modelOverride } : {}),
+              // Server-admitted model route; transport profile and budgets
+              // were validated before the option entered the catalog.
+              ...(modelRoute ? { route: modelRoute } : {}),
               usageContext: {
                 workload: 'interactive',
                 operationId,
@@ -2003,7 +2018,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             maxTokens: CHAT_MAX_COMPLETION_TOKENS,
             think: false,
             usageContext: { workload: 'interactive' },
-            ...(modelOverride ? { model: modelOverride } : {}),
+            ...(modelRoute ? { route: modelRoute } : {}),
             ...(synthesisSignal ? { signal: synthesisSignal } : {}),
           });
           let iterResult = await gen.next();

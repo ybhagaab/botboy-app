@@ -376,6 +376,14 @@ case "$BOTBOY_INFERENCE_PROVIDER" in
     export BOTBOY_INFERENCE_DIALECT="${BOTBOY_INFERENCE_DIALECT:-openai}"
     export BOTBOY_INFERENCE_REASONING_EFFORT="${BOTBOY_INFERENCE_REASONING_EFFORT:-low}"
     export BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS="${BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS:-1000000}"
+    # Curated chat-only GPT-6 routes. These identifiers are deployment
+    # metadata, not credentials: all gateways reuse the existing Cognito
+    # client pair and scope. Background work remains on GPT-5.6 Terra.
+    export BOTBOY_INFERENCE_GPT6_ROLLOUT="${BOTBOY_INFERENCE_GPT6_ROLLOUT:-preview}"
+    export BOTBOY_INFERENCE_GPT6_EAST_TARGET="${BOTBOY_INFERENCE_GPT6_EAST_TARGET:-botboy-gpt6-east}"
+    export BOTBOY_INFERENCE_GPT6_ASTRA_TARGET="${BOTBOY_INFERENCE_GPT6_ASTRA_TARGET:-botboy-gpt6-astra-west}"
+    export BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT="${BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT:-https://botboy-gpt6-astra-west-gateway-y0bjavx16u.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1}"
+    export BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT="${BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT:-proj_gcag2sv5e6z2eni2azsx}"
     ;;
 esac
 

@@ -64,15 +64,20 @@ optional connections, troubleshooting, and unusual recovery cases.
    from Downloads/Desktop into
    `~/.personal-productivity-tracker/.env` with permissions limited to you;
 2. deletes the downloaded credential attachment after a successful import;
-3. selects the authenticated team gateway and Terra model automatically;
-4. builds BotBoy when the build is missing or stale;
-5. starts a provisional local boot page while connections and stores initialize;
-6. opens `http://localhost:7778` only after the final dashboard endpoint is
+3. selects the authenticated team gateway and GPT-5.6 Terra default;
+4. loads the server-approved chat model catalog with GPT-5.6 Terra, Luna,
+   and Sol plus GPT-6 Astra, Sol, and Luna;
+5. builds BotBoy when the build is missing or stale;
+6. starts a provisional local boot page while connections and stores initialize;
+7. opens `http://localhost:7778` only after the final dashboard endpoint is
    ready and the server remains alive through the window launch; and
-7. best-effort installs `/Applications/BotBoy.app` when it is missing.
+8. best-effort installs `/Applications/BotBoy.app` when it is missing.
 
 The gateway deployment name still contains `luna`; that is infrastructure
-naming, not the selected default model. The default model is Terra.
+naming, not the selected default model. The default remains GPT-5.6 Terra.
+Approved GPT-6 additions use the same Cognito token URL, OAuth scope, and
+allowlisted client identity across the approved team gateways, so existing
+teammates do not need a replacement credential attachment.
 
 ### Updating and customizations
 

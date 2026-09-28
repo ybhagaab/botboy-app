@@ -3,7 +3,9 @@ import {
   createInferenceProviderFromEnv,
   defaultInferenceMaxContextTokens,
   BLESSED_CHAT_MODELS,
+  getChatModelCatalog,
   resolveBlessedModelId,
+  resolveBlessedModelRoute,
 } from './inference-provider.js';
 import { createLlmClient, type LlmRequestAuthorizer } from './llm-client.js';
 
@@ -23,28 +25,113 @@ const GATEWAY_ENV = {
   BOTBOY_INFERENCE_OAUTH_SCOPE: 'botboy-llm/invoke',
 } as NodeJS.ProcessEnv;
 
-describe('blessed model choices (chat model picker)', () => {
-  it('offers the gpt-5.6 family only, Terra first as the default', () => {
-    expect(BLESSED_CHAT_MODELS.map(m => m.key)).toEqual(['terra', 'luna', 'sol']);
-    expect(BLESSED_CHAT_MODELS.every(m => m.bareId.startsWith('openai.gpt-5.6-'))).toBe(true);
-    expect(BLESSED_CHAT_MODELS[0].bareId).toBe('openai.gpt-5.6-terra');
+describe('server-owned chat model catalog', () => {
+  const defaultModel = 'bedrock-mantle-luna/openai.gpt-5.6-terra';
+  const previewEnv = {
+    BOTBOY_INFERENCE_GPT6_ROLLOUT: 'preview',
+    BOTBOY_INFERENCE_GPT6_EAST_TARGET: 'botboy-gpt6-east',
+    BOTBOY_INFERENCE_GPT6_ASTRA_TARGET: 'botboy-gpt6-astra-west',
+    BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT:
+      'https://botboy-astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+    BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT: 'proj_gcag2sv5e6z2eni2azsx',
+  } as NodeJS.ProcessEnv;
+
+  it('retains all GPT-5.6 profiles and records all exact GPT-6 base ids', () => {
+    expect(BLESSED_CHAT_MODELS.map(model => model.key)).toEqual([
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+    ]);
+    expect(BLESSED_CHAT_MODELS.map(model => model.bareId)).toEqual([
+      'openai.gpt-5.6-terra',
+      'openai.gpt-5.6-luna',
+      'openai.gpt-5.6-sol',
+      'openai.gpt-6-astra',
+      'openai.gpt-6-sol',
+      'openai.gpt-6-luna',
+    ]);
   });
 
-  it('inherits the gateway target prefix from the provider default', () => {
-    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'luna'))
+  it('exposes only proven GPT-5.6 routes until GPT-6 preview is explicitly enabled', () => {
+    const catalog = getChatModelCatalog(defaultModel, {});
+    expect(catalog.defaultKey).toBe('terra');
+    expect(catalog.models.map(model => model.key)).toEqual(['terra', 'luna', 'sol']);
+    expect(resolveBlessedModelId(defaultModel, 'gpt6-astra', {})).toBeNull();
+  });
+
+  it('routes Astra to its west Project and Sol/Luna to the explicit east Mantle target', () => {
+    const catalog = getChatModelCatalog(defaultModel, previewEnv);
+    expect(catalog.models.map(model => model.key)).toEqual([
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+    ]);
+    expect(catalog.models.filter(model => model.preview).map(model => model.key)).toEqual([
+      'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+    ]);
+    const serializedCatalog = JSON.stringify(catalog);
+    expect(serializedCatalog).not.toContain('botboy-gpt6-east');
+    expect(serializedCatalog).not.toContain('botboy-gpt6-astra-west');
+    expect(serializedCatalog).not.toContain('proj_gcag2sv5e6z2eni2azsx');
+
+    expect(resolveBlessedModelRoute(defaultModel, 'gpt6-astra', previewEnv)).toEqual({
+      model: 'botboy-gpt6-astra-west/openai.gpt-6-astra',
+      endpoint: 'https://botboy-astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+      headers: { 'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx' },
+    });
+    expect(resolveBlessedModelRoute(defaultModel, 'gpt6-sol', previewEnv)).toEqual({
+      model: 'botboy-gpt6-east/openai.gpt-6-sol',
+    });
+    expect(resolveBlessedModelRoute(defaultModel, 'gpt6-luna', previewEnv)).toEqual({
+      model: 'botboy-gpt6-east/openai.gpt-6-luna',
+    });
+  });
+
+  it('keeps GPT-6 unavailable on direct Mantle because it needs another endpoint', () => {
+    const direct = getChatModelCatalog('openai.gpt-5.6-terra', previewEnv);
+    expect(direct.models.map(model => model.key)).toEqual(['terra', 'luna', 'sol']);
+    expect(resolveBlessedModelId('openai.gpt-5.6-terra', 'gpt6-astra', previewEnv)).toBeNull();
+  });
+
+  it('does not mistake local or Hugging Face model paths for a gateway target', () => {
+    for (const providerModel of ['/app/models/qwen35-35b-a3b-fp8', 'Qwen/Qwen3.5-27B-Instruct']) {
+      const catalog = getChatModelCatalog(providerModel, previewEnv);
+      expect(catalog).toEqual({
+        defaultKey: 'default',
+        models: [{
+          key: 'default', label: 'Provider default', family: 'Provider', isDefault: true, preview: false,
+        }],
+      });
+      expect(resolveBlessedModelId(providerModel, 'terra', previewEnv)).toBeNull();
+    }
+  });
+
+  it('fails configured preview closed when either final route is incomplete or malformed', () => {
+    expect(() => getChatModelCatalog(defaultModel, {
+      BOTBOY_INFERENCE_GPT6_ROLLOUT: 'preview',
+    })).toThrow(/BOTBOY_INFERENCE_GPT6_EAST_TARGET/);
+    expect(() => getChatModelCatalog(defaultModel, {
+      ...previewEnv,
+      BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT: 'https://example.com/inference/v1',
+    })).toThrow(/us-west-2 AgentCore/);
+    expect(() => getChatModelCatalog(defaultModel, {
+      ...previewEnv,
+      BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT: 'default',
+    })).toThrow(/dedicated west Mantle Project/);
+    expect(() => getChatModelCatalog(defaultModel, {
+      ...previewEnv,
+      BOTBOY_INFERENCE_GPT6_ASTRA_TARGET: 'bad/target',
+    })).toThrow(/target name without slashes/);
+  });
+
+  it('inherits the existing gateway target for every GPT-5.6 choice', () => {
+    expect(resolveBlessedModelId(defaultModel, 'luna'))
       .toBe('bedrock-mantle-luna/openai.gpt-5.6-luna');
-    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'sol'))
+    expect(resolveBlessedModelId(defaultModel, 'sol'))
       .toBe('bedrock-mantle-luna/openai.gpt-5.6-sol');
   });
 
-  it('resolves bare on direct bedrock (no prefix on the default)', () => {
+  it('resolves GPT-5.6 bare on direct Bedrock and rejects arbitrary ids', () => {
     expect(resolveBlessedModelId('openai.gpt-5.6-terra', 'luna')).toBe('openai.gpt-5.6-luna');
-  });
-
-  it('rejects unknown keys — callers fall back to the default model, arbitrary ids never reach the wire', () => {
-    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', 'gpt-4')).toBeNull();
-    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', '')).toBeNull();
-    expect(resolveBlessedModelId('bedrock-mantle-luna/openai.gpt-5.6-terra', undefined)).toBeNull();
+    expect(resolveBlessedModelId(defaultModel, 'gpt-4')).toBeNull();
+    expect(resolveBlessedModelId(defaultModel, '')).toBeNull();
+    expect(resolveBlessedModelId(defaultModel, undefined)).toBeNull();
   });
 });
 
@@ -173,6 +260,53 @@ describe('llm-client 401 invalidate-and-retry', () => {
   function isUserRequest(init: { body?: string } | undefined): boolean {
     return typeof init?.body === 'string' && init.body.includes('"hi"');
   }
+
+  it('routes one request to an alternate gateway with fixed server metadata', async () => {
+    const authorizer = vi.fn(async () => ({ Authorization: 'Bearer shared-oauth-token' }));
+    const fetchMock = vi.fn(async () => responsesOk('routed'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient(respondersConfig(authorizer));
+    const result = await client.chatCompletionPrimary({
+      messages: [{ role: 'user', content: 'hi' }],
+      route: {
+        model: 'botboy-gpt6-astra-west/openai.gpt-6-astra',
+        endpoint: 'https://astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+        headers: { 'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx' },
+      },
+    });
+
+    expect(result.content).toBe('routed');
+    const routedCall = fetchMock.mock.calls.find(([, init]) =>
+      String(init?.body).includes('botboy-gpt6-astra-west/openai.gpt-6-astra'));
+    expect(routedCall?.[0]).toBe(
+      'https://astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1/responses',
+    );
+    expect(routedCall?.[1]?.headers).toMatchObject({
+      Authorization: 'Bearer shared-oauth-token',
+      'Content-Type': 'application/json',
+      'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx',
+    });
+    client.close();
+  });
+
+  it('rejects route metadata that could replace authorization', async () => {
+    const authorizer: LlmRequestAuthorizer = async () => ({ Authorization: 'Bearer shared-oauth-token' });
+    const fetchMock = vi.fn(async () => responsesOk('unused'));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = createLlmClient(respondersConfig(authorizer));
+
+    await expect(client.chatCompletionPrimary({
+      messages: [{ role: 'user', content: 'hi' }],
+      route: {
+        model: 'botboy-gpt6-astra-west/openai.gpt-6-astra',
+        endpoint: 'https://astra.gateway.bedrock-agentcore.us-west-2.amazonaws.com/inference/v1',
+        headers: { Authorization: 'Bearer attacker-controlled' },
+      },
+    })).rejects.toThrow(/route header is not allowed: Authorization/);
+    expect(fetchMock.mock.calls.filter(([, init]) => String(init?.body).includes('"hi"'))).toHaveLength(0);
+    client.close();
+  });
 
   it('invalidates the authorizer and retries exactly once on 401', async () => {
     const invalidate = vi.fn();

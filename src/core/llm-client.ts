@@ -227,6 +227,15 @@ function validateStrictJsonSchema(schema: Record<string, unknown>): void {
   visit(schema, '$', 0);
 }
 
+export interface LlmRequestRoute {
+  /** Exact provider-qualified model selected by the server-owned catalog. */
+  readonly model: string;
+  /** Optional alternate OpenAI-compatible base URL using the same authorizer. */
+  readonly endpoint?: string;
+  /** Server-authored target metadata; never accepted from browser/model input. */
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
 export interface ChatCompletionRequest {
   messages: LlmMessage[];
   tools?: ToolDefinition[];
@@ -242,13 +251,12 @@ export interface ChatCompletionRequest {
    */
   reasoningEffort?: ReasoningEffort;
   /**
-   * Per-request model override (chat model picker, 2026-09-03). Must be a
-   * FULL provider-qualified id from the blessed registry
-   * (inference-provider › resolveBlessedModelId) — same family/profile as
-   * the endpoint's default, so budgets and dialects are unchanged. Applies
-   * to the OpenAI-compatible endpoint only; the Ollama fallback always
-   * keeps its own local model.
+   * Server-admitted per-request route. The alternate endpoint reuses the
+   * primary OAuth authorizer and wire dialect while keeping endpoint health
+   * independent. Route values and headers never originate in request JSON.
    */
+  route?: LlmRequestRoute;
+  /** Legacy model-only override for existing internal callers. */
   model?: string;
   /**
    * Internal exact-wire guard used only by same-turn payload recovery. The
@@ -898,13 +906,41 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     return endpoints; // try all if none known healthy
   }
 
+  function validatedRouteHeaders(headers: Readonly<Record<string, string>> | undefined): Record<string, string> {
+    if (!headers) return {};
+    const entries = Object.entries(headers);
+    if (entries.length > 10) throw new Error('LLM route headers exceed the provider metadata limit');
+    const blocked = new Set(['authorization', 'content-type', 'host', 'content-length']);
+    const result: Record<string, string> = {};
+    for (const [name, value] of entries) {
+      if (!/^[A-Za-z0-9_-]+$/.test(name) || blocked.has(name.toLowerCase())) {
+        throw new Error(`LLM route header is not allowed: ${name}`);
+      }
+      if (typeof value !== 'string' || value.length > 4_096 || !/^[\x20-\x7E]*$/.test(value)) {
+        throw new Error(`LLM route header has an invalid value: ${name}`);
+      }
+      result[name] = value;
+    }
+    return result;
+  }
+
   /**
    * Auth headers for an OpenAI-compatible request. A requestAuthorizer is
    * preferred and is invoked on every request so it can refresh short-lived
-   * credentials. authMode/apiKey remain as backward-compatible fallbacks.
+   * credentials. Server-authored route headers can add target metadata but
+   * can never replace authorization or transport headers.
    */
-  async function buildAuthHeaders(ep: Endpoint, url: string, method: 'GET' | 'POST', body?: string): Promise<Record<string, string>> {
-    const baseHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+  async function buildAuthHeaders(
+    ep: Endpoint,
+    url: string,
+    method: 'GET' | 'POST',
+    body?: string,
+    routeHeaders?: Readonly<Record<string, string>>,
+  ): Promise<Record<string, string>> {
+    const baseHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...validatedRouteHeaders(routeHeaders),
+    };
     if (ep.requestAuthorizer) {
       const authorizedHeaders = await ep.requestAuthorizer({
         url,
@@ -948,11 +984,12 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     bodyStr: string,
     metadata: RecordedPostMetadata,
     init: { signal?: AbortSignal } = {},
+    routeHeaders?: Readonly<Record<string, string>>,
   ): Promise<RecordedResponse> {
     const send = async (authRetry = false): Promise<RecordedResponse> => {
       // Authorization can fail before a network send, so build it before the
       // attempt row. The insert remains immediately adjacent to fetch.
-      const headers = await buildAuthHeaders(ep, url, 'POST', bodyStr);
+      const headers = await buildAuthHeaders(ep, url, 'POST', bodyStr, routeHeaders);
       const handle = usage.beginAttempt(metadata.context, {
         endpointKey: ep.name,
         apiMode: metadata.apiMode,
@@ -1130,9 +1167,14 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
   }
 
   // Build request body for OpenAI-compatible Chat Completions (vLLM).
-  /** Blessed per-request override beats the endpoint default; Ollama never overrides. */
+  /** Server-admitted route beats the legacy model override and endpoint default. */
   function effectiveModel(ep: Endpoint, req: ChatCompletionRequest): string {
-    return !ep.useOllamaApi && req.model ? req.model : ep.model;
+    return !ep.useOllamaApi ? (req.route?.model ?? req.model ?? ep.model) : ep.model;
+  }
+
+  function effectiveEndpoint(ep: Endpoint, req: ChatCompletionRequest): Endpoint {
+    if (ep.useOllamaApi || !req.route?.endpoint) return ep;
+    return { ...ep, url: req.route.endpoint, model: req.route.model };
   }
 
   function buildOpenAIBody(ep: Endpoint, req: ChatCompletionRequest): any {
@@ -1320,18 +1362,20 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     },
   ): Promise<ChatCompletionResponse> {
     // Serialize ONCE: SigV4 signs the payload hash, so the signed string and
-    // the sent string must be byte-identical.
-    const prepared = prepareBatchRequest(ep, req);
+    // the sent string must be byte-identical. An alternate route clones the
+    // endpoint so its health/retry state cannot poison the default provider.
+    const requestEp = effectiveEndpoint(ep, req);
+    const prepared = prepareBatchRequest(requestEp, req);
     const { isOllama, isResponses, url, body, bodyStr, size } = prepared;
-    const model = effectiveModel(ep, req);
-    const apiMode = isOllama ? 'ollama' : (ep.apiMode ?? 'chat-completions');
+    const model = effectiveModel(requestEp, req);
+    const apiMode = isOllama ? 'ollama' : (requestEp.apiMode ?? 'chat-completions');
     logLlmPrompt({
       url, model, apiMode, stream: false, request: body,
       bodyChars: size.bodyChars, bodyBytes: size.bodyBytes, imageCount: size.imageCount, imageChars: size.imageChars,
     });
 
     const { response: resp, handle } = await postWithAuthRetry(
-      ep,
+      requestEp,
       url,
       bodyStr,
       {
@@ -1343,12 +1387,13 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         fallback: options.fallback,
       },
       (() => {
-        const timeoutSignal = ep.timeoutMs > 0 ? AbortSignal.timeout(ep.timeoutMs) : undefined;
+        const timeoutSignal = requestEp.timeoutMs > 0 ? AbortSignal.timeout(requestEp.timeoutMs) : undefined;
         const signal = req.signal && timeoutSignal
           ? AbortSignal.any([req.signal, timeoutSignal])
           : req.signal ?? timeoutSignal;
         return signal ? { signal } : {};
       })(),
+      req.route?.headers,
     );
 
     if (resp.status === 429 || resp.status === 503) {
@@ -1359,7 +1404,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         usage: parseUsageFromText(detail, isOllama),
       });
       if (!options.healthNeutral) {
-        const wait = Math.min(1000 * Math.pow(2, ep.retryCount++), 30000);
+        const wait = Math.min(1000 * Math.pow(2, requestEp.retryCount++), 30000);
         await new Promise(r => setTimeout(r, wait));
       }
       throw new Error(`${resp.status} — retryable`);
@@ -1380,8 +1425,8 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       const data: any = await resp.json();
       parsedUsage = isOllama ? parseOllamaUsage(data) : parseProviderUsage(data);
       if (!options.healthNeutral) {
-        ep.retryCount = 0;
-        ep.healthy = true;
+        requestEp.retryCount = 0;
+        requestEp.healthy = true;
       }
       const result = isOllama
         ? parseOllamaResponse(data)
@@ -1461,7 +1506,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         apiMode: 'responses',
         stream: true,
         size,
-      }, { signal: streamSignal });
+      }, { signal: streamSignal }, req.route?.headers);
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
@@ -1737,16 +1782,17 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     req: ChatCompletionRequest,
     context: NormalizedLlmUsageContext,
   ): AsyncGenerator<StreamChunk, StreamResult, undefined> {
-    if (ep.apiMode === 'responses') {
-      return yield* streamResponsesEndpoint(ep, req, context);
+    const requestEp = effectiveEndpoint(ep, req);
+    if (requestEp.apiMode === 'responses') {
+      return yield* streamResponsesEndpoint(requestEp, req, context);
     }
     // Did the caller actually offer tools this turn? An empty array is a
     // deliberate "no tools" signal, not an omission.
     const toolsOffered = (req.tools?.length ?? 0) > 0;
-    const url = remoteRequestUrl(ep);
-    const model = effectiveModel(ep, req);
+    const url = remoteRequestUrl(requestEp);
+    const model = effectiveModel(requestEp, req);
     // Serialize ONCE — sigv4 signs the payload hash (see callEndpoint).
-    const openAiStreamBody = buildOpenAIStreamBody(ep, req);
+    const openAiStreamBody = buildOpenAIStreamBody(requestEp, req);
     const { bodyStr, size } = serializeProviderRequest(openAiStreamBody, maximumRequestBytes, req.payloadConstraint);
     logLlmPrompt({
       url, model, apiMode: 'chat-completions', stream: true, request: openAiStreamBody,
@@ -1780,13 +1826,13 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     resetIdleTimer(); // also covers time-to-first-byte (prefill)
     let recorded: RecordedResponse;
     try {
-      recorded = await postWithAuthRetry(ep, url, bodyStr, {
+      recorded = await postWithAuthRetry(requestEp, url, bodyStr, {
         context,
         model,
         apiMode: 'chat-completions',
         stream: true,
         size,
-      }, { signal: streamSignal });
+      }, { signal: streamSignal }, req.route?.headers);
     } catch (err) {
       if (idleTimer) clearTimeout(idleTimer);
       throw err;
@@ -1830,8 +1876,8 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       throw new Error('No response body for streaming');
     }
 
-    ep.healthy = true;
-    ep.retryCount = 0;
+    requestEp.healthy = true;
+    requestEp.retryCount = 0;
 
     // Accumulate full response
     let contentAcc = '';
@@ -2069,11 +2115,12 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     preflightPrimary(request: ChatCompletionRequest): PrimaryRequestPreflight {
       const primary = endpoints.find(endpoint => !endpoint.useOllamaApi);
       if (!primary) throw new Error('Primary visual-capable LLM endpoint is unavailable');
-      const prepared = prepareBatchRequest(primary, request);
+      const requestEp = effectiveEndpoint(primary, request);
+      const prepared = prepareBatchRequest(requestEp, request);
       return {
         ...prepared.size,
-        model: effectiveModel(primary, request),
-        apiMode: primary.apiMode,
+        model: effectiveModel(requestEp, request),
+        apiMode: requestEp.apiMode,
         maximumBytes: maximumRequestBytes,
         remainingBytes: Math.max(0, maximumRequestBytes - prepared.size.bodyBytes),
       };
@@ -2109,6 +2156,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           // poison health or fall through to a transport that would lose
           // image evidence; the owning loop gets one smaller recovery pass.
           if (isLlmPayloadTooLargeError(err)) throw err;
+          // A server-admitted alternate route is isolated from default health
+          // and must never fall through to a different local model.
+          if (request.route) throw err;
           ep.healthy = false;
           lastError = err;
           if (!config.fallbackEnabled) throw err;
@@ -2132,6 +2182,8 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         // A request-specific payload rejection says nothing about endpoint
         // health; preserve the endpoint and let the chat loop rebuild once.
         if (isLlmPayloadTooLargeError(err)) throw err;
+        // Alternate model routes never poison or fall back from the default.
+        if (request.route) throw err;
         ecsEp.healthy = false;
         throw err;
       }

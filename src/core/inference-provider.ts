@@ -80,37 +80,209 @@ const BEDROCK_ENDPOINT = 'https://bedrock-mantle.us-east-1.api.aws/openai/v1';
 // Responses family and context profile — only the model id changes.
 const BEDROCK_MODEL = 'openai.gpt-5.6-terra';
 
+export type ChatModelFamily = 'GPT-5.6' | 'GPT-6';
+
+export interface ChatModelCatalogOption {
+  readonly key: string;
+  readonly label: string;
+  readonly family: ChatModelFamily | 'Provider';
+  readonly isDefault: boolean;
+  readonly preview: boolean;
+}
+
+export interface ChatModelCatalog {
+  readonly defaultKey: string;
+  readonly models: readonly ChatModelCatalogOption[];
+}
+
+/** Server-only route; the browser receives only ChatModelCatalogOption. */
+export interface ChatModelRoute {
+  readonly model: string;
+  readonly endpoint?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
 /**
- * The blessed model choices (owner decision 2026-09-03): the gpt-5.6
- * Responses family ONLY — identical API mode, dialect, parameter quirks,
- * and 1M-token context profile, so switching between them is a pure
- * request-body change. Terra is the default for EVERY lane (chat and
- * background); the chat composer may override per message. Other gateway
- * models (Kimi, DeepSeek, …) are deliberately NOT offered: each would need
- * its own validated dialect/window profile (Claude models don't even speak
- * an API this client implements).
+ * Server-owned model profiles. GPT-5.6 keeps the proven provider-default
+ * Mantle target. GPT-6 Sol/Luna use one explicit east Mantle target so the
+ * gateway rewrites to the required /openai/v1 path. Astra uses a separate
+ * west gateway, Mantle target, and Project.
  */
 export const BLESSED_CHAT_MODELS = Object.freeze([
-  Object.freeze({ key: 'terra', label: 'Terra (default)', bareId: 'openai.gpt-5.6-terra' }),
-  Object.freeze({ key: 'luna', label: 'Luna', bareId: 'openai.gpt-5.6-luna' }),
-  Object.freeze({ key: 'sol', label: 'Sol', bareId: 'openai.gpt-5.6-sol' }),
+  Object.freeze({
+    key: 'terra', label: 'GPT-5.6 Terra', family: 'GPT-5.6',
+    bareId: 'openai.gpt-5.6-terra', route: 'provider-default' as const,
+  }),
+  Object.freeze({
+    key: 'luna', label: 'GPT-5.6 Luna', family: 'GPT-5.6',
+    bareId: 'openai.gpt-5.6-luna', route: 'provider-default' as const,
+  }),
+  Object.freeze({
+    key: 'sol', label: 'GPT-5.6 Sol', family: 'GPT-5.6',
+    bareId: 'openai.gpt-5.6-sol', route: 'provider-default' as const,
+  }),
+  Object.freeze({
+    key: 'gpt6-astra', label: 'GPT-6 Astra', family: 'GPT-6',
+    bareId: 'openai.gpt-6-astra', route: 'gpt6-astra-west' as const,
+  }),
+  Object.freeze({
+    key: 'gpt6-sol', label: 'GPT-6 Sol', family: 'GPT-6',
+    bareId: 'openai.gpt-6-sol', route: 'gpt6-east-mantle' as const,
+  }),
+  Object.freeze({
+    key: 'gpt6-luna', label: 'GPT-6 Luna', family: 'GPT-6',
+    bareId: 'openai.gpt-6-luna', route: 'gpt6-east-mantle' as const,
+  }),
 ] as const);
 export type BlessedModelKey = (typeof BLESSED_CHAT_MODELS)[number]['key'];
 
+interface Gpt6GatewayConfig {
+  readonly eastTarget: string;
+  readonly astraTarget: string;
+  readonly astraEndpoint: string;
+  readonly astraProject: string;
+}
+
+function gatewayTargetPrefix(model: string): string | null {
+  const slash = model.lastIndexOf('/');
+  // A target-qualified gateway id has a non-empty target before the slash.
+  // Local/Hugging Face model paths are rejected later unless their suffix is
+  // one of the exact proven provider-default profiles.
+  return slash > 0 && !model.startsWith('/') ? model.slice(0, slash + 1) : null;
+}
+
+function validatedTarget(value: string | undefined, setting: string): string {
+  const target = value?.trim() ?? '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/.test(target)) {
+    throw new Error(`${setting} must be one AgentCore target name without slashes.`);
+  }
+  return target;
+}
+
+function validatedAstraEndpoint(value: string | undefined): string {
+  const raw = value?.trim() ?? '';
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT must be the approved west AgentCore inference URL.');
+  }
+  const expectedHost = /^[a-z0-9-]+\.gateway\.bedrock-agentcore\.us-west-2\.amazonaws\.com$/;
+  if (url.protocol !== 'https:' || !expectedHost.test(url.hostname)
+    || url.username || url.password || url.search || url.hash
+    || url.pathname.replace(/\/+$/, '') !== '/inference/v1') {
+    throw new Error('BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT must be an HTTPS us-west-2 AgentCore /inference/v1 URL.');
+  }
+  return `${url.origin}/inference/v1`;
+}
+
+function gpt6GatewayConfig(env: NodeJS.ProcessEnv): Gpt6GatewayConfig | null {
+  const rollout = (env.BOTBOY_INFERENCE_GPT6_ROLLOUT ?? 'off').trim().toLowerCase();
+  if (rollout !== 'off' && rollout !== 'preview') {
+    throw new Error('Unsupported BOTBOY_INFERENCE_GPT6_ROLLOUT: use off or preview.');
+  }
+  if (rollout === 'off') return null;
+
+  const eastTarget = validatedTarget(
+    env.BOTBOY_INFERENCE_GPT6_EAST_TARGET,
+    'BOTBOY_INFERENCE_GPT6_EAST_TARGET',
+  );
+  const astraTarget = validatedTarget(
+    env.BOTBOY_INFERENCE_GPT6_ASTRA_TARGET,
+    'BOTBOY_INFERENCE_GPT6_ASTRA_TARGET',
+  );
+  const astraEndpoint = validatedAstraEndpoint(env.BOTBOY_INFERENCE_GPT6_ASTRA_ENDPOINT);
+  const astraProject = env.BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT?.trim() ?? '';
+  if (!/^proj_[a-z0-9]{20}$/.test(astraProject)) {
+    throw new Error('BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT must be the dedicated west Mantle Project id.');
+  }
+  return { eastTarget, astraTarget, astraEndpoint, astraProject };
+}
+
 /**
- * Resolve a blessed choice against the ACTIVE provider's default model id:
- * gateway ids carry the deployment target prefix ('bedrock-mantle-luna/'),
- * direct bedrock ids are bare — the prefix (everything through the last
- * '/') is inherited from the default id, so the qualification rule can
- * never drift from the provider. Unknown keys resolve to null: callers
- * fall back to the default model rather than sending arbitrary ids.
+ * Return only routes the active provider can actually serve. The browser owns
+ * no model ids, endpoints, targets, headers, or credentials.
  */
-export function resolveBlessedModelId(providerDefaultModel: string, key: unknown): string | null {
+export function getChatModelCatalog(
+  providerDefaultModel: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ChatModelCatalog {
+  const configuredGpt6 = gpt6GatewayConfig(env);
+  const defaultProfile = BLESSED_CHAT_MODELS.find(
+    candidate => candidate.route === 'provider-default'
+      && providerDefaultModel.endsWith(candidate.bareId),
+  );
+  const inheritedTarget = gatewayTargetPrefix(providerDefaultModel);
+  const directBedrock = defaultProfile ? providerDefaultModel === defaultProfile.bareId : false;
+  const supportsBlessedProfiles = Boolean(defaultProfile && (inheritedTarget || directBedrock));
+  if (!supportsBlessedProfiles) {
+    return {
+      defaultKey: 'default',
+      models: [{
+        key: 'default', label: 'Provider default', family: 'Provider', isDefault: true, preview: false,
+      }],
+    };
+  }
+
+  const gpt6 = inheritedTarget ? configuredGpt6 : null;
+  const models = BLESSED_CHAT_MODELS
+    .filter(model => model.route === 'provider-default' || gpt6 !== null)
+    .map(model => ({
+      key: model.key,
+      label: model.label,
+      family: model.family,
+      isDefault: model === defaultProfile,
+      preview: model.route !== 'provider-default',
+    }));
+  return {
+    defaultKey: defaultProfile?.key ?? 'default',
+    models: defaultProfile ? models : [
+      { key: 'default', label: 'Provider default', family: 'Provider', isDefault: true, preview: false },
+      ...models,
+    ],
+  };
+}
+
+/** Resolve one admitted key to its exact internal provider route. */
+export function resolveBlessedModelRoute(
+  providerDefaultModel: string,
+  key: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): ChatModelRoute | null {
   const entry = BLESSED_CHAT_MODELS.find(candidate => candidate.key === key);
   if (!entry) return null;
-  const slash = providerDefaultModel.lastIndexOf('/');
-  const prefix = slash >= 0 ? providerDefaultModel.slice(0, slash + 1) : '';
-  return `${prefix}${entry.bareId}`;
+  const defaultProfile = BLESSED_CHAT_MODELS.find(
+    candidate => candidate.route === 'provider-default'
+      && providerDefaultModel.endsWith(candidate.bareId),
+  );
+  if (!defaultProfile) return null;
+
+  const target = gatewayTargetPrefix(providerDefaultModel);
+  const directBedrock = providerDefaultModel === defaultProfile.bareId;
+  if (!target && !directBedrock) return null;
+  if (entry.route === 'provider-default') {
+    return { model: `${target ?? ''}${entry.bareId}` };
+  }
+
+  const config = target ? gpt6GatewayConfig(env) : null;
+  if (!config) return null;
+  if (entry.route === 'gpt6-astra-west') {
+    return {
+      model: `${config.astraTarget}/${entry.bareId}`,
+      endpoint: config.astraEndpoint,
+      headers: { 'OpenAI-Project': config.astraProject },
+    };
+  }
+  return { model: `${config.eastTarget}/${entry.bareId}` };
+}
+
+/** Backward-compatible model-only projection used by focused callers/tests. */
+export function resolveBlessedModelId(
+  providerDefaultModel: string,
+  key: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  return resolveBlessedModelRoute(providerDefaultModel, key, env)?.model ?? null;
 }
 const BEDROCK_MAX_CONTEXT_TOKENS = 1_000_000;
 const LEGACY_BEDROCK_MODEL = 'moonshotai.kimi-k2.5';
