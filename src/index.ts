@@ -11,7 +11,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
 import { createMcpManager } from './core/mcp-manager.js';
-import { createAnalyticsDashboardService, parseSqlMcpResult, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
+import { sqlContextExportDir } from './core/mcp-profiles.js';
+import { createSqlContextExportRunner } from './core/analytics-sql-export.js';
+import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
 import { createDashboardEtlRunner } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
@@ -456,25 +458,9 @@ async function main() {
     localQuery: analyticsLocalQuery,
     dataRoom: analyticsDataRoom,
     etlRunner: analyticsAnswerEtlRunner,
-    sqlRunner: {
-      execute: async sql => {
-        const call = await mcpManager.callTool(
-          'sql-context',
-          'run_query',
-          { sql },
-          { source: 'agent', timeoutMs: 35 * 60_000 },
-        );
-        if (call.isError) throw new Error(call.text || 'SQL preparation query failed.');
-        const parsed = parseSqlMcpResult(call.text);
-        return {
-          columns: parsed.columns,
-          rows: parsed.rows,
-          rowCount: parsed.rowCount,
-          displayedRowCount: parsed.displayedRowCount,
-          truncated: parsed.displayedRowCount !== parsed.rowCount,
-        };
-      },
-    },
+    // Complete exact results through export_query (sql-context 1.5); run_query
+    // pages are sized for model context and never feed a dataset.
+    sqlRunner: createSqlContextExportRunner({ mcpManager, exportDir: sqlContextExportDir() }),
     modelContextRuntime: answerProviderReceipt,
     documentParser,
   });

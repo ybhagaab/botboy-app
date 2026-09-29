@@ -1,6 +1,5 @@
 import Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
-import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -24,11 +23,13 @@ import {
   resolveDefinitionExecutable,
   sanitizeMcpError,
   SQL_CONTEXT_PROFILE_ID,
+  sqlContextExportDir,
   type McpServerDefinition,
 } from './mcp-profiles.js';
 import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-session.js';
 import { createMcpTerminalEngine } from './mcp-terminal.js';
 import { modelProcessSandboxInvocation } from './protected-local-resources.js';
+import { createSqlContextPackageResolver, type SqlContextPackageResolver } from './sql-context-package.js';
 import type {
   BuiltInMcpProfileId,
   McpCallOptions,
@@ -49,7 +50,6 @@ import type {
   SqlSslMode,
 } from './mcp-types.js';
 
-const require = createRequire(import.meta.url);
 const SQL_SERVER_ID = SQL_CONTEXT_PROFILE_ID;
 
 const HEALTH_INTERVAL_MS = 60_000;
@@ -322,7 +322,7 @@ function extractResult(result: any): { text: string; isError: boolean; structure
   };
 }
 
-function sqlEnvironment(config: SqlContextMcpConfig, password: string | null): Record<string, string> {
+export function sqlEnvironment(config: SqlContextMcpConfig, password: string | null): Record<string, string> {
   const env = getDefaultEnvironment();
   for (const key of AWS_ENV_KEYS) {
     const value = process.env[key];
@@ -348,16 +348,24 @@ function sqlEnvironment(config: SqlContextMcpConfig, password: string | null): R
   if (config.contextSource === 'file') values.SQL_CONTEXT_FILE = config.contextValue;
   if (config.contextSource === 's3') values.SQL_CONTEXT_S3 = config.contextValue;
   if (config.contextSource === 'url') values.SQL_CONTEXT_URL = config.contextValue;
-  return { ...env, ...values };
+  // Exports and paging spools land in the files workspace, where the shell,
+  // local_file imports, and /api/files can use them.
+  return { ...env, ...values, SQL_EXPORT_DIR: sqlContextExportDir() };
 }
 
 export function createMcpManager(options: {
   db: Database.Database;
   secretStore?: McpSecretStore;
   healthIntervalMs?: number;
+  /** Which sql-context copy to launch; defaults to the npm auto-updating resolver. */
+  sqlContextPackages?: SqlContextPackageResolver;
 }): McpManager {
   const db = options.db;
   const secretStore = options.secretStore ?? createMcpSecretStore();
+  const sqlContextPackages = options.sqlContextPackages ?? createSqlContextPackageResolver();
+  // Ends an in-progress connector update check or npm install when the
+  // manager stops, so process shutdown never waits for a download.
+  let launchPreparation = new AbortController();
   const runtimes = new Map<string, RuntimeState>();
   const startLocks = new Map<string, Promise<void>>();
   const setupLocks = new Map<string, Promise<McpSetupActionResult>>();
@@ -573,12 +581,21 @@ export function createMcpManager(options: {
           updateState(serverId, 'needs_configuration', { error: `Missing ${missing.join(', ')}`, pid: null });
           return;
         }
-        const entry = require.resolve('sql-context-presets-mcp/dist/index.js');
+        // The connector keeps its own release lifecycle: the newest 1.x copy,
+        // updated from npm at launch, with BotBoy's bundled copy as fallback.
+        let copy: Awaited<ReturnType<SqlContextPackageResolver['resolveLaunch']>>;
+        try {
+          copy = await sqlContextPackages.resolveLaunch({ signal: launchPreparation.signal });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          updateState(serverId, 'failed', { error: message, pid: null });
+          throw new Error(`Could not start ${profile.displayName}: ${message}`);
+        }
         transport = new StdioClientTransport({
           command: process.execPath,
-          args: [entry],
+          args: [copy.entry],
           env: sqlEnvironment(config, password),
-          cwd: path.dirname(entry),
+          cwd: path.dirname(copy.entry),
           stderr: 'pipe',
         });
       } else {
@@ -762,6 +779,7 @@ export function createMcpManager(options: {
     runtime: RuntimeState,
     operation: () => Promise<T>,
     source = 'system',
+    signal?: AbortSignal,
   ): Promise<T> {
     const limit = concurrencyLimitFor(serverId);
     const sourceLimit = sourceLimitFor(serverId, source);
@@ -776,8 +794,18 @@ export function createMcpManager(options: {
         })
         && !runtime.expectedClose && runtimes.get(serverId) === runtime
       ) {
-        await new Promise<void>((resolve) => runtime.callWaiters.push(resolve));
+        signal?.throwIfAborted();
+        // A cancelled caller leaves the queue at once instead of waiting for a lane.
+        await new Promise<void>((resolve) => {
+          const onAbort = () => resolve();
+          runtime.callWaiters.push(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+          });
+          signal?.addEventListener('abort', onAbort, { once: true });
+        });
       }
+      signal?.throwIfAborted();
       if (runtime.expectedClose || runtimes.get(serverId) !== runtime) {
         throw new Error(`MCP server '${serverId}' runtime changed before the queued call could start`);
       }
@@ -832,8 +860,16 @@ export function createMcpManager(options: {
       const response = await queueRuntimeCall(serverId, runtime, () => runtime.client.callTool(
         { name: toolName, arguments: validatedArgs },
         undefined,
-        { timeout: options.timeoutMs ?? 60_000 },
-      ), options.source ?? 'api');
+        {
+          // An idle window, never a cap on active work: asking for progress
+          // lets a server that reports it keep a long query alive, and each
+          // report restarts the window. No maximum total time is set.
+          timeout: options.timeoutMs ?? 60_000,
+          resetTimeoutOnProgress: true,
+          onprogress: () => {},
+          ...(options.signal ? { signal: options.signal } : {}),
+        },
+      ), options.source ?? 'api', options.signal);
       const extracted = extractResult(response);
       const durationMs = Date.now() - started;
       db.prepare(`
@@ -1292,6 +1328,7 @@ export function createMcpManager(options: {
       for (const timer of restartTimers.values()) clearTimeout(timer);
       restartTimers.clear();
       for (const controller of setupAbortControllers.values()) controller.abort();
+      launchPreparation.abort();
       terminalEngine.shutdown();
 
       // Remove published runtimes before draining queued work. Closing the
@@ -1325,19 +1362,28 @@ export function createMcpManager(options: {
       }
       stopping = false;
       active = true;
+      if (launchPreparation.signal.aborted) launchPreparation = new AbortController();
       const enabled = db.prepare('SELECT id FROM mcp_servers WHERE enabled = 1').all() as { id: string }[];
-      for (const server of enabled) {
-        if (!active || stopping) break;
+      const launch = async (serverId: string): Promise<void> => {
         try {
-          await startServer(server.id);
-          const runtime = runtimes.get(server.id);
-          if (runtime && server.id === SQL_SERVER_ID) void checkConnectionIfIdle(server.id, runtime).catch((error) => {
-            updateState(server.id, 'degraded', { error: truncateError(error) });
+          await startServer(serverId);
+          const runtime = runtimes.get(serverId);
+          if (runtime && serverId === SQL_SERVER_ID) void checkConnectionIfIdle(serverId, runtime).catch((error) => {
+            updateState(serverId, 'degraded', { error: truncateError(error) });
           });
         } catch (error) {
-          scheduleRestart(server.id, describeProfileError(definitionFor(server.id), error));
+          scheduleRestart(serverId, describeProfileError(definitionFor(serverId), error));
         }
+      };
+      // sql-context may first install a connector update from npm; the other
+      // servers start in order without waiting for that download.
+      const sqlLaunch = enabled.some(server => server.id === SQL_SERVER_ID) ? launch(SQL_SERVER_ID) : null;
+      for (const server of enabled) {
+        if (!active || stopping) break;
+        if (server.id === SQL_SERVER_ID) continue;
+        await launch(server.id);
       }
+      if (sqlLaunch) await sqlLaunch;
       if (!active || stopping) return;
       healthTimer = setInterval(() => { void healthTick(); }, options.healthIntervalMs ?? HEALTH_INTERVAL_MS);
       healthTimer.unref?.();

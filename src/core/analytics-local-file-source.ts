@@ -552,19 +552,26 @@ export function typeAnalyticsLocalTable(
   schema: AnalyticsFieldContract[],
   nullToken: string | undefined,
   paths: { source: string; schema: string; fixedDatasetId?: string },
-  options: { withholdValues?: boolean } = {},
+  options: {
+    withholdValues?: boolean;
+    /** 'query': the table is a warehouse query result, so fixes name the query, not a file. */
+    origin?: 'file' | 'query';
+  } = {},
 ): { columns: string[]; rows: AnalyticsDataCell[][] } {
+  const query = options.origin === 'query';
   const names = schema.map(field => field.name);
   const missing = names.filter(name => !table.header.includes(name));
   const extra = table.header.filter(name => !names.includes(name));
   const header = `[${table.header.map(name => JSON.stringify(name)).join(', ')}]`;
   if (missing.length || extra.length) {
-    reject('invalid_input', 'Schema columns differ from the file header.', dataRoomIssue({
+    reject('invalid_input', query ? 'Schema columns differ from the query result columns.' : 'Schema columns differ from the file header.', dataRoomIssue({
       code: 'columns_mismatch', path: paths.schema,
-      message: paths.fixedDatasetId
-        ? `The ${table.sheet ? `sheet ${JSON.stringify(table.sheet)} ` : ''}header is exactly ${header}, but dataset ${paths.fixedDatasetId} has columns [${names.map(name => JSON.stringify(name)).join(', ')}] (order may differ).${missing.length ? ` Missing from file: ${missing.join(', ')}.` : ''}${extra.length ? ` Not in the dataset: ${extra.join(', ')}.` : ''} Pick the dataset whose columns match, or create a new dataset from this file with target.`
-        : `The ${table.sheet ? `sheet ${JSON.stringify(table.sheet)} ` : ''}header is exactly ${header}. Declare each file column exactly once by the same name (order may differ).${missing.length ? ` Not in file: ${missing.join(', ')}.` : ''}${extra.length ? ` Not declared: ${extra.join(', ')}.` : ''}`,
-      expected: { kind: 'relation', description: 'Schema column-name set equals the file header set.' }, received: names,
+      message: query
+        ? `The query returned exactly the columns ${header}. Declare each result column exactly once by the same name (order may differ), or change the SELECT list.${missing.length ? ` Not returned: ${missing.join(', ')}.` : ''}${extra.length ? ` Not declared: ${extra.join(', ')}.` : ''}`
+        : paths.fixedDatasetId
+          ? `The ${table.sheet ? `sheet ${JSON.stringify(table.sheet)} ` : ''}header is exactly ${header}, but dataset ${paths.fixedDatasetId} has columns [${names.map(name => JSON.stringify(name)).join(', ')}] (order may differ).${missing.length ? ` Missing from file: ${missing.join(', ')}.` : ''}${extra.length ? ` Not in the dataset: ${extra.join(', ')}.` : ''} Pick the dataset whose columns match, or create a new dataset from this file with target.`
+          : `The ${table.sheet ? `sheet ${JSON.stringify(table.sheet)} ` : ''}header is exactly ${header}. Declare each file column exactly once by the same name (order may differ).${missing.length ? ` Not in file: ${missing.join(', ')}.` : ''}${extra.length ? ` Not declared: ${extra.join(', ')}.` : ''}`,
+      expected: { kind: 'relation', description: query ? 'Schema column-name set equals the query result column set.' : 'Schema column-name set equals the file header set.' }, received: names,
     }));
   }
   const token = nullToken ?? '';
@@ -577,7 +584,9 @@ export function typeAnalyticsLocalTable(
     if (converted.ok) return converted.value;
     failed.add(fieldIndex);
     if (issues.length < MAX_ISSUES) {
-      const where = coordinate(table, row.rowNumber, indexes[fieldIndex]);
+      const where = query
+        ? `result row ${row.rowNumber - 1}`
+        : coordinate(table, row.rowNumber, indexes[fieldIndex]);
       const fixed = paths.fixedDatasetId;
       // Same model-context rule as the profile: structure always, cell values only when allowed.
       const found = converted.sample === undefined
@@ -588,11 +597,15 @@ export function typeAnalyticsLocalTable(
         path: fixed
           ? `${paths.source}.${converted.nullViolation ? 'nullToken' : 'path'}`
           : `${paths.schema}[${fieldIndex}].${converted.nullViolation ? 'nullable' : 'logicalType'}`,
-        message: fixed
-          ? `Dataset ${fixed} declares column ${JSON.stringify(field.name)} as ${converted.nullViolation ? 'non-nullable' : field.logicalType}, but ${where} ${converted.nullViolation ? 'is empty' : `holds ${found}`}. The existing contract cannot change here: correct nullToken if that text marks missing values, or import this file as a new dataset with target.`
-          : converted.nullViolation
-            ? `Column ${JSON.stringify(field.name)} is declared non-nullable but ${where} is empty. Declare nullable:true, or choose the correct nullToken.`
-            : `Column ${JSON.stringify(field.name)} is declared ${field.logicalType} but ${where} holds ${found}. Declare a logicalType every cell satisfies (inspect_local_file reports compatibleTypes), or set ${paths.source}.nullToken if that text marks a missing value.`,
+        message: query
+          ? converted.nullViolation
+            ? `Column ${JSON.stringify(field.name)} is declared non-nullable but ${where} is NULL. Declare nullable:true, or filter or COALESCE the NULLs in the query.`
+            : `Column ${JSON.stringify(field.name)} is declared ${field.logicalType} but ${where} holds ${found}. Declare a logicalType every value satisfies, or convert the column in the query (dates as YYYY-MM-DD; timestamps as ISO 8601 with a zone, e.g. TO_CHAR(ts, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') for UTC).`
+          : fixed
+            ? `Dataset ${fixed} declares column ${JSON.stringify(field.name)} as ${converted.nullViolation ? 'non-nullable' : field.logicalType}, but ${where} ${converted.nullViolation ? 'is empty' : `holds ${found}`}. The existing contract cannot change here: correct nullToken if that text marks missing values, or import this file as a new dataset with target.`
+            : converted.nullViolation
+              ? `Column ${JSON.stringify(field.name)} is declared non-nullable but ${where} is empty. Declare nullable:true, or choose the correct nullToken.`
+              : `Column ${JSON.stringify(field.name)} is declared ${field.logicalType} but ${where} holds ${found}. Declare a logicalType every cell satisfies (inspect_local_file reports compatibleTypes), or set ${paths.source}.nullToken if that text marks a missing value.`,
         expected: converted.nullViolation
           ? { kind: 'literal', value: true }
           : { kind: 'enum', values: LOGICAL_TYPES },

@@ -80,6 +80,9 @@ export function createFilesRouter(_deps: RouterDeps): Router {
         if (entry.name.startsWith('.')) continue;
         const full = path.join(dir, entry.name);
         const relName = rel ? `${rel}/${entry.name}` : entry.name;
+        // The SQL connector's paging spool (sql-exports/<process>/spool) is
+        // its working storage, not an export; exports stay listed.
+        if (entry.isDirectory() && /^sql-exports\/[^/]+\/spool$/.test(relName)) continue;
         if (entry.isDirectory()) {
           await walk(full, relName);
         } else if (entry.isFile()) {

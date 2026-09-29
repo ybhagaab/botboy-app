@@ -107,6 +107,22 @@ Always use this updater instead of `git pull`. It preserves compatible tracked
 customizations, saves overlaps for deliberate reapplication, and never removes
 untracked files or home-directory evidence.
 
+If an old process exited without a DB-last receipt, BotBoy blocks replacement
+rather than guessing that SQLite closed cleanly. Do not delete the guard or kill
+a PID from the message. If this checkout predates the recovery helper, fetch the
+new release without starting, then run the explicit recovery:
+
+```bash
+cd ~/botboy-app
+BOTBOY_UPDATE_NO_START=1 ./start.sh --update  # only if helper is missing
+./start.sh --doctor
+./start.sh --recover-shutdown
+./start.sh
+```
+
+Recovery runs only on a stopped database, makes and verifies an exact private
+DB/WAL/SHM snapshot, archives the guard, and never calls the old exit clean.
+
 ## Privacy
 
 BotBoy is single-user and local-first. Its evidence database, document copies,

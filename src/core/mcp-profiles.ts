@@ -27,6 +27,20 @@ import type {
 } from './mcp-types.js';
 
 export const SQL_CONTEXT_PROFILE_ID = 'sql-context' as const;
+
+/**
+ * Base folder for sql-context `export_query` and paging files
+ * (SQL_EXPORT_DIR), inside BotBoy's files workspace so an export is directly
+ * usable: the model's sandboxed shell can analyze it, a `local_file` source
+ * can import it into the Data Room, and /api/files can serve it to the owner.
+ * The server writes one private `<pid>-<start>/{exports,spool}/` folder per
+ * process and deletes the folders of dead processes when it next starts, so
+ * files worth keeping are copied or imported. Paging and export behavior are
+ * the server's own defaults; BotBoy sets only this folder.
+ */
+export function sqlContextExportDir(homeDir = os.homedir()): string {
+  return path.join(homeDir, '.personal-productivity-tracker', 'files', 'sql-exports');
+}
 export const GRASP_PROFILE_ID = 'grasp-m365' as const;
 export const SLACK_MCP_PROFILE_ID = 'slack' as const;
 export const SHAREPOINT_MCP_PROFILE_ID = 'sharepoint' as const;
@@ -277,7 +291,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
     kind: SQL_CONTEXT_PROFILE_ID,
     displayName: 'SQL / Redshift',
     shortName: 'SQL MCP',
-    packageVersion: '1.4.0',
+    packageVersion: '1.5.0',
     launch: Object.freeze({ type: 'sql-context-package' as const }),
     setupActions: Object.freeze([]),
     terminalCommands: Object.freeze([]),
@@ -289,8 +303,12 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
       // warehouse never queued (stl_wlm_query queue_s=0 throughout). 1.4.0
       // executes via pool.query, so lanes now translate to real warehouse
       // concurrency. 4 total (owner's number) with dashboards capped at 3
-      // keeps one slot always reachable for chat. Re-measure with 1.4.0
-      // before raising: warehouse behavior at true 4+ wide is unproven.
+      // keeps one slot always reachable for chat. Re-measure before raising:
+      // warehouse behavior at true 4+ wide is unproven. 1.5 keeps pool.query
+      // and adds paging (owner 2026-09-29: needed): a result being spooled
+      // or held as an open cursor keeps a pooled connection after its call
+      // returns, bounded by the server's own caps (3 cursors, 2 exports,
+      // pool of 10) rather than these lanes.
       maxConcurrentCalls: 4,
       sourceLimits: Object.freeze({ dashboard: 3 }),
       exposeToolDescriptors: true,

@@ -17,6 +17,10 @@ fi
 #   ./start.sh --stop        stop every running BotBoy server and exit
 #   ./start.sh --doctor      print a diagnostic report (paste it when asking
 #                            for help) and exit; changes nothing
+#   ./start.sh --recover-shutdown
+#                            explicit receipt-less legacy recovery: refuse live
+#                            processes/DB handles, snapshot DB+WAL+SHM, verify
+#                            a copy, archive the guard, and exit without start
 #   ./start.sh --update      back up tracked BotBoy customizations, fast-forward
 #                            the owner release, three-way reapply clean changes,
 #                            preserve overlaps for rebase, rebuild, and start.
@@ -31,6 +35,7 @@ FOREGROUND=0
 OPEN_WINDOW_ONLY=0
 STOP_ONLY=0
 DOCTOR=0
+RECOVER_SHUTDOWN=0
 UPDATE_ONLY=0
 [ "$1" = "--foreground" ] && FOREGROUND=1
 # --open-window: just focus/open the dashboard window (used when BotBoy.app's
@@ -38,6 +43,7 @@ UPDATE_ONLY=0
 [ "$1" = "--open-window" ] && OPEN_WINDOW_ONLY=1
 [ "$1" = "--stop" ] && STOP_ONLY=1
 [ "$1" = "--doctor" ] && DOCTOR=1
+[ "$1" = "--recover-shutdown" ] && RECOVER_SHUTDOWN=1
 [ "$1" = "--update" ] && UPDATE_ONLY=1
 
 # Resolve the project dir from THIS script's location — never hardcode, or the
@@ -65,6 +71,14 @@ if [ "$UPDATE_ONLY" = "1" ]; then
   fi
   if ! git -C "$PROJ_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "❌ This botboy-app install is not a Git checkout. Re-clone it to update."
+    exit 1
+  fi
+  UPDATE_SAFETY_BLOCK="${PPT_STARTUP_SAFETY_BLOCK:-/tmp/ppt-startup-safety-block.json}"
+  if [ -f "$UPDATE_SAFETY_BLOCK" ]; then
+    echo "❌ Update paused: an earlier shutdown is still unverified."
+    echo "    Run: ./start.sh --doctor"
+    echo "    Then: ./start.sh --recover-shutdown"
+    echo "    The updater will not replace the existing guard or change Git state."
     exit 1
   fi
 
@@ -169,6 +183,19 @@ fi
 # Make the chosen node's bin dir visible to child processes (npm, npx).
 PATH="$(dirname "$NODE"):$PATH"
 export PATH
+
+if [ "$RECOVER_SHUTDOWN" = "1" ]; then
+  RECOVERY_SCRIPT="$PROJ_DIR/scripts/recover-shutdown.mjs"
+  if [ ! -f "$RECOVERY_SCRIPT" ]; then
+    echo "❌ Shutdown recovery helper is missing; update BotBoy without starting, then retry."
+    echo "    BOTBOY_UPDATE_NO_START=1 ./start.sh --update"
+    exit 1
+  fi
+  PPT_STARTUP_SAFETY_BLOCK="$STARTUP_SAFETY_BLOCK" \
+  PPT_SHUTDOWN_RECEIPT_DIR="$SHUTDOWN_RECEIPT_DIR" \
+  PPT_PID_FILE="$PID_FILE" \
+    exec "$NODE" "$RECOVERY_SCRIPT"
+fi
 
 server_is_ready() {
   local expected_pid="${1:-}"
@@ -466,21 +493,49 @@ open_dashboard_window() {
     # if its URL has already become chrome-error://.
     PRELAUNCH_TARGET_IDS=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
       | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).filter(x=>x.type==='page').map(x=>String(x.id||'')).filter(Boolean).join('\n'))}catch{}})" 2>/dev/null)
+    local window_started=$SECONDS
     "$CHROME" \
       --user-data-dir="$DEBUG_PROFILE" \
       --app="$REOPEN_URL" >/dev/null 2>&1 &
+    # Chrome can take several seconds to open an --app window while it is
+    # busy (large profile, many tabs, a cold hand-off to the running debug
+    # instance). The old ~2 s poll gave up before the window appeared on a
+    # 2026-09-29 restart, and the launcher then stopped a healthy server.
+    # Wait up to BOTBOY_WINDOW_WAIT_SECONDS (default 20) and claim only a page
+    # that looks like this launch (the dashboard URL, a connection-error page,
+    # or a blank page still loading), so a tab the owner opens meanwhile is
+    # never taken for it. Only a gone server PID ends the wait early: a slow
+    # version API during boot is not a reason to give up on the window, and
+    # the readiness check after the window appears still decides the outcome.
+    local window_wait="${BOTBOY_WINDOW_WAIT_SECONDS:-20}"
+    [[ "$window_wait" =~ ^[0-9]+$ ]] || window_wait=20
+    local window_deadline=$((SECONDS + window_wait))
+    local server_gone=0
     NEW_DASH_TARGET=""
-    for _ in $(seq 1 10); do
+    while :; do
       NEW_DASH_TARGET=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
-        | BOTBOY_PRELAUNCH_TARGET_IDS="$PRELAUNCH_TARGET_IDS" "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const old=new Set(String(process.env.BOTBOY_PRELAUNCH_TARGET_IDS||'').split('\n').filter(Boolean));const t=JSON.parse(d).find(x=>x.type==='page'&&x.id&&!old.has(String(x.id)));process.stdout.write(String(t?.id||''))}catch{}})" 2>/dev/null)
+        | BOTBOY_PRELAUNCH_TARGET_IDS="$PRELAUNCH_TARGET_IDS" "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const old=new Set(String(process.env.BOTBOY_PRELAUNCH_TARGET_IDS||'').split('\n').filter(Boolean));const launched=u=>u===''||u==='about:blank'||u.startsWith('chrome-error://')||u.startsWith('http://localhost:7778')||u.startsWith('http://127.0.0.1:7778');const t=JSON.parse(d).find(x=>x.type==='page'&&x.id&&!old.has(String(x.id))&&launched(String(x.url||'')));process.stdout.write(String(t?.id||''))}catch{}})" 2>/dev/null)
       [ -n "$NEW_DASH_TARGET" ] && break
-      sleep 0.2
+      if [ -n "$expected_pid" ] && ! kill -0 "$expected_pid" 2>/dev/null; then
+        server_gone=1
+        break
+      fi
+      [ "$SECONDS" -ge "$window_deadline" ] && break
+      sleep 0.25
     done
     if [ -z "$NEW_DASH_TARGET" ]; then
-      echo "❌ Chrome did not create a dashboard window."
+      if [ "$server_gone" = "1" ]; then
+        echo "❌ BotBoy stopped before its dashboard window opened."
+        echo "    Run: ./start.sh --doctor"
+        echo "    Runtime log: $LOG_FILE"
+        return 1
+      fi
+      echo "❌ Chrome did not create a dashboard window within ${window_wait}s."
       echo "    Run: ./start.sh --doctor"
       return 1
     fi
+    local window_seconds=$((SECONDS - window_started))
+    [ "$window_seconds" -ge 3 ] && echo "ℹ️  Chrome took ${window_seconds}s to open the dashboard window"
     sleep 2
     if startup_target_is_ready "$expected_pid"; then
       echo "✅ Dashboard ready: $REOPEN_URL"
@@ -562,7 +617,8 @@ write_shutdown_safety_block() {
     const notBeforeMs = Number(process.argv[3]);
     const pids = process.argv.slice(4).map(Number);
     if (!Number.isFinite(notBeforeMs) || notBeforeMs <= 0
-        || pids.length === 0 || pids.some(pid => !Number.isInteger(pid) || pid <= 0)) {
+        || pids.length === 0 || pids.length > 20
+        || pids.some(pid => !Number.isInteger(pid) || pid <= 0)) {
       process.exit(1);
     }
     const value = {
@@ -1047,6 +1103,13 @@ fi
 
 # ── --stop: clean shutdown of every tracker process ──
 if [ "$STOP_ONLY" = "1" ]; then
+  if [ -f "$STARTUP_SAFETY_BLOCK" ]; then
+    echo "❌ BotBoy stop refused: an earlier shutdown guard is unresolved."
+    echo "    Run: ./start.sh --doctor"
+    echo "    Then: ./start.sh --recover-shutdown"
+    echo "    The existing guard was not replaced."
+    exit 1
+  fi
   if ! pgrep -f 'node dist/index.js' >/dev/null 2>&1; then
     rm -f "$PID_FILE"
     echo "ℹ️  BotBoy is not running"
@@ -1078,6 +1141,16 @@ if [ "$DOCTOR" = "1" ]; then
   echo "checkout-mode: $([ "$BOTBOY_RELEASE_CHECKOUT" = "1" ] && echo 'teammate release (customizations supported)' || echo 'development')"
   TRACKED_DIRTY_COUNT=$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
   echo "tracked local changes: ${TRACKED_DIRTY_COUNT:-unknown}$([ "${TRACKED_DIRTY_COUNT:-0}" != "0" ] && echo ' — run ./start.sh --update before pulling' || true)"
+  if [ -f "$PROJ_DIR/scripts/recover-shutdown.mjs" ]; then
+    PPT_STARTUP_SAFETY_BLOCK="$STARTUP_SAFETY_BLOCK" \
+    PPT_SHUTDOWN_RECEIPT_DIR="$SHUTDOWN_RECEIPT_DIR" \
+    PPT_PID_FILE="$PID_FILE" \
+      "$NODE" "$PROJ_DIR/scripts/recover-shutdown.mjs" --inspect
+  elif [ -f "$STARTUP_SAFETY_BLOCK" ]; then
+    echo "shutdown recovery: BLOCKED helper=missing next=update-without-start"
+  else
+    echo "shutdown recovery: no active safety guard"
+  fi
   if xcode-select -p >/dev/null 2>&1; then echo "xcode-clt: installed"; else echo "xcode-clt: MISSING — run: xcode-select --install"; fi
   [ -x "$CHROME" ] && echo "chrome: installed" || echo "chrome: MISSING at $CHROME"
   [ -f "$PROJ_DIR/dist/index.js" ] && echo "build: dist/index.js present" || echo "build: MISSING — run: npm run build"

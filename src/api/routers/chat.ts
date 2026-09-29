@@ -1792,6 +1792,11 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               if (tc.function.name === 'get_document_writing_guide') {
                 documentAuthoringThink = true;
               }
+              // An MCP call that produced a file in the files workspace (a SQL
+              // export) is a real local effect: "saved to …" is then true.
+              if (tc.function.name === 'mcp_call_tool' && String(result?.content ?? '').includes('"botboyFiles"')) {
+                writeToolCalled = true;
+              }
               if (toolCallMayWrite(tc)) {
                 const dataRoomTool = dataRoomChatToolName(tc.function.name);
                 writeToolCalled ||= dataRoomTool

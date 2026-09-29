@@ -2,6 +2,12 @@ import type { McpToolRisk } from './mcp-types.js';
 
 const SQL_CONTEXT_READ_TOOLS = new Set([
   'run_query',
+  // sql-context-presets-mcp 1.5: read pages of an existing result, stream a
+  // complete read-only result to a private local file, and check/cancel that
+  // export. None changes warehouse data; export SQL passes the same wall.
+  'fetch_rows',
+  'export_query',
+  'export_status',
   'list_schemas',
   'list_tables',
   'describe_table',
@@ -10,6 +16,13 @@ const SQL_CONTEXT_READ_TOOLS = new Set([
   'get_schema_context',
   'list_presets',
 ]);
+
+/**
+ * sql-context tools known to execute caller SQL. The read-only wall also
+ * covers ANY sql-context call that carries a `sql` argument, so a tool added
+ * by a future connector release is checked without a BotBoy change.
+ */
+const SQL_CONTEXT_SQL_TOOLS = new Set(['run_query', 'export_query']);
 
 const FORBIDDEN_SQL_TOKENS = new Set([
   'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'UPSERT', 'REPLACE',
@@ -323,7 +336,10 @@ const READ_NAME_PATTERN = /^(get|list|search|read|describe|query|fetch|show|stat
  */
 export function classifyMcpTool(serverKind: string, toolName: string): McpToolRisk {
   if (serverKind === 'sql-context') {
-    return SQL_CONTEXT_READ_TOOLS.has(toolName) ? 'read' : 'write';
+    // Known tools first; a tool from a newer connector release is classified
+    // by name like any user-added MCP (reads free, anything else needs an
+    // owner request). SQL arguments are checked regardless (validateMcpToolCall).
+    return SQL_CONTEXT_READ_TOOLS.has(toolName) || READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
   }
   if (serverKind === 'grasp-m365') {
     if (GRASP_READ_TOOLS.has(toolName)) return 'read';
@@ -386,7 +402,12 @@ export function validateMcpToolCall(
       `MCP tool '${toolName}' changes external data and was blocked: it requires an explicit owner request (ownerRequested=true) in the current conversation`,
     );
   }
-  if (serverKind === 'sql-context' && toolName === 'run_query') {
+  // Every call that executes caller SQL passes the one read-only wall. 1.5
+  // runs multi-statement scripts (BEGIN/COMMIT, SET) as written and does not
+  // enforce read-only itself, so the rule follows the argument, not a tool
+  // list: any sql-context call carrying `sql` is checked, whatever its name.
+  if (serverKind === 'sql-context'
+    && (SQL_CONTEXT_SQL_TOOLS.has(toolName) || Object.prototype.hasOwnProperty.call(args, 'sql'))) {
     return { ...args, sql: validateReadOnlySql(args.sql) };
   }
   return args;

@@ -38,6 +38,9 @@ cd ~/botboy-app
 
 Always use this updater instead of `git pull`. It keeps compatible BotBoy
 customizations active and safely saves anything that overlaps a new release.
+If it reports an unverified earlier shutdown, do not remove the guard or kill a
+PID from its message. Run `./start.sh --doctor`, then follow the explicit
+`./start.sh --recover-shutdown` recovery below.
 
 ### Need help?
 
@@ -98,6 +101,7 @@ and does not recognize `./start.sh --update`:
 ```bash
 set -euo pipefail
 cd ~/botboy-app
+./start.sh --stop
 mkdir -p ~/.personal-productivity-tracker/update-backups
 STAMP="$(date +%Y%m%d-%H%M%S)"
 PATCH="$HOME/.personal-productivity-tracker/update-backups/pre-updater-$STAMP.patch"
@@ -193,8 +197,42 @@ credential attachment before producing the report.
 | Chat returns HTTP 401 | Ask the owner to check gateway access. |
 | Dashboard does not open | Confirm Google Chrome is installed and inspect `/tmp/ppt.log`. |
 | Chrome shows `ERR_CONNECTION_REFUSED` | Do not keep refreshing. Run `./start.sh --update`, then `./start.sh`; if startup reports failure, run `./start.sh --doctor` and share only the reviewed relevant output. |
+| `Replacement start blocked` / `shutdown recovery: BLOCKED` | Do not delete the guard or kill its PID. Follow **Unverified shutdown recovery** below. |
 | BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
 | A connection card is missing | Run `./start.sh --update`, then reopen BotBoy. |
+
+### Unverified shutdown recovery
+
+Use this only when BotBoy names `/tmp/ppt-startup-safety-block.json`. It covers
+a legacy process that exited without the newer DB-last receipt; it is not a
+normal update step.
+
+If the installed launcher says `--recover-shutdown` is unknown or its helper is
+missing, fetch the current release **without starting it**:
+
+```bash
+cd ~/botboy-app
+BOTBOY_UPDATE_NO_START=1 ./start.sh --update
+```
+
+Then run:
+
+```bash
+./start.sh --doctor
+./start.sh --recover-shutdown
+./start.sh
+./start.sh --doctor
+```
+
+Recovery refuses to proceed while any guarded PID, BotBoy process, port 7778
+listener, or tracker DB/WAL/SHM handle remains. On a stopped system it creates a
+private timestamped exact snapshot under
+`~/.personal-productivity-tracker/recovery-backups/`, verifies a disposable
+copy with SQLite `quick_check` and `foreign_key_check`, and archives the guard.
+It never fabricates a receipt, calls the old shutdown clean, or starts BotBoy
+automatically. Keep the snapshot; never restore `tracker.db` alone without its
+matching WAL/SHM and related private state. If recovery refuses, share the
+reviewed doctor line with the owner instead of bypassing it.
 
 ### Safe reinstall
 

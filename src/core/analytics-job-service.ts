@@ -33,6 +33,13 @@ import type { AnalyticsLocalQueryEngine } from './analytics-data-room-query.js';
 import type { AnalyticsDataRoomService, AnalyticsLocalFileCompleteReceipt } from './analytics-data-room-service.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import {
+  AnalyticsSqlExportError,
+  SQL_EXPORT_PRODUCER_VERSION,
+  type AnalyticsPreparationSqlRunner,
+  type AnalyticsSqlExport,
+  type AnalyticsSqlExportErrorCode,
+} from './analytics-sql-export.js';
+import {
   analyticsHandlingAllowsModelContext,
   analyticsRequestSha256,
   analyticsSha256,
@@ -49,7 +56,6 @@ import {
   type DataRoomFailureIssueV1,
 } from './data-room-tool-failure.js';
 import type {
-  AnalyticsCanonicalResult,
   AnalyticsDataCell,
   AnalyticsDataRoomUse,
   AnalyticsDatasetContract,
@@ -114,9 +120,16 @@ const CLASSIFICATION_RANK = new Map([
   ['critical', 5],
 ]);
 
-export interface AnalyticsPreparationSqlRunner {
-  execute(sql: string, options?: { signal?: AbortSignal }): Promise<AnalyticsCanonicalResult>;
-}
+export type { AnalyticsPreparationSqlRunner } from './analytics-sql-export.js';
+
+/** Export failures map onto job codes; each carries its own next action. */
+const SQL_EXPORT_JOB_CODES: Record<AnalyticsSqlExportErrorCode, ConstructorParameters<typeof AnalyticsJobError>[0]> = {
+  connector_outdated: 'unsupported',
+  unavailable: 'conflict',
+  query_failed: 'invalid_input',
+  too_large: 'invalid_input',
+  integrity_failed: 'integrity_failed',
+};
 
 /** Zero-effect profile of one local file table, from the exact create-time reader and cell converter. */
 export interface AnalyticsLocalFileInspection {
@@ -2817,27 +2830,44 @@ export function createAnalyticsJobService(input: {
     const querySha256 = analyticsSha256(source.sql);
     if (source.kind === 'sql_query') {
       if (!input.sqlRunner) fail('unsupported', 'The SQL preparation adapter is unavailable.');
-      const result = await input.sqlRunner.execute(source.sql);
-      const promoted = input.dataRoom.ingestSqlRows({
-        datasetId: prepared.definition.id,
-        expectedHeadRevision,
-        materializedAt: timestamp(),
-        sourceReceipt: {
-          sourceKind: 'sql_context',
-          sourceId: `analytics-job:${observation.job.id}:${source.alias}`,
-          querySha256,
-          producerVersion: 'sql-context-preparation-v1',
-          acquiredAt: timestamp(),
-        },
-        quality: prepared.quality ?? [],
-        trigger: 'agent',
-        requestSha256: observation.job.intentSha256,
-        columns: result.columns,
-        rows: result.rows,
-        rowCount: result.rowCount,
-        displayedRowCount: result.displayedRowCount,
-        truncated: result.truncated,
-      });
+      // One complete exported result, never a context-sized page.
+      let exported: AnalyticsSqlExport;
+      try {
+        exported = await input.sqlRunner.exportComplete(source.sql, { signal });
+      } catch (error) {
+        if (error instanceof AnalyticsSqlExportError) {
+          failWithNextAction(SQL_EXPORT_JOB_CODES[error.code], error.message, error.nextAction);
+        }
+        throw error;
+      }
+      let promoted: ReturnType<AnalyticsDataRoomService['ingestSqlExport']>;
+      try {
+        promoted = input.dataRoom.ingestSqlExport({
+          datasetId: prepared.definition.id,
+          expectedHeadRevision,
+          materializedAt: timestamp(),
+          sourceReceipt: {
+            sourceKind: 'sql_context',
+            sourceId: `analytics-job:${observation.job.id}:${source.alias}`,
+            querySha256,
+            producerVersion: SQL_EXPORT_PRODUCER_VERSION,
+            acquiredAt: timestamp(),
+          },
+          quality: prepared.quality ?? [],
+          trigger: 'agent',
+          requestSha256: observation.job.intentSha256,
+          export: exported,
+        });
+      } catch (error) {
+        // The query ran; a result that does not fit the declared target is a
+        // definition problem. Unlike Datanet, re-running read-only SQL is cheap.
+        if (!(error instanceof AnalyticsDataRoomError) || error.code === 'conflict') throw error;
+        failWithNextAction(
+          'invalid_input',
+          `The SQL query returned ${exported.rowCount} row(s), but they could not become a version of this target: ${error.message}`,
+          'Nothing was published. Tell the owner the reason above. On the owner\'s request, correct target.schema (names, logicalType, nullable) or target.coverage to match those results, or convert the columns in the SQL, and create again; re-running this read-only query is safe.',
+        );
+      }
       input.store.verifyVersion(promoted.version.id, 'local_answer');
       input.jobStore.succeedNode({
         nodeId: node.id,
@@ -2846,7 +2876,8 @@ export function createAnalyticsJobService(input: {
         outputVersionId: promoted.version.id,
         receipt: {
           kind: 'sql_query', datasetId: promoted.datasetId, versionId: promoted.version.id,
-          querySha256, contentSha256: promoted.version.materializedSha256,
+          querySha256, exportSha256: exported.sha256, exportRowCount: exported.rowCount,
+          contentSha256: promoted.version.materializedSha256,
           rowCount: promoted.version.rowCount, sourceRunId: promoted.run.id,
           idempotent: promoted.idempotent,
         },

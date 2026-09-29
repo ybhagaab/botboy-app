@@ -159,6 +159,8 @@ class EtlAliveHandoffError extends Error {
 const LATE_ETL_RECHECK_MS = 60_000;
 const LATE_ETL_RETRY_MS = 5 * 60_000;
 const LATE_ETL_LEASE_MS = 6 * 60_000;
+/** How often a run renews its lease while a widget query is in flight. */
+const RUN_LEASE_RENEW_MS = 60_000;
 
 function cleanText(value: unknown, label: string, max: number, required = false): string {
   if (value == null) {
@@ -596,7 +598,10 @@ export function createAnalyticsDashboardService(options: {
   const dataRoomRead = options.dataRoomRead;
   const dataRoomEnabled = Boolean(dataRoom)
     && (options.dataRoomEnabled ?? process.env.PPT_ANALYTICS_DATA_ROOM_WIDGETS_ENABLED !== '0');
-  const defaultQueryTimeoutMs = 60 * 60_000; // owner decision 2026-09-09: allow slow ETL-backed widgets to finish
+  // Owner decision 2026-09-09: allow slow ETL-backed widgets to finish. For
+  // the SQL lane this is an idle window, not a cap (2026-09-29): every
+  // connector progress report restarts it, and run leases renew meanwhile.
+  const defaultQueryTimeoutMs = 60 * 60_000;
   const configuredQueryTimeoutMs = Number(
     options.queryTimeoutMs ?? process.env.PPT_ANALYTICS_QUERY_TIMEOUT_MS ?? defaultQueryTimeoutMs,
   );
@@ -2517,6 +2522,22 @@ export function createAnalyticsDashboardService(options: {
     return new Date(Date.now() + queryTimeoutMs + 60_000).toISOString();
   }
 
+  /** Renew an owned run's lease every minute until the returned stop is called. */
+  function keepRunLeaseAlive(runId: string): () => void {
+    const timer = setInterval(() => {
+      try {
+        db.prepare(`
+          UPDATE analytics_runs SET heartbeat_at = ?, lease_expires_at = ?
+          WHERE id = ? AND status = 'running' AND worker_id = ? AND worker_pid = ?
+        `).run(new Date().toISOString(), leaseExpiresAt(), runId, workerId, process.pid);
+      } catch {
+        // the widget's own completion update records the lease
+      }
+    }, RUN_LEASE_RENEW_MS);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  }
+
   function ownsRun(runId: string): boolean {
     return Boolean(db.prepare(`
       SELECT 1 FROM analytics_runs
@@ -3685,7 +3706,19 @@ export function createAnalyticsDashboardService(options: {
       }
     };
 
+    // A widget query has no total time limit (its connector call is bounded by
+    // an idle window that progress restarts), so the run's lease is renewed
+    // while it executes: recovery must never requeue a run still in flight.
     const runWidgetToCompletion = async (widget: any): Promise<void> => {
+      const stopLeaseRenewal = keepRunLeaseAlive(runId);
+      try {
+        await runWidgetWork(widget);
+      } finally {
+        stopLeaseRenewal();
+      }
+    };
+
+    const runWidgetWork = async (widget: any): Promise<void> => {
       try {
         const result = await executeRunWidgetWithSafeRuntimeRetry(widget, lane);
         const completedAt = new Date().toISOString();

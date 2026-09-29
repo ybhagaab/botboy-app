@@ -37,9 +37,15 @@ import type {
   AnalyticsVersionPromotionReceipt,
 } from './analytics-data-room-types.js';
 import type { AnalyticsDataRoomBackupService } from './analytics-data-room-backup.js';
+import { SQL_EXPORT_MAX_BYTES, type AnalyticsSqlExport } from './analytics-sql-export.js';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const MAX_LOCAL_FILE_CANONICAL_BYTES = 32 * 1024 * 1024;
+
+/** One complete sql-context export CSV, verified by the export runner, typed here. */
+export interface AnalyticsSqlExportIngestRequest extends AnalyticsVersionIngestContext {
+  export: AnalyticsSqlExport;
+}
 
 export interface AnalyticsEtlTsvIngestRequest extends AnalyticsVersionIngestContext {
   savedTo: string;
@@ -106,6 +112,7 @@ export interface AnalyticsDataRoomService extends AnalyticsDataRoomCatalogReader
   ingestEtlTsv(input: AnalyticsEtlTsvIngestRequest): AnalyticsVersionPromotionReceipt;
   ingestLocalFileRows(input: AnalyticsLocalFileRowsIngestRequest): AnalyticsVersionPromotionReceipt;
   ingestSqlRows(input: AnalyticsSqlRowsIngestRequest): AnalyticsVersionPromotionReceipt;
+  ingestSqlExport(input: AnalyticsSqlExportIngestRequest): AnalyticsVersionPromotionReceipt;
   ingestImportRows(input: AnalyticsImportRowsIngestRequest): AnalyticsVersionPromotionReceipt;
   backupDataset(datasetId: string, targetRoot: string): AnalyticsDatasetBackupReceipt;
   restoreDatasetBackup(backupDirectory: string): AnalyticsDatasetRestoreReceipt;
@@ -254,6 +261,76 @@ export function createAnalyticsDataRoomService(input: {
     });
   }
 
+  /**
+   * Publish one complete SQL result exported as CSV. Same reader and cell
+   * grammar as a local CSV or Datanet TSV: columns match the schema by name,
+   * NULL (an empty field) is null. An empty string exports as "" and reads
+   * as null too, the same rule as every delimited source.
+   */
+  function ingestSqlExport(request: AnalyticsSqlExportIngestRequest): AnalyticsVersionPromotionReceipt {
+    if (request.sourceReceipt.sourceKind !== 'sql_context') {
+      throw new AnalyticsDataRoomError('invalid_input', 'SQL export ingestion requires a sql_context source receipt.');
+    }
+    const exported = request.export;
+    const bytes = Buffer.from(exported.bytes);
+    const directSha256 = createHash('sha256').update(bytes).digest('hex');
+    if (exported.format !== 'csv' || bytes.length !== exported.size || directSha256 !== exported.sha256
+      || !SHA256_RE.test(exported.sqlSha256) || !Number.isSafeInteger(exported.rowCount) || exported.rowCount < 0) {
+      incomplete('SQL export bytes do not match their export receipt.');
+    }
+    if (bytes.length > SQL_EXPORT_MAX_BYTES) incomplete('SQL export exceeds the 32 MiB complete-source limit.');
+    const dataset = store.getDataset(request.datasetId);
+    if (!dataset) throw new AnalyticsDataRoomError('not_found', `Dataset ${request.datasetId} was not found.`);
+    let typed: { columns: string[]; rows: AnalyticsDataCell[][] };
+    try {
+      const table = readAnalyticsDelimitedTable({
+        format: 'csv',
+        fileName: 'sql-export.csv',
+        sha256: directSha256,
+        size: bytes.length,
+        bytes,
+      }, 'sql_query');
+      if (table.rows.length !== exported.rowCount) {
+        incomplete(`SQL export holds ${table.rows.length} rows but its receipt reports ${exported.rowCount}.`);
+      }
+      if (table.header.join('\0') !== exported.columns.map(column => column.name).join('\0')) {
+        incomplete('SQL export header differs from its column receipt.');
+      }
+      typed = typeAnalyticsLocalTable(table, dataset.contract.schema, '', {
+        source: 'sql_query',
+        schema: 'target.schema',
+      }, { withholdValues: !dataset.contract.handling.allowModelContext, origin: 'query' });
+    } catch (error) {
+      if (!(error instanceof AnalyticsLocalFileError)) throw error;
+      return incomplete(error.issues.map(issue => issue.message).join(' ') || error.message);
+    }
+    const sourceBytes = Buffer.from(`${stableAnalyticsJson({
+      format: 'botboy-canonical-sql-export-rows-v1',
+      export: {
+        format: exported.format,
+        sha256: exported.sha256,
+        bytes: exported.size,
+        rowCount: exported.rowCount,
+        columns: exported.columns,
+        sqlSha256: exported.sqlSha256,
+      },
+      columns: typed.columns,
+      rows: typed.rows,
+      rowCount: typed.rows.length,
+    })}\n`, 'utf8');
+    if (sourceBytes.length > MAX_LOCAL_FILE_CANONICAL_BYTES) {
+      incomplete('Canonical SQL export rows exceed the 32 MiB immutable-source limit. Aggregate or split the query.');
+    }
+    const { export: _export, ...ingest } = request;
+    return store.publishParsedSource({
+      ...ingest,
+      sourceFormat: 'canonical_json',
+      sourceBytes,
+      columns: typed.columns,
+      rows: typed.rows,
+    });
+  }
+
   function ingestImportRows(request: AnalyticsImportRowsIngestRequest): AnalyticsVersionPromotionReceipt {
     if (request.sourceReceipt.sourceKind !== 'import' || !request.sourceReceipt.sourceId?.trim()) {
       throw new AnalyticsDataRoomError('invalid_input', 'Import ingestion requires an exact import source receipt.');
@@ -323,6 +400,7 @@ export function createAnalyticsDataRoomService(input: {
     ingestEtlTsv,
     ingestLocalFileRows,
     ingestSqlRows,
+    ingestSqlExport,
     ingestImportRows,
     backupDataset: (datasetId, targetRoot) => backups.backupDataset(datasetId, targetRoot),
     restoreDatasetBackup: backupDirectory => backups.restoreDatasetBackup(backupDirectory),

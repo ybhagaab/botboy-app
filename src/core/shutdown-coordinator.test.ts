@@ -2,6 +2,7 @@ import http from 'http';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -279,9 +280,20 @@ describe('launcher failed-start cleanup contract', () => {
     expect(launcher).toContain('value.pid !== expectedPid');
     expect(launcher).toContain('Math.max(...signalTimes) < notBeforeMs');
     expect(launcher).toContain('schemaVersion: 2');
+    expect(launcher).toContain('pids.length > 20');
     expect(launcher).toContain('BOTBOY_TEST_EXISTING_CLEANUP_PID');
     expect(takeover).toContain('lacks exact, fresh DB-last closure');
     expect(launcher).not.toContain('legacy takeover');
+    expect(launcher).toContain('[ "$1" = "--recover-shutdown" ] && RECOVER_SHUTDOWN=1');
+    expect(launcher).toContain('exec "$NODE" "$RECOVERY_SCRIPT"');
+    expect(launcher).toContain('shutdown recovery: BLOCKED helper=missing next=update-without-start');
+    expect(launcher.indexOf('Update paused: an earlier shutdown is still unverified'))
+      .toBeLessThan(launcher.indexOf('git -C "$PROJ_DIR" pull --ff-only'));
+    const stopStart = launcher.indexOf('if [ "$STOP_ONLY" = "1" ]; then');
+    const stopEnd = launcher.indexOf('\n# ── --doctor', stopStart);
+    const stopBlock = launcher.slice(stopStart, stopEnd);
+    expect(stopBlock.indexOf('BotBoy stop refused: an earlier shutdown guard is unresolved'))
+      .toBeLessThan(stopBlock.indexOf("pgrep -f 'node dist/index.js'"));
   });
 
   it('executes PID/freshness binding, private-path scrubbing, blocked retry, late recovery, and receipt-less refusal', async () => {
@@ -512,4 +524,153 @@ describe('launcher failed-start cleanup contract', () => {
     expect(multiRecovered.status).toBe(0);
     expect(fs.existsSync(safetyBlock)).toBe(false);
   }, 30_000);
+});
+
+describe('receipt-less shutdown recovery composite', () => {
+  const recoveryScript = fileURLToPath(new URL('../../scripts/recover-shutdown.mjs', import.meta.url));
+
+  function recoveryFixture(targetPid: number) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-receiptless-recovery-'));
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+    const databasePath = path.join(root, 'tracker.db');
+    const guardPath = path.join(root, 'startup-guard.json');
+    const pidFile = path.join(root, 'ppt.pid');
+    const backupRoot = path.join(root, 'backups');
+    const storage = createStorage(databasePath);
+    storage.initialize();
+    storage.getDb().prepare("INSERT INTO nodes (id, title) VALUES ('recovery_fixture', 'Receipt-less recovery')").run();
+    storage.close();
+    const guard = {
+      schemaVersion: 2,
+      reason: 'tracker_shutdown_unverified',
+      createdAt: new Date().toISOString(),
+      targets: [{ pid: targetPid, notBeforeMs: Date.now() - 100 }],
+    };
+    fs.writeFileSync(guardPath, `${JSON.stringify(guard, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(pidFile, String(targetPid), { mode: 0o600 });
+    const env = {
+      ...process.env,
+      NODE_ENV: 'test',
+      BOTBOY_TEST_RECOVERY_ISOLATED: '1',
+      PPT_STARTUP_SAFETY_BLOCK: guardPath,
+      PPT_SHUTDOWN_RECEIPT_DIR: root,
+      PPT_PID_FILE: pidFile,
+      PPT_RECOVERY_DATABASE_PATH: databasePath,
+      PPT_RECOVERY_BACKUP_ROOT: backupRoot,
+    };
+    return { root, databasePath, guardPath, backupRoot, env };
+  }
+
+  it('inspects an unresolved guard without changing its bytes or mtime', () => {
+    const box = recoveryFixture(987_654_321);
+    const before = fs.statSync(box.guardPath);
+    const bytes = fs.readFileSync(box.guardPath);
+
+    const result = spawnSync(process.execPath, [recoveryScript, '--inspect'], {
+      env: box.env,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('shutdown recovery: BLOCKED');
+    expect(result.stdout).toContain('targetCount=1');
+    expect(result.stdout).toContain('targets=987654321:not-live:missing');
+    expect(fs.readFileSync(box.guardPath)).toEqual(bytes);
+    expect(fs.statSync(box.guardPath).mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it('refuses a live guard target and leaves the original guard in place', () => {
+    const box = recoveryFixture(process.pid);
+    const bytes = fs.readFileSync(box.guardPath);
+
+    const result = spawnSync(process.execPath, [recoveryScript], {
+      env: box.env,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`Guard target PID(s) still live: ${process.pid}`);
+    expect(fs.readFileSync(box.guardPath)).toEqual(bytes);
+    expect(fs.existsSync(box.backupRoot)).toBe(false);
+  });
+
+  it('refuses an open database handle and retains the guard', () => {
+    const box = recoveryFixture(987_654_321);
+    const openDatabase = new Database(box.databasePath, { fileMustExist: true });
+    try {
+      const result = spawnSync(process.execPath, [recoveryScript], {
+        env: box.env,
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('database family still has open handles');
+      expect(fs.existsSync(box.guardPath)).toBe(true);
+    } finally {
+      openDatabase.close();
+    }
+  });
+
+  it('recovers a valid multi-target guard only after every target is not live', () => {
+    const box = recoveryFixture(987_654_321);
+    const guard = JSON.parse(fs.readFileSync(box.guardPath, 'utf8'));
+    guard.targets.push({ pid: 987_654_322, notBeforeMs: Date.now() - 50 });
+    fs.writeFileSync(box.guardPath, `${JSON.stringify(guard, null, 2)}\n`, { mode: 0o600 });
+
+    const result = spawnSync(process.execPath, [recoveryScript], {
+      env: box.env,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(fs.existsSync(box.guardPath)).toBe(false);
+    const snapshots = fs.readdirSync(box.backupRoot);
+    expect(snapshots).toHaveLength(1);
+    const boundary = JSON.parse(fs.readFileSync(
+      path.join(box.backupRoot, snapshots[0], 'source-boundary.json'),
+      'utf8',
+    ));
+    expect(boundary.targetPids).toEqual([987_654_321, 987_654_322]);
+  });
+
+  it('snapshots and verifies the stopped DB family, archives the guard, and never claims a clean shutdown', () => {
+    const box = recoveryFixture(987_654_321);
+    const sourceHash = crypto.createHash('sha256').update(fs.readFileSync(box.databasePath)).digest('hex');
+
+    const result = spawnSync(process.execPath, [recoveryScript], {
+      env: box.env,
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('quick_check=ok, foreign_key_violations=0');
+    expect(result.stdout).toContain('does NOT claim the old process closed cleanly');
+    expect(result.stdout).not.toContain('stopped cleanly');
+    expect(fs.existsSync(box.guardPath)).toBe(false);
+    const archivedGuards = fs.readdirSync(box.root).filter(name => name.startsWith('startup-guard.json.archived-'));
+    expect(archivedGuards).toHaveLength(1);
+
+    const snapshots = fs.readdirSync(box.backupRoot);
+    expect(snapshots).toHaveLength(1);
+    const snapshot = path.join(box.backupRoot, snapshots[0]);
+    const exactDatabase = path.join(snapshot, 'exact', 'tracker.db');
+    expect(fs.existsSync(exactDatabase)).toBe(true);
+    expect(crypto.createHash('sha256').update(fs.readFileSync(exactDatabase)).digest('hex')).toBe(sourceHash);
+    expect(fs.statSync(snapshot).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(exactDatabase).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(path.join(snapshot, 'guard-copy.json'))).toBe(true);
+    expect(fs.existsSync(path.join(snapshot, 'guard-archived-from-tmp.json'))).toBe(true);
+
+    const reopened = new Database(box.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      expect(reopened.pragma('quick_check', { simple: true })).toBe('ok');
+      expect((reopened.prepare("SELECT COUNT(*) AS count FROM nodes WHERE id='recovery_fixture'").get() as { count: number }).count).toBe(1);
+    } finally {
+      reopened.close();
+    }
+  });
 });

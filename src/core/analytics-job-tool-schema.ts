@@ -637,6 +637,7 @@ function sourceSchema(): JsonSchema {
       },
       {
         type: 'object', additionalProperties: false,
+        description: 'SQL source mini-shape: {kind:"sql_query", alias:"source_alias", sql:"complete read-only query", target:{complete target}}. BotBoy exports the complete result through the SQL connection (at most 50,000 rows, 500,000 cells, and 32 MiB) and reads it like a local CSV: target.schema names equal the query output columns (any order; warehouse names are usually lowercase), NULL is null, dates must be YYYY-MM-DD and timestamps ISO 8601 with a zone (format them in SQL, or declare string). Aggregate larger data in SQL, or use etl_query.',
         properties: {
           kind: { type: 'string', enum: ['sql_query'] }, alias,
           sql: { type: 'string', minLength: 1, maxLength: 100000, description: 'One complete read-only SELECT/WITH query.' },

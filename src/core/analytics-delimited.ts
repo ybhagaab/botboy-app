@@ -8,6 +8,10 @@ import type { AnalyticsDataCell, AnalyticsFieldContract } from './analytics-data
  * lane brought them in.
  */
 
+/** Largest complete delimited table one Data Room source admits. */
+export const ANALYTICS_DELIMITED_MAX_ROWS = 50_000;
+export const ANALYTICS_DELIMITED_MAX_CELLS = 500_000;
+
 function incomplete(message: string): never {
   throw new AnalyticsDataRoomError('incomplete_source', message);
 }
@@ -123,8 +127,8 @@ export function parseAnalyticsDelimited(
   }
   if (new Set(columns).size !== columns.length) incomplete(`${label} contains duplicate headers.`);
   const rawRows = rows.slice(1);
-  if (rawRows.length > 50_000 || rawRows.length * columns.length > 500_000) {
-    incomplete(`${label} exceeds the 50000-row or 500000-cell complete-source limit.`);
+  if (rawRows.length > ANALYTICS_DELIMITED_MAX_ROWS || rawRows.length * columns.length > ANALYTICS_DELIMITED_MAX_CELLS) {
+    incomplete(`${label} exceeds the ${ANALYTICS_DELIMITED_MAX_ROWS}-row or ${ANALYTICS_DELIMITED_MAX_CELLS}-cell complete-source limit.`);
   }
   const terminated = text.endsWith('\n');
   for (const [index, row] of rawRows.entries()) {

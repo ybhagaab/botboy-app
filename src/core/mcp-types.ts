@@ -160,7 +160,15 @@ export interface SqlContextMcpConfigView extends SqlContextMcpConfig {
 
 export interface McpCallOptions {
   source?: 'api' | 'agent' | 'dashboard' | 'health';
+  /**
+   * Idle window, not a cap: every progress notification from the server
+   * restarts it, so a call that keeps reporting (sql-context sends progress
+   * every 30 s) runs as long as it needs. A server that never reports progress
+   * gets exactly this long.
+   */
   timeoutMs?: number;
+  /** Cancels the call, including a queued one; the server is told to stop the work. */
+  signal?: AbortSignal;
   /**
    * Fail fast with a busy error instead of queueing behind an in-flight call
    * on the same serialized server. Used by dashboard picker routes so a

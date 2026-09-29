@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { createHash } from 'crypto';
+import { fileURLToPath } from 'url';
 import type { NodeManager } from './node-manager.js';
 import type { BrainStore } from './brain-store.js';
 import { setBrainTaskState } from './brain-tasks.js';
@@ -523,15 +524,17 @@ export function readFileHandler(filesDir: string, args: { filename: string; star
 }
 
 /**
- * Per-tool budget for the managed SQL connector. Warehouse queries
- * legitimately run for many minutes (owner: 10-15 min is normal; Kiro
- * applies no cap — a flat 90s ceiling here made identical queries "time
- * out" only in BotBoy chat, diagnosed 2026-08-27). Data-bearing tools share
- * the analytics refresh budget, including its env override; catalog and
- * status tools stay on a short leash so a wedged call cannot hold the
- * serialized per-server lane for half an hour.
+ * Per-tool idle window for the managed SQL connector. Warehouse queries
+ * legitimately run for many minutes or hours (Kiro applies no cap — a flat
+ * 90s ceiling here made identical queries "time out" only in BotBoy chat,
+ * diagnosed 2026-08-27). The window restarts on every progress report
+ * (sql-context 1.5 reports every 30 s), so it bounds silence, not work; a
+ * connector that never reports progress (1.4) gets exactly this long.
+ * Data-bearing tools share the analytics refresh window, including its env
+ * override; catalog and status tools stay on a short leash so a wedged call
+ * cannot hold the serialized per-server lane for half an hour.
  */
-const SQL_DATA_TOOLS = new Set(['run_query', 'get_sample_data']);
+const SQL_DATA_TOOLS = new Set(['run_query', 'get_sample_data', 'fetch_rows', 'export_query']);
 
 /**
  * Datanet ETL calls are metadata reads plus one file download — minutes at
@@ -573,6 +576,88 @@ export function sqlToolTimeoutMs(toolName: string): number {
   return Number.isFinite(configured)
     ? Math.max(30_000, Math.min(60 * 60_000, Math.floor(configured)))
     : fallback;
+}
+
+/**
+ * Tools whose only long wait is one MCP call. The manager bounds that call by
+ * an idle window that the server's progress reports keep open, so a working
+ * query runs as long as it needs (owner decision 2026-09-29: no hard cap on
+ * SQL; an idle timeout is a different thing). The executor adds no cap of its
+ * own: under the old flat 95s `mcp_*` budget a query reported
+ * "Tool timeout (95s)" while it kept running and holding a warehouse lane.
+ * Stop, disconnect, and shutdown cancel the call through the turn's signal.
+ */
+const MCP_CALL_TOOLS = new Set(['mcp_sql_query', 'mcp_sql_sample_data', 'mcp_call_tool']);
+
+export function toolRunsWithoutExecutorCap(toolName: string): boolean {
+  return MCP_CALL_TOOLS.has(toolName);
+}
+
+const DATA_ROOM_IMPORTABLE_FILE = /\.(?:csv|tsv|tab|xlsx)$/i;
+
+/**
+ * BotBoy's note on an MCP result that produced a file inside the files
+ * workspace (sql-context writes exports there): the relative path, an owner
+ * url, and, for a table format, the exact `local_file` source that imports it
+ * into the Data Room. Paths come from the result's resource links or its JSON
+ * `path`; only real files inside the workspace count, never schema sidecars.
+ */
+export function filesWorkspaceNote(
+  resultText: string,
+  filesDir = path.join(os.homedir(), '.personal-productivity-tracker', 'files'),
+): { files: Array<{ path: string; url: string; dataRoomSource?: { kind: 'local_file'; path: string } }>; next: string } | null {
+  const candidates = new Set<string>();
+  for (const match of resultText.matchAll(/\[Resource: [^\]\n]*\] (file:\/\/\S+)/g)) {
+    try {
+      candidates.add(fileURLToPath(match[1]));
+    } catch {
+      // not a local file URI
+    }
+  }
+  try {
+    const value = JSON.parse(resultText.replace(/\n\n\[Resource: [^\n]*$/, '').trim()) as { path?: unknown };
+    if (value && typeof value === 'object' && typeof value.path === 'string') candidates.add(value.path);
+  } catch {
+    // not a JSON receipt
+  }
+  let root: string;
+  try {
+    root = fs.realpathSync(filesDir);
+  } catch {
+    return null;
+  }
+  const files: Array<{ path: string; url: string; dataRoomSource?: { kind: 'local_file'; path: string } }> = [];
+  for (const candidate of candidates) {
+    if (!path.isAbsolute(candidate) || /\.(?:schema\.json|part)$/i.test(candidate)) continue;
+    let real: string;
+    try {
+      real = fs.realpathSync(candidate);
+      if (!fs.statSync(real).isFile()) continue;
+    } catch {
+      continue;
+    }
+    const relative = path.relative(root, real);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+    const workspacePath = relative.split(path.sep).join('/');
+    if (files.some(file => file.path === workspacePath)) continue;
+    files.push({
+      path: workspacePath,
+      url: `/api/files/${workspacePath.split('/').map(encodeURIComponent).join('/')}`,
+      ...(DATA_ROOM_IMPORTABLE_FILE.test(workspacePath) ? { dataRoomSource: { kind: 'local_file' as const, path: workspacePath } } : {}),
+    });
+  }
+  if (!files.length) return null;
+  const importable = files.some(file => file.dataRoomSource);
+  return {
+    files,
+    next: [
+      importable
+        ? 'To keep this data as a reusable Data Room dataset, call create_data_room_dataset: inspect_local_file on the path, then one local_file source with that path (one import holds at most 50,000 rows, 500,000 cells, and 32 MiB).'
+        : 'This format is for analysis only; export CSV to import it into the Data Room.',
+      'To analyze it, use run_command (the shell starts in the files folder, so the path works as is); to share it, give the owner the url.',
+      'An MCP may clear its working folder when it restarts (sql-context does at startup), so import or copy files worth keeping.',
+    ].join(' '),
+  };
 }
 
 export function createToolExecutor(
@@ -836,9 +921,13 @@ export function createToolExecutor(
     return { ok: true, node: { id: row.id, title: row.title } };
   }
 
-  async function callMcpRead(toolName: string, args: Record<string, unknown>): Promise<string> {
+  async function callMcpRead(toolName: string, args: Record<string, unknown>, context: ToolExecutionContext = {}): Promise<string> {
     if (!mcpManager) return 'Error: managed MCP runtime unavailable';
-    const result = await mcpManager.callTool('sql-context', toolName, args, { source: 'agent', timeoutMs: sqlToolTimeoutMs(toolName) });
+    const result = await mcpManager.callTool('sql-context', toolName, args, {
+      source: 'agent',
+      timeoutMs: sqlToolTimeoutMs(toolName),
+      ...(context.abortSignal ? { signal: context.abortSignal } : {}),
+    });
     const citation = {
       serverId: result.serverId,
       toolName: result.toolName,
@@ -1308,7 +1397,7 @@ export function createToolExecutor(
       }, null, 1);
     },
 
-    mcp_call_tool: async (args) => {
+    mcp_call_tool: async (args, context: ToolExecutionContext = {}) => {
       if (!mcpManager) return 'Error: managed MCP runtime unavailable';
       const serverId = String(args.serverId ?? '').trim();
       const toolName = String(args.toolName ?? '').trim();
@@ -1318,7 +1407,9 @@ export function createToolExecutor(
       if (!serverId || !toolName) return 'Error: serverId and toolName are required';
       const result = await mcpManager.callTool(serverId, toolName, toolArgs, {
         source: 'agent',
-        timeoutMs: 90_000,
+        // Idle window (progress restarts it); SQL data tools get the SQL one.
+        timeoutMs: serverId === 'sql-context' ? sqlToolTimeoutMs(toolName) : 90_000,
+        ...(context.abortSignal ? { signal: context.abortSignal } : {}),
         // Policy gate: write-classified tools execute only when the model
         // asserts an explicit owner request from the current conversation.
         ownerApproved: args.ownerRequested === true,
@@ -1339,6 +1430,10 @@ export function createToolExecutor(
           ? `${result.text.slice(0, 200_000)}\n\n[Result truncated for the model context from ${result.text.length} characters. Refine the tool arguments for a smaller result.]`
           : result.text,
         isError: result.isError,
+        ...(() => {
+          const produced = result.isError ? null : filesWorkspaceNote(result.text);
+          return produced ? { botboyFiles: produced } : {};
+        })(),
       }, null, 1);
     },
 
@@ -1826,11 +1921,11 @@ export function createToolExecutor(
     mcp_sql_list_schemas: () => callMcpRead('list_schemas', {}),
     mcp_sql_list_tables: (args) => callMcpRead('list_tables', { schema: String(args.schema ?? 'public').trim() || 'public' }),
     mcp_sql_describe_table: (args) => callMcpRead('describe_table', { table: String(args.table ?? '').trim() }),
-    mcp_sql_sample_data: (args) => {
+    mcp_sql_sample_data: (args, context) => {
       const limit = Math.max(1, Math.min(20, Number(args.limit) || 5));
-      return callMcpRead('get_sample_data', { table: String(args.table ?? '').trim(), limit });
+      return callMcpRead('get_sample_data', { table: String(args.table ?? '').trim(), limit }, context);
     },
-    mcp_sql_query: (args) => callMcpRead('run_query', { sql: String(args.sql ?? '').trim() }),
+    mcp_sql_query: (args, context) => callMcpRead('run_query', { sql: String(args.sql ?? '').trim() }, context),
 
     // ── Datanet ETL (DataCentral) through the a2-analytics profile ──
     // Reads are free; every mutation goes through requireOwnerRequested AND
@@ -3903,7 +3998,9 @@ export function createToolExecutor(
             : name.startsWith('mcp_')
             ? 95_000
             : name.startsWith('browser_') ? 65_000 : TIMEOUT;
-        const rawOutput = await withTimeout(() => (handler as any)(args, context), timeoutMs);
+        const rawOutput = toolRunsWithoutExecutorCap(name)
+          ? await (handler as any)(args, context)
+          : await withTimeout(() => (handler as any)(args, context), timeoutMs);
         const normalized = typeof rawOutput === 'string'
           ? { content: rawOutput, isError: false, images: undefined, imageEvidence: undefined }
           : {

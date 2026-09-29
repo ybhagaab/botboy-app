@@ -17,6 +17,7 @@ import type { AnalyticsJobPlanner } from './analytics-job-planner.js';
 import type { AnalyticsDatasetPreparationPlanV1 } from './analytics-job-types.js';
 import { createDocumentParser } from './document-parser.js';
 import type { QueryRunner } from './etl-adhoc.js';
+import { AnalyticsSqlExportError, type AnalyticsPreparationSqlRunner } from './analytics-sql-export.js';
 import {
   AnalyticsLocalFileError,
   defaultAnalyticsLocalFilePolicy,
@@ -234,6 +235,7 @@ describe('local-file Data Room lifecycle', () => {
     home: string,
     modelContextRuntime: { providerLocality: 'device_local' | 'amazon_managed_remote' | 'external_remote'; endpointSha256: string } = { providerLocality: 'amazon_managed_remote', endpointSha256: 'a'.repeat(64) },
     etlRunner?: QueryRunner,
+    sqlRunner?: AnalyticsPreparationSqlRunner,
   ) {
     const storage = createStorage(':memory:');
     storage.initialize();
@@ -254,6 +256,7 @@ describe('local-file Data Room lifecycle', () => {
       localFilePolicy: policyFor(home),
       modelContextRuntime,
       etlRunner,
+      sqlRunner,
       waitMs: 20_000,
     });
     const counts = () => ({
@@ -505,5 +508,101 @@ describe('local-file Data Room lifecycle', () => {
       request('2026-09-01', '2026-09-01'),
     ))).rejects.toMatchObject({ code: 'invalid_input', issues: [expect.objectContaining({ code: 'invalid_null_token' })] });
     expect(env.counts().jobs).toBe(1);
+  });
+
+  /** One exact sql-context 1.5 CSV export (the runner is covered in analytics-sql-export.test.ts). */
+  function fakeSql(csv: string, columns: string[]) {
+    const calls: string[] = [];
+    const runner: AnalyticsPreparationSqlRunner = {
+      exportComplete: async sql => {
+        calls.push(sql);
+        const bytes = Buffer.from(csv);
+        return {
+          format: 'csv', bytes, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'),
+          rowCount: csv.split('\n').filter(Boolean).length - 1,
+          columns: columns.map(name => ({ name, type: 'text' })),
+          sqlSha256: createHash('sha256').update(sql).digest('hex'),
+        };
+      },
+    };
+    return { runner, calls };
+  }
+
+  // REGRESSION (live 2026-09-26): the SQL source read a run_query page (100
+  // rows, "0 rows returned" footer on Redshift, JS Date text), so it could
+  // never publish. It now exports the complete result and types it like a CSV.
+  it('publishes a complete SQL export: exact dates, NULL, the text "NULL", and quoted commas', async () => {
+    const home = tempDir('local-file-home-');
+    const sql = fakeSql(
+      'metrics_name,date,total,hours\n"app, open",2026-09-01,5,1.5\nNULL,2026-09-02,6,\n',
+      ['metrics_name', 'date', 'total', 'hours'],
+    );
+    const env = environment(home, undefined, undefined, sql.runner);
+    const created = await env.service.prepareOrJoinAndWait(owner('sql-ok'), plan(
+      { kind: 'sql_query', alias: 'report', sql: 'SELECT metrics_name, date, total, hours FROM fixture', target: etlTarget('2026-09-01', '2026-09-02') },
+      request('2026-09-01', '2026-09-02'),
+    ));
+    expect(created.status).toBe('completed');
+    expect(sql.calls).toEqual(['SELECT metrics_name, date, total, hours FROM fixture']);
+    const { datasetId, versionId } = created.result!.primary;
+    expect(env.store.getDataset(datasetId)).toMatchObject({ sourceKind: 'sql_context', sourceFormat: 'canonical_json' });
+    expect(env.store.getDatasetVersion(versionId)).toMatchObject({ rowCount: 2 });
+    const sidecar = new Database(env.store.getVerifiedMaterializedPath(versionId, 'local_answer'), { readonly: true });
+    try {
+      expect(sidecar.prepare('SELECT date, metrics_name, total, hours FROM data ORDER BY date').all()).toEqual([
+        { date: '2026-09-01', metrics_name: 'app, open', total: 5, hours: 1.5 },
+        { date: '2026-09-02', metrics_name: 'NULL', total: 6, hours: null },
+      ]);
+    } finally {
+      sidecar.close();
+    }
+  });
+
+  it('publishes nothing when a SQL result misfits its target, and says re-running the query is safe', async () => {
+    const home = tempDir('local-file-home-');
+    const sql = fakeSql(
+      'metrics_name,date,total,hours,network\napp_open,2026-09-01,5,1.5,wifi\n',
+      ['metrics_name', 'date', 'total', 'hours', 'network'],
+    );
+    const env = environment(home, undefined, undefined, sql.runner);
+    const failed = await env.service.prepareOrJoinAndWait(owner('sql-misfit'), plan(
+      { kind: 'sql_query', alias: 'report', sql: 'SELECT 1', target: etlTarget('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ));
+    expect(failed.status).not.toBe('completed');
+    expect(failed.error).toMatchObject({ code: 'invalid_input' });
+    expect(failed.error!.message).toContain('The SQL query returned 1 row(s)');
+    expect(failed.error!.message).toContain('The query returned exactly the columns');
+    expect(failed.error!.message).toContain('Not declared: network');
+    expect(failed.error!.message).not.toContain('nullToken');
+    expect(failed.error!.nextAction).toContain('re-running this read-only query is safe');
+    expect(env.counts()).toMatchObject({ jobs: 1, versions: 0 });
+
+    const timestamps = fakeSql('metrics_name,date,total,hours\napp_open,2026-09-01 10:30:00,5,1.5\n', ['metrics_name', 'date', 'total', 'hours']);
+    const envTs = environment(tempDir('local-file-home-'), undefined, undefined, timestamps.runner);
+    const wrongType = await envTs.service.prepareOrJoinAndWait(owner('sql-ts'), plan(
+      { kind: 'sql_query', alias: 'report', sql: 'SELECT 1', target: etlTarget('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ));
+    expect(wrongType.error!.message).toContain('result row 1 holds text "2026-09-01 10:30:00"');
+    expect(wrongType.error!.message).toContain('convert the column in the query');
+  });
+
+  it('passes an export failure through with its own next action and publishes nothing', async () => {
+    const home = tempDir('local-file-home-');
+    const runner: AnalyticsPreparationSqlRunner = {
+      exportComplete: async () => {
+        throw new AnalyticsSqlExportError('too_large', 'The query returns more than 50,000 rows or 32 MiB.', 'Nothing was published. Aggregate or filter in SQL, or use etl_query.');
+      },
+    };
+    const env = environment(home, undefined, undefined, runner);
+    const failed = await env.service.prepareOrJoinAndWait(owner('sql-large'), plan(
+      { kind: 'sql_query', alias: 'report', sql: 'SELECT * FROM big', target: etlTarget('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ));
+    expect(failed.status).not.toBe('completed');
+    expect(failed.error).toMatchObject({ code: 'invalid_input', message: 'The query returns more than 50,000 rows or 32 MiB.' });
+    expect(failed.error!.nextAction).toBe('Nothing was published. Aggregate or filter in SQL, or use etl_query.');
+    expect(env.counts()).toMatchObject({ jobs: 1, versions: 0 });
   });
 });

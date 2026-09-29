@@ -151,6 +151,52 @@ describe('Existing kinds unchanged (regressions)', () => {
   });
 });
 
+// sql-context-presets-mcp 1.5 added SQL-executing and paging tools. Its server
+// runs multi-statement scripts as written, so BotBoy's read-only wall must
+// cover every tool that takes SQL, whoever calls it.
+describe('sql-context 1.5 tools', () => {
+  it('classifies paging and export tools as reads', () => {
+    for (const tool of ['fetch_rows', 'export_query', 'export_status']) {
+      expect(classifyMcpTool('sql-context', tool)).toBe('read');
+    }
+  });
+
+  it.each([
+    ['a write', 'DELETE FROM events'],
+    ['a script', 'SELECT 1; DELETE FROM events'],
+    ['a session change', 'SET search_path TO other'],
+    ['a transaction', 'BEGIN; SELECT 1; COMMIT'],
+  ])('rejects %s through export_query even with owner approval', (_label, sql) => {
+    expect(() => validateMcpToolCall('sql-context', 'export_query', { sql, format: 'csv' }, { ownerApproved: true }))
+      .toThrow(/read-only|Multiple SQL statements/);
+  });
+
+  // The model calls the connector's own export directly, exactly as other
+  // MCP clients do; the file lands in the files workspace.
+  it('passes a direct read-only export with its options, trimmed like run_query', () => {
+    expect(validateMcpToolCall('sql-context', 'export_query', {
+      sql: '  SELECT event_date, total FROM events  ', format: 'jsonl', wait: false,
+    })).toEqual({ sql: 'SELECT event_date, total FROM events', format: 'jsonl', wait: false });
+    expect(validateMcpToolCall('sql-context', 'fetch_rows', { resultId: 'r_abcdefghijklmnop' }))
+      .toEqual({ resultId: 'r_abcdefghijklmnop' });
+    expect(validateMcpToolCall('sql-context', 'export_status', { exportId: 'e_abcdefghijklmnop' }))
+      .toEqual({ exportId: 'e_abcdefghijklmnop' });
+  });
+
+  // A newer connector release may add tools BotBoy has never seen: they are
+  // classified by name like any user-added MCP, and any `sql` they carry
+  // still passes the read-only wall, with no BotBoy change.
+  it('handles tools from a newer connector release without a BotBoy change', () => {
+    expect(classifyMcpTool('sql-context', 'describe_view')).toBe('read');
+    expect(classifyMcpTool('sql-context', 'upload_table')).toBe('write');
+    expect(() => validateMcpToolCall('sql-context', 'describe_view', { sql: 'DROP TABLE events' }))
+      .toThrow(/read-only/);
+    expect(validateMcpToolCall('sql-context', 'describe_view', { sql: ' SELECT 1 ' })).toEqual({ sql: 'SELECT 1' });
+    expect(() => validateMcpToolCall('sql-context', 'upload_table', { table: 'x' }))
+      .toThrow(/explicit owner request/);
+  });
+});
+
 describe('a2-analytics (Datanet ETL) classification', () => {
   it('classifies curated reads as read, including the download tool', () => {
     for (const tool of [
