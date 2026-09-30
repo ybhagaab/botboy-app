@@ -40,6 +40,9 @@ export function adaptSendPrompt(
     getActiveEndpoint?(): string;
     getActiveModel?(): string | undefined;
     getContextBudgetTokens?(): number;
+    /** Live provider id; follows runtime provider changes (Settings → AI model). */
+    getProviderId?(): string | undefined;
+    getDefaultModel?(): string;
   },
   metadata: PipelineLlmAuditMetadata = {},
 ): PipelineLlm {
@@ -51,8 +54,8 @@ export function adaptSendPrompt(
       const activeEndpoint = client.getActiveEndpoint?.() ?? metadata.activeEndpoint;
       return {
         ...metadata,
-        provider: activeEndpoint === 'ollama' ? 'ollama' : metadata.provider,
-        model: client.getActiveModel?.() ?? metadata.model,
+        provider: activeEndpoint === 'ollama' ? 'ollama' : (client.getProviderId?.() ?? metadata.provider),
+        model: client.getActiveModel?.() ?? client.getDefaultModel?.() ?? metadata.model,
         activeEndpoint,
       };
     },

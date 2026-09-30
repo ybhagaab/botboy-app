@@ -15,9 +15,12 @@ import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
 import {
+  chatModelCatalogContext,
   getChatModelCatalog,
   resolveBlessedModelRoute,
 } from '../../core/inference-provider.js';
+import { isLlmClientSwitch, pinLlmClient } from '../../core/llm-client-switch.js';
+import type { LlmClient } from '../../core/llm-client.js';
 import { createLlmUsageOperationId } from '../../core/llm-usage.js';
 import { normalizeAnalyticsSearchText } from '../../core/analytics-search-normalization.js';
 import {
@@ -120,6 +123,9 @@ function dataRoomCreateEffectNeedsObservation(content: unknown): boolean {
     return false;
   }
 }
+
+/** Final message for a turn stopped by a Settings → AI model provider change. */
+const PROVIDER_CHANGED_STOP_TEXT = '⏹️ Stopped because the AI model was changed in Settings. Work already completed is preserved; send your message again to continue on the new model.';
 
 /**
  * Transient-error detector for the chat stream retry: network hiccups,
@@ -449,19 +455,28 @@ function formatAnalyticsEditCompletion(receipt: Record<string, any>): string | u
 export function createChatRouter(deps: RouterDeps, dashboardState: DashboardState): Router {
   const router = Router();
   const chat = deps.chatInterface;
-  const chatModelDefault = deps.llmClient?.getDefaultModel?.() ?? '';
-  const chatModelCatalog = getChatModelCatalog(chatModelDefault);
+  // The active provider can change at runtime (Settings → AI model), so the
+  // catalog is computed per request from one pinned client: its default
+  // model, provider id, and per-key model list always belong together.
+  const chatModelCatalogFor = (client: LlmClient) => getChatModelCatalog(
+    client.getDefaultModel?.() ?? '',
+    process.env,
+    chatModelCatalogContext(client),
+  );
 
   // The browser renders this server-owned, provider-aware catalog. It never
   // carries endpoint, target, or credential details and cannot invent ids.
   router.get('/chat/models', (_req: Request, res: Response) => {
-    if (!deps.llmClient) return res.status(503).json({ error: 'Chat models are unavailable' });
-    return res.json(chatModelCatalog);
+    const client = pinLlmClient(deps.llmClient);
+    if (!client) return res.status(503).json({ error: 'Chat models are unavailable' });
+    return res.json(chatModelCatalogFor(client));
   });
 
   const analyticsSchemaLoader = createAnalyticsSchemaBriefingLoader(deps.mcpManager, {
     db: deps.db,
-    contextWindowTokens: deps.llmClient?.getContextWindow?.(),
+    // No contextWindowTokens snapshot: the loader then reads the active
+    // provider's window per load (limits.ts › endpointContextTokens, which
+    // Settings → AI model republishes on every activation).
     selector: deps.llmClient?.chatCompletion
       ? async ({ message, catalog }) => {
           const response = await deps.llmClient!.chatCompletion({
@@ -587,10 +602,27 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     stopRequested: boolean;
     shutdownRequested: boolean;
     disconnected: boolean;
+    /** The owner switched AI providers mid-turn (Settings → AI model). */
+    providerChanged?: boolean;
     startedAt: number;
     abortController: AbortController;
   }>();
   let chatTurnCounter = 0;
+
+  // A provider change stops every in-flight turn. Each turn is pinned to the
+  // provider it started on; data admitted under the NEW provider's locality
+  // (for example Data Room rows) must never flow to the old one, so these
+  // turns also skip the usual end-of-turn summary call.
+  if (isLlmClientSwitch(deps.llmClient)) {
+    deps.llmClient.onActivate(() => {
+      for (const turn of activeChatTurns.values()) {
+        if (turn.stopRequested) continue;
+        turn.stopRequested = true;
+        turn.providerChanged = true;
+        turn.abortController.abort(new Error('AI model provider changed'));
+      }
+    });
+  }
 
   router.post('/chat/stop', (_req: Request, res: Response) => {
     let stopped = 0;
@@ -611,6 +643,16 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     const stream = body.stream === true;
     const requestedMode = body.mode;
     if (!message) return res.status(400).json({ error: 'message is required' });
+    // A fresh install has no AI model until the owner adds a key in
+    // Settings → AI model. Say so plainly before admitting a turn instead of
+    // failing mid-stream with a provider credential error.
+    if (deps.aiModelSettings?.state() === 'not_configured') {
+      return res.status(409).json({
+        error: 'Chat needs an AI model first.',
+        code: 'ai_model_not_configured',
+        nextAction: 'Open Settings → AI model and paste your OpenAI API key. Chat and background organizing start right away.',
+      });
+    }
     if (requestedMode !== undefined && requestedMode !== 'general' && requestedMode !== 'analytics_dashboard') {
       return res.status(400).json({ error: 'mode must be general or analytics_dashboard' });
     }
@@ -662,10 +704,20 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // stable catalog key. GPT-6 remains absent unless its separate target has
     // an explicit preview attestation, so dead/unapproved ids never hit wire.
     let modelRoute: ReturnType<typeof resolveBlessedModelRoute> | undefined;
+    // One provider serves this whole turn: route admission, every tool-loop
+    // iteration, and provider-bound replay (encrypted reasoning) use the
+    // client pinned here, even if the owner changes providers mid-turn.
+    const turnLlmClient = pinLlmClient(deps.llmClient);
     if (body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
-      const allowedModelKeys = new Set(chatModelCatalog.models.map(model => model.key));
-      const resolved = allowedModelKeys.has(body.model)
-        ? resolveBlessedModelRoute(chatModelDefault, body.model)
+      const turnCatalog = turnLlmClient ? chatModelCatalogFor(turnLlmClient) : { models: [] };
+      const allowedModelKeys = new Set(turnCatalog.models.map(model => model.key));
+      const resolved = turnLlmClient && allowedModelKeys.has(body.model)
+        ? resolveBlessedModelRoute(
+          turnLlmClient.getDefaultModel?.() ?? '',
+          body.model,
+          process.env,
+          chatModelCatalogContext(turnLlmClient),
+        )
         : null;
       if (!resolved) {
         const allowed = ['default', ...allowedModelKeys].filter((key, index, keys) => keys.indexOf(key) === index);
@@ -762,7 +814,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       };
       res.once('close', handleResponseClose);
       try {
-        const llmClient = deps.llmClient;
+        const llmClient = turnLlmClient;
         const toolExecutor = deps.toolExecutor;
         const promptManager = deps.promptManager;
         const convManager = deps.conversationManager;
@@ -2006,11 +2058,16 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // tools-off call so the model synthesizes honestly from whatever it
         // gathered (no tool defs are sent, so this cannot loop further); on
         // any failure fall back to a plain deterministic line.
-        res.write(`data: ${JSON.stringify({ type: 'status', text: stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
-        let finalContent = stoppedByUser
+        // A provider change ends the turn without another model call: the
+        // turn is pinned to the old provider and must not receive more data.
+        const providerChanged = activeChatTurns.get(turnId)?.providerChanged === true;
+        res.write(`data: ${JSON.stringify({ type: 'status', text: providerChanged ? '⏹️ AI model changed in Settings — stopping...' : stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
+        let finalContent = providerChanged
+          ? PROVIDER_CHANGED_STOP_TEXT
+          : stoppedByUser
           ? '⏹️ Stopped at your request. The work done so far is preserved above; tell me when to continue.'
           : `Reached the runaway ceiling of ${HARD_ITERATION_CEILING} tool iterations — stopping to be safe.`;
-        try {
+        if (!providerChanged) try {
           messages.push({
             role: 'user',
             content: stoppedByUser
@@ -2056,7 +2113,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           try { res.end(); } catch {}
         } else if (interrupted?.stopRequested) {
           const stopId = `asst-${Date.now()}`;
-          const stopText = '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.';
+          const stopText = interrupted.providerChanged
+            ? PROVIDER_CHANGED_STOP_TEXT
+            : '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.';
           if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(stopId, 'assistant', stopText);
           try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: stopId, role: 'assistant', content: stopText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           try { res.end(); } catch {}

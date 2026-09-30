@@ -1,4 +1,5 @@
 import { lookup } from 'node:dns/promises';
+import fs from 'node:fs';
 import { isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -123,4 +124,72 @@ export function modelCommandSandboxInvocation(
   options: ModelCommandSandboxOptions = {},
 ): { executable: '/usr/bin/sandbox-exec'; args: string[]; filesDir: string; profile: string } {
   return modelProcessSandboxInvocation(options.shell ?? '/bin/zsh', ['-lc', command], options);
+}
+
+/**
+ * BotBoy's own inference credentials. The launcher exports them so the server
+ * can authenticate to its model provider; model-run commands never need them.
+ * Exact names only, so the owner's other tool settings (AWS profiles, PATH,
+ * tokens their own CLIs use) keep working inside the sandboxed shell. The
+ * Settings → AI model key is never in the environment at all.
+ */
+export const BOTBOY_CREDENTIAL_ENV_KEYS: readonly string[] = Object.freeze([
+  'BOTBOY_INFERENCE_OAUTH_CLIENT_ID',
+  'BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET',
+  'BOTBOY_INFERENCE_API_KEY',
+  'VLLM_API_KEY',
+  'AWS_BEARER_TOKEN_BEDROCK',
+]);
+
+/** Environment for a model-run child: the server's environment minus BotBoy credentials. */
+export function modelChildEnvironment(
+  extra: Record<string, string> = {},
+  base: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const denied = new Set(BOTBOY_CREDENTIAL_ENV_KEYS);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (typeof value === 'string' && !denied.has(key)) env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
+/**
+ * Canonical on-disk path. The native resolver matters on macOS: its volumes
+ * fold letter case, and the JavaScript resolver keeps whatever case a caller
+ * or link spelled, so `.PERSONAL-productivity-tracker/.env` would open the
+ * real file while failing a case-sensitive containment check.
+ */
+export function canonicalLocalPath(value: string): string {
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    try {
+      return fs.realpathSync(value);
+    } catch {
+      return path.resolve(value);
+    }
+  }
+}
+
+function inside(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!!relative && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+/**
+ * True when `target`, after resolving every link, lands in BotBoy private
+ * state outside the files workspace: the same boundary the model-command
+ * Seatbelt profile enforces for child processes, applied to in-process file
+ * tools (which run outside the sandbox). Links to the BotBoy source/build
+ * checkout or anywhere outside private state are unaffected.
+ */
+export function resolvesIntoPrivateState(
+  target: string,
+  options: { privateRoot?: string; filesDir?: string } = {},
+): boolean {
+  const privateRoot = canonicalLocalPath(options.privateRoot ?? path.join(os.homedir(), '.personal-productivity-tracker'));
+  const filesDir = canonicalLocalPath(options.filesDir ?? path.join(privateRoot, 'files'));
+  const real = canonicalLocalPath(target);
+  return inside(real, privateRoot) && !inside(real, filesDir);
 }

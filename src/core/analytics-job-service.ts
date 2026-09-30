@@ -2097,8 +2097,10 @@ export function createAnalyticsJobService(input: {
   const waitMs = Math.max(100, Math.min(ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS, input.waitMs ?? DEFAULT_WAIT_MS));
   const localFilePolicy = input.localFilePolicy ?? defaultAnalyticsLocalFilePolicy();
   // Same model-context rule as newly prepared datasets: without a local or
-  // managed provider, file facts reach the model as structure only.
-  const withholdFileValues = !input.modelContextRuntime || input.modelContextRuntime.providerLocality === 'external_remote';
+  // managed provider, file facts reach the model as structure only. Read per
+  // use: the active provider can change at runtime (Settings → AI model).
+  const withholdFileValues = (): boolean =>
+    !input.modelContextRuntime || input.modelContextRuntime.providerLocality === 'external_remote';
   let active: Promise<number> | null = null;
   let activeController: AbortController | null = null;
   let activeJobId: string | null = null;
@@ -2372,7 +2374,7 @@ export function createAnalyticsJobService(input: {
         source: label,
         schema: source.target ? `${label}.target.schema` : `${label}.into.datasetId`,
         ...(dataset ? { fixedDatasetId: dataset.id } : {}),
-      }, { withholdValues: withholdFileValues });
+      }, { withholdValues: withholdFileValues() });
     } catch (error) {
       return localFileFailure(error);
     }
@@ -2530,7 +2532,7 @@ export function createAnalyticsJobService(input: {
         tempRoot: localFilePolicy.tempRoot,
       }, 'file');
       const profile = profileAnalyticsLocalTable(table, locator.nullToken);
-      const samplesWithheld = withholdFileValues;
+      const samplesWithheld = withholdFileValues();
       return {
         file: { name: table.fileName, format: table.format, bytes: table.size, sha256: table.sha256 },
         ...(table.sheets ? { sheets: table.sheets } : {}),

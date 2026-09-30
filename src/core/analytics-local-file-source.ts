@@ -11,6 +11,7 @@ import {
 import { compactAnalyticsPartitionRanges } from './analytics-data-room-policy.js';
 import { dataRoomIssue, type DataRoomFailureIssueV1 } from './data-room-tool-failure.js';
 import type { DocumentParser } from './document-parser.js';
+import { canonicalLocalPath } from './protected-local-resources.js';
 
 /**
  * Generic local-file source for Data Room creation.
@@ -93,13 +94,8 @@ function inside(child: string, parent: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-function realOrResolved(value: string): string {
-  try {
-    return fs.realpathSync(value);
-  } catch {
-    return path.resolve(value);
-  }
-}
+// Canonical on-disk case on macOS; see protected-local-resources.ts.
+const realOrResolved = canonicalLocalPath;
 
 function inferFormat(fileName: string, explicit: AnalyticsLocalFileFormat | undefined, label: string): AnalyticsLocalFileFormat {
   if (explicit !== undefined) {
@@ -158,7 +154,8 @@ export function resolveAnalyticsLocalFile(
   let resolvedPath: string;
   let stat: fs.Stats;
   try {
-    resolvedPath = fs.realpathSync(candidate);
+    // Native: the private-state check below must see the on-disk letter case.
+    resolvedPath = fs.realpathSync.native(candidate);
     stat = fs.statSync(resolvedPath);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;

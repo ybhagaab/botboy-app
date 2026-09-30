@@ -80,6 +80,9 @@ const CHAT_MODEL_KEY = 'botboy.chat.model';
 // GPT-5.6 choices usable in that narrow window; GPT-6 is never browser-baked.
 let chatModelChoices = ['default', 'luna', 'sol'];
 let chatDefaultModelKey = 'default';
+// Last AI-model activation counter/state seen on /dashboard/version.
+let lastAiModelVersion = null;
+let lastAiModelState = null;
 
 function storedChatModelChoice() {
   try { return localStorage.getItem(CHAT_MODEL_KEY) || 'default'; }
@@ -115,12 +118,18 @@ function parseChatModelCatalog(value) {
   return { defaultKey, models };
 }
 
-async function initChatModelControl() {
+// The active provider can change at runtime (Settings → AI model), so the
+// catalog refreshes on demand; the latest request wins.
+let chatModelCatalogRequest = 0;
+
+async function refreshChatModelCatalog() {
   const select = document.getElementById('chat-model');
   if (!select) return;
+  const requestId = ++chatModelCatalogRequest;
 
   try {
     const catalog = parseChatModelCatalog(await api('/chat/models'));
+    if (requestId !== chatModelCatalogRequest) return;
     if (!catalog) throw new Error('model catalog response was invalid');
     chatModelChoices = catalog.models.map(model => model.key);
     chatDefaultModelKey = catalog.defaultKey;
@@ -130,9 +139,8 @@ async function initChatModelControl() {
       option.textContent = `Model · ${model.label}${model.isDefault ? ' (default)' : ''}${model.preview ? ' · Preview' : ''}`;
       return option;
     }));
-    select.value = chatModelChoice();
-    select.disabled = false;
   } catch (error) {
+    if (requestId !== chatModelCatalogRequest) return;
     console.warn('[chat-model] Could not load model catalog; retaining GPT-5.6 compatibility choices', error);
     chatModelChoices = ['default', 'luna', 'sol'];
     chatDefaultModelKey = 'default';
@@ -141,14 +149,58 @@ async function initChatModelControl() {
       new Option('Model · GPT-5.6 Luna', 'luna'),
       new Option('Model · GPT-5.6 Sol', 'sol'),
     );
-    select.value = chatModelChoice();
-    select.disabled = false;
   }
+  select.value = chatModelChoice();
+  select.disabled = lastAiModelState === 'not_configured';
+}
 
+function initChatModelControl() {
+  const select = document.getElementById('chat-model');
+  if (!select) return;
   select.addEventListener('change', () => {
     const value = chatModelChoices.includes(select.value) ? select.value : chatDefaultModelKey;
     try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
   });
+  void refreshChatModelCatalog();
+}
+
+// ── AI model readiness (Settings → AI model) ──
+// /dashboard/version carries only an activation counter and a coarse state.
+// A new counter means another provider: refresh the picker. 'not_configured'
+// shows the setup notice so a fresh install knows where to add a key.
+function applyAiModelState(value) {
+  const notConfigured = value === 'not_configured';
+  const notice = document.getElementById('chat-ai-model-notice');
+  if (notice) notice.hidden = !notConfigured;
+  const select = document.getElementById('chat-model');
+  if (select) select.disabled = notConfigured;
+}
+
+function observeAiModel(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const version = typeof payload.aiModelVersion === 'number' ? payload.aiModelVersion : null;
+  const value = typeof payload.aiModelState === 'string' ? payload.aiModelState : null;
+  if (value !== lastAiModelState) {
+    lastAiModelState = value;
+    applyAiModelState(value);
+  }
+  if (version !== null && lastAiModelVersion !== null && version !== lastAiModelVersion) {
+    void refreshChatModelCatalog();
+  }
+  if (version !== null) lastAiModelVersion = version;
+}
+
+async function refreshAiModelReadiness() {
+  try { observeAiModel(await api('/dashboard/version')); } catch {}
+}
+
+function initAiModelReadiness() {
+  // Same-tab Settings save/remove: refresh immediately, not on the next poll.
+  window.addEventListener('botboy:ai-model-changed', () => {
+    void refreshChatModelCatalog();
+    void refreshAiModelReadiness();
+  });
+  void refreshAiModelReadiness();
 }
 
 // Chat panel width preset (teammate request 2026-08-28). A body class
@@ -450,9 +502,19 @@ async function sendChat(msg) {
       completeChatRequestId(requestId);
       // Server returned non-2xx (e.g. 400). Read error body and surface it on the bubble.
       let errText = `HTTP ${resp.status}`;
-      try { errText = (await resp.text()).slice(0, 500) || errText; } catch {}
+      let friendly = '';
+      try {
+        const raw = await resp.text();
+        errText = raw.slice(0, 500) || errText;
+        // Structured errors ({error, nextAction}) read as a sentence, not JSON.
+        const payload = JSON.parse(raw);
+        if (payload && typeof payload.error === 'string' && payload.error.trim()) {
+          friendly = `⚠️ ${payload.error.trim()}${typeof payload.nextAction === 'string' && payload.nextAction.trim() ? ` ${payload.nextAction.trim()}` : ''}`;
+        }
+      } catch {}
       console.error('[sendChat] HTTP error response:', resp.status, errText);
-      segments.push({ type: 'text', content: `❌ Error ${resp.status}: ${errText}` });
+      if (resp.status === 409) void refreshAiModelReadiness();
+      segments.push({ type: 'text', content: friendly || `❌ Error ${resp.status}: ${errText}` });
       renderSegments();
       msgEl.classList.remove('streaming-live');
       msgEl.classList.add('streaming-frozen');
@@ -3025,6 +3087,7 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
 
   initChatThinkingControl();
   initChatModelControl();
+  initAiModelReadiness();
   initChatWidthControl();
   initChatAttachments();
   await Promise.all([
@@ -3040,7 +3103,9 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
   let lastAutoOpenedTerminalId = '';
   setInterval(async () => {
     try {
-      const { version, terminal } = await api('/dashboard/version');
+      const versionPayload = await api('/dashboard/version');
+      const { version, terminal } = versionPayload;
+      observeAiModel(versionPayload);
       // Terminal sessions can be opened from any tab or by the agent loop —
       // sync the chat dock whenever the server-side session id/status moves.
       const fingerprint = terminal ? `${terminal.id}:${terminal.status}` : '';

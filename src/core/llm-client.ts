@@ -61,6 +61,12 @@ export interface LlmClient {
   getMaxRequestBytes(): number;
   /** The primary (non-Ollama) endpoint's default model id — the anchor blessed overrides resolve against. */
   getDefaultModel(): string;
+  /** Provider id serving the primary endpoint (e.g. 'gateway', 'openai'). Optional for lightweight mocks. */
+  getProviderId?(): string | undefined;
+  /** Catalog model ids the active credential reported it can call, when the platform lists them. */
+  getAvailableModels?(): readonly string[] | undefined;
+  /** Most recent credential/account problem reported by the provider; cleared by the next success. */
+  getProviderIssue?(): LlmProviderIssue | undefined;
   sendPrompt(prompt: string, usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
   sendMessage(messages: AcpChatMessage[], usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
   initialize(): Promise<void>; // no-op for backward compat
@@ -400,6 +406,114 @@ export function isLlmPayloadTooLargeError(error: unknown): error is LlmPayloadTo
   return error instanceof LlmPayloadTooLargeError || (error as any)?.code === 'LLM_PAYLOAD_TOO_LARGE';
 }
 
+/**
+ * The provider is throttling this credential. Request-specific, never endpoint
+ * health: the same key recovers once its rate window resets.
+ */
+export class LlmRateLimitedError extends Error {
+  readonly code = 'LLM_RATE_LIMITED';
+  readonly nextAction = 'Wait a minute and try again. Heavy use on a new OpenAI account hits its rate limit sooner; limits rise automatically as the account is used.';
+  constructor(readonly retryAfterMs?: number) {
+    super(`The AI provider is rate-limiting this API key${retryAfterMs ? ` (it asked BotBoy to wait about ${Math.max(1, Math.round(retryAfterMs / 1000))}s)` : ''}.`);
+    this.name = 'LlmRateLimitedError';
+  }
+}
+
+/** The provider account has no usable credit. Retrying cannot succeed. */
+export class LlmQuotaExhaustedError extends Error {
+  readonly code = 'LLM_QUOTA_EXHAUSTED';
+  readonly nextAction = 'Add credit or raise the spending limit for this OpenAI account (platform.openai.com → Billing), then try again.';
+  constructor() {
+    super('The OpenAI account behind this API key has no available credit.');
+    this.name = 'LlmQuotaExhaustedError';
+  }
+}
+
+/** Account/credential limits are not endpoint failures and never authorize fallback. */
+export function isLlmProviderLimitError(error: unknown): error is LlmRateLimitedError | LlmQuotaExhaustedError {
+  const code = (error as any)?.code;
+  return error instanceof LlmRateLimitedError || error instanceof LlmQuotaExhaustedError
+    || code === 'LLM_RATE_LIMITED' || code === 'LLM_QUOTA_EXHAUSTED';
+}
+
+/** Most recent credential/account problem the provider reported, for owner status. */
+export interface LlmProviderIssue {
+  readonly code: 'auth_rejected' | 'quota_exhausted' | 'rate_limited';
+  readonly httpStatus: number;
+  readonly at: string;
+}
+
+/**
+ * Remove API keys and bearer tokens from provider-supplied text before it can
+ * reach logs, persisted chat messages, or the model. OpenAI's 401 body echoes
+ * a masked key fragment; nothing credential-shaped leaves this boundary.
+ */
+export function redactProviderSecrets(text: string): string {
+  return String(text ?? '')
+    .replace(/\bsk-[A-Za-z0-9_*.\-]{4,}/g, 'sk-…[redacted]')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/=\-]{8,}/gi, '$1 [redacted]');
+}
+
+/** OpenAI error `code` from a JSON error body, when present. */
+export function openAiErrorCode(responseText: string): string | undefined {
+  try {
+    const parsed = JSON.parse(responseText);
+    const code = parsed?.error?.code ?? parsed?.error?.type;
+    return typeof code === 'string' ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function durationHintMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const text = value.trim();
+  // OpenAI rate-limit reset headers use Go duration text: "20ms", "1.5s", "6m0s".
+  const parts = [...text.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/g)];
+  if (parts.length && parts.map(part => part[0]).join('') === text) {
+    const unit: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
+    return Math.ceil(parts.reduce((sum, part) => sum + Number(part[1]) * unit[part[2]], 0));
+  }
+  return undefined;
+}
+
+/** Provider-requested wait before retrying a 429, in milliseconds. */
+export function retryAfterMs(headers: Pick<Headers, 'get'>): number | undefined {
+  const explicitMs = Number(headers.get('retry-after-ms'));
+  if (Number.isFinite(explicitMs) && explicitMs > 0) return Math.ceil(explicitMs);
+  const retryAfter = headers.get('retry-after')?.trim();
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  const resets = [headers.get('x-ratelimit-reset-requests'), headers.get('x-ratelimit-reset-tokens')]
+    .map(durationHintMs)
+    .filter((value): value is number => value !== undefined);
+  return resets.length ? Math.max(...resets) : undefined;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error('aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Bounded 429 handling for the hosted OpenAI platform. */
+const OPENAI_RATE_LIMIT_MAX_RETRIES = 3;
+const OPENAI_RATE_LIMIT_MAX_WAIT_MS = 20_000;
+const OPENAI_RATE_LIMIT_DEFAULT_WAIT_MS = 2_000;
+
 function bytesFromHumanSize(value: string, unit: string): number | null {
   const numeric = Number(value.replace(/,/g, ''));
   if (!Number.isFinite(numeric) || numeric <= 0) return null;
@@ -420,7 +534,7 @@ function bytesFromHumanSize(value: string, unit: string): number | null {
 
 /** Normalize only the provider's explicit payload-limit rejection. */
 export function providerHttpError(status: number, responseText: string, size: ProviderRequestSize): Error {
-  const detail = String(responseText ?? '');
+  const detail = redactProviderSecrets(String(responseText ?? ''));
   const match = /\bpayload size of\s+([\d,.]+)\s*(bytes?|b|kb|kib|mb|mib|gb|gib)\s+exceeds\s+the\s+allowed limit of\s+([\d,.]+)\s*(bytes?|b|kb|kib|mb|mib|gb|gib)\b/i.exec(detail);
   if ((status === 400 || status === 413) && match) {
     const maximumBytes = bytesFromHumanSize(match[3], match[4]);
@@ -524,6 +638,17 @@ export interface LlmConfig {
   fallbackEnabled: boolean;
   /** Exact serialized HTTP body ceiling for this provider profile. */
   maxRequestBytes?: number;
+  /** Provider id stamped on usage rows and returned by getProviderId(). */
+  providerId?: string;
+  /**
+   * Hosted-platform conventions for the primary endpoint. 'openai' is the
+   * OpenAI API itself: a free model-retrieve health probe instead of a billed
+   * ping, explicitly non-strict function tools (Responses otherwise attempts
+   * strict mode), and bounded Retry-After handling for 429s.
+   */
+  platform?: 'openai';
+  /** Catalog model ids the configured credential can call (from the platform's model list). */
+  availableModels?: readonly string[];
   /**
    * Streaming idle watchdog: abort a stream when no bytes arrive for this many
    * ms (wedged socket after laptop sleep, silent ALB drop). There is
@@ -895,6 +1020,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
   }
 
   let healthTimer: ReturnType<typeof setInterval> | null = null;
+  let providerIssue: LlmProviderIssue | undefined;
   const configuredRequestMaximum = Number(config.maxRequestBytes ?? process.env.BOTBOY_LLM_MAX_REQUEST_BYTES ?? 5_500_000);
   const maximumRequestBytes = Number.isFinite(configuredRequestMaximum) && configuredRequestMaximum > 0
     ? Math.floor(configuredRequestMaximum)
@@ -992,6 +1118,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       const headers = await buildAuthHeaders(ep, url, 'POST', bodyStr, routeHeaders);
       const handle = usage.beginAttempt(metadata.context, {
         endpointKey: ep.name,
+        ...(!ep.useOllamaApi && config.providerId ? { provider: config.providerId } : {}),
         apiMode: metadata.apiMode,
         model: metadata.model,
         stream: metadata.stream,
@@ -1022,7 +1149,46 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       ep.requestAuthorizer.invalidate();
       recorded = await send(true);
     }
+    if (config.platform === 'openai' && !ep.useOllamaApi) {
+      // Hosted OpenAI: a 429 is either an exhausted account (terminal) or a
+      // rate window (wait as instructed, resend). Each resend is its own
+      // usage attempt in the same operation; neither case is endpoint health.
+      let rateLimitRetries = 0;
+      while (recorded.response.status === 429) {
+        const detail = await recorded.response.text().catch(() => '');
+        usage.failAttempt(recorded.handle, {
+          httpStatus: 429,
+          errorClass: 'HTTP_429',
+          usage: parseUsageFromText(detail),
+        });
+        if (openAiErrorCode(detail) === 'insufficient_quota') {
+          noteProviderIssue('quota_exhausted', 429);
+          throw new LlmQuotaExhaustedError();
+        }
+        const requestedWait = retryAfterMs(recorded.response.headers);
+        const waitMs = requestedWait ?? OPENAI_RATE_LIMIT_DEFAULT_WAIT_MS * 2 ** rateLimitRetries;
+        if (rateLimitRetries >= OPENAI_RATE_LIMIT_MAX_RETRIES || waitMs > OPENAI_RATE_LIMIT_MAX_WAIT_MS) {
+          noteProviderIssue('rate_limited', 429);
+          throw new LlmRateLimitedError(requestedWait);
+        }
+        rateLimitRetries += 1;
+        await abortableDelay(waitMs, init.signal);
+        recorded = await send();
+      }
+    }
+    const finalStatus = recorded.response.status;
+    if (recorded.response.ok) {
+      providerIssue = undefined;
+    } else if (config.platform === 'openai' && (finalStatus === 401 || finalStatus === 403)) {
+      // Only the hosted platform maps these to the credential: a gateway 403
+      // can be a WAF/policy answer to one request (see providerHttpError).
+      noteProviderIssue('auth_rejected', finalStatus);
+    }
     return recorded;
+  }
+
+  function noteProviderIssue(code: LlmProviderIssue['code'], httpStatus: number): void {
+    providerIssue = { code, httpStatus, at: new Date().toISOString() };
   }
 
   function remoteRequestUrl(ep: Endpoint): string {
@@ -1073,6 +1239,22 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
 
   async function probeEndpoint(ep: Endpoint): Promise<boolean> {
     try {
+      if (!ep.useOllamaApi && config.platform === 'openai') {
+        // The OpenAI API has a model-retrieve route: it proves the key and
+        // model access without generating (no tokens, no usage row).
+        const url = `${ep.url.replace(/\/+$/, '')}/models/${encodeURIComponent(ep.model)}`;
+        const headers = await buildAuthHeaders(ep, url, 'GET');
+        const resp = await fetch(url, { signal: AbortSignal.timeout(10_000), headers });
+        await resp.body?.cancel().catch(() => undefined);
+        // The probe can report a rejected key but never clears one: a key
+        // may list models yet be refused generation. Only a successful
+        // generation (postWithAuthRetry) clears a credential issue.
+        if (resp.status === 401 || resp.status === 403) noteProviderIssue('auth_rejected', resp.status);
+        // A rate-limited probe is an account limit, not an endpoint failure:
+        // it must not mark the endpoint unhealthy and pause background work.
+        if (resp.status === 429) return true;
+        return resp.ok;
+      }
       if (!ep.useOllamaApi && ep.apiMode === 'responses') {
         // Bedrock Mantle has no generic application health route. A tiny
         // Responses request verifies model access and bearer authentication.
@@ -1212,6 +1394,10 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           name: tool.function.name,
           description: tool.function.description,
           parameters: tool.function.parameters,
+          // OpenAI's Responses API attempts strict mode when `strict` is
+          // omitted, which changes how optional parameters are filled. Keep
+          // BotBoy's schemas advisory, exactly as they behave on the gateway.
+          ...(config.platform === 'openai' ? { strict: false } : {}),
         })),
       } : {}),
       ...(req.responseFormat ? { text: { format: responsesTextFormat(req.responseFormat) } } : {}),
@@ -1287,7 +1473,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     const providerError = data?.error;
     if (providerError || data?.status === 'failed' || data?.status === 'cancelled') {
       const detail = providerError?.message || providerError?.code || data?.status || 'unknown failure';
-      throw new Error(`Responses API failed: ${detail}`);
+      throw new Error(`Responses API failed: ${redactProviderSecrets(detail)}`);
     }
 
     const output = Array.isArray(data?.output) ? data.output : [];
@@ -1592,12 +1778,12 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           const eventType = event.type;
 
           if (eventType === 'error') {
-            throw new Error(`Responses stream failed: ${event.message || event.code || 'unknown error'}`);
+            throw new Error(`Responses stream failed: ${redactProviderSecrets(event.message || event.code || 'unknown error')}`);
           }
           if (eventType === 'response.failed' || eventType === 'response.cancelled') {
             terminalUsage = parseProviderUsage(event.response);
             const failure = event.response?.error || event.error;
-            throw new Error(`Responses stream failed: ${failure?.message || failure?.code || eventType}`);
+            throw new Error(`Responses stream failed: ${redactProviderSecrets(failure?.message || failure?.code || eventType)}`);
           }
 
           if (eventType === 'response.output_text.delta' && typeof event.delta === 'string') {
@@ -2112,6 +2298,18 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       return primary?.model ?? '';
     },
 
+    getProviderId(): string | undefined {
+      return config.providerId;
+    },
+
+    getAvailableModels(): readonly string[] | undefined {
+      return config.availableModels;
+    },
+
+    getProviderIssue(): LlmProviderIssue | undefined {
+      return providerIssue;
+    },
+
     preflightPrimary(request: ChatCompletionRequest): PrimaryRequestPreflight {
       const primary = endpoints.find(endpoint => !endpoint.useOllamaApi);
       if (!primary) throw new Error('Primary visual-capable LLM endpoint is unavailable');
@@ -2156,6 +2354,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           // poison health or fall through to a transport that would lose
           // image evidence; the owning loop gets one smaller recovery pass.
           if (isLlmPayloadTooLargeError(err)) throw err;
+          // Rate windows and account credit belong to the credential, not the
+          // endpoint: stay healthy, never fall back to a different model.
+          if (isLlmProviderLimitError(err)) throw err;
           // A server-admitted alternate route is isolated from default health
           // and must never fall through to a different local model.
           if (request.route) throw err;
@@ -2182,6 +2383,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         // A request-specific payload rejection says nothing about endpoint
         // health; preserve the endpoint and let the chat loop rebuild once.
         if (isLlmPayloadTooLargeError(err)) throw err;
+        if (isLlmProviderLimitError(err)) throw err;
         // Alternate model routes never poison or fall back from the default.
         if (request.route) throw err;
         ecsEp.healthy = false;

@@ -73,6 +73,9 @@ const state = {
   projectErrors: new Map(),
   health: null,
   llmUsage: { data: null, error: '', loading: false, days: 30, timeZone: LLM_USAGE_TIME_ZONE, requestId: 0 },
+  // Settings → AI model. The key itself never lives in state: it is read
+  // from the form once, sent, and the field is cleared by the next repaint.
+  aiModel: { status: null, error: '', loading: false, saving: false, removing: false, requestId: 0, saveError: null },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
@@ -211,6 +214,8 @@ const state = {
   lastDocumentsVersion: null,
   lastBootId: null,
   lastUiVersion: null,
+  lastAiModelVersion: null,
+  lastAiModelState: null,
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -295,6 +300,7 @@ function parseRoute() {
   if (parts[0] === 'connections' && parts[1]) return { view: 'profile-settings', profileId: parts[1] };
   if (parts[0] === 'settings' && parts[1] === 'dashboard-sharing') return { view: 'publisher-settings' };
   if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
+  if (parts[0] === 'settings' && parts[1] === 'ai-model') return { view: 'ai-model-settings' };
   if (parts[0] === 'data-room') {
     let id = parts[2] || parts[1] || '';
     try { id = decodeURIComponent(id); } catch { id = ''; }
@@ -826,7 +832,7 @@ function renderSidebar() {
         || (view === 'connections' && ['mcp-settings', 'profile-settings', 'mcp-add', 'mcp-edit'].includes(route.view))
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
         || (view === 'data-room' && ['data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'].includes(route.view))
-        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings'].includes(route.view));
+        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings'].includes(route.view));
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
     <section class="nav-section"><div class="nav-label"><span>Areas & projects</span></div><div class="area-tree">
@@ -3337,6 +3343,122 @@ async function loadLlmUsage({ force = false } = {}) {
     if (requestId !== state.llmUsage.requestId) return;
     state.llmUsage.loading = false;
     if (state.route.view === 'llm-usage-settings') renderRoute();
+  }
+}
+
+// ── Settings → AI model: owner OpenAI key, verified server-side, applied without restart ──
+function aiModelErrorText(error) {
+  return String(error?.payload?.error || error?.message || error || 'Unknown error');
+}
+
+async function loadAiModelStatus() {
+  const requestId = ++state.aiModel.requestId;
+  state.aiModel.loading = true;
+  try {
+    const status = await request('/settings/ai-model');
+    if (requestId !== state.aiModel.requestId) return;
+    state.aiModel.status = status;
+    state.aiModel.error = '';
+  } catch (error) {
+    if (requestId !== state.aiModel.requestId) return;
+    state.aiModel.error = aiModelErrorText(error);
+  } finally {
+    if (requestId === state.aiModel.requestId) {
+      state.aiModel.loading = false;
+      // Background repaint: skipped while a key is half-typed (hasUnsavedUserInput).
+      if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true });
+    }
+  }
+}
+
+function renderAiModelSettings() {
+  const ai = state.aiModel;
+  const head = `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>AI model</span></div>${pageHead('Settings', 'AI model', 'Choose what powers chat and background organizing. Changes apply right away, with no restart.', '<a class="button" href="#/settings">Back</a>')}`;
+  if (!ai.status) {
+    if (!ai.error) {
+      if (!ai.loading) void loadAiModelStatus();
+      return loadingView();
+    }
+    return `${head}${errorView(ai.error)}`;
+  }
+  const status = ai.status;
+  const busy = ai.saving || ai.removing;
+  const ready = status.state === 'ready';
+  const notSetUp = status.state === 'not_configured';
+  const models = Array.isArray(status.models) ? status.models.map(model => model?.label).filter(Boolean) : [];
+  const issue = status.issue
+    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(status.issue.message)}</strong> ${esc(status.issue.nextAction)}</span></div>`
+    : '';
+  const statusRows = notSetUp
+    ? `<div class="setting-row"><span class="setting-copy"><strong>No AI model yet</strong><span>Chat and background organizing are off until you add an OpenAI API key below.</span></span><span class="pill">Not set up</span></div>`
+    : `<div class="setting-row"><span class="setting-copy"><strong>${esc(status.providerLabel)}</strong><span>${status.source === 'settings' ? 'Set up here in Settings.' : 'Set up by the BotBoy launcher configuration.'}</span></span><span class="pill ${ready ? 'good' : 'warn'}">${ready ? 'Ready' : 'Needs attention'}</span></div>`
+      + `<div class="setting-row"><span class="setting-copy"><strong>Background organizing</strong><span>Routing, project briefs, and digests use ${esc(status.backgroundModel)}.</span></span></div>`
+      + `<div class="setting-row"><span class="setting-copy"><strong>Chat models</strong><span>${models.length ? esc(models.join(' · ')) : 'The provider default.'}</span></span></div>`;
+  const keyRow = status.openai
+    ? `<div class="setting-row"><span class="setting-copy"><strong>OpenAI key ${esc(status.openai.keySuffix)}</strong><span>Verified ${esc(relativeTime(status.openai.verifiedAt))}.${status.environmentProviderLabel ? ` Removing it switches BotBoy back to ${esc(status.environmentProviderLabel)}.` : ' Removing it turns chat and background organizing off.'}</span></span><button class="button small" type="button" data-action="ai-model-remove" ${busy ? 'disabled' : ''}>${ai.removing ? 'Removing…' : 'Remove key'}</button></div>`
+    : '';
+  const replacing = Boolean(status.openai);
+  const saveError = ai.saveError
+    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.saveError.message)}</strong>${ai.saveError.nextAction ? ` ${esc(ai.saveError.nextAction)}` : ''}</span></div>`
+    : '';
+  const form = `<form class="card mcp-form ai-model-key-form"><div class="card-header"><div><h2 class="card-title">${replacing ? 'Replace your OpenAI API key' : 'Use your OpenAI API key'}</h2><div class="card-meta">Runs chat and background organizing on GPT-5.6 and GPT-6 with your own OpenAI account.</div></div></div>${saveError}<div class="mcp-form-body">${mcpField('apiKey', 'OpenAI API key', '', { type: 'password', placeholder: 'sk-…', autocomplete: 'off', required: true, help: 'Create one at platform.openai.com/api-keys. BotBoy checks it with OpenAI, keeps it private on this Mac, and switches over right away.' })}<p class="card-meta">While a key is saved, what BotBoy’s model reads (captured messages, documents, your chats, and query results) is sent to OpenAI under your account. Data Room table values stay on this Mac, so chat can’t analyze Data Room datasets in this mode.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${ai.saving ? 'Checking key…' : replacing ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
+  return `${head}<section class="ai-model-settings"><article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Current model</h2><div class="card-meta">What powers BotBoy right now</div></div><button class="button small ghost" type="button" data-action="ai-model-refresh" ${ai.loading || busy ? 'disabled' : ''}>${ai.loading ? 'Checking…' : 'Refresh'}</button></div>${issue}${statusRows}${keyRow}</article>${form}</section>`;
+}
+
+/** Tell the chat panel (app.js) to refresh its model picker and notice now. */
+function announceAiModelChange() {
+  try { window.dispatchEvent(new CustomEvent('botboy:ai-model-changed')); } catch {}
+}
+
+async function saveAiModelKey(form) {
+  if (!form || state.aiModel.saving || state.aiModel.removing) return;
+  // Read before painting: the busy repaint recreates the field empty.
+  const apiKey = String(form.elements.apiKey?.value || '').trim();
+  if (!apiKey) return;
+  state.aiModel.saving = true;
+  state.aiModel.saveError = null;
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const status = await request('/settings/ai-model/openai', { method: 'PUT', body: { apiKey } });
+    // Supersede any status read that started before this change.
+    state.aiModel.requestId += 1;
+    state.aiModel.loading = false;
+    state.aiModel.status = status;
+    state.aiModel.error = '';
+    toast('OpenAI is on. Chat and background organizing now use your key.');
+    announceAiModelChange();
+  } catch (error) {
+    state.aiModel.saveError = { message: aiModelErrorText(error), nextAction: String(error?.nextAction || '') };
+    toast('Could not turn on OpenAI', 'bad');
+  } finally {
+    state.aiModel.saving = false;
+    if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+async function removeAiModelKey() {
+  const status = state.aiModel.status;
+  if (!status?.openai || state.aiModel.saving || state.aiModel.removing) return;
+  const after = status.environmentProviderLabel
+    ? `BotBoy switches back to ${status.environmentProviderLabel} right away.`
+    : 'Chat and background organizing stop until you add a key again.';
+  if (!window.confirm(`Remove the saved OpenAI key (${status.openai.keySuffix})?\n\n${after}`)) return;
+  state.aiModel.removing = true;
+  state.aiModel.saveError = null;
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const next = await request('/settings/ai-model/openai', { method: 'DELETE' });
+    state.aiModel.requestId += 1;
+    state.aiModel.loading = false;
+    state.aiModel.status = next;
+    state.aiModel.error = '';
+    toast('OpenAI key removed');
+    announceAiModelChange();
+  } catch (error) {
+    toast(`Could not remove the key: ${aiModelErrorText(error)}`, 'bad');
+  } finally {
+    state.aiModel.removing = false;
+    if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -6433,7 +6555,7 @@ function renderLlmUsageSettings() {
 function renderSettings() {
   const dark = document.documentElement.dataset.theme !== 'light';
   return `${pageHead('Workspace', 'Settings', 'Appearance, diagnostics, and compatibility tools for the local dashboard.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
+    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
 // Repaints rebuild #app-view from scratch, which destroys any text the
@@ -6555,6 +6677,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
     state.analytics.chatSelection.delete(previousRoute.dashboardId);
   }
   if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
+  if (routeChanged && state.route.view === 'ai-model-settings') void loadAiModelStatus();
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
   // hard-reload restore, even if the owner later returns to the same hash.
@@ -6635,6 +6758,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'settings') html = renderSettings();
   if (state.route.view === 'publisher-settings') html = renderPublisherSettings();
   if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
+  if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   view.innerHTML = html;
   if (state.route.view === 'documents') {
@@ -7276,6 +7400,8 @@ function bindEvents() {
       void loadLlmUsage({ force: true });
       renderRoute({ preserveScroll: true, userAction: true });
     }
+    if (action === 'ai-model-remove') void removeAiModelKey();
+    if (action === 'ai-model-refresh') void loadAiModelStatus();
     if (action === 'llm-usage-range') {
       const days = Number(target.dataset.days);
       if ([30, 90, 365].includes(days) && days !== state.llmUsage.days) {
@@ -7753,6 +7879,11 @@ function bindEvents() {
       void savePublisherConfig(event.target);
       return;
     }
+    if (event.target?.matches('.ai-model-key-form')) {
+      event.preventDefault();
+      void saveAiModelKey(event.target);
+      return;
+    }
     if (event.target?.id === 'mcp-config-form') {
       event.preventDefault();
       void saveMcpConfig();
@@ -8020,6 +8151,10 @@ async function pollVersion() {
     state.lastDocumentsVersion = payload.documentsVersion ?? '0';
     state.lastBootId = payload.bootId ?? null;
     state.lastUiVersion = payload.uiVersion ?? null;
+    const previousAiModelVersion = state.lastAiModelVersion;
+    const previousAiModelState = state.lastAiModelState;
+    state.lastAiModelVersion = payload.aiModelVersion ?? null;
+    state.lastAiModelState = payload.aiModelState ?? null;
 
     // Reload the tab when the code it runs is stale. Two triggers:
     //  - bootId change: the server restarted (possibly with new UI code).
@@ -8064,6 +8199,14 @@ async function pollVersion() {
         location.reload();
         return;
       }
+    }
+
+    // Another tab (or a provider credential problem) changed the AI model:
+    // refresh the open Settings page. Never reloads the tab.
+    if (state.route.view === 'ai-model-settings' && !state.aiModel.saving && !state.aiModel.removing
+      && ((previousAiModelVersion !== null && state.lastAiModelVersion !== previousAiModelVersion)
+        || (previousAiModelState !== null && state.lastAiModelState !== previousAiModelState))) {
+      void loadAiModelStatus();
     }
 
     if (previousVersion !== null && payload.version !== previousVersion) {

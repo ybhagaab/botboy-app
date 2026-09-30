@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
 import type { AcpClient } from './acp-client.js';
 import type { LlmClient, ToolCall } from './llm-client.js';
+import { isLlmClientSwitch, pinLlmClient } from './llm-client-switch.js';
 import type { LlmUsageContext } from './llm-usage.js';
 import type { ToolExecutor } from './tool-executor.js';
 import { type PromptManager } from './prompt-manager.js';
@@ -195,6 +196,15 @@ Be concise, helpful, proactive. You have full authority.`;
       try {
         // If we have LlmClient + ToolExecutor, use the tool execution loop
         if (llmClient && toolExecutor && promptManager) {
+          // One provider for the whole loop: replayed provider output
+          // (encrypted reasoning) is only valid on the provider that issued it.
+          const loopClient = pinLlmClient(llmClient);
+          // Tool results gathered after a Settings → AI model change follow the
+          // new provider's data rules, so they are never sent to the pinned
+          // one: the loop stops and the task can run again on the new model.
+          const pinnedConfigVersion = isLlmClientSwitch(llmClient) ? llmClient.configVersion() : undefined;
+          const providerChanged = () => pinnedConfigVersion !== undefined
+            && isLlmClientSwitch(llmClient) && llmClient.configVersion() !== pinnedConfigVersion;
           const tools = promptManager.getToolDefinitions('chat', promptContext);
           const messages: any[] = [
             { role: 'system', content: systemPrompt },
@@ -214,6 +224,9 @@ Be concise, helpful, proactive. You have full authority.`;
           // with nobody watching and no Stop button — bounded autonomy here,
           // unbounded work only in interactive chat where the owner presides.
           for (let i = 0; i < 15; i++) {
+            if (providerChanged()) {
+              throw new Error('the AI model was changed in Settings during this task, so it stopped before sending more work to the previous model. Run it again to continue on the new model.');
+            }
             const request = {
               messages,
               tools,
@@ -223,13 +236,13 @@ Be concise, helpful, proactive. You have full authority.`;
             };
             let resp;
             try {
-              resp = await llmClient.chatCompletion(request);
+              resp = await loopClient.chatCompletion(request);
             } catch (error) {
               const receipt = payloadRecoveryUsed ? null : prepareImageFreePayloadRecovery(messages, error);
               if (!receipt) throw error;
               payloadRecoveryUsed = true;
               console.warn(`[Agent] Payload recovery: removed ${receipt.removedImageCount} image(s), ${receipt.removedImageChars} chars; resuming the same instruction without rejected pixels`);
-              resp = await llmClient.chatCompletion({
+              resp = await loopClient.chatCompletion({
                 ...request,
                 payloadConstraint: {
                   requireImageFree: true,

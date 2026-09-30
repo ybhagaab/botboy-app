@@ -8,7 +8,8 @@ local folders, and your browser—and turns that activity into organized
 projects, living briefs, and a chat assistant grounded in your work. Evidence,
 document copies, generated files, and credentials stay local by default;
 selected content needed for LLM requests goes through the authenticated team
-gateway.
+gateway, or to OpenAI under your own account if you add an OpenAI API key in
+Settings → AI model.
 
 ## Why teams use it
 
@@ -75,11 +76,12 @@ dedicated read-only analytics connection.
 
 ## Install
 
-You need macOS, Google Chrome, Git, Node.js 20+, and the private BotBoy
-credential attachment sent by the owner. No AWS account or `aws login` is
-required.
+You need macOS, Google Chrome, Git, Node.js 20+, and an AI model: either the
+private BotBoy credential attachment sent by the owner, or your own OpenAI API
+key. No AWS account or `aws login` is required.
 
-Download the credential attachment to Downloads or Desktop, then run:
+If you have a credential attachment, download it to Downloads or Desktop.
+Then run:
 
 ```bash
 git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
@@ -88,7 +90,12 @@ npm install
 ./start.sh
 ```
 
-Allow a few minutes on first run. BotBoy imports the credential attachment
+Using your own OpenAI API key instead? When the dashboard opens, go to
+**Settings → AI model**, paste the key, and choose **Save and turn on**. BotBoy
+checks it with OpenAI and starts chat and background organizing right away,
+with no restart.
+
+Allow a few minutes on first run. BotBoy imports any credential attachment
 (`.env` or owner-issued ZIP), builds itself, waits for the final dashboard to
 be usable, opens it, and attempts to install `BotBoy.app` in Applications. A
 successful Terminal start ends with `✅ Dashboard ready:`. If startup instead
@@ -128,9 +135,10 @@ DB/WAL/SHM snapshot, archives the guard, and never calls the old exit clean.
 BotBoy is single-user and local-first. Its evidence database, document copies,
 generated files, and credentials live under
 `~/.personal-productivity-tracker/`. Selected text and bounded visual inputs
-needed for LLM requests go through the authenticated team gateway. Connections
-communicate only with services you enable; explicit writes keep their own
-approval boundaries.
+needed for LLM requests go through the authenticated team gateway, or to OpenAI
+under your own account while an OpenAI key is saved in Settings → AI model
+(Data Room table values are never sent to OpenAI). Connections communicate only
+with services you enable; explicit writes keep their own approval boundaries.
 
 ## Help
 

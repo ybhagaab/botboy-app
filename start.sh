@@ -155,6 +155,10 @@ fi
 ulimit -n 10240 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 LOG_FILE="${PPT_LOG_FILE:-/tmp/ppt.log}"
 PID_FILE="${PPT_PID_FILE:-/tmp/ppt.pid}"
+# Settings → AI model: the owner's OpenAI key, saved by the server (0600). The
+# launcher only checks that it exists; it never reads it into a variable,
+# argv, or the environment.
+AI_MODEL_SETTINGS_FILE="$HOME/.personal-productivity-tracker/ai-model.json"
 STARTUP_SAFETY_BLOCK="${PPT_STARTUP_SAFETY_BLOCK:-/tmp/ppt-startup-safety-block.json}"
 SHUTDOWN_RECEIPT_DIR="${PPT_SHUTDOWN_RECEIPT_DIR:-/tmp}"
 STARTUP_INT_GRACE_SECONDS="${PPT_STARTUP_INT_GRACE_SECONDS:-20}"
@@ -724,14 +728,17 @@ stop_startup_child() {
 # owner debug "BotBoy has no LLM" from a screenshot. Owner machines with any
 # credential source stay silent.
 warn_if_no_llm_credentials() {
+  # An OpenAI key saved in Settings → AI model powers BotBoy on its own.
+  [ -s "$AI_MODEL_SETTINGS_FILE" ] && return 0
   [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ] && return 0
   [ -n "${BOTBOY_INFERENCE_API_KEY:-}" ] && return 0
   if [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] \
     && [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ]; then
     return 0
   fi
-  echo "⚠️  No LLM credentials found — BotBoy will run without chat/synthesis."
-  echo "    Download your botboy-credentials file into ~/Downloads and re-run ./start.sh (it installs automatically)."
+  echo "⚠️  No AI model set up yet — chat and background organizing stay off until you add one."
+  echo "    In BotBoy, open Settings → AI model and paste your OpenAI API key (it takes effect right away)."
+  echo "    Or, if the owner sent you a botboy-credentials file, put it in ~/Downloads and re-run ./start.sh."
 }
 
 # Self-heal the Dock/Applications launcher: build /Applications/BotBoy.app on
@@ -1189,6 +1196,35 @@ if [ "$DOCTOR" = "1" ]; then
     echo "homebrew: not installed (optional — the in-app pandoc install needs it; https://brew.sh)"
   fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
+  echo "llm-provider (launcher): ${BOTBOY_INFERENCE_PROVIDER:-unset}"
+  # Settings → AI model. Node reads the key in its own memory and prints only
+  # its last four characters plus the HTTP status of a free model-retrieve
+  # probe; the key never enters this shell, argv, or the output.
+  if [ -f "$AI_MODEL_SETTINGS_FILE" ]; then
+    "$NODE" -e '
+      const fs = require("fs");
+      const file = process.argv[1];
+      const mode = (fs.statSync(file).mode & 0o777).toString(8);
+      let key = "";
+      try {
+        const value = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (value && value.provider === "openai" && typeof value.apiKey === "string") key = value.apiKey;
+      } catch {}
+      if (!key) {
+        console.log(`ai-model: Settings file is unreadable (mode ${mode}) — save the key again in Settings → AI model`);
+        process.exit(0);
+      }
+      console.log(`ai-model: OpenAI key …${key.slice(-4)} saved in Settings (mode ${mode}); it takes precedence over launcher credentials`);
+      fetch("https://api.openai.com/v1/models/gpt-5.6-terra", {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(10000),
+      })
+        .then(response => console.log(`openai probe: HTTP ${response.status} (200=key works, 401=key rejected, 404=no GPT-5.6 Terra access)`))
+        .catch(() => console.log("openai probe: HTTP 000 (network, proxy, or VPN blocks api.openai.com)"));
+    ' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
+  else
+    echo "ai-model: no OpenAI key saved (add one in Settings → AI model)"
+  fi
   # Diagnose the same effective pair normal startup will use. A partial shell
   # override is reported directly and never completed from the stored file.
   DOCTOR_CID="${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}"
@@ -1214,6 +1250,8 @@ if [ "$DOCTOR" = "1" ]; then
     echo "llm auth probe: HTTP ${CODE:-000} (200=valid, 400=invalid/revoked — ask owner, 000=network)"
   elif [ -n "$DOCTOR_CID" ] || [ -n "$DOCTOR_SEC" ]; then
     echo "llm-credentials: INCOMPLETE — client id and secret must both be present"
+  elif [ -s "$AI_MODEL_SETTINGS_FILE" ]; then
+    echo "llm-credentials: none in ~/.personal-productivity-tracker/.env (not needed: the Settings → AI model key is used)"
   else
     echo "llm-credentials: missing (~/.personal-productivity-tracker/.env)"
   fi

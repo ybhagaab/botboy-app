@@ -29,6 +29,12 @@ export interface ParsedProviderUsage {
 
 export interface LlmAttemptMetadata {
   endpointKey: 'ecs' | 'ollama';
+  /**
+   * Provider that actually served this attempt. The active provider can change
+   * at runtime (Settings → AI model), so each client stamps its own identity;
+   * the service-level primaryProvider is only the fallback for older callers.
+   */
+  provider?: string;
   apiMode: string;
   model: string;
   stream: boolean;
@@ -323,7 +329,9 @@ export function createLlmUsageService(
     startedAt: string,
   ): number => {
     const ordinal = Number((nextOrdinal.get(context.operationId) as { ordinal: number }).ordinal);
-    const provider = metadata.endpointKey === 'ollama' ? 'ollama' : options.primaryProvider;
+    const provider = metadata.endpointKey === 'ollama'
+      ? 'ollama'
+      : (metadata.provider?.trim() || options.primaryProvider);
     insertAttempt.run(
       attemptId,
       context.operationId,

@@ -24,7 +24,14 @@ import type { LlmUsageService } from './llm-usage.js';
  * OIDC/JWT work belongs at this boundary; consumers must not acquire AWS or
  * gateway credentials themselves.
  */
-export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible';
+/**
+ * 'openai' is the hosted OpenAI API configured from Settings → AI model (the
+ * owner's own key). It is never derived from environment variables, so an
+ * ambient OPENAI_API_KEY can never silently redirect BotBoy's data.
+ */
+export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible' | 'openai';
+/** Providers the launcher/environment can select. */
+export type EnvInferenceProviderId = Exclude<InferenceProviderId, 'openai'>;
 
 export interface InferenceProvider {
   readonly id: InferenceProviderId;
@@ -111,29 +118,85 @@ export interface ChatModelRoute {
 export const BLESSED_CHAT_MODELS = Object.freeze([
   Object.freeze({
     key: 'terra', label: 'GPT-5.6 Terra', family: 'GPT-5.6',
-    bareId: 'openai.gpt-5.6-terra', route: 'provider-default' as const,
+    bareId: 'openai.gpt-5.6-terra', openaiId: 'gpt-5.6-terra', route: 'provider-default' as const,
   }),
   Object.freeze({
     key: 'luna', label: 'GPT-5.6 Luna', family: 'GPT-5.6',
-    bareId: 'openai.gpt-5.6-luna', route: 'provider-default' as const,
+    bareId: 'openai.gpt-5.6-luna', openaiId: 'gpt-5.6-luna', route: 'provider-default' as const,
   }),
   Object.freeze({
     key: 'sol', label: 'GPT-5.6 Sol', family: 'GPT-5.6',
-    bareId: 'openai.gpt-5.6-sol', route: 'provider-default' as const,
+    bareId: 'openai.gpt-5.6-sol', openaiId: 'gpt-5.6-sol', route: 'provider-default' as const,
   }),
   Object.freeze({
     key: 'gpt6-astra', label: 'GPT-6 Astra', family: 'GPT-6',
-    bareId: 'openai.gpt-6-astra', route: 'gpt6-astra-west' as const,
+    bareId: 'openai.gpt-6-astra', openaiId: 'gpt-6-astra', route: 'gpt6-astra-west' as const,
   }),
   Object.freeze({
     key: 'gpt6-sol', label: 'GPT-6 Sol', family: 'GPT-6',
-    bareId: 'openai.gpt-6-sol', route: 'gpt6-east-mantle' as const,
+    bareId: 'openai.gpt-6-sol', openaiId: 'gpt-6-sol', route: 'gpt6-east-mantle' as const,
   }),
   Object.freeze({
     key: 'gpt6-luna', label: 'GPT-6 Luna', family: 'GPT-6',
-    bareId: 'openai.gpt-6-luna', route: 'gpt6-east-mantle' as const,
+    bareId: 'openai.gpt-6-luna', openaiId: 'gpt-6-luna', route: 'gpt6-east-mantle' as const,
   }),
 ] as const);
+
+/**
+ * Hosted OpenAI API profile (Settings → AI model). Every catalog model uses
+ * the platform's plain id on one endpoint; there are no gateway targets,
+ * alternate endpoints, or Mantle Project headers. Background work stays on
+ * GPT-5.6 Terra, exactly as on the team gateway.
+ */
+export const OPENAI_PLATFORM_ENDPOINT = 'https://api.openai.com/v1';
+export const OPENAI_PLATFORM_DEFAULT_MODEL = 'gpt-5.6-terra';
+/** OpenAI lists 1.05M-token windows for these models; keep the gateway's 1M profile. */
+const OPENAI_PLATFORM_MAX_CONTEXT_TOKENS = 1_000_000;
+
+/** Catalog ids the hosted OpenAI API must list for a model to be offered. */
+export const OPENAI_PLATFORM_MODEL_IDS: readonly string[] = Object.freeze(
+  BLESSED_CHAT_MODELS.map(model => model.openaiId),
+);
+
+/** Provider facts the catalog needs beyond the default model id. */
+export interface ChatModelCatalogContext {
+  readonly providerId?: string;
+  /** Plain OpenAI ids the configured key can call; undefined = not reported. */
+  readonly availableModels?: readonly string[];
+}
+
+function openAiPlatformCatalog(
+  providerDefaultModel: string,
+  availableModels: readonly string[] | undefined,
+): ChatModelCatalog {
+  const available = new Set(availableModels ?? OPENAI_PLATFORM_MODEL_IDS);
+  const offered = BLESSED_CHAT_MODELS.filter(model => available.has(model.openaiId));
+  const defaultEntry = offered.find(model => model.openaiId === providerDefaultModel);
+  if (!offered.length) {
+    return {
+      defaultKey: 'default',
+      models: [{ key: 'default', label: 'Provider default', family: 'Provider', isDefault: true, preview: false }],
+    };
+  }
+  const models = offered.map(model => ({
+    key: model.key,
+    label: model.label,
+    family: model.family,
+    isDefault: model === defaultEntry,
+    // Generally available on the hosted API; the gateway's GPT-6 preview
+    // attestation does not apply to the owner's own OpenAI account.
+    preview: false,
+  }));
+  return defaultEntry
+    ? { defaultKey: defaultEntry.key, models }
+    : {
+        defaultKey: 'default',
+        models: [
+          { key: 'default', label: 'Provider default', family: 'Provider', isDefault: true, preview: false },
+          ...models,
+        ],
+      };
+}
 export type BlessedModelKey = (typeof BLESSED_CHAT_MODELS)[number]['key'];
 
 interface Gpt6GatewayConfig {
@@ -206,7 +269,11 @@ function gpt6GatewayConfig(env: NodeJS.ProcessEnv): Gpt6GatewayConfig | null {
 export function getChatModelCatalog(
   providerDefaultModel: string,
   env: NodeJS.ProcessEnv = process.env,
+  context: ChatModelCatalogContext = {},
 ): ChatModelCatalog {
+  if (context.providerId === 'openai') {
+    return openAiPlatformCatalog(providerDefaultModel, context.availableModels);
+  }
   const configuredGpt6 = gpt6GatewayConfig(env);
   const defaultProfile = BLESSED_CHAT_MODELS.find(
     candidate => candidate.route === 'provider-default'
@@ -248,9 +315,16 @@ export function resolveBlessedModelRoute(
   providerDefaultModel: string,
   key: unknown,
   env: NodeJS.ProcessEnv = process.env,
+  context: ChatModelCatalogContext = {},
 ): ChatModelRoute | null {
   const entry = BLESSED_CHAT_MODELS.find(candidate => candidate.key === key);
   if (!entry) return null;
+  if (context.providerId === 'openai') {
+    // One endpoint, plain ids, no route headers: a gateway Project id sent
+    // here would be read as the owner's own OpenAI project selector.
+    const available = context.availableModels ?? OPENAI_PLATFORM_MODEL_IDS;
+    return available.includes(entry.openaiId) ? { model: entry.openaiId } : null;
+  }
   const defaultProfile = BLESSED_CHAT_MODELS.find(
     candidate => candidate.route === 'provider-default'
       && providerDefaultModel.endsWith(candidate.bareId),
@@ -281,8 +355,20 @@ export function resolveBlessedModelId(
   providerDefaultModel: string,
   key: unknown,
   env: NodeJS.ProcessEnv = process.env,
+  context: ChatModelCatalogContext = {},
 ): string | null {
-  return resolveBlessedModelRoute(providerDefaultModel, key, env)?.model ?? null;
+  return resolveBlessedModelRoute(providerDefaultModel, key, env, context)?.model ?? null;
+}
+
+/** Catalog context for one live client: its provider id and per-key model list. */
+export function chatModelCatalogContext(client: {
+  getProviderId?(): string | undefined;
+  getAvailableModels?(): readonly string[] | undefined;
+}): ChatModelCatalogContext {
+  return {
+    providerId: client.getProviderId?.(),
+    availableModels: client.getAvailableModels?.(),
+  };
 }
 const BEDROCK_MAX_CONTEXT_TOKENS = 1_000_000;
 const LEGACY_BEDROCK_MODEL = 'moonshotai.kimi-k2.5';
@@ -376,6 +462,9 @@ function provider(
   options: SharedProviderOptions,
   config: LlmConfig,
 ): InferenceProvider {
+  // Each client stamps its own provider on usage rows and catalog lookups, so
+  // a runtime provider change can never inherit another provider's identity.
+  const identifiedConfig: LlmConfig = { ...config, providerId: config.providerId ?? id };
   return {
     id,
     endpoint: options.endpoint,
@@ -383,7 +472,7 @@ function provider(
     apiMode: options.apiMode,
     maxContextTokens: options.maxContextTokens,
     localFallbackEnabled: options.localFallback,
-    createClient: (clientOptions = {}) => createLlmClient(config, clientOptions.usageService),
+    createClient: (clientOptions = {}) => createLlmClient(identifiedConfig, clientOptions.usageService),
   };
 }
 
@@ -482,6 +571,94 @@ function apiModeSetting(value: string | undefined, fallback: LlmApiMode): LlmApi
   throw new Error(`Unsupported BOTBOY_INFERENCE_API_MODE: ${value}`);
 }
 
+/**
+ * Provider-independent runtime settings (timeouts, budgets, health cadence,
+ * opt-in local fallback). Shared by every provider so switching providers at
+ * runtime keeps the owner's tuning.
+ */
+function runtimeSettingsFromEnv(env: NodeJS.ProcessEnv) {
+  return {
+    requestTimeoutMs: nonNegativeIntSetting(
+      env.BOTBOY_INFERENCE_TIMEOUT_MS ?? env.VLLM_TIMEOUT_MS,
+      SHARED_DEFAULTS.requestTimeoutMs,
+    ),
+    maxCompletionTokens: positiveIntSetting(
+      env.BOTBOY_INFERENCE_MAX_COMPLETION_TOKENS,
+      SHARED_DEFAULTS.maxCompletionTokens,
+    ),
+    contextBudgetTokens: positiveIntSetting(
+      env.BOTBOY_INFERENCE_CONTEXT_BUDGET_TOKENS,
+      SHARED_DEFAULTS.contextBudgetTokens,
+    ),
+    // Zero disables periodic probes; an explicit healthCheck() still works.
+    healthCheckIntervalMs: nonNegativeIntSetting(
+      env.BOTBOY_INFERENCE_HEALTH_INTERVAL_MS,
+      SHARED_DEFAULTS.healthCheckIntervalMs,
+    ),
+    streamIdleTimeoutMs: nonNegativeIntSetting(
+      env.BOTBOY_INFERENCE_STREAM_IDLE_TIMEOUT_MS ?? env.VLLM_STREAM_IDLE_TIMEOUT_MS,
+      SHARED_DEFAULTS.streamIdleTimeoutMs,
+    ),
+    localFallback: boolSetting(
+      env.BOTBOY_LOCAL_LLM_FALLBACK ?? env.LLM_FALLBACK_ENABLED,
+      false,
+    ),
+    ollamaEndpoint: env.OLLAMA_ENDPOINT || SHARED_DEFAULTS.ollamaEndpoint,
+    ollamaModel: env.OLLAMA_MODEL || SHARED_DEFAULTS.ollamaModel,
+    ollamaMaxContextTokens: positiveIntSetting(
+      env.OLLAMA_MAX_CONTEXT_TOKENS,
+      SHARED_DEFAULTS.ollamaMaxContextTokens,
+    ),
+    ollamaTimeoutMs: nonNegativeIntSetting(
+      env.OLLAMA_TIMEOUT_MS,
+      SHARED_DEFAULTS.ollamaTimeoutMs,
+    ),
+  };
+}
+
+export interface OpenAiPlatformInferenceOptions {
+  /** The owner's OpenAI API key. Held only by the request authorizer. */
+  apiKey: string;
+  /** Plain catalog ids the key reported (GET /v1/models); undefined = unknown. */
+  availableModels?: readonly string[];
+  /** Test seam only; production always uses the hosted OpenAI API. */
+  endpoint?: string;
+  /** Runtime tuning source (timeouts, health cadence, fallback). */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The hosted OpenAI API powering every BotBoy workload with the owner's key:
+ * Responses wire, OpenAI dialect, GPT-5.6 Terra for background work, and the
+ * per-key model list for the chat catalog.
+ */
+export function createOpenAiPlatformInferenceProvider(
+  options: OpenAiPlatformInferenceOptions,
+): InferenceProvider {
+  const apiKey = options.apiKey.trim();
+  if (!apiKey) throw new Error('An OpenAI API key is required.');
+  const env = options.env ?? process.env;
+  const settings: SharedProviderOptions = {
+    endpoint: (options.endpoint ?? OPENAI_PLATFORM_ENDPOINT).replace(/\/+$/, ''),
+    model: OPENAI_PLATFORM_DEFAULT_MODEL,
+    apiMode: 'responses',
+    dialect: 'openai',
+    reasoningEffort: reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low',
+    maxContextTokens: OPENAI_PLATFORM_MAX_CONTEXT_TOKENS,
+    ...runtimeSettingsFromEnv(env),
+  };
+  const config = buildLlmConfig(settings, {
+    authMode: 'apiKey',
+    requestAuthorizer: createStaticBearerAuthorizer(apiKey),
+  });
+  return provider('openai', settings, {
+    ...config,
+    providerId: 'openai',
+    platform: 'openai',
+    ...(options.availableModels ? { availableModels: Object.freeze([...options.availableModels]) } : {}),
+  });
+}
+
 function inferProvider(env: NodeJS.ProcessEnv): InferenceProviderId {
   const endpoint = (env.BOTBOY_INFERENCE_ENDPOINT || env.VLLM_ENDPOINT)?.trim();
   const authMode = env.VLLM_AUTH_MODE?.trim().toLowerCase();
@@ -500,9 +677,12 @@ function inferProvider(env: NodeJS.ProcessEnv): InferenceProviderId {
 /** Resolve explicit product configuration first, then legacy vLLM intent. */
 export function resolveInferenceProviderId(
   env: NodeJS.ProcessEnv = process.env,
-): InferenceProviderId {
+): EnvInferenceProviderId {
   const providerName = (env.BOTBOY_INFERENCE_PROVIDER || '').trim().toLowerCase()
     || inferProvider(env);
+  if (providerName === 'openai') {
+    throw new Error('BOTBOY_INFERENCE_PROVIDER=openai is not an environment setting. Add your OpenAI API key in BotBoy Settings → AI model instead, and remove this variable.');
+  }
   if (providerName !== 'bedrock' && providerName !== 'gateway' && providerName !== 'openai-compatible') {
     throw new Error(`Unsupported BOTBOY_INFERENCE_PROVIDER: ${providerName}`);
   }
@@ -513,6 +693,7 @@ export function resolveInferenceProviderId(
 export function defaultInferenceMaxContextTokens(id: InferenceProviderId): number {
   if (id === 'bedrock') return BEDROCK_MAX_CONTEXT_TOKENS;
   if (id === 'gateway') return GATEWAY_MAX_CONTEXT_TOKENS;
+  if (id === 'openai') return OPENAI_PLATFORM_MAX_CONTEXT_TOKENS;
   return OPENAI_COMPATIBLE_MAX_CONTEXT_TOKENS;
 }
 
@@ -563,10 +744,6 @@ export function createInferenceProviderFromEnv(
           reasoningEffort: undefined,
           maxContextTokens: LEGACY_BEDROCK_MAX_CONTEXT_TOKENS,
         };
-  const localFallback = boolSetting(
-    env.BOTBOY_LOCAL_LLM_FALLBACK ?? env.LLM_FALLBACK_ENABLED,
-    false,
-  );
   const shared = {
     apiMode,
     reasoningEffort: reasoningSetting(
@@ -576,38 +753,7 @@ export function createInferenceProviderFromEnv(
       env.BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS ?? env.VLLM_MAX_CONTEXT_TOKENS,
       providerDefaults.maxContextTokens,
     ),
-    requestTimeoutMs: nonNegativeIntSetting(
-      env.BOTBOY_INFERENCE_TIMEOUT_MS ?? env.VLLM_TIMEOUT_MS,
-      SHARED_DEFAULTS.requestTimeoutMs,
-    ),
-    maxCompletionTokens: positiveIntSetting(
-      env.BOTBOY_INFERENCE_MAX_COMPLETION_TOKENS,
-      SHARED_DEFAULTS.maxCompletionTokens,
-    ),
-    contextBudgetTokens: positiveIntSetting(
-      env.BOTBOY_INFERENCE_CONTEXT_BUDGET_TOKENS,
-      SHARED_DEFAULTS.contextBudgetTokens,
-    ),
-    // Zero disables periodic probes; an explicit healthCheck() still works.
-    healthCheckIntervalMs: nonNegativeIntSetting(
-      env.BOTBOY_INFERENCE_HEALTH_INTERVAL_MS,
-      SHARED_DEFAULTS.healthCheckIntervalMs,
-    ),
-    streamIdleTimeoutMs: nonNegativeIntSetting(
-      env.BOTBOY_INFERENCE_STREAM_IDLE_TIMEOUT_MS ?? env.VLLM_STREAM_IDLE_TIMEOUT_MS,
-      SHARED_DEFAULTS.streamIdleTimeoutMs,
-    ),
-    localFallback,
-    ollamaEndpoint: env.OLLAMA_ENDPOINT || SHARED_DEFAULTS.ollamaEndpoint,
-    ollamaModel: env.OLLAMA_MODEL || SHARED_DEFAULTS.ollamaModel,
-    ollamaMaxContextTokens: positiveIntSetting(
-      env.OLLAMA_MAX_CONTEXT_TOKENS,
-      SHARED_DEFAULTS.ollamaMaxContextTokens,
-    ),
-    ollamaTimeoutMs: nonNegativeIntSetting(
-      env.OLLAMA_TIMEOUT_MS,
-      SHARED_DEFAULTS.ollamaTimeoutMs,
-    ),
+    ...runtimeSettingsFromEnv(env),
   };
 
   if (id === 'bedrock') {

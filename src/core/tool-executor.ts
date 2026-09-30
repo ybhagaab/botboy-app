@@ -34,7 +34,12 @@ import type { ChatTerminalService } from './chat-terminal.js';
 import type { ToolCall } from './llm-client.js';
 import { writeFileMaxChars } from './limits.js';
 import { getBuiltInMcpProfile } from './mcp-profiles.js';
-import { isProtectedLocalHttpUrl, modelCommandSandboxInvocation } from './protected-local-resources.js';
+import {
+  isProtectedLocalHttpUrl,
+  modelChildEnvironment,
+  modelCommandSandboxInvocation,
+  resolvesIntoPrivateState,
+} from './protected-local-resources.js';
 
 import { createEtlQueryRunner, createEtlToolCall, type QueryRunner } from './etl-adhoc.js';
 import { listAnalyticsContext, loadAnalyticsContext } from './analytics-context.js';
@@ -495,7 +500,11 @@ export function writeFileHandler(filesDir: string, args: { filename: string; con
 }
 
 /** Standalone read_file handler — accepts filesDir for testability */
-export function readFileHandler(filesDir: string, args: { filename: string; startLine?: number; endLine?: number }): string {
+export function readFileHandler(
+  filesDir: string,
+  args: { filename: string; startLine?: number; endLine?: number },
+  options: { privateRoot?: string } = {},
+): string {
   const filename = (args.filename || '').trim();
   if (!filename) return 'Error: filename is required';
   if (filename.includes('..')) return 'Error: path traversal not allowed (..)';
@@ -503,6 +512,12 @@ export function readFileHandler(filesDir: string, args: { filename: string; star
 
   const resolved = path.resolve(filesDir, filename);
   if (!resolved.startsWith(path.resolve(filesDir))) return 'Error: path escapes files directory';
+  // A link planted inside the workspace must not reach BotBoy private state
+  // (credentials, the database, Settings → AI model): this reader runs in the
+  // server process, outside the model-command sandbox.
+  if (resolvesIntoPrivateState(resolved, { filesDir, ...(options.privateRoot ? { privateRoot: options.privateRoot } : {}) })) {
+    return 'Error: this path leads into BotBoy private state, which read_file cannot open';
+  }
 
   try {
     const content = fs.readFileSync(resolved, 'utf-8');
@@ -716,7 +731,11 @@ export function createToolExecutor(
         let allowed = false;
         try {
           const version = analyticsDataRoom?.getDatasetVersion(String(source.versionId));
-          allowed = Boolean(version && analyticsHandlingAllowsModelContext(
+          // Background callers are pinned-policy-conservative (no runtime),
+          // but an external active provider withholds rows from every caller:
+          // the background agent runs on that same provider.
+          const externalProvider = modelContextRuntime?.providerLocality === 'external_remote';
+          allowed = Boolean(version && !externalProvider && analyticsHandlingAllowsModelContext(
             version.handling,
             context?.callerKind === 'background' ? undefined : modelContextRuntime,
           ));
@@ -2582,7 +2601,9 @@ export function createToolExecutor(
           tool,
           error,
           nextAction: code === 'policy_denied'
-            ? 'Do not bypass the handling policy. Use an allowed local/dashboard consumer or ask the owner for a policy-compliant outcome.'
+            ? (modelContextRuntime?.providerLocality === 'external_remote'
+              ? 'Data Room rows never go to an external model: chat is running on the owner’s own OpenAI key (Settings → AI model). Tell the owner the rows stay on this Mac and can be read in the Data Room page or a local dashboard. Do not try other tools to read them.'
+              : 'Do not bypass the handling policy. Use an allowed local/dashboard consumer or ask the owner for a policy-compliant outcome.')
             : 'Correct every listed issue; refresh list_data_room_datasets first when state changed; then retry once.',
           effect: dataRoomNoEffect(),
           authorization: policyAuthorization,
@@ -3394,7 +3415,7 @@ export function createToolExecutor(
             timeout: 600000,
             maxBuffer: 1024 * 1024,
             cwd: invocation.filesDir,
-            env: { ...process.env, BOTBOY_FILES: invocation.filesDir },
+            env: modelChildEnvironment({ BOTBOY_FILES: invocation.filesDir }),
           }, (error, stdout, stderr) => {
             if (error) {
               (error as any).stdout = stdout;

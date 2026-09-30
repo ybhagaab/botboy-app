@@ -1869,3 +1869,13 @@ a.data-room-row:hover { background:var(--hover); }
 .analytics-provenance-warnings strong { color:var(--yellow); }
 @media(max-width:900px){.data-room-summary{grid-template-columns:1fr}.data-room-layout{grid-template-columns:1fr}.data-room-contract{grid-column:auto}.analytics-control-filter{grid-template-columns:repeat(2,minmax(0,1fr))}.analytics-control-filter-value{grid-column:1/-1}.analytics-control-remove{justify-self:end}}
 @media(max-width:600px){.data-room-facts{grid-template-columns:repeat(2,minmax(0,1fr))}.data-room-summary-facts,.analytics-control-dates,.analytics-control-order{grid-template-columns:1fr}.analytics-controls-heading{flex-direction:column}.analytics-control-filter{grid-template-columns:1fr}.analytics-control-filter-value{grid-column:auto}.analytics-control-remove{justify-self:stretch}.analytics-control-actions{align-items:stretch;flex-direction:column}.analytics-control-actions>span{display:none}.analytics-control-actions .button{width:100%}.analytics-widget-actions{flex-wrap:wrap}}
+
+/* ── Settings → AI model + chat setup notice (2026-09-30) ── */
+.ai-model-settings { display:grid; gap:14px; max-width:760px; }
+.ai-model-settings .settings-panel .mcp-alert { margin:0 0 12px; }
+.ai-model-status-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:0 0 8px; }
+.ai-model-key-form .mcp-form-body p.card-meta { margin:4px 0 0; line-height:1.5; }
+.chat-ai-model-notice:not([hidden]) { display:flex; align-items:center; gap:10px; margin:10px 15px 0; padding:10px 12px; border:1px solid rgba(157,140,255,.35); border-radius:11px; color:var(--soft); background:var(--accent-soft); font-size:11px; line-height:1.45; }
+.chat-ai-model-notice span { min-width:0; flex:1; }
+.chat-ai-model-notice strong { display:block; color:var(--text); font-size:12px; }
+.chat-ai-model-notice .button { flex:0 0 auto; }

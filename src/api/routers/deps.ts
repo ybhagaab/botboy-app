@@ -22,6 +22,7 @@ import type { PipelineOrchestrator } from '../../core/pipeline-orchestrator.js';
 import type { ProjectRelationsEngine } from '../../core/project-relations.js';
 import type { ChannelDigester } from '../../core/channel-digest.js';
 import type { LlmClient } from '../../core/llm-client.js';
+import type { AiModelSettingsService } from '../../core/ai-model-settings.js';
 import type { LlmUsageService } from '../../core/llm-usage.js';
 import type { ToolExecutor } from '../../core/tool-executor.js';
 import type { PromptManager } from '../../core/prompt-manager.js';
@@ -64,6 +65,8 @@ export interface RouterDeps {
   channelDigester?: ChannelDigester;
   // Chat streaming loop deps (previously accessed via `(deps as any)`)
   llmClient?: LlmClient;
+  /** Settings → AI model: owner OpenAI key, verified activation, live status. */
+  aiModelSettings?: AiModelSettingsService;
   llmUsageService?: LlmUsageService;
   toolExecutor?: ToolExecutor;
   promptManager?: PromptManager;

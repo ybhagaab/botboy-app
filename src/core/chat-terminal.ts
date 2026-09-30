@@ -34,7 +34,7 @@ import {
   type McpTerminalEngine,
   type McpTerminalSessionSnapshot,
 } from './mcp-terminal.js';
-import { modelCommandSandboxInvocation } from './protected-local-resources.js';
+import { modelChildEnvironment, modelCommandSandboxInvocation } from './protected-local-resources.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 // Source builds are real on machines whose Homebrew prefix disables bottles
@@ -137,13 +137,14 @@ export function createChatTerminalService(): ChatTerminalService {
         title: input.title || input.command.slice(0, 60),
         executable: invocation.executable,
         args: invocation.args,
-        env: {
-          ...(process.env as Record<string, string>),
+        // Same environment as run_command: BotBoy's own inference credentials
+        // never reach a model-run terminal.
+        env: modelChildEnvironment({
           TERM: 'xterm-256color',
           BOTBOY_FILES: invocation.filesDir,
           // Non-interactive-friendly defaults; prompts still work via PTY.
           HOMEBREW_NO_AUTO_UPDATE: '1',
-        },
+        }),
         timeoutMs,
       });
       latestSessionId = snapshot.id;

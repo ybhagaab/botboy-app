@@ -52,13 +52,14 @@ export function requireLocalOwnerUiRequest(
   req: Request,
   res: Response,
   label = 'Owner UI action',
+  nextAction = 'Open the Data Room import review and use its owner control.',
 ): boolean {
   if (!requireLocalOwnerRequest(req, res, label)) return false;
   if (!req.get('origin')) {
     res.status(403).json({
       error: `${label} requires the same-origin BotBoy owner interface.`,
       code: 'owner_action_required',
-      nextAction: 'Open the Data Room import review and use its owner control.',
+      nextAction,
     });
     return false;
   }
@@ -67,7 +68,7 @@ export function requireLocalOwnerUiRequest(
     res.status(403).json({
       error: `${label} requires a same-origin browser navigation context.`,
       code: 'owner_action_required',
-      nextAction: 'Open the Data Room import review and use its owner control.',
+      nextAction,
     });
     return false;
   }

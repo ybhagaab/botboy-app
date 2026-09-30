@@ -67,7 +67,13 @@ export function createDashboardState(): DashboardState {
   };
 }
 
-export function createDashboardRouter(state: DashboardState, db?: Database.Database, chatTerminal?: ChatTerminalService): Router {
+export function createDashboardRouter(
+  state: DashboardState,
+  db?: Database.Database,
+  chatTerminal?: ChatTerminalService,
+  /** Settings → AI model activation counter and readiness; open tabs refresh model UI on change. */
+  aiModel?: () => { version: number; state: string },
+): Router {
   const router = Router();
 
   // Include durable capture/assignment revisions so monitor and pipeline
@@ -169,6 +175,17 @@ export function createDashboardRouter(state: DashboardState, db?: Database.Datab
       processId: process.pid,
       uiVersion: computeUiAssetsVersion(),
       terminal: terminalSession ? { id: terminalSession.id, status: terminalSession.status } : null,
+      // In-memory only (no secret, no provider detail): a version change
+      // tells open tabs to refresh the model picker; a state change updates
+      // the chat panel's "set up your AI model" notice.
+      ...(() => {
+        try {
+          const summary = aiModel?.();
+          return summary ? { aiModelVersion: summary.version, aiModelState: summary.state } : {};
+        } catch {
+          return {};
+        }
+      })(),
     });
   });
   // ── Log viewer (tail kiro-cli and app logs) ──

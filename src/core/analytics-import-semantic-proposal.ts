@@ -26,6 +26,7 @@ import type {
 } from './analytics-data-room-types.js';
 import type { DocumentParser } from './document-parser.js';
 import type { LlmApiMode, LlmClient, LlmResponseFormat } from './llm-client.js';
+import { pinLlmClient } from './llm-client-switch.js';
 import { createLlmUsageOperationId } from './llm-usage.js';
 
 export const ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION = 'analytics-import-semantic-v6';
@@ -411,6 +412,9 @@ function words(value: string): string[] {
 }
 
 function providerLocality(endpoint: string, providerId: string): ProviderLocality {
+  // The owner's own OpenAI account is a third-party remote by definition,
+  // whatever endpoint it is reached through.
+  if (providerId === 'openai') return 'external_remote';
   try {
     const host = new URL(endpoint).hostname.toLowerCase();
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return 'device_local';
@@ -423,6 +427,19 @@ function providerLocality(endpoint: string, providerId: string): ProviderLocalit
     // Invalid endpoint is handled by the LLM client; do not classify it as trusted.
   }
   return 'external_remote';
+}
+
+export interface ImportProviderDescriptor {
+  id: string;
+  endpoint: string;
+  model: string;
+  apiMode: LlmApiMode;
+}
+
+interface ImportProviderRuntime {
+  provider: ImportProviderDescriptor;
+  locality: ProviderLocality;
+  endpointSha256: string;
 }
 
 export function analyticsImportProviderReceipt(provider: { id: string; endpoint: string }): {
@@ -1723,7 +1740,12 @@ export function createAnalyticsImportSemanticProposalService(input: {
   importRootDir: string;
   documentParser: DocumentParser;
   llm: LlmClient;
-  provider: { id: string; endpoint: string; model: string; apiMode: LlmApiMode };
+  /**
+   * Active provider identity. A getter follows runtime provider changes
+   * (Settings → AI model); locality and endpoint receipts are evaluated per
+   * proposal, never cached from boot.
+   */
+  provider: ImportProviderDescriptor | (() => ImportProviderDescriptor);
   ownerId: string;
   now?: () => Date;
   createId?: () => string;
@@ -1731,9 +1753,11 @@ export function createAnalyticsImportSemanticProposalService(input: {
   const db = input.db;
   const now = input.now ?? (() => new Date());
   const createId = input.createId ?? (() => randomUUID().replace(/-/g, '').slice(0, 24));
-  const providerReceipt = analyticsImportProviderReceipt(input.provider);
-  const locality = providerReceipt.providerLocality;
-  const endpointSha256 = providerReceipt.endpointSha256;
+  const providerRuntime = (): ImportProviderRuntime => {
+    const provider = typeof input.provider === 'function' ? input.provider() : input.provider;
+    const receipt = analyticsImportProviderReceipt(provider);
+    return { provider, locality: receipt.providerLocality, endpointSha256: receipt.endpointSha256 };
+  };
   let active: Promise<number> | null = null;
   const maintenance = new Set<Promise<void>>();
   let maintenanceController = new AbortController();
@@ -1829,7 +1853,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         ...(row.provider_endpoint_sha256 ? { endpointSha256: row.provider_endpoint_sha256 } : {}),
         ...(row.model_temperature !== null ? { modelTemperature: Number(row.model_temperature) } : {}),
         ...(row.disclosure_policy_version ? { disclosurePolicyVersion: row.disclosure_policy_version } : {}),
-        providerLocality: row.provider_locality ?? locality,
+        providerLocality: row.provider_locality ?? providerRuntime().locality,
       },
       ...(result ? { result } : {}),
       ...(row.error_code && row.error_message
@@ -1933,11 +1957,12 @@ export function createAnalyticsImportSemanticProposalService(input: {
   }
 
   function getDisclosure() {
+    const { provider, locality, endpointSha256 } = providerRuntime();
     return {
       policyVersion: ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
       classification: IMPORT_CLASSIFICATION,
-      provider: input.provider.id,
-      model: input.provider.model,
+      provider: provider.id,
+      model: provider.model,
       providerLocality: locality,
       endpointSha256,
       modelTemperature: 0 as const,
@@ -2124,7 +2149,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
     return review(rowById(row.id)!);
   }
 
-  function updateNeedsInput(row: AnalyticsImportProposalRecord, profile: AnalyticsImportCompleteProfile, unresolved: AnalyticsImportUnresolvedField[], extra: Partial<{
+  function updateNeedsInput(row: AnalyticsImportProposalRecord, profile: AnalyticsImportCompleteProfile, unresolved: AnalyticsImportUnresolvedField[], runtime: ImportProviderRuntime, extra: Partial<{
     contextFamily: string;
     contextSelectionSha256: string;
     contextReceiptsJson: string;
@@ -2159,7 +2184,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         profile.parseSha256, profile.profileSha256, profile.rowsetSha256, profile.schemaSha256,
         extra.contextFamily ?? null, extra.contextSelectionSha256 ?? null, extra.contextReceiptsJson ?? null, extra.contextBundleSha256 ?? null,
         extra.llmOperationId ?? null, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION, extra.promptSha256 ?? null,
-        input.provider.id, input.provider.model, input.provider.apiMode, endpointSha256, locality, 0, ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
+        runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, runtime.endpointSha256, runtime.locality, 0, ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
         extra.responseSha256 ?? null, extra.finishReason ?? null,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, extra.evidenceJson ?? null, stableAnalyticsJson(canonicalUnresolved), at, row.id, row.state_revision,
         ANALYTICS_IMPORT_TRANSFORM_VERSION,
@@ -2183,6 +2208,11 @@ export function createAnalyticsImportSemanticProposalService(input: {
   }
 
   async function processRow(row: AnalyticsImportProposalRecord, signal: AbortSignal): Promise<void> {
+    // Pin the client and its identity together, before any await: the
+    // locality this proposal checks is the one it sends to and records.
+    const llm = pinLlmClient(input.llm);
+    const runtime = providerRuntime();
+    const { locality, endpointSha256 } = runtime;
     const candidate = input.candidateReader.readVerifiedCandidate({ importId: row.candidate_id, expectedRevision: row.candidate_revision });
     const parsed = await parseAnalyticsImportSheet({
       filePath: candidate.sourcePath,
@@ -2197,7 +2227,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
     const catalog = listAnalyticsContext(db).files;
     const selected = selectContextFamily(catalog, profileSignals(candidate, parsed), ownerAnswers.contextFamily);
     if (!selected.family) {
-      updateNeedsInput(rowById(row.id)!, parsed.profile, [selected.unresolved!]);
+      updateNeedsInput(rowById(row.id)!, parsed.profile, [selected.unresolved!], runtime);
       return;
     }
     const context = loadSelectedContext(db, catalog, selected.family);
@@ -2206,7 +2236,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         field: 'modelProvider',
         reason: 'The configured inference endpoint is not device-local or Amazon-managed, so workbook evidence was not sent.',
         choices: [{ id: 'retry_after_provider_change', label: 'Retry after changing the inference provider' }],
-      }], {
+      }], runtime, {
         contextFamily: context.family,
         contextSelectionSha256: context.selectionSha256,
         contextReceiptsJson: stableAnalyticsJson(context.receipts),
@@ -2228,9 +2258,9 @@ export function createAnalyticsImportSemanticProposalService(input: {
       usageContext: { workload: 'background' as const, operationId },
       signal,
     };
-    const preflight = input.llm.preflightPrimary(request);
+    const preflight = llm.preflightPrimary(request);
     if (preflight.bodyBytes > preflight.maximumBytes) throw new AnalyticsImportInboxError('too_large', 'Semantic proposal request exceeds the configured model payload limit.');
-    const response = await input.llm.chatCompletionPrimary(request);
+    const response = await llm.chatCompletionPrimary(request);
     if (response.finishReason !== 'stop' || response.toolCalls?.length) throw new AnalyticsImportInboxError('unavailable', 'Semantic proposal model did not return one complete tool-less JSON object.');
     const responseSha256 = sha256(response.content);
     let model: ModelProposal;
@@ -2265,7 +2295,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
       evidenceJson: stableAnalyticsJson(model.evidence),
     };
     if (!validation.built) {
-      updateNeedsInput(current, parsed.profile, validation.unresolved, shared);
+      updateNeedsInput(current, parsed.profile, validation.unresolved, runtime, shared);
       return;
     }
     const built = validation.built;
@@ -2297,7 +2327,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         parsed.profile.parseSha256, parsed.profile.profileSha256, parsed.profile.rowsetSha256, parsed.profile.schemaSha256,
         preparedReceipt.relativePath, preparedReceipt.sha256, preparedReceipt.bytes, context.family, context.selectionSha256,
         stableAnalyticsJson(context.receipts), context.bundleSha256, operationId, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION,
-        promptSha256, input.provider.id, input.provider.model, input.provider.apiMode, endpointSha256, locality, 0,
+        promptSha256, runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, endpointSha256, locality, 0,
         ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION, responseSha256, response.finishReason,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, proposalJson, sha256(proposalJson), definitionJson, contractJson,
         built.definition.contract.contractSha256, stableAnalyticsJson(built.evidence), at, at, row.id, current.state_revision,

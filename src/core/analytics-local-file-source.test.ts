@@ -133,6 +133,24 @@ describe('local-file source boundary and strict table reader', () => {
     expect(issuesOf(() => resolveAnalyticsLocalFile({ path: write(path.join(home, 'old.xls'), 'x') }, policy, 'file'))[0].code).toBe('unsupported_file_format');
   });
 
+  it('denies private state reached through a different letter case (case-insensitive macOS volumes)', () => {
+    const home = tempDir('local-file-home-');
+    const policy = policyFor(home);
+    const secret = write(path.join(policy.privateRoot, 'ai-model.json'), '{"apiKey":"sk-proj-casevariant0000000000"}\n');
+    const variantRoot = policy.privateRoot.replace('.personal-productivity-tracker', '.PERSONAL-Productivity-Tracker');
+    const variantPath = path.join(variantRoot, 'AI-MODEL.json');
+    // Only meaningful where the volume folds case (the macOS default); elsewhere the path does not exist.
+    if (!fs.existsSync(variantPath)) return;
+    const aliasToVariant = path.join(home, 'Downloads', 'variant.csv');
+    fs.mkdirSync(path.dirname(aliasToVariant), { recursive: true });
+    fs.symlinkSync(variantPath, aliasToVariant);
+
+    for (const candidate of [variantPath, aliasToVariant]) {
+      expect(issuesOf(() => resolveAnalyticsLocalFile({ path: candidate, format: 'csv' }, policy, 'file'))[0].code).toBe('private_state_denied');
+    }
+    expect(fs.readFileSync(secret, 'utf8')).toContain('casevariant');
+  });
+
   it('maps delimited headers by exact name, treats empty cells as null by default, and names the first bad cell per column', async () => {
     const home = tempDir('local-file-home-');
     const policy = policyFor(home);

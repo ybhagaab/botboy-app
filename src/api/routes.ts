@@ -32,6 +32,7 @@ import { createProductDocumentsRouter } from './routers/product-documents.js';
 import { createDocumentsRouter } from './routers/documents.js';
 import { createVisualAssetsRouter } from './routers/visual-assets.js';
 import { createLlmUsageRouter } from './routers/llm-usage.js';
+import { createAiModelRouter } from './routers/ai-model.js';
 
 export type { RouterDeps } from './routers/deps.js';
 
@@ -46,7 +47,14 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createNodesRouter(deps));
   router.use(createItemsRouter(deps));
   router.use(createChatRouter(deps, dashboardState));
-  router.use(createDashboardRouter(dashboardState, deps.db, deps.chatTerminal));
+  router.use(createDashboardRouter(
+    dashboardState,
+    deps.db,
+    deps.chatTerminal,
+    deps.aiModelSettings
+      ? () => ({ version: deps.aiModelSettings!.version(), state: deps.aiModelSettings!.state() })
+      : undefined,
+  ));
   router.use(createFilesRouter(deps));
   router.use(createAgentRouter(deps));
   router.use(createSlackRouter(deps));
@@ -62,6 +70,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createProductDocumentsRouter(deps));
   router.use(createVisualAssetsRouter(deps));
   router.use(createLlmUsageRouter(deps));
+  router.use(createAiModelRouter(deps));
   // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from
   // /product-documents — the writing workspace stays untouched.
   router.use(createDocumentsRouter(deps));

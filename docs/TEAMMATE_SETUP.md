@@ -7,15 +7,17 @@ You need:
 - a Mac with **Google Chrome**
 - **Node.js 20 or newer** (`node --version`)
 - **Git**
-- the private BotBoy credential attachment sent to you by the owner
+- an AI model: either the private BotBoy credential attachment sent to you by
+  the owner, or your own OpenAI API key
 
 You do **not** need an AWS account or `aws login`.
 
 ### Install
 
-1. Download the private BotBoy credential attachment from your 1:1 Slack DM.
-   Leave it in **Downloads** or on your **Desktop**. BotBoy accepts the
-   owner-issued `.env` file or ZIP automatically.
+1. If the owner sent you a credential attachment, download it from your 1:1
+   Slack DM and leave it in **Downloads** or on your **Desktop**. BotBoy
+   accepts the owner-issued `.env` file or ZIP automatically. Using your own
+   OpenAI API key instead? Skip this step.
 2. Open Terminal and run:
 
 ```bash
@@ -25,9 +27,15 @@ npm install
 ./start.sh
 ```
 
-Allow a few minutes on the first run. BotBoy imports the credential, builds
-itself, opens the dashboard, and attempts to install `BotBoy.app` in
-Applications. Ask BotBoy a question to confirm it is working.
+3. Using your own OpenAI API key: when the dashboard opens, go to
+   **Settings → AI model**, paste a key from
+   [platform.openai.com/api-keys](https://platform.openai.com/api-keys), and
+   choose **Save and turn on**. BotBoy checks the key with OpenAI, then starts
+   chat and background organizing right away. No restart is needed.
+
+Allow a few minutes on the first run. BotBoy imports any credential
+attachment, builds itself, opens the dashboard, and attempts to install
+`BotBoy.app` in Applications. Ask BotBoy a question to confirm it is working.
 
 ### Update
 
@@ -67,7 +75,8 @@ optional connections, troubleshooting, and unusual recovery cases.
    from Downloads/Desktop into
    `~/.personal-productivity-tracker/.env` with permissions limited to you;
 2. deletes the downloaded credential attachment after a successful import;
-3. selects the authenticated team gateway and GPT-5.6 Terra default;
+3. selects the authenticated team gateway and GPT-5.6 Terra default, or your
+   own OpenAI key when one is saved in **Settings → AI model**;
 4. loads the server-approved chat model catalog with GPT-5.6 Terra, Luna,
    and Sol plus GPT-6 Astra, Sol, and Luna;
 5. builds BotBoy when the build is missing or stale;
@@ -81,6 +90,29 @@ naming, not the selected default model. The default remains GPT-5.6 Terra.
 Approved GPT-6 additions use the same Cognito token URL, OAuth scope, and
 allowlisted client identity across the approved team gateways, so existing
 teammates do not need a replacement credential attachment.
+
+### Your own OpenAI API key
+
+**Settings → AI model** runs BotBoy on your own OpenAI account instead of the
+team gateway:
+
+- BotBoy verifies the key with OpenAI before switching, so a mistyped or
+  revoked key changes nothing.
+- The key is stored only on your Mac, in
+  `~/.personal-productivity-tracker/ai-model.json` with permissions limited to
+  you. BotBoy never shows it again (Settings shows its last four characters),
+  and commands BotBoy's model runs cannot read it.
+- Chat offers the GPT-5.6 and GPT-6 models your key can use. Background
+  organizing (routing, project briefs, digests) uses GPT-5.6 Terra.
+- A saved key takes precedence over a credential attachment. **Remove key**
+  switches BotBoy back to the attachment's team gateway, or turns the AI model
+  off when there is none.
+- While a key is saved, what BotBoy's model reads (captured messages,
+  documents, your chats, and query results) is sent to OpenAI under your
+  account. Data Room table values are not: they stay on your Mac, so chat
+  cannot analyze Data Room datasets while a key is saved.
+- New OpenAI accounts have low rate limits. BotBoy waits and retries when
+  OpenAI asks it to; limits rise as the account is used.
 
 ### Updating and customizations
 
@@ -191,6 +223,10 @@ credential attachment before producing the report.
 | Symptom | What to do |
 |---|---|
 | `node not found` | Install Node.js 20+ and rerun `./start.sh`. |
+| Chat says it needs an AI model first | Open **Settings → AI model** and add your OpenAI API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
+| Settings → AI model says OpenAI rejected the key | Copy a current key from platform.openai.com/api-keys and save it again. |
+| Settings → AI model says the account has no credit | Add credit in OpenAI Billing. BotBoy resumes on its own once calls succeed. |
+| Settings → AI model cannot reach api.openai.com | Check your internet connection and any proxy or VPN rules for `api.openai.com`, then save again. `./start.sh --doctor` prints an `openai probe` status. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
@@ -263,8 +299,9 @@ BotBoy is local-first. Its evidence database, document copies, generated files,
 and credentials stay under `~/.personal-productivity-tracker/` on your Mac by
 default. Content needed for an LLM request—including selected text and bounded
 visual inputs when you ask BotBoy to inspect an image—is sent through the
-authenticated team gateway. Connections communicate with the services you
-enable. Any document publication, message draft, or production pipeline change
+authenticated team gateway, or to OpenAI under your own account while an
+OpenAI key is saved in **Settings → AI model**. Connections communicate with
+the services you enable. Any document publication, message draft, or production pipeline change
 requires your explicit request and follows its own review/approval boundary.
 
 ### Lost laptop or suspected exposure

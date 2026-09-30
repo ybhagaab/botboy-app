@@ -42,6 +42,7 @@ import { createScreenshotStore } from './core/screenshot-store.js';
 import { createDocumentParser } from './core/document-parser.js';
 import { createAcpClient } from './core/acp-client.js';
 import { createInferenceProviderFromEnv } from './core/inference-provider.js';
+import { createAiModelSettingsService } from './core/ai-model-settings.js';
 import { resolveOwnerIdentity } from './core/owner-identity.js';
 import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
@@ -389,21 +390,39 @@ async function main() {
   // the future OIDC/JWT gateway plugs in here without changing consumers.
   // Shell settings override the documented local dotenv-style file.
   const localEnvFile = loadSlackEnv();
-  const inferenceProvider = createInferenceProviderFromEnv({
-    ...localEnvFile,
-    ...process.env,
+  const inferenceEnv = { ...localEnvFile, ...process.env };
+  // Launcher/.env configuration. An OpenAI key saved in Settings → AI model
+  // takes precedence at runtime; removing it returns here.
+  const environmentProvider = createInferenceProviderFromEnv(inferenceEnv);
+  const llmUsageService = createLlmUsageService(db, { primaryProvider: environmentProvider.id });
+  // Assigned once the information pipeline exists: a Settings activation
+  // drains the capture backlog immediately instead of waiting for the next tick.
+  let kickInformationPipeline: () => void = () => {};
+  // The settings service owns the one switchable client every consumer holds,
+  // and publishes BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS for limits.ts on every
+  // activation (it reads that normalized process value per call).
+  const aiModelSettings = await createAiModelSettingsService({
+    envProvider: environmentProvider,
+    usageService: llmUsageService,
+    env: inferenceEnv,
+    environmentCredentialsPresent: environmentProvider.id !== 'bedrock'
+      || Boolean((inferenceEnv.BOTBOY_INFERENCE_API_KEY || inferenceEnv.AWS_BEARER_TOKEN_BEDROCK || '').trim()),
+    onActivated: () => kickInformationPipeline(),
   });
-  // limits.ts is intentionally dependency-light and reads this normalized
-  // process value. Publish the provider's resolved value so settings loaded
-  // from the local dotenv file cannot diverge from tool/prompt safety limits.
-  process.env.BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS = String(inferenceProvider.maxContextTokens);
-  const llmUsageService = createLlmUsageService(db, { primaryProvider: inferenceProvider.id });
-  const llmClient = inferenceProvider.createClient({ usageService: llmUsageService });
-  await llmClient.healthCheck().catch(() => {});
-  console.log(
-    `✅ LLM client ready (provider: ${inferenceProvider.id}, model: ${inferenceProvider.model}, active: ${llmClient.getActiveEndpoint()})`,
-  );
-  if (inferenceProvider.localFallbackEnabled) {
+  const llmClient = aiModelSettings.client;
+  {
+    const active = llmClient.identity();
+    console.log(
+      `✅ LLM client ready (provider: ${active.providerId}, model: ${active.model}, source: ${active.source}, active: ${llmClient.getActiveEndpoint()})`,
+    );
+  }
+  // Provider identity for data-handling receipts, read at use time so a
+  // Settings change can never leave a boot-time locality in force.
+  const activeProviderDescriptor = () => {
+    const active = llmClient.identity();
+    return { id: active.providerId, endpoint: active.endpoint, model: active.model, apiMode: active.apiMode };
+  };
+  if (environmentProvider.localFallbackEnabled) {
     console.warn('⚠️  Local LLM fallback is enabled; background output may use a different model when the primary provider is unavailable.');
   }
 
@@ -417,12 +436,7 @@ async function main() {
     importRootDir: analyticsImportInbox.rootDir,
     documentParser,
     llm: llmClient,
-    provider: {
-      id: inferenceProvider.id,
-      endpoint: inferenceProvider.endpoint,
-      model: inferenceProvider.model,
-      apiMode: inferenceProvider.apiMode,
-    },
+    provider: activeProviderDescriptor,
     ownerId: ownerIdentity.alias || ownerIdentity.email || 'local-owner',
   });
   const analyticsImportPromotion = createAnalyticsImportPromotionService({
@@ -439,7 +453,12 @@ async function main() {
     mcpManager,
     etlRunner: analyticsAnswerEtlRunner,
   });
-  const answerProviderReceipt = analyticsImportProviderReceipt(inferenceProvider);
+  // Live model-context runtime: every Data Room policy check evaluates the
+  // provider serving requests at that moment (getters, never a boot snapshot).
+  const answerProviderReceipt = {
+    get providerLocality() { return analyticsImportProviderReceipt(activeProviderDescriptor()).providerLocality; },
+    get endpointSha256() { return analyticsImportProviderReceipt(activeProviderDescriptor()).endpointSha256; },
+  };
   const analyticsDataRoomRead = createAnalyticsDataRoomReadService({
     store: analyticsDataRoomStore,
     modelContextRuntime: answerProviderReceipt,
@@ -687,9 +706,11 @@ async function main() {
   const ocrEngine = createVisionOcrEngine();
   const extractor = createExtractor({ db, documentParser, ocrEngine, contentStore, failures });
   const batcher = createBatcher(db);
+  // Audit identity is read live from the switch (getProviderId/getActiveModel);
+  // these are only the fallbacks for an unhealthy moment.
   const pipelineLlm = adaptSendPrompt(llmClient, {
-    provider: inferenceProvider.id,
-    model: inferenceProvider.model,
+    provider: llmClient.identity().providerId,
+    model: llmClient.identity().model,
     temperature: 0.7,
   });
   const librarian = createLibrarian({ db, batcher, contentStore, brainStore, failures, llm: pipelineLlm });
@@ -704,6 +725,14 @@ async function main() {
   // open Today tab re-renders as sentences land.
   const evidenceGister = createEvidenceGister({ db, contentStore, llm: pipelineLlm, failures });
   const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister });
+  // A newly activated model (Settings → AI model) drains the waiting capture
+  // backlog now; later work follows the normal interpretation cadence.
+  kickInformationPipeline = () => {
+    if (!llmClient.isAvailable()) return;
+    void pipelineOrchestrator.processAll().catch((error: unknown) => {
+      console.warn(`[AI model] Post-activation processing deferred: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
   // Sibling links are derived data — refresh once at startup so the project
   // pages are current even before the first interpretation wave fires.
   try {
@@ -1272,6 +1301,7 @@ async function main() {
     filesystemMonitor,
     db,
     llmClient,
+    aiModelSettings,
     llmUsageService,
     toolExecutor,
     promptManager,

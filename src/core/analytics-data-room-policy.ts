@@ -65,10 +65,13 @@ export function analyticsHandlingAllowsModelContext(
   runtime?: AnalyticsModelContextRuntime,
 ): boolean {
   if (!handling.allowModelContext) return false;
+  // Rows never reach a model outside the device or Amazon (for example the
+  // owner's own OpenAI account), including legacy versions without a pinned
+  // policy.
+  if (runtime?.providerLocality === 'external_remote') return false;
   const policy = handling.modelContextPolicy;
   if (!policy) return true;
   return Boolean(runtime
-    && runtime.providerLocality !== 'external_remote'
     && policy.allowedProviderLocalities.includes(runtime.providerLocality)
     && (!policy.endpointSha256 || policy.endpointSha256 === runtime.endpointSha256));
 }
