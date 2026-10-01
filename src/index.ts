@@ -113,7 +113,13 @@ import { initToolchain } from './core/toolchain.js';
 import { createChatTerminalService } from './core/chat-terminal.js';
 import { createShutdownCoordinator } from './core/shutdown-coordinator.js';
 import { getSetting, setSetting } from './core/storage.js';
-import { addLocalFolder, listLocalFolders } from './core/local-folders-config.js';
+import { addLocalFolder } from './core/local-folders-config.js';
+import os from 'os';
+import { createDiskSpaceMonitor } from './core/disk-space.js';
+import { createMainThreadWatchdog } from './core/main-thread-watchdog.js';
+import { createLocalFolderImportLedger, folderImportThresholds } from './core/local-folder-imports.js';
+import { createStorageUsage } from './core/storage-usage.js';
+import { createFolderImportScheduler } from './monitors/folder-import-scheduler.js';
 import { WebClient } from '@slack/web-api';
 import { bootstrapFromEnv } from './core/slack-config.js';
 import fs from 'fs';
@@ -768,6 +774,10 @@ async function main() {
     const awaitedPublicationCapture = item.source === 'sharepoint'
       && item.type === 'document_capture'
       && Boolean(String(item.metadata?.publicationId ?? '').trim());
+    // Local-folder captures are awaited by the monitor: a store failure must
+    // reject so a folder import leaves the file unrecorded and retries it
+    // (the monitor logs live failures itself). Other monitors stay fail-soft.
+    const rethrowStoreFailure = awaitedPublicationCapture || item.source === 'filesystem';
     try {
     const publicationId = awaitedPublicationCapture
       ? String(item.metadata?.publicationId ?? '').trim()
@@ -1068,7 +1078,7 @@ async function main() {
     } catch (dbErr: any) {
       failures.record({ itemId: id, step: 'capture', message: `insert failed: ${dbErr.message}`, retryable: true });
       console.error(`[DB] Insert failed for ${item.source}/${item.type}: ${dbErr.message}`);
-      if (awaitedPublicationCapture) throw dbErr;
+      if (rethrowStoreFailure) throw dbErr;
       return; // Ordinary monitors stay fail-soft.
     }
 
@@ -1076,7 +1086,7 @@ async function main() {
     // Routing into projects happens in the batched interpretation passes.
     } catch (outerErr: any) {
       console.error(`[EventBus] Handler error for ${item.source}/${item.type}: ${outerErr.message}`);
-      if (awaitedPublicationCapture) throw outerErr;
+      if (rethrowStoreFailure) throw outerErr;
     }
   });
 
@@ -1133,9 +1143,28 @@ async function main() {
   // work: capture starting late only delays evidence, never loses it.
   startInBackground('Slack capture', () => slackMonitor.start(), '✅ Slack capture online');
 
-  // ── Filesystem monitor (chokidar-backed local folder ingestion) ──
-  const filesystemMonitor = createFilesystemMonitor({ db, documentParser });
-  filesystemMonitor.onWorkItem(item => eventBus.emit(item));
+  // ── Filesystem monitor (native fs.watch local folder ingestion) ──
+  // The watchdog logs any main-thread stall over 1 s with the labeled
+  // subsystem (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md C9); it starts now so
+  // startup stalls are named too. Disk floors read a cached statfs.
+  const mainThreadWatchdog = createMainThreadWatchdog();
+  mainThreadWatchdog.start();
+  const folderImportLimits = folderImportThresholds();
+  const diskSpace = createDiskSpaceMonitor({ path: os.homedir() });
+  void diskSpace.freeBytes(0);
+  const folderImportLedger = createLocalFolderImportLedger(db);
+  const filesystemMonitor = createFilesystemMonitor({
+    db,
+    documentParser,
+    ledger: folderImportLedger,
+    diskSpace,
+    thresholds: folderImportLimits,
+    watchdog: mainThreadWatchdog,
+  });
+  // Awaited emit: folder imports record a file only after its item is stored
+  // (the capture handler rethrows filesystem store failures). Live changes
+  // are not awaited; the monitor logs any failure.
+  filesystemMonitor.onWorkItem(item => eventBus.emitAndWait(item));
 
   // R12.2: seed default watched folders (Downloads/Desktop/Documents) on first
   // run only, guarded by a flag so the user can later disable/remove them.
@@ -1169,16 +1198,15 @@ async function main() {
     db, mcpManager, documentParser, contentStore, emit: item => eventBus.emitAndWait(item),
   });
 
-  // R12.3: one-time ingestion of pre-existing files per enabled folder. A
-  // persistent per-folder marker prevents re-flooding on every boot.
-  for (const folder of listLocalFolders(db, { enabledOnly: true })) {
-    const key = `local_folders.backfilled.${folder.id}`;
-    if (getSetting<boolean>(db, key)) continue;
-    filesystemMonitor
-      .backfill(folder.id)
-      .then(() => setSetting(db, key, true))
-      .catch((err) => console.warn(`[fs] initial backfill failed for ${folder.path}:`, err?.message ?? err));
-  }
+  // First imports of existing files (formerly the R12.3 startup loop) run in
+  // the post-ready folder-import scheduler created below with the shutdown
+  // coordinator. The Local folders storage card measures with du (cached).
+  const storageUsage = createStorageUsage({
+    dataDir: path.dirname(path.resolve(db.name)),
+    chromeProfileDir: path.join(os.homedir(), '.chrome-debug-profile'),
+    diskSpace,
+    thresholds: folderImportLimits,
+  });
 
   // ── Bounded process shutdown ──
   // One coordinator owns admission, locally abortable work, HTTP sockets,
@@ -1212,6 +1240,8 @@ async function main() {
       stop('context-sync', () => contextManager?.stopAutoSync());
       stop('midway-sentinel', () => midwaySentinel.stop());
       stop('chat-terminal', () => chatTerminal.shutdown());
+      stop('folder-imports', () => folderImports.stop());
+      stop('main-thread-watchdog', () => mainThreadWatchdog.stop());
       if (failures.length) throw new Error(`Quiesce failures: ${failures.join('; ')}`);
     },
     closeStages: [
@@ -1229,6 +1259,8 @@ async function main() {
           await Promise.all([analyticsImportSemantic.drain(), analyticsImportPromotion.drain()]);
         },
       },
+      // The active walk was aborted in quiesce; wait for its current file.
+      { name: 'folder-imports', timeoutMs: 5_000, close: () => folderImports.drain() },
       { name: 'filesystem', timeoutMs: 3_000, close: () => filesystemMonitor.stop() },
       { name: 'mcp', timeoutMs: 10_000, close: () => mcpManager.stop() },
       {
@@ -1284,6 +1316,21 @@ async function main() {
     hardDeadlineMs: 25_000,
   });
 
+  // ── Folder imports (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md P1/P3) ──
+  // Never during startup: `start()` runs after final-ready and arms a delay.
+  // One folder at a time, resumable via the import ledger, big files held for
+  // the owner's review, paused below the disk floor, abortable by shutdown.
+  const folderImports = createFolderImportScheduler({
+    db,
+    monitor: filesystemMonitor,
+    ledger: folderImportLedger,
+    diskSpace,
+    thresholds: folderImportLimits,
+    watchdog: mainThreadWatchdog,
+    shutdown: shutdownCoordinator.context,
+    readableExtensions: new Set(documentParser.getSupportedFormats().map(ext => ext.toLowerCase())),
+  });
+
   // ── Express API ──
   const app = express();
   // 16mb: chat image attachments arrive as base64 data URLs (8MB binary cap
@@ -1333,6 +1380,8 @@ async function main() {
     visualInspector,
     projectArtifacts,
     shutdown: shutdownCoordinator.context,
+    folderImports,
+    storageUsage,
   };
   app.use('/api', createRouter(routerDeps));
 
@@ -1393,6 +1442,9 @@ async function main() {
   httpServer.removeListener('request', bootHandler);
   httpServer.on('request', shutdownCoordinator.wrapRequestHandler(app));
   console.log(`✅ API server running on http://${HOST}:${PORT} — dashboard ready in ${((Date.now() - bootStartedAt) / 1000).toFixed(1)}s`);
+  // Background folder imports begin only now, after a settle delay.
+  folderImports.start();
+  console.log('✅ Folder imports scheduled (first pass in 30 s; big files wait for your review)');
   console.log(`🔍 Tracking your activity. Dashboard: http://${HOST}:${PORT}`);
 
   // Every signal enters the same state machine. The first closes admission

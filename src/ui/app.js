@@ -2521,15 +2521,22 @@ function renderLocalFoldersList() {
         progressHtml = `<span class="type" style="color:var(--green)">✓ ${bf.processed} files</span>`;
       } else if (bf.phase === 'aborted') {
         progressHtml = `<span class="type" style="color:var(--text-muted)">⊘ aborted at ${bf.processed || 0}</span>`;
+      } else if (bf.phase === 'paused') {
+        progressHtml = `<span class="type" style="color:var(--yellow)">⏸ paused at ${bf.processed || 0}: free space is low; it resumes when space returns</span>`;
       } else if (bf.phase === 'error') {
         progressHtml = `<span class="type" style="color:var(--red)">✗ ${escHtml(bf.error || 'error')}</span>`;
       }
     }
     const running = bf && (bf.phase === 'started' || bf.phase === 'progress');
+    const importPhase = lfFolderStatus(id)?.phase;
+    const scheduledWalk = !running && (importPhase === 'scanning' || importPhase === 'importing');
     const backfillBtn = running
       ? `<button class="btn" type="button" data-action="cancel-backfill" data-id="${id}">Cancel backfill</button>`
-      : `<button class="btn" type="button" data-action="start-backfill" data-id="${id}">Backfill now</button>`;
-    return `<div class="work-item" data-folder-id="${id}" style="display:flex;align-items:center;gap:10px;margin-bottom:0">
+      : scheduledWalk
+        ? `<button class="btn" type="button" disabled title="BotBoy is importing this folder in the background">Importing…</button>`
+        : `<button class="btn" type="button" data-action="start-backfill" data-id="${id}">Backfill now</button>`;
+    return `<div class="lf-folder" data-lf-folder="${id}">
+    <div class="work-item" data-folder-id="${id}" style="display:flex;align-items:center;gap:10px;margin-bottom:0">
       <div style="flex:1;min-width:0">
         <div class="title" style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(f.path)}</div>
         <div class="meta">
@@ -2538,12 +2545,19 @@ function renderLocalFoldersList() {
           · <span class="type">${enabled ? 'enabled' : 'disabled'}</span>
           ${progressHtml ? ' · ' + progressHtml : ''}
         </div>
+        <div class="lf-state" data-lf-state="${id}" aria-live="polite">${lfStateHtml(f)}</div>
       </div>
       ${backfillBtn}
       <button class="btn" type="button" data-action="toggle-enabled" data-id="${id}">${enabled ? 'Disable' : 'Enable'}</button>
       <button class="btn btn-danger" type="button" data-action="remove" data-id="${id}">Delete</button>
+    </div>
+    <div class="lf-review-slot" data-lf-review="${id}"></div>
     </div>`;
   }).join('');
+  bindLfListDelegation(list);
+  for (const [reviewId, reviewState] of lfReviews) {
+    if (reviewState.open) renderLfReview(reviewId);
+  }
 
   // Bind row-level actions (delegated within the list).
   list.querySelectorAll('button[data-action]').forEach(btn => {
@@ -2581,6 +2595,8 @@ async function loadLocalFolders() {
   const body = await res.json();
   lfFolders = Array.isArray(body.folders) ? body.folders : [];
   renderLocalFoldersList();
+  await refreshLfImportState({ storage: true });
+  startLfPolling();
 }
 
 async function addLocalFolder() {
@@ -2692,7 +2708,15 @@ async function startBackfill(id) {
   }
   if (!resp.ok || !resp.body) {
     let errText = `HTTP ${resp.status}`;
-    try { errText = (await resp.text()).slice(0, 300) || errText; } catch {}
+    try {
+      const raw = await resp.text();
+      try {
+        const parsed = JSON.parse(raw);
+        errText = [parsed.error, parsed.nextAction].filter(Boolean).join(' ') || raw.slice(0, 300) || errText;
+      } catch {
+        errText = raw.slice(0, 300) || errText;
+      }
+    } catch {}
     lfBackfillState.set(id, { phase: 'error', error: errText });
     renderLocalFoldersList();
     return;
@@ -2760,6 +2784,399 @@ async function cancelBackfill(id) {
   }
 }
 
+// ── Folder import states, big-file review, storage card ──
+//
+// LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md P1/P3. The server owns every decision:
+// `/api/local-folders/imports` (per-folder phase, ledger counts, disk floors)
+// is polled every 5 s while the panel is open; `/api/local-folders/storage`
+// loads on open and on Refresh (server caches du for 10 min). Review choices
+// live in `lfReviews` (JS state), so polls update only the state lines and
+// never reset an open review card. Saving posts one all-or-nothing decision.
+
+let lfImports = null;          // last GET /api/local-folders/imports
+let lfStorage = null;          // last GET /api/local-folders/storage
+let lfStorageLoading = false;
+let lfStorageRenderKey = '';
+const lfReviews = new Map();   // folderId → review card state
+const lfReviewAutoOpened = new Set();
+let lfPollTimer = null;
+
+function formatLfBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+function lfCount(n, one, many) {
+  const value = Number(n) || 0;
+  return `${value.toLocaleString()} ${value === 1 ? one : many}`;
+}
+
+function lfFolderStatus(id) {
+  const folders = lfImports && Array.isArray(lfImports.folders) ? lfImports.folders : [];
+  return folders.find(entry => entry && entry.folderId === id) || null;
+}
+
+function lfStateHtml(folder) {
+  const st = lfFolderStatus(folder.id);
+  if (!st || !folder.enabled) return '';
+  const id = folder.id;
+  const counts = st.counts || {};
+  const bigLabel = formatLfBytes(lfImports?.thresholds?.bigFileBytes ?? 25 * 1024 * 1024);
+  const lines = [];
+  const progress = st.progress || null;
+  const reviewLink = (label) => `<button class="text-link" type="button" data-lf-action="open-review" data-id="${id}">${label}</button>`;
+  if (st.phase === 'scanning') {
+    lines.push(`<span class="lf-tone-info">Checking this folder for big files… ${lfCount(progress?.processed, 'file', 'files')} seen</span>`);
+  } else if (st.phase === 'importing') {
+    const total = progress?.total ? ` of ${Number(progress.total).toLocaleString()}` : '';
+    lines.push(`<span class="lf-tone-info">Importing existing files: ${Number(progress?.processed || 0).toLocaleString()}${total} checked</span>`);
+  } else if (st.phase === 'needs_review') {
+    lines.push(`<span class="lf-tone-warn">Needs your decision: ${lfCount(counts.needs_review, 'big file', 'big files')} (${bigLabel} or larger). Watching continues; ${st.firstImportDone ? 'these files wait' : 'the import waits'} for your choice.</span> ${reviewLink('Review big files')}`);
+  } else if (st.phase === 'paused_low_disk') {
+    lines.push(`<span class="lf-tone-warn">Import paused: free space is below ${formatLfBytes(lfImports?.disk?.importFloorBytes)}. Watching continues; the import resumes when space returns.</span>`);
+  } else if (st.phase === 'waiting') {
+    lines.push(lfImports?.started ? 'Waiting to import existing files' : 'Existing files import shortly after BotBoy is ready');
+  } else if (st.phase === 'watching') {
+    lines.push('<span class="lf-tone-good">Watching for changes</span>');
+  }
+  const skipped = [];
+  if (counts.too_large) skipped.push(`${lfCount(counts.too_large, 'file', 'files')} too large to import yet`);
+  if (counts.excluded) skipped.push(`${lfCount(counts.excluded, 'file', 'files')} excluded by you`);
+  if (counts.deferred_low_disk) skipped.push(`${lfCount(counts.deferred_low_disk, 'change', 'changes')} held for low disk space`);
+  const hasBigFiles = (counts.too_large || 0) + (counts.excluded || 0) + (counts.approved || 0) > 0;
+  if (skipped.length || (hasBigFiles && st.phase !== 'needs_review')) {
+    lines.push(`${skipped.length ? `Skipped: ${skipped.join(' · ')}` : 'Big files decided'}${hasBigFiles && st.phase !== 'needs_review' ? ` ${reviewLink('Big files')}` : ''}`);
+  }
+  if (st.lastResult && st.lastResult.failed) {
+    lines.push(`<span class="lf-tone-bad">${lfCount(st.lastResult.failed, 'file', 'files')} could not be stored; use Backfill now to retry.</span>`);
+  }
+  if (st.lastError) lines.push(`<span class="lf-tone-bad">Last import error: ${escHtml(st.lastError)}</span>`);
+  return lines.map(line => `<div>${line}</div>`).join('');
+}
+
+function lfPhaseKey() {
+  const folders = lfImports && Array.isArray(lfImports.folders) ? lfImports.folders : [];
+  return folders.map(entry => `${entry.folderId}:${entry.phase}`).join(',');
+}
+
+function renderLfStates() {
+  for (const folder of lfFolders) {
+    const el = document.querySelector(`[data-lf-state="${folder.id}"]`);
+    if (el) el.innerHTML = lfStateHtml(folder);
+  }
+}
+
+function lfDefaultChoice(file) {
+  if (file.decision === 'keep') return 'keep';
+  if (file.decision === 'exclude') return 'exclude';
+  // Undecided: readable types default to import; unknown types and files
+  // whose content was removed earlier to free space default to exclude.
+  return file.readable && !file.contentRemoved ? 'keep' : 'exclude';
+}
+
+function lfReviewDirPath(review, dir) {
+  return dir ? `${review.root}/${dir}` : null;
+}
+
+function lfReviewCounts(state) {
+  let keep = 0;
+  let exclude = 0;
+  for (const file of state.review?.files || []) {
+    const absDir = lfReviewDirPath(state.review, file.dir);
+    if ((absDir && state.excludeDirs.has(absDir)) || state.choice.get(file.path) !== 'keep') exclude++;
+    else keep++;
+  }
+  return { keep, exclude };
+}
+
+function renderLfReview(id) {
+  const slot = document.querySelector(`[data-lf-review="${id}"]`);
+  if (!slot) return;
+  const state = lfReviews.get(id);
+  if (!state || !state.open) { slot.innerHTML = ''; return; }
+  const folder = lfFolders.find(entry => entry.id === id);
+  const folderName = folder ? (folder.path.split('/').filter(Boolean).pop() || folder.path) : `folder ${id}`;
+  if (state.loading || !state.review) {
+    slot.innerHTML = `<div class="lf-review" role="region" aria-label="Big files in ${escAttr(folderName)}"><p>${state.error ? escHtml(state.error) : 'Loading the big-file list…'}</p>
+      <div class="lf-review-footer"><button class="btn" type="button" data-lf-action="close-review" data-id="${id}">Close</button></div></div>`;
+    return;
+  }
+  const review = state.review;
+  const groups = new Map();
+  for (const file of review.files || []) {
+    if (!groups.has(file.dir)) groups.set(file.dir, []);
+    groups.get(file.dir).push(file);
+  }
+  const groupHtml = [...groups.keys()].sort((a, b) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b))).map(dir => {
+    const files = groups.get(dir);
+    const absDir = lfReviewDirPath(review, dir);
+    const dirExcluded = Boolean(absDir && state.excludeDirs.has(absDir));
+    const bytes = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+    const dirButton = absDir
+      ? `<button class="text-link" type="button" data-lf-action="${dirExcluded ? 'include-dir' : 'exclude-dir'}" data-id="${id}" data-dir="${escAttr(absDir)}">${dirExcluded ? 'Include subfolder' : 'Exclude subfolder'}</button>`
+      : '';
+    const rows = files.map(file => {
+      const keep = !dirExcluded && state.choice.get(file.path) === 'keep';
+      const notes = [];
+      if (!file.readable) notes.push('BotBoy may not be able to read this type');
+      if (file.contentRemoved) notes.push('Its content was removed earlier to free space');
+      if (file.imported) notes.push('Already imported');
+      const inputId = `lf-file-${id}-${encodeURIComponent(file.path).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+      return `<div class="lf-review-file${keep ? '' : ' is-excluded'}">
+        <input type="checkbox" id="${inputId}" data-lf-file="${escAttr(file.path)}" data-id="${id}" ${keep ? 'checked' : ''} ${dirExcluded ? 'disabled' : ''}>
+        <label class="lf-name" for="${inputId}" title="${escAttr(file.relPath)}">${escHtml(file.name)}</label>
+        <span class="lf-size">${escHtml((file.ext || '').replace('.', '').toUpperCase() || 'FILE')} · ${formatLfBytes(file.size)}</span>
+        ${notes.length ? `<span class="lf-note">${escHtml(notes.join(' · '))}</span>` : ''}
+      </div>`;
+    }).join('');
+    return `<div class="lf-review-group">
+      <div class="lf-review-group-head">${escHtml(dir || 'Top level')} <span>${lfCount(files.length, 'file', 'files')} · ${formatLfBytes(bytes)}${dirExcluded ? ' · whole subfolder excluded on save' : ''}</span> ${dirButton}</div>
+      ${rows}
+    </div>`;
+  }).join('');
+  const excludedDirs = (review.excludedDirs || []).map(entry => {
+    const restoring = state.restoreDirs.has(entry.path);
+    return `<li>${escHtml(entry.relPath)} <span>(${lfCount(entry.files, 'big file', 'big files')})</span> <button class="text-link" type="button" data-lf-action="${restoring ? 'keep-dir-excluded' : 'restore-dir'}" data-id="${id}" data-dir="${escAttr(entry.path)}">${restoring ? 'Keep excluded' : 'Restore'}</button>${restoring ? ' <span>restores on save</span>' : ''}</li>`;
+  }).join('');
+  const tooLarge = review.tooLarge || [];
+  const tooLargeHtml = tooLarge.length
+    ? `<div class="lf-review-toolarge"><button class="text-link" type="button" data-lf-action="toggle-too-large" data-id="${id}">${state.showTooLarge ? 'Hide' : 'Show'} ${lfCount(tooLarge.length, 'file', 'files')} too large to import yet (over ${formatLfBytes(review.maxFileBytes)})</button>
+      ${state.showTooLarge ? `<ul>${tooLarge.map(file => `<li>${escHtml(file.relPath)} <span>${formatLfBytes(file.size)}</span></li>`).join('')}</ul>` : ''}</div>`
+    : '';
+  const counts = lfReviewCounts(state);
+  const hasFiles = (review.files || []).length > 0;
+  slot.innerHTML = `<div class="lf-review" role="region" aria-label="Big files in ${escAttr(folderName)}">
+    <h3>Big files in ${escHtml(folderName)}</h3>
+    <p>${hasFiles
+      ? `These files are ${formatLfBytes(review.bigFileBytes)} or larger. Tick the files to import; unticked files are excluded and never read. ${review.undecided ? 'The rest of the folder imports after you save.' : ''} You can change this later.`
+      : 'No big files wait for a decision.'}</p>
+    ${hasFiles ? `<div class="lf-review-toolbar"><button class="btn" type="button" data-lf-action="all-keep" data-id="${id}">Import all</button><button class="btn" type="button" data-lf-action="all-exclude" data-id="${id}">Exclude all</button></div>
+    <div class="lf-review-list">${groupHtml}</div>` : ''}
+    ${excludedDirs ? `<div class="lf-review-excluded"><strong>Excluded subfolders</strong><ul>${excludedDirs}</ul></div>` : ''}
+    ${tooLargeHtml}
+    <div class="lf-review-footer">
+      <button class="btn btn-primary" type="button" data-lf-action="save-review" data-id="${id}" ${state.saving ? 'disabled' : ''}>${state.saving ? 'Saving…' : 'Save and start import'}</button>
+      <button class="btn" type="button" data-lf-action="close-review" data-id="${id}">Close</button>
+      <span class="lf-review-summary" data-lf-review-summary="${id}">Import ${counts.keep.toLocaleString()} · Exclude ${counts.exclude.toLocaleString()}</span>
+      ${state.error ? `<span class="lf-review-error" role="alert">${escHtml(state.error)}</span>` : ''}
+    </div>
+  </div>`;
+}
+
+async function openLfReview(id) {
+  const state = lfReviews.get(id) || { choice: new Map(), excludeDirs: new Set(), restoreDirs: new Set(), showTooLarge: false };
+  Object.assign(state, { open: true, loading: true, saving: false, error: '', review: null });
+  lfReviews.set(id, state);
+  renderLfReview(id);
+  let res;
+  try {
+    res = await fetch(`/api/local-folders/${id}/review`);
+  } catch (e) {
+    state.loading = false;
+    state.error = `Could not load the big-file list: ${e.message || 'network error'}`;
+    renderLfReview(id);
+    return;
+  }
+  let body = {};
+  try { body = await res.json(); } catch {}
+  state.loading = false;
+  if (!res.ok || !body || !body.review) {
+    state.error = `Could not load the big-file list: ${(body && body.error) || `HTTP ${res.status}`}`;
+    renderLfReview(id);
+    return;
+  }
+  state.review = body.review;
+  state.choice = new Map((body.review.files || []).map(file => [file.path, lfDefaultChoice(file)]));
+  state.excludeDirs = new Set();
+  state.restoreDirs = new Set();
+  renderLfReview(id);
+}
+
+async function saveLfReview(id) {
+  const state = lfReviews.get(id);
+  if (!state || !state.review || state.saving) return;
+  const keep = [];
+  const exclude = [];
+  for (const file of state.review.files || []) {
+    const absDir = lfReviewDirPath(state.review, file.dir);
+    if (absDir && state.excludeDirs.has(absDir)) continue; // the subfolder entry covers it
+    (state.choice.get(file.path) === 'keep' ? keep : exclude).push(file.path);
+  }
+  const body = { keep, exclude, excludeDirs: [...state.excludeDirs], restoreDirs: [...state.restoreDirs] };
+  if (!keep.length && !exclude.length && !body.excludeDirs.length && !body.restoreDirs.length) {
+    state.error = 'Nothing to save.';
+    renderLfReview(id);
+    return;
+  }
+  state.saving = true;
+  state.error = '';
+  renderLfReview(id);
+  let res;
+  try {
+    res = await fetch(`/api/local-folders/${id}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    state.saving = false;
+    state.error = `Not saved: ${e.message || 'network error'}`;
+    renderLfReview(id);
+    return;
+  }
+  let payload = {};
+  try { payload = await res.json(); } catch {}
+  state.saving = false;
+  if (!res.ok) {
+    const invalid = Array.isArray(payload.invalid)
+      ? payload.invalid.slice(0, 3).map(entry => `${String(entry.path || '').split('/').pop()} ${entry.reason}`).join('; ')
+      : '';
+    state.error = ['Not saved.', payload.error || `HTTP ${res.status}`, invalid, payload.nextAction].filter(Boolean).join(' ');
+    renderLfReview(id);
+    return;
+  }
+  state.open = false;
+  renderLfReview(id);
+  const excludedTotal = exclude.length + body.excludeDirs.length;
+  showLfStatus(`Saved: ${keep.length.toLocaleString()} kept, ${excludedTotal.toLocaleString()} excluded. Importing in the background.`);
+  await refreshLfImportState();
+}
+
+function bindLfListDelegation(list) {
+  if (!list || list.dataset.lfBound === '1') return;
+  list.dataset.lfBound = '1';
+  list.addEventListener('click', (event) => {
+    const target = event.target && event.target.closest ? event.target.closest('[data-lf-action]') : null;
+    if (!target || !list.contains(target)) return;
+    event.preventDefault();
+    const id = Number(target.getAttribute('data-id'));
+    const action = target.getAttribute('data-lf-action');
+    if (!Number.isFinite(id)) return;
+    if (action === 'open-review') { void openLfReview(id); return; }
+    const state = lfReviews.get(id);
+    if (!state) return;
+    const dir = target.getAttribute('data-dir');
+    if (action === 'close-review') state.open = false;
+    else if (action === 'save-review') { void saveLfReview(id); return; }
+    else if (action === 'all-keep' || action === 'all-exclude') {
+      for (const file of state.review?.files || []) state.choice.set(file.path, action === 'all-keep' ? 'keep' : 'exclude');
+      if (action === 'all-keep') state.excludeDirs.clear();
+    } else if (action === 'exclude-dir' && dir) state.excludeDirs.add(dir);
+    else if (action === 'include-dir' && dir) state.excludeDirs.delete(dir);
+    else if (action === 'restore-dir' && dir) state.restoreDirs.add(dir);
+    else if (action === 'keep-dir-excluded' && dir) state.restoreDirs.delete(dir);
+    else if (action === 'toggle-too-large') state.showTooLarge = !state.showTooLarge;
+    renderLfReview(id);
+  });
+  list.addEventListener('change', (event) => {
+    const input = event.target;
+    if (!input || !input.matches || !input.matches('input[data-lf-file]')) return;
+    const id = Number(input.getAttribute('data-id'));
+    const state = lfReviews.get(id);
+    if (!state) return;
+    state.choice.set(input.getAttribute('data-lf-file'), input.checked ? 'keep' : 'exclude');
+    const row = input.closest('.lf-review-file');
+    if (row) row.classList.toggle('is-excluded', !input.checked);
+    const summary = document.querySelector(`[data-lf-review-summary="${id}"]`);
+    if (summary) {
+      const counts = lfReviewCounts(state);
+      summary.textContent = `Import ${counts.keep.toLocaleString()} · Exclude ${counts.exclude.toLocaleString()}`;
+    }
+  });
+}
+
+function renderLfStorage() {
+  const el = document.getElementById('local-folders-storage');
+  if (!el) return;
+  const disk = (lfImports && lfImports.disk) || (lfStorage && lfStorage.disk) || null;
+  const free = disk && typeof disk.freeBytes === 'number' ? disk.freeBytes : null;
+  const importFloor = lfImports?.disk?.importFloorBytes ?? lfStorage?.floors?.importFloorBytes ?? null;
+  const liveFloor = lfImports?.disk?.liveFloorBytes ?? lfStorage?.floors?.liveFloorBytes ?? null;
+  let level = '';
+  if (free != null && liveFloor != null && free < liveFloor) level = 'live';
+  else if (free != null && importFloor != null && free < importFloor) level = 'import';
+  const key = [free == null ? '' : Math.round(free / (100 * 1024 ** 2)), level, lfStorage?.measuredAt || '', lfStorage?.error || '', lfStorageLoading].join('|');
+  if (key === lfStorageRenderKey) return;
+  lfStorageRenderKey = key;
+  const warning = level === 'live'
+    ? `<div class="lf-storage-warning live" role="alert">Free space is below ${formatLfBytes(liveFloor)}. Folder imports and live folder captures are paused; BotBoy keeps watching and imports held changes when space returns.</div>`
+    : level === 'import'
+      ? `<div class="lf-storage-warning import" role="status">Free space is below ${formatLfBytes(importFloor)}. Folder imports are paused; watching and live captures continue.</div>`
+      : '';
+  const categories = Array.isArray(lfStorage?.categories) ? lfStorage.categories : [];
+  const usage = lfStorage && !lfStorage.error && categories.length ? `BotBoy uses ${formatLfBytes(lfStorage.botboyBytes)}` : 'BotBoy storage';
+  const freeText = free != null ? ` · ${formatLfBytes(free)} free on this Mac` : '';
+  const list = categories.length
+    ? `<ul class="lf-storage-list">${categories.map(category => `<li><span>${escHtml(category.label)}</span><span>${formatLfBytes(category.bytes)}</span></li>`).join('')}</ul>`
+    : `<p class="lf-storage-meta">${lfStorage?.error ? escHtml(lfStorage.error) : 'Measuring…'}</p>`;
+  const actions = Array.isArray(lfStorage?.nextActions) && lfStorage.nextActions.length
+    ? `<details class="lf-storage-help"${level ? ' open' : ''}><summary>How to free space</summary><ul class="lf-storage-actions">${lfStorage.nextActions.map(action => `<li>${escHtml(action)}</li>`).join('')}</ul></details>`
+    : '';
+  const minutes = lfStorage?.measuredAt ? Math.max(0, Math.round((Date.now() - lfStorage.measuredAt) / 60000)) : null;
+  const measured = minutes == null ? '' : `Sizes measured ${minutes === 0 ? 'just now' : `${minutes} min ago`}. Imports pause below ${formatLfBytes(importFloor)} free; live captures below ${formatLfBytes(liveFloor)}.`;
+  el.innerHTML = `<div class="lf-storage-head"><strong>Storage</strong><span>${usage}${freeText}</span><span class="toolbar-spacer"></span><button class="btn" type="button" data-lf-storage="refresh" ${lfStorageLoading ? 'disabled' : ''}>${lfStorageLoading ? 'Measuring…' : 'Refresh'}</button></div>
+    ${warning}${list}${actions}<div class="lf-storage-meta">${measured}</div>`;
+  if (el.dataset.lfBound !== '1') {
+    el.dataset.lfBound = '1';
+    el.addEventListener('click', (event) => {
+      const button = event.target && event.target.closest ? event.target.closest('[data-lf-storage="refresh"]') : null;
+      if (!button) return;
+      event.preventDefault();
+      void refreshLfImportState({ storage: 'refresh' });
+    });
+  }
+}
+
+async function refreshLfImportState(opts = {}) {
+  const wantStorage = Boolean(opts.storage);
+  const readJson = (url) => fetch(url).then(res => (res && res.ok ? res.json() : null)).catch(() => null);
+  if (wantStorage) {
+    lfStorageLoading = true;
+    renderLfStorage();
+  }
+  const [imports, storage] = await Promise.all([
+    readJson('/api/local-folders/imports'),
+    wantStorage ? readJson(`/api/local-folders/storage${opts.storage === 'refresh' ? '?refresh=1' : ''}`) : Promise.resolve(null),
+  ]);
+  const previousPhases = lfPhaseKey();
+  if (imports && Array.isArray(imports.folders)) lfImports = imports;
+  if (wantStorage) {
+    lfStorageLoading = false;
+    if (storage && Array.isArray(storage.categories)) lfStorage = storage;
+  }
+  // A phase change also changes row buttons (Backfill now ↔ Importing…), so
+  // re-render rows; otherwise update only the state lines.
+  if (lfPhaseKey() !== previousPhases) renderLocalFoldersList();
+  else renderLfStates();
+  renderLfStorage();
+  // A folder waiting for a big-file decision opens its review once per visit.
+  for (const folder of lfFolders) {
+    const st = lfFolderStatus(folder.id);
+    if (st && st.phase === 'needs_review' && !lfReviewAutoOpened.has(folder.id)) {
+      lfReviewAutoOpened.add(folder.id);
+      if (!lfReviews.get(folder.id)?.open) void openLfReview(folder.id);
+    }
+  }
+}
+
+function startLfPolling() {
+  if (lfPollTimer) return;
+  lfPollTimer = setInterval(() => {
+    const panel = document.getElementById('local-folders');
+    if (!panel || panel.style.display !== 'block') {
+      clearInterval(lfPollTimer);
+      lfPollTimer = null;
+      return;
+    }
+    if (document.visibilityState === 'hidden') return;
+    void refreshLfImportState();
+  }, 5000);
+}
+
 async function showLocalFolders() {
   const grid = document.getElementById('grid-view');
   const detail = document.getElementById('detail-view');
@@ -2779,6 +3196,9 @@ window.removeLocalFolder = removeLocalFolder;
 window.startBackfill = startBackfill;
 window.cancelBackfill = cancelBackfill;
 window.showLocalFolders = showLocalFolders;
+window.openLfReview = openLfReview;
+window.saveLfReview = saveLfReview;
+window.refreshLfImportState = refreshLfImportState;
 
 // ── In-app file preview ──
 //

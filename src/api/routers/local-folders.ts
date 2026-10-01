@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import type { BackfillProgress } from '../../monitors/filesystem-monitor.js';
+import type { ReviewDecision } from '../../monitors/folder-import-scheduler.js';
 import {
   addLocalFolder,
   listLocalFolders,
@@ -13,6 +14,29 @@ import {
   getLocalFolder,
 } from '../../core/local-folders-config.js';
 import { paramStr, type RouterDeps } from './deps.js';
+import { requireLocalOwnerUiRequest } from './local-owner.js';
+
+const REVIEW_DECISION_KEYS = ['keep', 'exclude', 'excludeDirs', 'restoreDirs'] as const;
+
+/** Shape-only validation of a big-file review decision body. */
+function validateReviewDecision(body: unknown): { ok: true; value: ReviewDecision } | { ok: false; message: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, message: 'Body must be a JSON object with keep, exclude, excludeDirs, or restoreDirs arrays' };
+  }
+  const record = body as Record<string, unknown>;
+  const unknownKeys = Object.keys(record).filter(key => !(REVIEW_DECISION_KEYS as readonly string[]).includes(key));
+  if (unknownKeys.length > 0) return { ok: false, message: `Unknown field(s): ${unknownKeys.join(', ')}` };
+  const value: ReviewDecision = {};
+  for (const key of REVIEW_DECISION_KEYS) {
+    const entry = record[key];
+    if (entry === undefined) continue;
+    if (!Array.isArray(entry) || !entry.every(item => typeof item === 'string')) {
+      return { ok: false, message: `${key} must be an array of absolute paths` };
+    }
+    value[key] = entry as string[];
+  }
+  return { ok: true, value };
+}
 
 export function createLocalFoldersRouter(deps: RouterDeps): Router {
   const router = Router();
@@ -116,6 +140,8 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
     } catch (err: any) {
       console.warn('[routes] setWatchedFolders failed after add:', err?.message ?? err);
     }
+    // The first import runs in the background: scan, big-file review, import.
+    deps.folderImports?.kick();
 
     res.status(201).json({ folder: result.folder });
   });
@@ -145,6 +171,8 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
     } catch (err: any) {
       console.warn('[routes] setWatchedFolders failed after patch:', err?.message ?? err);
     }
+    // Disabling or reconfiguring stops an active walk; enabling kicks one.
+    deps.folderImports?.folderChanged(id);
 
     res.json({ folder: result.folder });
   });
@@ -166,8 +194,78 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
     } catch (err: any) {
       console.warn('[routes] setWatchedFolders failed after delete:', err?.message ?? err);
     }
+    // Captured items stay; the import ledger and first-import marker go.
+    deps.folderImports?.forgetFolder(id);
 
     res.status(204).end();
+  });
+
+  // ── Import status, big-file review, storage card ──
+
+  router.get('/local-folders/imports', (_req: Request, res: Response) => {
+    if (!deps.folderImports) {
+      return res.status(503).json({ error: 'Folder imports are not available', nextAction: 'Restart BotBoy.' });
+    }
+    res.json(deps.folderImports.status());
+  });
+
+  router.get('/local-folders/storage', async (req: Request, res: Response) => {
+    if (!deps.storageUsage) {
+      return res.status(503).json({ error: 'Storage measurement is not available', nextAction: 'Restart BotBoy.' });
+    }
+    res.json(await deps.storageUsage.get({ refresh: req.query.refresh === '1' }));
+  });
+
+  router.get('/local-folders/:id/review', (req: Request, res: Response) => {
+    const id = Number(paramStr(req.params.id));
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'id must be a positive integer' });
+    }
+    if (!deps.folderImports) {
+      return res.status(503).json({ error: 'Folder imports are not available', nextAction: 'Restart BotBoy.' });
+    }
+    const review = deps.folderImports.review(id);
+    if (!review) return res.status(404).json({ error: `No folder with id ${id}` });
+    res.json({ review });
+  });
+
+  /**
+   * Owner big-file decision (C8). Same-origin owner UI only: the choice to
+   * read (or never read) a large file is the owner's, never an agent's.
+   * Validation is all-or-nothing; the response names every rejected entry.
+   */
+  router.post('/local-folders/:id/review', async (req: Request, res: Response) => {
+    const id = Number(paramStr(req.params.id));
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'id must be a positive integer' });
+    }
+    if (!requireLocalOwnerUiRequest(
+      req,
+      res,
+      'Big-file review decision',
+      'Open Connections → Local folders and choose files in the folder’s big-file review.',
+    )) return;
+    if (!deps.folderImports) {
+      return res.status(503).json({ error: 'Folder imports are not available', nextAction: 'Restart BotBoy.' });
+    }
+    const validated = validateReviewDecision(req.body);
+    if (!validated.ok) {
+      return res.status(400).json({
+        error: validated.message,
+        code: 'invalid_decision',
+        nextAction: 'Send keep, exclude, excludeDirs, or restoreDirs as arrays of absolute paths from the review list.',
+      });
+    }
+    const result = await deps.folderImports.decide(id, validated.value);
+    if (!result.ok) {
+      return res.status(result.status).json({
+        error: result.error,
+        code: result.code,
+        invalid: result.invalid,
+        nextAction: result.nextAction,
+      });
+    }
+    res.json(result);
   });
 
   /**
@@ -195,6 +293,14 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
     }
     if (!deps.db || !getLocalFolder(deps.db, id)) {
       return res.status(404).json({ error: `No folder with id ${id}` });
+    }
+    // One walk per folder: a running scheduled import already owns it.
+    if (deps.folderImports?.isFolderBusy(id)) {
+      return res.status(409).json({
+        error: 'This folder is already being imported.',
+        code: 'import_running',
+        nextAction: 'Wait for the import shown in Local folders to finish; interrupted imports resume on their own.',
+      });
     }
 
     res.setHeader('Content-Type', 'text/event-stream');

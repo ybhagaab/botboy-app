@@ -247,6 +247,34 @@ function createSchema(db: Database.Database): void {
 
   // ── local provider-reported LLM generation usage (indefinite raw history) ──
   migrateLlmUsage(db);
+
+  // ── local-folder import ledger (resumable imports + big-file review) ──
+  migrateLocalFolderImports(db);
+}
+
+/**
+ * Local-folder import ledger (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md C2/C8): one
+ * row per (watched folder, file path) that a folder import handed to capture,
+ * or that waits for the owner (big-file review), was skipped as too large, or
+ * was deferred for low disk. Path/size/mtime/outcome only; never content.
+ * `origin` keeps capture provenance truthful when a held file is imported
+ * later (`import` = found by a folder walk, `live` = a watched change).
+ * Owned by `core/local-folder-imports.ts`.
+ */
+export function migrateLocalFolderImports(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS local_folder_imports (
+      folder_id INTEGER NOT NULL,
+      path TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      mtime_ms REAL NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('imported','needs_review','approved','excluded','too_large','deferred_low_disk')),
+      origin TEXT NOT NULL DEFAULT 'import' CHECK(origin IN ('import','live')),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (folder_id, path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_local_folder_imports_outcome ON local_folder_imports(folder_id, outcome);
+  `);
 }
 
 /**

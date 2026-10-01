@@ -23,54 +23,138 @@
  */
 
 import { createHash } from 'crypto';
-import { statSync, watch as fsNativeWatch, promises as fsPromises } from 'fs';
+import { statSync, watch as fsNativeWatch, promises as fsPromises, type Stats } from 'fs';
 import path from 'path';
+import { performance } from 'perf_hooks';
 import type Database from 'better-sqlite3';
 import type { RawWorkItem } from '../core/types.js';
 import type { DocumentParser } from '../core/document-parser.js';
 import type { LocalFolder } from '../core/local-folders-config.js';
 import { listLocalFolders, getLocalFolder } from '../core/local-folders-config.js';
+import type { DiskSpaceMonitor } from '../core/disk-space.js';
+import { NOOP_MAIN_THREAD_WATCHDOG, type MainThreadWatchdog } from '../core/main-thread-watchdog.js';
+import {
+  captureSignature,
+  createLocalFolderImportLedger,
+  existingCaptureSignatures,
+  folderImportThresholds,
+  markFirstImportDone,
+  parseLiteralGlob,
+  type FolderFileOrigin,
+  type FolderFileOutcome,
+  type FolderFileRecord,
+  type FolderImportThresholds,
+  type LocalFolderImportLedger,
+} from '../core/local-folder-imports.js';
 
 // ── Public types ───────────────────────────────────────────────────────────
 
 /**
  * Progress event emitted during a `backfill` run. Mirrors the SSE event shape
  * the route handler will forward to the client. The `phase` field is the
- * discriminant; not every field is populated for every phase.
+ * discriminant; not every field is populated for every phase. `paused` is
+ * terminal: the walk stopped below the import disk floor and resumes later
+ * (unchanged files are skipped, so resuming is cheap).
  */
 export interface BackfillProgress {
-  phase: 'started' | 'progress' | 'done' | 'error' | 'aborted';
+  phase: 'started' | 'progress' | 'done' | 'error' | 'aborted' | 'paused';
   folderId: number;
   total?: number;
   processed?: number;
   error?: string;
+  /** Files handed to capture during this walk. */
+  imported?: number;
+  /** Files skipped because this exact version was already handed to capture. */
+  unchanged?: number;
+  /** Big files held for the owner's review. */
+  needsReview?: number;
+  /** Files above the import ceiling, listed but never read. */
+  tooLarge?: number;
+  reason?: 'low_disk' | 'busy';
+  freeBytes?: number;
 }
 
 /**
  * Terminal result returned by `backfill`. `aborted: true` is returned when
  * the caller-provided `AbortSignal` fired mid-walk; otherwise `aborted: false`
- * with the total number of files inspected.
+ * with the total number of files inspected. `paused` means the walk stopped
+ * below the import disk floor; `busy` means another walk owns the folder.
  */
 export type BackfillResult =
   | { aborted: true }
-  | { aborted: false; total: number };
+  | {
+    aborted: false;
+    total: number;
+    imported?: number;
+    unchanged?: number;
+    needsReview?: number;
+    tooLarge?: number;
+    failed?: number;
+    paused?: 'low_disk';
+    busy?: boolean;
+  };
 
 /**
  * Public surface area of the filesystem monitor. Mirrors the slack-monitor
  * shape (start/stop/onWorkItem) and adds the watched-folders diff control
- * plus a `backfill` API used by the SSE backfill route.
+ * plus a `backfill` API used by the SSE backfill route. A listener may
+ * return a promise; folder imports wait for it before recording a file as
+ * imported, so a failed store is retried by the next walk.
  */
 export interface FilesystemMonitor {
   start(): Promise<void>;
   stop(): Promise<void>;
-  onWorkItem(cb: (item: RawWorkItem) => void): void;
+  onWorkItem(cb: (item: RawWorkItem) => unknown): void;
   setWatchedFolders(folders: LocalFolder[]): Promise<void>;
   getWatchedFolders(): LocalFolder[];
   backfill(
     folderId: number,
-    opts?: { onProgress?: (p: BackfillProgress) => void; signal?: AbortSignal },
+    opts?: { onProgress?: (p: BackfillProgress) => void; signal?: AbortSignal; expectedTotal?: number },
   ): Promise<BackfillResult>;
 }
+
+/** Live progress of one folder walk (scan or import). */
+export interface FolderWalkState {
+  kind: 'scan' | 'import';
+  processed: number;
+  total: number | null;
+  startedAt: number;
+}
+
+/** Result of the read-only first-import scan (no file content is read). */
+export type FolderScanResult =
+  | { aborted: true }
+  | {
+    aborted: false;
+    busy?: boolean;
+    /** Files an import walk would visit (its `total`). */
+    walked: number;
+    /** Capture candidates seen (after ignores, excludes, and include globs). */
+    files: number;
+    bytes: number;
+    /** Candidates that an import walk would hand to capture now. */
+    importable: number;
+    unchanged: number;
+    needsReview: number;
+    tooLarge: number;
+  };
+
+export type ImportFilesResult =
+  | { aborted: true }
+  | { aborted: false; busy?: boolean; imported: number; held: number; failed: number; paused?: 'low_disk' };
+
+/**
+ * Folder-import operations used by `folder-import-scheduler.ts`. Kept off
+ * `FilesystemMonitor` so route-level monitor stubs stay minimal.
+ */
+export interface FolderImportWalker {
+  isWalking(folderId: number): boolean;
+  walkState(folderId: number): FolderWalkState | null;
+  scanFolder(folderId: number, opts?: { signal?: AbortSignal }): Promise<FolderScanResult>;
+  importFiles(folderId: number, records: FolderFileRecord[], opts?: { signal?: AbortSignal }): Promise<ImportFilesResult>;
+}
+
+export type FilesystemMonitorWithImports = FilesystemMonitor & FolderImportWalker;
 
 // ── Watch engine seam ──────────────────────────────────────────────────────
 
@@ -121,6 +205,9 @@ const MAX_FILE_BYTES = (() => {
   }
   return parsed;
 })();
+
+/** Import ceiling: files above it are listed as too large and never read. */
+export const LOCAL_FOLDER_MAX_FILE_BYTES = MAX_FILE_BYTES;
 
 /**
  * Static ignore patterns shared by `attachWatcher` and (later) `backfill` so
@@ -212,15 +299,26 @@ export function isRelativePathIgnored(relPath: string): boolean {
 /**
  * Compile a single glob pattern into a `RegExp`. Supports the subset chokidar
  * documents: `**` (any number of path segments), `*` (any chars except `/`),
- * `?` (single char). Other regex metacharacters are escaped. Patterns that do
- * not contain a `/` are matched against the file's basename so `*.md` matches
- * any markdown file regardless of directory depth.
+ * `?` (single char). A backslash escapes `*`, `?`, or itself, so a literal
+ * path written by the big-file review (`literalGlobForPath`) matches exactly
+ * that path even when its name contains a wildcard character. Other regex
+ * metacharacters are escaped. Patterns that do not contain a `/` are matched
+ * against the file's basename so `*.md` matches any markdown file regardless
+ * of directory depth. Compiled patterns are cached (bounded).
  */
+const globRegexCache = new Map<string, RegExp>();
+const GLOB_CACHE_LIMIT = 10_000;
+
 function compileGlob(glob: string): RegExp {
+  const cached = globRegexCache.get(glob);
+  if (cached) return cached;
   let pattern = '';
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
-    if (ch === '*') {
+    if (ch === '\\' && i + 1 < glob.length && '\\*?'.includes(glob[i + 1])) {
+      pattern += '\\' + glob[i + 1];
+      i++;
+    } else if (ch === '*') {
       if (glob[i + 1] === '*') {
         // `**` matches any number of characters including `/`.
         pattern += '.*';
@@ -239,7 +337,10 @@ function compileGlob(glob: string): RegExp {
       pattern += ch;
     }
   }
-  return new RegExp('^' + pattern + '$');
+  const compiled = new RegExp('^' + pattern + '$');
+  if (globRegexCache.size >= GLOB_CACHE_LIMIT) globRegexCache.clear();
+  globRegexCache.set(glob, compiled);
+  return compiled;
 }
 
 /**
@@ -259,6 +360,62 @@ function matchesAnyGlob(filePath: string, globs: ReadonlyArray<string>): boolean
     }
   }
   return false;
+}
+
+/**
+ * A folder's `exclude_globs`, compiled once. Literal entries written by the
+ * big-file review (one exact file, or `<dir>/**`) become set lookups, so a
+ * review that excludes hundreds of files stays O(depth) per path; owner
+ * patterns keep `matchesAnyGlob` semantics. `matchesFile` is exactly
+ * equivalent to `matchesAnyGlob(filePath, globs)`. `prunesDir` is true only
+ * when every path under the directory is excluded (a literal directory entry
+ * or a pattern ending in `/**` that matches it), so a walk may skip the
+ * subtree without reading it.
+ */
+interface CompiledExcludes {
+  matchesFile(filePath: string): boolean;
+  prunesDir(dirPath: string): boolean;
+}
+
+const compiledExcludesCache = new WeakMap<ReadonlyArray<string>, CompiledExcludes>();
+
+function hasAncestorIn(dirs: ReadonlySet<string>, target: string): boolean {
+  if (dirs.size === 0) return false;
+  let current = path.dirname(target);
+  for (;;) {
+    if (dirs.has(current)) return true;
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+function compileExcludes(globs: ReadonlyArray<string>): CompiledExcludes {
+  const cached = compiledExcludesCache.get(globs);
+  if (cached) return cached;
+  const literalFiles = new Set<string>();
+  const literalDirs = new Set<string>();
+  const patterns: string[] = [];
+  for (const glob of globs) {
+    const literal = parseLiteralGlob(glob);
+    if (!literal) patterns.push(glob);
+    else if (literal.directory) literalDirs.add(literal.path);
+    else literalFiles.add(literal.path);
+  }
+  const subtreePatterns = patterns.filter(glob => glob.includes('/') && glob.endsWith('/**'));
+  const compiled: CompiledExcludes = {
+    matchesFile(filePath) {
+      if (literalFiles.has(filePath) || hasAncestorIn(literalDirs, filePath)) return true;
+      return patterns.length > 0 && matchesAnyGlob(filePath, patterns);
+    },
+    prunesDir(dirPath) {
+      if (literalDirs.has(dirPath) || hasAncestorIn(literalDirs, dirPath)) return true;
+      const probe = dirPath.endsWith('/') ? dirPath : dirPath + '/';
+      return subtreePatterns.some(glob => compileGlob(glob).test(probe));
+    },
+  };
+  compiledExcludesCache.set(globs, compiled);
+  return compiled;
 }
 
 // ── Native watch engine ────────────────────────────────────────────────────
@@ -363,7 +520,7 @@ export function createNativeWatchEngine(
     if (!row.recursive && rel.includes(path.sep)) return;
     if (isRelativePathIgnored(rel)) return;
     const absolutePath = path.join(row.path, rel);
-    if (row.exclude_globs.length > 0 && matchesAnyGlob(absolutePath, row.exclude_globs)) return;
+    if (row.exclude_globs.length > 0 && compileExcludes(row.exclude_globs).matchesFile(absolutePath)) return;
 
     // Burst guard (R3). Window reset first so a long-quiet folder starts
     // fresh; while paused, drop and count; on expiry, log the resume once.
@@ -448,33 +605,158 @@ export function createFilesystemMonitor(deps: {
   documentParser: DocumentParser;
   /** Injectable watch engine; defaults to the native fs.watch engine. */
   watchEngine?: WatchEngine;
-}): FilesystemMonitor {
+  /** Import ledger; defaults to one over `db`. */
+  ledger?: LocalFolderImportLedger;
+  /** Free-space probe for the disk floors; omitted ⇒ no floors apply. */
+  diskSpace?: DiskSpaceMonitor | null;
+  thresholds?: FolderImportThresholds;
+  watchdog?: MainThreadWatchdog;
+  /** Cooperative yield between files; defaults to `setImmediate`. */
+  yieldToLoop?: () => Promise<void>;
+}): FilesystemMonitorWithImports {
   const { db, documentParser } = deps;
   const watchEngine = deps.watchEngine ?? createNativeWatchEngine;
+  const ledger = deps.ledger ?? createLocalFolderImportLedger(db);
+  const diskSpace = deps.diskSpace ?? null;
+  const thresholds = deps.thresholds ?? folderImportThresholds();
+  const watchdog = deps.watchdog ?? NOOP_MAIN_THREAD_WATCHDOG;
+  const yieldToLoop = deps.yieldToLoop ?? (() => new Promise<void>(resolve => setImmediate(resolve)));
 
   const watchersByPath = new Map<string, WatchHandle>();
+  // Latest row per watched path. Cooked handlers read it at event time, so
+  // an id/include-glob change applies without re-attaching; `recursive` and
+  // `exclude_globs` live inside the engine and trigger a re-attach.
+  const watchedRows = new Map<string, LocalFolder>();
   let currentRows: LocalFolder[] = [];
   const seenHashes = new Map<string, string>();
-  const listeners: Array<(item: RawWorkItem) => void> = [];
+  const listeners: Array<(item: RawWorkItem) => unknown> = [];
   // Folders whose watcher was force-closed after exhausting file descriptors.
   // Collapses an EMFILE error storm into a single actionable log line and
   // exactly one close() call (last-resort fuse; the native engine's O(1)
   // descriptor cost makes this near-impossible to trip).
   const fdExhausted = new Set<string>();
+  // One walk (scan, import, or pending import) per folder at a time.
+  const walks = new Map<number, FolderWalkState>();
+  let liveLowDiskNotified = false;
 
   // ── Private helpers ────────────────────────────────────────────────────
 
   /**
    * Fan-out a `RawWorkItem` to every registered listener. Each listener is
    * isolated — one throwing handler does not block siblings, matching the
-   * clipboard-monitor pattern.
+   * clipboard-monitor pattern. Listeners are invoked synchronously; the
+   * returned promise resolves `true` once every returned promise settled
+   * successfully, and `false` when any listener threw or rejected (already
+   * logged here, so callers never need their own catch).
    */
-  function emit(item: RawWorkItem): void {
+  function emit(item: RawWorkItem): Promise<boolean> {
+    let failed = false;
+    const pending: Array<Promise<unknown>> = [];
     for (const fn of listeners) {
       try {
-        fn(item);
+        const result = fn(item);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          pending.push(Promise.resolve(result).catch((err) => {
+            failed = true;
+            console.error('[filesystem-monitor] listener error:', err);
+          }));
+        }
       } catch (err) {
+        failed = true;
         console.error('[filesystem-monitor] listener error:', err);
+      }
+    }
+    if (pending.length === 0) return Promise.resolve(!failed);
+    return Promise.all(pending).then(() => !failed);
+  }
+
+  /** True when the owner kept this path as a big file (approved or imported big). */
+  function ownerKept(known: FolderFileRecord | undefined | null): boolean {
+    if (!known) return false;
+    return known.outcome === 'approved'
+      || (known.outcome === 'imported' && known.size >= thresholds.bigFileBytes);
+  }
+
+  function holdFile(row: LocalFolder, filePath: string, stat: Stats, outcome: FolderFileOutcome, origin: FolderFileOrigin, known?: FolderFileRecord | null): void {
+    // Skip the write when this exact version is already held the same way.
+    if (known && known.outcome === outcome && known.size === stat.size && known.mtimeMs === stat.mtimeMs) return;
+    ledger.record({ folderId: row.id, path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, outcome, origin });
+  }
+
+  /** Live floor check on the cached free-space value (sync; never blocks). */
+  function liveDiskLow(): boolean {
+    if (!diskSpace) return false;
+    const free = diskSpace.cachedFreeBytes();
+    const low = free != null && free < thresholds.liveMinFreeBytes;
+    if (low && !liveLowDiskNotified) {
+      liveLowDiskNotified = true;
+      console.warn(
+        `[filesystem-monitor] Free disk space is ${formatGiB(free)} (below the ${formatGiB(thresholds.liveMinFreeBytes)} live floor): `
+        + 'live folder captures are deferred and will be imported when space returns. Free space from Connections → Local folders → Storage.',
+      );
+    } else if (!low && liveLowDiskNotified) {
+      liveLowDiskNotified = false;
+      console.log('[filesystem-monitor] Free disk space recovered; live folder captures resumed.');
+    }
+    return low;
+  }
+
+  async function importDiskLow(): Promise<number | null> {
+    if (!diskSpace) return null;
+    const free = await diskSpace.freeBytes(5_000);
+    return free != null && free < thresholds.importMinFreeBytes ? free : null;
+  }
+
+  function acquireWalk(folderId: number, kind: FolderWalkState['kind'], total: number | null = null): FolderWalkState | null {
+    if (walks.has(folderId)) return null;
+    const state: FolderWalkState = { kind, processed: 0, total, startedAt: Date.now() };
+    walks.set(folderId, state);
+    return state;
+  }
+
+  /**
+   * Breadth-first walk over one folder yielding candidate file paths. Prunes
+   * statically ignored directories, excluded subtrees, and (non-recursive
+   * rows) every subdirectory; skips statically ignored and excluded files.
+   * `readdir` is async; entry iteration yields to the event loop after
+   * ~25 ms of synchronous work so a huge directory never starves the loop.
+   */
+  async function* walkFolderFiles(
+    row: LocalFolder,
+    excludes: CompiledExcludes,
+  ): AsyncGenerator<{ path: string } | { error: string }> {
+    const queue: string[] = [row.path];
+    let sliceStarted = performance.now();
+    while (queue.length > 0) {
+      const dir = queue.shift() as string;
+      let entries;
+      try {
+        entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      } catch (err) {
+        yield { error: `readdir failed for ${dir}: ${(err as Error).message ?? String(err)}` };
+        continue;
+      }
+      sliceStarted = performance.now();
+      for (const entry of entries) {
+        if (performance.now() - sliceStarted > 25) {
+          await yieldToLoop();
+          sliceStarted = performance.now();
+        }
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!row.recursive) continue;
+          if (isStaticallyIgnored(entry.name, true)) continue;
+          if (excludes.prunesDir(fullPath)) continue;
+          queue.push(fullPath);
+          continue;
+        }
+        // Skip non-regular files (sockets, fifos, char devices, broken
+        // symlinks), matching live watching.
+        if (!entry.isFile()) continue;
+        if (isStaticallyIgnored(entry.name, false)) continue;
+        if (excludes.matchesFile(fullPath)) continue;
+        yield { path: fullPath };
+        sliceStarted = performance.now();
       }
     }
   }
@@ -496,6 +778,25 @@ export function createFilesystemMonitor(deps: {
 
   type CaptureMode = 'live' | 'backfill';
 
+  interface HandleOptions {
+    /** Pre-fetched stat (walks stat asynchronously). */
+    stat?: Stats;
+    /** Ledger row for this path when the caller already holds it (`null` = none). */
+    known?: FolderFileRecord | null;
+    /** A folder import (walk or pending import) owns this call. */
+    importWalk?: boolean;
+  }
+
+  /**
+   * What happened to one file. `captured` carries `done`, which resolves
+   * `true` once every capture listener stored the item (and the ledger was
+   * updated), `false` when a listener failed — the file stays unrecorded,
+   * so the next walk retries it.
+   */
+  type HandleResult =
+    | { outcome: 'missing' | 'ignored' | 'too_large' | 'needs_review' | 'deferred_low_disk' | 'unchanged' }
+    | { outcome: 'captured'; done: Promise<boolean> };
+
   /** Stable provenance consumed by evidence-gist.ts and Today. Never infer
    * backfill from timestamps: only the explicit tree-walk path may set it. */
   function captureProvenance(row: LocalFolder, captureMode: CaptureMode): Record<string, string> {
@@ -507,63 +808,60 @@ export function createFilesystemMonitor(deps: {
   }
 
   /**
-   * Emit-or-skip a single file under `row`. The filter chain is:
+   * Emit-or-hold a single file under `row`. The filter chain is:
    *
    *   1. `stat` the file (catch ENOENT/EACCES so a transient unlink during
    *      processing is silent rather than crashing the watcher).
-   *   2. Skip when `size > MAX_FILE_BYTES` (Requirement 8.2).
-   *   3. Skip when `extname(filePath)` is not in
-   *      `documentParser.getSupportedFormats()` (Requirement 8.3 / 2.3).
-   *   4. Skip when `row.include_globs` is non-empty AND nothing matches
-   *      (Requirement 2.2).
-   *   5. Parse via `documentParser.parse`. On `success: false` warn-log and
-   *      return without emitting (Requirement 2.4).
-   *   6. Compute `sha256(text)`. If the hash matches the last-seen hash for
-   *      this file, short-circuit — this is the §2.5 content dedup that
-   *      prevents `chokidar` `change` events triggered by `mtime`-only
-   *      touches from flooding the classifier.
-   *   7. Emit a `RawWorkItem` with the canonical filesystem shape per the
-   *      design doc (`source: 'filesystem'`, `sourceApp: 'Local Files'`,
-   *      `type: 'document_capture'`, `url: 'file://' + filePath`, full
-   *      `metadata` map).
+   *   2. Skip non-content extensions and include-glob misses (not recorded).
+   *   3. Above the import ceiling (`MAX_FILE_BYTES`): hold as `too_large`.
+   *   4. At or above the big-file threshold without the owner's keep for
+   *      this path: hold as `needs_review` (C8 — live and import alike).
+   *   5. Live only: below the live disk floor, hold as `deferred_low_disk`.
+   *   6. Parse plain-text types inline; `sha256(text)` short-circuits an
+   *      unchanged file (§2.5 dedup). Other types emit raw.
+   *   7. Emit a `RawWorkItem` with the canonical filesystem shape
+   *      (`source: 'filesystem'`, `sourceApp: 'Local Files'`,
+   *      `type: 'document_capture'`, `url: 'file://' + filePath`).
    *
-   * Skipped paths are debug-logged with their reason so users can diagnose
-   * missing ingests via `LOCAL_FOLDERS_DEBUG=1` (Requirement 8.5).
+   * `exclude_globs` are NOT applied here: the live engine drops excluded
+   * raw events before cooking and folder walks prune them before calling.
+   * Listeners run synchronously inside this call; `done` settles when they
+   * finish. Skipped paths are debug-logged with their reason so users can
+   * diagnose missing ingests via `LOCAL_FOLDERS_DEBUG=1` (Requirement 8.5).
    */
-  function handleAddOrChange(row: LocalFolder, filePath: string, captureMode: CaptureMode = 'live'): void {
-    let stat: ReturnType<typeof statSync>;
-    try {
-      stat = statSync(filePath);
-    } catch (err) {
-      if (process.env.LOCAL_FOLDERS_DEBUG) {
-        console.debug(
-          `[filesystem-monitor] stat failed for ${filePath}:`,
-          (err as Error).message,
-        );
+  function handleAddOrChange(
+    row: LocalFolder,
+    filePath: string,
+    captureMode: CaptureMode = 'live',
+    opts: HandleOptions = {},
+  ): HandleResult {
+    let stat: Stats;
+    if (opts.stat) {
+      stat = opts.stat;
+    } else {
+      try {
+        stat = statSync(filePath);
+      } catch (err) {
+        if (process.env.LOCAL_FOLDERS_DEBUG) {
+          console.debug(
+            `[filesystem-monitor] stat failed for ${filePath}:`,
+            (err as Error).message,
+          );
+        }
+        return { outcome: 'missing' };
       }
-      return;
-    }
-
-    // 1. Size cap.
-    if (stat.size > MAX_FILE_BYTES) {
-      if (process.env.LOCAL_FOLDERS_DEBUG) {
-        console.debug(
-          `[filesystem-monitor] skip (size>${MAX_FILE_BYTES}): ${filePath} (${stat.size} bytes)`,
-        );
-      }
-      return;
     }
 
     const ext = path.extname(filePath).toLowerCase();
 
-    // 1b. Skip clearly-non-textual file types (video/audio/archive/binary/
-    //     design assets). A productivity tracker has no text to gain from these,
-    //     and OCR'ing them is wasteful — so we don't ingest them at all.
+    // 1. Skip clearly-non-textual file types (video/audio/archive/binary/
+    //    design assets). A productivity tracker has no text to gain from these,
+    //    and OCR'ing them is wasteful — so we don't ingest them at all.
     if (SKIP_EXTENSIONS.has(ext)) {
       if (process.env.LOCAL_FOLDERS_DEBUG) {
         console.debug(`[filesystem-monitor] skip (non-content type ${ext}): ${filePath}`);
       }
-      return;
+      return { outcome: 'ignored' };
     }
 
     // 2. Per-folder include globs (only enforced when non-empty).
@@ -576,8 +874,65 @@ export function createFilesystemMonitor(deps: {
           `[filesystem-monitor] skip (no include_glob match): ${filePath}`,
         );
       }
-      return;
+      return { outcome: 'ignored' };
     }
+
+    const origin: FolderFileOrigin = captureMode === 'live' ? 'live' : 'import';
+    const known = opts.known !== undefined ? opts.known : ledger.get(row.id, filePath);
+
+    // 3. Import ceiling: listed for the owner as "too large to import yet",
+    //    never read (C8).
+    if (stat.size > MAX_FILE_BYTES) {
+      if (process.env.LOCAL_FOLDERS_DEBUG) {
+        console.debug(
+          `[filesystem-monitor] skip (size>${MAX_FILE_BYTES}): ${filePath} (${stat.size} bytes)`,
+        );
+      }
+      holdFile(row, filePath, stat, 'too_large', origin, known);
+      return { outcome: 'too_large' };
+    }
+
+    // 4. Big-file gate (C8, live and import): no file at or above the
+    //    threshold is read without the owner's choice for its path.
+    if (stat.size >= thresholds.bigFileBytes && !ownerKept(known)) {
+      holdFile(row, filePath, stat, 'needs_review', origin, known);
+      return { outcome: 'needs_review' };
+    }
+
+    // 5. Live disk floor (C7). Import walks check their own, higher floor
+    //    before each file. A deferred change is imported when space returns.
+    if (!opts.importWalk && liveDiskLow()) {
+      holdFile(row, filePath, stat, 'deferred_low_disk', 'live', known);
+      return { outcome: 'deferred_low_disk' };
+    }
+
+    // Imports record every version they hand over (resume skips it). Live
+    // captures record only paths the ledger already tracks or big kept
+    // files, so ordinary live churn adds no ledger writes.
+    // A failed store forgets the in-process dedup entry, so the next event or
+    // walk retries the file instead of treating it as unchanged.
+    const recordImported = Boolean(opts.importWalk || known || stat.size >= thresholds.bigFileBytes);
+    const settle = (done: Promise<boolean>): Promise<boolean> => {
+      const seenValue = seenHashes.get(filePath);
+      return done.then((ok) => {
+        if (!ok) {
+          if (seenHashes.get(filePath) === seenValue) seenHashes.delete(filePath);
+          return false;
+        }
+        if (recordImported) {
+          try {
+            ledger.record({ folderId: row.id, path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, outcome: 'imported', origin });
+          } catch (err) {
+            console.warn(`[filesystem-monitor] import ledger write failed for ${filePath}:`, (err as Error)?.message ?? err);
+            return false;
+          }
+        }
+        return true;
+      });
+    };
+    // Same content already handed over by this process: nothing to record
+    // (the stored item's signature covers later walks).
+    const unchanged = (): HandleResult => ({ outcome: 'unchanged' });
 
     // 3. Parse plain-text types inline (a UTF-8 read — no subprocess). All
     //    heavier supported formats (.pdf/.docx/.pptx/.xlsx) are deliberately
@@ -598,10 +953,10 @@ export function createFilesystemMonitor(deps: {
           if (process.env.LOCAL_FOLDERS_DEBUG) {
             console.debug(`[filesystem-monitor] skip (unchanged contentHash): ${filePath}`);
           }
-          return;
+          return unchanged();
         }
         seenHashes.set(filePath, contentHash);
-        emit({
+        const done = emit({
           type: 'document_capture',
           source: 'filesystem',
           sourceApp: 'Local Files',
@@ -615,7 +970,7 @@ export function createFilesystemMonitor(deps: {
           },
           capturedAt: new Date(),
         });
-        return;
+        return { outcome: 'captured', done: settle(done) };
       }
       console.warn(
         `[filesystem-monitor] parse failed for ${filePath}: ${parsed.error ?? 'unknown error'} — emitting raw for extractor`,
@@ -630,10 +985,10 @@ export function createFilesystemMonitor(deps: {
       if (process.env.LOCAL_FOLDERS_DEBUG) {
         console.debug(`[filesystem-monitor] skip (unchanged size/mtime): ${filePath}`);
       }
-      return;
+      return unchanged();
     }
     seenHashes.set(filePath, signature);
-    emit({
+    const done = emit({
       type: 'document_capture',
       source: 'filesystem',
       sourceApp: 'Local Files',
@@ -647,6 +1002,13 @@ export function createFilesystemMonitor(deps: {
       },
       capturedAt: new Date(),
     });
+    return { outcome: 'captured', done: settle(done) };
+  }
+
+  /** Live cooked add/change: measured for the watchdog, never awaited. */
+  function handleLiveChange(row: LocalFolder, filePath: string): void {
+    const result = watchdog.measure('folder-live', () => handleAddOrChange(row, filePath, 'live'));
+    if (result.outcome === 'captured') void result.done;
   }
 
   /**
@@ -684,7 +1046,7 @@ export function createFilesystemMonitor(deps: {
       },
       capturedAt: new Date(),
     };
-    emit(item);
+    void emit(item);
     seenHashes.delete(filePath);
   }
 
@@ -702,16 +1064,19 @@ export function createFilesystemMonitor(deps: {
    * fuse.
    */
   function attachWatcher(row: LocalFolder): WatchHandle {
+    const currentRow = () => watchedRows.get(row.path) ?? row;
     const handle = watchEngine(row, {
-      onAddOrChange: (filePath) => handleAddOrChange(row, filePath),
+      onAddOrChange: (filePath) => handleLiveChange(currentRow(), filePath),
       onUnlink: (filePath) => {
+        // A vanished file no longer waits for review or import.
+        try { ledger.remove(currentRow().id, filePath); } catch { /* ledger is advisory here */ }
         // Parity with the previous engine's contract: unlink fires only for
         // paths we actually ingested. Without this guard, a transient editor
         // temp file (created and renamed away within the settle window) would
         // emit a spurious archive item for a path that never existed
         // downstream.
         if (!seenHashes.has(filePath)) return;
-        handleUnlink(row, filePath);
+        handleUnlink(currentRow(), filePath);
       },
       onError: (err) => {
         // EMFILE circuit breaker — near-impossible with the O(1)-descriptor
@@ -780,15 +1145,17 @@ export function createFilesystemMonitor(deps: {
       }
       await Promise.all(closes);
       watchersByPath.clear();
+      watchedRows.clear();
       seenHashes.clear();
       currentRows = [];
     },
 
     /**
      * Register a fan-out callback for emitted work items. Multiple callbacks
-     * are supported; ordering is registration order.
+     * are supported; ordering is registration order. A returned promise is
+     * awaited by folder imports (see `emit`).
      */
-    onWorkItem(cb: (item: RawWorkItem) => void): void {
+    onWorkItem(cb: (item: RawWorkItem) => unknown): void {
       listeners.push(cb);
     },
 
@@ -802,7 +1169,10 @@ export function createFilesystemMonitor(deps: {
      *   3. For every path in the next set NOT currently watched: attach a
      *      fresh watch-engine handle and store it.
      *   4. Paths present in BOTH sets keep their existing instance — no
-     *      flicker, no replay.
+     *      flicker, no replay — unless the row's engine configuration
+     *      (`recursive`, `exclude_globs`) changed: the engine holds those,
+     *      so that path is closed and re-attached. Other row changes (id,
+     *      include globs) apply in place through `watchedRows`.
      *
      * `currentRows` is replaced wholesale at the end so `getWatchedFolders`
      * reflects what the caller asked for (including disabled rows, which
@@ -814,27 +1184,39 @@ export function createFilesystemMonitor(deps: {
         if (folder.enabled) nextByPath.set(folder.path, folder);
       }
 
+      const closeWatcher = async (watchedPath: string, watcher: WatchHandle) => {
+        try {
+          await watcher.close();
+        } catch (err) {
+          console.warn(
+            `[filesystem-monitor] close failed for ${watchedPath}:`,
+            err,
+          );
+        }
+        watchersByPath.delete(watchedPath);
+      };
+
       // Close removed paths (await each to avoid leaking fds across rapid
       // reconfigure calls).
       for (const [watchedPath, watcher] of [...watchersByPath]) {
         if (!nextByPath.has(watchedPath)) {
-          try {
-            await watcher.close();
-          } catch (err) {
-            console.warn(
-              `[filesystem-monitor] close failed for ${watchedPath}:`,
-              err,
-            );
-          }
-          watchersByPath.delete(watchedPath);
+          await closeWatcher(watchedPath, watcher);
+          watchedRows.delete(watchedPath);
           dropSeenHashesUnder(watchedPath);
           fdExhausted.delete(watchedPath);
         }
       }
 
-      // Open newly-added paths. Existing paths are deliberately untouched so
-      // the engine's internal state (settle timers, burst window) survives.
+      // Open newly-added paths and re-attach reconfigured ones. Unchanged
+      // paths are deliberately untouched so the engine's internal state
+      // (settle timers, burst window) survives.
       for (const [nextPath, row] of nextByPath) {
+        const existing = watchersByPath.get(nextPath);
+        const previous = watchedRows.get(nextPath);
+        if (existing && previous && engineConfigKey(previous) !== engineConfigKey(row)) {
+          await closeWatcher(nextPath, existing);
+        }
+        watchedRows.set(nextPath, row);
         if (!watchersByPath.has(nextPath)) {
           fdExhausted.delete(nextPath);
           watchersByPath.set(nextPath, attachWatcher(row));
@@ -853,17 +1235,23 @@ export function createFilesystemMonitor(deps: {
     },
 
     /**
-     * Walk a folder and re-emit every existing file as a work item, reusing
-     * `handleAddOrChange` so the size/extension/glob filter chain and
-     * content-hash dedup match live ingestion exactly (Requirement 3.2).
+     * Folder import walk (first import, resume, and manual "Backfill now"):
+     * hand every existing file to capture once, reusing `handleAddOrChange`
+     * so the extension/glob/size chain, the big-file gate, and content-hash
+     * dedup match live ingestion exactly (Requirement 3.2).
      *
-     * The walker is a tiny breadth-first traversal over `fs.promises.readdir`
-     * with `withFileTypes: true` so we get directory/file information without
-     * a per-entry `stat`. Recursion respects `row.recursive`, and the same
-     * `STATIC_IGNORES` applied to chokidar are evaluated at the basename
-     * level on both directories (so e.g. `node_modules` is pruned before we
-     * ever pay the `readdir` cost) and files (so `.DS_Store` and `*.lock`
-     * never reach the parser).
+     * The walk (`walkFolderFiles`) prunes static ignores, excluded subtrees,
+     * and (non-recursive rows) subdirectories. Per file it is idempotent and
+     * cooperative (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md C2/C3/C7):
+     *   - an exact version already in the ledger or already captured (path +
+     *     size + mtime signature of an existing item) is skipped;
+     *   - below the import disk floor the walk stops with `paused`;
+     *   - the file is recorded `imported` only after every capture listener
+     *     finished (awaited), so an interrupted import resumes without
+     *     duplicates and a failed store is retried by the next walk;
+     *   - the event loop gets a turn between files.
+     * One walk per folder: a concurrent request returns `busy`. A complete
+     * walk sets the folder's first-import marker.
      *
      * Progress events follow the design doc:
      *
@@ -890,7 +1278,7 @@ export function createFilesystemMonitor(deps: {
      */
     async backfill(
       folderId: number,
-      opts?: { onProgress?: (p: BackfillProgress) => void; signal?: AbortSignal },
+      opts?: { onProgress?: (p: BackfillProgress) => void; signal?: AbortSignal; expectedTotal?: number },
     ): Promise<BackfillResult> {
       const onProgress = opts?.onProgress;
       const signal = opts?.signal;
@@ -909,79 +1297,268 @@ export function createFilesystemMonitor(deps: {
         return { aborted: false, total: 0 };
       }
 
-      onProgress?.({ phase: 'started', folderId });
+      const walk = acquireWalk(folderId, 'import', opts?.expectedTotal ?? null);
+      if (!walk) {
+        onProgress?.({
+          phase: 'error',
+          folderId,
+          reason: 'busy',
+          error: 'This folder is already being imported. Wait for that import to finish, then try again.',
+        });
+        return { aborted: false, total: 0, busy: true };
+      }
 
-      const queue: string[] = [row.path];
       let processed = 0;
+      const tally = { imported: 0, unchanged: 0, needsReview: 0, tooLarge: 0, failed: 0 };
+      const summary = () => ({ ...tally });
+      try {
+        onProgress?.({ phase: 'started', folderId });
+        const excludes = compileExcludes(row.exclude_globs);
+        const ledgerRows = ledger.forFolder(row.id);
+        const signatures = watchdog.measure('folder-import:index', () => existingCaptureSignatures(db, row.path));
 
-      while (queue.length > 0) {
-        // Outer cancellation check — handles aborts that fire while the
-        // queue is still draining but no entries remain in the inner loop.
-        if (signal?.aborted) {
-          onProgress?.({ phase: 'aborted', folderId, processed });
-          return { aborted: true };
-        }
-
-        const dir = queue.shift() as string;
-
-        let entries;
-        try {
-          entries = await fsPromises.readdir(dir, { withFileTypes: true });
-        } catch (err) {
-          // EACCES on a subtree, ENOENT mid-walk, etc. Emit an error event
-          // for visibility but keep walking — one unreadable directory
-          // shouldn't sink an otherwise-healthy backfill.
-          onProgress?.({
-            phase: 'error',
-            folderId,
-            error: `readdir failed for ${dir}: ${(err as Error).message ?? String(err)}`,
-          });
-          continue;
-        }
-
-        for (const entry of entries) {
-          // Inner cancellation check — keeps abort latency proportional to
-          // entries-per-directory rather than total-files.
+        for await (const entry of walkFolderFiles(row, excludes)) {
+          // Cancellation check per candidate — abort latency is one file.
           if (signal?.aborted) {
             onProgress?.({ phase: 'aborted', folderId, processed });
             return { aborted: true };
           }
-
-          const fullPath = path.join(dir, entry.name);
-
-          if (entry.isDirectory()) {
-            if (isStaticallyIgnored(entry.name, true)) continue;
-            if (row.recursive) queue.push(fullPath);
+          if ('error' in entry) {
+            // EACCES on a subtree, ENOENT mid-walk, etc. Emit an error event
+            // for visibility but keep walking — one unreadable directory
+            // shouldn't sink an otherwise-healthy backfill.
+            onProgress?.({ phase: 'error', folderId, error: entry.error });
             continue;
           }
 
-          // Skip non-regular files (sockets, fifos, char devices, broken
-          // symlinks). chokidar does the same for live events.
-          if (!entry.isFile()) continue;
+          const fullPath = entry.path;
+          processed++;
+          walk.processed = processed;
+          if (processed % 50 === 0) {
+            onProgress?.({ phase: 'progress', folderId, processed, ...summary() });
+          }
 
-          if (isStaticallyIgnored(entry.name, false)) continue;
+          let stat: Stats;
+          try {
+            stat = await fsPromises.stat(fullPath);
+          } catch {
+            continue; // vanished between readdir and stat
+          }
+          if (!stat.isFile()) continue;
+
+          // Idempotency (C2): this exact version was already handed over.
+          const known = ledgerRows.get(fullPath) ?? null;
+          if (known && known.size === stat.size && known.mtimeMs === stat.mtimeMs) {
+            if (known.outcome === 'imported') { tally.unchanged++; continue; }
+            if (known.outcome === 'needs_review') { tally.needsReview++; continue; }
+            if (known.outcome === 'too_large') { tally.tooLarge++; continue; }
+          }
+          if (signatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) {
+            tally.unchanged++;
+            continue;
+          }
+
+          // Disk floor (C7): pause the whole import; the next run resumes.
+          const lowFree = await importDiskLow();
+          if (lowFree != null) {
+            onProgress?.({ phase: 'paused', folderId, processed, reason: 'low_disk', freeBytes: lowFree, ...summary() });
+            return { aborted: false, total: processed, paused: 'low_disk', ...summary() };
+          }
 
           try {
-            handleAddOrChange(row, fullPath, 'backfill');
+            const result = watchdog.measure('folder-import', () => handleAddOrChange(row, fullPath, 'backfill', { stat, known, importWalk: true }));
+            if (result.outcome === 'captured') {
+              if (await result.done) tally.imported++;
+              else tally.failed++;
+            } else if (result.outcome === 'needs_review') tally.needsReview++;
+            else if (result.outcome === 'too_large') tally.tooLarge++;
+            else if (result.outcome === 'unchanged') tally.unchanged++;
           } catch (err) {
+            tally.failed++;
             onProgress?.({
               phase: 'error',
               folderId,
               error: `handler failed for ${fullPath}: ${(err as Error).message ?? String(err)}`,
             });
-            // Fall through — count the file as processed so the progress
-            // counter doesn't stall on a single bad input.
+            // Fall through — the file stays unrecorded and is retried later.
           }
+          await yieldToLoop();
+        }
 
-          processed++;
-          if (processed % 50 === 0) {
-            onProgress?.({ phase: 'progress', folderId, processed });
+        if (signal?.aborted) {
+          onProgress?.({ phase: 'aborted', folderId, processed });
+          return { aborted: true };
+        }
+        // A complete walk is the folder's first import (idempotent re-runs).
+        markFirstImportDone(db, row.id);
+        onProgress?.({ phase: 'done', folderId, total: processed, ...summary() });
+        return { aborted: false, total: processed, ...summary() };
+      } finally {
+        walks.delete(folderId);
+      }
+    },
+
+    isWalking(folderId: number): boolean {
+      return walks.has(folderId);
+    },
+
+    walkState(folderId: number): FolderWalkState | null {
+      const state = walks.get(folderId);
+      return state ? { ...state } : null;
+    },
+
+    /**
+     * Read-only first-import scan (C8): walks the folder with the import's
+     * exact filters, stats candidates (no content is read), and records big
+     * files as `needs_review` and over-ceiling files as `too_large`. After a
+     * complete scan, held rows for paths no longer present are removed, so
+     * the review list only names files that exist.
+     */
+    async scanFolder(folderId: number, opts?: { signal?: AbortSignal }): Promise<FolderScanResult> {
+      const signal = opts?.signal;
+      const row = getLocalFolder(db, folderId);
+      const empty = { walked: 0, files: 0, bytes: 0, importable: 0, unchanged: 0, needsReview: 0, tooLarge: 0 };
+      if (!row) return { aborted: false, ...empty };
+      const walk = acquireWalk(folderId, 'scan');
+      if (!walk) return { aborted: false, busy: true, ...empty };
+      try {
+        const excludes = compileExcludes(row.exclude_globs);
+        const ledgerRows = ledger.forFolder(row.id);
+        const signatures = watchdog.measure('folder-scan:index', () => existingCaptureSignatures(db, row.path));
+        const result = { ...empty };
+        // Ledger paths still present as candidates (bounded by ledger size).
+        const seenKnown = new Set<string>();
+        let sinceYield = 0;
+
+        for await (const entry of walkFolderFiles(row, excludes)) {
+          if (signal?.aborted) return { aborted: true };
+          if ('error' in entry) continue;
+          const fullPath = entry.path;
+          result.walked++;
+          walk.processed = result.walked;
+          const ext = path.extname(fullPath).toLowerCase();
+          if (SKIP_EXTENSIONS.has(ext)) continue;
+          if (row.include_globs.length > 0 && !matchesAnyGlob(fullPath, row.include_globs)) continue;
+          let stat: Stats;
+          try {
+            stat = await fsPromises.stat(fullPath);
+          } catch {
+            continue;
+          }
+          if (!stat.isFile()) continue;
+          result.files++;
+          result.bytes += stat.size;
+          const known = ledgerRows.get(fullPath) ?? null;
+          if (known) seenKnown.add(fullPath);
+          const sameVersion = Boolean(known && known.size === stat.size && known.mtimeMs === stat.mtimeMs);
+          if ((sameVersion && known?.outcome === 'imported')
+            || signatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) {
+            result.unchanged++;
+          } else if (stat.size > MAX_FILE_BYTES) {
+            holdFile(row, fullPath, stat, 'too_large', 'import', known);
+            result.tooLarge++;
+          } else if (stat.size >= thresholds.bigFileBytes && !ownerKept(known)) {
+            holdFile(row, fullPath, stat, 'needs_review', 'import', known);
+            result.needsReview++;
+          } else {
+            result.importable++;
+          }
+          if (++sinceYield >= 64) {
+            sinceYield = 0;
+            await yieldToLoop();
           }
         }
-      }
+        if (signal?.aborted) return { aborted: true };
 
-      onProgress?.({ phase: 'done', folderId, total: processed });
-      return { aborted: false, total: processed };
+        // Complete scans only: forget rows for files that are gone, so the
+        // review list names only files that exist. Excluded subtrees are
+        // pruned from the walk, so excluded rows are checked directly.
+        for (const [knownPath, record] of ledgerRows) {
+          if (seenKnown.has(knownPath)) continue;
+          if (record.outcome === 'excluded') {
+            try { await fsPromises.stat(knownPath); } catch { ledger.remove(row.id, knownPath); }
+            continue;
+          }
+          ledger.remove(row.id, knownPath);
+        }
+        return { aborted: false, ...result };
+      } finally {
+        walks.delete(folderId);
+      }
+    },
+
+    /**
+     * Import held rows the owner kept (`approved`) or live changes deferred
+     * for low disk. Each file is re-checked against the folder's current
+     * exclusions, existence, the gate, and the import disk floor.
+     */
+    async importFiles(folderId: number, records: FolderFileRecord[], opts?: { signal?: AbortSignal }): Promise<ImportFilesResult> {
+      const signal = opts?.signal;
+      const row = getLocalFolder(db, folderId);
+      if (!row) return { aborted: false, imported: 0, held: 0, failed: 0 };
+      const walk = acquireWalk(folderId, 'import', records.length);
+      if (!walk) return { aborted: false, busy: true, imported: 0, held: 0, failed: 0 };
+      const tally = { imported: 0, held: 0, failed: 0 };
+      try {
+        const excludes = compileExcludes(row.exclude_globs);
+        for (const record of records) {
+          if (signal?.aborted) return { aborted: true };
+          walk.processed++;
+          const current = ledger.get(row.id, record.path);
+          if (!current || (current.outcome !== 'approved' && current.outcome !== 'deferred_low_disk')) continue;
+          if (excludes.matchesFile(record.path)) {
+            ledger.setOutcome(row.id, record.path, 'excluded');
+            continue;
+          }
+          let stat: Stats;
+          try {
+            stat = await fsPromises.stat(record.path);
+          } catch {
+            ledger.remove(row.id, record.path);
+            continue;
+          }
+          if (!stat.isFile()) {
+            ledger.remove(row.id, record.path);
+            continue;
+          }
+          const lowFree = await importDiskLow();
+          if (lowFree != null) return { aborted: false, ...tally, paused: 'low_disk' };
+          const captureMode: CaptureMode = current.origin === 'live' ? 'live' : 'backfill';
+          try {
+            const result = watchdog.measure('folder-import', () => handleAddOrChange(row, record.path, captureMode, { stat, known: current, importWalk: true }));
+            if (result.outcome === 'captured') {
+              if (await result.done) tally.imported++;
+              else tally.failed++;
+            } else if (result.outcome === 'unchanged') {
+              // Already captured by this process: the pending row is satisfied.
+              ledger.record({ folderId: row.id, path: record.path, size: stat.size, mtimeMs: stat.mtimeMs, outcome: 'imported' });
+            } else if (result.outcome === 'needs_review' || result.outcome === 'too_large') {
+              tally.held++;
+            } else if (result.outcome === 'ignored' || result.outcome === 'missing') {
+              // No longer a capture candidate (type or include globs changed):
+              // drop the pending row so it is not retried on every pass.
+              ledger.remove(row.id, record.path);
+            }
+          } catch (err) {
+            tally.failed++;
+            console.warn(`[filesystem-monitor] pending import failed for ${record.path}:`, (err as Error)?.message ?? err);
+          }
+          await yieldToLoop();
+        }
+        return { aborted: false, ...tally };
+      } finally {
+        walks.delete(folderId);
+      }
     },
   };
+}
+
+/** Engine-held row configuration; a change requires re-attaching the watcher. */
+function engineConfigKey(row: LocalFolder): string {
+  return JSON.stringify([Boolean(row.recursive), row.exclude_globs]);
+}
+
+function formatGiB(bytes: number | null): string {
+  if (bytes == null) return 'unknown';
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }

@@ -47,6 +47,8 @@ import type { VisualAssetRegistry } from '../../core/visual-assets.js';
 import type { VisualInspector } from '../../core/visual-inspector.js';
 import type { ProjectArtifactService } from '../../core/project-artifacts.js';
 import type { ShutdownRuntimeContext } from '../../core/shutdown-coordinator.js';
+import type { FolderImportScheduler } from '../../monitors/folder-import-scheduler.js';
+import type { StorageUsageService } from '../../core/storage-usage.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -103,6 +105,10 @@ export interface RouterDeps {
   projectArtifacts?: ProjectArtifactService;
   /** Process-local admission/abort/work registry for bounded shutdown. */
   shutdown?: ShutdownRuntimeContext;
+  /** Post-ready local-folder imports: status, big-file review, decisions. */
+  folderImports?: FolderImportScheduler;
+  /** Local folders storage card (du-measured, cached). */
+  storageUsage?: StorageUsageService;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

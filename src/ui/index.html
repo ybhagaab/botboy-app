@@ -102,8 +102,9 @@
 
     <section class="integration-panel" id="local-folders" aria-labelledby="local-folders-heading">
       <div class="panel-toolbar"><button class="button" type="button" data-action="close-integration">Back</button><div id="local-folders-status" class="banner success" role="status" hidden></div><div id="local-folders-error" class="banner error" role="alert" hidden></div><span class="toolbar-spacer"></span><button id="local-folders-add-btn" class="button primary" type="button">Add folder</button></div>
-      <header class="panel-heading"><p class="eyebrow">Connection settings</p><h1 id="local-folders-heading">Local folders</h1><p>Watch selected directories and preserve files as source evidence alongside Slack and browser captures.</p></header>
+      <header class="panel-heading"><p class="eyebrow">Connection settings</p><h1 id="local-folders-heading">Local folders</h1><p>Watch selected directories and preserve files as source evidence alongside Slack and browser captures. Existing files import in the background after BotBoy is ready; files of 25 MB or more wait for your choice.</p></header>
       <div id="local-folders-add-form" class="folder-form" hidden><input id="lf-path-input" type="text" placeholder="~/Documents/notes"><label><input id="lf-recursive-input" type="checkbox" checked> Include subfolders</label><button id="lf-submit-add" class="button primary" type="button">Add</button><button id="lf-cancel-add" class="button" type="button">Cancel</button></div>
+      <section id="local-folders-storage" class="lf-storage" aria-label="Storage"></section>
       <div id="local-folders-list" class="settings-list"></div>
     </section>
 

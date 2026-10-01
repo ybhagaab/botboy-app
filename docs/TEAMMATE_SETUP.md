@@ -164,6 +164,15 @@ guided setup.
 - **Slack** — choose and configure the channels you want BotBoy to capture.
 - **SharePoint** — install and authenticate from its connection card when you
   want document synchronization.
+- **Local folders** — BotBoy watches Downloads, Desktop, and Documents by
+  default, and you can add more. Existing files import in the background after
+  BotBoy is ready, so a big folder never delays startup. Files of 25 MB or more
+  wait for you: the folder shows **Needs your decision** with a list where you
+  tick the files to import and exclude the rest, one by one or by subfolder.
+  Files over 200 MB are listed as too large to import yet. The **Storage** card
+  on the same page shows where BotBoy's disk space goes. Imports pause below
+  10 GB free; below 2 GB, new changes wait until space returns. Watching
+  continues either way.
 
 #### Datanet ETL
 

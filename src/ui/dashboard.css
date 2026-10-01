@@ -1879,3 +1879,49 @@ a.data-room-row:hover { background:var(--hover); }
 .chat-ai-model-notice span { min-width:0; flex:1; }
 .chat-ai-model-notice strong { display:block; color:var(--text); font-size:12px; }
 .chat-ai-model-notice .button { flex:0 0 auto; }
+
+/* Local folders: import states, big-file review, storage card
+   (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md P1/P3). */
+.lf-folder { display:grid; gap:6px; }
+.lf-state { margin-top:5px; color:var(--muted); font-size:11px; line-height:1.5; }
+.lf-state:empty { display:none; }
+.lf-state .text-link { font-size:11px; }
+.lf-tone-good { color:var(--green); }
+.lf-tone-warn { color:var(--yellow); }
+.lf-tone-bad { color:var(--red); }
+.lf-tone-info { color:var(--soft); }
+.lf-review { padding:14px 15px; border:1px solid color-mix(in srgb,var(--yellow) 30%,var(--border)); border-radius:11px; background:var(--surface); }
+.lf-review h3 { margin:0 0 4px; color:var(--text); font-size:13px; }
+.lf-review p { margin:0 0 10px; color:var(--muted); font-size:11px; line-height:1.5; }
+.lf-review-toolbar,.lf-review-footer { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.lf-review-list { max-height:420px; overflow:auto; margin:10px 0; border:1px solid var(--border); border-radius:9px; }
+.lf-review-group + .lf-review-group { border-top:1px solid var(--border); }
+.lf-review-group-head { position:sticky; top:0; z-index:1; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 10px; color:var(--soft); background:var(--surface-2); font-size:11px; font-weight:600; }
+.lf-review-group-head span { color:var(--muted); font-weight:500; }
+.lf-review-group-head .text-link { margin-left:auto; font-size:11px; }
+.lf-review-file { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:4px 8px; padding:6px 10px; color:var(--soft); font-size:11px; }
+.lf-review-file .lf-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+.lf-review-file .lf-size { color:var(--muted); white-space:nowrap; }
+.lf-review-file .lf-note { grid-column:2 / -1; color:var(--yellow); font-size:10px; }
+.lf-review-file.is-excluded .lf-name { color:var(--muted); text-decoration:line-through; }
+.lf-review-excluded,.lf-review-toolarge { margin:8px 0; color:var(--muted); font-size:11px; }
+.lf-review-excluded strong { color:var(--soft); font-weight:600; }
+.lf-review-excluded ul,.lf-review-toolarge ul { max-height:180px; overflow:auto; margin:6px 0 0; padding-left:18px; }
+.lf-review-toolarge .text-link,.lf-review-excluded .text-link { font-size:11px; }
+.lf-review-summary { color:var(--muted); font-size:11px; }
+.lf-review-error { flex-basis:100%; color:var(--red); font-size:11px; }
+.lf-storage { margin:0 0 14px; padding:14px 15px; border:1px solid var(--border); border-radius:11px; background:var(--surface); }
+.lf-storage:empty { display:none; }
+.lf-storage-head { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.lf-storage-head strong { color:var(--text); font-size:13px; }
+.lf-storage-head span { color:var(--muted); font-size:11px; }
+.lf-storage-list { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:6px 18px; margin:10px 0 0; padding:0; list-style:none; font-size:11px; }
+.lf-storage-list li { display:flex; justify-content:space-between; gap:8px; color:var(--soft); }
+.lf-storage-list li span:last-child { color:var(--muted); font-variant-numeric:tabular-nums; }
+.lf-storage-warning { margin-top:10px; padding:8px 11px; border:1px solid; border-radius:8px; font-size:11px; line-height:1.45; }
+.lf-storage-warning.import { color:var(--yellow); border-color:color-mix(in srgb,var(--yellow) 35%,transparent); background:var(--yellow-soft); }
+.lf-storage-warning.live { color:var(--red); border-color:color-mix(in srgb,var(--red) 35%,transparent); background:var(--red-soft); }
+.lf-storage-help { margin-top:10px; color:var(--muted); font-size:11px; }
+.lf-storage-help summary { cursor:pointer; color:var(--soft); }
+.lf-storage-actions { margin:6px 0 0; padding-left:18px; line-height:1.5; }
+.lf-storage-meta { margin:8px 0 0; color:var(--faint); font-size:10px; }
