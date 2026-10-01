@@ -92,15 +92,24 @@ function storedChatModelChoice() {
 function chatModelChoice() {
   const stored = storedChatModelChoice();
   if (stored === 'default') return chatDefaultModelKey;
-  return chatModelChoices.includes(stored) ? stored : chatDefaultModelKey;
+  if (chatModelChoices.includes(stored)) return stored;
+  // Older pickers stored unqualified gateway keys ("sol"); keep that choice.
+  const legacy = `team.${stored}`;
+  return chatModelChoices.includes(legacy) ? legacy : chatDefaultModelKey;
 }
 
 function parseChatModelCatalog(value) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.models)) return null;
+  const groups = Array.isArray(value.groups)
+    ? value.groups.filter(group => group && typeof group.id === 'string' && /^[a-z]{1,32}$/.test(group.id)
+      && typeof group.label === 'string' && group.label.trim())
+      .map(group => ({ id: group.id, label: group.label.trim().slice(0, 60) }))
+    : [];
+  const groupIds = new Set(groups.map(group => group.id));
   const seen = new Set();
   const models = value.models.filter(model => {
     if (!model || typeof model !== 'object'
-      || typeof model.key !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(model.key)
+      || typeof model.key !== 'string' || !/^[A-Za-z0-9._:-]{1,200}$/.test(model.key)
       || typeof model.label !== 'string' || !model.label.trim()
       || seen.has(model.key)) return false;
     seen.add(model.key);
@@ -110,12 +119,30 @@ function parseChatModelCatalog(value) {
     label: model.label.trim().slice(0, 80),
     isDefault: model.isDefault === true,
     preview: model.preview === true,
+    group: typeof model.group === 'string' && groupIds.has(model.group) ? model.group : '',
   }));
   if (!models.length) return null;
   const defaultKey = typeof value.defaultKey === 'string' && seen.has(value.defaultKey)
     ? value.defaultKey
     : models.find(model => model.isDefault)?.key ?? models[0].key;
-  return { defaultKey, models };
+  return { defaultKey, models, groups: groups.filter(group => models.some(model => model.group === group.id)) };
+}
+
+function chatModelOption(model) {
+  const option = document.createElement('option');
+  option.value = model.key;
+  option.textContent = `Model · ${model.label}${model.isDefault ? ' (default)' : ''}${model.preview ? ' · Preview' : ''}`;
+  return option;
+}
+
+// Group headings name the provider; the closed select shows only the model,
+// so its tooltip names the provider of the current choice.
+let chatModelGroupLabels = new Map();
+let chatModelGroupOf = new Map();
+function updateChatModelTitle(select) {
+  const base = 'Which model answers this chat. Background work uses the models chosen in Settings → AI model.';
+  const group = chatModelGroupLabels.size > 1 ? chatModelGroupLabels.get(chatModelGroupOf.get(select.value) || '') : '';
+  select.title = group ? `${base} Current: ${group}.` : base;
 }
 
 // The active provider can change at runtime (Settings → AI model), so the
@@ -133,17 +160,26 @@ async function refreshChatModelCatalog() {
     if (!catalog) throw new Error('model catalog response was invalid');
     chatModelChoices = catalog.models.map(model => model.key);
     chatDefaultModelKey = catalog.defaultKey;
-    select.replaceChildren(...catalog.models.map(model => {
-      const option = document.createElement('option');
-      option.value = model.key;
-      option.textContent = `Model · ${model.label}${model.isDefault ? ' (default)' : ''}${model.preview ? ' · Preview' : ''}`;
-      return option;
-    }));
+    chatModelGroupLabels = new Map(catalog.groups.map(group => [group.id, group.label]));
+    chatModelGroupOf = new Map(catalog.models.map(model => [model.key, model.group]));
+    if (catalog.groups.length > 1) {
+      // Several providers: one tree, provider headings over plain model titles.
+      select.replaceChildren(...catalog.groups.map(group => {
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = group.label;
+        optgroup.append(...catalog.models.filter(model => model.group === group.id).map(chatModelOption));
+        return optgroup;
+      }), ...catalog.models.filter(model => !model.group).map(chatModelOption));
+    } else {
+      select.replaceChildren(...catalog.models.map(chatModelOption));
+    }
   } catch (error) {
     if (requestId !== chatModelCatalogRequest) return;
     console.warn('[chat-model] Could not load model catalog; retaining GPT-5.6 compatibility choices', error);
     chatModelChoices = ['default', 'luna', 'sol'];
     chatDefaultModelKey = 'default';
+    chatModelGroupLabels = new Map();
+    chatModelGroupOf = new Map();
     select.replaceChildren(
       new Option('Model · GPT-5.6 Terra (default)', 'default'),
       new Option('Model · GPT-5.6 Luna', 'luna'),
@@ -151,6 +187,7 @@ async function refreshChatModelCatalog() {
     );
   }
   select.value = chatModelChoice();
+  updateChatModelTitle(select);
   select.disabled = lastAiModelState === 'not_configured';
 }
 
@@ -160,6 +197,7 @@ function initChatModelControl() {
   select.addEventListener('change', () => {
     const value = chatModelChoices.includes(select.value) ? select.value : chatDefaultModelKey;
     try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
+    updateChatModelTitle(select);
   });
   void refreshChatModelCatalog();
 }

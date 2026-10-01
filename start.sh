@@ -728,8 +728,9 @@ stop_startup_child() {
 # owner debug "BotBoy has no LLM" from a screenshot. Owner machines with any
 # credential source stay silent.
 warn_if_no_llm_credentials() {
-  # An OpenAI key saved in Settings → AI model powers BotBoy on its own.
-  [ -s "$AI_MODEL_SETTINGS_FILE" ] && return 0
+  # An OpenAI or DeepSeek key saved in Settings → AI model powers BotBoy on its
+  # own. grep -q only tests for a key field; nothing is read into the shell.
+  [ -s "$AI_MODEL_SETTINGS_FILE" ] && grep -q '"apiKey"' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null && return 0
   [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ] && return 0
   [ -n "${BOTBOY_INFERENCE_API_KEY:-}" ] && return 0
   if [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] \
@@ -737,7 +738,7 @@ warn_if_no_llm_credentials() {
     return 0
   fi
   echo "⚠️  No AI model set up yet — chat and background organizing stay off until you add one."
-  echo "    In BotBoy, open Settings → AI model and paste your OpenAI API key (it takes effect right away)."
+  echo "    In BotBoy, open Settings → AI model and paste an OpenAI or DeepSeek API key (it takes effect right away)."
   echo "    Or, if the owner sent you a botboy-credentials file, put it in ~/Downloads and re-run ./start.sh."
 }
 
@@ -1197,33 +1198,46 @@ if [ "$DOCTOR" = "1" ]; then
   fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
   echo "llm-provider (launcher): ${BOTBOY_INFERENCE_PROVIDER:-unset}"
-  # Settings → AI model. Node reads the key in its own memory and prints only
-  # its last four characters plus the HTTP status of a free model-retrieve
-  # probe; the key never enters this shell, argv, or the output.
+  # Settings → AI model. Node reads the keys in its own memory and prints only
+  # their last four characters plus the HTTP status of each provider's free
+  # model-list probe; no key enters this shell, argv, or the output.
   if [ -f "$AI_MODEL_SETTINGS_FILE" ]; then
     "$NODE" -e '
       const fs = require("fs");
       const file = process.argv[1];
       const mode = (fs.statSync(file).mode & 0o777).toString(8);
-      let key = "";
-      try {
-        const value = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (value && value.provider === "openai" && typeof value.apiKey === "string") key = value.apiKey;
-      } catch {}
-      if (!key) {
+      let value;
+      try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+      const pattern = /^sk-[A-Za-z0-9_-]{16,400}$/;
+      const keys = {};
+      if (value && value.schemaVersion === 1 && value.provider === "openai") keys.openai = value.apiKey;
+      if (value && value.schemaVersion === 2 && value.keys) {
+        keys.openai = value.keys.openai && value.keys.openai.apiKey;
+        keys.deepseek = value.keys.deepseek && value.keys.deepseek.apiKey;
+      }
+      const probes = [
+        ["openai", "OpenAI", "https://api.openai.com/v1/models", "api.openai.com"],
+        ["deepseek", "DeepSeek", "https://api.deepseek.com/models", "api.deepseek.com"],
+      ].filter(([id]) => typeof keys[id] === "string" && pattern.test(keys[id]));
+      if (!value || (!probes.length && !(value.roles && Object.keys(value.roles).length))) {
         console.log(`ai-model: Settings file is unreadable (mode ${mode}) — save the key again in Settings → AI model`);
         process.exit(0);
       }
-      console.log(`ai-model: OpenAI key …${key.slice(-4)} saved in Settings (mode ${mode}); it takes precedence over launcher credentials`);
-      fetch("https://api.openai.com/v1/models/gpt-5.6-terra", {
-        headers: { Authorization: `Bearer ${key}` },
+      for (const [id, label] of probes) console.log(`ai-model: ${label} key …${keys[id].slice(-4)} saved in Settings (mode ${mode})`);
+      if (!probes.length) console.log(`ai-model: no API key saved; background model choices only (mode ${mode})`);
+      const roles = value.roles || {};
+      const choice = role => (roles[role] && roles[role].modelKey) || "automatic";
+      console.log(`ai-model: organizing model ${choice("processing")}; document writing ${choice("documents")}`);
+      Promise.all(probes.map(([id, label, url, host]) => fetch(url, {
+        headers: { Authorization: `Bearer ${keys[id]}` },
         signal: AbortSignal.timeout(10000),
       })
-        .then(response => console.log(`openai probe: HTTP ${response.status} (200=key works, 401=key rejected, 404=no GPT-5.6 Terra access)`))
-        .catch(() => console.log("openai probe: HTTP 000 (network, proxy, or VPN blocks api.openai.com)"));
+        .then(response => `${id} probe: HTTP ${response.status} (200=key works, 401=key rejected)`)
+        .catch(() => `${id} probe: HTTP 000 (network, proxy, or VPN blocks ${host})`)))
+        .then(lines => lines.forEach(line => console.log(line)));
     ' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
   else
-    echo "ai-model: no OpenAI key saved (add one in Settings → AI model)"
+    echo "ai-model: no API key saved (add an OpenAI or DeepSeek key in Settings → AI model)"
   fi
   # Diagnose the same effective pair normal startup will use. A partial shell
   # override is reported directly and never completed from the stored file.
@@ -1250,8 +1264,8 @@ if [ "$DOCTOR" = "1" ]; then
     echo "llm auth probe: HTTP ${CODE:-000} (200=valid, 400=invalid/revoked — ask owner, 000=network)"
   elif [ -n "$DOCTOR_CID" ] || [ -n "$DOCTOR_SEC" ]; then
     echo "llm-credentials: INCOMPLETE — client id and secret must both be present"
-  elif [ -s "$AI_MODEL_SETTINGS_FILE" ]; then
-    echo "llm-credentials: none in ~/.personal-productivity-tracker/.env (not needed: the Settings → AI model key is used)"
+  elif [ -s "$AI_MODEL_SETTINGS_FILE" ] && grep -q '"apiKey"' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null; then
+    echo "llm-credentials: none in ~/.personal-productivity-tracker/.env (not needed: a Settings → AI model key is used)"
   else
     echo "llm-credentials: missing (~/.personal-productivity-tracker/.env)"
   fi

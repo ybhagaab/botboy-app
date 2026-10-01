@@ -7,8 +7,8 @@ You need:
 - a Mac with **Google Chrome**
 - **Node.js 20 or newer** (`node --version`)
 - **Git**
-- an AI model: either the private BotBoy credential attachment sent to you by
-  the owner, or your own OpenAI API key
+- an AI model: the private BotBoy credential attachment sent to you by the
+  owner, your own OpenAI API key, your own DeepSeek API key, or any mix of them
 
 You do **not** need an AWS account or `aws login`.
 
@@ -16,8 +16,8 @@ You do **not** need an AWS account or `aws login`.
 
 1. If the owner sent you a credential attachment, download it from your 1:1
    Slack DM and leave it in **Downloads** or on your **Desktop**. BotBoy
-   accepts the owner-issued `.env` file or ZIP automatically. Using your own
-   OpenAI API key instead? Skip this step.
+   accepts the owner-issued `.env` file or ZIP automatically. Using only your
+   own OpenAI or DeepSeek API key? Skip this step.
 2. Open Terminal and run:
 
 ```bash
@@ -27,11 +27,12 @@ npm install
 ./start.sh
 ```
 
-3. Using your own OpenAI API key: when the dashboard opens, go to
+3. Using your own API key: when the dashboard opens, go to
    **Settings → AI model**, paste a key from
-   [platform.openai.com/api-keys](https://platform.openai.com/api-keys), and
-   choose **Save and turn on**. BotBoy checks the key with OpenAI, then starts
-   chat and background organizing right away. No restart is needed.
+   [platform.openai.com/api-keys](https://platform.openai.com/api-keys) or
+   [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
+   into its card, and choose **Save and turn on**. BotBoy checks the key with
+   the provider, then offers its models right away. No restart is needed.
 
 Allow a few minutes on the first run. BotBoy imports any credential
 attachment, builds itself, opens the dashboard, and attempts to install
@@ -75,10 +76,11 @@ optional connections, troubleshooting, and unusual recovery cases.
    from Downloads/Desktop into
    `~/.personal-productivity-tracker/.env` with permissions limited to you;
 2. deletes the downloaded credential attachment after a successful import;
-3. selects the authenticated team gateway and GPT-5.6 Terra default, or your
-   own OpenAI key when one is saved in **Settings → AI model**;
-4. loads the server-approved chat model catalog with GPT-5.6 Terra, Luna,
-   and Sol plus GPT-6 Astra, Sol, and Luna;
+3. connects the authenticated team gateway (GPT-5.6 Terra by default) plus
+   any OpenAI or DeepSeek key saved in **Settings → AI model**;
+4. loads the server-approved chat model catalog: GPT-5.6 Terra, Luna, and Sol
+   plus GPT-6 Astra, Sol, and Luna on the team gateway, and each saved key's
+   own models;
 5. builds BotBoy when the build is missing or stale;
 6. starts a provisional local boot page while connections and stores initialize;
 7. opens `http://localhost:7778` only after the final dashboard endpoint is
@@ -91,28 +93,40 @@ Approved GPT-6 additions use the same Cognito token URL, OAuth scope, and
 allowlisted client identity across the approved team gateways, so existing
 teammates do not need a replacement credential attachment.
 
-### Your own OpenAI API key
+### Your own OpenAI or DeepSeek API key
 
-**Settings → AI model** runs BotBoy on your own OpenAI account instead of the
-team gateway:
+**Settings → AI model** connects your own OpenAI and DeepSeek accounts next to
+the team gateway. Any mix works at the same time:
 
-- BotBoy verifies the key with OpenAI before switching, so a mistyped or
-  revoked key changes nothing.
-- The key is stored only on your Mac, in
+- BotBoy verifies each key with its provider (model list plus one tiny
+  request) before using it, so a mistyped or revoked key changes nothing.
+- Keys are stored only on your Mac, in
   `~/.personal-productivity-tracker/ai-model.json` with permissions limited to
-  you. BotBoy never shows it again (Settings shows its last four characters),
-  and commands BotBoy's model runs cannot read it.
-- Chat offers the GPT-5.6 and GPT-6 models your key can use. Background
-  organizing (routing, project briefs, digests) uses GPT-5.6 Terra.
-- A saved key takes precedence over a credential attachment. **Remove key**
-  switches BotBoy back to the attachment's team gateway, or turns the AI model
-  off when there is none.
-- While a key is saved, what BotBoy's model reads (captured messages,
-  documents, your chats, and query results) is sent to OpenAI under your
-  account. Data Room table values are not: they stay on your Mac, so chat
-  cannot analyze Data Room datasets while a key is saved.
-- New OpenAI accounts have low rate limits. BotBoy waits and retries when
-  OpenAI asks it to; limits rise as the account is used.
+  you. BotBoy never shows them again (Settings shows their last four
+  characters), and commands BotBoy's model runs cannot read them.
+- Each key's card lists the models it offers. An OpenAI key offers every chat
+  model the key can use; a DeepSeek key offers every model DeepSeek lists for
+  it. The team gateway keeps its fixed list.
+- The chat panel's model menu shows every connected provider's models under
+  provider headings. You pick the model per message.
+- **Background work** in Settings has two choices, each with its own
+  Thinking level: **Organizing** (routing, project briefs, digests, planning,
+  and reading images) and **Document writing** (product documents and email
+  drafts, plus the review of documents written in chat). **Automatic** uses
+  the team gateway's default when it is set up, otherwise your OpenAI key,
+  otherwise your DeepSeek key.
+- Pick an image-capable organizing model (for example DeepSeek Flash or
+  GPT-5.6 Terra) if you want BotBoy to read screenshots and image
+  attachments. A text-only model says so instead of guessing.
+- **Remove key** stops chats on that provider's models; background work moves
+  to another connected model.
+- When one of your key's models does the work, what it reads (captured
+  messages, documents, your chats, and query results) is sent to that
+  provider under your account. Data Room table values are not: they stay on
+  your Mac, so chat on an OpenAI or DeepSeek model cannot analyze Data Room
+  datasets.
+- New provider accounts have low rate limits. BotBoy waits and retries when
+  the provider asks it to; limits rise as the account is used.
 
 ### Updating and customizations
 
@@ -232,10 +246,11 @@ credential attachment before producing the report.
 | Symptom | What to do |
 |---|---|
 | `node not found` | Install Node.js 20+ and rerun `./start.sh`. |
-| Chat says it needs an AI model first | Open **Settings → AI model** and add your OpenAI API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
-| Settings → AI model says OpenAI rejected the key | Copy a current key from platform.openai.com/api-keys and save it again. |
-| Settings → AI model says the account has no credit | Add credit in OpenAI Billing. BotBoy resumes on its own once calls succeed. |
-| Settings → AI model cannot reach api.openai.com | Check your internet connection and any proxy or VPN rules for `api.openai.com`, then save again. `./start.sh --doctor` prints an `openai probe` status. |
+| Chat says it needs an AI model first | Open **Settings → AI model** and add an OpenAI or DeepSeek API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
+| Settings → AI model says OpenAI or DeepSeek rejected the key | Copy a current key from platform.openai.com/api-keys or platform.deepseek.com/api_keys and save it again. |
+| Settings → AI model says the account has no credit | Add credit in OpenAI Billing or top up the DeepSeek account. BotBoy resumes on its own once calls succeed. |
+| Settings → AI model cannot reach api.openai.com or api.deepseek.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` status. |
+| Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
@@ -307,9 +322,10 @@ evidence and credentials.
 BotBoy is local-first. Its evidence database, document copies, generated files,
 and credentials stay under `~/.personal-productivity-tracker/` on your Mac by
 default. Content needed for an LLM request—including selected text and bounded
-visual inputs when you ask BotBoy to inspect an image—is sent through the
-authenticated team gateway, or to OpenAI under your own account while an
-OpenAI key is saved in **Settings → AI model**. Connections communicate with
+visual inputs when you ask BotBoy to inspect an image—goes to the model doing
+that work: through the authenticated team gateway, or to OpenAI or DeepSeek
+under your own account when one of your saved keys' models is chosen in chat or
+in **Settings → AI model**. Connections communicate with
 the services you enable. Any document publication, message draft, or production pipeline change
 requires your explicit request and follows its own review/approval boundary.
 

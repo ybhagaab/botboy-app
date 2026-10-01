@@ -1875,6 +1875,20 @@ a.data-room-row:hover { background:var(--hover); }
 .ai-model-settings .settings-panel .mcp-alert { margin:0 0 12px; }
 .ai-model-status-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:0 0 8px; }
 .ai-model-key-form .mcp-form-body p.card-meta { margin:4px 0 0; line-height:1.5; }
+.ai-model-role-row { align-items:flex-start; }
+.ai-model-role-row .setting-copy { min-width:0; flex:1; }
+.ai-model-role-caption { margin-top:4px; color:var(--soft) !important; }
+.ai-model-role-controls { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; max-width:340px; }
+.ai-model-role-controls select { min-height:34px; max-width:220px; padding:6px 9px; border:1px solid var(--border-strong); border-radius:9px; color:var(--text); background:var(--surface-2); font-size:11px; }
+.ai-model-role-controls select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); outline:0; }
+.ai-model-models { margin:14px 0 2px; color:var(--muted); font-size:11px; }
+.ai-model-models summary { cursor:pointer; color:var(--soft); font-weight:620; }
+.ai-model-models ul { display:grid; gap:4px; max-height:260px; margin:8px 0 0; padding:0; overflow:auto; list-style:none; }
+.ai-model-models li { display:flex; justify-content:space-between; gap:12px; padding:5px 8px; border:1px solid var(--border); border-radius:8px; background:var(--surface-2); }
+.ai-model-models li span { min-width:0; overflow-wrap:anywhere; color:var(--soft); }
+.ai-model-models li small { flex:0 0 auto; color:var(--faint); font-size:10px; }
+.ai-model-key-remove { display:flex; justify-content:flex-end; margin-top:8px; }
+@media(max-width:700px){.ai-model-role-row{flex-direction:column;align-items:stretch}.ai-model-role-controls{justify-content:flex-start;max-width:none}.ai-model-role-controls select{max-width:none}}
 .chat-ai-model-notice:not([hidden]) { display:flex; align-items:center; gap:10px; margin:10px 15px 0; padding:10px 12px; border:1px solid rgba(157,140,255,.35); border-radius:11px; color:var(--soft); background:var(--accent-soft); font-size:11px; line-height:1.45; }
 .chat-ai-model-notice span { min-width:0; flex:1; }
 .chat-ai-model-notice strong { display:block; color:var(--text); font-size:12px; }

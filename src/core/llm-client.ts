@@ -7,6 +7,7 @@
 import type { AcpResponse, AcpChatMessage } from './types.js';
 import { signBedrockRequest } from './aws-sigv4.js';
 import { logLlmPrompt } from './llm-prompt-log.js';
+import type { LlmModelOperation } from './llm-model-operation.js';
 import {
   createNoopLlmUsageService,
   emptyProviderUsage,
@@ -67,6 +68,11 @@ export interface LlmClient {
   getAvailableModels?(): readonly string[] | undefined;
   /** Most recent credential/account problem reported by the provider; cleared by the next success. */
   getProviderIssue?(): LlmProviderIssue | undefined;
+  /**
+   * The connection, model, and capabilities a model-bound client serves
+   * (Settings → AI model connections). Undefined for raw provider clients.
+   */
+  getModelOperation?(): LlmModelOperation | undefined;
   sendPrompt(prompt: string, usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
   sendMessage(messages: AcpChatMessage[], usageContext?: LlmUsageContext): Promise<AcpResponse>; // backward compat
   initialize(): Promise<void>; // no-op for backward compat
@@ -240,6 +246,12 @@ export interface LlmRequestRoute {
   readonly endpoint?: string;
   /** Server-authored target metadata; never accepted from browser/model input. */
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * false for models that reject Responses reasoning parameters (for
+   * example GPT-4o on the hosted OpenAI API): the body then omits
+   * `reasoning` and `include`. Undefined keeps the endpoint default.
+   */
+  readonly supportsReasoning?: boolean;
 }
 
 export interface ChatCompletionRequest {
@@ -406,13 +418,16 @@ export function isLlmPayloadTooLargeError(error: unknown): error is LlmPayloadTo
   return error instanceof LlmPayloadTooLargeError || (error as any)?.code === 'LLM_PAYLOAD_TOO_LARGE';
 }
 
+/** Hosted model APIs reached with the owner's own key (Settings → AI model). */
+export type LlmHostedPlatform = 'openai' | 'deepseek';
+
 /**
  * The provider is throttling this credential. Request-specific, never endpoint
  * health: the same key recovers once its rate window resets.
  */
 export class LlmRateLimitedError extends Error {
   readonly code = 'LLM_RATE_LIMITED';
-  readonly nextAction = 'Wait a minute and try again. Heavy use on a new OpenAI account hits its rate limit sooner; limits rise automatically as the account is used.';
+  readonly nextAction = 'Wait a minute and try again. New provider accounts have lower rate limits that rise automatically as the account is used.';
   constructor(readonly retryAfterMs?: number) {
     super(`The AI provider is rate-limiting this API key${retryAfterMs ? ` (it asked BotBoy to wait about ${Math.max(1, Math.round(retryAfterMs / 1000))}s)` : ''}.`);
     this.name = 'LlmRateLimitedError';
@@ -422,10 +437,15 @@ export class LlmRateLimitedError extends Error {
 /** The provider account has no usable credit. Retrying cannot succeed. */
 export class LlmQuotaExhaustedError extends Error {
   readonly code = 'LLM_QUOTA_EXHAUSTED';
-  readonly nextAction = 'Add credit or raise the spending limit for this OpenAI account (platform.openai.com → Billing), then try again.';
-  constructor() {
-    super('The OpenAI account behind this API key has no available credit.');
+  readonly nextAction: string;
+  constructor(readonly platform: LlmHostedPlatform = 'openai') {
+    super(platform === 'deepseek'
+      ? 'The DeepSeek account behind this API key has no balance left.'
+      : 'The OpenAI account behind this API key has no available credit.');
     this.name = 'LlmQuotaExhaustedError';
+    this.nextAction = platform === 'deepseek'
+      ? 'Top up this DeepSeek account (platform.deepseek.com → Top up), then try again.'
+      : 'Add credit or raise the spending limit for this OpenAI account (platform.openai.com → Billing), then try again.';
   }
 }
 
@@ -631,6 +651,11 @@ export interface LlmConfig {
     authMode?: 'apiKey' | 'sigv4';
     /** Preferred authorization path; overrides authMode/apiKey when supplied. */
     requestAuthorizer?: LlmRequestAuthorizer;
+    /**
+     * false when the default model rejects Responses reasoning parameters.
+     * A request route's own `supportsReasoning` takes precedence.
+     */
+    supportsReasoning?: boolean;
   };
   ollama: { endpoint: string; model: string; maxContextTokens: number; requestTimeoutMs: number };
   defaults: { temperature: number; maxCompletionTokens: number; contextBudgetTokens: number };
@@ -641,12 +666,15 @@ export interface LlmConfig {
   /** Provider id stamped on usage rows and returned by getProviderId(). */
   providerId?: string;
   /**
-   * Hosted-platform conventions for the primary endpoint. 'openai' is the
-   * OpenAI API itself: a free model-retrieve health probe instead of a billed
-   * ping, explicitly non-strict function tools (Responses otherwise attempts
-   * strict mode), and bounded Retry-After handling for 429s.
+   * Hosted-platform conventions for the primary endpoint.
+   * 'openai' is the OpenAI API itself: a free model-retrieve health probe
+   * instead of a billed ping, explicitly non-strict function tools (Responses
+   * otherwise attempts strict mode), and bounded Retry-After handling for 429s.
+   * 'deepseek' is the DeepSeek API's Responses surface: a free model-list
+   * probe, bounded 429 handling, HTTP 402 as terminal no-balance, its own
+   * effort levels (none/low/high/max), and no `include` field (unsupported).
    */
-  platform?: 'openai';
+  platform?: LlmHostedPlatform;
   /** Catalog model ids the configured credential can call (from the platform's model list). */
   availableModels?: readonly string[];
   /**
@@ -672,6 +700,7 @@ interface Endpoint {
   reasoningEffort?: ReasoningEffort;
   authMode?: 'apiKey' | 'sigv4';
   requestAuthorizer?: LlmRequestAuthorizer;
+  supportsReasoning?: boolean;
 }
 
 interface RecordedResponse {
@@ -1007,8 +1036,10 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       reasoningEffort: config.ecs.reasoningEffort,
       authMode: config.ecs.authMode ?? 'apiKey',
       requestAuthorizer: config.ecs.requestAuthorizer,
+      supportsReasoning: config.ecs.supportsReasoning,
     });
   }
+  const hostedPlatform = config.platform;
 
   // Ollama endpoint (native API with think control)
   if (config.ollama.endpoint) {
@@ -1149,21 +1180,23 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       ep.requestAuthorizer.invalidate();
       recorded = await send(true);
     }
-    if (config.platform === 'openai' && !ep.useOllamaApi) {
-      // Hosted OpenAI: a 429 is either an exhausted account (terminal) or a
-      // rate window (wait as instructed, resend). Each resend is its own
-      // usage attempt in the same operation; neither case is endpoint health.
+    if (hostedPlatform && !ep.useOllamaApi) {
+      // Hosted APIs reached with the owner's own key: a 429 is either an
+      // exhausted account (terminal) or a rate window (wait as instructed,
+      // resend). Each resend is its own usage attempt in the same operation;
+      // neither case is endpoint health. DeepSeek reports no balance as 402.
       let rateLimitRetries = 0;
-      while (recorded.response.status === 429) {
+      while (recorded.response.status === 429 || (hostedPlatform === 'deepseek' && recorded.response.status === 402)) {
+        const status = recorded.response.status;
         const detail = await recorded.response.text().catch(() => '');
         usage.failAttempt(recorded.handle, {
-          httpStatus: 429,
-          errorClass: 'HTTP_429',
+          httpStatus: status,
+          errorClass: `HTTP_${status}`,
           usage: parseUsageFromText(detail),
         });
-        if (openAiErrorCode(detail) === 'insufficient_quota') {
-          noteProviderIssue('quota_exhausted', 429);
-          throw new LlmQuotaExhaustedError();
+        if (status === 402 || openAiErrorCode(detail) === 'insufficient_quota') {
+          noteProviderIssue('quota_exhausted', status);
+          throw new LlmQuotaExhaustedError(hostedPlatform);
         }
         const requestedWait = retryAfterMs(recorded.response.headers);
         const waitMs = requestedWait ?? OPENAI_RATE_LIMIT_DEFAULT_WAIT_MS * 2 ** rateLimitRetries;
@@ -1179,8 +1212,8 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     const finalStatus = recorded.response.status;
     if (recorded.response.ok) {
       providerIssue = undefined;
-    } else if (config.platform === 'openai' && (finalStatus === 401 || finalStatus === 403)) {
-      // Only the hosted platform maps these to the credential: a gateway 403
+    } else if (hostedPlatform && (finalStatus === 401 || finalStatus === 403)) {
+      // Only the hosted platforms map these to the credential: a gateway 403
       // can be a WAF/policy answer to one request (see providerHttpError).
       noteProviderIssue('auth_rejected', finalStatus);
     }
@@ -1239,10 +1272,14 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
 
   async function probeEndpoint(ep: Endpoint): Promise<boolean> {
     try {
-      if (!ep.useOllamaApi && config.platform === 'openai') {
-        // The OpenAI API has a model-retrieve route: it proves the key and
-        // model access without generating (no tokens, no usage row).
-        const url = `${ep.url.replace(/\/+$/, '')}/models/${encodeURIComponent(ep.model)}`;
+      if (!ep.useOllamaApi && hostedPlatform) {
+        // Both hosted APIs prove the key without generating (no tokens, no
+        // usage row): OpenAI retrieves the default model, DeepSeek lists
+        // its models (the documented model route).
+        const base = ep.url.replace(/\/+$/, '');
+        const url = hostedPlatform === 'deepseek'
+          ? `${base}/models`
+          : `${base}/models/${encodeURIComponent(ep.model)}`;
         const headers = await buildAuthHeaders(ep, url, 'GET');
         const resp = await fetch(url, { signal: AbortSignal.timeout(10_000), headers });
         await resp.body?.cancel().catch(() => undefined);
@@ -1372,22 +1409,38 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     };
   }
 
-  function responsesReasoningEffort(ep: Endpoint, req: ChatCompletionRequest): 'low' | 'high' {
-    if (req.think !== true) return 'low';
+  function responsesReasoningEffort(ep: Endpoint, req: ChatCompletionRequest): 'none' | 'low' | 'high' | 'max' {
     const effort = req.reasoningEffort ?? ep.reasoningEffort;
+    if (hostedPlatform === 'deepseek') {
+      // DeepSeek documents none (non-thinking mode) through max, so BotBoy's
+      // "Thinking: off" really turns thinking off there.
+      if (req.think !== true) return 'none';
+      return effort === 'max' ? 'max' : effort === 'high' ? 'high' : 'low';
+    }
+    // Gateway and OpenAI keep the proven mapping: off → low, max → high.
+    if (req.think !== true) return 'low';
     return effort === 'high' || effort === 'max' ? 'high' : 'low';
+  }
+
+  /** Route first, then the endpoint default; undefined means supported. */
+  function reasoningSupported(ep: Endpoint, req: ChatCompletionRequest): boolean {
+    return (req.route?.supportsReasoning ?? ep.supportsReasoning) !== false;
   }
 
   function buildResponsesBody(ep: Endpoint, req: ChatCompletionRequest, stream: boolean): any {
     const prompt = toResponsesInput(req.messages);
+    const reasoning = reasoningSupported(ep, req);
     return {
       model: effectiveModel(ep, req),
       ...prompt,
       max_output_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
-      reasoning: { effort: responsesReasoningEffort(ep, req) },
+      // Non-reasoning models (GPT-4o on the hosted OpenAI API) reject both
+      // fields, so they are omitted together.
+      ...(reasoning ? { reasoning: { effort: responsesReasoningEffort(ep, req) } } : {}),
       // store:false disables server-side turn state. Request encrypted reasoning
       // so it can be replayed locally with function outputs on the next turn.
-      include: ['reasoning.encrypted_content'],
+      // DeepSeek does not support `include`; it replays plain-text reasoning.
+      ...(reasoning && hostedPlatform !== 'deepseek' ? { include: ['reasoning.encrypted_content'] } : {}),
       ...(req.tools?.length ? {
         tools: req.tools.map(tool => ({
           type: 'function',
@@ -1497,9 +1550,17 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
             arguments: typeof rawArguments === 'string' ? rawArguments : JSON.stringify(rawArguments),
           },
         });
-      } else if (item?.type === 'reasoning' && Array.isArray(item.summary)) {
-        for (const summary of item.summary) {
+      } else if (item?.type === 'reasoning') {
+        // OpenAI returns reasoning summaries; DeepSeek returns the plain
+        // chain-of-thought as reasoning_text content parts.
+        const summaries = Array.isArray(item.summary) ? item.summary : [];
+        for (const summary of summaries) {
           if (typeof summary?.text === 'string') reasoningParts.push(summary.text);
+        }
+        if (!summaries.length && Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (part?.type === 'reasoning_text' && typeof part.text === 'string') reasoningParts.push(part.text);
+          }
         }
       }
     }
@@ -1796,7 +1857,10 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
             yield { type: 'content', text: event.delta };
             continue;
           }
-          if (eventType === 'response.reasoning_summary_text.delta' && typeof event.delta === 'string') {
+          // OpenAI streams reasoning summaries; DeepSeek streams the plain
+          // chain-of-thought as reasoning_text deltas.
+          if ((eventType === 'response.reasoning_summary_text.delta' || eventType === 'response.reasoning_text.delta')
+            && typeof event.delta === 'string') {
             reasoningAcc += event.delta;
             yield { type: 'thinking', text: event.delta };
             continue;

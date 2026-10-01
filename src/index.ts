@@ -43,6 +43,7 @@ import { createDocumentParser } from './core/document-parser.js';
 import { createAcpClient } from './core/acp-client.js';
 import { createInferenceProviderFromEnv } from './core/inference-provider.js';
 import { createAiModelSettingsService } from './core/ai-model-settings.js';
+import { currentLlmModelOperation } from './core/llm-model-operation.js';
 import { resolveOwnerIdentity } from './core/owner-identity.js';
 import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
@@ -397,16 +398,18 @@ async function main() {
   // Shell settings override the documented local dotenv-style file.
   const localEnvFile = loadSlackEnv();
   const inferenceEnv = { ...localEnvFile, ...process.env };
-  // Launcher/.env configuration. An OpenAI key saved in Settings → AI model
-  // takes precedence at runtime; removing it returns here.
+  // Launcher/.env configuration: the team connection. OpenAI and DeepSeek
+  // keys saved in Settings → AI model add their own connections alongside it.
   const environmentProvider = createInferenceProviderFromEnv(inferenceEnv);
   const llmUsageService = createLlmUsageService(db, { primaryProvider: environmentProvider.id });
   // Assigned once the information pipeline exists: a Settings activation
   // drains the capture backlog immediately instead of waiting for the next tick.
   let kickInformationPipeline: () => void = () => {};
-  // The settings service owns the one switchable client every consumer holds,
-  // and publishes BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS for limits.ts on every
-  // activation (it reads that normalized process value per call).
+  // The settings service owns every model connection (team gateway, OpenAI
+  // key, DeepSeek key), one switchable client per background role
+  // (organizing → `client`, document writing → `documents`), and the chat
+  // picker's catalog. It publishes BOTBOY_INFERENCE_MAX_CONTEXT_TOKENS for
+  // limits.ts whenever the organizing model changes.
   const aiModelSettings = await createAiModelSettingsService({
     envProvider: environmentProvider,
     usageService: llmUsageService,
@@ -422,12 +425,15 @@ async function main() {
       `✅ LLM client ready (provider: ${active.providerId}, model: ${active.model}, source: ${active.source}, active: ${llmClient.getActiveEndpoint()})`,
     );
   }
-  // Provider identity for data-handling receipts, read at use time so a
-  // Settings change can never leave a boot-time locality in force.
-  const activeProviderDescriptor = () => {
+  // Provider identity of the organizing model, read at use time so a Settings
+  // change can never leave a boot-time locality in force.
+  const organizingProviderDescriptor = () => {
     const active = llmClient.identity();
     return { id: active.providerId, endpoint: active.endpoint, model: active.model, apiMode: active.apiMode };
   };
+  // Where data is about to go: the chat turn or agent loop running this tool
+  // (its model operation), otherwise the organizing model.
+  const operationProviderDescriptor = () => currentLlmModelOperation()?.provider ?? organizingProviderDescriptor();
   if (environmentProvider.localFallbackEnabled) {
     console.warn('⚠️  Local LLM fallback is enabled; background output may use a different model when the primary provider is unavailable.');
   }
@@ -441,8 +447,10 @@ async function main() {
     candidateReader: analyticsImportInbox,
     importRootDir: analyticsImportInbox.rootDir,
     documentParser,
+    // The proposal's own model call runs on the organizing model, so its
+    // locality is that model's, never an ambient chat turn's.
     llm: llmClient,
-    provider: activeProviderDescriptor,
+    provider: organizingProviderDescriptor,
     ownerId: ownerIdentity.alias || ownerIdentity.email || 'local-owner',
   });
   const analyticsImportPromotion = createAnalyticsImportPromotionService({
@@ -460,10 +468,11 @@ async function main() {
     etlRunner: analyticsAnswerEtlRunner,
   });
   // Live model-context runtime: every Data Room policy check evaluates the
-  // provider serving requests at that moment (getters, never a boot snapshot).
+  // model that will receive the data at that moment — the calling chat turn
+  // or agent loop, else the organizing model (getters, never a boot snapshot).
   const answerProviderReceipt = {
-    get providerLocality() { return analyticsImportProviderReceipt(activeProviderDescriptor()).providerLocality; },
-    get endpointSha256() { return analyticsImportProviderReceipt(activeProviderDescriptor()).endpointSha256; },
+    get providerLocality() { return analyticsImportProviderReceipt(operationProviderDescriptor()).providerLocality; },
+    get endpointSha256() { return analyticsImportProviderReceipt(operationProviderDescriptor()).endpointSha256; },
   };
   const analyticsDataRoomRead = createAnalyticsDataRoomReadService({
     store: analyticsDataRoomStore,
@@ -516,7 +525,9 @@ async function main() {
   });
   const productDocumentStore = createProductDocumentStore(db);
   const productDocumentService = createProductDocumentService({
-    llmClient,
+    // Settings → AI model "Document writing": generation and the conformance
+    // review of chat-authored documents.
+    llmClient: aiModelSettings.documents,
     promptManager,
     registry: profileRegistry,
     configStore: writingConfigStore,
@@ -1276,7 +1287,7 @@ async function main() {
       },
     ],
     beforeDatabaseClose: () => {
-      llmClient.close();
+      aiModelSettings.close();
       conversationManager.pruneOldSessions();
     },
     onEscalate: () => chatTerminal.shutdown(),

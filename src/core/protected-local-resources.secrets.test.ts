@@ -197,7 +197,7 @@ describe('Data Room rows and an external model provider', () => {
     }
   });
 
-  it('tells the model why a query was refused on the owner’s OpenAI key and what to say instead', async () => {
+  it('tells the model why a query was refused on the owner’s own API key and what to say instead', async () => {
     const storage = createStorage(':memory:');
     storage.initialize();
     try {
@@ -213,7 +213,7 @@ describe('Data Room rows and an external model provider', () => {
 
       const external = await query();
       expect(external).toMatchObject({ code: 'policy_denied', effect: expect.anything() });
-      expect(external.nextAction).toMatch(/own OpenAI key/);
+      expect(external.nextAction).toMatch(/own OpenAI or DeepSeek key/);
       expect(external.nextAction).toMatch(/Data Room page or a local dashboard/);
 
       live.providerLocality = 'amazon_managed_remote';

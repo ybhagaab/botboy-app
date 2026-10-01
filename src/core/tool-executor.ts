@@ -2602,7 +2602,7 @@ export function createToolExecutor(
           error,
           nextAction: code === 'policy_denied'
             ? (modelContextRuntime?.providerLocality === 'external_remote'
-              ? 'Data Room rows never go to an external model: chat is running on the owner’s own OpenAI key (Settings → AI model). Tell the owner the rows stay on this Mac and can be read in the Data Room page or a local dashboard. Do not try other tools to read them.'
+              ? 'Data Room rows never go to an external model: this chat is running on the owner’s own OpenAI or DeepSeek key (Settings → AI model). Tell the owner the rows stay on this Mac and can be read in the Data Room page or a local dashboard, or by choosing a team gateway model in the chat model picker when one is set up. Do not try other tools to read them.'
               : 'Do not bypass the handling policy. Use an allowed local/dashboard consumer or ask the owner for a policy-compliant outcome.')
             : 'Correct every listed issue; refresh list_data_room_datasets first when state changed; then retry once.',
           effect: dataRoomNoEffect(),

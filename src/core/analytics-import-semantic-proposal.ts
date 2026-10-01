@@ -412,9 +412,9 @@ function words(value: string): string[] {
 }
 
 function providerLocality(endpoint: string, providerId: string): ProviderLocality {
-  // The owner's own OpenAI account is a third-party remote by definition,
-  // whatever endpoint it is reached through.
-  if (providerId === 'openai') return 'external_remote';
+  // The owner's own OpenAI or DeepSeek account is a third-party remote by
+  // definition, whatever endpoint it is reached through.
+  if (providerId === 'openai' || providerId === 'deepseek') return 'external_remote';
   try {
     const host = new URL(endpoint).hostname.toLowerCase();
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return 'device_local';

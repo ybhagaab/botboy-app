@@ -8,6 +8,7 @@ import { v4 as uuid } from 'uuid';
 import type { AcpClient } from './acp-client.js';
 import type { LlmClient, ToolCall } from './llm-client.js';
 import { isLlmClientSwitch, pinLlmClient } from './llm-client-switch.js';
+import { runInLlmModelOperation } from './llm-model-operation.js';
 import type { LlmUsageContext } from './llm-usage.js';
 import type { ToolExecutor } from './tool-executor.js';
 import { type PromptManager } from './prompt-manager.js';
@@ -199,6 +200,7 @@ Be concise, helpful, proactive. You have full authority.`;
           // One provider for the whole loop: replayed provider output
           // (encrypted reasoning) is only valid on the provider that issued it.
           const loopClient = pinLlmClient(llmClient);
+          const loopOperation = loopClient.getModelOperation?.();
           // Tool results gathered after a Settings → AI model change follow the
           // new provider's data rules, so they are never sent to the pinned
           // one: the loop stops and the task can run again on the new model.
@@ -264,10 +266,11 @@ Be concise, helpful, proactive. You have full authority.`;
             });
             const toolImageEvidence: ToolImageEvidence[] = [];
             for (const tc of resp.toolCalls) {
-              const result = await toolExecutor.executeTool(tc, {
+              // Tool results go to the loop's model: data checks judge its connection.
+              const result = await runInLlmModelOperation(loopOperation, () => toolExecutor.executeTool(tc, {
                 currentUserMessage: instruction,
                 callerKind: 'background',
-              });
+              }));
               if (tc.function.name === 'get_document_writing_guide') documentAuthoringThink = true;
               messages.push({ role: 'tool', content: result.content, toolCallId: tc.id });
               if (result.imageEvidence?.length) toolImageEvidence.push(...result.imageEvidence);

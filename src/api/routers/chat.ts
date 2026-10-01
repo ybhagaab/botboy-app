@@ -14,13 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
 import type { DashboardState } from './dashboard.js';
 import { writeFileMaxChars } from '../../core/limits.js';
-import {
-  chatModelCatalogContext,
-  getChatModelCatalog,
-  resolveBlessedModelRoute,
-} from '../../core/inference-provider.js';
-import { isLlmClientSwitch, pinLlmClient } from '../../core/llm-client-switch.js';
-import type { LlmClient } from '../../core/llm-client.js';
+import { createSingleClientChatModelSource, type ChatModelSource } from '../../core/chat-model-source.js';
+import { currentLlmModelOperation, runInLlmModelOperation } from '../../core/llm-model-operation.js';
 import { createLlmUsageOperationId } from '../../core/llm-usage.js';
 import { normalizeAnalyticsSearchText } from '../../core/analytics-search-normalization.js';
 import {
@@ -455,21 +450,19 @@ function formatAnalyticsEditCompletion(receipt: Record<string, any>): string | u
 export function createChatRouter(deps: RouterDeps, dashboardState: DashboardState): Router {
   const router = Router();
   const chat = deps.chatInterface;
-  // The active provider can change at runtime (Settings → AI model), so the
-  // catalog is computed per request from one pinned client: its default
-  // model, provider id, and per-key model list always belong together.
-  const chatModelCatalogFor = (client: LlmClient) => getChatModelCatalog(
-    client.getDefaultModel?.() ?? '',
-    process.env,
-    chatModelCatalogContext(client),
-  );
+  // Settings → AI model supplies every configured connection's models
+  // (team gateway, OpenAI key, DeepSeek key); a lone client (tests, older
+  // wiring) supplies its own catalog. Either way the catalog is computed per
+  // request because connections change at runtime.
+  const chatModels: ChatModelSource = deps.aiModelSettings?.chatModels
+    ?? createSingleClientChatModelSource(deps.llmClient);
 
   // The browser renders this server-owned, provider-aware catalog. It never
   // carries endpoint, target, or credential details and cannot invent ids.
   router.get('/chat/models', (_req: Request, res: Response) => {
-    const client = pinLlmClient(deps.llmClient);
-    if (!client) return res.status(503).json({ error: 'Chat models are unavailable' });
-    return res.json(chatModelCatalogFor(client));
+    const catalog = chatModels.catalog();
+    if (!catalog) return res.status(503).json({ error: 'Chat models are unavailable' });
+    return res.json(catalog);
   });
 
   const analyticsSchemaLoader = createAnalyticsSchemaBriefingLoader(deps.mcpManager, {
@@ -479,7 +472,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // Settings → AI model republishes on every activation).
     selector: deps.llmClient?.chatCompletion
       ? async ({ message, catalog }) => {
-          const response = await deps.llmClient!.chatCompletion({
+          // Part of the chat turn: route the owner's message on the turn's
+          // own model (its operation is active during the briefing load).
+          const selectorClient = currentLlmModelOperation()?.client ?? deps.llmClient!;
+          const response = await selectorClient.chatCompletion({
             messages: [
               {
                 role: 'system',
@@ -602,27 +598,28 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     stopRequested: boolean;
     shutdownRequested: boolean;
     disconnected: boolean;
-    /** The owner switched AI providers mid-turn (Settings → AI model). */
+    /** The owner replaced or removed this turn's AI connection mid-turn (Settings → AI model). */
     providerChanged?: boolean;
+    /** The model connection this turn is pinned to. */
+    connectionId?: string;
     startedAt: number;
     abortController: AbortController;
   }>();
   let chatTurnCounter = 0;
 
-  // A provider change stops every in-flight turn. Each turn is pinned to the
-  // provider it started on; data admitted under the NEW provider's locality
-  // (for example Data Room rows) must never flow to the old one, so these
-  // turns also skip the usual end-of-turn summary call.
-  if (isLlmClientSwitch(deps.llmClient)) {
-    deps.llmClient.onActivate(() => {
-      for (const turn of activeChatTurns.values()) {
-        if (turn.stopRequested) continue;
-        turn.stopRequested = true;
-        turn.providerChanged = true;
-        turn.abortController.abort(new Error('AI model provider changed'));
-      }
-    });
-  }
+  // Replacing or removing a connection stops the turns pinned to it. Each
+  // turn stays on the connection it started on: provider-bound replay
+  // (encrypted reasoning) and data admitted under another connection's
+  // locality must never cross over, so these turns also skip the usual
+  // end-of-turn summary call. Turns on other connections keep running.
+  chatModels.onChange(({ connectionId }) => {
+    for (const turn of activeChatTurns.values()) {
+      if (turn.stopRequested || turn.connectionId !== connectionId) continue;
+      turn.stopRequested = true;
+      turn.providerChanged = true;
+      turn.abortController.abort(new Error('AI model provider changed'));
+    }
+  });
 
   router.post('/chat/stop', (_req: Request, res: Response) => {
     let stopped = 0;
@@ -650,7 +647,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       return res.status(409).json({
         error: 'Chat needs an AI model first.',
         code: 'ai_model_not_configured',
-        nextAction: 'Open Settings → AI model and paste your OpenAI API key. Chat and background organizing start right away.',
+        nextAction: 'Open Settings → AI model and paste an OpenAI or DeepSeek API key. Chat and background organizing start right away.',
       });
     }
     if (requestedMode !== undefined && requestedMode !== 'general' && requestedMode !== 'analytics_dashboard') {
@@ -699,32 +696,25 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         if (visual) attachmentVisualAssets.push(visual);
       }
     }
-    // Model picker: the server-owned catalog admits only routes available to
-    // this provider. `default` preserves old clients; current clients send the
-    // stable catalog key. GPT-6 remains absent unless its separate target has
-    // an explicit preview attestation, so dead/unapproved ids never hit wire.
-    let modelRoute: ReturnType<typeof resolveBlessedModelRoute> | undefined;
-    // One provider serves this whole turn: route admission, every tool-loop
-    // iteration, and provider-bound replay (encrypted reasoning) use the
-    // client pinned here, even if the owner changes providers mid-turn.
-    const turnLlmClient = pinLlmClient(deps.llmClient);
-    if (body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
-      const turnCatalog = turnLlmClient ? chatModelCatalogFor(turnLlmClient) : { models: [] };
-      const allowedModelKeys = new Set(turnCatalog.models.map(model => model.key));
-      const resolved = turnLlmClient && allowedModelKeys.has(body.model)
-        ? resolveBlessedModelRoute(
-          turnLlmClient.getDefaultModel?.() ?? '',
-          body.model,
-          process.env,
-          chatModelCatalogContext(turnLlmClient),
-        )
-        : null;
-      if (!resolved) {
-        const allowed = ['default', ...allowedModelKeys].filter((key, index, keys) => keys.indexOf(key) === index);
-        return res.status(400).json({ error: `model must be one of: ${allowed.join(', ')}` });
-      }
-      modelRoute = resolved;
+    // Model picker: the server-owned catalog admits only models a configured
+    // connection offers. `default` preserves old clients; current clients send
+    // the stable catalog key. GPT-6 remains absent unless its separate target
+    // has an explicit preview attestation, so dead/unapproved ids never hit wire.
+    // One connection and model serve this whole turn: every tool-loop
+    // iteration and provider-bound replay (encrypted reasoning) use the client
+    // resolved here, even if the owner changes Settings mid-turn.
+    const chatBinding = chatModels.resolve(body.model);
+    if (!chatBinding && body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
+      const offered = chatModels.catalog()?.models.map(model => model.key) ?? [];
+      const allowed = ['default', ...offered].filter((key, index, keys) => keys.indexOf(key) === index);
+      return res.status(400).json({ error: `model must be one of: ${allowed.join(', ')}` });
     }
+    const turnLlmClient = chatBinding?.client;
+    // Explicit only on the single-client path; a connection binding carries its own route.
+    const modelRoute = chatBinding?.route;
+    // Tool executions in this turn send their results to this model, so data
+    // checks (Data Room rows, file values) judge this connection's locality.
+    const turnModelOperation = chatBinding?.operation;
     // modeHint is ambient page context (an analytics route being open). It is
     // advisory — the message must corroborate — unlike mode, which commands.
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
@@ -791,6 +781,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         stopRequested: false,
         shutdownRequested: false,
         disconnected: false,
+        ...(chatBinding ? { connectionId: chatBinding.connectionId } : {}),
         startedAt: Date.now(),
         abortController: new AbortController(),
       };
@@ -871,9 +862,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                   selectionStatus: 'selected',
                   selectionRationale: 'exact_dashboard_task',
                 }
-              : await analyticsSchemaLoader.load(message, {
+              : await runInLlmModelOperation(turnModelOperation, () => analyticsSchemaLoader.load(message, {
                   localOnly: analyticsIntent !== 'create' && Boolean(deps.analyticsDataRoom),
-                });
+                }));
           } catch (error: any) {
             console.error(`[Chat] Analytics schema preflight failed: ${error?.message ?? error}`);
             analyticsBriefing = {
@@ -1629,7 +1620,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }, 10_000);
             try {
               const settled = await Promise.all(sanitizedToolCalls.map((tc: any) =>
-                toolExecutor.executeTool(tc as any, toolExecutionContext)
+                runInLlmModelOperation(turnModelOperation, () => toolExecutor.executeTool(tc as any, toolExecutionContext))
                   .catch((error: any) => ({ content: `Error: ${error?.message ?? String(error)}` }))));
               for (const [index, tc] of sanitizedToolCalls.entries()) {
                 toolResults.push({ tc, result: settled[index] });
@@ -1837,7 +1828,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 }, 10000);
               }
               try {
-                result = await toolExecutor.executeTool(tc as any, toolExecutionContext);
+                result = await runInLlmModelOperation(turnModelOperation, () => toolExecutor.executeTool(tc as any, toolExecutionContext));
               } finally {
                 if (blockingKeepalive) clearInterval(blockingKeepalive);
               }

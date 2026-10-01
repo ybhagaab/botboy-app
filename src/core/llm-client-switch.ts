@@ -23,9 +23,11 @@ export interface LlmRuntimeIdentity {
 }
 
 /**
- * One stable LlmClient for every BotBoy consumer while the provider behind it
- * can change at runtime (Settings → AI model). Every call reads the active
- * client at call time, so background passes, chat, and tools switch together
+ * One stable LlmClient for a group of consumers while the model behind it can
+ * change at runtime (Settings → AI model). Settings holds one switch per
+ * background role (organizing, document writing); each is activated with a
+ * model-bound client whenever that role's model or its connection changes.
+ * Every call reads the active client at call time, so consumers switch
  * without a restart.
  *
  * Multi-request operations that replay provider-bound state (Responses
@@ -101,6 +103,7 @@ export function createLlmClientSwitch(initial: LlmClient, initialIdentity: LlmRu
     getProviderId: (): string | undefined => active.getProviderId?.() ?? activeIdentity.providerId,
     getAvailableModels: (): readonly string[] | undefined => active.getAvailableModels?.(),
     getProviderIssue: (): LlmProviderIssue | undefined => active.getProviderIssue?.(),
+    getModelOperation: () => active.getModelOperation?.(),
     sendPrompt: (prompt: string, usageContext?: LlmUsageContext) => active.sendPrompt(prompt, usageContext),
     sendMessage: (messages, usageContext?: LlmUsageContext) => active.sendMessage(messages, usageContext),
     initialize: (): Promise<void> => active.initialize(),

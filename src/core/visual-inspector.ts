@@ -671,6 +671,16 @@ export function createVisualInspector(deps: {
   return {
     async inspect(input) {
       const workload: LlmUsageWorkload = input.callerKind === 'background' ? 'background' : 'interactive';
+      // The reader is the organizing model. A model that cannot read images
+      // stops here with the fix; pixels never go to another provider instead.
+      const reader = llmClient.getModelOperation?.();
+      if (reader?.capabilities.images === false) {
+        throw new VisualInspectionError(
+          'VISUAL_MODEL_TEXT_ONLY',
+          `${reader.label}, the model BotBoy uses for organizing, cannot read images, so these images were not inspected.`,
+          'Tell the owner the images were not inspected, and that choosing an image-capable organizing model in Settings → AI model (for example DeepSeek Flash or GPT-5.6 Terra) lets BotBoy read them. Do not describe or guess their contents.',
+        );
+      }
       const assetIds = [...new Set((input.assetIds ?? []).map(String))];
       if (!assetIds.length || assetIds.length > MAX_ASSETS) {
         throw new VisualInspectionError('VISUAL_ASSET_COUNT', `inspect_visual_assets requires 1–${MAX_ASSETS} unique asset IDs.`, 'Use exact IDs from the attachment or screenshot manifest.');

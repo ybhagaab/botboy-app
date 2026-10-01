@@ -75,7 +75,7 @@ const state = {
   llmUsage: { data: null, error: '', loading: false, days: 30, timeZone: LLM_USAGE_TIME_ZONE, requestId: 0 },
   // Settings → AI model. The key itself never lives in state: it is read
   // from the form once, sent, and the field is cleared by the next repaint.
-  aiModel: { status: null, error: '', loading: false, saving: false, removing: false, requestId: 0, saveError: null },
+  aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
@@ -3346,7 +3346,29 @@ async function loadLlmUsage({ force = false } = {}) {
   }
 }
 
-// ── Settings → AI model: owner OpenAI key, verified server-side, applied without restart ──
+// ── Settings → AI model: model connections (team gateway, OpenAI key,
+// DeepSeek key) and the models for background work. Keys are verified
+// server-side and never kept in browser state; changes apply without restart.
+const AI_MODEL_KEY_PROVIDERS = [
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    keysUrl: 'platform.openai.com/api-keys',
+    intro: 'Use your own OpenAI API key. BotBoy offers every chat model the key can use.',
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    keysUrl: 'platform.deepseek.com/api_keys',
+    intro: 'Use your own DeepSeek API key. BotBoy offers every model the key lists, including image input where the model supports it.',
+  },
+];
+const AI_MODEL_ROLE_COPY = {
+  processing: { title: 'Organizing', detail: 'Routing, project briefs, digests, planning, and reading images.' },
+  documents: { title: 'Document writing', detail: 'Product documents and email drafts, plus the review of documents written in chat.' },
+};
+const AI_MODEL_THINKING_LEVELS = [['off', 'Off'], ['low', 'Low'], ['high', 'High'], ['max', 'Max']];
+
 function aiModelErrorText(error) {
   return String(error?.payload?.error || error?.message || error || 'Unknown error');
 }
@@ -3371,9 +3393,95 @@ async function loadAiModelStatus() {
   }
 }
 
+function aiModelContextLabel(tokens) {
+  const value = Number(tokens) || 0;
+  if (value >= 1_000_000) return `${Math.round(value / 100_000) / 10}M`;
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+  return String(value);
+}
+
+function aiModelIssueAlert(issue) {
+  return issue
+    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(issue.message)}</strong> ${esc(issue.nextAction)}</span></div>`
+    : '';
+}
+
+/** One connection's models, collapsed: titles plus image/context facts. */
+function aiModelModelList(connection) {
+  const models = Array.isArray(connection?.models) ? connection.models : [];
+  if (!models.length) return '';
+  const rows = models.map(model => {
+    const facts = [
+      model.images === true ? 'Reads images' : model.images === false ? 'Text only' : '',
+      model.contextWindow ? `${aiModelContextLabel(model.contextWindow)} context` : '',
+    ].filter(Boolean).join(' · ');
+    return `<li><span>${esc(model.label)}</span>${facts ? `<small>${esc(facts)}</small>` : ''}</li>`;
+  }).join('');
+  return `<details class="ai-model-models"><summary>${esc(String(models.length))} model${models.length === 1 ? '' : 's'} available</summary><ul>${rows}</ul></details>`;
+}
+
+/** Model choices for a role: one tree, grouped by provider when there are several. */
+function aiModelRoleOptions(connections, role) {
+  const chosenKey = role?.chosen ? role.modelKey : '';
+  const option = model => `<option value="${attr(model.key)}" ${model.key === chosenKey ? 'selected' : ''}>${esc(model.label)}</option>`;
+  const automatic = `<option value="" ${chosenKey ? '' : 'selected'}>Automatic</option>`;
+  if (connections.length <= 1) {
+    return automatic + (connections[0]?.models || []).map(option).join('');
+  }
+  return automatic + connections.map(connection =>
+    `<optgroup label="${attr(connection.label)}">${(connection.models || []).map(option).join('')}</optgroup>`).join('');
+}
+
+function aiModelRoleRow(status, roleId) {
+  const role = status.roles?.[roleId];
+  const copy = AI_MODEL_ROLE_COPY[roleId];
+  if (!role || !copy) return '';
+  const connections = Array.isArray(status.connections) ? status.connections : [];
+  const busy = state.aiModel.roleBusy === roleId || state.aiModel.saving || state.aiModel.removing;
+  const using = `${role.label} (${role.connectionLabel})`;
+  const caption = role.unavailableChoice
+    ? `Your choice is not available right now, so BotBoy is using ${using}.`
+    : role.chosen ? `Using ${using}.` : `Automatic: using ${using}.`;
+  const imageNote = roleId === 'processing' && role.images === false
+    ? ' This model cannot read images, so screenshots and image attachments are not inspected.'
+    : '';
+  const thinking = AI_MODEL_THINKING_LEVELS
+    .map(([value, label]) => `<option value="${value}" ${role.thinking === value ? 'selected' : ''}>Thinking · ${label}</option>`).join('');
+  return `<div class="setting-row ai-model-role-row"><span class="setting-copy"><strong>${esc(copy.title)}</strong><span>${esc(copy.detail)}</span><span class="ai-model-role-caption">${esc(caption + imageNote)}</span></span><span class="ai-model-role-controls"><label><span class="visually-hidden">${esc(copy.title)} model</span><select data-ai-model-role="${roleId}" data-ai-model-field="modelKey" ${busy ? 'disabled' : ''}>${aiModelRoleOptions(connections, role)}</select></label><label><span class="visually-hidden">${esc(copy.title)} thinking</span><select data-ai-model-role="${roleId}" data-ai-model-field="thinking" ${busy ? 'disabled' : ''}>${thinking}</select></label></span></div>`;
+}
+
+function aiModelKeyCard(status, provider) {
+  const ai = state.aiModel;
+  const saved = status[provider.id];
+  const connection = (status.connections || []).find(entry => entry.id === provider.id);
+  const busy = ai.saving || ai.removing;
+  const savingThis = ai.saving && ai.savingProvider === provider.id;
+  const saveError = ai.saveError && ai.saveError.provider === provider.id
+    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.saveError.message)}</strong>${ai.saveError.nextAction ? ` ${esc(ai.saveError.nextAction)}` : ''}</span></div>`
+    : '';
+  const meta = saved
+    ? `Key ${esc(saved.keySuffix)} · verified ${esc(relativeTime(saved.verifiedAt))}`
+    : esc(provider.intro);
+  const pill = saved
+    ? `<span class="pill ${connection?.healthy && !connection?.issue ? 'good' : 'warn'}">${connection?.healthy && !connection?.issue ? 'Ready' : 'Needs attention'}</span>`
+    : '';
+  const savedRows = saved
+    ? `${aiModelModelList(connection)}<div class="ai-model-key-remove"><button class="button small" type="button" data-action="ai-model-remove" data-provider="${provider.id}" ${busy ? 'disabled' : ''}>${ai.removing && ai.savingProvider === provider.id ? 'Removing…' : 'Remove key'}</button></div>`
+    : '';
+  const issue = saved ? aiModelIssueAlert(connection?.issue) : '';
+  const field = mcpField('apiKey', `${provider.label} API key`, '', {
+    type: 'password',
+    placeholder: 'sk-…',
+    autocomplete: 'off',
+    required: true,
+    help: `Create one at ${provider.keysUrl}. BotBoy checks it with ${provider.label}, keeps it private on this Mac, and offers its models right away.`,
+  });
+  return `<form class="card mcp-form ai-model-key-form" data-provider="${provider.id}"><div class="card-header"><div><h2 class="card-title">${esc(provider.label)}</h2><div class="card-meta">${meta}</div></div>${pill}</div>${saveError}${issue}<div class="mcp-form-body">${savedRows}${field}<p class="card-meta">When one of this key's models does the work, what it reads (captured messages, documents, your chats, and query results) is sent to ${esc(provider.label)} under your account. Data Room table values stay on this Mac.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${savingThis ? 'Checking key…' : saved ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
+}
+
 function renderAiModelSettings() {
   const ai = state.aiModel;
-  const head = `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>AI model</span></div>${pageHead('Settings', 'AI model', 'Choose what powers chat and background organizing. Changes apply right away, with no restart.', '<a class="button" href="#/settings">Back</a>')}`;
+  const head = `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>AI model</span></div>${pageHead('Settings', 'AI model', 'Connect model providers and choose which model does each kind of work. Changes apply right away, with no restart.', '<a class="button" href="#/settings">Back</a>')}`;
   if (!ai.status) {
     if (!ai.error) {
       if (!ai.loading) void loadAiModelStatus();
@@ -3383,26 +3491,19 @@ function renderAiModelSettings() {
   }
   const status = ai.status;
   const busy = ai.saving || ai.removing;
-  const ready = status.state === 'ready';
   const notSetUp = status.state === 'not_configured';
-  const models = Array.isArray(status.models) ? status.models.map(model => model?.label).filter(Boolean) : [];
-  const issue = status.issue
-    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(status.issue.message)}</strong> ${esc(status.issue.nextAction)}</span></div>`
+  const connections = Array.isArray(status.connections) ? status.connections : [];
+  const team = connections.find(connection => connection.id === 'team');
+  const roles = status.roles
+    ? `${aiModelRoleRow(status, 'processing')}${aiModelRoleRow(status, 'documents')}<div class="setting-row"><span class="setting-copy"><strong>Chat</strong><span>Each message uses the model picked in the chat panel.</span></span></div>`
     : '';
-  const statusRows = notSetUp
-    ? `<div class="setting-row"><span class="setting-copy"><strong>No AI model yet</strong><span>Chat and background organizing are off until you add an OpenAI API key below.</span></span><span class="pill">Not set up</span></div>`
-    : `<div class="setting-row"><span class="setting-copy"><strong>${esc(status.providerLabel)}</strong><span>${status.source === 'settings' ? 'Set up here in Settings.' : 'Set up by the BotBoy launcher configuration.'}</span></span><span class="pill ${ready ? 'good' : 'warn'}">${ready ? 'Ready' : 'Needs attention'}</span></div>`
-      + `<div class="setting-row"><span class="setting-copy"><strong>Background organizing</strong><span>Routing, project briefs, and digests use ${esc(status.backgroundModel)}.</span></span></div>`
-      + `<div class="setting-row"><span class="setting-copy"><strong>Chat models</strong><span>${models.length ? esc(models.join(' · ')) : 'The provider default.'}</span></span></div>`;
-  const keyRow = status.openai
-    ? `<div class="setting-row"><span class="setting-copy"><strong>OpenAI key ${esc(status.openai.keySuffix)}</strong><span>Verified ${esc(relativeTime(status.openai.verifiedAt))}.${status.environmentProviderLabel ? ` Removing it switches BotBoy back to ${esc(status.environmentProviderLabel)}.` : ' Removing it turns chat and background organizing off.'}</span></span><button class="button small" type="button" data-action="ai-model-remove" ${busy ? 'disabled' : ''}>${ai.removing ? 'Removing…' : 'Remove key'}</button></div>`
+  const intro = notSetUp
+    ? `<div class="setting-row"><span class="setting-copy"><strong>No AI model yet</strong><span>Chat and background organizing are off until you add an OpenAI or DeepSeek API key below.</span></span><span class="pill">Not set up</span></div>`
+    : roles;
+  const teamCard = team && !notSetUp
+    ? `<article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">${esc(team.label)}</h2><div class="card-meta">Set up by the BotBoy launcher configuration.</div></div><span class="pill ${team.healthy ? 'good' : 'warn'}">${team.healthy ? 'Ready' : 'Needs attention'}</span></div>${aiModelIssueAlert(team.issue)}${aiModelModelList(team)}</article>`
     : '';
-  const replacing = Boolean(status.openai);
-  const saveError = ai.saveError
-    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.saveError.message)}</strong>${ai.saveError.nextAction ? ` ${esc(ai.saveError.nextAction)}` : ''}</span></div>`
-    : '';
-  const form = `<form class="card mcp-form ai-model-key-form"><div class="card-header"><div><h2 class="card-title">${replacing ? 'Replace your OpenAI API key' : 'Use your OpenAI API key'}</h2><div class="card-meta">Runs chat and background organizing on GPT-5.6 and GPT-6 with your own OpenAI account.</div></div></div>${saveError}<div class="mcp-form-body">${mcpField('apiKey', 'OpenAI API key', '', { type: 'password', placeholder: 'sk-…', autocomplete: 'off', required: true, help: 'Create one at platform.openai.com/api-keys. BotBoy checks it with OpenAI, keeps it private on this Mac, and switches over right away.' })}<p class="card-meta">While a key is saved, what BotBoy’s model reads (captured messages, documents, your chats, and query results) is sent to OpenAI under your account. Data Room table values stay on this Mac, so chat can’t analyze Data Room datasets in this mode.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${ai.saving ? 'Checking key…' : replacing ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
-  return `${head}<section class="ai-model-settings"><article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Current model</h2><div class="card-meta">What powers BotBoy right now</div></div><button class="button small ghost" type="button" data-action="ai-model-refresh" ${ai.loading || busy ? 'disabled' : ''}>${ai.loading ? 'Checking…' : 'Refresh'}</button></div>${issue}${statusRows}${keyRow}</article>${form}</section>`;
+  return `${head}<section class="ai-model-settings"><article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Background work</h2><div class="card-meta">Models BotBoy uses when you are not chatting</div></div><button class="button small ghost" type="button" data-action="ai-model-refresh" ${ai.loading || busy ? 'disabled' : ''}>${ai.loading ? 'Checking…' : 'Refresh'}</button></div>${ai.roleError ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.roleError.message)}</strong>${ai.roleError.nextAction ? ` ${esc(ai.roleError.nextAction)}` : ''}</span></div>` : ''}${intro}</article>${teamCard}${AI_MODEL_KEY_PROVIDERS.map(provider => aiModelKeyCard(status, provider)).join('')}</section>`;
 }
 
 /** Tell the chat panel (app.js) to refresh its model picker and notice now. */
@@ -3412,52 +3513,96 @@ function announceAiModelChange() {
 
 async function saveAiModelKey(form) {
   if (!form || state.aiModel.saving || state.aiModel.removing) return;
+  const provider = AI_MODEL_KEY_PROVIDERS.find(entry => entry.id === form.dataset.provider);
+  if (!provider) return;
   // Read before painting: the busy repaint recreates the field empty.
   const apiKey = String(form.elements.apiKey?.value || '').trim();
   if (!apiKey) return;
   state.aiModel.saving = true;
+  state.aiModel.savingProvider = provider.id;
   state.aiModel.saveError = null;
   renderRoute({ preserveScroll: true, userAction: true });
   try {
-    const status = await request('/settings/ai-model/openai', { method: 'PUT', body: { apiKey } });
+    const status = await request(`/settings/ai-model/${provider.id}`, { method: 'PUT', body: { apiKey } });
     // Supersede any status read that started before this change.
     state.aiModel.requestId += 1;
     state.aiModel.loading = false;
     state.aiModel.status = status;
     state.aiModel.error = '';
-    toast('OpenAI is on. Chat and background organizing now use your key.');
+    toast(`${provider.label} is on. Its models are ready in chat and in Background work.`);
     announceAiModelChange();
   } catch (error) {
-    state.aiModel.saveError = { message: aiModelErrorText(error), nextAction: String(error?.nextAction || '') };
-    toast('Could not turn on OpenAI', 'bad');
+    state.aiModel.saveError = { provider: provider.id, message: aiModelErrorText(error), nextAction: String(error?.nextAction || '') };
+    toast(`Could not turn on ${provider.label}`, 'bad');
   } finally {
     state.aiModel.saving = false;
+    state.aiModel.savingProvider = '';
     if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
-async function removeAiModelKey() {
+async function removeAiModelKey(providerId) {
   const status = state.aiModel.status;
-  if (!status?.openai || state.aiModel.saving || state.aiModel.removing) return;
-  const after = status.environmentProviderLabel
-    ? `BotBoy switches back to ${status.environmentProviderLabel} right away.`
-    : 'Chat and background organizing stop until you add a key again.';
-  if (!window.confirm(`Remove the saved OpenAI key (${status.openai.keySuffix})?\n\n${after}`)) return;
+  const provider = AI_MODEL_KEY_PROVIDERS.find(entry => entry.id === providerId);
+  if (!provider || !status?.[provider.id] || state.aiModel.saving || state.aiModel.removing) return;
+  if (!window.confirm(`Remove the saved ${provider.label} key (${status[provider.id].keySuffix})?\n\nChats on its models stop, and background work moves to another connected model.`)) return;
   state.aiModel.removing = true;
+  state.aiModel.savingProvider = provider.id;
   state.aiModel.saveError = null;
   renderRoute({ preserveScroll: true, userAction: true });
   try {
-    const next = await request('/settings/ai-model/openai', { method: 'DELETE' });
+    const next = await request(`/settings/ai-model/${provider.id}`, { method: 'DELETE' });
     state.aiModel.requestId += 1;
     state.aiModel.loading = false;
     state.aiModel.status = next;
     state.aiModel.error = '';
-    toast('OpenAI key removed');
+    toast(`${provider.label} key removed`);
     announceAiModelChange();
   } catch (error) {
     toast(`Could not remove the key: ${aiModelErrorText(error)}`, 'bad');
   } finally {
     state.aiModel.removing = false;
+    state.aiModel.savingProvider = '';
+    if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+/** Saving re-renders the page; keep keyboard focus on the control the owner used. */
+function restoreAiModelRoleFocus() {
+  const pending = state.aiModel.pendingFocus;
+  if (!pending || state.aiModel.roleBusy) return;
+  state.aiModel.pendingFocus = null;
+  document.querySelector(`select[data-ai-model-role="${CSS.escape(pending.role)}"][data-ai-model-field="${CSS.escape(pending.field)}"]`)
+    ?.focus({ preventScroll: true });
+}
+
+/** Apply a Background work model or Thinking choice right away. */
+async function saveAiModelRole(select) {
+  const role = select?.dataset?.aiModelRole;
+  const field = select?.dataset?.aiModelField;
+  if (!AI_MODEL_ROLE_COPY[role] || (field !== 'modelKey' && field !== 'thinking')) return;
+  if (state.aiModel.roleBusy || state.aiModel.saving || state.aiModel.removing) return;
+  const body = field === 'modelKey' ? { modelKey: select.value || null } : { thinking: select.value };
+  state.aiModel.roleBusy = role;
+  state.aiModel.roleError = null;
+  state.aiModel.pendingFocus = { role, field };
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const status = await request(`/settings/ai-model/roles/${role}`, { method: 'PUT', body });
+    state.aiModel.requestId += 1;
+    state.aiModel.loading = false;
+    state.aiModel.status = status;
+    state.aiModel.error = '';
+    const chosen = status.roles?.[role];
+    toast(field === 'modelKey'
+      ? `${AI_MODEL_ROLE_COPY[role].title} now uses ${chosen?.label || 'the selected model'}`
+      : `${AI_MODEL_ROLE_COPY[role].title} thinking: ${chosen?.thinking || select.value}`);
+    announceAiModelChange();
+  } catch (error) {
+    state.aiModel.roleError = { message: aiModelErrorText(error), nextAction: String(error?.nextAction || '') };
+    toast('Could not change the model', 'bad');
+  } finally {
+    state.aiModel.roleBusy = '';
     if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
@@ -6775,6 +6920,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
     });
   }
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
+  if (state.route.view === 'ai-model-settings') restoreAiModelRoleFocus();
   // Scroll ownership: only USER-INITIATED renders may reset to top (real
   // navigation). Background renders — polls, loader completions, SSE — always
   // restore the previous position, whether or not preserveScroll was threaded
@@ -7400,7 +7546,7 @@ function bindEvents() {
       void loadLlmUsage({ force: true });
       renderRoute({ preserveScroll: true, userAction: true });
     }
-    if (action === 'ai-model-remove') void removeAiModelKey();
+    if (action === 'ai-model-remove') void removeAiModelKey(target.dataset.provider);
     if (action === 'ai-model-refresh') void loadAiModelStatus();
     if (action === 'llm-usage-range') {
       const days = Number(target.dataset.days);
@@ -8085,6 +8231,9 @@ function bindEvents() {
   document.addEventListener('change', event => {
     if (event.target?.id === 'mcp-auth-method' || event.target?.id === 'mcp-context-source') {
       updateMcpFormVisibility();
+    }
+    if (event.target?.matches?.('[data-ai-model-role]')) {
+      void saveAiModelRole(event.target);
     }
   });
 

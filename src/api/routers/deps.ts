@@ -67,7 +67,7 @@ export interface RouterDeps {
   channelDigester?: ChannelDigester;
   // Chat streaming loop deps (previously accessed via `(deps as any)`)
   llmClient?: LlmClient;
-  /** Settings → AI model: owner OpenAI key, verified activation, live status. */
+  /** Settings → AI model: model connections, background role choices, chat model catalog, live status. */
   aiModelSettings?: AiModelSettingsService;
   llmUsageService?: LlmUsageService;
   toolExecutor?: ToolExecutor;

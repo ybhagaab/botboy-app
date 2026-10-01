@@ -286,6 +286,31 @@ describe('visual inspection composite', () => {
     const runs = storage.getDb().prepare('SELECT COUNT(*) AS n FROM visual_inspection_runs').get() as any;
     expect(runs.n).toBe(1);
   });
+
+  it('stops before any model call when the organizing model cannot read images', async () => {
+    const { storage, registry } = fixture();
+    const asset = registry.registerBuffer({ buffer: makePng(8, 8, () => [1, 2, 3, 255]), ownerKind: 'chat_attachment', ownerId: 'text-only' });
+    const fake = fakeLlm();
+    const client = {
+      ...fake.client,
+      getModelOperation: () => ({
+        connectionId: 'deepseek',
+        modelKey: 'deepseek.deepseek-v4-pro',
+        label: 'DeepSeek V4 Pro',
+        provider: { id: 'deepseek', endpoint: 'https://api.deepseek.com', model: 'deepseek-v4-pro', apiMode: 'responses' as const },
+        capabilities: { images: false, contextWindow: 1_000_000, maxOutputTokens: 384_000 },
+        client: fake.client,
+      }),
+    };
+    const inspector = createVisualInspector({ db: storage.getDb(), registry, llmClient: client });
+    const error = await inspector.inspect({ assetIds: [asset.assetId], question: 'What is visible?', ownerRequest: 'Inspect it.', callerKind: 'interactive' }).catch(e => e);
+    expect(error).toMatchObject({ code: 'VISUAL_MODEL_TEXT_ONLY', nextAction: expect.stringContaining('Settings → AI model') });
+    expect(error.message).toContain('DeepSeek V4 Pro');
+    expect(fake.client.chatCompletionPrimary).not.toHaveBeenCalled();
+    expect(fake.client.preflightPrimary).not.toHaveBeenCalled();
+    const runs = storage.getDb().prepare('SELECT COUNT(*) AS n FROM visual_inspection_runs').get() as any;
+    expect(runs.n).toBe(0);
+  });
 });
 
 describe('sips crop provenance', () => {

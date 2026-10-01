@@ -25,13 +25,14 @@ import type { LlmUsageService } from './llm-usage.js';
  * gateway credentials themselves.
  */
 /**
- * 'openai' is the hosted OpenAI API configured from Settings → AI model (the
- * owner's own key). It is never derived from environment variables, so an
- * ambient OPENAI_API_KEY can never silently redirect BotBoy's data.
+ * 'openai' and 'deepseek' are hosted APIs configured from Settings → AI model
+ * (the owner's own keys). They are never derived from environment variables,
+ * so an ambient OPENAI_API_KEY or DEEPSEEK_API_KEY can never silently redirect
+ * BotBoy's data.
  */
-export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible' | 'openai';
+export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible' | 'openai' | 'deepseek';
 /** Providers the launcher/environment can select. */
-export type EnvInferenceProviderId = Exclude<InferenceProviderId, 'openai'>;
+export type EnvInferenceProviderId = Exclude<InferenceProviderId, 'openai' | 'deepseek'>;
 
 export interface InferenceProvider {
   readonly id: InferenceProviderId;
@@ -424,6 +425,7 @@ function buildLlmConfig(
     apiKey?: string;
     requestAuthorizer?: LlmRequestAuthorizer;
   },
+  model: { supportsReasoning?: boolean } = {},
 ): LlmConfig {
   return {
     ecs: {
@@ -437,6 +439,7 @@ function buildLlmConfig(
       authMode: auth.authMode,
       apiKey: auth.apiKey,
       requestAuthorizer: auth.requestAuthorizer,
+      ...(model.supportsReasoning === false ? { supportsReasoning: false } : {}),
     },
     // A fallback endpoint is omitted entirely unless explicitly enabled. This
     // prevents background intelligence from silently switching models.
@@ -619,8 +622,17 @@ function runtimeSettingsFromEnv(env: NodeJS.ProcessEnv) {
 export interface OpenAiPlatformInferenceOptions {
   /** The owner's OpenAI API key. Held only by the request authorizer. */
   apiKey: string;
-  /** Plain catalog ids the key reported (GET /v1/models); undefined = unknown. */
+  /** Plain chat-model ids the key reported (GET /v1/models); undefined = unknown. */
   availableModels?: readonly string[];
+  /**
+   * The connection's default model (health probe, route-less calls).
+   * Defaults to GPT-5.6 Terra; Settings picks one the key actually lists.
+   */
+  defaultModel?: string;
+  /** Context window of the default model (route-less budget math). */
+  defaultContextTokens?: number;
+  /** false when the default model rejects Responses reasoning parameters. */
+  defaultSupportsReasoning?: boolean;
   /** Test seam only; production always uses the hosted OpenAI API. */
   endpoint?: string;
   /** Runtime tuning source (timeouts, health cadence, fallback). */
@@ -628,9 +640,10 @@ export interface OpenAiPlatformInferenceOptions {
 }
 
 /**
- * The hosted OpenAI API powering every BotBoy workload with the owner's key:
- * Responses wire, OpenAI dialect, GPT-5.6 Terra for background work, and the
- * per-key model list for the chat catalog.
+ * The hosted OpenAI API with the owner's key: Responses wire, OpenAI dialect,
+ * and the per-key model list. Which model serves chat, organizing, and
+ * document writing is chosen per use (Settings → AI model); the default model
+ * here only anchors the free health probe and route-less calls.
  */
 export function createOpenAiPlatformInferenceProvider(
   options: OpenAiPlatformInferenceOptions,
@@ -640,22 +653,76 @@ export function createOpenAiPlatformInferenceProvider(
   const env = options.env ?? process.env;
   const settings: SharedProviderOptions = {
     endpoint: (options.endpoint ?? OPENAI_PLATFORM_ENDPOINT).replace(/\/+$/, ''),
-    model: OPENAI_PLATFORM_DEFAULT_MODEL,
+    model: options.defaultModel?.trim() || OPENAI_PLATFORM_DEFAULT_MODEL,
     apiMode: 'responses',
     dialect: 'openai',
     reasoningEffort: reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low',
-    maxContextTokens: OPENAI_PLATFORM_MAX_CONTEXT_TOKENS,
+    maxContextTokens: options.defaultContextTokens ?? OPENAI_PLATFORM_MAX_CONTEXT_TOKENS,
+    ...runtimeSettingsFromEnv(env),
+  };
+  const config = buildLlmConfig(settings, {
+    authMode: 'apiKey',
+    requestAuthorizer: createStaticBearerAuthorizer(apiKey),
+  }, { supportsReasoning: options.defaultSupportsReasoning });
+  return provider('openai', settings, {
+    ...config,
+    providerId: 'openai',
+    platform: 'openai',
+    ...(options.availableModels ? { availableModels: Object.freeze([...options.availableModels]) } : {}),
+  });
+}
+
+/** DeepSeek API (Settings → AI model). Responses lives at the base URL. */
+export const DEEPSEEK_PLATFORM_ENDPOINT = 'https://api.deepseek.com';
+/** Preferred default when the key lists it: vision-capable and fastest. */
+export const DEEPSEEK_PREFERRED_DEFAULT_MODEL = 'deepseek-flash';
+/** DeepSeek's documented V4 profile, used only when GET /models omits a value. */
+const DEEPSEEK_DEFAULT_CONTEXT_TOKENS = 1_000_000;
+
+export interface DeepSeekInferenceOptions {
+  /** The owner's DeepSeek API key. Held only by the request authorizer. */
+  apiKey: string;
+  /** Model ids the key reported (GET /models). */
+  availableModels: readonly string[];
+  /** The connection's default model (route-less calls); must be listed. */
+  defaultModel: string;
+  /** Context window of the default model, from GET /models. */
+  defaultContextTokens?: number;
+  /** Test seam only; production always uses the hosted DeepSeek API. */
+  endpoint?: string;
+  /** Runtime tuning source (timeouts, health cadence, fallback). */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The hosted DeepSeek API with the owner's key, on its Responses surface:
+ * the same wire and dialect as OpenAI, with DeepSeek's effort levels and
+ * error codes handled by `platform: 'deepseek'` in llm-client.ts.
+ */
+export function createDeepSeekInferenceProvider(options: DeepSeekInferenceOptions): InferenceProvider {
+  const apiKey = options.apiKey.trim();
+  if (!apiKey) throw new Error('A DeepSeek API key is required.');
+  const defaultModel = options.defaultModel.trim();
+  if (!defaultModel) throw new Error('A DeepSeek default model is required.');
+  const env = options.env ?? process.env;
+  const settings: SharedProviderOptions = {
+    endpoint: (options.endpoint ?? DEEPSEEK_PLATFORM_ENDPOINT).replace(/\/+$/, ''),
+    model: defaultModel,
+    apiMode: 'responses',
+    dialect: 'openai',
+    reasoningEffort: reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low',
+    maxContextTokens: options.defaultContextTokens ?? DEEPSEEK_DEFAULT_CONTEXT_TOKENS,
     ...runtimeSettingsFromEnv(env),
   };
   const config = buildLlmConfig(settings, {
     authMode: 'apiKey',
     requestAuthorizer: createStaticBearerAuthorizer(apiKey),
   });
-  return provider('openai', settings, {
+  return provider('deepseek', settings, {
     ...config,
-    providerId: 'openai',
-    platform: 'openai',
-    ...(options.availableModels ? { availableModels: Object.freeze([...options.availableModels]) } : {}),
+    providerId: 'deepseek',
+    platform: 'deepseek',
+    availableModels: Object.freeze([...options.availableModels]),
   });
 }
 
@@ -680,8 +747,9 @@ export function resolveInferenceProviderId(
 ): EnvInferenceProviderId {
   const providerName = (env.BOTBOY_INFERENCE_PROVIDER || '').trim().toLowerCase()
     || inferProvider(env);
-  if (providerName === 'openai') {
-    throw new Error('BOTBOY_INFERENCE_PROVIDER=openai is not an environment setting. Add your OpenAI API key in BotBoy Settings → AI model instead, and remove this variable.');
+  if (providerName === 'openai' || providerName === 'deepseek') {
+    const label = providerName === 'openai' ? 'OpenAI' : 'DeepSeek';
+    throw new Error(`BOTBOY_INFERENCE_PROVIDER=${providerName} is not an environment setting. Add your ${label} API key in BotBoy Settings → AI model instead, and remove this variable.`);
   }
   if (providerName !== 'bedrock' && providerName !== 'gateway' && providerName !== 'openai-compatible') {
     throw new Error(`Unsupported BOTBOY_INFERENCE_PROVIDER: ${providerName}`);
@@ -694,6 +762,7 @@ export function defaultInferenceMaxContextTokens(id: InferenceProviderId): numbe
   if (id === 'bedrock') return BEDROCK_MAX_CONTEXT_TOKENS;
   if (id === 'gateway') return GATEWAY_MAX_CONTEXT_TOKENS;
   if (id === 'openai') return OPENAI_PLATFORM_MAX_CONTEXT_TOKENS;
+  if (id === 'deepseek') return DEEPSEEK_DEFAULT_CONTEXT_TOKENS;
   return OPENAI_COMPATIBLE_MAX_CONTEXT_TOKENS;
 }
 
