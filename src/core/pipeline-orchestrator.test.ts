@@ -16,6 +16,7 @@ import { createPipelineOrchestrator, isFullOrganizeDue } from './pipeline-orches
 import type { DocumentParser } from './document-parser.js';
 import type { OcrEngine, OcrResult } from './ocr-engine.js';
 import type { PipelineLlm } from './pipeline-llm.js';
+import type { PlacementRepairTick } from './placement-repair.js';
 
 describe('PipelineOrchestrator', () => {
   let storage: StorageLayer;
@@ -108,7 +109,10 @@ describe('PipelineOrchestrator', () => {
     );
   }
 
-  function buildState(llm: PipelineLlm, extra: { documentReads?: { tick(reader: unknown): Promise<unknown> } } = {}) {
+  function buildState(llm: PipelineLlm, extra: {
+    documentReads?: { tick(reader: unknown): Promise<unknown> };
+    placementRepair?: { tick(reader: unknown): Promise<PlacementRepairTick> };
+  } = {}) {
     const db = storage.getDb();
     const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
     const failures = createFailureRecorder(db);
@@ -122,6 +126,7 @@ describe('PipelineOrchestrator', () => {
     const orchestrator = createPipelineOrchestrator({
       db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, brainStore,
       documentReads: extra.documentReads,
+      placementRepair: extra.placementRepair,
       config: { extractionConcurrency: 2 },
     });
     return { orchestrator, brainStore };
@@ -189,6 +194,37 @@ describe('PipelineOrchestrator', () => {
     await orch.tickExtraction();
     expect((await orch.tickInterpretation()).ran).toBe(true);
     expect(documentReads.tick).toHaveBeenCalledTimes(1); // the wave had the tick
+  });
+
+  it('runs a placement-repair step on an idle tick ahead of long document reads, never instead of a wave', async () => {
+    const steps: PlacementRepairTick[] = [
+      { ran: true, step: 'placed', placed: 2, released: 0, ownerRestored: 0, projects: 1 },
+      { ran: true, step: 'synthesized', projectId: 'proj_a', itemIds: ['x', 'y'], remainingProjects: 0 },
+      { ran: false },
+    ];
+    const placementRepair = { tick: vi.fn(async () => steps.shift() ?? { ran: false as const }) };
+    const documentReads = { tick: vi.fn(async () => ({ ran: false })) };
+    const llm: PipelineLlm = {
+      isAvailable: () => true,
+      complete: async (prompt) => prompt.includes('librarian')
+        ? JSON.stringify([{ itemId: 'a', decision: 'new', newTitle: 'Extracted Body Project' }])
+        : JSON.stringify({ summary: 's', statusLine: 'active', tasks: [], blockers: [], people: [], newActivity: [] }),
+    };
+    const orch = buildState(llm, { documentReads, placementRepair }).orchestrator;
+
+    await orch.tickInterpretation();
+    await orch.tickInterpretation();
+    expect(placementRepair.tick).toHaveBeenCalledTimes(2);
+    expect(documentReads.tick).not.toHaveBeenCalled();
+    await orch.tickInterpretation();
+    expect(documentReads.tick).toHaveBeenCalledTimes(1); // repair idle: the reading lane has the tick
+
+    const f = path.join(dir, 'a.txt');
+    writeFileSync(f, 'x');
+    insertCaptured('a', f, 'manual');
+    await orch.tickExtraction();
+    expect((await orch.tickInterpretation()).ran).toBe(true);
+    expect(placementRepair.tick).toHaveBeenCalledTimes(3); // the wave had the tick
   });
 
   it('interpretation tick does not fire when nothing is pending', async () => {

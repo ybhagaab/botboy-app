@@ -1439,15 +1439,22 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
         && projectTitleHasExactDocumentFilenameAnchor(homeAnchor, item.title ?? '');
     });
 
-    // Scope-integrity quarantine (owner request 2026-08-21): evidence that
-    // independently anchors a FOREIGN project scope is the raw material of
-    // brain contamination — one blended item widens the summary, which
-    // attracts the next off-topic item. A foreign anchor counts only when it
-    // is distinctive, exact, or clearly dominates this project's own anchor;
-    // ordinary shared vocabulary in a large portfolio never trips it. Flagged
-    // items stay on the work item (advisory, surfaced in the project UI) and
-    // are kept OUT of synthesis; the owner decides placement. Items that stop
-    // being mixed clear their flag.
+    // Scope alert (advisory only). Evidence that also anchors a FOREIGN
+    // project scope is flagged on the work item and surfaced in the project
+    // UI, so the owner can review the placement. A foreign anchor counts only
+    // when it is distinctive, exact, or clearly dominates this project's own
+    // anchor; ordinary shared vocabulary in a large portfolio never trips it.
+    // Items that stop being mixed clear their flag.
+    //
+    // Every item here is already placed in this project and anchors its
+    // scope (filter above), so a flag never holds it back from synthesis
+    // (owner decision 2026-10-05). This retires the 2026-08-21 quarantine of
+    // dominant foreign anchors: a lexical competitor is not evidence of a
+    // misfiling. The quarantine withheld the AppsFlyer/CleverTap event
+    // contract from its own project because "MX Player Content Cards &
+    // Banner Widgets" shared four product words with it. Placement belongs
+    // to routing and the owner; `dominantTitles` stays on the alert as review
+    // information, and `quarantined` is always false.
     const foreignAnchors = brainStore.listProjects()
       .filter((project) => (project.status === 'active' || project.status === 'paused')
         && project.id !== projectId
@@ -1463,23 +1470,18 @@ Keep it tight and information-dense. Prefer evidence over completeness.`;
         foreignAnchors,
       );
       if (mixed.mixed) {
-        // Dominant foreign anchor → probable misfiling: flag AND withhold from
-        // synthesis. Non-dominant → related scopes genuinely touching: flag as
-        // advisory but keep synthesizing, otherwise a project whose documents
-        // legitimately reference a sibling program could never build a brain.
-        const quarantine = mixed.dominantTitles.length > 0;
         setScopeAlert.run(
           JSON.stringify({
             titles: mixed.titles,
             dominantTitles: mixed.dominantTitles,
-            quarantined: quarantine,
+            quarantined: false,
             detectedAt: new Date().toISOString(),
             pass: 'brain',
           }),
           item.id,
         );
-        console.log(`[Brain] Mixed-scope evidence in ${projectId}: ${item.id} anchors ${mixed.titles.join(' | ')}${quarantine ? ' (quarantined)' : ' (advisory, synthesized)'}`);
-        if (!quarantine) cleanItems.push(item);
+        console.log(`[Brain] Mixed-scope evidence in ${projectId}: ${item.id} anchors ${mixed.titles.join(' | ')} (advisory, synthesized)`);
+        cleanItems.push(item);
       } else {
         setScopeAlert.run(null, item.id);
         cleanItems.push(item);

@@ -28,6 +28,7 @@ import type { ChannelDigester } from './channel-digest.js';
 import type { BrainStore } from './brain-store.js';
 import { BrainWriteConflictError, newBrain, type Brain } from './brain-store.js';
 import { syncNodesFromProjects } from './node-projection.js';
+import type { PlacementRepairTick } from './placement-repair.js';
 
 export interface OrchestratorConfig {
   extractionConcurrency?: number; // default 2
@@ -167,6 +168,13 @@ export function createPipelineOrchestrator(deps: {
    * and ordinary brain updates never wait for reading.
    */
   documentReads?: { tick(reader: BrainUpdater): Promise<unknown> };
+  /**
+   * Placement repair, once per store (placement-repair.ts): orphans the
+   * retired exclusivity veto left return to the projects the model chose,
+   * then one project's brain synthesis per tick in which no librarian wave
+   * is due, ahead of long document reads.
+   */
+  placementRepair?: { tick(reader: BrainUpdater): Promise<PlacementRepairTick> };
   config?: OrchestratorConfig;
 }): PipelineOrchestrator {
   const { db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, digester, brainStore, gister } = deps;
@@ -181,6 +189,22 @@ export function createPipelineOrchestrator(deps: {
     if (!deps.documentReads) return;
     try { await deps.documentReads.tick(brainUpdater); } catch (error) {
       console.warn(`[Pipeline] long document read failed: ${(error as Error)?.message ?? error}`);
+    }
+  }
+
+  /** One placement-repair step; true when it did work this tick. */
+  async function repairPlacements(): Promise<boolean> {
+    if (!deps.placementRepair) return false;
+    try {
+      const step = await deps.placementRepair.tick(brainUpdater);
+      if (!step.ran) return false;
+      if (step.step === 'synthesized') await gistRoutedEvidence(Math.max(8, step.itemIds.length));
+      try { syncNodesFromProjects(db); } catch { /* projection best-effort */ }
+      refreshProjectRelations();
+      return true;
+    } catch (error) {
+      console.warn(`[Pipeline] placement repair failed: ${(error as Error)?.message ?? error}`);
+      return false;
     }
   }
 
@@ -234,7 +258,7 @@ export function createPipelineOrchestrator(deps: {
     try {
       adoptFileReferences();
       if (!batcher.shouldFire()) {
-        await readDocumentPart();
+        if (!(await repairPlacements())) await readDocumentPart();
         return { ran: false };
       }
       const wave = await librarian.runWave();

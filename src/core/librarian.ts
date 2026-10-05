@@ -528,10 +528,19 @@ Return ONLY the JSON array.`;
       // Validate against the founding scope, not the current (possibly
       // drifted) title/brief: a contaminated brain can never widen what its
       // project is allowed to attract.
-      const scope = projectTitleHasExclusiveEvidenceAnchor(
+      //
+      // The model already placed the item in this existing project, so the
+      // only check is that the item anchors this project's founding scope. A
+      // lexical competitor never vetoes the placement: in a large portfolio,
+      // ordinary product words collide with some other title, and that veto
+      // overrode 260 placements, nearly all of them correct. Owner report
+      // 2026-10-05: a project's own event contract was orphaned because
+      // "MX Player Content Cards & Banner Widgets" shared "MX", "player",
+      // "content", and a single "banner" with it. Creating a NEW project
+      // (below) still checks that no existing project fits better.
+      const scope = evaluateProjectEvidenceScope(
         projectScopeAnchor(target),
         scopeEvidence(item),
-        activeProjectScopeAnchors(),
       );
       const corroboratedReason = scope.matches
         ? null

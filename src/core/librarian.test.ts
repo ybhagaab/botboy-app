@@ -224,6 +224,48 @@ describe('Librarian', () => {
     expect(res2.assigned).toBe(1);
   });
 
+  it('keeps the model\'s anchored placement when another title shares more product words (owner report 2026-10-05)', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_argonaut', 'Argonaut MX Client Metrics Instrumentation'), 'Argonaut MX Client Metrics Instrumentation');
+    brains.write(newBrain('proj_cards', 'MX Player Content Cards & Banner Widgets'), 'MX Player Content Cards & Banner Widgets');
+    // The live event contract: it anchors its own project on "MX" and
+    // "metrics", while the other title collects "MX", "player", "content",
+    // and one incidental "banner". The old exclusivity veto orphaned it.
+    insertExtracted('contract', 'AppsFlyer-and-CleverTap-Event-Contract-MXP-Android.docx', [
+      'AppsFlyer and CleverTap event contract for MX playback telemetry.',
+      'Player exit events carry content metadata and validated playback metrics.',
+      'Content type, content id, and player path are required; the banner slot id is optional.',
+    ].join('\n'));
+    const { lib } = build(mockLlm(() => JSON.stringify([
+      { itemId: 'contract', decision: 'assign', projectId: 'proj_argonaut' },
+    ])));
+
+    const res = await lib.runWave();
+    expect(res).toMatchObject({ assigned: 1, orphaned: 0 });
+    expect(db.prepare('SELECT process_state, project_id FROM work_items WHERE id = ?').get('contract'))
+      .toEqual({ process_state: 'routed', project_id: 'proj_argonaut' });
+    const audit = db.prepare('SELECT applied_decision AS applied, validation_reason AS reason FROM routing_decisions WHERE item_id = ?').get('contract') as any;
+    expect(audit.applied).toBe('assign');
+    expect(audit.reason).toBe('matched title scope via mx, metrics');
+  });
+
+  it('still refuses a new project when an existing unrelated project clearly fits better', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_cards', 'MX Player Content Cards & Banner Widgets'), 'MX Player Content Cards & Banner Widgets');
+    insertExtracted('cards', 'Banner widget layout', 'MX Player content cards and banner widgets: carousel layout for the home page');
+    const { lib, brains: routed } = build(mockLlm(() => JSON.stringify([
+      { itemId: 'cards', decision: 'new', newTitle: 'Home Carousel Layout Redesign' },
+    ])));
+
+    const res = await lib.runWave();
+    expect(res).toMatchObject({ created: 0, orphaned: 1 });
+    expect(routed.listProjects().map((project) => project.id)).toEqual(['proj_cards']);
+    const audit = db.prepare('SELECT validation_reason AS reason FROM routing_decisions WHERE item_id = ?').get('cards') as any;
+    expect(audit.reason).toBe('evidence is more strongly anchored to independent scope: MX Player Content Cards & Banner Widgets');
+  });
+
   it('creates a new project (with brain) when decision is "new"', async () => {
     insertExtracted('a', 'Hiring loop kickoff', 'Q3 eng hiring', 'manual');
     const { lib, brains } = build(

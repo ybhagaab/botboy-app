@@ -120,6 +120,7 @@ import { FILE_REFERENCE_TYPE, createFileReferences } from './core/file-reference
 import { createFileReferenceMigration } from './core/file-reference-migration.js';
 import { createRawCaptureRepair } from './core/raw-capture-repair.js';
 import { createDocumentReads } from './core/document-reads.js';
+import { createPlacementRepair } from './core/placement-repair.js';
 import { addLocalFolder } from './core/local-folders-config.js';
 import os from 'os';
 import { createDiskSpaceMonitor } from './core/disk-space.js';
@@ -760,7 +761,11 @@ async function main() {
   // interpretation tick adopts unassigned ones once their folder's
   // documents are routed.
   const fileReferences = createFileReferences({ db, contentStore });
-  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister, fileReferences, documentReads });
+  // Once per store: orphans the retired exclusivity veto left return to the
+  // projects the model chose, then their brains are updated on idle ticks
+  // (placement-repair.ts, owner decision 2026-10-05).
+  const placementRepair = createPlacementRepair({ db, contentStore, brainStore, llm: pipelineLlm });
+  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister, fileReferences, documentReads, placementRepair });
   // A newly activated model (Settings → AI model) drains the waiting capture
   // backlog now; later work follows the normal interpretation cadence.
   kickInformationPipeline = () => {

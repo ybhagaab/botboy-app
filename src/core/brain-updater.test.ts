@@ -1484,6 +1484,40 @@ describe('BrainUpdater', () => {
     expect(passing.scope_alert).toBeNull();
   });
 
+  it('synthesizes a placed item even when another title outweighs its anchor; the alert stays advisory (owner decision 2026-10-05)', async () => {
+    const prompts: string[] = [];
+    const { brains, updater } = build({
+      isAvailable: () => true,
+      complete: async (prompt: string) => {
+        prompts.push(prompt);
+        return JSON.stringify({ summary: 'Event contract for client metrics', newActivity: [] });
+      },
+    });
+    brains.write(newBrain('proj_argonaut', 'Argonaut MX Client Metrics Instrumentation'));
+    brains.write(newBrain('proj_cards', 'MX Player Content Cards & Banner Widgets'));
+    // The live event contract: it anchors its own project on "MX" and
+    // "metrics", while the other title collects "MX", "player", "content",
+    // and one incidental "banner", so that anchor dominates. The retired
+    // quarantine withheld this item from its own project's brain.
+    insertRouted('contract', 'AppsFlyer-and-CleverTap-Event-Contract-MXP-Android.docx', [
+      'AppsFlyer and CleverTap event contract for MX playback telemetry.',
+      'Player exit events carry content metadata and validated playback metrics.',
+      'Content type, content id, and player path are required; the banner slot id is optional.',
+    ].join('\n'), 'proj_argonaut', 'batchC');
+
+    const res = await updater.runForBatch('batchC');
+    expect(res).toEqual([{ projectId: 'proj_argonaut', status: 'updated' }]);
+    expect(prompts.filter((prompt) => prompt.includes('id="contract"'))).toHaveLength(1);
+    expect(brains.read('proj_argonaut')!.summary).toBe('Event contract for client metrics');
+    const row = storage.getDb().prepare('SELECT scope_alert FROM work_items WHERE id = ?').get('contract') as any;
+    expect(JSON.parse(row.scope_alert)).toMatchObject({
+      titles: ['MX Player Content Cards & Banner Widgets'],
+      dominantTitles: ['MX Player Content Cards & Banner Widgets'],
+      quarantined: false,
+      pass: 'brain',
+    });
+  });
+
   it('records a failure and skips on unparseable LLM output', async () => {
     const { brains, updater } = build({ isAvailable: () => true, complete: async () => 'not json at all' });
     brains.write(newBrain('proj_z', 'Content Parsing'));

@@ -382,7 +382,7 @@ function countTokenOccurrences(evidenceLower: string, token: string): number {
 }
 
 /**
- * Brain-pass quarantine check: does evidence already living in `homeTitle`'s
+ * Brain-pass scope-alert check (advisory): does evidence already living in `homeTitle`'s
  * project independently anchor a FOREIGN project scope? Deliberately much
  * more conservative than routing-time checks: in a large portfolio every page
  * shares ordinary words with some title, years appear in report-series
@@ -446,9 +446,10 @@ export function evidenceAnchorsForeignScope(
   return {
     mixed: foreign.length > 0,
     titles: foreign.map((entry) => entry.title),
-    // A dominant foreign anchor means the evidence is probably misfiled here;
-    // a non-dominant one means genuinely related scopes touching. Callers may
-    // synthesize the latter but should suppress the former.
+    // Foreign titles whose anchor outweighs the home anchor on shared product
+    // words. Review information only: the brain pass synthesizes placed items
+    // either way (owner decision 2026-10-05), because a lexical competitor is
+    // not evidence of a misfiling.
     dominantTitles: foreign.filter((entry) => entry.dominates).map((entry) => entry.title),
   };
 }

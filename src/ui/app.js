@@ -1741,9 +1741,18 @@ function escapeMarkdownText(value) {
     .replace(/'/g, '&#39;');
 }
 
+// In-app routes owned by the dashboard router (#/doc/<base64url docKey>,
+// #/projects/<id>, #/documents/<artifactId>, …). BotBoy's tools hand the model
+// exact routes such as a staged edit's `readerLink`, and the prompt tells it to
+// give them to the owner; rejecting them left "Approve + Sync" links as dead
+// text (owner report 2026-10-05). A hash route has no scheme, so it can only
+// change the view, and the character set excludes quotes, spaces, and markup.
+const IN_APP_ROUTE_HREF = /^#\/[A-Za-z0-9._~%=?&:+\/-]+$/;
+
 function safeMarkdownHref(value) {
   const href = String(value ?? '').trim();
   if (!href || /[\u0000-\u001f\u007f]/.test(href)) return null;
+  if (IN_APP_ROUTE_HREF.test(href)) return href;
   if (href.startsWith('/api/files/')) return href;
   if (!/^https?:\/\//i.test(href)) return null;
   try {
@@ -1757,6 +1766,11 @@ function safeMarkdownHref(value) {
 function markdownAnchor(label, href) {
   const safeHref = safeMarkdownHref(href);
   if (!safeHref) return null;
+  // In-app routes navigate this window, so the chat panel stays beside the
+  // view it opened; everything else keeps opening a separate tab.
+  if (safeHref.startsWith('#/')) {
+    return `<a class="chat-app-link" href="${escAttr(safeHref)}">${formatMarkdownInline(label, false)}</a>`;
+  }
   return `<a href="${escAttr(safeHref)}" target="_blank" rel="noopener noreferrer">${formatMarkdownInline(label, false)}</a>`;
 }
 
@@ -1928,6 +1942,13 @@ function formatMarkdownInline(raw, allowLinks = true) {
       const href = match.startsWith('/api/files/') ? match : `/api/files/${relativePath}`;
       const anchor = markdownAnchor(match, href);
       return anchor ? stash(anchor) : match;
+    });
+
+    // A bare document-reader route (a tool's `readerLink` pasted as text)
+    // becomes a readable link; the base64url id itself means nothing to the owner.
+    text = text.replace(/(^|[\s(\[:])(#\/doc\/[A-Za-z0-9_-]{8,})(?=$|[\s).,;:!?\]])/g, (match, prefix, route) => {
+      const anchor = markdownAnchor('Open in the document reader', route);
+      return anchor ? `${prefix}${stash(anchor)}` : match;
     });
 
     // Runs last so an explicit markdown link, URL, or code span that happens to

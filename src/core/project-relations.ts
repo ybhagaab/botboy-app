@@ -13,7 +13,8 @@ import { sharedTitleAnchorTokens, countTitlesMatchingToken } from './project-sco
  *   1. Mixed-scope evidence: the brain pass stamps `scope_alert` on items
  *      that lexically anchor a foreign project's scope. Advisory alerts
  *      ("related scopes genuinely touching") are the strongest relatedness
- *      signal; quarantined ones (probable misfiles) still hint weakly.
+ *      signal. Since 2026-10-05 the brain pass writes only advisory alerts;
+ *      a legacy quarantined row (pre-retirement) still hints weakly.
  *   2. Shared distinctive title vocabulary: both titles anchor the same
  *      subject token (same tokenizer/stemming as routing), weighted by
  *      rarity so a token shared by two titles links them but family words
