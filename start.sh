@@ -181,12 +181,31 @@ if [ -z "$NODE" ]; then
   done
 fi
 if [ -z "$NODE" ]; then
-  echo "❌ node not found — install Node 20+ (e.g. brew install node), then re-run ./start.sh" | tee -a "$LOG_FILE"
+  echo "❌ node not found — install Node 20.16+ (e.g. brew install node), then re-run ./start.sh" | tee -a "$LOG_FILE"
   exit 1
 fi
 # Make the chosen node's bin dir visible to child processes (npm, npx).
 PATH="$(dirname "$NODE"):$PATH"
 export PATH
+
+# Packages package.json declares that node_modules lacks, or holds at another
+# version than an exact pin. Space-separated; empty when everything is there.
+missing_npm_dependencies() {
+  "$NODE" -e '
+    const fs = require("fs");
+    const path = require("path");
+    const dir = process.argv[1];
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+    const wanted = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    const missing = [];
+    for (const [name, spec] of Object.entries(wanted)) {
+      let installed = null;
+      try { installed = JSON.parse(fs.readFileSync(path.join(dir, "node_modules", name, "package.json"), "utf8")).version; } catch {}
+      if (installed == null || (/^\d+\.\d+\.\d+$/.test(spec) && installed !== spec)) missing.push(name);
+    }
+    process.stdout.write(missing.join(" "));
+  ' "$PROJ_DIR" 2>/dev/null || true
+}
 
 if [ "$RECOVER_SHUTDOWN" = "1" ]; then
   RECOVERY_SCRIPT="$PROJ_DIR/scripts/recover-shutdown.mjs"
@@ -1163,6 +1182,9 @@ if [ "$DOCTOR" = "1" ]; then
   [ -x "$CHROME" ] && echo "chrome: installed" || echo "chrome: MISSING at $CHROME"
   [ -f "$PROJ_DIR/dist/index.js" ] && echo "build: dist/index.js present" || echo "build: MISSING — run: npm run build"
   [ -f "$PROJ_DIR/dist/ui/index.html" ] && [ -f "$PROJ_DIR/dist/ui/dashboard.css" ] && echo "ui-assets: present" || echo "ui-assets: MISSING/PARTIAL — run: npm run build"
+  DOCTOR_MISSING_DEPS="$(missing_npm_dependencies)"
+  if [ -z "$DOCTOR_MISSING_DEPS" ]; then echo "npm dependencies: installed"; else echo "npm dependencies: MISSING $DOCTOR_MISSING_DEPS — run: npm install (./start.sh also tries)"; fi
+  echo "pdf readers: vision-ocr helper $([ -x "$PROJ_DIR/native/vision-ocr/bin/vision-ocr" ] && echo built || echo 'not built (needs Xcode CLT)'); pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
   for mod in better-sqlite3 node-pty; do
     if "$NODE" -e "require('$mod')" >/dev/null 2>&1; then
       echo "native $mod: loads"
@@ -1313,9 +1335,27 @@ trap release_start_lock EXIT
 #   2. dist/.build-commit differs from git HEAD — stale build after git pull.
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
+# Dependency self-heal. `--update` fast-forwards package.json but never ran
+# npm, so a new or re-pinned dependency (BotBoy's pdf.js reader, an SDK pin)
+# never reached teammates. Install only when something is missing; a failed
+# install warns, and BotBoy starts with what it has.
+DEPS_INSTALLED=0
+MISSING_DEPS="$(missing_npm_dependencies)"
+if [ -n "$MISSING_DEPS" ]; then
+  echo "ℹ️  Installing dependencies ($MISSING_DEPS) — npm install" | tee -a "$LOG_FILE"
+  if (cd "$PROJ_DIR" && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1); then
+    echo "✅ Dependencies installed" | tee -a "$LOG_FILE"
+    DEPS_INSTALLED=1
+  else
+    echo "⚠️  npm install failed — see $LOG_FILE. BotBoy starts without: $MISSING_DEPS" | tee -a "$LOG_FILE"
+  fi
+fi
+
 NEED_BUILD=""
 if [ "${BOTBOY_FORCE_BUILD:-0}" = "1" ]; then
   NEED_BUILD="updated release/customizations"
+elif [ "$DEPS_INSTALLED" = "1" ]; then
+  NEED_BUILD="dependencies installed"
 elif [ ! -f "$PROJ_DIR/dist/index.js" ]; then
   NEED_BUILD="first run"
 else

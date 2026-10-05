@@ -30,6 +30,7 @@ import { completeModelAudit, failModelAudit, startModelAudit } from './pipeline-
 import { createOwnerMatcher, type OwnerMatcher } from './owner-identity.js';
 import type { FailureRecorder } from './failures.js';
 import { emailAuthoredBody } from './email-thread.js';
+import { redactSensitiveText } from './prompt-redaction.js';
 
 export const MAX_GIST_CHARS = 140;
 export const GIST_PROMPT_VERSION = 'gist-v1';
@@ -43,12 +44,15 @@ export type GistKind = 'derived' | 'verbatim' | 'model' | 'excerpt';
 /**
  * The ONE definition of "substantive evidence" shared by the Today changes
  * query and the gist sweeper, so both select the identical population. The
- * fragment assumes the `work_items` table alias.
+ * fragment assumes the `work_items` table alias. File references (data and
+ * code files, file-references.ts) are recorded, not read, so they are never
+ * gisted or shown as Today changes.
  */
 export const SUBSTANTIVE_EVIDENCE_SQL_PREDICATE = `
       COALESCE(work_items.process_state, '') <> 'noise'
       AND COALESCE(work_items.incomplete, 0) = 0
       AND work_items.type <> 'app_activity'
+      AND work_items.type <> 'file_reference'
       AND NOT (
         work_items.type = 'website_visit'
         AND COALESCE(work_items.content_bytes, length(work_items.raw_text), length(work_items.parsed_text), 0) < 1500
@@ -451,10 +455,19 @@ ${actorRule}
 Kind: ${kindLine}
 Project: ${projectTitle || '(unknown)'}
 Actor: ${description.actor || '(unknown)'}
-Identifier: ${description.identifier}
+Identifier: ${redactSensitiveText(description.identifier)}
 <evidence>
-${input.text.slice(0, MODEL_TEXT_CHARS)}
+${gistEvidenceText(input.text)}
 </evidence>`;
+}
+
+/**
+ * The model-visible excerpt, redacted like every other pipeline prompt.
+ * Redaction runs on a wider window first so a secret that starts inside the
+ * excerpt is replaced whole rather than cut.
+ */
+function gistEvidenceText(text: string): string {
+  return redactSensitiveText(text.slice(0, MODEL_TEXT_CHARS * 4)).slice(0, MODEL_TEXT_CHARS);
 }
 
 /**
@@ -547,7 +560,9 @@ export function createEvidenceGister(deps: {
     ORDER BY MAX(project_event.id) DESC
     LIMIT ?
   `);
-  const writeGist = db.prepare('UPDATE work_items SET gist = ?, gist_kind = ?, gist_at = ? WHERE id = ? AND gist IS NULL');
+  // A row that became a file reference while its gist was being written
+  // keeps no gist (file-reference-migration.ts).
+  const writeGist = db.prepare("UPDATE work_items SET gist = ?, gist_kind = ?, gist_at = ? WHERE id = ? AND gist IS NULL AND type <> 'file_reference'");
 
   function readContent(row: GisterRow): string {
     const ref = contentStore.refFromRow(row);
@@ -599,7 +614,7 @@ export function createEvidenceGister(deps: {
 
   async function gistItem(itemId: string): Promise<GistResult | null> {
     const row = selectRow.get(itemId) as GisterRow | undefined;
-    if (!row || !row.project_id) return null;
+    if (!row || !row.project_id || row.type === 'file_reference') return null;
     const owner = createOwnerMatcher(db);
     const result = await compute(row, owner);
     return result ? persist(row, result) : null;

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createStorage, StorageLayer } from '../core/storage.js';
-import { createSlackMcpClient } from './slack-mcp-client.js';
+import { createSlackMcpClient, SlackCallError, slackErrorKind } from './slack-mcp-client.js';
 import { classifyMcpTool, validateMcpToolCall } from '../core/mcp-policy.js';
 
 describe('slack MCP transport client', () => {
@@ -92,6 +92,66 @@ describe('slack MCP transport client', () => {
     const { manager } = managerReturning({}, 'stopped');
     const client = createSlackMcpClient({ db: storage.getDb(), mcpManager: manager });
     expect(await client.isAvailable()).toBe(false);
+  });
+
+  // 2026-10-02: a Midway expiry reached BotBoy as `{ channelId, error }` inside
+  // a successful batch result and was logged as "history unavailable" for
+  // 276 conversations, with the cause discarded.
+  it('keeps the per-item batch error and classifies it, without the Midway URL', async () => {
+    const midway = 'Request to IDP URL https://midway-auth.amazon.com/SSO/redirect?client_id=a&state=b did not redirect. Status code: 401. You may need to authenticate by running mwinit.';
+    const { manager } = managerReturning({
+      batch_get_conversation_history: [{ channelId: 'C1', error: midway }],
+      batch_get_thread_replies: [{ threadTs: '1.0', result: { ok: false, error: 'ratelimited' } }],
+    });
+    const client = createSlackMcpClient({ db: storage.getDb(), mcpManager: manager });
+
+    const historyError = await client.history('C1', {}).catch((error: unknown) => error);
+    expect(historyError).toBeInstanceOf(SlackCallError);
+    expect((historyError as SlackCallError).kind).toBe('midway_auth');
+    expect((historyError as Error).message).toContain('mwinit');
+    expect((historyError as Error).message).not.toContain('state=b');
+
+    const repliesError = await client.replies('C1', '1.0').catch((error: unknown) => error);
+    expect((repliesError as SlackCallError).kind).toBe('rate_limited');
+  });
+
+  it('treats conversation-specific errors and error-only results as failures of that conversation', async () => {
+    const { manager } = managerReturning({
+      batch_get_conversation_history: [{ channelId: 'C9', result: { ok: false, error: 'channel_not_found' } }],
+    });
+    const client = createSlackMcpClient({ db: storage.getDb(), mcpManager: manager });
+    const error = await client.history('C9', {}).catch((caught: unknown) => caught);
+    expect(slackErrorKind(error)).toBe('conversation_access');
+
+    // An unparseable-timestamp reply carries only `error`: not an empty success.
+    const { manager: second } = managerReturning({
+      batch_get_conversation_history: [{ channelId: 'C2', result: { channelId: 'C2', oldest: 'x', error: 'invalid oldest' } }],
+    });
+    const other = createSlackMcpClient({ db: storage.getDb(), mcpManager: second });
+    await expect(other.history('C2', {})).rejects.toBeInstanceOf(SlackCallError);
+  });
+
+  it('classifies tool errors and unreadable payloads', async () => {
+    const calls = {
+      async callTool(_server: string, tool: string) {
+        if (tool === 'list_channels') return { text: 'bad response: {"ok":false,"error":"invalid_auth"}', isError: true };
+        return { text: '=== notice ===\n[not json', isError: false };
+      },
+      async getServer() { return { state: 'running' } as any; },
+    } as any;
+    const client = createSlackMcpClient({ db: storage.getDb(), mcpManager: calls });
+    const listError = await client.listConversations(['dm']).catch((error: unknown) => error);
+    expect(slackErrorKind(listError)).toBe('service_auth');
+    const searchError = await client.search('anything').catch((error: unknown) => error);
+    expect(slackErrorKind(searchError)).toBe('unexpected_response');
+  });
+
+  it('accepts a lone batch entry whose key is named differently', async () => {
+    const { manager } = managerReturning({
+      batch_get_user_info: [{ userId: 'U1', result: { real_name: 'Ada' } }],
+    });
+    const client = createSlackMcpClient({ db: storage.getDb(), mcpManager: manager });
+    expect((await client.userInfo('U1'))?.real_name).toBe('Ada');
   });
 });
 

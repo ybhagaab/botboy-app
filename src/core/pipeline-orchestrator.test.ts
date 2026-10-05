@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -108,7 +108,7 @@ describe('PipelineOrchestrator', () => {
     );
   }
 
-  function buildState(llm: PipelineLlm) {
+  function buildState(llm: PipelineLlm, extra: { documentReads?: { tick(reader: unknown): Promise<unknown> } } = {}) {
     const db = storage.getDb();
     const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
     const failures = createFailureRecorder(db);
@@ -121,6 +121,7 @@ describe('PipelineOrchestrator', () => {
     const organizer = createProjectOrganizer({ db, brainStore, failures, llm });
     const orchestrator = createPipelineOrchestrator({
       db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, brainStore,
+      documentReads: extra.documentReads,
       config: { extractionConcurrency: 2 },
     });
     return { orchestrator, brainStore };
@@ -168,6 +169,26 @@ describe('PipelineOrchestrator', () => {
     const row = storage.getDb().prepare('SELECT process_state, project_id FROM work_items WHERE id = ?').get('a') as any;
     expect(row.process_state).toBe('routed');
     expect(row.project_id).toBeTruthy();
+  });
+
+  it('reads one part of a long document only on a tick with no librarian wave due', async () => {
+    const documentReads = { tick: vi.fn(async () => ({ ran: true })) };
+    const llm: PipelineLlm = {
+      isAvailable: () => true,
+      complete: async (prompt) => prompt.includes('librarian')
+        ? JSON.stringify([{ itemId: 'a', decision: 'new', newTitle: 'Extracted Body Project' }])
+        : JSON.stringify({ summary: 's', statusLine: 'active', tasks: [], blockers: [], people: [], newActivity: [] }),
+    };
+    const orch = buildState(llm, { documentReads }).orchestrator;
+    expect(await orch.tickInterpretation()).toEqual({ ran: false });
+    expect(documentReads.tick).toHaveBeenCalledTimes(1);
+
+    const f = path.join(dir, 'a.txt');
+    writeFileSync(f, 'x');
+    insertCaptured('a', f, 'manual');
+    await orch.tickExtraction();
+    expect((await orch.tickInterpretation()).ran).toBe(true);
+    expect(documentReads.tick).toHaveBeenCalledTimes(1); // the wave had the tick
   });
 
   it('interpretation tick does not fire when nothing is pending', async () => {

@@ -73,7 +73,7 @@ export function listAreasWithProjects(db: Database.Database): AreaWithProjects[]
   const projRows = db
     .prepare(
       `SELECT p.id, p.title, p.status, p.one_liner, p.area_id,
-              (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id) AS itemCount
+              (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id AND w.type <> 'file_reference') AS itemCount
        FROM projects p
        WHERE p.status != 'archived'
        ORDER BY p.updated_at DESC`,
@@ -162,7 +162,7 @@ export function createProjectOrganizer(deps: {
       // Per-project signals so the LLM can judge growth/promotion, not just
       // titles: item volume and recency.
       const stats = new Map<string, { items: number; lastAt: string | null }>(
-        (db.prepare('SELECT project_id, COUNT(*) AS c, MAX(captured_at) AS last FROM work_items WHERE project_id IS NOT NULL GROUP BY project_id').all() as any[])
+        (db.prepare("SELECT project_id, COUNT(*) AS c, MAX(captured_at) AS last FROM work_items WHERE project_id IS NOT NULL AND type <> 'file_reference' GROUP BY project_id").all() as any[])
           .map((r) => [r.project_id, { items: r.c, lastAt: r.last }]),
       );
       const daysAgo = (iso: string | null): string => {

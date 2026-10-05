@@ -73,6 +73,8 @@ export function createDashboardRouter(
   chatTerminal?: ChatTerminalService,
   /** Settings → AI model activation counter and readiness; open tabs refresh model UI on change. */
   aiModel?: () => { version: number; state: string },
+  /** Capture-health issue counter; open tabs refetch /capture-health on change. */
+  captureHealth?: () => { version: number; issues: number },
 ): Router {
   const router = Router();
 
@@ -182,6 +184,15 @@ export function createDashboardRouter(
         try {
           const summary = aiModel?.();
           return summary ? { aiModelVersion: summary.version, aiModelState: summary.state } : {};
+        } catch {
+          return {};
+        }
+      })(),
+      // In-memory: changes when a capture source starts or stops warning.
+      ...(() => {
+        try {
+          const summary = captureHealth?.();
+          return summary ? { captureHealthVersion: summary.version, captureIssues: summary.issues } : {};
         } catch {
           return {};
         }

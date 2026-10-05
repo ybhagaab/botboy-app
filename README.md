@@ -76,7 +76,7 @@ dedicated read-only analytics connection.
 
 ## Install
 
-You need macOS, Google Chrome, Git, Node.js 20+, and an AI model: the private
+You need macOS, Google Chrome, Git, Node.js 20.16+, and an AI model: the private
 BotBoy credential attachment sent by the owner, your own OpenAI API key, your
 own DeepSeek API key, or any mix of them. No AWS account or `aws login` is
 required.

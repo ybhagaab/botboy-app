@@ -1,5 +1,10 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ESM-native config directory: Vite 8 warns that `__dirname` stops working
+// once its native config loader becomes the default.
+const configDir = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   test: {
@@ -15,10 +20,10 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@core': path.resolve(__dirname, 'src/core'),
-      '@monitors': path.resolve(__dirname, 'src/monitors'),
-      '@ui': path.resolve(__dirname, 'src/ui'),
-      '@api': path.resolve(__dirname, 'src/api'),
+      '@core': path.resolve(configDir, 'src/core'),
+      '@monitors': path.resolve(configDir, 'src/monitors'),
+      '@ui': path.resolve(configDir, 'src/ui'),
+      '@api': path.resolve(configDir, 'src/api'),
     },
   },
 });

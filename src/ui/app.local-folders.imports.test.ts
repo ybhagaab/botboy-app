@@ -229,6 +229,40 @@ describe('Local folders — import states, big-file review, storage card', () =>
     expect((slot.querySelector('input[data-lf-file$="/users.csv"]') as HTMLInputElement).checked).toBe(true);
   });
 
+  it('names held possible credentials on the state line and lists them, with reasons, in the card', async () => {
+    imports = importsStatus('watching', {
+      firstImportDone: true,
+      counts: { imported: 12, needs_review: 0, approved: 0, excluded: 0, too_large: 0, deferred_low_disk: 0, sensitive: 2 },
+    });
+    const review = {
+      ...REVIEW, undecided: 0, files: [], tooLarge: [],
+      sensitive: [
+        { path: `${ROOT}/keys/server.pem`, relPath: 'keys/server.pem', dir: 'keys', name: 'server.pem', ext: '.pem', size: 1_700, reason: 'File type of a private key or certificate file (.pem)' },
+        { path: `${ROOT}/deploy.md`, relPath: 'deploy.md', dir: '', name: 'deploy.md', ext: '.md', size: 90, reason: 'Contains what looks like a GitHub token' },
+      ],
+    };
+    fetchMock.mockImplementation(((input: RequestInfo, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      if (url.endsWith('/api/local-folders/5/review') && (init?.method ?? 'GET') === 'GET') return Promise.resolve(makeResponse(200, { review }));
+      return route(input, init);
+    }) as unknown as AnyFn);
+    try {
+      await appWindow.loadLocalFolders!();
+      await flush();
+      const state = document.querySelector('[data-lf-state="5"]')!;
+      expect(state.textContent).toContain('2 possible credentials kept on this Mac (never sent to the AI)');
+      const slot = await openReview();
+      expect(slot.textContent).toContain('Show 2 possible credentials kept on this Mac');
+      (slot.querySelector('[data-lf-action="toggle-sensitive"]') as HTMLButtonElement).click();
+      const card = document.querySelector('[data-lf-review="5"] .lf-review')!;
+      expect(card.textContent).toContain('keys/server.pem');
+      expect(card.textContent).toContain('Contains what looks like a GitHub token');
+      expect(card.textContent).toContain('never opened');
+    } finally {
+      fetchMock.mockImplementation(route as unknown as AnyFn);
+    }
+  });
+
   it('updates state lines on a poll without re-rendering an open review card', async () => {
     await appWindow.loadLocalFolders!();
     await flush();
@@ -262,5 +296,32 @@ describe('Local folders — import states, big-file review, storage card', () =>
     (storage.querySelector('[data-lf-storage="refresh"]') as HTMLButtonElement).click();
     await flush();
     expect(calls('GET', /\/api\/local-folders\/storage\?refresh=1$/)).toHaveLength(1);
+  });
+
+  it('warns about a file that keeps changing and pauses, keeps, or resumes it in one click', async () => {
+    const changing = `${ROOT}/dashboard/training-progress.json`;
+    const paused = `${ROOT}/reports/ledger.jsonl`;
+    imports = importsStatus('watching', {
+      firstImportDone: true,
+      counts: { imported: 12, needs_review: 0, approved: 0, excluded: 0, too_large: 0, deferred_low_disk: 0, owner_paused: 1 },
+      changingOften: [{ path: changing, relPath: 'dashboard/training-progress.json', versions: 47, maxBytes: 2.4 * 1024 ** 2, storedBytes: 110 * 1024 ** 2, lastCapturedAt: new Date().toISOString(), acknowledged: false }],
+      ownerPaused: [{ path: paused, relPath: 'reports/ledger.jsonl', size: 800_000, mtimeMs: Date.now() - 2 * 3600_000 }],
+    });
+    decideResponse = { status: 200, body: { ok: true, applied: { paused: 1 } } };
+    await appWindow.loadLocalFolders!();
+    await flush();
+    const state = document.querySelector('[data-lf-state="5"]')!;
+    expect(state.textContent).toContain('Changing often: dashboard/training-progress.json (2.4 MB) was captured 47 times in the last day, 110.0 MB stored.');
+    expect(state.textContent).toContain('Paused by you: reports/ledger.jsonl · last changed 2 hr ago');
+
+    (state.querySelector(`[data-lf-action="pause-file"][data-path="${changing}"]`) as HTMLButtonElement).click();
+    await flush();
+    (document.querySelector(`[data-lf-state="5"] [data-lf-action="resume-file"][data-path="${paused}"]`) as HTMLButtonElement).click();
+    await flush();
+    (document.querySelector(`[data-lf-state="5"] [data-lf-action="keep-changing"][data-path="${changing}"]`) as HTMLButtonElement).click();
+    await flush();
+    const bodies = calls('POST', /\/api\/local-folders\/5\/review$/).map(([, init]) => JSON.parse(String(init!.body)));
+    expect(bodies).toEqual([{ pause: [changing] }, { resume: [paused] }, { keepChanging: [changing] }]);
+    expect(document.getElementById('local-folders-status')!.textContent).toContain('this warning stays off');
   });
 });

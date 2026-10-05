@@ -84,7 +84,10 @@ const opArb = fc.oneof(
 );
 
 describe('local-folders-config property tests', () => {
-  it('P-LF-1: listLocalFolders matches the shadow model after every op (Requirements 1.1, 1.3)', () => {
+  // 100 runs each build a fully migrated in-memory DB, synchronously: ~2 s
+  // alone, 6–9 s under full-suite CPU contention. Vitest 4 fails a sync test
+  // that returns after its timeout (Vitest 2 could not), so budget the real cost.
+  it('P-LF-1: listLocalFolders matches the shadow model after every op (Requirements 1.1, 1.3)', { timeout: 30_000 }, () => {
     fc.assert(
       fc.property(fc.array(opArb, { minLength: 0, maxLength: 30 }), (ops) => {
         const storage = createStorage(':memory:');

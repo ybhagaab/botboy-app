@@ -796,9 +796,10 @@ function changeFromSnapshot(
   };
 }
 
+/** Evidence per project. File references (data/code files) are not evidence. */
 function itemCounts(db: Database.Database): Map<string, number> {
   const rows = db.prepare(
-    'SELECT project_id AS projectId, COUNT(*) AS count FROM work_items WHERE project_id IS NOT NULL GROUP BY project_id',
+    "SELECT project_id AS projectId, COUNT(*) AS count FROM work_items WHERE project_id IS NOT NULL AND type <> 'file_reference' GROUP BY project_id",
   ).all() as { projectId: string; count: number }[];
   return new Map(rows.map(row => [row.projectId, row.count]));
 }
@@ -854,6 +855,7 @@ function lastEvidenceAt(db: Database.Database): Map<string, string> {
     FROM work_items
     WHERE project_id IS NOT NULL
       AND type <> 'app_activity'
+      AND type <> 'file_reference'
       AND COALESCE(process_state, '') <> 'noise'
     GROUP BY project_id
   `).all() as { projectId: string; lastAt: string | null }[];

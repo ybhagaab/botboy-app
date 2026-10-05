@@ -25,6 +25,7 @@ import {
   buildProductDocumentPublicationViewFromService,
 } from '../../product-manager/product-document-publication-view.js';
 import type { RouterDeps } from './deps.js';
+import { sharePointToolPayload } from '../../core/sharepoint-mcp-output.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -444,7 +445,7 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       if (result.isError) {
         return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(result.text.slice(0, 300) || 'SharePoint listing failed.') });
       }
-      const payload = JSON.parse(result.text) as { files?: Array<Record<string, unknown>> };
+      const payload = JSON.parse(sharePointToolPayload(result.text)) as { files?: Array<Record<string, unknown>> };
       const resolved = resolvePublicationDestinationCandidates(
         (payload.files ?? []).map(file => file.Path), 'sharepoint_list_files',
       );

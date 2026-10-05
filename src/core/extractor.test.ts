@@ -52,13 +52,13 @@ describe('Extractor', () => {
     async ocrPdfPages(): Promise<OcrResult> { throw new OcrUnavailableError('no helper'); },
   });
 
-  function build(parser: DocumentParser, ocr: OcrEngine) {
+  function build(parser: DocumentParser, ocr: OcrEngine, inlineThresholdBytes = 64) {
     const db = storage.getDb();
     return createExtractor({
       db,
       documentParser: parser,
       ocrEngine: ocr,
-      contentStore: createContentStore(db, { contentDir: dir, inlineThresholdBytes: 64 }),
+      contentStore: createContentStore(db, { contentDir: dir, inlineThresholdBytes }),
       failures: createFailureRecorder(db),
     });
   }
@@ -150,6 +150,94 @@ describe('Extractor', () => {
     expect(row.incomplete).toBe(1);
     const fail = storage.getDb().prepare('SELECT * FROM failures WHERE item_id = ?').get('b1') as any;
     expect(fail.step).toBe('parse');
+  });
+
+  describe('possible credentials in local files', () => {
+    // Built from split parts at run time: no key-shaped literal in the repo.
+    const keyBlock = [
+      ['-----BEGIN ', 'OPENSSH PRIVATE', ' KEY-----'].join(''),
+      'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW',
+      'QyNTUxOQAAACBkZXZlbG9wZXItdGVzdC1mYWtlLWtleS1tYXRlcmlhbC0wMDAxAAAAoNTE',
+      ['-----END ', 'OPENSSH PRIVATE', ' KEY-----'].join(''),
+    ].join('\n');
+
+    function insertLocalItem(id: string, filePath: string) {
+      writeFileSync(filePath, 'bytes are irrelevant: the parser stub supplies text');
+      storage.getDb().prepare(
+        `INSERT INTO work_items (id, type, source, title, captured_at, metadata, process_state)
+         VALUES (?, 'document_capture', 'filesystem', ?, '2026-10-01T10:00:00Z', ?, 'captured')`,
+      ).run(id, path.basename(filePath), JSON.stringify({ filePath, localFolderId: '3', size: '120', mtime: '1727776800000' }));
+      storage.getDb().prepare("INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, '')").run(id, path.basename(filePath));
+    }
+
+    it('withholds a document whose extracted text holds a private key: stub content, noise, ledger hold', async () => {
+      const doc = path.join(dir, 'runbook.pdf');
+      insertLocalItem('k1', doc);
+      const ex = build(okParser(`Runbook\n\n${keyBlock}\n\nRotate quarterly.`), okOcr('unused'), 4_096);
+      const out = await ex.extract('k1');
+      expect(out.state).toBe('noise');
+      const db = storage.getDb();
+      const row = db.prepare("SELECT raw_text, process_state, json_extract(metadata, '$.sensitiveHold') AS hold FROM work_items WHERE id = 'k1'").get() as any;
+      expect(row.process_state).toBe('noise');
+      expect(row.hold).toBe('Contains what looks like a private key');
+      expect(row.raw_text).toContain('Content withheld: Contains what looks like a private key');
+      expect(row.raw_text).not.toContain('OPENSSH');
+      const fts = db.prepare("SELECT body FROM work_items_fts WHERE item_id = 'k1'").all() as Array<{ body: string }>;
+      expect(fts).toHaveLength(1);
+      expect(fts[0].body).not.toContain('Rotate quarterly');
+      const hold = db.prepare('SELECT outcome, reason, size, mtime_ms FROM local_folder_imports WHERE folder_id = 3 AND path = ?').get(doc) as any;
+      expect(hold).toMatchObject({ outcome: 'sensitive', reason: 'Contains what looks like a private key', size: 120, mtime_ms: 1727776800000 });
+    });
+
+    it('never opens a credential-named local file, and withholds OCR text before its lines are stored', async () => {
+      const pem = path.join(dir, 'server.pem');
+      insertLocalItem('k2', pem);
+      const untouchable: DocumentParser = {
+        getSupportedFormats: () => ['.pem', '.png'],
+        parse: () => { throw new Error('the parser must not open a credential file'); },
+      };
+      expect((await build(untouchable, okOcr('unused')).extract('k2')).state).toBe('noise');
+
+      const shot = path.join(dir, 'screenshot.png');
+      insertLocalItem('k3', shot);
+      const fakeOpenAi = ['sk', '-proj-', 'Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0fGh3iJk'].join('');
+      const out = await build(untouchable, okOcr(`Settings › API keys\n${fakeOpenAi}`)).extract('k3');
+      expect(out.state).toBe('noise');
+      const lines = storage.getDb().prepare("SELECT COUNT(*) AS c FROM item_ocr_lines WHERE item_id = 'k3'").get() as any;
+      expect(lines.c).toBe(0);
+    });
+
+    it('leaves non-local sources to prompt redaction (the hold is a local-folder boundary)', async () => {
+      const doc = path.join(dir, 'shared.docx');
+      writeFileSync(doc, 'x');
+      insertItem('k4', 'document_capture', 'sharepoint', doc);
+      const out = await build(okParser(`Shared doc\n${keyBlock}`), okOcr('unused')).extract('k4');
+      expect(out.state).toBe('extracted');
+    });
+  });
+
+  it('never stores a reader\'s echo of a PDF\'s raw bytes as its text (2026-10-05)', async () => {
+    const pdf = path.join(dir, 'receipt.pdf');
+    writeFileSync(pdf, '%PDF-1.4');
+    insertItem('raw1', 'document_capture', 'filesystem', pdf);
+    const echo = `%PDF-1.4\n%\u00e2\u00e3\n5 0 obj << /Filter /FlateDecode >> stream\n${'x\u00ff'.repeat(100)}`;
+    const out = await build(okParser(echo), okOcr('never reached')).extract('raw1');
+    expect(out.state).toBe('extract_failed');
+    const row = storage.getDb().prepare('SELECT raw_text, content_bytes, process_state FROM work_items WHERE id = ?').get('raw1') as any;
+    expect(row).toMatchObject({ raw_text: null, content_bytes: null, process_state: 'extract_failed' });
+    const fail = storage.getDb().prepare('SELECT message, retryable FROM failures WHERE item_id = ?').get('raw1') as any;
+    expect(fail).toMatchObject({ message: "the PDF reader returned the file's raw bytes instead of its text", retryable: 1 });
+
+    // Office containers too; plain text may carry control characters (terminal colours).
+    const deck = path.join(dir, 'deck.docx');
+    writeFileSync(deck, 'PK');
+    insertItem('raw2', 'document_capture', 'filesystem', deck);
+    expect((await build(okParser(`PK\u0003\u0004${'\u0000\u0001zip'.repeat(400)}`), okOcr('')).extract('raw2')).state).toBe('extract_failed');
+    const log = path.join(dir, 'session.txt');
+    writeFileSync(log, 'x');
+    insertItem('txt1', 'document_capture', 'filesystem', log);
+    const coloured = '\u001b[32mok\u001b[0m step done\n'.repeat(200);
+    expect((await build(okParser(coloured), okOcr('')).extract('txt1')).state).toBe('extracted');
   });
 
   it('marks items with no source file as extracted (nothing to do)', async () => {

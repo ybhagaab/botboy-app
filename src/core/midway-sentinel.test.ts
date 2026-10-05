@@ -28,6 +28,7 @@ import {
   type MidwaySentinel,
 } from './midway-sentinel.js';
 import type { McpProfileSnapshot } from './mcp-types.js';
+import { createCaptureHealth } from './capture-health.js';
 
 // ── Pure helpers ──
 
@@ -315,6 +316,51 @@ describe('midway sentinel flow', () => {
     await sentinel.tick();
     expect(chatMessages()).toHaveLength(1);
     expect(agentCalls[0]).toContain('grasp-m365');
+  });
+
+  // 2026-10-02: Slack received Midway 401s inside successful batch results
+  // (no failed tool-call rows), and the cookie file can look valid while the
+  // Midway keys-process session has expired.
+  it('EXPLICIT MIDWAY DEMAND: a capture source reporting mwinit opens the episode even with a valid cookie file', async () => {
+    writeCookie(3600);
+    const captureHealth = createCaptureHealth({ db: storage.getDb(), now: () => clock.value });
+    captureHealth.reportFailure('slack', { kind: 'midway_auth', reason: 'Status code: 401. You may need to authenticate by running mwinit.' });
+    const sentinel = createMidwaySentinel(
+      { db: storage.getDb(), mcpManager: fakeMcpManager(), chatTerminal: fakeChatTerminal(), agent: fakeAgent(), captureHealth },
+      { cookiePath, now: () => clock.value },
+    );
+    await sentinel.tick();
+    expect(openedTerminals).toHaveLength(1);
+    expect(openedTerminals[0].command).toBe('mwinit');
+    expect(agentCalls[0]).toContain('reported that the Midway session needs re-authentication');
+    expect(chatMessages()).toHaveLength(1);
+  });
+
+  it('a capture report older than the last recovery cannot reopen the episode', async () => {
+    writeCookie(3600);
+    const captureHealth = createCaptureHealth({ db: storage.getDb(), now: () => clock.value });
+    captureHealth.reportFailure('slack', { kind: 'midway_auth', reason: 'You may need to authenticate by running mwinit.' });
+    waitForEndResult = async () => ({ id: 'term-1', status: 'completed', exitCode: 0 });
+    const sentinel = createMidwaySentinel(
+      { db: storage.getDb(), mcpManager: fakeMcpManager(), chatTerminal: fakeChatTerminal(), agent: fakeAgent(), captureHealth },
+      { cookiePath, now: () => clock.value },
+    );
+    await sentinel.tick();
+    await new Promise(resolve => setTimeout(resolve, 20)); // detached recovery
+    expect(lifecycle).toEqual(['stop:slack', 'start:slack', 'test:slack']);
+    expect(chatMessages()).toHaveLength(2);
+
+    // Slack has not polled again yet, so its streak still says midway_auth.
+    clock.value += 45_000;
+    await sentinel.tick();
+    expect(chatMessages()).toHaveLength(2);
+    expect(openedTerminals).toHaveLength(1);
+
+    // A fresh failure after the recovery is a new episode.
+    clock.value += 60_000;
+    captureHealth.reportFailure('slack', { kind: 'midway_auth', reason: 'You may need to authenticate by running mwinit.' });
+    await sentinel.tick();
+    expect(chatMessages()).toHaveLength(3);
   });
 
   it('skips opening a terminal when one is already running', async () => {

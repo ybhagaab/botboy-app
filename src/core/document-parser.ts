@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { visionHelperPath } from './deps-check.js';
+import { pdfTextScriptPath, visionHelperPath } from './deps-check.js';
 
 export interface ParseResult {
   success: boolean;
@@ -160,47 +160,81 @@ export function createDocumentParser(): DocumentParser {
     throw new Error(parsed.error ?? 'vision helper returned no text');
   }
 
+  /**
+   * A PDF's text comes from the native PDFKit text layer (the vision-ocr
+   * helper), then poppler's pdftotext, then BotBoy's own pdf.js reader
+   * (`scripts/pdf-text.mjs`, a pinned npm dependency every install has), each
+   * in its own process. Never textutil: it cannot read PDFs and echoes the
+   * file's bytes as "text", which is how July–August 2026 captures stored raw
+   * PDF bytes (`raw-file-text.ts`).
+   */
+  const PDF_TOOL_TIMEOUT_MS = 60_000;
+  /** pdf.js is slower than the native readers on big files. */
+  const PDF_JS_TIMEOUT_MS = 120_000;
+
+  function noPdfReader(errors: { helper: string; pdftotext: string; pdfjs: string }): Error {
+    const install = /not installed/.test(errors.pdfjs) ? ' Run "npm install" in the BotBoy folder.' : '';
+    return new Error(`No PDF reader could read this file (vision-ocr helper: ${errors.helper}; pdftotext: ${errors.pdftotext}; pdf.js: ${errors.pdfjs}).${install}`);
+  }
+
+  function toolError(err: unknown): string {
+    const code = (err as { code?: unknown })?.code;
+    if (code === 'ENOENT') return 'not installed';
+    return String((err as Error)?.message ?? err).split('\n')[0].slice(0, 120);
+  }
+
+  function pdfJsArgs(filePath: string, maxPages?: number): string[] {
+    return [pdfTextScriptPath(), filePath, ...(maxPages ? [String(maxPages)] : [])];
+  }
+
   function parsePdf(filePath: string): string {
-    // Native PDFKit text layer first (the vision-ocr helper — zero external
-    // dependencies), then poppler's pdftotext if installed, then textutil.
+    const errors = { helper: 'not built', pdftotext: '', pdfjs: '' };
     const helper = visionHelperPath();
     if (fs.existsSync(helper)) {
       try {
-        return pdfHelperText(run(helper, ['pdf-text', filePath], 60000));
+        return pdfHelperText(run(helper, ['pdf-text', filePath], PDF_TOOL_TIMEOUT_MS));
       } catch (err) {
         if (err instanceof Error && /password/i.test(err.message)) throw err;
-        // Helper missing/failed for this file — fall through to the others.
+        errors.helper = toolError(err);
       }
     }
     try {
-      return run('pdftotext', [filePath, '-'], 60000);
-    } catch {
-      try {
-        return run('textutil', ['-convert', 'txt', '-stdout', filePath], 60000);
-      } catch {
-        throw new Error('No PDF conversion tool available (tried vision-ocr pdf-text, pdftotext, textutil)');
-      }
+      return run('pdftotext', [filePath, '-'], PDF_TOOL_TIMEOUT_MS);
+    } catch (err) {
+      errors.pdftotext = toolError(err);
     }
+    try {
+      return pdfHelperText(run(process.execPath, pdfJsArgs(filePath), PDF_JS_TIMEOUT_MS));
+    } catch (err) {
+      if (err instanceof Error && /password/i.test(err.message)) throw err;
+      errors.pdfjs = toolError(err);
+    }
+    throw noPdfReader(errors);
   }
 
   async function parsePdfAsync(filePath: string): Promise<string> {
+    const errors = { helper: 'not built', pdftotext: '', pdfjs: '' };
     const helper = visionHelperPath();
     if (fs.existsSync(helper)) {
       try {
-        return pdfHelperText(await runAsync(helper, ['pdf-text', filePath], 60000));
+        return pdfHelperText(await runAsync(helper, ['pdf-text', filePath], PDF_TOOL_TIMEOUT_MS));
       } catch (err) {
         if (err instanceof Error && /password/i.test(err.message)) throw err;
+        errors.helper = toolError(err);
       }
     }
     try {
-      return await runAsync('pdftotext', [filePath, '-'], 60000);
-    } catch {
-      try {
-        return await runAsync('textutil', ['-convert', 'txt', '-stdout', filePath], 60000);
-      } catch {
-        throw new Error('No PDF conversion tool available (tried vision-ocr pdf-text, pdftotext, textutil)');
-      }
+      return await runAsync('pdftotext', [filePath, '-'], PDF_TOOL_TIMEOUT_MS);
+    } catch (err) {
+      errors.pdftotext = toolError(err);
     }
+    try {
+      return pdfHelperText(await runAsync(process.execPath, pdfJsArgs(filePath), PDF_JS_TIMEOUT_MS));
+    } catch (err) {
+      if (err instanceof Error && /password/i.test(err.message)) throw err;
+      errors.pdfjs = toolError(err);
+    }
+    throw noPdfReader(errors);
   }
 
   // ── Native .docx extraction (structure-preserving) ────────────────────────
@@ -1052,14 +1086,21 @@ export function createDocumentParser(): DocumentParser {
     } catch { /* fall through */ }
     const helper = visionHelperPath();
     if (fs.existsSync(helper)) {
-      const raw = pdfHelperText(await runAsync(helper, ['pdf-text', filePath], 120_000));
-      const capped = raw.length > LARGE_PDF_CHAR_CAP;
-      return {
-        text: capped ? `${raw.slice(0, LARGE_PDF_CHAR_CAP)}\n… [document text truncated]` : raw,
-        truncation: { pages: { capApplied: null, tool: 'vision-helper', charCapped: capped } },
-      };
+      try {
+        const raw = pdfHelperText(await runAsync(helper, ['pdf-text', filePath], 120_000));
+        const capped = raw.length > LARGE_PDF_CHAR_CAP;
+        return {
+          text: capped ? `${raw.slice(0, LARGE_PDF_CHAR_CAP)}\n… [document text truncated]` : raw,
+          truncation: { pages: { capApplied: null, tool: 'vision-helper', charCapped: capped } },
+        };
+      } catch (err) {
+        if (err instanceof Error && /password/i.test(err.message)) throw err;
+      }
     }
-    throw new Error('No large-PDF extraction tool available (tried pdftotext, vision helper)');
+    // BotBoy's own pdf.js reader caps pages natively too.
+    const text = pdfHelperText(await runAsync(process.execPath, pdfJsArgs(filePath, pageCap), PDF_JS_TIMEOUT_MS));
+    if (!text) throw new Error('No large-PDF reader found a text layer (tried pdftotext, vision helper, pdf.js)');
+    return { text, truncation: { pages: { capApplied: pageCap, tool: 'pdf.js' } } };
   }
 
   async function parseLargeAsync(filePath: string, options?: LargeParseOptions): Promise<LargeParseResult> {

@@ -22,6 +22,10 @@ import { OcrUnavailableError } from './ocr-engine.js';
 import type { ContentStore } from './content-store.js';
 import { refToColumns } from './content-store.js';
 import type { FailureRecorder } from './failures.js';
+import { describeSecretKinds, detectSecrets, sensitiveLocalFileReason } from './sensitive-files.js';
+import { recordSensitiveLocalFile } from './local-folder-imports.js';
+import { deleteWorkItemFts } from './work-items-fts.js';
+import { isRawFileText } from './raw-file-text.js';
 
 export type ExtractionKind = 'none' | 'doc' | 'ocr' | 'doc+ocr';
 
@@ -64,6 +68,8 @@ export interface Extractor {
 }
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.gif', '.bmp', '.webp']);
+/** Container formats whose parsed text must never be the file's own bytes. */
+const BINARY_DOCUMENT_EXTS = new Set(['.pdf', '.docx', '.xlsx', '.pptx']);
 /** A parsed PDF shorter than this is treated as image-only → OCR fallback. */
 const PDF_TEXT_MIN_CHARS = 32;
 
@@ -133,7 +139,7 @@ export function createExtractor(deps: {
       const row = db.prepare('SELECT title FROM work_items WHERE id = ?').get(itemId) as { title: string | null } | undefined;
       db.transaction(() => {
         updateContent();
-        db.prepare('DELETE FROM work_items_fts WHERE item_id = ?').run(itemId);
+        deleteWorkItemFts(db, itemId);
         db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)')
           .run(itemId, row?.title ?? '', text);
       })();
@@ -141,6 +147,64 @@ export function createExtractor(deps: {
       updateContent();
     }
     return { itemId, kind, bytes: ref.byteLength, ocrConfidence, state: 'extracted' };
+  }
+
+  /**
+   * Hold a local file whose path or extracted text marks it as a credential:
+   * a one-line stub replaces its content and search text, the item becomes
+   * `noise` (routing, brains, gists, and organize never read noise), and the
+   * folder ledger records the version so it is not read again. The stub
+   * names the kind of secret, never its value.
+   */
+  function withholdLocalFile(row: ItemRow, reason: string): ExtractOutcome {
+    const stub = `Content withheld: ${reason}. BotBoy keeps this file's text out of storage and never sends it to an AI model.`;
+    const ref = contentStore.put(row.id, stub);
+    const cols = refToColumns(ref);
+    const title = (db.prepare('SELECT title FROM work_items WHERE id = ?').get(row.id) as { title: string | null } | undefined)?.title ?? '';
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE work_items SET
+           raw_text = ?, content_storage = ?, content_path = ?, content_sha256 = ?, content_bytes = ?, summary = '',
+           extraction_kind = 'none', ocr_confidence = NULL, process_state = 'noise',
+           metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.sensitiveHold', ?)
+         WHERE id = ?`,
+      ).run(cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes, reason, row.id);
+      db.prepare('DELETE FROM item_ocr_lines WHERE item_id = ?').run(row.id);
+      try {
+        deleteWorkItemFts(db, row.id);
+        db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)').run(row.id, title, stub);
+      } catch { /* FTS is best-effort */ }
+    })();
+    let meta: Record<string, unknown> = {};
+    try { meta = row.metadata ? JSON.parse(row.metadata) : {}; } catch { /* ignore */ }
+    const folderId = Number(meta.localFolderId);
+    const size = Number(meta.size);
+    const mtimeMs = Number(meta.mtime);
+    if (Number.isInteger(folderId) && typeof meta.filePath === 'string' && Number.isFinite(size) && Number.isFinite(mtimeMs)) {
+      try {
+        recordSensitiveLocalFile(db, { folderId, path: meta.filePath, size, mtimeMs, reason });
+      } catch (err) {
+        console.warn(`[extractor] could not record the sensitive hold for ${row.id}: ${(err as Error).message}`);
+      }
+    }
+    console.log(`[extractor] held local file ${row.id} as possibly sensitive (${reason})`);
+    return { itemId: row.id, kind: 'none', bytes: 0, ocrConfidence: null, state: 'noise' };
+  }
+
+  /** Local-file text is checked for secrets before it is stored or sent. */
+  function persistLocal(
+    row: ItemRow,
+    text: string,
+    kind: ExtractionKind,
+    ocrConfidence: number | null,
+    ocrLines: { text: string; confidence: number }[] = [],
+  ): ExtractOutcome {
+    if (row.source === 'filesystem') {
+      const secrets = detectSecrets(text);
+      if (secrets.length > 0) return withholdLocalFile(row, describeSecretKinds(secrets));
+    }
+    persistOcrLines(row.id, ocrLines);
+    return persist(row.id, text, kind, ocrConfidence);
   }
 
   function persistOcrLines(itemId: string, lines: { text: string; confidence: number }[]): void {
@@ -181,12 +245,20 @@ export function createExtractor(deps: {
 
       const ext = path.extname(sourcePath).toLowerCase();
 
+      // ── Local credentials: decided from the path alone, never read ──
+      // (Covers rows captured before the folder monitor's gate existed.)
+      if (row.source === 'filesystem') {
+        let sizeBytes: number | undefined;
+        try { sizeBytes = statSync(sourcePath).size; } catch { /* path rule still applies */ }
+        const reason = sensitiveLocalFileReason(sourcePath, sizeBytes);
+        if (reason) return withholdLocalFile(row, reason);
+      }
+
       // ── Image → OCR ──
       if (IMAGE_EXTS.has(ext)) {
         try {
           const r = await ocrEngine.ocr(sourcePath);
-          persistOcrLines(itemId, r.lines);
-          return persist(itemId, r.text, 'ocr', r.aggConfidence);
+          return persistLocal(row, r.text, 'ocr', r.aggConfidence, r.lines);
         } catch (err) {
           if (err instanceof OcrUnavailableError) {
             return markFailed(itemId, 'ocr', `OCR unavailable: ${(err as Error).message}`);
@@ -211,7 +283,7 @@ export function createExtractor(deps: {
           // binary files (that slipped past the monitor's skip list) are marked
           // noise quietly rather than OCR'd or logged as failures.
           const text = readTextualFile(sourcePath);
-          if (text != null) return persist(itemId, text, 'doc', null);
+          if (text != null) return persistLocal(row, text, 'doc', null);
           db.prepare("UPDATE work_items SET process_state = 'noise', extraction_kind = 'none' WHERE id = ?").run(itemId);
           return { itemId, kind: 'none', bytes: 0, ocrConfidence: null, state: 'noise' };
         }
@@ -221,8 +293,15 @@ export function createExtractor(deps: {
       }
 
       let text = parsed.text ?? '';
+      // A reader that hands back the file's own bytes has not extracted
+      // anything; storing them would feed raw PDF/Office structure to
+      // routing and briefs (July–August 2026, `raw-file-text.ts`).
+      if (BINARY_DOCUMENT_EXTS.has(ext) && isRawFileText(text)) {
+        return markFailed(itemId, 'parse', `the ${ext.slice(1).toUpperCase()} reader returned the file's raw bytes instead of its text`);
+      }
       let kind: ExtractionKind = 'doc';
       let ocrConf: number | null = null;
+      let ocrLines: { text: string; confidence: number }[] = [];
 
       if (ext === '.pdf' && text.trim().length < PDF_TEXT_MIN_CHARS) {
         // Likely image-only / scanned PDF → OCR pages and merge (R3.5, R4.3).
@@ -232,7 +311,7 @@ export function createExtractor(deps: {
             text = text.trim() ? `${text}\n\n${r.text}` : r.text;
             kind = 'doc+ocr';
             ocrConf = r.aggConfidence;
-            persistOcrLines(itemId, r.lines);
+            ocrLines = r.lines;
           }
         } catch (err) {
           // Parse produced (little) text but OCR fallback failed — keep what we
@@ -241,7 +320,7 @@ export function createExtractor(deps: {
         }
       }
 
-      return persist(itemId, text, kind, ocrConf);
+      return persistLocal(row, text, kind, ocrConf, ocrLines);
     },
   };
 }

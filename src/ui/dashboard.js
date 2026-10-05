@@ -80,9 +80,12 @@ const state = {
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
   slack: { configured: null, error: '' },
-  folders: { items: null, error: '' },
+  // changingOften: watched files rewritten often enough to warn (Local folders panel).
+  folders: { items: null, error: '', changingOften: 0 },
   graspSync: { status: null, error: '', busy: '' },
   sharepointSync: { status: null, error: '', busy: '', sites: [], libraries: [], pickedSite: '' },
+  // Outcome-level capture health: per-source streaks and owner warnings.
+  captureHealth: { sources: null, issues: [], error: '' },
   mcp: {
     servers: null,
     config: null,
@@ -196,6 +199,7 @@ const state = {
   // Document workbench: per-project grouped documents + the reader view.
   projectDocuments: new Map(), // projectId → { documents, error, loading }
   projectArtifacts: new Map(), // projectId → { artifacts, unassigned, error, loading }
+  projectFiles: new Map(), // projectId → { files, total, error, loading } (file references)
   artifactAssignmentPending: new Set(),
   docReader: { key: '', data: null, error: '', loading: false, refreshing: false },
   taskActions: { expandedKey: '', discardArmedKey: '', busyKey: '' },
@@ -216,6 +220,7 @@ const state = {
   lastUiVersion: null,
   lastAiModelVersion: null,
   lastAiModelState: null,
+  lastCaptureHealthVersion: null,
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -428,7 +433,7 @@ async function loadCore({ quiet = false } = {}) {
   // Sources panel needs it, and the panel fetches it on open (post-mortem
   // 2026-08-18: every navigation blanked for the slowest request, which was
   // always this one).
-  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, sharepointSyncResult] = await Promise.allSettled([
+  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, sharepointSyncResult, captureHealthResult] = await Promise.allSettled([
     request('/areas'),
     request('/projects'),
     todayRequest,
@@ -439,7 +444,9 @@ async function loadCore({ quiet = false } = {}) {
     request('/mcp/profiles'),
     request('/grasp-sync/status'),
     request('/sharepoint-sync/status'),
+    request('/capture-health'),
   ]);
+  applyCaptureHealthResult(captureHealthResult);
 
   const criticalErrors = [];
   if (areasResult.status === 'fulfilled') state.areas = normalizeAreas(areasResult.value); else criticalErrors.push(`areas: ${areasResult.reason.message}`);
@@ -465,8 +472,10 @@ async function loadCore({ quiet = false } = {}) {
   }
   if (slackConfigResult.status === 'fulfilled') state.slack.configured = Array.isArray(slackConfigResult.value.ids) ? slackConfigResult.value.ids : [];
   else state.slack.error = slackConfigResult.reason.message;
-  if (foldersResult.status === 'fulfilled') state.folders.items = foldersResult.value.folders || [];
-  else state.folders.error = foldersResult.reason.message;
+  if (foldersResult.status === 'fulfilled') {
+    state.folders.items = foldersResult.value.folders || [];
+    state.folders.changingOften = Number(foldersResult.value.attention?.changingOften || 0);
+  } else state.folders.error = foldersResult.reason.message;
   if (graspSyncResult.status === 'fulfilled') { state.graspSync.status = graspSyncResult.value.status || null; state.graspSync.error = ''; }
   else state.graspSync.error = graspSyncResult.reason.message;
   if (sharepointSyncResult.status === 'fulfilled') { state.sharepointSync.status = sharepointSyncResult.value.status || null; state.sharepointSync.error = ''; }
@@ -757,19 +766,91 @@ async function loadProject(id, { renderAfter = true, force = false } = {}) {
   }
 }
 
+/** Apply one /capture-health result (an allSettled entry). */
+function applyCaptureHealthResult(result) {
+  if (result?.status === 'fulfilled') {
+    state.captureHealth = {
+      sources: Array.isArray(result.value?.sources) ? result.value.sources : [],
+      issues: Array.isArray(result.value?.issues) ? result.value.issues : [],
+      error: '',
+    };
+  } else {
+    state.captureHealth = { ...state.captureHealth, error: result?.reason?.message || 'Capture health unavailable' };
+  }
+}
+
+async function refreshCaptureHealth() {
+  try {
+    applyCaptureHealthResult({ status: 'fulfilled', value: await request('/capture-health') });
+  } catch (error) {
+    applyCaptureHealthResult({ status: 'rejected', reason: error });
+  }
+  updateGlobalHealth();
+}
+
+function captureIssueFor(source) {
+  return (state.captureHealth.issues || []).find(issue => issue.source === source) || null;
+}
+
+function captureSourceHealth(source) {
+  return (state.captureHealth.sources || []).find(entry => entry.source === source) || null;
+}
+
+/** Mid-sentence relative time: "5 min ago", "just now", "on Sep 26". */
+function whenPhrase(value) {
+  const rel = relativeTime(value);
+  return /^[A-Z][a-z]{2} \d/.test(rel) ? `on ${rel}` : rel.toLowerCase();
+}
+
+/** One sentence the owner can act on: cause, last success, next action. */
+function captureIssueDetail(issue) {
+  const last = issue.lastSuccessAt ? `last synced ${whenPhrase(issue.lastSuccessAt)}` : 'no successful sync recorded';
+  return `${issue.cause} (${last}). ${issue.nextAction}`;
+}
+
+/**
+ * Top-bar chip. Capture sources that stopped delivering come first: they are
+ * the outages the owner must hear about (SharePoint failed silently for days
+ * in 2026-09). Item-level pipeline failures stay on the Pipeline page; their
+ * all-time count made this chip permanently amber, so it warned about nothing.
+ */
 function updateGlobalHealth() {
   const dot = document.getElementById('global-health-dot');
   const label = document.getElementById('global-health-label');
   if (!dot || !label) return;
+  const chip = label.closest('a');
   dot.className = 'status-dot';
-  if (!state.health) {
-    label.textContent = 'Health unavailable';
+  const issues = state.captureHealth.issues || [];
+  const failures = Number(state.health?.totalFailures || 0);
+  if (issues.length > 0) {
+    const first = issues[0];
+    label.textContent = issues.length === 1 ? `${first.name} not syncing` : `${number(issues.length)} sources not syncing`;
     dot.classList.add('warn');
-  } else if (Number(state.health.totalFailures || 0) > 0) {
-    label.textContent = `${number(state.health.totalFailures)} unresolved failures`;
+    if (chip) {
+      chip.setAttribute('href', issues.length === 1 ? first.href : '#/connections');
+      chip.title = issues.map(issue => `${issue.name}: ${captureIssueDetail(issue)}`).join('\n');
+    }
+    return;
+  }
+  const changing = Number(state.folders?.changingOften || 0);
+  if (changing > 0) {
+    label.textContent = `${number(changing)} file${changing === 1 ? '' : 's'} changing often`;
     dot.classList.add('warn');
+    if (chip) {
+      chip.setAttribute('href', '#/connections');
+      chip.title = 'A watched file keeps changing, and every change is reprocessed in full. Open Connections → Local folders to pause it or keep processing.';
+    }
+    return;
+  }
+  if (chip) {
+    chip.setAttribute('href', '#/pipeline');
+    chip.title = failures > 0 ? `${number(failures)} item-level pipeline failures recorded. Open Pipeline for details.` : '';
+  }
+  if (!state.captureHealth.sources) {
+    label.textContent = state.captureHealth.error ? 'Source health unavailable' : 'Checking sources';
+    if (state.captureHealth.error) dot.classList.add('warn');
   } else {
-    label.textContent = 'All systems healthy';
+    label.textContent = 'All sources syncing';
     dot.classList.add('good');
   }
 }
@@ -939,12 +1020,16 @@ function renderProject(projectId) {
     : (authoredDocCount || 0) + (externalDocCount || 0);
   const artifactEntry = state.projectArtifacts.get(projectId);
   const artifactCount = Array.isArray(artifactEntry?.artifacts) ? artifactEntry.artifacts.length : null;
-  const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['documents', `Documents${typeof docsCount === 'number' ? ` ${docsCount}` : ''}`], ['timeline', 'Timeline'], ['artifacts', `Artifacts${typeof artifactCount === 'number' ? ` ${artifactCount}` : ''}`]];
+  const fileCount = Number.isFinite(Number(detail.fileCount)) ? Number(detail.fileCount) : Number(project.fileCount || 0);
+  // Files = data and code files recorded as references (file-references.ts);
+  // mirrored in project-layouts.js › projectTabs.
+  const tabs = [['brief', 'Brief'], ['tasks', `Tasks ${brain.tasks?.length || 0}`], ['evidence', `Evidence ${project.itemCount}`], ['documents', `Documents${typeof docsCount === 'number' ? ` ${docsCount}` : ''}`], ['files', `Files ${fileCount}`], ['timeline', 'Timeline'], ['artifacts', `Artifacts${typeof artifactCount === 'number' ? ` ${artifactCount}` : ''}`]];
   let content = '';
   if (state.projectTab === 'brief') content = renderProjectBrief(project, detail, area);
   if (state.projectTab === 'tasks') content = renderProjectTasks(project, brain);
   if (state.projectTab === 'evidence') content = renderEvidence(project, detail.items || [], detail);
   if (state.projectTab === 'documents') content = renderProjectDocuments(projectId);
+  if (state.projectTab === 'files') content = renderProjectFiles(projectId);
   if (state.projectTab === 'timeline') content = renderTimeline(brain.activityLog || []);
   if (state.projectTab === 'artifacts') content = renderProjectArtifacts(projectId);
   const fallbackHtml = `<div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${area ? `<a href="#/areas/${encodeURIComponent(area.id)}">${esc(area.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Project</span></div><header class="page-head"><div><div class="project-title-row"><h1 class="page-title">${esc(brain.title || project.title)}</h1><span class="pill ${projectTone(project, detail)}"><span class="status-dot ${projectTone(project, detail)}"></span>${esc(statusLabel(project))}</span></div><p class="project-status-line">${esc(brain.statusLine || project.oneLiner || 'No current status line has been synthesized.')}</p><div class="project-meta"><span>${icon('refresh', 13)} Updated ${esc(relativeTime(brain.updated || project.updatedAt))}</span><span>${icon('file', 13)} ${number(project.itemCount)} evidence items</span><span>${icon('shield', 13)} Local workspace</span>${detail.scopeAlertCount ? `<span class="pill warn" title="Evidence flagged by the brain pass because it also anchors another project's scope. Dominant foreign anchors are quarantined from synthesis; the rest are advisory. Review in the Evidence tab.">${icon('alert', 12)} Scope alerts: ${number(detail.scopeAlertCount)}</span>` : ''}</div></div><div class="head-actions"><button class="button" type="button" data-action="rebuild-brain" data-project="${attr(project.id)}" ${state.rebuilding.has(project.id) ? 'disabled' : ''}>${icon('refresh')} ${state.rebuilding.has(project.id) ? 'Rebuilding…' : 'Rebuild from evidence'}</button><button class="button primary" type="button" data-prompt="${attr(projectAskSeed(brain.title || project.title, project.id))}" data-project-context="${attr(project.id)}" data-project-title="${attr(brain.title || project.title)}">${icon('sparkles')} Ask BotBoy</button></div></header><div class="tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${state.projectTab === id ? 'active' : ''}" type="button" role="tab" aria-selected="${state.projectTab === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div><div role="tabpanel">${content}</div>`;
@@ -956,6 +1041,7 @@ function renderProject(projectId) {
     rebuilding: state.rebuilding.has(project.id),
     documentCount: typeof docsCount === 'number' ? docsCount : null,
     artifactCount: typeof artifactCount === 'number' ? artifactCount : null,
+    fileCount,
     fallbackHtml,
   }) || fallbackHtml;
 }
@@ -1186,6 +1272,43 @@ async function projectTaskDiscard(projectId, taskB64) {
   }
 }
 
+/** How far the brief has read a long document (document-reads.ts); nothing for ordinary evidence. */
+function documentReadChip(read, project, item) {
+  if (!read || read.status === 'skipped') return '';
+  if (read.status === 'reading') {
+    const what = read.mode === 'diff' ? 'changes' : `part ${number(read.partsDone + 1)} of ${number(read.partsTotal)}`;
+    return `<span class="pill accent" title="BotBoy reads long documents into the brief one part at a time when it is idle.">${icon('refresh', 11)} reading ${esc(what)}</span>`;
+  }
+  if (read.status === 'done') {
+    return `<span class="pill" title="The brief has read ${read.mode === 'diff' ? 'what changed in this version' : 'all of this version'}.">${icon('check', 11)} ${read.mode === 'diff' ? 'changes read' : 'read in full'}</span>`;
+  }
+  const label = read.status === 'sample' ? 'sampled' : 'reading stopped';
+  const why = read.status === 'sample'
+    ? 'The brief used an excerpt of this document. Read in full reads all of it, one part at a time when BotBoy is idle.'
+    : `The full read stopped: ${read.reason || 'an error'}.`;
+  const button = project
+    ? `<button class="button small" type="button" data-action="read-document-in-full" data-project="${attr(project.id)}" data-item="${attr(item.id)}">Read in full</button>`
+    : '';
+  return `<span class="pill warn" title="${attr(why)}">${icon('alert', 11)} ${label}</span>${button}`;
+}
+
+async function readDocumentInFull(projectId, itemId) {
+  const key = `read:${projectId}:${itemId}`;
+  if (!projectId || !itemId || state.evidencePending.has(key)) return;
+  state.evidencePending.add(key);
+  try {
+    const payload = await request(`/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(itemId)}/read-in-full`, { method: 'POST', body: {} });
+    const item = (state.projectDetails.get(projectId)?.items || []).find(entry => entry.id === itemId);
+    if (item) item.documentRead = payload.documentRead;
+    toast('BotBoy will read this document in full, one part at a time when it is idle.');
+    renderRoute({ preserveScroll: true });
+  } catch (error) {
+    toast(`Could not start the full read: ${error.message}`, 'bad');
+  } finally {
+    state.evidencePending.delete(key);
+  }
+}
+
 function evidenceRows(items, project) {
   if (!items.length) return '<div class="empty-state"><h3>No matching evidence</h3><p>The project brain exists, but no evidence rows matched this view.</p></div>';
   return items.map(item => {
@@ -1209,7 +1332,7 @@ function evidenceRows(items, project) {
       : tier === 'metadata_only'
         ? `<span class="pill" title="Presence only: BotBoy knows this document exists and who changed it, but its content is not synced. Open it in SharePoint for the full document.">${icon('alert', 11)} listed only</span>`
         : '';
-    return `<article class="evidence-row"><span class="source-icon">${icon(sourceIcon(item.source, item.type), 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(item.title || '(untitled evidence)')}</div><p>${esc(item.summary || `${item.type || 'Evidence'} captured from ${item.source || 'an unknown source'}.`)}</p><div class="evidence-meta"><span class="pill">${esc((item.type || 'item').replaceAll('_', ' '))}</span><span class="pill">${esc(item.source || 'unknown')}</span>${tierChip}${scopeAlert}${item.url ? `<a class="text-link" href="${attr(item.url)}" target="_blank" rel="noopener">Open source</a>` : ''}${filePath ? `<a class="text-link" href="#" data-action="reveal" data-path="${attr(filePath)}">Reveal file</a>` : ''}</div></div><div class="today-item-side"><time>${esc(relativeTime(item.capturedAt || item.captured_at))}</time>${rejectControl}</div></article>`;
+    return `<article class="evidence-row"><span class="source-icon">${icon(sourceIcon(item.source, item.type), 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(item.title || '(untitled evidence)')}</div><p>${esc(item.summary || `${item.type || 'Evidence'} captured from ${item.source || 'an unknown source'}.`)}</p><div class="evidence-meta"><span class="pill">${esc((item.type || 'item').replaceAll('_', ' '))}</span><span class="pill">${esc(item.source || 'unknown')}</span>${tierChip}${documentReadChip(item.documentRead, project, item)}${scopeAlert}${item.url ? `<a class="text-link" href="${attr(item.url)}" target="_blank" rel="noopener">Open source</a>` : ''}${filePath ? `<a class="text-link" href="#" data-action="reveal" data-path="${attr(filePath)}">Reveal file</a>` : ''}</div></div><div class="today-item-side"><time>${esc(relativeTime(item.capturedAt || item.captured_at))}</time>${rejectControl}</div></article>`;
   }).join('');
 }
 
@@ -1289,6 +1412,55 @@ function renderProjectArtifactCard(artifact, projectId) {
     .filter(project => project.status === 'active' || project.status === 'paused')
     .map(project => `<option value="${attr(project.id)}" ${project.id === artifact.projectId ? 'selected' : ''}>${esc(project.title)}</option>`).join('');
   return `<article class="card project-artifact-card" data-artifact-id="${attr(artifact.id)}"><div class="project-artifact-preview">${preview}<span class="project-artifact-format">HTML</span></div><div class="project-artifact-body"><div class="project-artifact-title-row"><div><h3>${esc(artifact.fileName)}</h3><code>${esc(artifact.relativePath)}</code></div>${status}</div><div class="project-artifact-facts"><span>${icon('clock', 11)} ${esc(relativeTime(local.modifiedAt || artifact.updatedAt))}</span>${local.bytes != null ? `<span>${number(local.bytes)} bytes</span>` : ''}${attempts.length ? `<span>${icon('activity', 11)} ${number(attempts.length)} publish attempt${attempts.length === 1 ? '' : 's'}</span>` : ''}</div><div class="project-artifact-actions">${local.exists ? `<a class="button small" href="${attr(local.url)}">${icon('expand', 12)} Open local</a>` : ''}${live?.url ? `<a class="button small primary" href="${attr(live.url)}" target="_blank" rel="noopener">${icon('globe', 12)} Open live</a><button class="button small ghost" type="button" data-action="artifact-copy-link" data-url="${attr(live.url)}">${icon('link', 12)} Copy link</button>` : ''}</div>${attempts.length ? `<details class="project-artifact-history"><summary>Publication history <span>${number(attempts.length)}</span></summary><ol>${attempts.map(renderArtifactAttempt).join('')}</ol></details>` : '<p class="project-artifact-note">Not published to Harmony yet.</p>'}<details class="project-artifact-manage"><summary>Move artifact</summary><div><select data-artifact-project>${projectOptions}</select><button class="button small" type="button" data-action="artifact-assign" data-artifact="${attr(artifact.id)}" data-version="${attr(artifact.version)}">Move</button><button class="button small ghost" type="button" data-action="artifact-unassign" data-artifact="${attr(artifact.id)}" data-version="${attr(artifact.version)}">Unassign</button></div></details>${latest && live && latest.attemptId !== live.attemptId ? `<div class="mcp-alert warn">${icon('alert', 13)}<span>The newest attempt is ${esc(documentStateLabel(latest.phase))}; the live link points to the last fully verified publication.</span></div>` : ''}</div></article>`;
+}
+
+// ── Project files: data and code files recorded as references ──────────────
+
+async function loadProjectFiles(projectId, { force = false } = {}) {
+  const existing = state.projectFiles.get(projectId);
+  if (existing?.loading || (existing?.files && !force)) return;
+  state.projectFiles.set(projectId, { ...(existing || {}), loading: true, error: '' });
+  try {
+    const payload = await request(`/projects/${encodeURIComponent(projectId)}/files?limit=500`);
+    state.projectFiles.set(projectId, { files: payload.files || [], total: Number(payload.total) || 0, loading: false, error: '' });
+  } catch (error) {
+    state.projectFiles.set(projectId, { ...(state.projectFiles.get(projectId) || {}), loading: false, error: String(error?.message || error) });
+  }
+  if (state.route.view === 'project' && state.route.projectId === projectId && state.projectTab === 'files') {
+    renderRoute({ preserveScroll: true });
+  }
+}
+
+function projectFileRow(file) {
+  const kind = file.format ? `${file.format} ${file.role === 'code' ? 'code' : 'data'}` : (file.role === 'code' ? 'code' : 'data');
+  const reveal = file.deleted ? '' : `<a class="text-link" href="#" data-action="reveal" data-path="${attr(file.filePath)}">Reveal file</a>`;
+  return `<article class="evidence-row"><span class="source-icon">${icon(file.role === 'code' ? 'branch' : 'database', 15)}</span><div class="evidence-copy"><div class="evidence-title">${esc(file.name)}</div><p>${esc(file.summary || kind)}</p><div class="evidence-meta">${file.deleted ? '<span class="pill warn">deleted</span>' : ''}<span class="pill">${esc(kind)}</span>${reveal}</div></div><div class="today-item-side"><time title="Last changed">${esc(file.modifiedAt ? relativeTime(file.modifiedAt) : '')}</time></div></article>`;
+}
+
+/** Grouped by folder; BotBoy never read these files, so the copy says so. */
+function renderProjectFiles(projectId) {
+  const entry = state.projectFiles.get(projectId);
+  if (!entry || (entry.loading && !entry.files)) {
+    if (!entry) void loadProjectFiles(projectId);
+    return '<section class="card"><div class="empty-state"><p>Loading files…</p></div></section>';
+  }
+  if (entry.error && !entry.files) return `<section class="card error-state"><h3>Files could not be loaded</h3><p>${esc(entry.error)}</p></section>`;
+  const files = entry.files || [];
+  const total = entry.total || files.length;
+  const intro = `<div class="section-heading" style="margin-top:0"><div><h2>Files</h2><p>Data and code files from your local folders that belong to this project. BotBoy records where each one is, its size, and its outline without reading it. Ask BotBoy when you need what is inside.</p></div><span class="pill accent">${number(total)}</span></div>`;
+  if (!files.length) {
+    return `${intro}<section class="card"><div class="empty-state"><span class="source-icon">${icon('folder', 18)}</span><h3>No files recorded</h3><p>A data or code file in a watched folder appears here once the documents in its folder belong to this project.</p></div></section>`;
+  }
+  const groups = new Map();
+  for (const file of files) {
+    const display = String(file.displayPath || file.filePath || '');
+    const slash = display.lastIndexOf('/');
+    const dir = slash > 0 ? display.slice(0, slash) : '';
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push(file);
+  }
+  const more = total > files.length ? `<p class="muted">Showing the first ${number(files.length)} of ${number(total)} files.</p>` : '';
+  return `${intro}${[...groups].map(([dir, list]) => `<div class="section-heading"><div><h3>${icon('folder', 13)} <code>${esc(dir || '/')}</code></h3></div><span class="pill">${number(list.length)}</span></div><section class="card evidence-list">${list.map(projectFileRow).join('')}</section>`).join('')}${more}`;
 }
 
 function renderProjectArtifacts(projectId) {
@@ -2341,6 +2513,8 @@ function graspSyncCardModel() {
   const status = sync.status;
   if (!status) return { status: 'Checking', tone: '', detail: 'Loading sync status' };
   if (!status.enabled) return { status: 'Paused', tone: 'warn', detail: 'Automatic sync is paused; browser email capture is active again' };
+  const issue = captureIssueFor('grasp');
+  if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
   const run = status.lastRun;
   if (!run) return { status: 'Scheduled', tone: 'good', detail: `First sync runs shortly after start, then every ${status.intervalMinutes} minutes` };
   if (run.status === 'failed') return { status: 'Needs attention', tone: 'warn', detail: String(run.reason || 'The last sync failed') };
@@ -2445,13 +2619,39 @@ function sharepointSyncCardModel() {
   if (!status.enabled) return { status: 'Off', tone: '', detail: 'Enable to sync documents from shared-with-me, OneDrive, and team libraries' };
   const surging = (status.sources || []).some(s => s.surgePending);
   if (surging) return { status: 'Needs review', tone: 'warn', detail: 'A source reports a mass change and is paused for your confirmation' };
+  const issue = captureIssueFor('sharepoint');
+  if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
   const queued = status.queue?.queued ?? 0;
   const failed = status.queue?.failed ?? 0;
   const gatePaused = status.queue?.queued > 0 && status.gates && (!status.gates.backlog || !status.gates.cache);
+  const run = status.lastRun;
+  const checked = run && run.status === 'completed' ? ` · checked ${whenPhrase(run.at)}` : '';
   const detail = queued > 0
     ? `${number(queued)} document${queued === 1 ? '' : 's'} queued${gatePaused ? ' — drain paused for pipeline headroom' : ''}`
-    : `${number((status.sources || []).length)} source${(status.sources || []).length === 1 ? '' : 's'} synced${failed ? `, ${number(failed)} failed` : ''}`;
+    : `${number((status.sources || []).length)} source${(status.sources || []).length === 1 ? '' : 's'} synced${failed ? `, ${number(failed)} failed` : ''}${checked}`;
   return { status: 'Connected', tone: failed ? 'warn' : 'good', detail };
+}
+
+/** [status, tone, detail] for the Local folders card; files that keep changing need the owner. */
+function localFoldersCardFields(enabledCount) {
+  if (state.folders.error) return ['Unavailable', 'warn', state.folders.error];
+  if (enabledCount == null) return ['Checking', '', 'Configuration unavailable'];
+  const changing = Number(state.folders.changingOften || 0);
+  if (changing > 0) {
+    return ['Needs attention', 'warn', `${number(changing)} file${changing === 1 ? '' : 's'} changing often: every change is reprocessed in full. Open Local folders to pause or keep processing.`];
+  }
+  return ['Connected', 'good', `${number(enabledCount)} enabled folders`];
+}
+
+/** Card status for Slack capture: configuration plus the last poll outcome. */
+function slackCardModel(configuredCount) {
+  if (state.slack.error) return { status: 'Unavailable', tone: 'warn', detail: state.slack.error };
+  if (configuredCount == null) return { status: 'Checking', tone: '', detail: 'Configuration unavailable' };
+  const issue = captureIssueFor('slack');
+  if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
+  const health = captureSourceHealth('slack');
+  const checked = health?.lastSuccessAt ? ` · checked ${whenPhrase(health.lastSuccessAt)}` : '';
+  return { status: 'Connected', tone: 'good', detail: `${number(configuredCount)} conversations configured${checked}` };
 }
 
 const SHAREPOINT_SOURCE_LABELS = { shared_with_me: 'Shared with me', onedrive: 'My OneDrive', library: 'Team library' };
@@ -2498,6 +2698,7 @@ function renderSharePointSyncSettings() {
         <span><span>Pipeline gate</span><strong>${status?.gates?.backlog === false ? 'Holding (pipeline busy)' : 'Open'}</strong></span>
         <span><span>Cache gate</span><strong>${status?.gates?.cache === false ? 'Holding (cache full)' : 'Open'}</strong></span>
       </div>
+      ${status?.lastRun?.status === 'failed' ? `<p class="page-subtitle" style="margin-top:8px;color:var(--warn, #b45309)">Last check failed ${esc(whenPhrase(status.lastRun.at))}: ${esc(String(status.lastRun.reason || 'unknown error'))}</p>` : ''}
       ${backoffs.length ? `<p class="page-subtitle" style="margin-top:8px">SharePoint asked BotBoy to slow down: ${backoffs.map(([domain, until]) => `${esc(domain)} until ${esc(new Date(until).toLocaleTimeString())}`).join(', ')}.</p>` : ''}
       ${status?.ownerIdentity ? (status.ownerIdentity.known
         ? `<p class="page-subtitle" style="margin-top:8px">Matching you in document comments as <strong>${esc(status.ownerIdentity.displayName || '(no name)')}</strong>${status.ownerIdentity.alias ? ` · <strong>${esc(status.ownerIdentity.alias)}</strong>` : ''} <span style="opacity:.7">(${esc(status.ownerIdentity.nameSource === 'grasp' ? 'detected from mail profile' : status.ownerIdentity.nameSource === 'none' ? 'alias only' : 'configured override')})</span>. Wrong? Set <code>owner_identity.name</code> / <code>owner_identity.alias</code> in settings.</p>`
@@ -2560,16 +2761,21 @@ function renderConnections() {
     }];
   const graspSyncCard = graspSyncCardModel();
   const sharepointSyncCard = sharepointSyncCardModel();
+  const slackCard = slackCardModel(slackCount);
   const captureCards = [
-    ['message', 'Slack', state.slack.error ? 'Unavailable' : slackCount == null ? 'Checking' : 'Connected', state.slack.error ? 'warn' : 'good', slackCount == null ? 'Configuration unavailable' : `${number(slackCount)} conversations configured`, 'slack'],
-    ['folder', 'Local folders', state.folders.error ? 'Unavailable' : folderCount == null ? 'Checking' : 'Connected', state.folders.error ? 'warn' : 'good', folderCount == null ? 'Configuration unavailable' : `${number(folderCount)} enabled folders`, 'folders'],
+    ['message', 'Slack', slackCard.status, slackCard.tone, slackCard.detail, 'slack'],
+    ['folder', 'Local folders', ...localFoldersCardFields(folderCount), 'folders'],
     ['clock', 'Outlook mail & calendar', graspSyncCard.status, graspSyncCard.tone, graspSyncCard.detail, 'grasp-sync'],
     ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
     ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
   ];
+  const captureIssueSources = { slack: 'slack', 'grasp-sync': 'grasp', 'sharepoint-sync': 'sharepoint' };
+  const lifecycleFor = action => (captureIssueFor(captureIssueSources[action])
+    ? 'Not syncing'
+    : action === 'folders' && state.folders.changingOften > 0 ? 'Needs attention' : 'Healthy');
   const connectionsAsk = 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
   return `${pageHead('Sources', 'Connections', 'Manage where evidence and analytical context come from, and verify each local connection.', `<button class="button" type="button" data-prompt="${attr(connectionsAsk)}">${icon('sparkles')} Ask BotBoy to add one</button><a class="button primary" href="#/connections/add">${icon('plus', 14)} Add MCP server</a>`)}
-    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${state.health?.totalFailures ? 'Needs review' : 'Healthy'}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
+    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
     ${managedCards.map(card => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(card.icon, 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div><h3>${esc(card.name)}</h3><p>${esc(card.detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>${esc(card.handling)}</strong></span><span><span>Lifecycle</span><strong>Managed by BotBoy</strong></span></div>${card.profileId ? `<button class="button small" type="button" data-action="manage-connection" data-connection="managed" data-profile="${attr(card.profileId)}">Manage ${icon('chevron-right', 12)}</button>` : ''}</article>`).join('')}</section>
     <div class="section-heading"><div><h2>Connection principles</h2><p>Captured sources stay durable; external analytical content remains untrusted until BotBoy applies its local policy.</p></div></div><section class="grid three-col"><article class="card pad"><div class="eyebrow">${icon('database', 14)} Preserve</div><h3 class="card-title">Raw content stays intact</h3><p class="page-subtitle">Project brains can evolve while original evidence remains unchanged.</p></article><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Restrict</div><h3 class="card-title">Writes need your explicit request</h3><p class="page-subtitle">BotBoy calls read tools freely and runs mutating operations only when you ask for them in chat.</p></article><article class="card pad"><div class="eyebrow">${icon('link', 14)} Explain</div><h3 class="card-title">Analysis stays traceable</h3><p class="page-subtitle">MCP calls are audited locally without storing credentials or query results in the audit log.</p></article></section>`;
 }
@@ -2625,6 +2831,16 @@ async function loadProfile(profileId, { force = false } = {}) {
     pending.delete('load');
     if (state.route.view === 'profile-settings') renderRoute();
   }
+}
+
+/** Capture source carried by a managed profile: a running server can still deliver nothing. */
+const CAPTURE_SOURCE_BY_PROFILE = { slack: 'slack', 'grasp-m365': 'grasp', sharepoint: 'sharepoint' };
+
+function profileCaptureIssueAlert(profileId) {
+  const issue = captureIssueFor(CAPTURE_SOURCE_BY_PROFILE[profileId]);
+  return issue
+    ? `<div class="mcp-alert warn" role="alert">${icon('alert', 15)}<span><strong>${esc(issue.name)} is not syncing.</strong> ${esc(captureIssueDetail(issue))}${issue.reason ? ` <span class="page-subtitle">Last error: ${esc(issue.reason)}</span>` : ''}</span></div>`
+    : '';
 }
 
 function renderProfileSettings(profileId) {
@@ -2722,6 +2938,7 @@ function renderProfileSettings(profileId) {
         <div class="card-header"><div><h2 class="card-title">${esc(guide.setupHeading?.title || 'Local setup')}</h2><div class="card-meta">${esc(guide.setupHeading?.subtitle || 'Run the fixed steps for this connection.')}</div></div><span class="pill ${processState.tone}"><span class="status-dot ${processState.tone}"></span>${esc(processState.label)}</span></div>
         ${profile.needsReview ? `<div class="mcp-alert">${icon('shield', 15)}<span>BotBoy wrote this configuration on your request. Review the command, arguments, and environment below (Edit shows the full definition). Pressing Start approves and launches it.</span></div>` : ''}
         ${profile.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(profile.lastError)}</span></div>` : ''}
+        ${profileCaptureIssueAlert(profileId)}
         ${notice?.message ? `<div class="mcp-alert ${noticeTone}">${icon(noticeTone === 'good' ? 'check' : 'activity', 15)}<span>${esc(notice.message)}</span></div>` : ''}
         <div class="mcp-form-body">${stepsHtml || `<div class="mcp-section"><h3>Server lifecycle</h3><p>BotBoy manages this connection. Use Start, Test, and Stop.</p><div class="mcp-form-actions">${actionButton('start', 'Start', 'Starting…', 'activity', canStart, true)}${actionButton('test', 'Test', 'Testing…', 'check', canTest)}${actionButton('stop', 'Stop', 'Stopping…', 'close', canStop)}</div></div>`}${renderTerminalPanel(profile, pending)}${toolsSection}</div>
       </article>
@@ -7294,6 +7511,7 @@ function bindEvents() {
       state.projectTab = target.dataset.tab;
       if (state.projectTab === 'documents' && state.route.view === 'project') void loadProjectDocuments(state.route.projectId);
       if (state.projectTab === 'artifacts' && state.route.view === 'project') void loadProjectArtifacts(state.route.projectId, { force: true });
+      if (state.projectTab === 'files' && state.route.view === 'project') void loadProjectFiles(state.route.projectId, { force: true });
       renderRoute({ userAction: true });
     }
     if (action === 'artifact-attach') {
@@ -7537,6 +7755,7 @@ function bindEvents() {
     if (action === 'run-digests') void runChannelDigests();
     if (action === 'review-ambient') void reviewAmbientProjects();
     if (action === 'reject-evidence') void rejectEvidence(target.dataset.project, target.dataset.item);
+    if (action === 'read-document-in-full') void readDocumentInFull(target.dataset.project, target.dataset.item);
     if (action === 'restore-evidence') void restoreEvidence(target.dataset.project, target.dataset.item);
     if (action === 'rebuild-brain') void rebuildProjectBrain(target.dataset.project);
     if (action === 'dismiss-relation') void dismissRelation(target.dataset.project, target.dataset.other);
@@ -8304,6 +8523,8 @@ async function pollVersion() {
     const previousAiModelState = state.lastAiModelState;
     state.lastAiModelVersion = payload.aiModelVersion ?? null;
     state.lastAiModelState = payload.aiModelState ?? null;
+    const previousCaptureHealthVersion = state.lastCaptureHealthVersion;
+    state.lastCaptureHealthVersion = payload.captureHealthVersion ?? null;
 
     // Reload the tab when the code it runs is stale. Two triggers:
     //  - bootId change: the server restarted (possibly with new UI code).
@@ -8347,6 +8568,17 @@ async function pollVersion() {
         } catch {}
         location.reload();
         return;
+      }
+    }
+
+    // A capture source started or stopped warning. Captures may have stopped
+    // entirely, so this cannot wait for the data version: refetch the small
+    // health payload, then repaint the views that show it.
+    if (previousCaptureHealthVersion !== null && state.lastCaptureHealthVersion !== null
+      && state.lastCaptureHealthVersion !== previousCaptureHealthVersion) {
+      await refreshCaptureHealth();
+      if (['connections', 'grasp-sync-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
+        renderRoute({ preserveScroll: true });
       }
     }
 

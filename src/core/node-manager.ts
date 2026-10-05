@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import type { Node, WorkItem, NodeConnection, ManualWorkItemInput, NodeTree, NodeWithChildren } from './types.js';
 
 const MAX_DEPTH = 4;
@@ -82,6 +82,7 @@ export function createNodeManager(db: Database.Database): NodeManager {
   const selectUnassigned = db.prepare(
     `SELECT wi.* FROM work_items wi
      WHERE wi.id NOT IN (SELECT work_item_id FROM node_work_items)
+       AND wi.type <> 'file_reference'
      ORDER BY wi.captured_at DESC`
   );
 

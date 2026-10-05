@@ -34,10 +34,18 @@ import { listLocalFolders, getLocalFolder } from '../core/local-folders-config.j
 import type { DiskSpaceMonitor } from '../core/disk-space.js';
 import { NOOP_MAIN_THREAD_WATCHDOG, type MainThreadWatchdog } from '../core/main-thread-watchdog.js';
 import {
+  describeSecretKinds,
+  detectSecrets,
+  sensitiveLocalFileReason,
+  sensitiveLocalPathReason,
+} from '../core/sensitive-files.js';
+import {
   captureSignature,
   createLocalFolderImportLedger,
   existingCaptureSignatures,
+  existingReferenceSignatures,
   folderImportThresholds,
+  OWNER_RESUMED_REASON,
   markFirstImportDone,
   parseLiteralGlob,
   type FolderFileOrigin,
@@ -46,6 +54,18 @@ import {
   type FolderImportThresholds,
   type LocalFolderImportLedger,
 } from '../core/local-folder-imports.js';
+import {
+  FILE_REFERENCE_TYPE,
+  ROLE_SNIFF_BYTES,
+  buildFileReference,
+  isReferenceRole,
+  localFileRoleForPath,
+  readFileHead,
+  readReferenceHead,
+  referenceMetadataFields,
+  roleFromHead,
+  type LocalFileRole,
+} from '../core/file-references.js';
 
 // ── Public types ───────────────────────────────────────────────────────────
 
@@ -70,6 +90,8 @@ export interface BackfillProgress {
   needsReview?: number;
   /** Files above the import ceiling, listed but never read. */
   tooLarge?: number;
+  /** Likely credentials held from capture (`sensitive-files.ts`). */
+  sensitive?: number;
   reason?: 'low_disk' | 'busy';
   freeBytes?: number;
 }
@@ -89,6 +111,7 @@ export type BackfillResult =
     unchanged?: number;
     needsReview?: number;
     tooLarge?: number;
+    sensitive?: number;
     failed?: number;
     paused?: 'low_disk';
     busy?: boolean;
@@ -137,6 +160,8 @@ export type FolderScanResult =
     unchanged: number;
     needsReview: number;
     tooLarge: number;
+    /** Likely credentials held by name, type, or location (never read). */
+    sensitive: number;
   };
 
 export type ImportFilesResult =
@@ -638,6 +663,13 @@ export function createFilesystemMonitor(deps: {
   // One walk (scan, import, or pending import) per folder at a time.
   const walks = new Map<number, FolderWalkState>();
   let liveLowDiskNotified = false;
+  const referenceExists = (filePath: string): boolean => {
+    try {
+      return Boolean(db.prepare("SELECT 1 FROM work_items WHERE type = 'file_reference' AND file_path = ?").get(filePath));
+    } catch {
+      return false;
+    }
+  };
 
   // ── Private helpers ────────────────────────────────────────────────────
 
@@ -677,11 +709,14 @@ export function createFilesystemMonitor(deps: {
       || (known.outcome === 'imported' && known.size >= thresholds.bigFileBytes);
   }
 
-  function holdFile(row: LocalFolder, filePath: string, stat: Stats, outcome: FolderFileOutcome, origin: FolderFileOrigin, known?: FolderFileRecord | null): void {
+  function holdFile(row: LocalFolder, filePath: string, stat: Stats, outcome: FolderFileOutcome, origin: FolderFileOrigin, known?: FolderFileRecord | null, reason?: string): void {
     // Skip the write when this exact version is already held the same way.
-    if (known && known.outcome === outcome && known.size === stat.size && known.mtimeMs === stat.mtimeMs) return;
-    ledger.record({ folderId: row.id, path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, outcome, origin });
+    if (known && known.outcome === outcome && known.size === stat.size && known.mtimeMs === stat.mtimeMs
+      && (known.reason ?? null) === (reason ?? null)) return;
+    ledger.record({ folderId: row.id, path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, outcome, origin, reason: reason ?? null });
   }
+
+
 
   /** Live floor check on the cached free-space value (sync; never blocks). */
   function liveDiskLow(): boolean {
@@ -785,6 +820,8 @@ export function createFilesystemMonitor(deps: {
     known?: FolderFileRecord | null;
     /** A folder import (walk or pending import) owns this call. */
     importWalk?: boolean;
+    /** The owner resumed this file: its brief reads this version in full (document-reads.ts). */
+    briefRead?: 'full';
   }
 
   /**
@@ -794,7 +831,7 @@ export function createFilesystemMonitor(deps: {
    * so the next walk retries it.
    */
   type HandleResult =
-    | { outcome: 'missing' | 'ignored' | 'too_large' | 'needs_review' | 'deferred_low_disk' | 'unchanged' }
+    | { outcome: 'missing' | 'ignored' | 'too_large' | 'needs_review' | 'deferred_low_disk' | 'unchanged' | 'sensitive' | 'owner_paused' }
     | { outcome: 'captured'; done: Promise<boolean> };
 
   /** Stable provenance consumed by evidence-gist.ts and Today. Never infer
@@ -807,18 +844,93 @@ export function createFilesystemMonitor(deps: {
     };
   }
 
+  /** Document, data, or code. A name with no extension is decided from its first 8 KB. */
+  function fileRoleFor(filePath: string): LocalFileRole {
+    const byPath = localFileRoleForPath(filePath);
+    if (byPath !== 'sniff') return byPath;
+    const head = readFileHead(filePath, ROLE_SNIFF_BYTES);
+    return head ? roleFromHead(filePath, head) : 'document';
+  }
+
+  /**
+   * Role for walk and scan bookkeeping, which otherwise read nothing: a name
+   * with no extension is sniffed only when its size would hold it for review
+   * (a hash-named model blob must not wait for the owner); a smaller one
+   * stays `sniff` and is decided when it is handed over.
+   */
+  function walkRoleFor(filePath: string, size: number): LocalFileRole | 'sniff' {
+    const byPath = localFileRoleForPath(filePath);
+    if (byPath !== 'sniff') return byPath;
+    return size >= thresholds.bigFileBytes ? fileRoleFor(filePath) : 'sniff';
+  }
+
+  /**
+   * Record one data or code file as a reference: the first 64 KB at most,
+   * checked for secret formats, turned into a deterministic outline. The
+   * store upserts one row per path, so an unchanged size/mtime is skipped.
+   */
+  function captureReference(
+    row: LocalFolder,
+    filePath: string,
+    stat: Stats,
+    role: 'data' | 'code',
+    captureMode: CaptureMode,
+    origin: FolderFileOrigin,
+    known: FolderFileRecord | null,
+    settle: (done: Promise<boolean>) => Promise<boolean>,
+  ): HandleResult {
+    const signature = `ref:${stat.size}:${stat.mtimeMs}`;
+    if (seenHashes.get(filePath) === signature) return { outcome: 'unchanged' };
+    // Binary formats and binary content are recorded by name and size only.
+    const { head, complete } = readReferenceHead(filePath, stat.size);
+    if (head) {
+      const secrets = detectSecrets(head);
+      if (secrets.length > 0) {
+        holdFile(row, filePath, stat, 'sensitive', origin, known, describeSecretKinds(secrets));
+        return { outcome: 'sensitive' };
+      }
+    }
+    const reference = buildFileReference({
+      filePath, rootPath: row.path, role, head, complete, size: stat.size, mtimeMs: stat.mtimeMs,
+    });
+    seenHashes.set(filePath, signature);
+    const done = emit({
+      type: FILE_REFERENCE_TYPE,
+      source: 'filesystem',
+      sourceApp: 'Local Files',
+      url: 'file://' + filePath,
+      title: path.basename(filePath),
+      content: reference.text,
+      metadata: {
+        ...captureProvenance(row, captureMode),
+        ...referenceMetadataFields({ filePath, role, size: stat.size, mtimeMs: stat.mtimeMs }, reference),
+      },
+      capturedAt: new Date(),
+    });
+    return { outcome: 'captured', done: settle(done) };
+  }
+
   /**
    * Emit-or-hold a single file under `row`. The filter chain is:
    *
    *   1. `stat` the file (catch ENOENT/EACCES so a transient unlink during
    *      processing is silent rather than crashing the watcher).
    *   2. Skip non-content extensions and include-glob misses (not recorded).
+   *   2b. Named, typed, or stored like a credential, or linked into a hidden
+   *      folder (`sensitive-files.ts`): hold as `sensitive`, never read. A
+   *      version already found to contain a secret stays held unread.
+   *   2c. Paused by the owner: note size/mtime, never read.
+   *   2d. Data or code (`file-references.ts`): emit one `file_reference`
+   *      built from the first 64 KB (secret formats hold it as `sensitive`);
+   *      the gates below do not apply.
    *   3. Above the import ceiling (`MAX_FILE_BYTES`): hold as `too_large`.
    *   4. At or above the big-file threshold without the owner's keep for
    *      this path: hold as `needs_review` (C8 — live and import alike).
    *   5. Live only: below the live disk floor, hold as `deferred_low_disk`.
-   *   6. Parse plain-text types inline; `sha256(text)` short-circuits an
-   *      unchanged file (§2.5 dedup). Other types emit raw.
+   *   6. Parse plain-text types inline; text with a secret format holds the
+   *      file as `sensitive` (nothing emitted); `sha256(text)` short-circuits
+   *      an unchanged file (§2.5 dedup). Other types emit raw, and the
+   *      extractor applies the same secret check before storing their text.
    *   7. Emit a `RawWorkItem` with the canonical filesystem shape
    *      (`source: 'filesystem'`, `sourceApp: 'Local Files'`,
    *      `type: 'document_capture'`, `url: 'file://' + filePath`).
@@ -880,30 +992,26 @@ export function createFilesystemMonitor(deps: {
     const origin: FolderFileOrigin = captureMode === 'live' ? 'live' : 'import';
     const known = opts.known !== undefined ? opts.known : ledger.get(row.id, filePath);
 
-    // 3. Import ceiling: listed for the owner as "too large to import yet",
-    //    never read (C8).
-    if (stat.size > MAX_FILE_BYTES) {
-      if (process.env.LOCAL_FOLDERS_DEBUG) {
-        console.debug(
-          `[filesystem-monitor] skip (size>${MAX_FILE_BYTES}): ${filePath} (${stat.size} bytes)`,
-        );
-      }
-      holdFile(row, filePath, stat, 'too_large', origin, known);
-      return { outcome: 'too_large' };
+    // 2b. Credentials never leave this Mac. A file named, typed, or stored
+    //     like one is held before anything reads it, at any size, and a
+    //     version already found to contain a secret is not read again.
+    // The link check matters for live changes: `stat` follows a symbolic
+    // link, so a link to `~/.ssh/id_rsa` would otherwise bypass the
+    // dot-folder rule. Walks never yield links.
+    const sensitiveReason = sensitiveLocalFileReason(filePath, stat.size);
+    if (sensitiveReason) {
+      holdFile(row, filePath, stat, 'sensitive', origin, known, sensitiveReason);
+      return { outcome: 'sensitive' };
+    }
+    if (known?.outcome === 'sensitive' && known.size === stat.size && known.mtimeMs === stat.mtimeMs) {
+      return { outcome: 'sensitive' };
     }
 
-    // 4. Big-file gate (C8, live and import): no file at or above the
-    //    threshold is read without the owner's choice for its path.
-    if (stat.size >= thresholds.bigFileBytes && !ownerKept(known)) {
-      holdFile(row, filePath, stat, 'needs_review', origin, known);
-      return { outcome: 'needs_review' };
-    }
-
-    // 5. Live disk floor (C7). Import walks check their own, higher floor
-    //    before each file. A deferred change is imported when space returns.
-    if (!opts.importWalk && liveDiskLow()) {
-      holdFile(row, filePath, stat, 'deferred_low_disk', 'live', known);
-      return { outcome: 'deferred_low_disk' };
+    // 2c. Paused by the owner (a file that keeps changing): note the newest
+    //     size/mtime so the panel can say when it last changed, never read.
+    if (known?.outcome === 'owner_paused') {
+      holdFile(row, filePath, stat, 'owner_paused', known.origin, known);
+      return { outcome: 'owner_paused' };
     }
 
     // Imports record every version they hand over (resume skips it). Live
@@ -934,7 +1042,42 @@ export function createFilesystemMonitor(deps: {
     // (the stored item's signature covers later walks).
     const unchanged = (): HandleResult => ({ outcome: 'unchanged' });
 
-    // 3. Parse plain-text types inline (a UTF-8 read — no subprocess). All
+    // 2d. Data and code files are references (owner decision 2026-10-04):
+    //     one row per path, built from at most the first 64 KB and updated
+    //     in place. Nothing more is read, so the import ceiling, the big-file
+    //     review, and the disk floors do not apply.
+    const role = fileRoleFor(filePath);
+    if (isReferenceRole(role)) {
+      return captureReference(row, filePath, stat, role, captureMode, origin, known ?? null, settle);
+    }
+
+    // 3. Import ceiling: listed for the owner as "too large to import yet",
+    //    never read (C8).
+    if (stat.size > MAX_FILE_BYTES) {
+      if (process.env.LOCAL_FOLDERS_DEBUG) {
+        console.debug(
+          `[filesystem-monitor] skip (size>${MAX_FILE_BYTES}): ${filePath} (${stat.size} bytes)`,
+        );
+      }
+      holdFile(row, filePath, stat, 'too_large', origin, known);
+      return { outcome: 'too_large' };
+    }
+
+    // 4. Big-file gate (C8, live and import): no file at or above the
+    //    threshold is read without the owner's choice for its path.
+    if (stat.size >= thresholds.bigFileBytes && !ownerKept(known)) {
+      holdFile(row, filePath, stat, 'needs_review', origin, known);
+      return { outcome: 'needs_review' };
+    }
+
+    // 5. Live disk floor (C7). Import walks check their own, higher floor
+    //    before each file. A deferred change is imported when space returns.
+    if (!opts.importWalk && liveDiskLow()) {
+      holdFile(row, filePath, stat, 'deferred_low_disk', 'live', known);
+      return { outcome: 'deferred_low_disk' };
+    }
+
+    // 6. Parse plain-text types inline (a UTF-8 read — no subprocess). All
     //    heavier supported formats (.pdf/.docx/.pptx/.xlsx) are deliberately
     //    NOT parsed here: their conversions shell out synchronously, and a
     //    slow document dropped into a watched folder froze the whole server's
@@ -947,6 +1090,14 @@ export function createFilesystemMonitor(deps: {
     if (INLINE_PARSE_EXTS.has(ext) && getSupportedFormats().has(ext)) {
       const parsed = documentParser.parse(filePath);
       if (parsed.success && typeof parsed.text === 'string') {
+        // Secret formats found in the text BotBoy just read locally: hold the
+        // file; its text is never stored or sent. Heavier formats get the
+        // same check in the extractor.
+        const secrets = detectSecrets(parsed.text);
+        if (secrets.length > 0) {
+          holdFile(row, filePath, stat, 'sensitive', origin, known, describeSecretKinds(secrets));
+          return { outcome: 'sensitive' };
+        }
         // Content-hash dedup for successfully parsed text.
         const contentHash = createHash('sha256').update(parsed.text).digest('hex');
         if (seenHashes.get(filePath) === contentHash) {
@@ -967,6 +1118,7 @@ export function createFilesystemMonitor(deps: {
             ...captureProvenance(row, captureMode),
             filePath, fileType: ext,
             mtime: String(stat.mtimeMs), size: String(stat.size), contentHash,
+            ...(opts.briefRead ? { briefRead: opts.briefRead } : {}),
           },
           capturedAt: new Date(),
         });
@@ -978,7 +1130,7 @@ export function createFilesystemMonitor(deps: {
       // fall through to raw emit
     }
 
-    // 4. Raw emit (unsupported extension OR parse failure) — dedup on a cheap
+    // 7. Raw emit (unsupported extension OR parse failure) — dedup on a cheap
     //    size:mtime signature so we don't re-read large binaries just to hash.
     const signature = `raw:${stat.size}:${stat.mtimeMs}`;
     if (seenHashes.get(filePath) === signature) {
@@ -999,6 +1151,7 @@ export function createFilesystemMonitor(deps: {
         ...captureProvenance(row, captureMode),
         filePath, fileType: ext,
         mtime: String(stat.mtimeMs), size: String(stat.size),
+        ...(opts.briefRead ? { briefRead: opts.briefRead } : {}),
       },
       capturedAt: new Date(),
     });
@@ -1031,7 +1184,39 @@ export function createFilesystemMonitor(deps: {
    * file with identical contents would be silently swallowed by the
    * content-hash dedup in `handleAddOrChange`.
    */
-  function handleUnlink(row: LocalFolder, filePath: string): void {
+  function handleUnlink(row: LocalFolder, filePath: string, knownBefore?: FolderFileRecord | null): void {
+    // A held credential was never captured: nothing to archive, and its
+    // hold row goes with the file. `knownBefore` is the row as it was before
+    // the unlink handler forgot it.
+    const known = knownBefore !== undefined ? knownBefore : ledger.get(row.id, filePath);
+    if (known?.outcome === 'sensitive' || sensitiveLocalPathReason(filePath)) {
+      if (known?.outcome === 'sensitive') ledger.remove(row.id, filePath);
+      seenHashes.delete(filePath);
+      return;
+    }
+    // A paused file that a writer deletes and recreates stays paused; its
+    // removal is not news while the owner has asked for quiet.
+    if (known?.outcome === 'owner_paused') {
+      seenHashes.delete(filePath);
+      return;
+    }
+    // A data or code file's reference is marked deleted in place (the store
+    // ignores a path it never recorded); no evidence row is created.
+    const role = localFileRoleForPath(filePath);
+    if (isReferenceRole(role) || (role === 'sniff' && referenceExists(filePath))) {
+      void emit({
+        type: FILE_REFERENCE_TYPE,
+        source: 'filesystem',
+        sourceApp: 'Local Files',
+        url: 'file://' + filePath,
+        title: path.basename(filePath),
+        content: '',
+        metadata: { ...captureProvenance(row, 'live'), filePath, archived: 'true' },
+        capturedAt: new Date(),
+      });
+      seenHashes.delete(filePath);
+      return;
+    }
     const item: RawWorkItem = {
       type: 'document_capture',
       source: 'filesystem',
@@ -1068,15 +1253,22 @@ export function createFilesystemMonitor(deps: {
     const handle = watchEngine(row, {
       onAddOrChange: (filePath) => handleLiveChange(currentRow(), filePath),
       onUnlink: (filePath) => {
-        // A vanished file no longer waits for review or import.
-        try { ledger.remove(currentRow().id, filePath); } catch { /* ledger is advisory here */ }
+        const folderId = currentRow().id;
+        let known: FolderFileRecord | null = null;
+        try { known = ledger.get(folderId, filePath) ?? null; } catch { /* ledger is advisory here */ }
+        // A vanished file no longer waits for review or import. A paused one
+        // stays paused: a writer that deletes and recreates it is still churn.
+        if (known?.outcome !== 'owner_paused') {
+          try { ledger.remove(folderId, filePath); } catch { /* ledger is advisory here */ }
+        }
         // Parity with the previous engine's contract: unlink fires only for
         // paths we actually ingested. Without this guard, a transient editor
         // temp file (created and renamed away within the settle window) would
         // emit a spurious archive item for a path that never existed
-        // downstream.
-        if (!seenHashes.has(filePath)) return;
-        handleUnlink(currentRow(), filePath);
+        // downstream. A file reference recorded before this process started
+        // is still marked deleted (one indexed lookup).
+        if (!seenHashes.has(filePath) && !referenceExists(filePath)) return;
+        handleUnlink(currentRow(), filePath, known);
       },
       onError: (err) => {
         // EMFILE circuit breaker — near-impossible with the O(1)-descriptor
@@ -1309,13 +1501,14 @@ export function createFilesystemMonitor(deps: {
       }
 
       let processed = 0;
-      const tally = { imported: 0, unchanged: 0, needsReview: 0, tooLarge: 0, failed: 0 };
+      const tally = { imported: 0, unchanged: 0, needsReview: 0, tooLarge: 0, sensitive: 0, failed: 0 };
       const summary = () => ({ ...tally });
       try {
         onProgress?.({ phase: 'started', folderId });
         const excludes = compileExcludes(row.exclude_globs);
         const ledgerRows = ledger.forFolder(row.id);
         const signatures = watchdog.measure('folder-import:index', () => existingCaptureSignatures(db, row.path));
+        const referenceSignatures = watchdog.measure('folder-import:references', () => existingReferenceSignatures(db, row.path));
 
         for await (const entry of walkFolderFiles(row, excludes)) {
           // Cancellation check per candidate — abort latency is one file.
@@ -1346,20 +1539,34 @@ export function createFilesystemMonitor(deps: {
           }
           if (!stat.isFile()) continue;
 
+          // Data and code files are references: done only when a reference
+          // row matches this version (a ledger row may come from an older
+          // full capture), and never held for size.
+          const role = walkRoleFor(fullPath, stat.size);
+          const reference = isReferenceRole(role);
+          const signature = captureSignature(fullPath, String(stat.size), String(stat.mtimeMs));
+
           // Idempotency (C2): this exact version was already handed over.
           const known = ledgerRows.get(fullPath) ?? null;
           if (known && known.size === stat.size && known.mtimeMs === stat.mtimeMs) {
-            if (known.outcome === 'imported') { tally.unchanged++; continue; }
-            if (known.outcome === 'needs_review') { tally.needsReview++; continue; }
-            if (known.outcome === 'too_large') { tally.tooLarge++; continue; }
+            if (known.outcome === 'imported' && (!reference || referenceSignatures.has(signature))) { tally.unchanged++; continue; }
+            if (known.outcome === 'needs_review' && !reference) { tally.needsReview++; continue; }
+            if (known.outcome === 'too_large' && !reference) { tally.tooLarge++; continue; }
+            if (known.outcome === 'sensitive') { tally.sensitive++; continue; }
           }
-          if (signatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) {
+          // Paused by the owner: never re-imported by a walk, any version.
+          if (known?.outcome === 'owner_paused') { tally.unchanged++; continue; }
+          // An unsniffed name with no extension may be stored either way.
+          if (reference
+            ? referenceSignatures.has(signature)
+            : signatures.has(signature) || (role === 'sniff' && referenceSignatures.has(signature))) {
             tally.unchanged++;
             continue;
           }
 
           // Disk floor (C7): pause the whole import; the next run resumes.
-          const lowFree = await importDiskLow();
+          // A reference stores about 1 KB, so it does not wait for space.
+          const lowFree = reference ? null : await importDiskLow();
           if (lowFree != null) {
             onProgress?.({ phase: 'paused', folderId, processed, reason: 'low_disk', freeBytes: lowFree, ...summary() });
             return { aborted: false, total: processed, paused: 'low_disk', ...summary() };
@@ -1372,6 +1579,7 @@ export function createFilesystemMonitor(deps: {
               else tally.failed++;
             } else if (result.outcome === 'needs_review') tally.needsReview++;
             else if (result.outcome === 'too_large') tally.tooLarge++;
+            else if (result.outcome === 'sensitive') tally.sensitive++;
             else if (result.outcome === 'unchanged') tally.unchanged++;
           } catch (err) {
             tally.failed++;
@@ -1417,7 +1625,7 @@ export function createFilesystemMonitor(deps: {
     async scanFolder(folderId: number, opts?: { signal?: AbortSignal }): Promise<FolderScanResult> {
       const signal = opts?.signal;
       const row = getLocalFolder(db, folderId);
-      const empty = { walked: 0, files: 0, bytes: 0, importable: 0, unchanged: 0, needsReview: 0, tooLarge: 0 };
+      const empty = { walked: 0, files: 0, bytes: 0, importable: 0, unchanged: 0, needsReview: 0, tooLarge: 0, sensitive: 0 };
       if (!row) return { aborted: false, ...empty };
       const walk = acquireWalk(folderId, 'scan');
       if (!walk) return { aborted: false, busy: true, ...empty };
@@ -1425,6 +1633,7 @@ export function createFilesystemMonitor(deps: {
         const excludes = compileExcludes(row.exclude_globs);
         const ledgerRows = ledger.forFolder(row.id);
         const signatures = watchdog.measure('folder-scan:index', () => existingCaptureSignatures(db, row.path));
+        const referenceSignatures = watchdog.measure('folder-scan:references', () => existingReferenceSignatures(db, row.path));
         const result = { ...empty };
         // Ledger paths still present as candidates (bounded by ledger size).
         const seenKnown = new Set<string>();
@@ -1451,8 +1660,22 @@ export function createFilesystemMonitor(deps: {
           const known = ledgerRows.get(fullPath) ?? null;
           if (known) seenKnown.add(fullPath);
           const sameVersion = Boolean(known && known.size === stat.size && known.mtimeMs === stat.mtimeMs);
-          if ((sameVersion && known?.outcome === 'imported')
-            || signatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) {
+          // Walks never yield symbolic links, so the path rule alone applies.
+          const sensitiveReason = sensitiveLocalPathReason(fullPath, stat.size);
+          if (sensitiveReason) {
+            holdFile(row, fullPath, stat, 'sensitive', 'import', known, sensitiveReason);
+            result.sensitive++;
+          } else if (sameVersion && known?.outcome === 'sensitive') {
+            result.sensitive++;
+          } else if (known?.outcome === 'owner_paused') {
+            result.unchanged++;
+          } else if (isReferenceRole(walkRoleFor(fullPath, stat.size))) {
+            // Data and code: recorded from the first 64 KB at any size.
+            if (referenceSignatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) result.unchanged++;
+            else result.importable++;
+          } else if ((sameVersion && known?.outcome === 'imported')
+            || signatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))
+            || referenceSignatures.has(captureSignature(fullPath, String(stat.size), String(stat.mtimeMs)))) {
             result.unchanged++;
           } else if (stat.size > MAX_FILE_BYTES) {
             holdFile(row, fullPath, stat, 'too_large', 'import', known);
@@ -1525,14 +1748,16 @@ export function createFilesystemMonitor(deps: {
           if (lowFree != null) return { aborted: false, ...tally, paused: 'low_disk' };
           const captureMode: CaptureMode = current.origin === 'live' ? 'live' : 'backfill';
           try {
-            const result = watchdog.measure('folder-import', () => handleAddOrChange(row, record.path, captureMode, { stat, known: current, importWalk: true }));
+            // A file the owner resumed after a pause: its brief reads it in full.
+            const briefRead = current.reason === OWNER_RESUMED_REASON ? 'full' as const : undefined;
+            const result = watchdog.measure('folder-import', () => handleAddOrChange(row, record.path, captureMode, { stat, known: current, importWalk: true, briefRead }));
             if (result.outcome === 'captured') {
               if (await result.done) tally.imported++;
               else tally.failed++;
             } else if (result.outcome === 'unchanged') {
               // Already captured by this process: the pending row is satisfied.
               ledger.record({ folderId: row.id, path: record.path, size: stat.size, mtimeMs: stat.mtimeMs, outcome: 'imported' });
-            } else if (result.outcome === 'needs_review' || result.outcome === 'too_large') {
+            } else if (result.outcome === 'needs_review' || result.outcome === 'too_large' || result.outcome === 'sensitive' || result.outcome === 'owner_paused') {
               tally.held++;
             } else if (result.outcome === 'ignored' || result.outcome === 'missing') {
               // No longer a capture candidate (type or include globs changed):

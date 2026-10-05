@@ -64,7 +64,8 @@ export function syncNodesFromProjects(db: Database.Database): ProjectionResult {
       const parent = p.area_id && areaIds.has(p.area_id) ? p.area_id : UNSORTED_ID;
       insNode.run(p.id, p.title, p.one_liner ?? null, parent, 1);
       result.projectNodes++;
-      const items = db.prepare('SELECT id FROM work_items WHERE project_id = ?').all(p.id) as { id: string }[];
+      // File references are listed on the project's Files tab, not as node items.
+      const items = db.prepare("SELECT id FROM work_items WHERE project_id = ? AND type <> 'file_reference'").all(p.id) as { id: string }[];
       for (const it of items) {
         const r = linkStmt.run(p.id, it.id);
         result.itemLinks += r.changes;

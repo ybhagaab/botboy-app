@@ -13,10 +13,11 @@
  * and cached durably. The OS username matches the Amazon alias on managed
  * machines; SLACK_SELF_ALIAS overrides it when it does not.
  *
- * Availability: every method throws when the managed MCP server is not
- * running or the Midway session has lapsed. Callers treat that as "transport
- * unavailable" and defer — capture is lossless because polling cursors only
- * advance after successful processing.
+ * Availability: history, replies, and listing throw a `SlackCallError` whose
+ * kind says whether one conversation or the whole transport failed (Midway
+ * session lapsed, sign-in rejected, rate limited, network). Callers defer —
+ * capture is lossless because polling cursors only advance after successful
+ * processing.
  */
 
 import os from 'node:os';
@@ -24,6 +25,39 @@ import type Database from 'better-sqlite3';
 import type { McpManager } from '../core/mcp-types.js';
 import { SLACK_MCP_PROFILE_ID } from '../core/mcp-profiles.js';
 import { getSetting, setSetting } from '../core/storage.js';
+import { classifyCaptureFailure, sanitizeCaptureReason, type CaptureFailureKind } from '../core/capture-health.js';
+
+/**
+ * What a failed Slack call means for the poll cycle. `conversation_access`
+ * concerns one conversation (archived, left, no scope); every other kind is
+ * transport-wide: one failure stands for all of them.
+ */
+export type SlackCallErrorKind = CaptureFailureKind | 'conversation_access';
+
+export class SlackCallError extends Error {
+  readonly kind: SlackCallErrorKind;
+  constructor(kind: SlackCallErrorKind, message: string) {
+    super(message);
+    this.name = 'SlackCallError';
+    this.kind = kind;
+  }
+}
+
+/** Slack API and Slack MCP error text → kind (deterministic). */
+export function classifySlackError(text: string): SlackCallErrorKind {
+  if (/channel_not_found|not_in_channel|missing_scope|access_denied|is_archived|method_not_supported_for_channel_type|thread_not_found|user_not_found/i.test(text)) {
+    return 'conversation_access';
+  }
+  return classifyCaptureFailure(text);
+}
+
+/** Kind of any error a Slack call can raise (typed or not). */
+export function slackErrorKind(error: unknown): SlackCallErrorKind {
+  if (error instanceof SlackCallError) return error.kind;
+  const data = (error as { data?: { error?: unknown } } | null)?.data?.error;
+  const message = typeof data === 'string' && data ? data : String((error as Error)?.message ?? error);
+  return classifySlackError(message);
+}
 
 export interface SlackHistoryPage {
   messages: any[];
@@ -91,23 +125,50 @@ export function createSlackMcpClient(deps: {
   }
 
   async function call<T = any>(tool: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<T> {
-    const result = await mcpManager.callTool(SLACK_MCP_PROFILE_ID, tool, args, { source: 'api', timeoutMs });
-    if (result.isError) throw new Error(result.text.slice(0, 500) || `${tool} failed`);
+    let result: Awaited<ReturnType<typeof mcpManager.callTool>>;
+    try {
+      result = await mcpManager.callTool(SLACK_MCP_PROFILE_ID, tool, args, { source: 'api', timeoutMs });
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      throw new SlackCallError(classifySlackError(message), `${tool}: ${sanitizeCaptureReason(message)}`);
+    }
+    if (result.isError) {
+      const text = result.text || `${tool} failed`;
+      throw new SlackCallError(classifySlackError(text), `${tool}: ${sanitizeCaptureReason(text)}`);
+    }
     try {
       return JSON.parse(result.text) as T;
     } catch {
-      throw new Error(`${tool} returned a non-JSON payload`);
+      throw new SlackCallError('unexpected_response', `${tool} returned a non-JSON payload`);
     }
   }
 
-  /** Unwrap `[{ channelId|threadTs, result: {...} }]` batch envelopes. */
-  function unwrapBatch(payload: unknown, matchKey: string, matchValue: string): Record<string, any> | null {
-    if (!Array.isArray(payload)) return null;
+  /**
+   * Unwrap `[{ channelId|threadTs, result: {...} }]` batch envelopes. The
+   * server reports a failed item as `{ channelId, error }` with no result
+   * (a Midway 401 arrives this way), so the error text is kept for the
+   * caller instead of collapsing into "unavailable".
+   */
+  function unwrapBatch(payload: unknown, matchKey: string, matchValue: string): { result: Record<string, any> } | { error: string } {
+    if (!Array.isArray(payload)) return { error: 'unexpected batch response shape' };
+    // One item is requested per call, so a lone entry answers it even when
+    // the server names its key differently.
     const entry = payload.find((row) => row && typeof row === 'object' && String((row as any)[matchKey]) === matchValue)
-      ?? payload[0];
-    const result = (entry as any)?.result;
-    if (!result || result.ok === false) return null;
-    return result;
+      ?? (payload.length === 1 ? payload[0] : undefined);
+    if (!entry || typeof entry !== 'object') return { error: `unexpected batch response: no entry for ${matchValue}` };
+    const entryError = (entry as any).error;
+    if (typeof entryError === 'string' && entryError) return { error: entryError };
+    const result = (entry as any).result;
+    if (!result || typeof result !== 'object') return { error: 'unexpected batch response: entry has no result' };
+    if (result.ok === false) return { error: String(result.error || 'ok:false') };
+    // A result that carries only an error (e.g. an unparseable timestamp) is
+    // not an empty success.
+    if (typeof result.error === 'string' && result.error && !Array.isArray(result.messages)) return { error: result.error };
+    return { result };
+  }
+
+  function batchFailure(what: string, error: string): SlackCallError {
+    return new SlackCallError(classifySlackError(error), `${what}: ${sanitizeCaptureReason(error)}`);
   }
 
   return {
@@ -130,12 +191,14 @@ export function createSlackMcpClient(deps: {
 
     async userInfo(userId) {
       const payload = await call<any>('batch_get_user_info', { users: [userId] }, 45_000);
-      return unwrapBatch(payload, 'user', userId);
+      const unwrapped = unwrapBatch(payload, 'user', userId);
+      return 'result' in unwrapped ? unwrapped.result : null;
     },
 
     async channelInfo(channelId) {
       const payload = await call<any>('batch_get_channel_info', { channelIds: [channelId] }, 45_000);
-      return unwrapBatch(payload, 'channelId', channelId);
+      const unwrapped = unwrapBatch(payload, 'channelId', channelId);
+      return 'result' in unwrapped ? unwrapped.result : null;
     },
 
     async history(channelId, opts) {
@@ -145,8 +208,9 @@ export function createSlackMcpClient(deps: {
       if (opts.limit) channel.limit = opts.limit;
       if (opts.cursor) channel.cursor = opts.cursor;
       const payload = await call<any>('batch_get_conversation_history', { channels: [channel] }, 90_000);
-      const result = unwrapBatch(payload, 'channelId', channelId);
-      if (!result) throw new Error(`history unavailable for ${channelId}`);
+      const unwrapped = unwrapBatch(payload, 'channelId', channelId);
+      if ('error' in unwrapped) throw batchFailure(`history ${channelId}`, unwrapped.error);
+      const { result } = unwrapped;
       return {
         messages: result.messages ?? [],
         response_metadata: { next_cursor: result.response_metadata?.next_cursor || result.next_cursor || undefined },
@@ -157,8 +221,9 @@ export function createSlackMcpClient(deps: {
       const thread: Record<string, unknown> = { channelId, threadTs };
       if (opts.cursor) thread.cursor = opts.cursor;
       const payload = await call<any>('batch_get_thread_replies', { threads: [thread] }, 90_000);
-      const result = unwrapBatch(payload, 'threadTs', threadTs);
-      if (!result) throw new Error(`thread replies unavailable for ${channelId}/${threadTs}`);
+      const unwrapped = unwrapBatch(payload, 'threadTs', threadTs);
+      if ('error' in unwrapped) throw batchFailure(`replies ${channelId}/${threadTs}`, unwrapped.error);
+      const { result } = unwrapped;
       return {
         messages: result.messages ?? [],
         response_metadata: { next_cursor: result.response_metadata?.next_cursor || result.next_cursor || undefined },

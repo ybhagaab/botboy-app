@@ -155,9 +155,34 @@ export function createPipelineOrchestrator(deps: {
    * blocks routing or brains.
    */
   gister?: { tick(opts?: { limit?: number }): Promise<unknown> };
+  /**
+   * Data and code file references (file-references.ts): unassigned ones
+   * follow their folder's documents once those are routed. Deterministic
+   * SQL, no model call; runs at the start of every interpretation tick.
+   */
+  fileReferences?: { adoptOrphans(): unknown };
+  /**
+   * Long documents read into brains in parts (document-reads.ts): one part
+   * per interpretation tick in which no librarian wave is due, so routing
+   * and ordinary brain updates never wait for reading.
+   */
+  documentReads?: { tick(reader: BrainUpdater): Promise<unknown> };
   config?: OrchestratorConfig;
 }): PipelineOrchestrator {
   const { db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, digester, brainStore, gister } = deps;
+
+  function adoptFileReferences(): void {
+    try { deps.fileReferences?.adoptOrphans(); } catch (error) {
+      console.warn(`[Pipeline] file reference adoption failed: ${(error as Error)?.message ?? error}`);
+    }
+  }
+
+  async function readDocumentPart(): Promise<void> {
+    if (!deps.documentReads) return;
+    try { await deps.documentReads.tick(brainUpdater); } catch (error) {
+      console.warn(`[Pipeline] long document read failed: ${(error as Error)?.message ?? error}`);
+    }
+  }
 
   async function gistRoutedEvidence(limit: number): Promise<void> {
     if (!gister) return;
@@ -207,7 +232,11 @@ export function createPipelineOrchestrator(deps: {
     if (interpreting) return { ran: false };
     interpreting = true;
     try {
-      if (!batcher.shouldFire()) return { ran: false };
+      adoptFileReferences();
+      if (!batcher.shouldFire()) {
+        await readDocumentPart();
+        return { ran: false };
+      }
       const wave = await librarian.runWave();
       if (wave.status === 'deferred' || !wave.batchId) return { ran: false };
       await brainUpdater.runForBatch(wave.batchId);
@@ -318,8 +347,9 @@ export function createPipelineOrchestrator(deps: {
       const proj = brainStore.getProject(projectId);
       if (!proj) return { status: 'skipped', items: 0 };
 
+      // File references are never synthesized (file-references.ts).
       const ids = (
-        db.prepare("SELECT id FROM work_items WHERE project_id = ? ORDER BY captured_at ASC").all(projectId) as { id: string }[]
+        db.prepare("SELECT id FROM work_items WHERE project_id = ? AND type <> 'file_reference' ORDER BY captured_at ASC").all(projectId) as { id: string }[]
       ).map((row) => row.id);
       if (ids.length === 0) return { status: 'skipped', items: 0 };
 
@@ -392,10 +422,10 @@ export function createPipelineOrchestrator(deps: {
     const minItems = opts?.minItems ?? 1;
     const rows = db
       .prepare(
-        `SELECT p.id AS id, (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id) AS n
+        `SELECT p.id AS id, (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id AND w.type <> 'file_reference') AS n
          FROM projects p
          WHERE p.status IN ('active','paused')
-           AND (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id) >= ?
+           AND (SELECT COUNT(*) FROM work_items w WHERE w.project_id = p.id AND w.type <> 'file_reference') >= ?
          ORDER BY n DESC`,
       )
       .all(minItems) as { id: string; n: number }[];

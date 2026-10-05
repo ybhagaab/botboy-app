@@ -47,8 +47,10 @@ import type { VisualAssetRegistry } from '../../core/visual-assets.js';
 import type { VisualInspector } from '../../core/visual-inspector.js';
 import type { ProjectArtifactService } from '../../core/project-artifacts.js';
 import type { ShutdownRuntimeContext } from '../../core/shutdown-coordinator.js';
+import type { DocumentReads } from '../../core/document-reads.js';
 import type { FolderImportScheduler } from '../../monitors/folder-import-scheduler.js';
 import type { StorageUsageService } from '../../core/storage-usage.js';
+import type { CaptureHealth } from '../../core/capture-health.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -63,6 +65,8 @@ export interface RouterDeps {
   failures?: FailureRecorder;
   brainStore?: BrainStore;
   pipelineOrchestrator?: PipelineOrchestrator;
+  /** Long-document reads into project brains (document-reads.ts). */
+  documentReads?: DocumentReads;
   projectRelations?: ProjectRelationsEngine;
   channelDigester?: ChannelDigester;
   // Chat streaming loop deps (previously accessed via `(deps as any)`)
@@ -109,6 +113,8 @@ export interface RouterDeps {
   folderImports?: FolderImportScheduler;
   /** Local folders storage card (du-measured, cached). */
   storageUsage?: StorageUsageService;
+  /** Outcome-level capture health per source (Slack, SharePoint, Outlook). */
+  captureHealth?: CaptureHealth;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

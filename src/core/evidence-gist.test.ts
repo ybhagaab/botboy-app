@@ -240,6 +240,16 @@ describe('gist kinds', () => {
     expect(prompt).toContain("(you're Cc'd)");
     expect(prompt).toContain('<evidence>');
   });
+  it('redacts secrets in the gist excerpt like every other pipeline prompt', () => {
+    const owner = ownerMatcherFor(storage);
+    // Split at run time: no token-shaped literal in the repository.
+    const fakeToken = ['gh', 'p_', 'Zq7Lm2Xc9Vb4Nt6Rw1Ky8Hs3Jd5Fg0Pa1QeT'].join('');
+    const clip = describeEvidence({ id: 'c', type: 'clipboard_capture', source: 'clipboard', title: 'deploy notes', metadata: { contentType: 'text' } }, owner);
+    const prompt = buildGistPrompt({ description: clip, projectTitle: 'PVD', text: `Use ${fakeToken} for the bot. password: Hunter2Hunter2` });
+    expect(prompt).not.toContain(fakeToken);
+    expect(prompt).not.toContain('Hunter2Hunter2');
+    expect(prompt).toContain('Use [REDACTED_SECRET] for the bot. password: [REDACTED]');
+  });
 });
 
 describe('createEvidenceGister', () => {
@@ -300,6 +310,17 @@ describe('createEvidenceGister', () => {
     expect(audit).toEqual([{ pass: 'gist', status: 'completed' }]);
     // Terminal: a second tick finds nothing.
     expect(await gister.tick()).toEqual({ attempted: 0, written: 0, skipped: 0 });
+  });
+
+  it('writes no gist onto a row that became a file reference while its gist was computed', async () => {
+    insertRouted('a76c', 'email_read', FIXTURE_META.subject, FIXTURE_EMAIL, FIXTURE_META);
+    const llm = fakeLlm(() => {
+      storage.getDb().prepare("UPDATE work_items SET type = 'file_reference' WHERE id = 'a76c'").run();
+      return '{"gist":"Parag Ahire asks Ravi to review the updated doc"}';
+    });
+    await createEvidenceGister({ db: storage.getDb(), contentStore, llm }).tick();
+    expect(llm.prompts).toHaveLength(1);
+    expect(storage.getDb().prepare("SELECT gist FROM work_items WHERE id = 'a76c'").get()).toEqual({ gist: null });
   });
 
   it('LLM unavailable → model-needed rows stay pending (NULL), derived rows still land', async () => {

@@ -16,12 +16,12 @@ import {
 import { paramStr, type RouterDeps } from './deps.js';
 import { requireLocalOwnerUiRequest } from './local-owner.js';
 
-const REVIEW_DECISION_KEYS = ['keep', 'exclude', 'excludeDirs', 'restoreDirs'] as const;
+const REVIEW_DECISION_KEYS = ['keep', 'exclude', 'excludeDirs', 'restoreDirs', 'pause', 'resume', 'keepChanging'] as const;
 
 /** Shape-only validation of a big-file review decision body. */
 function validateReviewDecision(body: unknown): { ok: true; value: ReviewDecision } | { ok: false; message: string } {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return { ok: false, message: 'Body must be a JSON object with keep, exclude, excludeDirs, or restoreDirs arrays' };
+    return { ok: false, message: `Body must be a JSON object with ${REVIEW_DECISION_KEYS.join(', ')} arrays` };
   }
   const record = body as Record<string, unknown>;
   const unknownKeys = Object.keys(record).filter(key => !(REVIEW_DECISION_KEYS as readonly string[]).includes(key));
@@ -114,7 +114,15 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
   router.get('/local-folders', (_req: Request, res: Response) => {
     const db = deps.db;
     if (!db) return res.status(503).json({ error: 'DB not available' });
-    res.json({ folders: listLocalFolders(db) });
+    // Files that keep changing and still warn (not paused, not kept by the
+    // owner): the Connections card and top-bar chip show this count.
+    let changingOften = 0;
+    try {
+      for (const folder of deps.folderImports?.status().folders ?? []) {
+        changingOften += folder.changingOften.filter(entry => !entry.acknowledged).length;
+      }
+    } catch { /* attention is advisory; the folder list still answers */ }
+    res.json({ folders: listLocalFolders(db), attention: { changingOften } });
   });
 
   router.post('/local-folders', async (req: Request, res: Response) => {
@@ -253,7 +261,7 @@ export function createLocalFoldersRouter(deps: RouterDeps): Router {
       return res.status(400).json({
         error: validated.message,
         code: 'invalid_decision',
-        nextAction: 'Send keep, exclude, excludeDirs, or restoreDirs as arrays of absolute paths from the review list.',
+        nextAction: `Send ${REVIEW_DECISION_KEYS.join(', ')} as arrays of absolute paths from the Local folders panel.`,
       });
     }
     const result = await deps.folderImports.decide(id, validated.value);

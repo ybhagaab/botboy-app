@@ -113,10 +113,14 @@ export function createBatcher(db: Database.Database, config?: BatcherConfig): Ba
     },
 
     transition(itemId: string, to: ProcessState, opts?: { projectId?: string | null }): boolean {
-      const row = db.prepare('SELECT process_state FROM work_items WHERE id = ?').get(itemId) as
-        | { process_state: ProcessState }
+      const row = db.prepare('SELECT process_state, type FROM work_items WHERE id = ?').get(itemId) as
+        | { process_state: ProcessState; type: string }
         | undefined;
       if (!row) return false;
+      // File references follow their folder (file-references.ts) and owner
+      // curation only. A model lane that read the row before it became a
+      // reference (file-reference-migration.ts) must not place it.
+      if (row.type === 'file_reference') return false;
       const from = row.process_state;
       if (from === to) {
         // idempotent no-op except for project assignment

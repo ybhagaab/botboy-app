@@ -10,12 +10,15 @@ import type { ShutdownRuntimeContext, ShutdownWorkRegistration } from '../core/s
 import {
   createLocalFolderImportLedger,
   isFirstImportDone,
+  isReferenceWalkDone,
   literalGlobForPath,
   markFirstImportDone,
+  markReferenceWalkDone,
   type LocalFolderImportLedger,
 } from '../core/local-folder-imports.js';
 import { createFilesystemMonitor, type FilesystemMonitorWithImports, type WatchEngine } from './filesystem-monitor.js';
 import { createFolderImportScheduler, type FolderImportScheduler } from './folder-import-scheduler.js';
+import { createRawCaptureRepair } from '../core/raw-capture-repair.js';
 
 vi.hoisted(() => {
   process.env.LOCAL_FOLDERS_MAX_FILE_BYTES = '2000';
@@ -134,9 +137,9 @@ describe('folder import scheduler', () => {
 
   it('holds the whole first import for an undecided big file, then imports after the owner decides', async () => {
     const small = write(root, 'notes/small.md', 10);
-    const keep = write(root, 'data/keep.csv', 600);
-    const drop = write(root, 'data/drop.csv', 700);
-    const huge = write(root, 'data/huge.csv', 3_000);
+    const keep = write(root, 'data/keep.txt', 600);
+    const drop = write(root, 'data/drop.txt', 700);
+    const huge = write(root, 'data/huge.txt', 3_000);
     const folder = addFolder();
     const s = build();
     s.start();
@@ -147,8 +150,8 @@ describe('folder import scheduler', () => {
     const review = s.review(folder.id)!;
     expect(review.undecided).toBe(2);
     expect(review.files.map(file => [file.relPath, file.dir, file.decision, file.readable])).toEqual([
-      [path.join('data', 'drop.csv'), 'data', 'undecided', true],
-      [path.join('data', 'keep.csv'), 'data', 'undecided', true],
+      [path.join('data', 'drop.txt'), 'data', 'undecided', true],
+      [path.join('data', 'keep.txt'), 'data', 'undecided', true],
     ]);
     expect(review.tooLarge.map(file => file.path)).toEqual([huge]);
 
@@ -163,20 +166,20 @@ describe('folder import scheduler', () => {
     expect(s.status().folders[0]).toMatchObject({ phase: 'watching', excludedEntries: 1 });
     const after = s.review(folder.id)!;
     expect(after.files.map(file => [file.name, file.decision, file.imported])).toEqual([
-      ['drop.csv', 'exclude', false],
-      ['keep.csv', 'keep', true],
+      ['drop.txt', 'exclude', false],
+      ['keep.txt', 'keep', true],
     ]);
   });
 
   it('rejects an invalid decision as a whole and names every bad entry', async () => {
-    write(root, 'data/a.csv', 600);
+    write(root, 'data/a.txt', 600);
     const folder = addFolder();
     const s = build();
     await monitor.scanFolder(folder.id);
-    const inside = path.join(root, 'data', 'a.csv');
+    const inside = path.join(root, 'data', 'a.txt');
     const before = getLocalFolder(storage.getDb(), folder.id)!.exclude_globs;
     const result = await s.decide(folder.id, {
-      keep: [inside, '/etc/passwd', path.join(root, 'unknown.csv')],
+      keep: [inside, '/etc/passwd', path.join(root, 'unknown.txt')],
       exclude: [inside],
       restoreDirs: [path.join(root, 'never-excluded')],
       excludeDirs: [root],
@@ -188,8 +191,8 @@ describe('folder import scheduler', () => {
     const reasons = result.invalid!.map(entry => `${path.basename(entry.path)}: ${entry.reason}`);
     expect(reasons).toEqual(expect.arrayContaining([
       'passwd: is not a file inside this folder',
-      'unknown.csv: is not in this folder’s big-file list',
-      'a.csv: is marked both import and exclude',
+      'unknown.txt: is not in this folder’s big-file list',
+      'a.txt: is marked both import and exclude',
       'never-excluded: is not an excluded subfolder of this folder',
       `${path.basename(root)}: is not a subfolder inside this folder`,
     ]));
@@ -291,6 +294,7 @@ describe('folder import scheduler', () => {
     write(root, 'a.md', 10);
     const folder = addFolder();
     markFirstImportDone(storage.getDb(), folder.id);
+    markReferenceWalkDone(storage.getDb(), folder.id);
     ledger.record({ folderId: folder.id, path: path.join(root, 'a.md'), size: 10, mtimeMs: 1, outcome: 'too_large' });
     const s = build();
     s.start();
@@ -299,5 +303,101 @@ describe('folder import scheduler', () => {
     s.forgetFolder(folder.id);
     expect(ledger.list(folder.id)).toEqual([]);
     expect(isFirstImportDone(storage.getDb(), folder.id)).toBe(false);
+    expect(isReferenceWalkDone(storage.getDb(), folder.id)).toBe(false);
+  });
+
+  it('converts stored data and code versions before any folder walk, and retries a deferred conversion', async () => {
+    write(root, 'a.md', 10);
+    const folder = addFolder();
+    const calls: string[] = [];
+    let runs = 0;
+    const referenceMigration = {
+      isDone: () => runs >= 2,
+      run: vi.fn(async () => { calls.push('migration'); runs++; return { done: runs >= 2 }; }),
+    };
+    const scan = monitor.scanFolder.bind(monitor);
+    monitor.scanFolder = async (id, opts) => { calls.push('scan'); return scan(id, opts); };
+    const s = build({ referenceMigration });
+    s.start();
+    await vi.waitFor(() => expect(referenceMigration.run).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+    await vi.waitFor(() => expect(isFirstImportDone(storage.getDb(), folder.id)).toBe(true), { timeout: 3_000 });
+    expect(calls.slice(0, 2)).toEqual(['migration', 'scan']);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    expect(referenceMigration.run).toHaveBeenCalledTimes(2); // done: never run again
+  });
+
+  it('repairs PDF captures stored as raw bytes after the conversion, before walks, and imports the re-captures in the same pass', async () => {
+    const done = addFolder();
+    markFirstImportDone(storage.getDb(), done.id);
+    markReferenceWalkDone(storage.getDb(), done.id);
+    const pdf = write(root, 'Documents/scan.pdf', 300);
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, file_path, raw_text, content_storage, content_sha256, content_bytes, metadata, captured_at, process_state)
+      VALUES ('raw', 'document_capture', 'filesystem', 'scan.pdf', ?, '%PDF-1.4 raw bytes', 'inline', 'sha', 18, ?, '2026-07-08T00:00:00Z', 'routed')
+    `).run(pdf, JSON.stringify({ filePath: pdf }));
+    const contentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-sched-content-'));
+    const calls: string[] = [];
+    const referenceMigration = { isDone: () => calls.includes('migration'), run: vi.fn(async () => { calls.push('migration'); return { done: true }; }) };
+    const repair = createRawCaptureRepair({ db: storage.getDb(), contentDir, bigFileBytes: THRESHOLDS.bigFileBytes, yieldToLoop: async () => {} });
+    const rawCaptureRepair = { isDone: () => repair.isDone(), run: async (opts?: { signal?: AbortSignal }) => { calls.push('repair'); return repair.run(opts); } };
+    const importFiles = monitor.importFiles.bind(monitor);
+    monitor.importFiles = async (id, records, opts) => { calls.push('import'); return importFiles(id, records, opts); };
+    const s = build({ referenceMigration, rawCaptureRepair });
+    s.start();
+    await vi.waitFor(() => expect(emitted.map(item => item.metadata.filePath)).toContain(pdf), { timeout: 3_000 });
+    expect(calls).toEqual(['migration', 'repair', 'import']);
+    expect(storage.getDb().prepare("SELECT COUNT(*) AS c FROM work_items WHERE id = 'raw'").get()).toEqual({ c: 0 });
+    expect(emitted.find(item => item.metadata.filePath === pdf)).toMatchObject({ type: 'document_capture', content: '' });
+    expect(repair.isDone()).toBe(true);
+    fs.rmSync(contentDir, { recursive: true, force: true });
+  });
+
+  it('a stop aborts the conversion and the pass', async () => {
+    addFolder();
+    let seen: AbortSignal | undefined;
+    const referenceMigration = {
+      isDone: () => false,
+      run: (opts?: { signal?: AbortSignal }) => new Promise<{ done: boolean; aborted?: boolean }>((resolve) => {
+        seen = opts?.signal;
+        opts?.signal?.addEventListener('abort', () => resolve({ done: false, aborted: true }), { once: true });
+      }),
+    };
+    const scanned = vi.spyOn(monitor, 'scanFolder');
+    const s = build({ referenceMigration });
+    s.start();
+    await vi.waitFor(() => expect(seen).toBeDefined(), { timeout: 3_000 });
+    s.stop();
+    await s.drain();
+    expect(seen!.aborted).toBe(true);
+    expect(scanned).not.toHaveBeenCalled();
+  });
+
+  it('walks a folder imported before the reference rules once: data and code become references, documents are skipped', async () => {
+    const note = write(root, 'notes/plan.md', 10);
+    const data = write(root, 'notes/results.json', 3_000);
+    const code = write(root, 'src/train.py', 40);
+    const folder = addFolder();
+    // An upgraded store: the first import finished under the old rules, the
+    // document was captured then, and the data file was held as too large.
+    markFirstImportDone(storage.getDb(), folder.id);
+    const noteStat = fs.statSync(note);
+    ledger.record({ folderId: folder.id, path: note, size: noteStat.size, mtimeMs: noteStat.mtimeMs, outcome: 'imported' });
+    const dataStat = fs.statSync(data);
+    ledger.record({ folderId: folder.id, path: data, size: dataStat.size, mtimeMs: dataStat.mtimeMs, outcome: 'too_large' });
+    const s = build();
+    s.start();
+    await vi.waitFor(() => expect(isReferenceWalkDone(storage.getDb(), folder.id)).toBe(true), { timeout: 3_000 });
+    expect(emitted.map(item => [path.basename(String(item.metadata.filePath)), item.type]).sort()).toEqual([
+      ['results.json', 'file_reference'],
+      ['train.py', 'file_reference'],
+    ]);
+    expect(ledger.get(folder.id, data)?.outcome).toBe('imported');
+    expect(emitted.find(item => item.metadata.filePath === code)?.metadata).toMatchObject({ fileRole: 'code', format: 'Python' });
+
+    // Done once: a later pass does not walk the folder again.
+    const before = emitted.length;
+    s.kick();
+    await new Promise(resolve => setTimeout(resolve, 120));
+    expect(emitted).toHaveLength(before);
   });
 });

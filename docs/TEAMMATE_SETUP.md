@@ -5,7 +5,7 @@
 You need:
 
 - a Mac with **Google Chrome**
-- **Node.js 20 or newer** (`node --version`)
+- **Node.js 20.16 or newer** (`node --version`; PDF reading needs 20.16)
 - **Git**
 - an AI model: the private BotBoy credential attachment sent to you by the
   owner, your own OpenAI API key, your own DeepSeek API key, or any mix of them
@@ -180,10 +180,16 @@ guided setup.
   want document synchronization.
 - **Local folders** — BotBoy watches Downloads, Desktop, and Documents by
   default, and you can add more. Existing files import in the background after
-  BotBoy is ready, so a big folder never delays startup. Files of 25 MB or more
-  wait for you: the folder shows **Needs your decision** with a list where you
-  tick the files to import and exclude the rest, one by one or by subfolder.
-  Files over 200 MB are listed as too large to import yet. The **Storage** card
+  BotBoy is ready, so a big folder never delays startup. Data and code files
+  (JSON, CSV, logs, model files, source code, config) are not read: BotBoy
+  records each one's name, size, and a short outline, lists it on its
+  project's **Files** tab, and opens the file only when you ask about it. After
+  you update from an older release, BotBoy replaces the copies of these files
+  it stored before with those records, once, in the background. Documents of
+  25 MB or more wait for you: the folder shows **Needs your decision** with a
+  list where you tick the files to import and exclude the rest, one by one or
+  by subfolder. Documents over 200 MB are listed as too large to import yet.
+  The **Storage** card
   on the same page shows where BotBoy's disk space goes. Imports pause below
   10 GB free; below 2 GB, new changes wait until space returns. Watching
   continues either way.
@@ -222,6 +228,21 @@ npm run app:bundle
 With Xcode Command Line Tools, the native launcher keeps the Dock icon present
 while BotBoy runs. Without them, BotBoy still runs from Terminal.
 
+BotBoy reads the text of PDFs on every Mac: its pdf.js reader is installed by
+`npm install`, and `./start.sh` installs it after an update if it is missing.
+Xcode Command Line Tools also build BotBoy's native reader, which is faster
+and adds OCR for scanned PDFs and images. Without them, BotBoy records scanned
+pages and images as unread rather than guessing. To add the native reader,
+run `xcode-select --install`, then:
+
+```bash
+cd ~/botboy-app
+npm run bootstrap
+./start.sh
+```
+
+Files recorded as unread are read the next time they change.
+
 ### Troubleshooting
 
 BotBoy's runtime log is `/tmp/ppt.log`.
@@ -245,13 +266,14 @@ credential attachment before producing the report.
 
 | Symptom | What to do |
 |---|---|
-| `node not found` | Install Node.js 20+ and rerun `./start.sh`. |
+| `node not found` | Install Node.js 20.16 or newer and rerun `./start.sh`. |
 | Chat says it needs an AI model first | Open **Settings → AI model** and add an OpenAI or DeepSeek API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
 | Settings → AI model says OpenAI or DeepSeek rejected the key | Copy a current key from platform.openai.com/api-keys or platform.deepseek.com/api_keys and save it again. |
 | Settings → AI model says the account has no credit | Add credit in OpenAI Billing or top up the DeepSeek account. BotBoy resumes on its own once calls succeed. |
 | Settings → AI model cannot reach api.openai.com or api.deepseek.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` status. |
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
+| `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app`. `./start.sh --update` updates BotBoy but never reinstalls packages, so older ones stay until you do. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
 | Chat returns HTTP 401 | Ask the owner to check gateway access. |

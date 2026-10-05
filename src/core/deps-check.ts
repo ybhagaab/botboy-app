@@ -35,10 +35,23 @@ function commandExists(bin: string): boolean {
   }
 }
 
+function projectRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+}
+
 export function visionHelperPath(): string {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const projectRoot = path.resolve(here, '..', '..');
-  return path.join(projectRoot, 'native', 'vision-ocr', 'bin', 'vision-ocr');
+  return path.join(projectRoot(), 'native', 'vision-ocr', 'bin', 'vision-ocr');
+}
+
+/** BotBoy's own PDF reader (pdf.js, a pinned npm dependency), run as a child process. */
+export function pdfTextScriptPath(): string {
+  return path.join(projectRoot(), 'scripts', 'pdf-text.mjs');
+}
+
+/** Whether `npm install` put pdf.js in place for `pdfTextScriptPath`. */
+export function pdfJsInstalled(): boolean {
+  return existsSync(path.join(projectRoot(), 'node_modules', 'pdfjs-dist', 'legacy', 'build', 'pdf.mjs'))
+    && existsSync(pdfTextScriptPath());
 }
 
 export function checkDependencies(): DepsReport {
@@ -57,18 +70,19 @@ export function checkDependencies(): DepsReport {
         : `missing; run "npm run bootstrap" to build the vision-ocr helper (${helper})`,
   });
 
-  // Document parsing — the native vision-ocr helper handles the PDF text
-  // layer (PDFKit) and page rasterization (CoreGraphics), so PDF support
-  // needs no external tool. poppler and textutil remain as fallbacks.
+  // Document parsing — the native vision-ocr helper reads the PDF text layer
+  // (PDFKit), then poppler's pdftotext if installed, then BotBoy's own pdf.js
+  // reader, which `npm install` always provides. textutil does not count: it
+  // cannot read PDFs and echoes their bytes.
   const pdftotext = commandExists('pdftotext');
-  const textutil = commandExists('textutil');
-  const pdfOk = ocrOk || pdftotext || textutil;
+  const pdfJs = pdfJsInstalled();
+  const pdfOk = ocrOk || pdftotext || pdfJs;
   deps.push({
-    name: 'pdf parsing (vision-ocr pdf-text|pdftotext|textutil)',
+    name: 'pdf parsing (vision-ocr pdf-text|pdftotext|pdf.js)',
     ok: pdfOk,
     detail: pdfOk
-      ? `available (${ocrOk ? 'native PDFKit helper' : pdftotext ? 'pdftotext' : 'textutil'})`
-      : 'missing; run "npm run bootstrap" to build the native helper',
+      ? `available (${ocrOk ? 'native PDFKit helper' : pdftotext ? 'pdftotext' : 'pdf.js'})`
+      : 'missing; PDFs fail extraction until you run "npm install" in the BotBoy folder',
   });
 
   // Scanned-PDF OCR rasterizes via the same native helper; pdftoppm optional.

@@ -78,8 +78,9 @@ export function demoteAmbientProjects(
       .map(([id]) => id.slice('project:'.length)),
   );
 
+  // File references (data/code files) are not evidence of engagement either way.
   const itemsFor = db.prepare(
-    'SELECT id, source, type, metadata, raw_text FROM work_items WHERE project_id = ?',
+    "SELECT id, source, type, metadata, raw_text FROM work_items WHERE project_id = ? AND type <> 'file_reference'",
   );
 
   for (const project of brainStore.listProjects()) {

@@ -5,7 +5,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import type { LlmMessage } from './llm-client.js';
 
 export type SessionType = 'chat' | 'background' | 'subagent';

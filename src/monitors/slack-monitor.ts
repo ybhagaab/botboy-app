@@ -42,12 +42,14 @@
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 import type { McpManager } from '../core/mcp-types.js';
-import { createSlackMcpClient, type SlackMcpClient } from './slack-mcp-client.js';
+import { createSlackMcpClient, slackErrorKind, type SlackCallErrorKind, type SlackMcpClient } from './slack-mcp-client.js';
+import { SLACK_MCP_PROFILE_ID } from '../core/mcp-profiles.js';
 import fs from 'fs';
 import type Database from 'better-sqlite3';
 import type { RawWorkItem } from '../core/types.js';
 import { getChannelConfig } from '../core/slack-config.js';
 import { getSetting, setSetting } from '../core/storage.js';
+import type { CaptureFailureKind, CaptureHealth } from '../core/capture-health.js';
 
 export interface SlackBackfillOptions {
   /** How many days of history to fetch (default 30). */
@@ -121,7 +123,29 @@ export function resolveSlackCaptureMode(
   return appToken ? 'socket' : 'poll';
 }
 
-export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: McpManager }): SlackMonitor {
+/** Kinds that mean the whole transport failed: one failure stands for every conversation. */
+const TRANSPORT_WIDE_KINDS: ReadonlySet<SlackCallErrorKind> = new Set([
+  'midway_auth', 'service_auth', 'rate_limited', 'network', 'connector_down',
+]);
+
+/** Longest wait between poll attempts while the transport keeps failing. */
+const MAX_POLL_BACKOFF_MS = 5 * 60_000;
+
+/** One automatic Slack connection restart per this interval for sign-in failures. */
+const SIGN_IN_HEAL_INTERVAL_MS = 30 * 60_000;
+
+function describeSlackError(error: unknown): string {
+  const data = (error as { data?: { error?: unknown } } | null)?.data?.error;
+  if (typeof data === 'string' && data) return data;
+  return String((error as Error)?.message ?? error);
+}
+
+export function createSlackMonitor(deps: {
+  db: Database.Database;
+  mcpManager?: McpManager;
+  /** Outcome of every poll cycle, for owner-facing capture warnings. */
+  captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
+}): SlackMonitor {
   const env = loadEnv();
   const appToken = process.env.SLACK_APP_TOKEN || env.SLACK_APP_TOKEN || '';
   const userToken = process.env.SLACK_USER_TOKEN || env.SLACK_USER_TOKEN || '';
@@ -633,6 +657,14 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
   let pollCycleCount = 0;
   let pollCarryover: string[] = [];
   let lastPollError = '';
+  // Transport-wide failures back off instead of sweeping every conversation
+  // each cycle (2026-10-02: one expired Midway session produced 276 sign-in
+  // attempts in 3.6 minutes).
+  let transportFailures = 0;
+  let nextPollAt = 0;
+  let lastSignInHealAt = 0;
+  // Last logged error per conversation, so a broken conversation logs once.
+  const conversationErrors = new Map<string, string>();
 
   const eligibleHistoryMessage = (m: any): boolean =>
     Boolean(m?.ts && !(m.subtype && m.subtype !== 'file_share') && !m.bot_id);
@@ -773,8 +805,67 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
     return calls;
   }
 
+  /**
+   * Poll one conversation. A conversation-specific failure (archived, left,
+   * unreadable message) is logged once and skipped; a transport-wide one
+   * (Midway session, sign-in, rate limit, network) is rethrown so the cycle
+   * stops instead of repeating the same failure for every conversation.
+   * Returns the calls used; a failed attempt still spent one.
+   */
+  async function pollOneConversation(
+    channelId: string,
+    threadScanDue: boolean,
+    cycle: { succeeded: number; firstError: unknown },
+  ): Promise<number> {
+    try {
+      const used = await pollConversation(channelId, threadScanDue);
+      cycle.succeeded++;
+      conversationErrors.delete(channelId);
+      return used;
+    } catch (err) {
+      if (TRANSPORT_WIDE_KINDS.has(slackErrorKind(err))) throw err;
+      cycle.firstError ??= err;
+      const message = describeSlackError(err);
+      if (conversationErrors.get(channelId) !== message) {
+        conversationErrors.set(channelId, message);
+        console.warn(`[Slack] poll failed for ${channelId}: ${message}`);
+      }
+      return 1;
+    }
+  }
+
+  /** Record a failed cycle, back off, and self-heal a stuck sign-in once. */
+  function recordCycleFailure(err: unknown): void {
+    connected = false;
+    const errorKind = slackErrorKind(err);
+    const kind: CaptureFailureKind = errorKind === 'conversation_access' ? 'service_auth' : errorKind;
+    const message = describeSlackError(err);
+    deps.captureHealth?.reportFailure('slack', { kind, reason: message });
+    transportFailures++;
+    const delayMs = Math.min(MAX_POLL_BACKOFF_MS, pollIntervalMs * 2 ** (transportFailures - 1));
+    // The interval timer drives cycles; the tolerance keeps timer jitter from
+    // skipping the attempt that is due.
+    nextPollAt = Date.now() + delayMs - 5_000;
+    if (message !== lastPollError) {
+      console.warn(`[Slack] capture paused (${kind}): ${message} — retrying in ${Math.round(delayMs / 1000)}s`);
+      lastPollError = message;
+    }
+    // A sign-in the service keeps rejecting is often stale session state in
+    // the Slack MCP process; one restart clears it. Midway expiry is the
+    // sentinel's job (it opens mwinit), so it is not restarted here.
+    if (kind === 'service_auth' && mcpTransportActive && deps.mcpManager
+      && transportFailures >= 2 && Date.now() - lastSignInHealAt >= SIGN_IN_HEAL_INTERVAL_MS) {
+      lastSignInHealAt = Date.now();
+      console.warn('[Slack] restarting the Slack connection after repeated sign-in failures');
+      void deps.mcpManager.restart(SLACK_MCP_PROFILE_ID).catch((error: unknown) => {
+        console.warn(`[Slack] Slack connection restart failed: ${(error as Error)?.message ?? error}`);
+      });
+    }
+  }
+
   async function pollCycle(): Promise<void> {
     if (polling) return;
+    if (Date.now() < nextPollAt) return;
     polling = true;
     try {
       pollCycleCount++;
@@ -803,6 +894,7 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
         ...watchedConversations,
       ])];
       pollCarryover = [];
+      const cycle: { succeeded: number; firstError: unknown } = { succeeded: 0, firstError: null };
       for (let index = 0; index < tierOne.length; index++) {
         if (budget <= 0) {
           pollCarryover = tierOne.slice(index);
@@ -810,10 +902,12 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
         }
         const channelId = tierOne[index];
         try {
-          budget -= await pollConversation(channelId, threadScanDue);
-        } catch (err: any) {
           // One broken conversation must not stall the rest of the cycle.
-          console.warn(`[Slack] poll failed for ${channelId}: ${err?.data?.error || err?.message || err}`);
+          budget -= await pollOneConversation(channelId, threadScanDue, cycle);
+        } catch (err) {
+          // Transport-wide: the conversations not reached go first next time.
+          pollCarryover = tierOne.slice(index);
+          throw err;
         }
       }
 
@@ -825,18 +919,22 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
       if (cold.length > 0 && budget > 0) {
         let position = (getSetting<number>(deps.db, 'slack.poll.rotation') ?? 0) % cold.length;
         let visited = 0;
-        while (budget > 0 && visited < cold.length) {
-          const channelId = cold[position];
-          position = (position + 1) % cold.length;
-          visited++;
-          try {
-            budget -= await pollConversation(channelId, false);
-          } catch (err: any) {
-            console.warn(`[Slack] poll failed for ${channelId}: ${err?.data?.error || err?.message || err}`);
+        try {
+          while (budget > 0 && visited < cold.length) {
+            const channelId = cold[position];
+            budget -= await pollOneConversation(channelId, false, cycle);
+            position = (position + 1) % cold.length;
+            visited++;
           }
+        } finally {
+          // A transport failure resumes the rotation at the conversation it hit.
+          setSetting(deps.db, 'slack.poll.rotation', position);
         }
-        setSetting(deps.db, 'slack.poll.rotation', position);
       }
+
+      // Every polled conversation failed: the cycle delivered nothing, which
+      // is an outage even when each error looked conversation-specific.
+      if (cycle.succeeded === 0 && cycle.firstError) throw cycle.firstError;
 
       // One-time DM context backfills, SEQUENTIAL and capped per cycle — the
       // poll analog of socket mode's backfill-on-first-DM-message. Only HOT
@@ -853,13 +951,12 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
 
       connected = true;
       lastPollError = '';
-    } catch (err: any) {
-      connected = false;
-      const message = String(err?.data?.error || err?.message || err);
-      if (message !== lastPollError) {
-        console.warn(`[Slack] poll cycle failed: ${message}`);
-        lastPollError = message;
-      }
+      if (transportFailures > 0) console.log('[Slack] capture resumed');
+      transportFailures = 0;
+      nextPollAt = 0;
+      deps.captureHealth?.reportSuccess('slack');
+    } catch (err) {
+      recordCycleFailure(err);
     } finally {
       polling = false;
     }
@@ -876,7 +973,7 @@ export function createSlackMonitor(deps: { db: Database.Database; mcpManager?: M
         await pollCycle(); // seeds first-sight cursors and proves the token
         pollTimer = setInterval(() => { void pollCycle(); }, pollIntervalMs);
         pollTimer.unref?.();
-        console.log(`✅ Slack polling mode active (user token only, every ${Math.round(pollIntervalMs / 1000)}s)`);
+        console.log(`✅ Slack polling mode active (${mcpClient ? `Slack MCP${webClient ? ', user token fallback' : ''}` : 'user token only'}, every ${Math.round(pollIntervalMs / 1000)}s)`);
         return;
       }
 

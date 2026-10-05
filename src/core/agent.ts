@@ -4,7 +4,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import type { AcpClient } from './acp-client.js';
 import type { LlmClient, ToolCall } from './llm-client.js';
 import { isLlmClientSwitch, pinLlmClient } from './llm-client-switch.js';

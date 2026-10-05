@@ -5,7 +5,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import type { AcpClient } from './acp-client.js';
 import type { NodeManager } from './node-manager.js';
 import type { TieredContextManager } from './context-sync.js';

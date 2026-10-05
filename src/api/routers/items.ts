@@ -21,17 +21,24 @@ export function createItemsRouter(deps: RouterDeps): Router {
     const limit = Math.max(1, Math.min(parseInt(String(req.query.limit)) || 50, 200));
     const pattern = `%${q}%`;
 
+    // File references (data/code files) carry their outline in summary and
+    // parsed_text, link to their project directly (not through nodes), and
+    // drop out once the file is deleted.
     const rows = db.prepare(`
       SELECT wi.id, wi.type, wi.source, wi.source_app, wi.title, wi.summary,
-             wi.url, wi.parsed_text, wi.captured_at,
+             wi.url, wi.parsed_text, wi.captured_at, wi.file_path,
              json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.docKey') AS doc_key,
-             n.id as node_id, n.title as node_title
+             COALESCE(n.id, CASE WHEN wi.type = 'file_reference' THEN pr.id END) as node_id,
+             COALESCE(n.title, CASE WHEN wi.type = 'file_reference' THEN pr.title END) as node_title
       FROM work_items wi
       LEFT JOIN node_work_items nwi ON wi.id = nwi.work_item_id
       LEFT JOIN nodes n ON nwi.node_id = n.id
+      LEFT JOIN projects pr ON pr.id = wi.project_id
       WHERE (wi.title LIKE ? OR wi.summary LIKE ? OR wi.parsed_text LIKE ?)
         AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
         AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
+        AND NOT (wi.type = 'file_reference'
+          AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.archived'), '') = 'true')
       ORDER BY wi.captured_at DESC, wi.id ASC, n.id ASC
       LIMIT ?
     `).all(pattern, pattern, pattern, limit) as any[];
@@ -53,9 +60,13 @@ export function createItemsRouter(deps: RouterDeps): Router {
     for (const r of rows) {
       if (seenIds.has(r.id)) continue; // node fan-out
       seenIds.add(r.id);
+      // A file reference is one row per path: same-named files (package.json,
+      // index.ts) in different folders are different files.
       const key = r.doc_key
         ? `doc:${r.doc_key}`
-        : `t:${r.source}\u0000${r.type}\u0000${String(r.title || '').replace(/\s+/g, ' ').trim().toLowerCase()}`;
+        : r.type === 'file_reference'
+          ? `file:${r.file_path}`
+          : `t:${r.source}\u0000${r.type}\u0000${String(r.title || '').replace(/\s+/g, ' ').trim().toLowerCase()}`;
       const existing = seen.get(key);
       if (!existing) {
         seen.set(key, r);
@@ -90,6 +101,7 @@ export function createItemsRouter(deps: RouterDeps): Router {
         item: {
           id: r.id, type: r.type, source: r.source, sourceApp: r.source_app, title: r.title,
           summary: r.summary, url: r.url, capturedAt: r.captured_at,
+          ...(r.type === 'file_reference' && r.file_path ? { filePath: r.file_path } : {}),
           ...(r.doc_key ? { docKey: r.doc_key } : {}),
           ...(r.doc_key || r.collapsed_count ? { collapsedCount: r.collapsed_count || 0 } : {}),
         },
@@ -223,10 +235,13 @@ export function createItemsRouter(deps: RouterDeps): Router {
     if (!db) return res.status(503).json({ error: 'DB not available' });
     const limit = Math.max(1, Math.min(parseInt(String(req.query.limit)) || 40, 100));
     const offset = Math.max(0, parseInt(String(req.query.offset)) || 0);
+    // File references (data/code files) are not inbox evidence: they follow
+    // their folder's documents (file-references.ts), and a code folder alone
+    // would bury the inbox. ⌘K still finds unassigned ones.
     const count = (db.prepare(`
       SELECT COUNT(*) AS c
       FROM work_items
-      WHERE project_id IS NULL AND process_state <> 'noise'
+      WHERE project_id IS NULL AND process_state <> 'noise' AND type <> 'file_reference'
     `).get() as { c: number }).c;
     const items = db.prepare(`
       SELECT id, type, source, source_app AS sourceApp, title, summary, url,
@@ -237,7 +252,7 @@ export function createItemsRouter(deps: RouterDeps): Router {
              ) AS filePath,
              captured_at AS capturedAt
       FROM work_items
-      WHERE project_id IS NULL AND process_state <> 'noise'
+      WHERE project_id IS NULL AND process_state <> 'noise' AND type <> 'file_reference'
       ORDER BY captured_at DESC
       LIMIT ? OFFSET ?
     `).all(limit, offset);

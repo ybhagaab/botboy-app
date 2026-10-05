@@ -35,6 +35,21 @@ describe('Batcher', () => {
     expect(row.batch_id).toBe(wave.batchId);
   });
 
+  it('never moves a file reference, even one a model lane read before it became a reference', () => {
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, captured_at, process_state, project_id)
+      VALUES ('ref', 'file_reference', 'filesystem', 'metrics.json', '2026-10-04T00:00:00Z', 'orphaned', NULL),
+             ('ref2', 'file_reference', 'filesystem', 'train.py', '2026-10-04T00:00:00Z', 'routed', 'p1')
+    `).run();
+    expect(batcher.transition('ref', 'routed', { projectId: 'p2' })).toBe(false);
+    expect(batcher.transition('ref2', 'routed', { projectId: 'p2' })).toBe(false);
+    const rows = storage.getDb().prepare("SELECT id, process_state AS state, project_id AS projectId FROM work_items ORDER BY id").all();
+    expect(rows).toEqual([
+      { id: 'ref', state: 'orphaned', projectId: null },
+      { id: 'ref2', state: 'routed', projectId: 'p1' },
+    ]);
+  });
+
   it('shouldFire respects the size trigger', () => {
     const now = new Date().toISOString(); // fresh → age trigger won't fire
     insert('a', 'extracted', now);

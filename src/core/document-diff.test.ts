@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { diffDocumentTexts } from './document-diff.js';
+import { changedTextForBrief, diffDocumentTexts } from './document-diff.js';
 
 /**
  * Revision diff summaries (sharepoint-signals R2): compact, section-
@@ -73,5 +73,61 @@ describe('diffDocumentTexts', () => {
     const bigDiff = diffDocumentTexts(big, `new head line\n${big}`)!;
     expect(bigDiff.truncated).toBe(true);
     expect(bigDiff.summary).toContain('compared first 200 KB');
+  });
+});
+
+/**
+ * The changed text a brief reads instead of a long document's new version
+ * (document-reads.ts): complete inputs, changed passages with context and
+ * their section, removed lines, and a measure of how much changed.
+ */
+describe('changedTextForBrief', () => {
+  const body = (count: number, prefix = 'line') => Array.from({ length: count }, (_, i) => `${prefix} ${i} of the plan`).join('\n');
+
+  it('returns null when no non-blank line changed', () => {
+    expect(changedTextForBrief('a\n\nb', 'a\nb\n\n')).toBeNull();
+    expect(changedTextForBrief(body(50), body(50))).toBeNull();
+  });
+
+  it('shows each changed passage with two lines of context, its section, and its line numbers', () => {
+    const oldText = ['# Rollout', 'step one', 'step two', 'step three', 'step four', '# Budget', 'total 10', 'owner Sam', 'end'].join('\n');
+    const newText = ['# Rollout', 'step one', 'step two', 'step three', 'step four', '# Budget', 'total 12', 'owner Sam', 'end'].join('\n');
+    const change = changedTextForBrief(oldText, newText, { since: '2026-10-01' })!;
+    expect(change).toMatchObject({ addedLines: 1, removedLines: 1, changedChars: 'total 12'.length + 'total 10'.length });
+    expect(change.text).toContain('CHANGES since the version this brain last read (captured 2026-10-01): 1 line added or changed, 1 removed.');
+    expect(change.text).toContain('@@ section "Budget", lines 5–9 of the new version @@\n  step four\n  # Budget\n+ total 12\n  owner Sam\n  end');
+    expect(change.text).toContain('REMOVED (1 line):\n- total 10   [section "Budget"]');
+  });
+
+  it('reads complete large texts, so a change deep in a 3 MB document is found and nothing else is shown', () => {
+    const big = body(100_000, 'row');
+    expect(big.length).toBeGreaterThan(2_000_000);
+    const changed = big.replace('row 90000 of the plan', 'row 90000 of the REVISED plan');
+    const started = Date.now();
+    const change = changedTextForBrief(big, changed)!;
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(change.text).toContain('+ row 90000 of the REVISED plan');
+    expect(change.text).toContain('  row 89999 of the plan');
+    expect(change.text).not.toContain('row 50000');
+    expect(change.text.length).toBeLessThan(1_000);
+  });
+
+  it('stays linear when thousands of lines change in a long file without headings', () => {
+    const rows = body(60_000, 'row');
+    const edited = rows.split('\n').map((line, index) => (index % 10 === 0 ? `${line} (revised)` : line)).join('\n');
+    const started = Date.now();
+    const change = changedTextForBrief(rows, edited)!;
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(change).toMatchObject({ addedLines: 6_000, removedLines: 6_000 });
+    expect(change.text).toContain('@@ lines 59989–59993 of the new version @@\n  row 59988 of the plan\n  row 59989 of the plan\n+ row 59990 of the plan (revised)');
+    expect(change.text).not.toContain('section "');
+  });
+
+  it('treats a moved line as unchanged and caps the removed list', () => {
+    expect(changedTextForBrief('a\nb\nc', 'c\na\nb')).toBeNull();
+    const removed = changedTextForBrief(body(3_000, 'gone'), 'kept')!;
+    expect(removed.removedLines).toBe(3_000);
+    expect(removed.text).toMatch(/REMOVED \(3,000 lines, first [\d,]+ shown\)/);
+    expect(removed.text.length).toBeLessThan(30_000);
   });
 });

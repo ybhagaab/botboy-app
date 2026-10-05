@@ -63,6 +63,15 @@ const AWS_ENV_KEYS = [
 
 const DEFAULT_SQL_CONFIG: SqlContextMcpConfig = DEFAULT_SQL_CONTEXT_CONFIG;
 
+/**
+ * Largest single stdio message accepted from a server. The MCP SDK (1.31)
+ * defaults to 10 MiB and closes the transport on overflow, which would fail
+ * every in-flight call and restart the connector. SharePoint inline reads have
+ * returned 9.5M-character results, and every stdio server here is a local
+ * child BotBoy launched itself, so keep the pre-1.31 unbounded buffer.
+ */
+const STDIO_MAX_MESSAGE_BYTES = Number.POSITIVE_INFINITY;
+
 interface McpServerRow {
   id: string;
   kind: string;
@@ -597,6 +606,7 @@ export function createMcpManager(options: {
           env: sqlEnvironment(config, password),
           cwd: path.dirname(copy.entry),
           stderr: 'pipe',
+          maxBufferSize: STDIO_MAX_MESSAGE_BYTES,
         });
       } else {
         const executable = await resolveDefinitionExecutable(profile);
@@ -633,6 +643,7 @@ export function createMcpManager(options: {
           args: launch.args,
           env: childEnv,
           stderr: 'pipe',
+          maxBufferSize: STDIO_MAX_MESSAGE_BYTES,
         });
       }
 

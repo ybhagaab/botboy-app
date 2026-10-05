@@ -95,12 +95,154 @@ function tokensMatch(a: string, b: string): boolean {
   return shorter.length >= 5 && longer.includes(shorter);
 }
 
-function matchedTitleTokens(title: string, evidence: string): WeightedToken[] {
-  const evidenceTokens = semanticTokens(evidence);
-  return semanticTokens(title).filter((titleToken) =>
-    evidenceTokens.some((evidenceToken) => tokensMatch(titleToken.value, evidenceToken.value)),
-  );
+/**
+ * One evidence string's scope vocabulary, built once and reused for every
+ * title checked against it. The previous form re-tokenized and re-normalized
+ * the whole evidence for every title and compared each title token with every
+ * evidence token. A portfolio check (≈150 titles) over a 2.4M-character file
+ * blocked the main thread for ~25 s, and 10–17M-character evidence for minutes
+ * (owner-live 2026-10-01). Lookups here answer exactly what
+ * `evidenceTokens.some(e => tokensMatch(t, e))` answered.
+ */
+interface EvidenceScopeIndex {
+  blank: boolean;
+  /** Distinct lowercase evidence tokens, filtered exactly like `semanticTokens`. */
+  tokens: Set<string>;
+  /** `morphologicalStem` of every token whose stem can match (length >= 4). */
+  stems: Set<string>;
+  /** Per title-token answers, so each distinct token is resolved once. */
+  matches: Map<string, boolean>;
+  /** Per normalized-title exact-phrase answers (one evidence scan each). */
+  phrases: Map<string, boolean>;
+  evidence: string;
+  joinedTokens: string | null;
+  lower: string | null;
 }
+
+const TOKEN_PATTERN = /[A-Za-z0-9][A-Za-z0-9_-]*/g;
+// Evidence tokens never contain this character, so a substring hit in the
+// joined list always lies inside one token.
+const TOKEN_DELIMITER = '\u0001';
+
+function buildEvidenceScopeIndex(evidence: string): EvidenceScopeIndex {
+  const tokens = new Set<string>();
+  const pattern = new RegExp(TOKEN_PATTERN.source, 'g');
+  for (let match = pattern.exec(evidence); match !== null; match = pattern.exec(evidence)) {
+    const token = match[0].toLowerCase();
+    if (token.length < 2 || GENERIC_TITLE_TOKENS.has(token)) continue;
+    tokens.add(token);
+  }
+  const stems = new Set<string>();
+  for (const token of tokens) {
+    const stem = morphologicalStem(token);
+    if (stem.length >= 4) stems.add(stem);
+  }
+  return {
+    blank: !/\S/.test(evidence),
+    tokens,
+    stems,
+    matches: new Map(),
+    phrases: new Map(),
+    evidence,
+    joinedTokens: null,
+    lower: null,
+  };
+}
+
+// Index reuse is bounded to one synchronous section: the entry is dropped at
+// the next microtask checkpoint, so a large evidence string is never retained
+// after the routing/brain pass that examined it. Short evidence is cheap to
+// index and is never cached.
+const INDEX_REUSE_MIN_CHARS = 4_096;
+let reusableIndex: { evidence: string; index: EvidenceScopeIndex } | null = null;
+
+function evidenceScopeIndex(evidence: string): EvidenceScopeIndex {
+  if (evidence.length < INDEX_REUSE_MIN_CHARS) return buildEvidenceScopeIndex(evidence);
+  if (reusableIndex && reusableIndex.evidence === evidence) return reusableIndex.index;
+  const entry = { evidence, index: buildEvidenceScopeIndex(evidence) };
+  reusableIndex = entry;
+  queueMicrotask(() => {
+    if (reusableIndex === entry) reusableIndex = null;
+  });
+  return entry.index;
+}
+
+function joinedEvidenceTokens(index: EvidenceScopeIndex): string {
+  if (index.joinedTokens === null) {
+    index.joinedTokens = `${TOKEN_DELIMITER}${[...index.tokens].join(TOKEN_DELIMITER)}${TOKEN_DELIMITER}`;
+  }
+  return index.joinedTokens;
+}
+
+function lowerEvidence(index: EvidenceScopeIndex): string {
+  if (index.lower === null) index.lower = index.evidence.toLowerCase();
+  return index.lower;
+}
+
+const phrasePatterns = new Map<string, RegExp>();
+
+/**
+ * Exactly `normalizePhrase(evidence).includes(normalizedPhrase)`, without
+ * materializing the normalized evidence (1.4 s for 24M characters). The
+ * normalized form is the `[a-z0-9]+` runs of the lowercased text joined by
+ * single spaces, so the phrase occurs there exactly when its first word ends a
+ * run, its inner words are whole runs, and its last word starts a run, with
+ * only separator characters between them.
+ */
+function evidenceContainsNormalizedPhrase(index: EvidenceScopeIndex, normalizedPhrase: string): boolean {
+  const known = index.phrases.get(normalizedPhrase);
+  if (known !== undefined) return known;
+  let pattern = phrasePatterns.get(normalizedPhrase);
+  if (!pattern) {
+    // Words of a normalized phrase are [a-z0-9]+, so they need no escaping.
+    pattern = new RegExp(normalizedPhrase.split(' ').join('[^a-z0-9]+'));
+    if (phrasePatterns.size >= 2_000) phrasePatterns.clear();
+    phrasePatterns.set(normalizedPhrase, pattern);
+  }
+  const result = pattern.test(lowerEvidence(index));
+  index.phrases.set(normalizedPhrase, result);
+  return result;
+}
+
+/** True when some evidence token `b` satisfies `tokensMatch(titleToken, b)`. */
+function evidenceHasMatchingToken(index: EvidenceScopeIndex, titleToken: string): boolean {
+  const known = index.matches.get(titleToken);
+  if (known !== undefined) return known;
+  const result = resolveMatchingToken(index, titleToken);
+  index.matches.set(titleToken, result);
+  return result;
+}
+
+function resolveMatchingToken(index: EvidenceScopeIndex, a: string): boolean {
+  // a === b
+  if (index.tokens.has(a)) return true;
+  // equal stems of length >= 4
+  const aStem = morphologicalStem(a);
+  if (aStem.length >= 4 && index.stems.has(aStem)) return true;
+  // `a` is the shorter (or equal) token and some longer token contains it
+  if (a.length >= 5 && joinedEvidenceTokens(index).includes(a)) return true;
+  // a strictly shorter evidence token of length >= 5 lies inside `a`
+  for (let length = 5; length < a.length; length++) {
+    for (let start = 0; start + length <= a.length; start++) {
+      if (index.tokens.has(a.slice(start, start + length))) return true;
+    }
+  }
+  return false;
+}
+
+function matchedTitleTokensIn(title: string, index: EvidenceScopeIndex): WeightedToken[] {
+  return semanticTokens(title).filter((titleToken) => evidenceHasMatchingToken(index, titleToken.value));
+}
+
+function matchedTitleTokens(title: string, evidence: string): WeightedToken[] {
+  return matchedTitleTokensIn(title, evidenceScopeIndex(evidence));
+}
+
+/**
+ * The token and phrase definitions the evidence index must agree with. Tests
+ * compare indexed evaluation against a brute-force evaluation built from these.
+ */
+export const projectScopeDefinitionsForTests = Object.freeze({ semanticTokens, tokensMatch, normalizePhrase });
 
 /**
  * Subject tokens shared by two project titles, using the same tokenizer,
@@ -131,23 +273,26 @@ export function countTitlesMatchingToken(token: string, titles: string[]): numbe
  * compound identifier can stand alone. Generic titles fail closed.
  */
 export function evaluateProjectEvidenceScope(title: string, evidence: string): ProjectScopeEvaluation {
+  return evaluateProjectEvidenceScopeIn(title, evidenceScopeIndex(evidence));
+}
+
+function evaluateProjectEvidenceScopeIn(title: string, index: EvidenceScopeIndex): ProjectScopeEvaluation {
   const titleTokens = semanticTokens(title);
   if (titleTokens.length === 0) {
     return { matches: false, score: 0, matchedTokens: [], hasDistinctiveAnchor: false, hasExactPhraseAnchor: false, reason: 'title has no enforceable subject tokens' };
   }
-  if (!evidence.trim()) {
+  if (index.blank) {
     return { matches: false, score: 0, matchedTokens: [], hasDistinctiveAnchor: false, hasExactPhraseAnchor: false, reason: 'evidence body is empty' };
   }
 
-  const matched = matchedTitleTokens(title, evidence);
+  const matched = titleTokens.filter((titleToken) => evidenceHasMatchingToken(index, titleToken.value));
   const score = matched.reduce((sum, token) => sum + token.weight, 0);
   const normalizedTitle = normalizePhrase(title);
-  const normalizedEvidence = normalizePhrase(evidence);
   // The exact-phrase shortcut needs a multi-word title: a single ordinary
   // word ("Slack", "Inbox") appearing verbatim proves nothing about scope.
   const exactPhrase = normalizedTitle.length >= 5
     && normalizedTitle.includes(' ')
-    && normalizedEvidence.includes(normalizedTitle);
+    && evidenceContainsNormalizedPhrase(index, normalizedTitle);
   const hasDistinctiveAnchor = matched.some((token) => token.weight >= 2);
   const matches = exactPhrase || matched.length >= 2 || hasDistinctiveAnchor;
   return {
@@ -162,11 +307,11 @@ export function evaluateProjectEvidenceScope(title: string, evidence: string): P
   };
 }
 
-function titleScopeCoverage(title: string, evidence: string): number {
+function titleScopeCoverage(title: string, index: EvidenceScopeIndex): number {
   const titleTokens = semanticTokens(title);
   const totalWeight = titleTokens.reduce((sum, token) => sum + token.weight, 0);
   if (totalWeight === 0) return 0;
-  const matchedWeight = matchedTitleTokens(title, evidence)
+  const matchedWeight = matchedTitleTokensIn(title, index)
     .reduce((sum, token) => sum + token.weight, 0);
   return matchedWeight / totalWeight;
 }
@@ -182,12 +327,12 @@ function scopeClearlyDominates(
   target: ProjectScopeEvaluation,
   candidateTitle: string,
   candidate: ProjectScopeEvaluation,
-  evidence: string,
+  index: EvidenceScopeIndex,
 ): boolean {
   if (!target.matches || !candidate.matches) return false;
   return target.score >= candidate.score + 2
     && target.matchedTokens.length >= candidate.matchedTokens.length + 1
-    && titleScopeCoverage(targetTitle, evidence) >= titleScopeCoverage(candidateTitle, evidence) + 0.25;
+    && titleScopeCoverage(targetTitle, index) >= titleScopeCoverage(candidateTitle, index) + 0.25;
 }
 
 /** True when two titles describe the same lexical topic family. */
@@ -209,12 +354,13 @@ export function evidenceAnchorsMultipleIndependentScopes(
   evidence: string,
   projectTitles: string[],
 ): { mixed: boolean; titles: string[] } {
+  const index = evidenceScopeIndex(evidence);
   const anchored = [...new Set(projectTitles.map((title) => title.trim()).filter(Boolean))]
-    .map((title) => ({ title, scope: evaluateProjectEvidenceScope(title, evidence) }))
+    .map((title) => ({ title, scope: evaluateProjectEvidenceScopeIn(title, index) }))
     .filter(({ scope }) => scope.matches);
   const undominated = anchored.filter((candidate) => !anchored.some((target) =>
     target.title !== candidate.title
-    && scopeClearlyDominates(target.title, target.scope, candidate.title, candidate.scope, evidence),
+    && scopeClearlyDominates(target.title, target.scope, candidate.title, candidate.scope, index),
   ));
   for (let i = 0; i < undominated.length; i++) {
     for (let j = i + 1; j < undominated.length; j++) {
@@ -254,8 +400,9 @@ export function evidenceAnchorsForeignScope(
   evidence: string,
   otherProjectTitles: string[],
 ): { mixed: boolean; titles: string[]; dominantTitles: string[] } {
-  const home = evaluateProjectEvidenceScope(homeTitle, evidence);
-  const evidenceLower = evidence.toLowerCase();
+  const index = evidenceScopeIndex(evidence);
+  const home = evaluateProjectEvidenceScopeIn(homeTitle, index);
+  const evidenceLower = lowerEvidence(index);
   const firstLineLower = evidence.split('\n', 1)[0].toLowerCase();
 
   // Portfolio frequency: a token appearing across 3+ titles is shared
@@ -285,12 +432,12 @@ export function evidenceAnchorsForeignScope(
     .filter((title) => !titlesShareScope(homeTitle, title))
     .map((title) => ({
       title,
-      scope: evaluateProjectEvidenceScope(title, evidence),
+      scope: evaluateProjectEvidenceScopeIn(title, index),
     }))
     .filter(({ scope }) => scope.matches)
     .map((entry) => ({
       ...entry,
-      dominates: scopeClearlyDominates(entry.title, entry.scope, homeTitle, home, evidence),
+      dominates: scopeClearlyDominates(entry.title, entry.scope, homeTitle, home, index),
     }))
     .filter(({ title, scope, dominates }) =>
       scope.hasExactPhraseAnchor
@@ -341,16 +488,17 @@ export function projectTitleHasExclusiveEvidenceAnchor(
   evidence: string,
   activeProjectTitles: string[],
 ): ProjectScopeEvaluation {
-  const target = evaluateProjectEvidenceScope(title, evidence);
+  const index = evidenceScopeIndex(evidence);
+  const target = evaluateProjectEvidenceScopeIn(title, index);
   if (!target.matches) return target;
 
   const unrelated = activeProjectTitles
     .map((candidate) => candidate.trim())
     .filter((candidate) => candidate && normalizePhrase(candidate) !== normalizePhrase(title))
     .filter((candidate) => !titlesShareScope(title, candidate))
-    .map((candidate) => ({ candidate, scope: evaluateProjectEvidenceScope(candidate, evidence) }))
+    .map((candidate) => ({ candidate, scope: evaluateProjectEvidenceScopeIn(candidate, index) }))
     .filter(({ scope }) => scope.matches)
-    .filter(({ candidate, scope }) => scopeClearlyDominates(candidate, scope, title, target, evidence));
+    .filter(({ candidate, scope }) => scopeClearlyDominates(candidate, scope, title, target, index));
   if (unrelated.length > 0) {
     return {
       ...target,

@@ -53,6 +53,7 @@ import {
 import { createPendingEdit, listPendingEdits, decidePendingEdit } from './pending-edits.js';
 import { listDocumentCorpus, buildDocumentView, docKeyForPath } from './document-corpus.js';
 import type { ContentStore } from './content-store.js';
+import { sharePointToolPayload } from './sharepoint-mcp-output.js';
 import type { BrowserHandsService } from './browser-hands.js';
 import type { VisualAssetRegistry } from './visual-assets.js';
 import type { VisualInspector } from './visual-inspector.js';
@@ -1499,7 +1500,7 @@ export function createToolExecutor(
       if (thread.isError) return `Error: could not read the current comment thread (${thread.text.slice(0, 200)}); not replying blind`;
       let comments: Array<{ id?: unknown; author?: unknown; text?: unknown }> = [];
       try {
-        const parsed = JSON.parse(thread.text) as unknown;
+        const parsed = JSON.parse(sharePointToolPayload(thread.text)) as unknown;
         if (Array.isArray(parsed)) comments = parsed as typeof comments;
       } catch { return 'Error: could not read the current comment thread (non-JSON response); not replying blind'; }
       if (!comments.some(c => String(c.id) === commentId)) {
@@ -1539,7 +1540,7 @@ export function createToolExecutor(
         { source: 'agent', timeoutMs: 120_000 });
       if (current.isError) return `Error: could not read the current document (${current.text.slice(0, 200)}); not commenting blind`;
       const squash = (value: string) => value.replace(/\s+/g, ' ');
-      if (!squash(current.text).includes(squash(anchorText))) {
+      if (!squash(sharePointToolPayload(current.text)).includes(squash(anchorText))) {
         return 'Error: anchor text not found in the current document — it may have been edited since it was read. Re-read the document and pick an anchor from its current content.';
       }
 
@@ -1585,7 +1586,9 @@ export function createToolExecutor(
         if (current.isError) {
           readFailure = current.text;
         } else {
-          const currentSha = createHash('sha256').update(current.text).digest('hex');
+          // Hash the document only: the server's trust notice and any
+          // rate-limit warning are not content and vary between reads.
+          const currentSha = createHash('sha256').update(sharePointToolPayload(current.text)).digest('hex');
           if (!baseContentSha) {
             return `Error: baseContentSha is required to update an existing document — read it first (current sha256 ${currentSha}) and pass that value so concurrent edits cannot be overwritten.`;
           }
@@ -3621,15 +3624,20 @@ export function createToolExecutor(
         .join(' ');
       let rows: any[] = [];
       try {
+        // type=file_reference rows are data/code files BotBoy recorded by path
+        // and outline without reading them; filePath is what run_command opens.
         rows = db.prepare(`
           SELECT wi.id, wi.type, wi.title,
                  snippet(work_items_fts, 2, '[', ']', '…', 16) AS snippet,
-                 wi.url, wi.captured_at
+                 wi.url, wi.captured_at,
+                 CASE WHEN wi.type = 'file_reference' THEN wi.file_path END AS filePath
           FROM work_items_fts
           JOIN work_items wi ON wi.id = work_items_fts.item_id
           WHERE work_items_fts MATCH ?
             AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
             AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
+            AND NOT (wi.type = 'file_reference'
+              AND COALESCE(json_extract(CASE WHEN json_valid(wi.metadata) THEN wi.metadata ELSE '{}' END, '$.archived'), '') = 'true')
           ORDER BY rank
           LIMIT ?
         `).all(ftsQuery, LIMIT) as any[];
@@ -3644,11 +3652,14 @@ export function createToolExecutor(
         const pattern = `%${q}%`;
         const seen = new Set(rows.map((r) => r.id));
         const likeRows = db.prepare(`
-          SELECT id, type, title, substr(COALESCE(summary, raw_text), 1, 150) AS snippet, url, captured_at
+          SELECT id, type, title, substr(COALESCE(summary, raw_text), 1, 150) AS snippet, url, captured_at,
+                 CASE WHEN type = 'file_reference' THEN file_path END AS filePath
           FROM work_items
           WHERE (title LIKE ? OR summary LIKE ? OR raw_text LIKE ?)
             AND COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.publicationRetired'), '') != 'true'
             AND COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.deletedFromDoc'), '') != 'true'
+            AND NOT (type = 'file_reference'
+              AND COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.archived'), '') = 'true')
           ORDER BY captured_at DESC
           LIMIT ?
         `).all(pattern, pattern, pattern, LIMIT) as any[];

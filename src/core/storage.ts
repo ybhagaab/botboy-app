@@ -250,6 +250,40 @@ function createSchema(db: Database.Database): void {
 
   // ── local-folder import ledger (resumable imports + big-file review) ──
   migrateLocalFolderImports(db);
+
+  // ── long documents read into project brains in parts (document-reads.ts) ──
+  migrateDocumentReads(db);
+}
+
+/**
+ * How far each project brain has read each long document
+ * (`core/document-reads.ts`): one row per (project, document identity). The
+ * row names the version being read (`item_id`), what is read (`full` text, or
+ * a `diff` against `base_item_id`, the version read last), and the character
+ * offset reached. `sample` rows are documents too long to read in full; the
+ * brain keeps their excerpt until the owner asks for a full read.
+ */
+export function migrateDocumentReads(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS brain_document_reads (
+      project_id TEXT NOT NULL,
+      doc_key TEXT NOT NULL,
+      item_id TEXT NOT NULL,
+      base_item_id TEXT,
+      mode TEXT NOT NULL CHECK(mode IN ('full','diff','sample')),
+      status TEXT NOT NULL CHECK(status IN ('reading','done','sample','failed','skipped')),
+      next_offset INTEGER NOT NULL DEFAULT 0,
+      text_chars INTEGER NOT NULL DEFAULT 0,
+      parts_done INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      reason TEXT,
+      queued_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (project_id, doc_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_brain_document_reads_status ON brain_document_reads(status, queued_at);
+    CREATE INDEX IF NOT EXISTS idx_brain_document_reads_item ON brain_document_reads(item_id);
+  `);
 }
 
 /**
@@ -262,17 +296,41 @@ function createSchema(db: Database.Database): void {
  * Owned by `core/local-folder-imports.ts`.
  */
 export function migrateLocalFolderImports(db: Database.Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS local_folder_imports (
+  // `sensitive` = held as a likely credential (name/type/location, or secret
+  // content found locally); `reason` says why, never the content.
+  // `owner_paused` = the owner paused reprocessing of a file that keeps
+  // changing; the row tracks its newest size/mtime without reading it.
+  const columns = `
       folder_id INTEGER NOT NULL,
       path TEXT NOT NULL,
       size INTEGER NOT NULL,
       mtime_ms REAL NOT NULL,
-      outcome TEXT NOT NULL CHECK(outcome IN ('imported','needs_review','approved','excluded','too_large','deferred_low_disk')),
+      outcome TEXT NOT NULL CHECK(outcome IN ('imported','needs_review','approved','excluded','too_large','deferred_low_disk','sensitive','owner_paused')),
       origin TEXT NOT NULL DEFAULT 'import' CHECK(origin IN ('import','live')),
       updated_at INTEGER NOT NULL,
-      PRIMARY KEY (folder_id, path)
-    );
+      reason TEXT,
+      PRIMARY KEY (folder_id, path)`;
+  const existing = (db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'local_folder_imports'",
+  ).get() as { sql?: string } | undefined)?.sql;
+  if (existing && !existing.includes("'owner_paused'")) {
+    // SQLite cannot widen a CHECK constraint; rebuild once, keeping every row
+    // (and `reason`, when an earlier rebuild already added it).
+    const hasReason = (db.prepare('PRAGMA table_info(local_folder_imports)').all() as Array<{ name: string }>)
+      .some(column => column.name === 'reason');
+    const copied = `folder_id, path, size, mtime_ms, outcome, origin, updated_at${hasReason ? ', reason' : ''}`;
+    db.transaction(() => {
+      db.exec(`
+        CREATE TABLE local_folder_imports_widened (${columns});
+        INSERT INTO local_folder_imports_widened (${copied})
+          SELECT ${copied} FROM local_folder_imports;
+        DROP TABLE local_folder_imports;
+        ALTER TABLE local_folder_imports_widened RENAME TO local_folder_imports;
+      `);
+    })();
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS local_folder_imports (${columns});
     CREATE INDEX IF NOT EXISTS idx_local_folder_imports_outcome ON local_folder_imports(folder_id, outcome);
   `);
 }
@@ -1552,9 +1610,9 @@ export function migrateLosslessCapture(db: Database.Database): void {
   }
 
   // ── Full-text search over titles + full content (Requirement 6.4) ──
-  // External-content-less FTS5 table: we own the rows explicitly (populated on
-  // ingest with the full content, not a prefix). `content=''` keeps it a plain
-  // contentless index keyed by rowid = the work item's rowid mapping table.
+  // A regular FTS5 table: we own the rows explicitly (populated on ingest with
+  // the full content, not a prefix), and FTS5 stores each row's columns in its
+  // `work_items_fts_content` shadow table.
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS work_items_fts USING fts5(
       item_id UNINDEXED,
@@ -1562,6 +1620,31 @@ export function migrateLosslessCapture(db: Database.Database): void {
       body,
       tokenize='unicode61'
     );
+  `);
+  // FTS5 cannot index `item_id`, so a per-item write would scan every row.
+  // Index the content table's item column (c0); `work-items-fts.ts` finds rows
+  // through it by rowid. Additive and rebuilt from data, so a failure here
+  // only costs speed.
+  try {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_work_items_fts_content_item ON work_items_fts_content(c0)');
+  } catch (error) {
+    console.warn(`⚠️  Search index item lookup unavailable; per-item search updates will scan: ${(error as Error).message}`);
+  }
+  // One reference row per local path (file-references.ts upserts by path).
+  // Kept out of the main schema block so a store holding duplicates from a
+  // faulty build still starts; the upsert's lookup works either way.
+  try {
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_file_reference_path ON work_items(file_path) WHERE type = 'file_reference'");
+  } catch (error) {
+    console.warn(`⚠️  File reference path index unavailable: ${(error as Error).message}`);
+  }
+  // Routed local documents by path: a reference follows the documents in its
+  // folder (file-references.ts › routedProjectsIn), asked once per directory
+  // level. Partial, so it holds only routed local documents.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_work_items_routed_local_documents
+      ON work_items(file_path, project_id)
+      WHERE source = 'filesystem' AND type = 'document_capture' AND process_state = 'routed'
   `);
 }
 

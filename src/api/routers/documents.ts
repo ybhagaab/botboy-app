@@ -35,6 +35,7 @@ import {
 } from '../../core/docx-body-editor.js';
 import { listDocumentCorpus, buildDocumentView, docKeyForPath } from '../../core/document-corpus.js';
 import { decomposeEditedMarkdown } from '../../core/edit-decompose.js';
+import { sharePointToolPayload } from '../../core/sharepoint-mcp-output.js';
 import { markdownBlocksOf, markdownLineToDocxText, blockToAnchorParagraphs } from '../../core/markdown-anchor.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -586,7 +587,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       }, { timeoutMs: 60_000 });
       if (listed.isError) throw new Error(`could not resolve SharePoint target identity: ${String(listed.text).slice(0, 300)}`);
       let payload: any;
-      try { payload = JSON.parse(String(listed.text ?? '')); } catch {
+      try { payload = JSON.parse(sharePointToolPayload(String(listed.text ?? ''))); } catch {
         throw new Error('SharePoint target listing returned an unreadable identity response.');
       }
       for (const entry of Array.isArray(payload?.files) ? payload.files : []) {

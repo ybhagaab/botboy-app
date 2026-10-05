@@ -5,8 +5,9 @@
  *
  *   DISCOVERY (every 30 min, single-flight with runNow): list each configured
  *   source through the managed SharePoint MCP (read tools only), validate
- *   every entry, change-detect against `sharepoint_seen` (modified + size),
- *   and UPSERT changed documents into the durable `sharepoint_sync_queue`.
+ *   every entry, change-detect against `sharepoint_seen` (a later modified
+ *   time; `listingIsNewer`), and UPSERT changed documents into the durable
+ *   `sharepoint_sync_queue`.
  *   Discovery never downloads.
  *
  *   DRAIN (every 20 s): acquire up to 2 queue entries per tick — live before
@@ -33,11 +34,14 @@ import path from 'path';
 import type { McpManager } from '../core/mcp-types.js';
 import type { RawWorkItem } from '../core/types.js';
 import { getSetting, setSetting } from '../core/storage.js';
+import { deleteWorkItemFts } from '../core/work-items-fts.js';
 import { createOwnerMatcher, resolveOwnerIdentity, type OwnerIdentity } from '../core/owner-identity.js';
 import { diffDocumentTexts } from '../core/document-diff.js';
 import { readZipEntry, extractCommentAnchors, extractTrackedChanges, DOCUMENT_XML_ENTRY } from '../core/docx-body-editor.js';
 import { suggestionSettingKey, docKeyForPath, buildCorpusLinkIndex, extractDocumentLinks, replaceOutgoingLinks } from '../core/document-corpus.js';
 import type { ContentStore, ContentRowColumns } from '../core/content-store.js';
+import { splitSharePointToolText } from '../core/sharepoint-mcp-output.js';
+import { classifyCaptureFailure, type CaptureHealth } from '../core/capture-health.js';
 
 const PROFILE_ID = 'sharepoint';
 
@@ -225,6 +229,31 @@ function compactStamp(iso: string): string {
   return iso.replace(/[-:TZ.]/g, '').slice(0, 14);
 }
 
+/** One strict percent-decoding pass; malformed sequences keep the raw value. */
+function decodeListingValue(value: string): string {
+  try { return decodeURIComponent(value); } catch { return value; }
+}
+
+/**
+ * A listing is news only when its modified time is NEWER than the stored one.
+ * OneDrive and Shared with me both list the owner's shared files, with times
+ * seconds (sometimes months) apart, and a listed size can stay stale while the
+ * drain stores the real size. Exact equality on either flipped
+ * `sharepoint_seen` between the two sources and re-downloaded 16 unchanged
+ * documents every discovery, 153 MB and 220 MB decks included (673 identical
+ * revisions in 48 h, live 2026-10-03). Every real edit stamps a later time,
+ * and Refresh still forces a fetch.
+ */
+export function listingIsNewer(
+  stored: { modified: string; size: number },
+  listed: { modified: string; size: number },
+): boolean {
+  const storedAt = Date.parse(stored.modified);
+  const listedAt = Date.parse(listed.modified);
+  if (Number.isFinite(storedAt) && Number.isFinite(listedAt)) return listedAt > storedAt;
+  return stored.modified !== listed.modified || stored.size !== listed.size;
+}
+
 function parseToolJson<T>(text: string, tool: string): T {
   try {
     return JSON.parse(text) as T;
@@ -258,6 +287,8 @@ export function createSharePointSync(deps: {
   contentStore?: Pick<ContentStore, 'refFromRow' | 'get'>;
   emit: (item: RawWorkItem) => void | Promise<void>;
   config?: SharePointSyncConfig;
+  /** Outcome of every discovery, for owner-facing capture warnings. */
+  captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
 }): SharePointSync {
   const { db, mcpManager, emit } = deps;
   const parser = deps.documentParser;
@@ -381,16 +412,17 @@ export function createSharePointSync(deps: {
   }
 
   async function call<T>(tool: string, args: Record<string, unknown>, timeoutMs = 120_000): Promise<T> {
-    const result = await mcpManager.callTool(PROFILE_ID, tool, args, { source: 'api', timeoutMs });
-    if (result.isError) throw new Error(`${tool} failed: ${result.text.slice(0, 300)}`);
-    return parseToolJson<T>(result.text, tool);
+    return parseToolJson<T>(await callText(tool, args, timeoutMs), tool);
   }
 
-  /** Inline reads return raw content text, not JSON. */
+  /** Inline reads return raw content text, not JSON. Either way the server's
+   * leading rate-limit/untrusted-content blocks are not part of the payload. */
   async function callText(tool: string, args: Record<string, unknown>, timeoutMs = 120_000): Promise<string> {
     const result = await mcpManager.callTool(PROFILE_ID, tool, args, { source: 'api', timeoutMs });
     if (result.isError) throw new Error(`${tool} failed: ${result.text.slice(0, 300)}`);
-    return result.text;
+    const { payload, rateLimitWarnings } = splitSharePointToolText(result.text);
+    for (const warning of rateLimitWarnings) console.warn(`[SharePointSync] ${tool}: ${warning}`);
+    return payload;
   }
 
   // ── Discovery ─────────────────────────────────────────────────────────────
@@ -410,8 +442,14 @@ export function createSharePointSync(deps: {
     const isFolder = entry.IsFolder === true;
     const isDocument = entry.IsDocument === undefined || String(entry.IsDocument) === 'true';
     if (isFolder || !isDocument) return null;
-    const name = String(entry.Title ?? entry.Name ?? '').trim();
-    const serverRelativeUrl = String(entry.Path ?? '').trim();
+    // `sharepoint_list_files` (OneDrive/library) percent-encodes non-ASCII
+    // in Name and Path ("—" → %E2%80%94); Shared with me does not. Decode
+    // once, like the publication identity check, so one file has one docKey:
+    // encoded keys duplicated five documents and their comment reads 404'd
+    // (live 2026-10-03).
+    const fromFileList = source.kind !== 'shared_with_me';
+    const name = (fromFileList ? decodeListingValue(String(entry.Title ?? entry.Name ?? '')) : String(entry.Title ?? entry.Name ?? '')).trim();
+    const serverRelativeUrl = (fromFileList ? decodeListingValue(String(entry.Path ?? '')) : String(entry.Path ?? '')).trim();
     const webUrl = String(entry.WebUrl ?? '').trim();
     const modifiedRaw = String(entry.LastModifiedTime ?? entry.Modified ?? '').trim();
     const size = Number(entry.Size ?? 0);
@@ -525,6 +563,14 @@ export function createSharePointSync(deps: {
       result.status = 'skipped';
       result.reason = ready.reason;
       result.durationMs = now() - startedAt;
+      // Sync is on but its connection cannot serve it: that is an outage the
+      // owner should see. A server still starting, or sync turned off, is not.
+      if (ready.reason && ready.reason !== 'sync disabled' && ready.reason !== 'profile starting') {
+        deps.captureHealth?.reportFailure('sharepoint', {
+          kind: classifyCaptureFailure(ready.reason),
+          reason: `SharePoint connection: ${ready.reason}`,
+        });
+      }
       return result;
     }
 
@@ -554,7 +600,7 @@ export function createSharePointSync(deps: {
           const domain = new URL(doc.webUrl).hostname;
           const docKey = `${domain}${doc.serverRelativeUrl}`;
           const seen = seenStmt.get(docKey) as { modified: string; size: number } | undefined;
-          if (seen && seen.modified === doc.modified && seen.size === doc.size) {
+          if (seen && !listingIsNewer(seen, doc)) {
             counters.unchanged++;
             continue;
           }
@@ -568,7 +614,8 @@ export function createSharePointSync(deps: {
           if (queuedRow) {
             try {
               const queued = JSON.parse(queuedRow.payload_json) as { modified?: string; size?: number };
-              if (queued.modified === doc.modified && queued.size === doc.size) {
+              if (typeof queued.modified === 'string' && typeof queued.size === 'number'
+                && !listingIsNewer({ modified: queued.modified, size: queued.size }, doc)) {
                 counters.unchanged++;
                 continue;
               }
@@ -661,11 +708,16 @@ export function createSharePointSync(deps: {
       durationMs: result.durationMs,
     });
     if (result.status === 'failed') {
+      deps.captureHealth?.reportFailure('sharepoint', {
+        kind: classifyCaptureFailure(result.reason ?? ''),
+        reason: result.reason ?? 'discovery failed',
+      });
       if (result.reason !== lastLoggedError) {
         console.warn(`[SharePointSync] discovery failed: ${result.reason}`);
         lastLoggedError = result.reason ?? '';
       }
     } else {
+      deps.captureHealth?.reportSuccess('sharepoint');
       lastLoggedError = '';
       const totals = Object.values(result.perSource).reduce(
         (acc, c) => ({ listed: acc.listed + c.listed, enqueued: acc.enqueued + c.enqueued, unchanged: acc.unchanged + c.unchanged }),
@@ -1079,16 +1131,22 @@ export function createSharePointSync(deps: {
    *   text form — author + normalized text, trusted only when the text is
    *   substantial (≥20 chars): short notes like "Done." legitimately repeat.
    * A stored row matching EITHER form of a live comment is the same comment.
+   * Word stamps times to the minute, so a SHORT text's date form also
+   * carries the text: one author's "@Wang, Chen" and "@Khandelwal, Surbhi"
+   * replies in the same minute are different comments (author + minute alone
+   * swapped their ids, live 2026-10-03). An edited short comment therefore
+   * reads as new, and its old row is kept as deleted history.
    */
   const TEXT_FP_MIN_CHARS = 20;
   function commentFingerprints(author: string, date: string | undefined, text: string): { dateFp?: string; textFp?: string; groupKey: string } {
     const parsed = date ? Date.parse(date) : NaN;
     const usableDate = Number.isFinite(parsed) && parsed >= 0;
     const normText = text.replace(/\s+/g, ' ').trim().slice(0, 200);
-    const dateFp = usableDate ? `${author}\u0000d\u0000${date}` : undefined;
-    const textFp = normText.length >= TEXT_FP_MIN_CHARS ? `${author}\u0000t\u0000${normText}` : undefined;
+    const substantial = normText.length >= TEXT_FP_MIN_CHARS;
+    const dateFp = usableDate ? `${author}\u0000d\u0000${date}${substantial ? '' : `\u0000${normText}`}` : undefined;
+    const textFp = substantial ? `${author}\u0000t\u0000${normText}` : undefined;
     // Sweep grouping: substantial text is the strongest renumber-stable key;
-    // short texts group by date (or the short text when no date exists).
+    // a short text groups by its date form (author + minute + text).
     const groupKey = textFp ?? dateFp ?? `${author}\u0000t\u0000${normText}`;
     return { dateFp, textFp, groupKey };
   }
@@ -1132,7 +1190,14 @@ export function createSharePointSync(deps: {
       } catch { return false; }
     });
 
+    const metaOf = (row: { metadata: string | null }): Record<string, unknown> => {
+      try { return JSON.parse(row.metadata ?? '{}') as Record<string, unknown>; } catch { return {}; }
+    };
+    const isTombstone = (row: { url: string | null; metadata: string | null }): boolean =>
+      String(row.url ?? '').includes('~deleted=') || metaOf(row).deletedFromDoc === 'true';
+
     let removed = 0;
+    let revived = 0;
     const tx = db.transaction(() => {
       for (const row of badDates) {
         db.prepare("UPDATE work_items SET metadata = json_remove(metadata, '$.commentedAt') WHERE id = ?").run(row.id);
@@ -1143,7 +1208,7 @@ export function createSharePointSync(deps: {
         const survivor = list[0];
         const dupes = list.slice(1);
         const anchor = dupes
-          .map(d => { try { return String((JSON.parse(d.metadata ?? '{}') as Record<string, unknown>).anchorText ?? ''); } catch { return ''; } })
+          .map(d => String(metaOf(d).anchorText ?? ''))
           .find(a => a !== '');
         if (anchor) {
           db.prepare(`
@@ -1151,18 +1216,47 @@ export function createSharePointSync(deps: {
             WHERE id = ? AND json_extract(metadata, '$.anchorText') IS NULL
           `).run(anchor, survivor.id);
         }
+        // The earliest capture keeps its content (original evidence) but takes
+        // the address of the newest live duplicate, as a renumber remap
+        // would: the newest capture came from the latest fetch. Keeping the
+        // earliest row's address left tombstones for live comments (upward
+        // renumber, live 2026-10-02) and stale ids that every later fetch
+        // captured again (EDD, live 2026-10-03).
+        const liveDupe = [...dupes].reverse().find(d => !isTombstone(d));
         for (const dupe of dupes) {
-          db.prepare('DELETE FROM work_items_fts WHERE item_id = ?').run(dupe.id);
+          deleteWorkItemFts(db, dupe.id);
           db.prepare('DELETE FROM node_work_items WHERE work_item_id = ?').run(dupe.id);
           db.prepare('DELETE FROM item_ocr_lines WHERE item_id = ?').run(dupe.id);
           db.prepare('DELETE FROM agent_todos WHERE work_item_id = ?').run(dupe.id);
           db.prepare('DELETE FROM work_items WHERE id = ?').run(dupe.id);
           removed++;
         }
+        if (liveDupe) {
+          const live = metaOf(liveDupe);
+          // json_patch: a null member removes the key.
+          const patch: Record<string, unknown> = {
+            deletedFromDoc: null,
+            resolved: live.resolved === 'true' ? 'true' : 'false',
+            // A root in the latest capture is a root now, whatever it replied to before.
+            parentCommentId: typeof live.parentCommentId === 'string' && live.parentCommentId !== '' ? live.parentCommentId : null,
+          };
+          for (const key of ['commentId', 'threadRoot', 'commentedAt']) {
+            if (typeof live[key] === 'string' && live[key] !== '') patch[key] = live[key];
+          }
+          db.prepare(`
+            UPDATE work_items
+            SET url = ?, metadata = json_patch(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, ?)
+            WHERE id = ?
+          `).run(liveDupe.url, JSON.stringify(patch), survivor.id);
+          revived++;
+        }
       }
     });
     tx();
-    if (removed > 0) console.log(`[SharePointSync] comment dedup sweep removed ${removed} renumbered-id duplicate row(s)`);
+    if (removed > 0) {
+      const revivedNote = revived > 0 ? `; ${revived} kept under their latest comment id` : '';
+      console.log(`[SharePointSync] comment dedup sweep removed ${removed} renumbered-id duplicate row(s)${revivedNote}`);
+    }
     if (badDates.length > 0) console.log(`[SharePointSync] comment sweep cleared ${badDates.length} placeholder (pre-epoch) comment date(s)`);
   }
   sweepDuplicateComments();
@@ -1249,8 +1343,10 @@ export function createSharePointSync(deps: {
             ? { siteUrl: payload.siteUrl, personal: false }
             : {}),
         }, 60_000);
+        // A non-JSON reply is not an empty thread: treating it as one would
+        // make every stored item comment look deleted from the document.
         let parsed: unknown;
-        try { parsed = JSON.parse(text); } catch { parsed = []; }
+        try { parsed = JSON.parse(text); } catch { throw new Error('item comments response was not JSON'); }
         groups.push({ comments: normalizeComments(parsed), fragment: '#itemcomment=' });
       } catch (error) {
         // Item comments are best-effort when the docx thread already
@@ -1301,7 +1397,7 @@ export function createSharePointSync(deps: {
       WHERE source = 'sharepoint' AND type = 'document_comment'
         AND json_extract(metadata, '$.docKey') = ?
     `).all(payload.docKey) as Array<{ id: string; url: string | null; metadata: string | null; text: string }>;
-    interface StoredEntry { id: string; keys: string[]; fragment: string; normText: string; wasDeleted: boolean; consumed: boolean }
+    interface StoredEntry { id: string; keys: string[]; textKey?: string; fragment: string; normText: string; wasDeleted: boolean; consumed: boolean }
     const storedByKey = new Map<string, StoredEntry>();
     const storedByUrl = new Map<string, StoredEntry>();
     const storedEntries: StoredEntry[] = [];
@@ -1318,6 +1414,7 @@ export function createSharePointSync(deps: {
       const entry: StoredEntry = {
         id: stored.id,
         keys: [],
+        ...(textFp ? { textKey: `${fragment}\u0000${textFp}` } : {}),
         fragment,
         normText: stored.text.replace(/\s+/g, ' ').trim().slice(0, 200),
         wasDeleted: meta.deletedFromDoc === 'true',
@@ -1408,16 +1505,37 @@ export function createSharePointSync(deps: {
       else syncMentionByIdStmt.run(mentioned ? 'true' : 'false', target.rowId);
     };
 
+    let shiftedIds = 0;
     for (const { comments, fragment } of groups) {
       const byId = new Map(comments.map(c => [c.id, c]));
-      for (const comment of comments) {
-        const url = `${payload.webUrl}${fragment}${comment.id}`;
-        const quoteForFp = comment.parentId !== undefined && byId.get(comment.parentId)
-          ? `↪ replying to ${byId.get(comment.parentId)!.author}: "${byId.get(comment.parentId)!.text.slice(0, 120)}${byId.get(comment.parentId)!.text.length > 120 ? '…' : ''}"\n\n`
+      const liveIdentity = (comment: NormalizedComment) => {
+        const parent = comment.parentId !== undefined ? byId.get(comment.parentId) : undefined;
+        const quoteForFp = parent
+          ? `↪ replying to ${parent.author}: "${parent.text.slice(0, 120)}${parent.text.length > 120 ? '…' : ''}"\n\n`
           : '';
         const liveContent = `${quoteForFp}${comment.text}`;
         const { dateFp, textFp } = commentFingerprints(comment.author, comment.date, liveContent);
         const liveKeys = [textFp, dateFp].filter((fp): fp is string => !!fp).map(fp => `${fragment}\u0000${fp}`);
+        return { liveContent, dateFp, textFp, liveKeys };
+      };
+      // Which live comments carry each fingerprint key in this fetch.
+      const liveKeyOwners = new Map<string, string[]>();
+      for (const comment of comments) {
+        for (const key of liveIdentity(comment).liveKeys) {
+          const owners = liveKeyOwners.get(key);
+          if (owners) owners.push(comment.id); else liveKeyOwners.set(key, [comment.id]);
+        }
+      }
+      // Text outranks a shared minute: Word stamps comment times to the
+      // minute, so one author's neighbouring comments share the date form.
+      // A row whose substantial text is another live comment's belongs to
+      // that comment, even when author and minute match this one (EDD, live
+      // 2026-10-03: row #33 held comment 38's text, and 38 was emitted again).
+      const textBelongsElsewhere = (entry: StoredEntry, commentId: string): boolean =>
+        entry.textKey !== undefined && (liveKeyOwners.get(entry.textKey) ?? []).some(id => id !== commentId);
+      for (const comment of comments) {
+        const url = `${payload.webUrl}${fragment}${comment.id}`;
+        const { liveContent, dateFp, textFp, liveKeys } = liveIdentity(comment);
 
         const atUrl = storedByUrl.get(url);
         if (existsStmt.get(url)) {
@@ -1426,7 +1544,8 @@ export function createSharePointSync(deps: {
           // = shared fingerprint (or equal normalized text when neither side
           // has a usable fingerprint).
           const sameComment = atUrl !== undefined && (
-            atUrl.keys.some(key => liveKeys.includes(key))
+            (atUrl.textKey !== undefined && liveKeys.includes(atUrl.textKey))
+            || (atUrl.keys.some(key => key !== atUrl.textKey && liveKeys.includes(key)) && !textBelongsElsewhere(atUrl, comment.id))
             || (atUrl.keys.length === 0 && liveKeys.length === 0
                 && atUrl.normText === liveContent.replace(/\s+/g, ' ').trim().slice(0, 200))
           );
@@ -1445,21 +1564,33 @@ export function createSharePointSync(deps: {
             restampMention(comment.text, comment.id, { url });
             continue; // durable dedup (spec R2.1)
           }
-          // GHOST SQUAT (soak find 2026-08-25): the row at this URL is a
-          // DIFFERENT comment — deleted from the doc, its id since reused.
-          // Relocate it to a tombstone URL (unique forever), flag it, and
-          // fall through so the live comment can remap or emit.
-          consumeEntry(atUrl);
+          // The row at this URL is a DIFFERENT comment. Move it to a tombstone
+          // URL (unique forever) so this live comment can take the address.
           relocateGhostStmt.run(`${payload.webUrl}${fragment.replace('=', '~deleted=')}${atUrl.id}`, atUrl.id);
-          stampDeletedStmt.run(atUrl.id);
-          console.log(`[SharePointSync] comment id ${comment.id} was reused — prior comment tombstoned (${atUrl.id.slice(0, 8)}) for ${payload.docKey}`);
+          const stillLive = atUrl.keys.some(key => (liveKeyOwners.get(key) ?? []).some(id => id !== comment.id));
+          if (stillLive) {
+            // SHIFTED ID (live find 2026-10-02): a comment added mid-thread
+            // pushed later ids up, so this row is still live under another id.
+            // Leave it unconsumed and unflagged: the live comment carrying its
+            // fingerprint remaps it below, and the post-loop pass flags it
+            // only if none does.
+            shiftedIds++;
+          } else {
+            // GHOST SQUAT (soak find 2026-08-25): deleted from the doc, its
+            // id since reused. Flag it and fall through so the live comment
+            // can remap or emit.
+            consumeEntry(atUrl);
+            stampDeletedStmt.run(atUrl.id);
+            console.log(`[SharePointSync] comment id ${comment.id} was reused — prior comment tombstoned (${atUrl.id.slice(0, 8)}) for ${payload.docKey}`);
+          }
         }
 
         // Same comment under a renumbered id (or a re-stamped date — Word
         // does both) → remap the stored row, no emit. Text form outranks
         // date form: substantial identical text is the stronger identity.
-        const stored = (textFp ? storedByKey.get(`${fragment}\u0000${textFp}`) : undefined)
-          ?? (dateFp ? storedByKey.get(`${fragment}\u0000${dateFp}`) : undefined);
+        const byText = textFp ? storedByKey.get(`${fragment}\u0000${textFp}`) : undefined;
+        const byDate = !byText && dateFp ? storedByKey.get(`${fragment}\u0000${dateFp}`) : undefined;
+        const stored = byText ?? (byDate && !textBelongsElsewhere(byDate, comment.id) ? byDate : undefined);
         if (stored) {
           consumeEntry(stored); // one stored row maps to one live comment
           remapStmt.run(url, comment.id, threadRootOf(comment, byId), comment.resolved ? 'true' : 'false', stored.id);
@@ -1515,6 +1646,9 @@ export function createSharePointSync(deps: {
           capturedAt: comment.date ? new Date(comment.date) : new Date(now()),
         });
       }
+    }
+    if (shiftedIds > 0) {
+      console.log(`[SharePointSync] ${shiftedIds} comment id(s) shifted in ${payload.docKey}; stored comments follow their new ids`);
     }
 
     // Stored comments the live thread no longer contains were DELETED from
@@ -1697,7 +1831,7 @@ export function createSharePointSync(deps: {
     // clean up automatically; the three non-cascade referencers must go first.
     const tx = db.transaction(() => {
       for (const row of rows) {
-        db.prepare('DELETE FROM work_items_fts WHERE item_id = ?').run(row.id);
+        deleteWorkItemFts(db, row.id);
         db.prepare('DELETE FROM node_work_items WHERE work_item_id = ?').run(row.id);
         db.prepare('DELETE FROM item_ocr_lines WHERE item_id = ?').run(row.id);
         db.prepare('DELETE FROM agent_todos WHERE work_item_id = ?').run(row.id);

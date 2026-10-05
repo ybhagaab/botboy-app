@@ -401,6 +401,7 @@ export const DOCUMENT_XML_ENTRY = 'word/document.xml';
 
 import type { McpManager } from './mcp-types.js';
 import { markdownLineToDocxText } from './markdown-anchor.js';
+import { sharePointToolPayload } from './sharepoint-mcp-output.js';
 
 /**
  * Map a SharePoint server-relative URL onto sharepoint_write_file's
@@ -667,7 +668,8 @@ export async function applyDocxBodyEdits(
       { serverRelativeUrl: target.serverRelativeUrl, ...siteUrl, ...(personal ? {} : { personal: false }), inline: true, format: 'markdown', stripImages: true },
       { source: 'agent', timeoutMs: 120_000 });
     const squash = (value: string) => value.replace(/\s+/g, ' ').trim();
-    const verified = !readBack.isError && probes.every(probe => probe.trim() === '' || squash(readBack.text).includes(squash(probe)));
+    const readBackText = readBack.isError ? '' : squash(sharePointToolPayload(readBack.text));
+    const verified = !readBack.isError && probes.every(probe => probe.trim() === '' || readBackText.includes(squash(probe)));
 
     return { uploaded: true, verifiedOnReadBack: verified, perEdit, uploadResultText: upload.text.slice(0, 2_000) };
   } finally {

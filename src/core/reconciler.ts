@@ -115,6 +115,7 @@ export function createReconciler(deps: {
         .prepare(
           `SELECT id, title, type, source, content_sha256 AS contentSha256, metadata FROM work_items
            WHERE process_state = 'orphaned' AND source <> 'app'
+             AND type <> 'file_reference' -- references follow their folder (file-references.ts)
            ORDER BY captured_at ASC LIMIT ?`,
         )
         .all(MAX_ORPHANS_PER_RUN) as {

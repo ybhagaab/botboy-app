@@ -57,6 +57,7 @@ import { createEtlQueryRunner, createEtlToolCall } from './core/etl-adhoc.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
 import { createChatInterface } from './core/chat-interface.js';
 import { createMidwaySentinel } from './core/midway-sentinel.js';
+import { createCaptureHealth } from './core/capture-health.js';
 import { createBrowserMonitor } from './monitors/browser-monitor.js';
 import { createAppMonitor } from './monitors/app-monitor.js';
 import { createClipboardMonitor } from './monitors/clipboard-monitor.js';
@@ -82,7 +83,7 @@ import type { AgentOrchestrator } from './core/agent.js';
 import { createContextSync } from './core/context-sync.js';
 import type { TieredContextManager } from './core/context-sync.js';
 import type { BackgroundProcessor } from './core/background-processor.js';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import { createClassificationPipeline } from './core/classification-pipeline.js';
 import { createSubagentDelegator } from './core/subagent-delegator.js';
 import { createItemDeduplicator } from './core/item-deduplicator.js';
@@ -92,7 +93,7 @@ import { createBackgroundProcessor } from './core/background-processor.js';
 import type { RawWorkItem } from './core/types.js';
 import { generateFallbackSummary } from './core/summary-generator.js';
 // ── lossless-capture-brain-pipeline ──
-import { createContentStore, refToColumns } from './core/content-store.js';
+import { DEFAULT_CONTENT_DIR, createContentStore, refToColumns } from './core/content-store.js';
 import { createFailureRecorder } from './core/failures.js';
 import { createVisionOcrEngine } from './core/ocr-engine.js';
 import { createExtractor } from './core/extractor.js';
@@ -114,6 +115,11 @@ import { initToolchain } from './core/toolchain.js';
 import { createChatTerminalService } from './core/chat-terminal.js';
 import { createShutdownCoordinator } from './core/shutdown-coordinator.js';
 import { getSetting, setSetting } from './core/storage.js';
+import { deleteWorkItemFts, setWorkItemFtsTitle } from './core/work-items-fts.js';
+import { FILE_REFERENCE_TYPE, createFileReferences } from './core/file-references.js';
+import { createFileReferenceMigration } from './core/file-reference-migration.js';
+import { createRawCaptureRepair } from './core/raw-capture-repair.js';
+import { createDocumentReads } from './core/document-reads.js';
 import { addLocalFolder } from './core/local-folders-config.js';
 import os from 'os';
 import { createDiskSpaceMonitor } from './core/disk-space.js';
@@ -711,8 +717,13 @@ async function main() {
   // fails and the local session cookie is expired, it notifies the owner in
   // chat, opens mwinit in the chat terminal, and restarts the affected
   // profiles after re-auth. Disable with PPT_MIDWAY_SENTINEL=0.
+  // Outcome-level capture health (Slack, SharePoint, Outlook): each source
+  // reports every run; a lasting failure streak becomes an owner warning
+  // with its cause and next action. Slack's Midway 401s also reach the
+  // sentinel through it.
+  const captureHealth = createCaptureHealth({ db });
   const midwaySentinel = createMidwaySentinel(
-    { db, mcpManager, chatTerminal, agent },
+    { db, mcpManager, chatTerminal, agent, captureHealth },
     // Cookie-path override for testing the flow without touching the real jar.
     process.env.PPT_MIDWAY_COOKIE_PATH ? { cookiePath: process.env.PPT_MIDWAY_COOKIE_PATH } : {},
   );
@@ -731,7 +742,10 @@ async function main() {
     temperature: 0.7,
   });
   const librarian = createLibrarian({ db, batcher, contentStore, brainStore, failures, llm: pipelineLlm });
-  const brainUpdater = createBrainUpdater({ db, contentStore, brainStore, failures, llm: pipelineLlm });
+  // Long documents are read into brains in parts, or as their changes since
+  // the version read last (document-reads.ts), one idle tick at a time.
+  const documentReads = createDocumentReads({ db, contentStore, brainStore, llm: pipelineLlm });
+  const brainUpdater = createBrainUpdater({ db, contentStore, brainStore, failures, llm: pipelineLlm, documentReads });
   const reconciler = createReconciler({ db, batcher, contentStore, brainStore, failures, llm: pipelineLlm });
   const projectOrganizer = createProjectOrganizer({ db, brainStore, llm: pipelineLlm, failures });
   const channelDigester = createChannelDigester({ db, contentStore, brainStore, failures, llm: pipelineLlm });
@@ -741,7 +755,12 @@ async function main() {
   // interpretation passes; its revision joins the dashboard version so an
   // open Today tab re-renders as sentences land.
   const evidenceGister = createEvidenceGister({ db, contentStore, llm: pipelineLlm, failures });
-  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister });
+  // Data and code files: one reference row per path, routed by folder
+  // (file-references.ts). The ingest handler upserts them; each
+  // interpretation tick adopts unassigned ones once their folder's
+  // documents are routed.
+  const fileReferences = createFileReferences({ db, contentStore });
+  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister, fileReferences, documentReads });
   // A newly activated model (Settings → AI model) drains the waiting capture
   // backlog now; later work follows the normal interpretation cadence.
   kickInformationPipeline = () => {
@@ -790,6 +809,12 @@ async function main() {
     // (the monitor logs live failures itself). Other monitors stay fail-soft.
     const rethrowStoreFailure = awaitedPublicationCapture || item.source === 'filesystem';
     try {
+    // Data and code files are references: one row per path, updated in
+    // place, never extracted or routed by a model (file-references.ts).
+    if (item.type === FILE_REFERENCE_TYPE) {
+      fileReferences.upsert(item);
+      return;
+    }
     const publicationId = awaitedPublicationCapture
       ? String(item.metadata?.publicationId ?? '').trim()
       : '';
@@ -844,6 +869,7 @@ async function main() {
                 process_state, project_id, batch_id
          FROM work_items
          WHERE url = ? AND datetime(captured_at) > datetime('now', '-2 hours')
+           AND type <> 'file_reference' -- a file:// page view never rewrites a reference
          ORDER BY datetime(captured_at) DESC LIMIT 1`
       ).get(item.url) as any;
       if (existing) {
@@ -959,7 +985,7 @@ async function main() {
                 newContent.slice(0, 15000), JSON.stringify(meta), item.capturedAt.toISOString(),
                 nextProcessState, nextBatchId, existing.id,
               );
-              db.prepare('DELETE FROM work_items_fts WHERE item_id = ?').run(existing.id);
+              deleteWorkItemFts(db, existing.id);
               db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)')
                 .run(existing.id, newTitle ?? '', newContent);
             })();
@@ -977,8 +1003,7 @@ async function main() {
             if (newTitle !== existing.title) {
               db.transaction(() => {
                 updateMetadata();
-                db.prepare('UPDATE work_items_fts SET title = ? WHERE item_id = ?')
-                  .run(newTitle ?? '', existing.id);
+                setWorkItemFtsTitle(db, existing.id, newTitle ?? '');
               })();
             } else {
               updateMetadata();
@@ -1147,7 +1172,7 @@ async function main() {
     console.log('⚠️  Skipping Slack channel-config bootstrap (no SLACK_USER_TOKEN)');
   }
 
-  const slackMonitor = createSlackMonitor({ db, mcpManager });
+  const slackMonitor = createSlackMonitor({ db, mcpManager, captureHealth });
   slackMonitor.onWorkItem(item => eventBus.emit(item));
   // The first poll walks all watched conversations through rate-limited Slack
   // APIs (~48s measured) — by far the largest boot cost, and pure background
@@ -1200,6 +1225,7 @@ async function main() {
   const graspSync = createGraspSync({
     db, mcpManager, emit: item => eventBus.emit(item),
     config: { intervalMs: 5 * 60 * 1000 },
+    captureHealth,
   });
 
   // ── SharePoint document sync (user-selected sources, discovery + drain) ──
@@ -1207,6 +1233,7 @@ async function main() {
   // The parser powers the large-file lane (self-parsed in the drain).
   const sharePointSync = createSharePointSync({
     db, mcpManager, documentParser, contentStore, emit: item => eventBus.emitAndWait(item),
+    captureHealth,
   });
 
   // First imports of existing files (formerly the R12.3 startup loop) run in
@@ -1340,6 +1367,12 @@ async function main() {
     watchdog: mainThreadWatchdog,
     shutdown: shutdownCoordinator.context,
     readableExtensions: new Set(documentParser.getSupportedFormats().map(ext => ext.toLowerCase())),
+    // Stores from before the reference rules: stored data/code versions
+    // become one reference per file, once, before the first folder walk.
+    referenceMigration: createFileReferenceMigration({ db, contentDir: DEFAULT_CONTENT_DIR, watchdog: mainThreadWatchdog }),
+    // PDFs the old textutil fallback stored as raw bytes: deleted, and the
+    // watched files re-captured once through the pending lane.
+    rawCaptureRepair: createRawCaptureRepair({ db, contentDir: DEFAULT_CONTENT_DIR, bigFileBytes: folderImportLimits.bigFileBytes, watchdog: mainThreadWatchdog }),
   });
 
   // ── Express API ──
@@ -1367,6 +1400,7 @@ async function main() {
     failures,
     brainStore,
     pipelineOrchestrator,
+    documentReads,
     projectRelations,
     channelDigester,
     mcpManager,
@@ -1393,6 +1427,7 @@ async function main() {
     shutdown: shutdownCoordinator.context,
     folderImports,
     storageUsage,
+    captureHealth,
   };
   app.use('/api', createRouter(routerDeps));
 

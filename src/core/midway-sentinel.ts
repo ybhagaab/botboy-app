@@ -42,6 +42,7 @@ import type { ChatTerminalService } from './chat-terminal.js';
 import type { McpManager, McpProfileSnapshot } from './mcp-types.js';
 import { A2_ANALYTICS_PROFILE_ID, GRASP_PROFILE_ID, SLACK_MCP_PROFILE_ID } from './mcp-profiles.js';
 import { hasLiveDatanetSentryCookie, isSentryAuthShapedError, primeDatanetSentrySession } from './sentry-session.js';
+import type { CaptureHealth, CaptureSourceId } from './capture-health.js';
 
 export interface MidwaySentinel {
   start(): void;
@@ -55,7 +56,19 @@ export interface MidwaySentinelDeps {
   mcpManager: McpManager;
   chatTerminal: ChatTerminalService;
   agent: Pick<AgentOrchestrator, 'executeAction'>;
+  /**
+   * Capture outcomes. Slack reports a Midway 401 inside successful batch tool
+   * results, which the failed-tool-call scan cannot see; the capture source's
+   * own classification closes that gap.
+   */
+  captureHealth?: Pick<CaptureHealth, 'needsMidwayReauth'>;
 }
+
+/** Capture source fed by each Midway-backed built-in profile. */
+const CAPTURE_SOURCE_BY_PROFILE: ReadonlyMap<string, CaptureSourceId> = new Map([
+  [SLACK_MCP_PROFILE_ID, 'slack'],
+  [GRASP_PROFILE_ID, 'grasp'],
+]);
 
 export interface MidwaySentinelOptions {
   /** Override for tests. Defaults to ~/.midway/cookie. */
@@ -171,6 +184,8 @@ export function createMidwaySentinel(
    * broken server cannot turn the sentinel into a restart loop. */
   let lastA2SilentPrimeAt = 0;
   const A2_PRIME_COOLDOWN_MS = 10 * 60_000;
+  /** When the last re-auth recovery finished (epoch ms; 0 = never). */
+  let lastRecoveredAt = 0;
 
   const insertAssistantMessage = (content: string) => {
     const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -203,6 +218,21 @@ export function createMidwaySentinel(
       `).all(profileId, `-${TOOL_FAILURE_WINDOW_MINUTES} minutes`) as Array<{ error: string | null }>;
       return rows.some(row => isAuthLikeError(row.error)
         || (profileId === A2_ANALYTICS_PROFILE_ID && isSentryAuthShapedError(row.error)));
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * The profile's capture source reports an explicit Midway re-auth demand
+   * newer than the last recovery (a source keeps its failure until its next
+   * poll, which can trail the recovery by minutes).
+   */
+  const captureReportsMidwayReauth = (profileId: string): boolean => {
+    const source = CAPTURE_SOURCE_BY_PROFILE.get(profileId);
+    if (!source || !deps.captureHealth) return false;
+    try {
+      return deps.captureHealth.needsMidwayReauth(source, lastRecoveredAt);
     } catch {
       return false;
     }
@@ -323,6 +353,7 @@ export function createMidwaySentinel(
     const cookieNow = readMidwayCookieStatus(cookiePath, now());
     if (ended?.status === 'completed' && ended.exitCode === 0 && cookieNow.valid) {
       const results = await recoverProfiles(episode.affectedProfileIds);
+      lastRecoveredAt = now();
       await postRecoveryMessage(results);
       episode.phase = 'idle';
       episode.affectedProfileIds = [];
@@ -354,11 +385,16 @@ export function createMidwaySentinel(
       const midwayProfiles = profiles.filter(profile => profile.enabled && isMidwayBackedProfile(profile));
       const failing = midwayProfiles.filter(profile =>
         FAILURE_STATES.has(profile.state)
-        || (profile.state === 'running' && hasRecentAuthFailures(profile.id)),
+        || (profile.state === 'running' && (hasRecentAuthFailures(profile.id) || captureReportsMidwayReauth(profile.id))),
       );
       if (!failing.length) return;
 
       const cookie = readMidwayCookieStatus(cookiePath, now());
+      // The Midway client's own "run mwinit" answer is authoritative even
+      // when the local cookie file still looks valid: on current Macs the
+      // session also lives in the Midway keys process, which can expire
+      // separately from the file.
+      const explicitReauth = failing.filter(profile => captureReportsMidwayReauth(profile.id));
 
       // Datanet (a2-analytics) rides Sentry SSO on TOP of Midway: its
       // session can lapse while the Midway cookie is perfectly valid, so the
@@ -410,8 +446,9 @@ export function createMidwaySentinel(
 
       // The deterministic discriminator: profile failures with a healthy
       // cookie are ordinary crashes — the manager's own restart/backoff logic
-      // handles those, and the sentinel stays silent.
-      if (cookie.valid) return;
+      // handles those, and the sentinel stays silent. An explicit Midway
+      // re-auth demand from a capture source is the exception.
+      if (cookie.valid && explicitReauth.length === 0) return;
 
       episode.phase = 'awaiting_reauth';
       episode.lastNotifiedAt = now();
@@ -439,7 +476,12 @@ export function createMidwaySentinel(
         }
       }
 
-      await postNotification(failing, cookie, terminalOpened, reauthCommand);
+      await postNotification(
+        failing, cookie, terminalOpened, reauthCommand,
+        cookie.valid
+          ? `${explicitReauth.map(profile => profile.displayName).join(', ')} reported that the Midway session needs re-authentication (mwinit), although the local Midway cookie file still looks valid.`
+          : undefined,
+      );
       void watchReauth(terminalSessionId).catch(error => {
         console.error(`[MidwaySentinel] re-auth watcher failed: ${error?.message ?? error}`);
         episode.phase = 'idle';

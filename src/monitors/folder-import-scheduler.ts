@@ -24,19 +24,27 @@
 import path from 'path';
 import type Database from 'better-sqlite3';
 import { getLocalFolder, listLocalFolders, updateLocalFolder, type LocalFolder } from '../core/local-folders-config.js';
+import { getSetting, setSetting } from '../core/storage.js';
 import type { DiskSpaceMonitor } from '../core/disk-space.js';
 import type { ShutdownRuntimeContext } from '../core/shutdown-coordinator.js';
 import { NOOP_MAIN_THREAD_WATCHDOG, type MainThreadStats, type MainThreadWatchdog } from '../core/main-thread-watchdog.js';
+import { statSync } from 'fs';
 import {
   READABLE_EXTENSIONS,
+  changingOftenFiles,
   clearFirstImportDone,
+  clearReferenceWalkDone,
   contentRemovedPaths,
   directoryGlobForPath,
   folderImportThresholds,
   isFirstImportDone,
+  isReferenceWalkDone,
   literalGlobForPath,
+  markReferenceWalkDone,
+  OWNER_RESUMED_REASON,
   parseLiteralGlob,
   type FolderFileCounts,
+  type FolderFileRecord,
   type FolderImportThresholds,
   type LocalFolderImportLedger,
 } from '../core/local-folder-imports.js';
@@ -74,6 +82,10 @@ export interface FolderImportFolderStatus {
   excludedEntries: number;
   lastResult: FolderImportResultSummary | null;
   lastError: string | null;
+  /** Files rewritten so often that every change costs a full reprocess (last 24 h). */
+  changingOften: ChangingOftenEntry[];
+  /** Files whose reprocessing the owner paused. */
+  ownerPaused: OwnerPausedEntry[];
 }
 
 export interface FolderImportStatus {
@@ -117,6 +129,8 @@ export interface FolderReview {
   undecided: number;
   files: FolderReviewFile[];
   tooLarge: Array<{ path: string; relPath: string; dir: string; name: string; ext: string; size: number }>;
+  /** Likely credentials held from capture: names and reasons only, never content. */
+  sensitive: Array<{ path: string; relPath: string; dir: string; name: string; ext: string; size: number; reason: string }>;
   excludedDirs: Array<{ path: string; relPath: string; files: number }>;
 }
 
@@ -125,12 +139,37 @@ export interface ReviewDecision {
   exclude?: string[];
   excludeDirs?: string[];
   restoreDirs?: string[];
+  /** Stop reprocessing these files until resumed (files that keep changing). */
+  pause?: string[];
+  /** Capture the current version of these paused files once, then watch as usual. */
+  resume?: string[];
+  /** Keep reprocessing these changing files; stop warning about them. */
+  keepChanging?: string[];
+}
+
+export interface ChangingOftenEntry {
+  path: string;
+  relPath: string;
+  versions: number;
+  maxBytes: number;
+  storedBytes: number;
+  lastCapturedAt: string;
+  /** The owner chose to keep reprocessing it; shown without a warning. */
+  acknowledged: boolean;
+}
+
+export interface OwnerPausedEntry {
+  path: string;
+  relPath: string;
+  size: number;
+  /** Newest modification time seen while paused (epoch ms). */
+  mtimeMs: number;
 }
 
 export type ReviewDecisionResult =
   | {
     ok: true;
-    applied: { kept: number; excluded: number; excludedDirs: number; restoredDirs: number };
+    applied: { kept: number; excluded: number; excludedDirs: number; restoredDirs: number; paused: number; resumed: number; keptChanging: number };
     review: FolderReview;
   }
   | {
@@ -163,6 +202,12 @@ export interface FolderImportScheduler {
 
 const MAX_DECISION_ENTRIES = 20_000;
 
+/** A one-time store change the scheduler runs before any folder walk, until it reports done. */
+export interface StoreMigration {
+  isDone(): boolean;
+  run(opts?: { signal?: AbortSignal }): Promise<{ done: boolean; aborted?: boolean }>;
+}
+
 export function createFolderImportScheduler(deps: {
   db: Database.Database;
   monitor: FilesystemMonitorWithImports;
@@ -172,6 +217,18 @@ export function createFolderImportScheduler(deps: {
   watchdog?: MainThreadWatchdog;
   shutdown?: ShutdownRuntimeContext;
   readableExtensions?: ReadonlySet<string>;
+  /**
+   * One-time conversion of stored data/code versions into references
+   * (`file-reference-migration.ts`). Runs at the start of a pass, before any
+   * folder walk, until it reports done.
+   */
+  referenceMigration?: StoreMigration;
+  /**
+   * One-time repair of local PDF captures stored as raw bytes
+   * (`raw-capture-repair.ts`). Runs after the reference migration, before
+   * any folder walk, so the same pass imports the files it re-queues.
+   */
+  rawCaptureRepair?: StoreMigration;
   /** Delay after `start()` before the first pass. */
   startDelayMs?: number;
   /** Retry cadence while paused for disk or blocked by a busy folder. */
@@ -197,9 +254,37 @@ export function createFolderImportScheduler(deps: {
   let running: Promise<void> | null = null;
   let rerun = false;
   let passCounter = 0;
-  let active: { folderId: number; controller: AbortController } | null = null;
+  // folderId null: the one-time reference migration, which no folder change aborts.
+  let active: { folderId: number | null; controller: AbortController } | null = null;
   const lastResults = new Map<number, FolderImportResultSummary>();
   const lastErrors = new Map<number, string>();
+  // The panel polls status every 5 s; the changing-often aggregate needs at
+  // most minute freshness, so it is cached per folder.
+  const CHANGING_CACHE_MS = 60_000;
+  const changingCache = new Map<number, { at: number; entries: ChangingOftenEntry[] }>();
+
+  const changingAckKey = (folderId: number) => `local_folders.changing_ack.${folderId}`;
+  function changingAcks(folderId: number): Set<string> {
+    const stored = getSetting<string[]>(db, changingAckKey(folderId));
+    return new Set(Array.isArray(stored) ? stored.filter(entry => typeof entry === 'string') : []);
+  }
+
+  function changingOftenFor(folder: LocalFolder, paused: ReadonlySet<string>): ChangingOftenEntry[] {
+    const cached = changingCache.get(folder.id);
+    let entries = cached && now() - cached.at < CHANGING_CACHE_MS ? cached.entries : null;
+    if (!entries) {
+      try {
+        const acks = changingAcks(folder.id);
+        entries = watchdog.measure('folder-changing', () => changingOftenFiles(db, folder.path, { now: now() }))
+          .map(file => ({ ...file, relPath: path.relative(folder.path, file.path), acknowledged: acks.has(file.path) }));
+      } catch (err) {
+        console.warn(`[folder-imports] changing-file check failed for ${folder.path}: ${(err as Error)?.message ?? err}`);
+        entries = [];
+      }
+      changingCache.set(folder.id, { at: now(), entries });
+    }
+    return entries.filter(entry => !paused.has(entry.path));
+  }
 
   function schedule(delayMs: number): void {
     if (stopped) return;
@@ -254,6 +339,29 @@ export function createFolderImportScheduler(deps: {
     });
   }
 
+  /**
+   * One walk under the file reference rules for a folder imported before
+   * them: each data or code file becomes a reference, and every unchanged
+   * document is skipped. The marker is set only after a complete walk.
+   */
+  async function referenceWalk(folder: LocalFolder): Promise<FolderOutcome> {
+    return withFolderWalk(folder.id, async (signal) => {
+      const result = await monitor.backfill(folder.id, { signal });
+      if (result.aborted) return stopped ? 'stopped' : 'aborted';
+      if (result.busy) return 'busy';
+      lastResults.set(folder.id, {
+        at: now(), kind: 'import',
+        imported: result.imported ?? 0, unchanged: result.unchanged ?? 0,
+        needsReview: result.needsReview ?? 0, tooLarge: result.tooLarge ?? 0,
+        failed: result.failed ?? 0, paused: result.paused === 'low_disk',
+      });
+      if (result.paused) return 'paused';
+      // A failed store stays unrecorded; walk again next pass to retry it.
+      if ((result.failed ?? 0) === 0) markReferenceWalkDone(db, folder.id);
+      return 'done';
+    });
+  }
+
   async function importPending(folder: LocalFolder): Promise<FolderOutcome> {
     const pending = ledger.list(folder.id, ['approved', 'deferred_low_disk']);
     if (pending.length === 0) return 'done';
@@ -270,14 +378,49 @@ export function createFolderImportScheduler(deps: {
   }
 
   /** One pass over enabled folders, one folder at a time. */
+  /**
+   * Stored data/code versions from before the reference rules become
+   * references before any walk, so the walks find them unchanged. A failure
+   * never blocks folder imports; the next pass retries.
+   */
+  async function runStoreMigration(migration: StoreMigration | undefined, label: string): Promise<'done' | 'deferred' | 'stopped'> {
+    if (!migration || migration.isDone()) return 'done';
+    const controller = new AbortController();
+    active = { folderId: null, controller };
+    try {
+      const result = await migration.run({ signal: controller.signal });
+      if (result.aborted) return 'stopped';
+      return result.done ? 'done' : 'deferred';
+    } catch (err) {
+      console.warn(`[folder-imports] ${label} failed:`, String((err as Error)?.message ?? err).slice(0, 300));
+      return 'deferred';
+    } finally {
+      if (active?.controller === controller) active = null;
+    }
+  }
+
   async function passOnce(): Promise<'done' | 'paused' | 'retry' | 'stopped'> {
     let retry = false;
+    for (const [migration, label] of [
+      [deps.referenceMigration, 'stored data/code conversion'],
+      [deps.rawCaptureRepair, 'raw PDF capture repair'],
+    ] as const) {
+      const outcome = await runStoreMigration(migration, label);
+      if (outcome === 'stopped' || stopped || deps.shutdown?.isShuttingDown()) return 'stopped';
+      if (outcome === 'deferred') retry = true;
+    }
     for (const folder of listLocalFolders(db, { enabledOnly: true })) {
       if (stopped || deps.shutdown?.isShuttingDown()) return 'stopped';
       if (await importFloorLow()) return 'paused';
       try {
         let outcome: FolderOutcome = 'done';
-        if (!isFirstImportDone(db, folder.id)) outcome = await firstImport(folder);
+        if (!isFirstImportDone(db, folder.id)) {
+          outcome = await firstImport(folder);
+          // A first import already applies the reference rules.
+          if (outcome === 'done') markReferenceWalkDone(db, folder.id);
+        } else if (!isReferenceWalkDone(db, folder.id)) {
+          outcome = await referenceWalk(folder);
+        }
         if (outcome === 'done') outcome = await importPending(folder);
         if (outcome === 'stopped') return 'stopped';
         if (outcome === 'paused') return 'paused';
@@ -356,6 +499,13 @@ export function createFolderImportScheduler(deps: {
         ...ledger.list(folder.id, ['too_large']),
         ...ledger.list(folder.id, ['needs_review', 'approved', 'excluded', 'imported'], thresholds.bigFileBytes),
       ];
+      const sensitive: FolderReview['sensitive'] = ledger.list(folder.id, ['sensitive']).map(row => ({
+        path: row.path,
+        ...relativeParts(folder.path, row.path),
+        ext: path.extname(row.path).toLowerCase(),
+        size: row.size,
+        reason: row.reason || 'Looks like a credential',
+      }));
       const removed = contentRemovedPaths(db, folder.path);
       const { dirs } = reviewEntriesIn(folder);
       const files: FolderReviewFile[] = [];
@@ -401,6 +551,7 @@ export function createFolderImportScheduler(deps: {
         undecided,
         files,
         tooLarge,
+        sensitive,
         excludedDirs: [...excludedDirCounts].map(([dir, count]) => ({
           path: dir,
           relPath: path.relative(folder.path, dir),
@@ -467,6 +618,9 @@ export function createFolderImportScheduler(deps: {
       if (active?.folderId === folderId) active.controller.abort(new Error('Folder removed'));
       ledger.removeFolder(folderId);
       clearFirstImportDone(db, folderId);
+      clearReferenceWalkDone(db, folderId);
+      db.prepare('DELETE FROM app_settings WHERE key = ?').run(changingAckKey(folderId));
+      changingCache.delete(folderId);
       lastResults.delete(folderId);
       lastErrors.delete(folderId);
     },
@@ -486,6 +640,14 @@ export function createFolderImportScheduler(deps: {
         const progress = monitor.walkState(folder.id);
         const firstDone = isFirstImportDone(db, folder.id);
         const entries = reviewEntriesIn(folder);
+        const ownerPaused: OwnerPausedEntry[] = counts.owner_paused > 0
+          ? ledger.list(folder.id, ['owner_paused']).map(row => ({
+            path: row.path,
+            relPath: path.relative(folder.path, row.path),
+            size: row.size,
+            mtimeMs: row.mtimeMs,
+          }))
+          : [];
         return {
           folderId: folder.id,
           path: folder.path,
@@ -497,6 +659,8 @@ export function createFolderImportScheduler(deps: {
           excludedEntries: entries.files.size + entries.dirs.size,
           lastResult: lastResults.get(folder.id) ?? null,
           lastError: lastErrors.get(folder.id) ?? null,
+          changingOften: folder.enabled ? changingOftenFor(folder, new Set(ownerPaused.map(entry => entry.path))) : [],
+          ownerPaused,
         };
       });
       return {
@@ -535,8 +699,12 @@ export function createFolderImportScheduler(deps: {
       const exclude = [...new Set(decision.exclude ?? [])];
       const excludeDirs = [...new Set(decision.excludeDirs ?? [])];
       const restoreDirs = [...new Set(decision.restoreDirs ?? [])];
+      const pause = [...new Set(decision.pause ?? [])];
+      const resume = [...new Set(decision.resume ?? [])];
+      const keepChanging = [...new Set(decision.keepChanging ?? [])];
       const invalid: Array<{ path: string; reason: string }> = [];
-      const total = keep.length + exclude.length + excludeDirs.length + restoreDirs.length;
+      const total = keep.length + exclude.length + excludeDirs.length + restoreDirs.length
+        + pause.length + resume.length + keepChanging.length;
       if (total === 0 || total > MAX_DECISION_ENTRIES) {
         return {
           ok: false, status: 400, code: 'invalid_decision',
@@ -581,6 +749,39 @@ export function createFolderImportScheduler(deps: {
       for (const dir of restoreDirs) {
         if (!currentDirs.has(dir)) invalid.push({ path: dir, reason: 'is not an excluded subfolder of this folder' });
       }
+      // Pause names a file BotBoy watches here; the file's current size and
+      // mtime become the paused row, so later changes are noted unread.
+      const resumeSet = new Set(resume);
+      const pauseStats = new Map<string, { size: number; mtimeMs: number }>();
+      const folderExcludes = new Set(folder.exclude_globs);
+      for (const filePath of pause) {
+        const known = insideRoot(filePath) ? ledger.get(folder.id, filePath) : undefined;
+        if (!insideRoot(filePath)) { invalid.push({ path: filePath, reason: 'is not a file inside this folder' }); continue; }
+        if (resumeSet.has(filePath)) { invalid.push({ path: filePath, reason: 'is marked both pause and resume' }); continue; }
+        if (known?.outcome === 'owner_paused') { invalid.push({ path: filePath, reason: 'is already paused' }); continue; }
+        if (known?.outcome === 'sensitive') { invalid.push({ path: filePath, reason: 'is held as a possible credential and never read' }); continue; }
+        if (folderExcludes.has(literalGlobForPath(filePath)) || known?.outcome === 'excluded') {
+          invalid.push({ path: filePath, reason: 'is excluded, so it is never read' });
+          continue;
+        }
+        try {
+          const stat = statSync(filePath);
+          if (!stat.isFile()) invalid.push({ path: filePath, reason: 'is not a file' });
+          else pauseStats.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs });
+        } catch {
+          invalid.push({ path: filePath, reason: 'no longer exists' });
+        }
+      }
+      const resumeRows = new Map<string, FolderFileRecord>();
+      for (const filePath of resume) {
+        const known = insideRoot(filePath) ? ledger.get(folder.id, filePath) : undefined;
+        if (known?.outcome !== 'owner_paused') invalid.push({ path: filePath, reason: 'is not paused' });
+        else resumeRows.set(filePath, known);
+      }
+      for (const filePath of keepChanging) {
+        if (!insideRoot(filePath)) invalid.push({ path: filePath, reason: 'is not a file inside this folder' });
+        else if (pauseStats.has(filePath)) invalid.push({ path: filePath, reason: 'is marked both pause and keep processing' });
+      }
       if (invalid.length > 0) {
         return {
           ok: false, status: 400, code: 'invalid_decision',
@@ -618,6 +819,28 @@ export function createFolderImportScheduler(deps: {
             else ledger.remove(folder.id, row.path);
           }
         }
+        for (const [filePath, stat] of pauseStats) {
+          const known = ledger.get(folder.id, filePath);
+          ledger.record({ folderId: folder.id, path: filePath, size: stat.size, mtimeMs: stat.mtimeMs, outcome: 'owner_paused', origin: known?.origin ?? 'live' });
+        }
+        // Resume captures the current version once through the pending lane.
+        // A file that grew past the big-file threshold while paused goes back
+        // to the big-file review instead of being read unasked.
+        // The resumed version's brief reads it in full (document-reads.ts):
+        // the changes made while paused were never read.
+        for (const [filePath, row] of resumeRows) {
+          ledger.record({
+            folderId: folder.id, path: filePath, size: row.size, mtimeMs: row.mtimeMs, origin: row.origin,
+            outcome: row.size >= thresholds.bigFileBytes ? 'needs_review' : 'approved', reason: OWNER_RESUMED_REASON,
+          });
+        }
+        // "Keep processing" silences the warning; pausing later supersedes it.
+        if (keepChanging.length > 0 || pauseStats.size > 0) {
+          const acks = changingAcks(folder.id);
+          for (const filePath of keepChanging) acks.add(filePath);
+          for (const filePath of pauseStats.keys()) acks.delete(filePath);
+          setSetting(db, changingAckKey(folder.id), [...acks]);
+        }
         // Restored subtrees were never walked: walk the folder again. The
         // walk skips every unchanged file, so this costs one cheap pass.
         if (restoreDirs.length > 0) clearFirstImportDone(db, folder.id);
@@ -631,6 +854,7 @@ export function createFolderImportScheduler(deps: {
           nextAction: 'Reload the big-file list and choose again.',
         };
       }
+      changingCache.delete(folder.id);
 
       // The engine holds exclude globs: re-attach before new events arrive.
       try {
@@ -647,6 +871,9 @@ export function createFolderImportScheduler(deps: {
           excluded: exclude.length,
           excludedDirs: excludeDirs.length,
           restoredDirs: restoreDirs.length,
+          paused: pauseStats.size,
+          resumed: resumeRows.size,
+          keptChanging: keepChanging.length,
         },
         review: buildReview(refreshed),
       };

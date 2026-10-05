@@ -89,7 +89,7 @@ export interface ContentStoreConfig {
   inlineThresholdBytes?: number;
 }
 
-const DEFAULT_CONTENT_DIR = path.join(os.homedir(), '.personal-productivity-tracker', 'content');
+export const DEFAULT_CONTENT_DIR = path.join(os.homedir(), '.personal-productivity-tracker', 'content');
 const DEFAULT_INLINE_THRESHOLD = 32 * 1024; // 32 KB (see design)
 
 function sha256Hex(s: string): string {

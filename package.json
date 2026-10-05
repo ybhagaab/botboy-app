@@ -23,15 +23,15 @@
     "@aws-sdk/client-s3": "3.1106.0",
     "@aws-sdk/credential-providers": "3.1106.0",
     "@aws/bedrock-token-generator": "1.1.0",
-    "@modelcontextprotocol/sdk": "1.25.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "@slack/socket-mode": "^2.0.6",
     "@slack/web-api": "^7.15.0",
     "aws4": "1.13.2",
     "better-sqlite3": "^11.10.0",
     "express": "^4.22.1",
     "node-pty": "1.0.0",
+    "pdfjs-dist": "5.4.624",
     "sql-context-presets-mcp": "1.5.0",
-    "uuid": "^10.0.0",
     "vega": "6.3.1",
     "vega-embed": "7.1.0",
     "vega-interpreter": "2.3.1",
@@ -44,13 +44,12 @@
     "@types/express": "^5.0.6",
     "@types/node": "^22.19.15",
     "@types/supertest": "^6.0.3",
-    "@types/uuid": "^10.0.0",
     "@types/ws": "^8.18.1",
     "fast-check": "^3.23.2",
     "jsdom": "^29.1.1",
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^2.1.9"
+    "vitest": "4.1.11"
   }
 }

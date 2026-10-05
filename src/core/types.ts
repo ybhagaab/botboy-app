@@ -12,6 +12,8 @@ export type WorkItemType =
   | 'document_online'
   | 'document_capture'
   | 'document_comment'
+  /** A data or code file recorded by path and outline, never read (file-references.ts). */
+  | 'file_reference'
   | 'call_summary'
   | 'app_activity'
   | 'clipboard_capture'

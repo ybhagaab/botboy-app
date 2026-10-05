@@ -3,6 +3,7 @@
  * projects/areas read model it produces.
  */
 
+import path from 'path';
 import { Router, Request, Response } from 'express';
 import { listAreasWithProjects } from '../../core/project-organizer.js';
 import { setBrainTaskState, removeBrainTask } from '../../core/brain-tasks.js';
@@ -230,12 +231,21 @@ export function createPipelineRouter(deps: RouterDeps): Router {
     const db = deps.db;
     if (!db) return res.status(503).json({ error: 'DB not available' });
     const health = deps.failures?.health() ?? { totalFailures: 0, failuresByStep: {}, retryableFailures: 0, incompleteItems: 0 };
+    // File references (data/code files) skip the evidence lifecycle; an
+    // unassigned one is not an orphan awaiting reconciliation.
     const stateRows = db
-      .prepare('SELECT process_state AS s, COUNT(*) AS c FROM work_items GROUP BY process_state')
+      .prepare("SELECT process_state AS s, COUNT(*) AS c FROM work_items WHERE type <> 'file_reference' GROUP BY process_state")
       .all() as { s: string; c: number }[];
     const byState: Record<string, number> = {};
     for (const r of stateRows) byState[r.s] = r.c;
     const orphanCount = byState['orphaned'] ?? 0;
+    const referenceRow = db.prepare(`
+      SELECT COUNT(*) AS total, COALESCE(SUM(project_id IS NOT NULL), 0) AS assigned
+      FROM work_items WHERE type = 'file_reference'
+    `).get() as { total: number; assigned: number };
+    const fileReferences = { total: referenceRow.total, assigned: referenceRow.assigned, unassigned: referenceRow.total - referenceRow.assigned };
+    let documentReads: Record<string, number> | null = null;
+    try { documentReads = deps.documentReads?.counts() ?? null; } catch { /* optional */ }
     const projectCount = (db.prepare('SELECT COUNT(*) AS c FROM projects').get() as { c: number }).c;
     const lastRuns = db
       .prepare('SELECT id, pass, batch_id, items_in, items_out, status, started_at, completed_at FROM pipeline_runs ORDER BY started_at DESC LIMIT 20')
@@ -244,6 +254,8 @@ export function createPipelineRouter(deps: RouterDeps): Router {
       ...health,
       itemsByState: byState,
       orphanCount,
+      fileReferences,
+      documentReads,
       projectCount,
       lastRuns,
     });
@@ -436,12 +448,20 @@ export function createPipelineRouter(deps: RouterDeps): Router {
     const db = deps.db;
     const bs = deps.brainStore;
     if (!db || !bs) return res.status(503).json({ error: 'projects not available' });
+    // Evidence and file references (data/code files) are counted apart: a
+    // code folder's thousands of files must not read as evidence.
+    const countsStmt = db.prepare(`
+      SELECT SUM(type <> 'file_reference') AS items, SUM(type = 'file_reference') AS files
+      FROM work_items WHERE project_id = ?
+    `);
     const projects = bs.listProjects().map((p) => {
-      const itemCount = (db.prepare('SELECT COUNT(*) AS c FROM work_items WHERE project_id = ?').get(p.id) as { c: number }).c;
+      const counts = countsStmt.get(p.id) as { items: number | null; files: number | null };
+      const itemCount = counts.items ?? 0;
+      const fileCount = counts.files ?? 0;
       const scopeAlertCount = (db.prepare('SELECT COUNT(*) AS c FROM work_items WHERE project_id = ? AND scope_alert IS NOT NULL').get(p.id) as { c: number }).c;
       return {
         id: p.id, title: p.title, status: p.status,
-        oneLiner: p.one_liner, updatedAt: p.updated_at, itemCount, scopeAlertCount,
+        oneLiner: p.one_liner, updatedAt: p.updated_at, itemCount, fileCount, scopeAlertCount,
       };
     });
     res.json({ projects, count: projects.length });
@@ -489,14 +509,22 @@ export function createPipelineRouter(deps: RouterDeps): Router {
                file_path AS filePath, metadata, captured_at, captured_at AS capturedAt,
                scope_alert AS scopeAlert
         FROM work_items
-        WHERE project_id = ?
+        WHERE project_id = ? AND type <> 'file_reference'
         ORDER BY captured_at DESC
         LIMIT 100
       `)
       .all(id) as Array<Record<string, unknown>>;
+    const fileCount = (db.prepare(
+      "SELECT COUNT(*) AS c FROM work_items WHERE project_id = ? AND type = 'file_reference'",
+    ).get(id) as { c: number }).c;
+    // How far the brain has read each long document (document-reads.ts).
+    let reads = new Map<string, unknown>();
+    try { reads = deps.documentReads?.forProject(id) ?? reads; } catch { /* optional */ }
     for (const item of items) {
       // Mixed-scope quarantine flag written by the brain pass; parsed for the UI.
       try { item.scopeAlert = item.scopeAlert ? JSON.parse(String(item.scopeAlert)) : null; } catch { item.scopeAlert = null; }
+      const read = reads.get(String(item.id));
+      if (read) item.documentRead = read;
     }
     const project = bs.getProject(id);
     const rejectedItems = db
@@ -520,8 +548,62 @@ export function createPipelineRouter(deps: RouterDeps): Router {
       rejectedItems,
       foundingScope: project?.founding_scope ?? null,
       scopeAlertCount,
+      fileCount,
       relatedProjects,
     });
+  });
+
+  // Data and code files recorded for this project (file-references.ts):
+  // path, format, size, outline. Paged; ordered by path so a folder's files
+  // stay together. Deleted files are listed last, marked.
+  router.get('/projects/:id/files', (req: Request, res: Response) => {
+    const db = deps.db;
+    if (!db) return res.status(503).json({ error: 'db not available' });
+    const projectId = paramStr(req.params.id);
+    const limit = Math.max(1, Math.min(500, Number.parseInt(String(req.query.limit ?? '200'), 10) || 200));
+    const offset = Math.max(0, Number.parseInt(String(req.query.offset ?? '0'), 10) || 0);
+    const total = (db.prepare(
+      "SELECT COUNT(*) AS c FROM work_items WHERE project_id = ? AND type = 'file_reference'",
+    ).get(projectId) as { c: number }).c;
+    const rows = db.prepare(`
+      SELECT id, title, summary, file_path AS filePath, metadata, captured_at AS capturedAt
+      FROM work_items
+      WHERE project_id = ? AND type = 'file_reference'
+      ORDER BY (COALESCE(json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.archived'), '') = 'true'),
+               file_path
+      LIMIT ? OFFSET ?
+    `).all(projectId, limit, offset) as Array<{ id: string; title: string | null; summary: string | null; filePath: string; metadata: string | null; capturedAt: string }>;
+    const files = rows.map((row) => {
+      let meta: Record<string, unknown> = {};
+      try { meta = row.metadata ? JSON.parse(row.metadata) as Record<string, unknown> : {}; } catch { /* legacy */ }
+      const mtime = Number(meta.mtime);
+      const size = Number(meta.size);
+      return {
+        id: row.id,
+        name: row.title ?? path.basename(row.filePath),
+        filePath: row.filePath,
+        displayPath: typeof meta.displayPath === 'string' ? meta.displayPath : row.filePath,
+        role: meta.fileRole === 'code' ? 'code' : 'data',
+        format: typeof meta.format === 'string' ? meta.format : '',
+        size: Number.isFinite(size) ? size : null,
+        modifiedAt: Number.isFinite(mtime) && mtime > 0 ? new Date(mtime).toISOString() : null,
+        summary: row.summary ?? '',
+        deleted: meta.archived === 'true',
+        recordedAt: row.capturedAt,
+      };
+    });
+    res.json({ files, total, limit, offset });
+  });
+
+  // Owner: read a long document into the brain in full (one too long for the
+  // automatic limit, or one whose read failed). Parts run on idle ticks.
+  router.post('/projects/:projectId/documents/:itemId/read-in-full', (req: Request, res: Response) => {
+    const reads = deps.documentReads;
+    if (!reads) return res.status(503).json({ error: 'document reads not available' });
+    if (!isSameOriginMutation(req)) return res.status(403).json({ error: 'Cross-origin document read rejected' });
+    const outcome = reads.readInFull(paramStr(req.params.projectId), paramStr(req.params.itemId));
+    if (!outcome.ok) return res.status(outcome.status).json({ error: outcome.error });
+    res.json({ ok: true, documentRead: outcome.info });
   });
 
   router.get('/projects/:id/artifacts', (req: Request, res: Response) => {

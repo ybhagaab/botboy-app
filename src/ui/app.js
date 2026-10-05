@@ -2853,6 +2853,44 @@ function lfCount(n, one, many) {
   return `${value.toLocaleString()} ${value === 1 ? one : many}`;
 }
 
+/** "5 min ago" for an epoch-ms time; days past the first. */
+function lfAgo(ms) {
+  const seconds = Math.max(0, Math.floor((Date.now() - Number(ms)) / 1000));
+  if (!Number.isFinite(seconds)) return 'at an unknown time';
+  if (seconds < 60) return 'just now';
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} hr ago`;
+  return `${Math.floor(seconds / 86400)} days ago`;
+}
+
+/** One owner decision for a changing file: pause, resume, or keep processing. */
+async function decideLfChangingFile(id, action, filePath) {
+  if (!filePath) return;
+  const key = action === 'pause-file' ? 'pause' : action === 'resume-file' ? 'resume' : 'keepChanging';
+  let res;
+  try {
+    res = await fetch(`/api/local-folders/${id}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [key]: [filePath] }),
+    });
+  } catch (e) {
+    showLfStatus(`Not saved: ${e.message || 'network error'}`);
+    return;
+  }
+  if (!res.ok) {
+    await showLfError('Not saved', res);
+    return;
+  }
+  const name = String(filePath).split('/').pop();
+  showLfStatus(key === 'pause'
+    ? `Paused ${name}. BotBoy notes its changes without reading them until you resume it.`
+    : key === 'resume'
+      ? `Resumed ${name}. Its current version is captured once in the background.`
+      : `Processing every change of ${name}; this warning stays off.`);
+  await refreshLfImportState();
+}
+
 function lfFolderStatus(id) {
   const folders = lfImports && Array.isArray(lfImports.folders) ? lfImports.folders : [];
   return folders.find(entry => entry && entry.folderId === id) || null;
@@ -2885,9 +2923,24 @@ function lfStateHtml(folder) {
   if (counts.too_large) skipped.push(`${lfCount(counts.too_large, 'file', 'files')} too large to import yet`);
   if (counts.excluded) skipped.push(`${lfCount(counts.excluded, 'file', 'files')} excluded by you`);
   if (counts.deferred_low_disk) skipped.push(`${lfCount(counts.deferred_low_disk, 'change', 'changes')} held for low disk space`);
+  if (counts.sensitive) skipped.push(`${lfCount(counts.sensitive, 'possible credential', 'possible credentials')} kept on this Mac (never sent to the AI)`);
   const hasBigFiles = (counts.too_large || 0) + (counts.excluded || 0) + (counts.approved || 0) > 0;
+  const hasHeldFiles = hasBigFiles || (counts.sensitive || 0) > 0;
   if (skipped.length || (hasBigFiles && st.phase !== 'needs_review')) {
-    lines.push(`${skipped.length ? `Skipped: ${skipped.join(' · ')}` : 'Big files decided'}${hasBigFiles && st.phase !== 'needs_review' ? ` ${reviewLink('Big files')}` : ''}`);
+    const linkLabel = hasBigFiles ? 'Big files' : 'Held files';
+    lines.push(`${skipped.length ? `Skipped: ${skipped.join(' · ')}` : 'Big files decided'}${hasHeldFiles && st.phase !== 'needs_review' ? ` ${reviewLink(linkLabel)}` : ''}`);
+  }
+  // Files that keep changing: every change is a full new capture, so the
+  // owner can pause one until it settles, or keep processing it quietly.
+  const fileButton = (action, file, label) => `<button class="text-link" type="button" data-lf-action="${action}" data-id="${id}" data-path="${escAttr(file.path)}">${label}</button>`;
+  for (const file of (Array.isArray(st.changingOften) ? st.changingOften : []).slice(0, 5)) {
+    const name = escHtml(file.relPath || file.path);
+    lines.push(file.acknowledged
+      ? `Changing often (you chose to process every change): ${name} ${fileButton('pause-file', file, 'Pause updates')}`
+      : `<span class="lf-tone-warn">Changing often: ${name} (${formatLfBytes(file.maxBytes)}) was captured ${lfCount(file.versions, 'time', 'times')} in the last day, ${formatLfBytes(file.storedBytes)} stored. Each change is read in full and goes through routing and the project brief again.</span> ${fileButton('pause-file', file, 'Pause updates')} ${fileButton('keep-changing', file, 'Keep processing')}`);
+  }
+  for (const file of (Array.isArray(st.ownerPaused) ? st.ownerPaused : []).slice(0, 5)) {
+    lines.push(`Paused by you: ${escHtml(file.relPath || file.path)} · last changed ${lfAgo(file.mtimeMs)}. Resume captures its current version once. ${fileButton('resume-file', file, 'Resume')}`);
   }
   if (st.lastResult && st.lastResult.failed) {
     lines.push(`<span class="lf-tone-bad">${lfCount(st.lastResult.failed, 'file', 'files')} could not be stored; use Backfill now to retry.</span>`);
@@ -2985,6 +3038,11 @@ function renderLfReview(id) {
     ? `<div class="lf-review-toolarge"><button class="text-link" type="button" data-lf-action="toggle-too-large" data-id="${id}">${state.showTooLarge ? 'Hide' : 'Show'} ${lfCount(tooLarge.length, 'file', 'files')} too large to import yet (over ${formatLfBytes(review.maxFileBytes)})</button>
       ${state.showTooLarge ? `<ul>${tooLarge.map(file => `<li>${escHtml(file.relPath)} <span>${formatLfBytes(file.size)}</span></li>`).join('')}</ul>` : ''}</div>`
     : '';
+  const sensitive = review.sensitive || [];
+  const sensitiveHtml = sensitive.length
+    ? `<div class="lf-review-toolarge"><button class="text-link" type="button" data-lf-action="toggle-sensitive" data-id="${id}">${state.showSensitive ? 'Hide' : 'Show'} ${lfCount(sensitive.length, 'possible credential', 'possible credentials')} kept on this Mac</button>
+      ${state.showSensitive ? `<p>BotBoy does not store these files' text or send them to the AI. A file named or typed like a credential is never opened. Rename or move a file only if it holds no secrets.</p><ul>${sensitive.map(file => `<li>${escHtml(file.relPath)} <span>${escHtml(file.reason)}</span></li>`).join('')}</ul>` : ''}</div>`
+    : '';
   const counts = lfReviewCounts(state);
   const hasFiles = (review.files || []).length > 0;
   slot.innerHTML = `<div class="lf-review" role="region" aria-label="Big files in ${escAttr(folderName)}">
@@ -2996,6 +3054,7 @@ function renderLfReview(id) {
     <div class="lf-review-list">${groupHtml}</div>` : ''}
     ${excludedDirs ? `<div class="lf-review-excluded"><strong>Excluded subfolders</strong><ul>${excludedDirs}</ul></div>` : ''}
     ${tooLargeHtml}
+    ${sensitiveHtml}
     <div class="lf-review-footer">
       <button class="btn btn-primary" type="button" data-lf-action="save-review" data-id="${id}" ${state.saving ? 'disabled' : ''}>${state.saving ? 'Saving…' : 'Save and start import'}</button>
       <button class="btn" type="button" data-lf-action="close-review" data-id="${id}">Close</button>
@@ -3006,7 +3065,7 @@ function renderLfReview(id) {
 }
 
 async function openLfReview(id) {
-  const state = lfReviews.get(id) || { choice: new Map(), excludeDirs: new Set(), restoreDirs: new Set(), showTooLarge: false };
+  const state = lfReviews.get(id) || { choice: new Map(), excludeDirs: new Set(), restoreDirs: new Set(), showTooLarge: false, showSensitive: false };
   Object.assign(state, { open: true, loading: true, saving: false, error: '', review: null });
   lfReviews.set(id, state);
   renderLfReview(id);
@@ -3095,6 +3154,10 @@ function bindLfListDelegation(list) {
     const action = target.getAttribute('data-lf-action');
     if (!Number.isFinite(id)) return;
     if (action === 'open-review') { void openLfReview(id); return; }
+    if (action === 'pause-file' || action === 'resume-file' || action === 'keep-changing') {
+      void decideLfChangingFile(id, action, target.getAttribute('data-path'));
+      return;
+    }
     const state = lfReviews.get(id);
     if (!state) return;
     const dir = target.getAttribute('data-dir');
@@ -3108,6 +3171,7 @@ function bindLfListDelegation(list) {
     else if (action === 'restore-dir' && dir) state.restoreDirs.add(dir);
     else if (action === 'keep-dir-excluded' && dir) state.restoreDirs.delete(dir);
     else if (action === 'toggle-too-large') state.showTooLarge = !state.showTooLarge;
+    else if (action === 'toggle-sensitive') state.showSensitive = !state.showSensitive;
     renderLfReview(id);
   });
   list.addEventListener('change', (event) => {

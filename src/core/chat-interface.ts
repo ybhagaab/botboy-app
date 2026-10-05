@@ -3,7 +3,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import type { ChatMessage, ChatResponse } from './types.js';
 import type { AgentOrchestrator } from './agent.js';
 

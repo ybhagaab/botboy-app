@@ -37,6 +37,7 @@ import type { McpManager } from '../core/mcp-types.js';
 import type { RawWorkItem } from '../core/types.js';
 import { getSetting, setSetting } from '../core/storage.js';
 import { parseOutlookMessageTimestamp } from '../core/email-thread.js';
+import { classifyCaptureFailure, type CaptureHealth } from '../core/capture-health.js';
 
 const GRASP_PROFILE_ID = 'grasp-m365';
 
@@ -233,6 +234,8 @@ export function createGraspSync(deps: {
   mcpManager: McpManager;
   emit: (item: RawWorkItem) => void;
   config?: GraspSyncConfig;
+  /** Outcome of every sync run, for owner-facing capture warnings. */
+  captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
 }): GraspSync {
   const { db, mcpManager, emit } = deps;
   const intervalMs = deps.config?.intervalMs ?? 30 * 60 * 1000;
@@ -582,6 +585,10 @@ export function createGraspSync(deps: {
     });
 
     if (result.status === 'failed') {
+      deps.captureHealth?.reportFailure('grasp', {
+        kind: classifyCaptureFailure(result.reason ?? ''),
+        reason: result.reason ?? 'sync failed',
+      });
       // A broken Midway session fails identically every 30 minutes — log the
       // transition, not the repetition.
       if (result.reason !== lastLoggedError) {
@@ -589,6 +596,7 @@ export function createGraspSync(deps: {
         lastLoggedError = result.reason ?? '';
       }
     } else {
+      deps.captureHealth?.reportSuccess('grasp');
       lastLoggedError = '';
       console.log(
         `[GraspSync] ${result.status} in ${(result.durationMs / 1000).toFixed(1)}s — `

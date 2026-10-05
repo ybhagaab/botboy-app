@@ -80,7 +80,7 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = Object.freeze([
   // Capture pipeline
   { name: 'pdftotext', purpose: 'PDF text extraction fallback (poppler; the native vision-ocr helper is primary)', requirement: 'optional', brewFormula: 'poppler', versionArgs: ['-v'] },
   { name: 'pdftoppm', purpose: 'scanned-PDF rasterize fallback (poppler; native CoreGraphics is primary)', requirement: 'optional', brewFormula: 'poppler', versionArgs: ['-v'] },
-  { name: 'textutil', purpose: 'Office/PDF conversion fallback', requirement: 'recommended', macBuiltin: true, internalOnly: true },
+  { name: 'textutil', purpose: 'Office conversion fallback (never for PDFs: it echoes their bytes)', requirement: 'recommended', macBuiltin: true, internalOnly: true },
   { name: 'libreoffice', purpose: 'Office conversion fallback for .docx/.xlsx/.pptx', requirement: 'optional', installHint: 'brew install --cask libreoffice' },
   // macOS built-ins the monitors use
   { name: 'osascript', purpose: 'AppleScript (active-app monitor)', requirement: 'required', macBuiltin: true, internalOnly: true },

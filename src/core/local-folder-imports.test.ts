@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createStorage, type StorageLayer } from './storage.js';
+import Database from 'better-sqlite3';
+import { createStorage, migrateLocalFolderImports, type StorageLayer } from './storage.js';
 import {
   FOLDER_FILE_OUTCOMES,
   captureSignature,
+  changingOftenFiles,
   clearFirstImportDone,
   contentRemovedPaths,
   createLocalFolderImportLedger,
@@ -109,5 +111,116 @@ describe('local-folder import ledger', () => {
     expect(db.prepare("SELECT value FROM app_settings WHERE key = 'local_folders.backfilled.7'").get()).toEqual({ value: 'true' });
     clearFirstImportDone(db, 7);
     expect(isFirstImportDone(db, 7)).toBe(false);
+  });
+
+  it('records why a sensitive row is held, and clears the reason when the file is imported later', () => {
+    const l = ledger();
+    l.record({ folderId: 1, path: '/r/deploy.md', size: 10, mtimeMs: 1, outcome: 'sensitive', reason: 'Contains what looks like a GitHub token' });
+    expect(l.get(1, '/r/deploy.md')).toMatchObject({ outcome: 'sensitive', reason: 'Contains what looks like a GitHub token' });
+    expect(l.counts(1).sensitive).toBe(1);
+    l.record({ folderId: 1, path: '/r/deploy.md', size: 12, mtimeMs: 2, outcome: 'imported' });
+    expect(l.get(1, '/r/deploy.md')).toMatchObject({ outcome: 'imported', reason: null });
+  });
+});
+
+describe('local-folder import ledger migration', () => {
+  it('widens an existing ledger to hold sensitive files without losing a row', () => {
+    const db = new Database(':memory:');
+    try {
+      // The ledger as shipped before sensitive holds existed.
+      db.exec(`
+        CREATE TABLE local_folder_imports (
+          folder_id INTEGER NOT NULL,
+          path TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          mtime_ms REAL NOT NULL,
+          outcome TEXT NOT NULL CHECK(outcome IN ('imported','needs_review','approved','excluded','too_large','deferred_low_disk')),
+          origin TEXT NOT NULL DEFAULT 'import' CHECK(origin IN ('import','live')),
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (folder_id, path)
+        );
+        INSERT INTO local_folder_imports VALUES (1, '/r/a.md', 10, 1.5, 'imported', 'live', 100);
+        INSERT INTO local_folder_imports VALUES (1, '/r/big.csv', 9000, 2.5, 'needs_review', 'import', 200);
+      `);
+      migrateLocalFolderImports(db);
+      const l = createLocalFolderImportLedger(db);
+      expect(l.get(1, '/r/a.md')).toMatchObject({ outcome: 'imported', origin: 'live', size: 10, mtimeMs: 1.5, updatedAt: 100, reason: null });
+      expect(l.get(1, '/r/big.csv')).toMatchObject({ outcome: 'needs_review', size: 9000 });
+      l.record({ folderId: 1, path: '/r/id_rsa', size: 3, mtimeMs: 3, outcome: 'sensitive', reason: 'Named like an SSH private key (id_rsa)' });
+      expect(l.counts(1)).toMatchObject({ imported: 1, needs_review: 1, sensitive: 1 });
+      // Idempotent: a second migration keeps the widened table as is.
+      createLocalFolderImportLedger(db);
+      expect(l.list(1)).toHaveLength(3);
+      const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'local_folder_imports'").all();
+      expect(indexes).toEqual(expect.arrayContaining([{ name: 'idx_local_folder_imports_outcome' }]));
+    } finally {
+      db.close();
+    }
+  });
+
+  it('widens a ledger that already holds sensitive rows, keeping every reason', () => {
+    const db = new Database(':memory:');
+    try {
+      // The ledger as rebuilt for sensitive holds, before owner pauses.
+      db.exec(`
+        CREATE TABLE local_folder_imports (
+          folder_id INTEGER NOT NULL,
+          path TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          mtime_ms REAL NOT NULL,
+          outcome TEXT NOT NULL CHECK(outcome IN ('imported','needs_review','approved','excluded','too_large','deferred_low_disk','sensitive')),
+          origin TEXT NOT NULL DEFAULT 'import' CHECK(origin IN ('import','live')),
+          updated_at INTEGER NOT NULL,
+          reason TEXT,
+          PRIMARY KEY (folder_id, path)
+        );
+        INSERT INTO local_folder_imports VALUES (6, '/r/key.pem', 3, 1, 'sensitive', 'live', 100, 'File type of a private key or certificate file (.pem)');
+        INSERT INTO local_folder_imports VALUES (6, '/r/progress.json', 2400000, 2, 'imported', 'live', 200, NULL);
+      `);
+      migrateLocalFolderImports(db);
+      const l = createLocalFolderImportLedger(db);
+      expect(l.get(6, '/r/key.pem')).toMatchObject({ outcome: 'sensitive', reason: 'File type of a private key or certificate file (.pem)', updatedAt: 100 });
+      expect(l.setOutcome(6, '/r/progress.json', 'owner_paused')).toBe(true);
+      expect(l.counts(6)).toMatchObject({ sensitive: 1, owner_paused: 1 });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('files that keep changing', () => {
+  let storage: StorageLayer;
+  const NOW = Date.parse('2026-10-02T12:00:00.000Z');
+  const MB = 1024 * 1024;
+
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+  });
+  afterEach(() => storage.close());
+
+  function capture(id: string, filePath: string, hoursAgo: number, bytes: number) {
+    storage.getDb().prepare(`INSERT INTO work_items (id, type, source, file_path, content_bytes, captured_at)
+      VALUES (?, 'document_capture', 'filesystem', ?, ?, ?)`)
+      .run(id, filePath, bytes, new Date(NOW - hoursAgo * 3600_000).toISOString());
+  }
+
+  it('flags a large file captured often in the last day that is still changing', () => {
+    // Every 30 minutes for the last 10 hours, 2.4 MB each.
+    for (let i = 0; i < 20; i++) capture(`t${i}`, '/r/dashboard/training-progress.json', i * 0.5, Math.round(2.4 * MB));
+    const [file, ...rest] = changingOftenFiles(storage.getDb(), '/r', { now: NOW });
+    expect(rest).toEqual([]);
+    expect(file).toMatchObject({ path: '/r/dashboard/training-progress.json', versions: 20 });
+    expect(file.maxBytes).toBe(Math.round(2.4 * MB));
+    expect(file.storedBytes).toBe(20 * Math.round(2.4 * MB));
+  });
+
+  it('ignores small files, rare changes, files that settled, and other folders', () => {
+    for (let i = 0; i < 20; i++) capture(`s${i}`, '/r/notes.md', i * 0.5, 200 * 1024); // small
+    for (let i = 0; i < 3; i++) capture(`r${i}`, '/r/rare.json', i, 5 * MB);          // rare
+    for (let i = 0; i < 10; i++) capture(`q${i}`, '/r/settled.json', 6 + i, 3 * MB);  // stopped 6 h ago
+    capture('q-resumed', '/r/settled.json', 0.1, 3 * MB);                             // one capture on resume
+    for (let i = 0; i < 20; i++) capture(`o${i}`, '/other/busy.json', i * 0.5, 3 * MB); // other root
+    expect(changingOftenFiles(storage.getDb(), '/r', { now: NOW })).toEqual([]);
   });
 });

@@ -11,6 +11,7 @@
 
 import { Router, Request, Response } from 'express';
 import type { RouterDeps } from './deps.js';
+import { sharePointToolPayload } from '../../core/sharepoint-mcp-output.js';
 
 const PROFILE_ID = 'sharepoint';
 
@@ -94,7 +95,7 @@ export function createSharePointSyncRouter(deps: RouterDeps): Router {
         ...(query ? { query } : {}), top: 25,
       }, { source: 'dashboard', timeoutMs: 30_000, skipIfBusy: true });
       if (result.isError) return res.status(502).json({ error: result.text.slice(0, 300) });
-      res.json({ sites: JSON.parse(result.text) });
+      res.json({ sites: JSON.parse(sharePointToolPayload(result.text)) });
     } catch (error: any) {
       const message = error?.message ?? String(error);
       if (/busy/i.test(message)) return res.status(409).json({ busy: true, error: 'SharePoint connection is busy syncing — try again in a moment' });
@@ -117,7 +118,7 @@ export function createSharePointSyncRouter(deps: RouterDeps): Router {
         siteUrl, personal: false,
       }, { source: 'dashboard', timeoutMs: 30_000, skipIfBusy: true });
       if (result.isError) return res.status(502).json({ error: result.text.slice(0, 300) });
-      res.json({ libraries: JSON.parse(result.text) });
+      res.json({ libraries: JSON.parse(sharePointToolPayload(result.text)) });
     } catch (error: any) {
       const message = error?.message ?? String(error);
       if (/busy/i.test(message)) return res.status(409).json({ busy: true, error: 'SharePoint connection is busy syncing — try again in a moment' });

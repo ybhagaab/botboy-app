@@ -191,6 +191,20 @@ describe('folder import walk', () => {
     expect(emitted.map(item => item.metadata.filePath).sort()).toEqual([fresh, removed].sort());
   });
 
+  it('skips files whose earlier capture keeps the path only in metadata (captures from before the file_path column)', async () => {
+    const old = write(root, 'notes/old-plan.md', 12);
+    const fresh = write(root, 'notes/new-plan.md', 14);
+    addFolder();
+    const stat = fs.statSync(old);
+    storage.getDb().prepare(`INSERT INTO work_items (id, type, source, file_path, metadata, captured_at)
+      VALUES ('legacy-1', 'document_capture', 'filesystem', NULL, ?, '2026-07-08T00:00:00.000Z')`)
+      .run(JSON.stringify({ filePath: old, size: String(stat.size), mtime: String(stat.mtimeMs) }));
+    const m = makeMonitor();
+    m.onWorkItem(item => { emitted.push(item); });
+    expect(await m.backfill(folder.id)).toMatchObject({ imported: 1, unchanged: 1 });
+    expect(emitted.map(item => item.metadata.filePath)).toEqual([fresh]);
+  });
+
   it('leaves a file unrecorded when its store fails, so the next walk retries it', async () => {
     const target = write(root, 'x.md', 10);
     addFolder();
@@ -212,8 +226,8 @@ describe('folder import walk', () => {
   });
 
   it('holds big files for review in walks and live changes, and imports them once kept', async () => {
-    const big = write(root, 'data/big.csv', 600);
-    const huge = write(root, 'data/huge.csv', 3_000);
+    const big = write(root, 'data/big.txt', 600);
+    const huge = write(root, 'data/huge.txt', 3_000);
     const small = write(root, 'small.md', 10);
     addFolder();
     const m = makeMonitor();
@@ -226,7 +240,7 @@ describe('folder import walk', () => {
 
     await m.start();
     const live = mocks.byPath.get(root)!.events;
-    const big2 = write(root, 'data/big2.csv', 700);
+    const big2 = write(root, 'data/big2.txt', 700);
     live.onAddOrChange(big2);
     expect(emitted).toHaveLength(1);
     expect(ledger.get(folder.id, big2)).toMatchObject({ outcome: 'needs_review', origin: 'live' });
@@ -349,8 +363,8 @@ describe('folder import walk', () => {
   });
 
   it('scans without reading content and forgets rows for files that are gone', async () => {
-    const big = write(root, 'data/big.csv', 600);
-    write(root, 'data/huge.csv', 3_000);
+    const big = write(root, 'data/big.txt', 600);
+    write(root, 'data/huge.txt', 3_000);
     write(root, 'small.md', 10);
     write(root, 'movie.mp4', 10);
     addFolder();
@@ -385,5 +399,93 @@ describe('folder import walk', () => {
     expect(yieldToLoop.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(labels.filter(label => label === 'folder-import')).toHaveLength(3);
     expect(getLocalFolder(storage.getDb(), folder.id)).not.toBeNull();
+  });
+
+  describe('possible credentials', () => {
+    // Built from split parts at run time: no token-shaped literal in the repo.
+    const fakeGithubToken = ['gh', 'p_', 'Zq7Lm2Xc9Vb4Nt6Rw1Ky8Hs3Jd5Fg0Pa1QeT'].join(''); // 36 after the prefix
+
+    it('holds credential-named files in walks and live changes without reading them, at any size', async () => {
+      const key = write(root, 'keys/server.pem', 40);
+      const aws = write(root, 'jane_accessKeys.csv', 60);
+      const bigEnv = write(root, 'prod.env', 700); // over the big-file threshold: still sensitive, not "review"
+      const note = write(root, 'notes.md', 10);
+      addFolder();
+      const documentParser = parser();
+      const m = makeMonitor({ documentParser });
+      m.onWorkItem(item => { emitted.push(item); });
+
+      const scan = await m.scanFolder(folder.id);
+      expect(scan).toMatchObject({ aborted: false, importable: 1, needsReview: 0, sensitive: 3 });
+      const walk = await m.backfill(folder.id);
+      expect(walk).toMatchObject({ imported: 1, sensitive: 3, needsReview: 0 });
+      expect(emitted.map(item => item.metadata.filePath)).toEqual([note]);
+      const parsed = (documentParser.parse as ReturnType<typeof vi.fn>).mock.calls.map(call => call[0]);
+      expect(parsed).toEqual([note]);
+      expect(ledger.get(folder.id, key)).toMatchObject({ outcome: 'sensitive', reason: 'File type of a private key or certificate file (.pem)' });
+      expect(ledger.get(folder.id, aws)?.reason).toBe('Named like an AWS access key download (jane_accessKeys.csv)');
+      expect(ledger.get(folder.id, bigEnv)?.outcome).toBe('sensitive');
+
+      await m.start();
+      const live = mocks.byPath.get(root)!.events;
+      fs.appendFileSync(key, 'more');
+      live.onAddOrChange(key);
+      const idRsa = write(root, 'id_rsa', 30);
+      live.onAddOrChange(idRsa);
+      expect(emitted).toHaveLength(1);
+      expect(ledger.get(folder.id, idRsa)).toMatchObject({ outcome: 'sensitive', origin: 'live' });
+      expect((documentParser.parse as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+
+      // Deleting a held file emits nothing and drops its hold row.
+      fs.rmSync(idRsa);
+      live.onUnlink(idRsa);
+      expect(emitted).toHaveLength(1);
+      expect(ledger.get(folder.id, idRsa)).toBeUndefined();
+    });
+
+    it('holds a text file whose content holds a secret, and never re-reads that version', async () => {
+      const leaked = write(root, 'deploy-notes.md', 0);
+      fs.writeFileSync(leaked, `Deploy steps\nGITHUB_TOKEN=${fakeGithubToken}\n`, 'utf-8');
+      addFolder();
+      const documentParser = parser();
+      const m = makeMonitor({ documentParser });
+      m.onWorkItem(item => { emitted.push(item); });
+      const walk = await m.backfill(folder.id);
+      expect(walk).toMatchObject({ imported: 0, sensitive: 1 });
+      expect(emitted).toHaveLength(0);
+      expect(ledger.get(folder.id, leaked)).toMatchObject({ outcome: 'sensitive', reason: 'Contains what looks like a GitHub token' });
+
+      // Same version, live and walk: held without another read.
+      await m.start();
+      mocks.byPath.get(root)!.events.onAddOrChange(leaked);
+      expect(await m.backfill(folder.id)).toMatchObject({ imported: 0, sensitive: 1 });
+      expect((documentParser.parse as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+
+      // The owner removes the secret: the new version is captured normally.
+      fs.writeFileSync(leaked, 'Deploy steps\nToken now lives in the vault.\n', 'utf-8');
+      mocks.byPath.get(root)!.events.onAddOrChange(leaked);
+      expect(emitted.map(item => item.content)).toEqual(['Deploy steps\nToken now lives in the vault.\n']);
+    });
+
+    it('holds a live symbolic link that resolves into a hidden folder', async () => {
+      addFolder();
+      const hidden = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-link-target-'));
+      try {
+        fs.mkdirSync(path.join(hidden, '.ssh'));
+        fs.writeFileSync(path.join(hidden, '.ssh', 'config'), 'Host *');
+        const link = path.join(root, 'ssh-config.txt');
+        fs.symlinkSync(path.join(hidden, '.ssh', 'config'), link);
+        const documentParser = parser();
+        const m = makeMonitor({ documentParser });
+        m.onWorkItem(item => { emitted.push(item); });
+        await m.start();
+        mocks.byPath.get(root)!.events.onAddOrChange(link);
+        expect(emitted).toHaveLength(0);
+        expect(documentParser.parse).not.toHaveBeenCalled();
+        expect(ledger.get(folder.id, link)?.reason).toBe('Links into a hidden location (.ssh)');
+      } finally {
+        fs.rmSync(hidden, { recursive: true, force: true });
+      }
+    });
   });
 });

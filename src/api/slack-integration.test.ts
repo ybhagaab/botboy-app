@@ -32,21 +32,28 @@ const mocks = vi.hoisted(() => {
   const socketOn = vi.fn((event: string, handler: any) => {
     socketHandlers.set(event, handler);
   });
-  const SocketModeClient = vi.fn().mockImplementation(() => ({
-    on: socketOn,
-    start: socketStart,
-    disconnect: socketDisconnect,
-  }));
+  // `function` implementations so `new SocketModeClient(...)` /
+  // `new WebClient(...)` work under Vitest 4 (arrow implementations are
+  // not constructible).
+  const SocketModeClient = vi.fn().mockImplementation(function () {
+    return {
+      on: socketOn,
+      start: socketStart,
+      disconnect: socketDisconnect,
+    };
+  });
 
   const authTest = vi.fn();
   const usersInfo = vi.fn();
   const conversationsInfo = vi.fn();
   const usersConversations = vi.fn();
-  const WebClient = vi.fn().mockImplementation(() => ({
-    auth: { test: authTest },
-    users: { info: usersInfo, conversations: usersConversations },
-    conversations: { info: conversationsInfo },
-  }));
+  const WebClient = vi.fn().mockImplementation(function () {
+    return {
+      auth: { test: authTest },
+      users: { info: usersInfo, conversations: usersConversations },
+      conversations: { info: conversationsInfo },
+    };
+  });
 
   return {
     socketHandlers,

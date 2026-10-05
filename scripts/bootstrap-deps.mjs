@@ -34,9 +34,10 @@ const INSTALL = process.argv.includes('--install');
 const WITH_OPTIONAL = process.argv.includes('--with-optional');
 
 // Keep aligned with TOOL_REGISTRY in src/core/toolchain.ts.
-// Core is EMPTY by design: the native vision-ocr helper (built below) covers
-// PDF text extraction and rasterization via PDFKit/CoreGraphics, so Homebrew
-// is fully optional for BotBoy's capture pipeline.
+// Core is EMPTY by design: BotBoy's own pdf.js reader (scripts/pdf-text.mjs,
+// an npm dependency) reads PDF text on every install, and the native
+// vision-ocr helper (built below) adds faster PDF text, page rasterization,
+// and OCR via PDFKit/CoreGraphics/Vision. Homebrew is fully optional.
 const CORE_FORMULAS = [];
 const OPTIONAL_FORMULAS = [
   { bins: ['pdftotext', 'pdftoppm'], formula: 'poppler', why: 'PDF tooling fallback (native helper is primary)' },
@@ -145,7 +146,7 @@ function verifyAndInstallTools() {
   const missingOptional = missingEntries(OPTIONAL_FORMULAS);
 
   if (missingCore.length === 0) {
-    log('no Homebrew tools are required — the native helper covers PDF parsing and OCR.');
+    log('no Homebrew tools are required — pdf.js reads PDF text; the native helper adds OCR for scans and images.');
   } else if (INSTALL) {
     const brew = findBrew();
     if (brew) {
