@@ -37,9 +37,9 @@ describe('hosted OpenAI provider (Settings → AI model)', () => {
 
   it('maps every catalog model to its plain OpenAI API id', () => {
     expect(BLESSED_CHAT_MODELS.map(model => model.openaiId)).toEqual([
-      'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+      'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol',
     ]);
-    expect(OPENAI_PLATFORM_MODEL_IDS).toHaveLength(6);
+    expect(OPENAI_PLATFORM_MODEL_IDS).toHaveLength(7);
   });
 
   it('builds a Responses provider on api.openai.com with Terra for background work', () => {
@@ -69,11 +69,11 @@ describe('hosted OpenAI provider (Settings → AI model)', () => {
     expect(() => createOpenAiPlatformInferenceProvider({ apiKey: '   ', env: {} })).toThrow(/OpenAI API key is required/);
   });
 
-  it('offers all six models when the key does not report a list, none as preview', () => {
+  it('offers all seven models when the key does not report a list, none as preview', () => {
     const catalog = getChatModelCatalog('gpt-5.6-terra', GPT6_PREVIEW_ENV, { providerId: 'openai' });
     expect(catalog.defaultKey).toBe('terra');
     expect(catalog.models.map(model => model.key)).toEqual([
-      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol',
     ]);
     expect(catalog.models.every(model => model.preview === false)).toBe(true);
     expect(catalog.models.find(model => model.isDefault)?.key).toBe('terra');
@@ -93,6 +93,8 @@ describe('hosted OpenAI provider (Settings → AI model)', () => {
       .toEqual({ model: 'gpt-6-astra' });
     expect(resolveBlessedModelRoute('gpt-5.6-terra', 'sol', GPT6_PREVIEW_ENV, context))
       .toEqual({ model: 'gpt-5.6-sol' });
+    expect(resolveBlessedModelRoute('gpt-5.6-terra', 'gpt6.1-sol', GPT6_PREVIEW_ENV, context))
+      .toEqual({ model: 'gpt-6.1-sol' });
     expect(resolveBlessedModelRoute('gpt-5.6-terra', 'gpt6-astra', {}, {
       providerId: 'openai',
       availableModels: ['gpt-5.6-terra'],
@@ -103,7 +105,7 @@ describe('hosted OpenAI provider (Settings → AI model)', () => {
   it('keeps the gateway catalog and routes unchanged for non-OpenAI providers', () => {
     const gatewayDefault = 'bedrock-mantle-luna/openai.gpt-5.6-terra';
     expect(getChatModelCatalog(gatewayDefault, GPT6_PREVIEW_ENV, { providerId: 'gateway' }).models.map(model => model.key))
-      .toEqual(['terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna']);
+      .toEqual(['terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol']);
     expect(resolveBlessedModelRoute(gatewayDefault, 'gpt6-astra', GPT6_PREVIEW_ENV, { providerId: 'gateway' }))
       .toMatchObject({ headers: { 'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx' } });
   });

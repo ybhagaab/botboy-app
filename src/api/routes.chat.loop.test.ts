@@ -134,7 +134,7 @@ describe('chat streaming loop safety', () => {
 
     const catalog = await request(app).get('/api/chat/models');
     expect(catalog.body.models.map((model: any) => model.key)).toEqual([
-      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol',
     ]);
     expect(JSON.stringify(catalog.body)).not.toContain('botboy-gpt6-east');
 
@@ -150,13 +150,22 @@ describe('chat streaming loop safety', () => {
       headers: { 'OpenAI-Project': 'proj_gcag2sv5e6z2eni2azsx' },
     });
 
+    const sol61 = await request(app).post('/api/chat/messages').send({
+      message: 'Use GPT-6.1 Sol',
+      stream: true,
+      model: 'gpt6.1-sol',
+    });
+    expect(sol61.status).toBe(200);
+    // The east target, no alternate endpoint, and no Project header.
+    expect(seenRequests[1].route).toEqual({ model: 'botboy-gpt6-east/openai.gpt-6.1-sol' });
+
     const rejected = await request(app).post('/api/chat/messages').send({
       message: 'Use an arbitrary model',
       stream: true,
       model: 'openai.gpt-6-unknown',
     });
     expect(rejected.status).toBe(400);
-    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(1);
+    expect(llmClient.chatCompletionStream).toHaveBeenCalledTimes(2);
   });
 
   it('breaks a repeated identical tool call: 1 execution, nudges, then tools-off answer', async () => {

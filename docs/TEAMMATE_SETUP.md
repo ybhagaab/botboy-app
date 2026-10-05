@@ -78,9 +78,9 @@ optional connections, troubleshooting, and unusual recovery cases.
 2. deletes the downloaded credential attachment after a successful import;
 3. connects the authenticated team gateway (GPT-5.6 Terra by default) plus
    any OpenAI or DeepSeek key saved in **Settings → AI model**;
-4. loads the server-approved chat model catalog: GPT-5.6 Terra, Luna, and Sol
-   plus GPT-6 Astra, Sol, and Luna on the team gateway, and each saved key's
-   own models;
+4. loads the server-approved chat model catalog: GPT-5.6 Terra, Luna, and Sol;
+   GPT-6 Astra, Sol, and Luna; and GPT-6.1 Sol on the team gateway, plus each
+   saved key's own models;
 5. builds BotBoy when the build is missing or stale;
 6. starts a provisional local boot page while connections and stores initialize;
 7. opens `http://localhost:7778` only after the final dashboard endpoint is
@@ -89,7 +89,7 @@ optional connections, troubleshooting, and unusual recovery cases.
 
 The gateway deployment name still contains `luna`; that is infrastructure
 naming, not the selected default model. The default remains GPT-5.6 Terra.
-Approved GPT-6 additions use the same Cognito token URL, OAuth scope, and
+Approved GPT-6 and GPT-6.1 additions use the same Cognito token URL, OAuth scope, and
 allowlisted client identity across the approved team gateways, so existing
 teammates do not need a replacement credential attachment.
 

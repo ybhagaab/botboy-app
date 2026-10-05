@@ -88,7 +88,7 @@ const BEDROCK_ENDPOINT = 'https://bedrock-mantle.us-east-1.api.aws/openai/v1';
 // Responses family and context profile — only the model id changes.
 const BEDROCK_MODEL = 'openai.gpt-5.6-terra';
 
-export type ChatModelFamily = 'GPT-5.6' | 'GPT-6';
+export type ChatModelFamily = 'GPT-5.6' | 'GPT-6' | 'GPT-6.1';
 
 export interface ChatModelCatalogOption {
   readonly key: string;
@@ -112,9 +112,11 @@ export interface ChatModelRoute {
 
 /**
  * Server-owned model profiles. GPT-5.6 keeps the proven provider-default
- * Mantle target. GPT-6 Sol/Luna use one explicit east Mantle target so the
- * gateway rewrites to the required /openai/v1 path. Astra uses a separate
- * west gateway, Mantle target, and Project.
+ * Mantle target. GPT-6 Sol/Luna and GPT-6.1 Sol use one explicit east Mantle
+ * target so the gateway rewrites to the required /openai/v1 path; that
+ * target admits only the exact model ids it lists, so an id added here must
+ * also be added there. Astra uses a separate west gateway, Mantle target, and
+ * Project.
  */
 export const BLESSED_CHAT_MODELS = Object.freeze([
   Object.freeze({
@@ -140,6 +142,10 @@ export const BLESSED_CHAT_MODELS = Object.freeze([
   Object.freeze({
     key: 'gpt6-luna', label: 'GPT-6 Luna', family: 'GPT-6',
     bareId: 'openai.gpt-6-luna', openaiId: 'gpt-6-luna', route: 'gpt6-east-mantle' as const,
+  }),
+  Object.freeze({
+    key: 'gpt6.1-sol', label: 'GPT-6.1 Sol', family: 'GPT-6.1',
+    bareId: 'openai.gpt-6.1-sol', openaiId: 'gpt-6.1-sol', route: 'gpt6-east-mantle' as const,
   }),
 ] as const);
 

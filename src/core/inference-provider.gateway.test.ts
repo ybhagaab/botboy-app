@@ -36,9 +36,9 @@ describe('server-owned chat model catalog', () => {
     BOTBOY_INFERENCE_GPT6_ASTRA_PROJECT: 'proj_gcag2sv5e6z2eni2azsx',
   } as NodeJS.ProcessEnv;
 
-  it('retains all GPT-5.6 profiles and records all exact GPT-6 base ids', () => {
+  it('retains all GPT-5.6 profiles and records all exact GPT-6 and GPT-6.1 base ids', () => {
     expect(BLESSED_CHAT_MODELS.map(model => model.key)).toEqual([
-      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol',
     ]);
     expect(BLESSED_CHAT_MODELS.map(model => model.bareId)).toEqual([
       'openai.gpt-5.6-terra',
@@ -47,6 +47,7 @@ describe('server-owned chat model catalog', () => {
       'openai.gpt-6-astra',
       'openai.gpt-6-sol',
       'openai.gpt-6-luna',
+      'openai.gpt-6.1-sol',
     ]);
   });
 
@@ -55,16 +56,20 @@ describe('server-owned chat model catalog', () => {
     expect(catalog.defaultKey).toBe('terra');
     expect(catalog.models.map(model => model.key)).toEqual(['terra', 'luna', 'sol']);
     expect(resolveBlessedModelId(defaultModel, 'gpt6-astra', {})).toBeNull();
+    expect(resolveBlessedModelId(defaultModel, 'gpt6.1-sol', {})).toBeNull();
   });
 
-  it('routes Astra to its west Project and Sol/Luna to the explicit east Mantle target', () => {
+  it('routes Astra to its west Project and Sol/Luna/6.1 Sol to the explicit east Mantle target', () => {
     const catalog = getChatModelCatalog(defaultModel, previewEnv);
     expect(catalog.models.map(model => model.key)).toEqual([
-      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+      'terra', 'luna', 'sol', 'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol',
     ]);
     expect(catalog.models.filter(model => model.preview).map(model => model.key)).toEqual([
-      'gpt6-astra', 'gpt6-sol', 'gpt6-luna',
+      'gpt6-astra', 'gpt6-sol', 'gpt6-luna', 'gpt6.1-sol',
     ]);
+    expect(catalog.models.find(model => model.key === 'gpt6.1-sol')).toEqual({
+      key: 'gpt6.1-sol', label: 'GPT-6.1 Sol', family: 'GPT-6.1', isDefault: false, preview: true,
+    });
     const serializedCatalog = JSON.stringify(catalog);
     expect(serializedCatalog).not.toContain('botboy-gpt6-east');
     expect(serializedCatalog).not.toContain('botboy-gpt6-astra-west');
@@ -81,12 +86,16 @@ describe('server-owned chat model catalog', () => {
     expect(resolveBlessedModelRoute(defaultModel, 'gpt6-luna', previewEnv)).toEqual({
       model: 'botboy-gpt6-east/openai.gpt-6-luna',
     });
+    expect(resolveBlessedModelRoute(defaultModel, 'gpt6.1-sol', previewEnv)).toEqual({
+      model: 'botboy-gpt6-east/openai.gpt-6.1-sol',
+    });
   });
 
   it('keeps GPT-6 unavailable on direct Mantle because it needs another endpoint', () => {
     const direct = getChatModelCatalog('openai.gpt-5.6-terra', previewEnv);
     expect(direct.models.map(model => model.key)).toEqual(['terra', 'luna', 'sol']);
     expect(resolveBlessedModelId('openai.gpt-5.6-terra', 'gpt6-astra', previewEnv)).toBeNull();
+    expect(resolveBlessedModelId('openai.gpt-5.6-terra', 'gpt6.1-sol', previewEnv)).toBeNull();
   });
 
   it('does not mistake local or Hugging Face model paths for a gateway target', () => {
