@@ -7,13 +7,11 @@
 # sections, each a KEY=value pair:
 #   - BOTBOY_INFERENCE_OAUTH_CLIENT_ID/_SECRET (team AI gateway sign-in):
 #     atomically replaces only those keys in ~/.personal-productivity-tracker/.env
-#   - BOTBOY_GMAIL_OAUTH_CLIENT_ID/_SECRET (BotBoy's shared Google client, so
-#     Connections → Gmail is one Connect click): validated and staged in
-#     ~/.personal-productivity-tracker/gmail-team-client.json; the server
-#     applies it at its next boot and deletes it (never into .env: model-run
-#     shells inherit the environment).
-# Every section present is validated before anything is written, and the
-# downloaded attachment is deleted only after every section is written.
+#   - BOTBOY_GMAIL_OAUTH_CLIENT_ID/_SECRET lines from older files are skipped:
+#     every install saves its own Google client in Connections → Gmail
+#     (GMAIL_CHAT_TOOLS_PLAN.md D12), so nothing about Gmail is imported.
+# The gateway section is validated before anything is written, and the
+# downloaded attachment is deleted only after it is written.
 #
 # No file found is a silent no-op (owner machines and configured teammates).
 set -euo pipefail
@@ -24,11 +22,6 @@ ID_KEY="BOTBOY_INFERENCE_OAUTH_CLIENT_ID"
 SECRET_KEY="BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET"
 GMAIL_ID_KEY="BOTBOY_GMAIL_OAUTH_CLIENT_ID"
 GMAIL_SECRET_KEY="BOTBOY_GMAIL_OAUTH_CLIENT_SECRET"
-GMAIL_INBOX="$ENV_DIR/gmail-team-client.json"
-# Same rules as gmail-credentials.ts › validateGmailClient. Only these JSON-safe
-# characters can pass, so the staged file needs no escaping.
-GMAIL_ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{4,200}\.apps\.googleusercontent\.com$'
-GMAIL_SECRET_RE='^[A-Za-z0-9._~+/=-]{8,200}$'
 
 # Newest botboy-credentials* file across the usual download spots. Slack and
 # browsers may add suffixes. Content is validated before stored state changes.
@@ -49,11 +42,9 @@ mkdir -p "$ENV_DIR"
 SOURCE="$CANDIDATE"
 EXTRACTED_FILE=""
 TMP_FILE=""
-TMP_GMAIL=""
 cleanup() {
   [ -z "$EXTRACTED_FILE" ] || rm -f "$EXTRACTED_FILE"
   [ -z "$TMP_FILE" ] || rm -f "$TMP_FILE"
-  [ -z "$TMP_GMAIL" ] || rm -f "$TMP_GMAIL"
 }
 trap cleanup EXIT
 
@@ -91,9 +82,8 @@ case "$CANDIDATE" in
     ;;
 esac
 
-# Each section is optional, but a present section needs exactly one non-empty
-# value for both of its keys. Extra source lines are ignored; only these four
-# allowlisted values can leave the attachment.
+# The gateway section needs exactly one non-empty value for both of its keys.
+# Extra source lines are ignored; only these two values can leave the attachment.
 key_count() { grep -c "^$1=" "$SOURCE" 2>/dev/null || true; }
 key_line() {
   local line
@@ -103,64 +93,39 @@ key_line() {
 }
 ID_COUNT=$(key_count "$ID_KEY")
 SECRET_COUNT=$(key_count "$SECRET_KEY")
-GMAIL_ID_COUNT=$(key_count "$GMAIL_ID_KEY")
-GMAIL_SECRET_COUNT=$(key_count "$GMAIL_SECRET_KEY")
+GMAIL_LINES=$(( $(key_count "$GMAIL_ID_KEY") + $(key_count "$GMAIL_SECRET_KEY") ))
 NEW_ID=$(key_line "$ID_KEY")
 NEW_SECRET=$(key_line "$SECRET_KEY")
-GMAIL_ID_LINE=$(key_line "$GMAIL_ID_KEY")
-GMAIL_SECRET_LINE=$(key_line "$GMAIL_SECRET_KEY")
-GMAIL_ID="${GMAIL_ID_LINE#*=}"
-GMAIL_SECRET="${GMAIL_SECRET_LINE#*=}"
+SOURCE_KIND="file"
+case "$CANDIDATE" in *.zip|*.ZIP) SOURCE_KIND="ZIP" ;; esac
+GMAIL_NOTE=""
+[ "$GMAIL_LINES" = "0" ] || GMAIL_NOTE=" Its Gmail lines were skipped: Gmail uses your own Google client from Connections → Gmail."
 
-HAS_INFERENCE=0
-if [ "$ID_COUNT" != "0" ] || [ "$SECRET_COUNT" != "0" ]; then
-  if [ "$ID_COUNT" != "1" ] || [ "$SECRET_COUNT" != "1" ] \
-    || [ -z "${NEW_ID#*=}" ] || [ -z "${NEW_SECRET#*=}" ]; then
-    echo "⚠️  Found $(basename "$CANDIDATE") but it does not contain one valid $ID_KEY/$SECRET_KEY pair — not imported"
-    exit 0
-  fi
-  HAS_INFERENCE=1
+if [ "$ID_COUNT" = "0" ] && [ "$SECRET_COUNT" = "0" ] && [ "$GMAIL_LINES" != "0" ]; then
+  # An older Gmail-only file: BotBoy no longer reads it, and a credential
+  # should not stay in Downloads.
+  rm -f "$CANDIDATE"
+  echo "ℹ️  Nothing to import from $SOURCE_KIND $(basename "$CANDIDATE"): it only carries a Google client, and Gmail now uses your own client from Connections → Gmail (downloaded attachment removed)"
+  exit 0
 fi
-HAS_GMAIL=0
-if [ "$GMAIL_ID_COUNT" != "0" ] || [ "$GMAIL_SECRET_COUNT" != "0" ]; then
-  if [ "$GMAIL_ID_COUNT" != "1" ] || [ "$GMAIL_SECRET_COUNT" != "1" ] \
-    || ! [[ "$GMAIL_ID" =~ $GMAIL_ID_RE ]] || ! [[ "$GMAIL_SECRET" =~ $GMAIL_SECRET_RE ]]; then
-    echo "⚠️  Found $(basename "$CANDIDATE") but its $GMAIL_ID_KEY/$GMAIL_SECRET_KEY pair is not one valid Google Desktop client — not imported"
-    exit 0
-  fi
-  HAS_GMAIL=1
-fi
-if [ "$HAS_INFERENCE" = "0" ] && [ "$HAS_GMAIL" = "0" ]; then
+if [ "$ID_COUNT" != "1" ] || [ "$SECRET_COUNT" != "1" ] \
+  || [ -z "${NEW_ID#*=}" ] || [ -z "${NEW_SECRET#*=}" ]; then
   echo "⚠️  Found $(basename "$CANDIDATE") but it does not contain one valid $ID_KEY/$SECRET_KEY pair — not imported"
   exit 0
 fi
 
-IMPORTED=""
-if [ "$HAS_INFERENCE" = "1" ]; then
-  TMP_FILE="$ENV_DIR/.env.import.$$"
-  # Keep every non-credential line already present; replace only the OAuth pair.
-  if [ -f "$ENV_FILE" ]; then
-    grep -v "^$ID_KEY=" "$ENV_FILE" | grep -v "^$SECRET_KEY=" > "$TMP_FILE" || true
-  else
-    : > "$TMP_FILE"
-  fi
-  printf '%s\n%s\n' "$NEW_ID" "$NEW_SECRET" >> "$TMP_FILE"
-  mv "$TMP_FILE" "$ENV_FILE"
-  TMP_FILE=""
-  chmod 600 "$ENV_FILE"
-  IMPORTED="AI gateway sign-in into ~/.personal-productivity-tracker/.env"
+TMP_FILE="$ENV_DIR/.env.import.$$"
+# Keep every non-credential line already present; replace only the OAuth pair.
+if [ -f "$ENV_FILE" ]; then
+  grep -v "^$ID_KEY=" "$ENV_FILE" | grep -v "^$SECRET_KEY=" > "$TMP_FILE" || true
+else
+  : > "$TMP_FILE"
 fi
-if [ "$HAS_GMAIL" = "1" ]; then
-  TMP_GMAIL="$ENV_DIR/.gmail-team-client.import.$$"
-  printf '{\n  "schemaVersion": 1,\n  "clientId": "%s",\n  "clientSecret": "%s"\n}\n' "$GMAIL_ID" "$GMAIL_SECRET" > "$TMP_GMAIL"
-  chmod 600 "$TMP_GMAIL"
-  # rename(2) replaces the path itself, never a file a planted link points to.
-  mv "$TMP_GMAIL" "$GMAIL_INBOX"
-  TMP_GMAIL=""
-  IMPORTED="${IMPORTED:+$IMPORTED and }BotBoy's Google client for Connections → Gmail (applied when BotBoy starts)"
-fi
+printf '%s\n%s\n' "$NEW_ID" "$NEW_SECRET" >> "$TMP_FILE"
+# rename(2) replaces the path itself, never a file a planted link points to.
+mv "$TMP_FILE" "$ENV_FILE"
+TMP_FILE=""
+chmod 600 "$ENV_FILE"
 rm -f "$CANDIDATE"
 
-SOURCE_KIND="file"
-case "$CANDIDATE" in *.zip|*.ZIP) SOURCE_KIND="ZIP" ;; esac
-echo "✅ Imported $IMPORTED from $SOURCE_KIND $(basename "$CANDIDATE") (downloaded attachment removed)"
+echo "✅ Imported AI gateway sign-in into ~/.personal-productivity-tracker/.env from $SOURCE_KIND $(basename "$CANDIDATE") (downloaded attachment removed).$GMAIL_NOTE"

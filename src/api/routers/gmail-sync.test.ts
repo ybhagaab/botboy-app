@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from '../../core/gmail-api.js';
 import { createGmailConnection, type GmailConnection } from '../../core/gmail-connection.js';
+import { createGmailCredentialStore } from '../../core/gmail-credentials.js';
 import { createGmailSync, type GmailSync } from '../../monitors/gmail-sync.js';
 import { createGmailSyncRouter, GMAIL_OAUTH_CALLBACK_PATH } from './gmail-sync.js';
 import { GmailComposeError } from '../../core/gmail-compose.js';
@@ -59,7 +60,9 @@ describe('Gmail sync router', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-router-'));
     storage = createStorage(':memory:');
     storage.initialize();
-    connection = createGmailConnection({ redirectUri: `http://127.0.0.1:7778/api${GMAIL_OAUTH_CALLBACK_PATH}`, privateRoot: dir, fetchImpl: fakeFetch, endpoints: ENDPOINTS });
+    // No built-in client: these routes are tested with a client the owner saves.
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    connection = createGmailConnection({ redirectUri: `http://127.0.0.1:7778/api${GMAIL_OAUTH_CALLBACK_PATH}`, store, fetchImpl: fakeFetch, endpoints: ENDPOINTS });
     sync = createGmailSync({ db: storage.getDb(), connection, emit: () => {} });
     runNow = vi.spyOn(sync, 'runNow').mockResolvedValue({ status: 'skipped', counters: {} as any, backlog: 0, durationMs: 0 });
     const app = express();

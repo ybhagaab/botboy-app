@@ -176,8 +176,8 @@ guided setup.
 - **Amazon Microsoft 365 through GRASP** — Outlook/calendar synchronization
   uses your own Amazon browser session. BotBoy stores no GRASP password.
 - **Gmail** — for a Google account (personal Gmail or Google Workspace)
-  instead of Amazon mail. With BotBoy's Google client from your credential
-  file you only choose **Connect Gmail**; see **Gmail** below.
+  instead of Amazon mail. You create a Google OAuth client once in your own
+  Google Cloud project and choose its JSON file; see **Gmail** below.
 - **Slack** — choose and configure the channels you want BotBoy to capture.
 - **SharePoint** — install and authenticate from its connection card when you
   want document synchronization.
@@ -216,15 +216,23 @@ pipeline happens only after you explicitly ask.
 
 #### Gmail
 
-For a Google account, open **Connections → Gmail**. When your credential file
-from the owner includes BotBoy's Google client (`./start.sh` imports it like the
-gateway sign-in), the page shows one button:
+For a Google account, open **Connections → Gmail**. BotBoy signs in with a
+Google OAuth client from your own Google Cloud project, so you create one once:
 
-1. Choose **Connect Gmail** and pick your Google account.
-2. Google shows **Google hasn't verified this app**, because BotBoy's Google
-   app has not been through Google's review. Choose **Advanced**, then the
-   **Go to … (unsafe)** link.
-3. Choose **Allow**. Google returns you to BotBoy.
+1. In Google Cloud Console, create a project and enable the **Gmail API**.
+2. In **Google Auth Platform → Branding**, enter an app name and your email.
+   Under **Audience**, choose **Internal** for a Google Workspace account. For a
+   personal Gmail account, choose **External** and then **Publish app**: while
+   the app is in testing, Google ends its sign-in after 7 days.
+3. Under **Clients**, choose **Create client → Desktop app**. You do not need
+   a redirect address.
+4. Download the client's JSON file (`client_secret_….json`) and choose it on
+   the BotBoy Gmail page, or paste the client ID and secret and choose
+   **Save client**.
+5. Choose **Connect Gmail** and pick your Google account. Google says the app
+   is unverified because your app has not been through Google's review: choose
+   **Advanced**, then the **Go to … (unsafe)** link, then **Allow**. Google
+   returns you to BotBoy.
 
 BotBoy asks Google for two kinds of access: reading your mail
 (`gmail.readonly`) and drafting and sending (`gmail.compose`). You can untick
@@ -250,22 +258,6 @@ fine), text files that contain an API key, a token, or a private key, or its
 own private data. When it
 refuses a file, it tells you which one and why; you can still attach that file
 yourself in Gmail.
-
-**Your own Google client (Advanced).** Without the shared client, or if you run
-your own Google Cloud project, create a client once and save it under
-**Advanced** on the Gmail page:
-
-1. In Google Cloud Console, create a project and enable the **Gmail API**.
-2. In **Google Auth Platform → Branding**, enter an app name and your email.
-   Under **Audience**, choose **Internal** for a Google Workspace account. For a
-   personal Gmail account, choose **External** and then **Publish app**: while
-   the app is in testing, Google ends its sign-in after 7 days.
-3. Under **Clients**, choose **Create client → Desktop app**. You do not need
-   a redirect address.
-4. Download the client's JSON file (`client_secret_….json`) and choose it on
-   the BotBoy Gmail page, or paste the client ID and secret and choose
-   **Save client**. Then choose **Connect Gmail**. If Google says the app is
-   unverified, it is your own app: choose **Advanced**, then go to the app.
 
 The first sync reads the last 48 hours of mail. After that, BotBoy checks for
 new mail every 5 minutes and reads at most 100 messages per sync. Received mail
@@ -346,12 +338,11 @@ credential attachment before producing the report.
 | `Replacement start blocked` / `shutdown recovery: BLOCKED` | Do not delete the guard or kill its PID. Follow **Unverified shutdown recovery** below. |
 | BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
 | A connection card is missing | Run `./start.sh --update`, then reopen BotBoy. |
-| Gmail shows **Reconnect needed** | Google ended BotBoy's access: you changed your Google password, you removed BotBoy from your Google account, or (with your own client) the app was in testing for 7 days. Open **Connections → Gmail** and choose **Reconnect**. To stop the 7-day sign-outs of your own client, publish the app (step 2 under **Your own Google client**). `./start.sh --doctor` prints a `gmail refresh probe` status; `400 invalid_grant` means Reconnect. |
+| Gmail shows **Reconnect needed** | Google ended BotBoy's access: you changed your Google password, you removed BotBoy from your Google account, or your app was in testing for 7 days. Open **Connections → Gmail** and choose **Reconnect**. To stop the 7-day sign-outs, publish the app (step 2 under **Gmail**). `./start.sh --doctor` prints a `gmail refresh probe` status; `400 invalid_grant` means Reconnect. |
 | BotBoy says it may not draft or send, or the Gmail page shows **Reconnect to allow drafting and sending** | The connection has read access only. Choose **Reconnect** and leave **Manage drafts and send emails** ticked on Google's screen. |
-| The Gmail page says Google rejected BotBoy's shared Google client | The shared client changed. Ask the owner for a new credential file, run `./start.sh`, then choose **Reconnect**. |
-| The Gmail page offers only your own client form, with no **Connect Gmail** | No Google client arrived yet. Ask the owner for a credential file that includes BotBoy's Google client (then run `./start.sh`), or create your own client and save it on that form. |
-| Google or the Gmail page shows `redirect_uri_mismatch` or `invalid_client` for your own client, or says the file is for a Web application client | The saved client is not a **Desktop app** client, or its ID or secret is wrong. Create a Desktop app client and choose its JSON file (or save its ID and secret) again. |
-| Google shows `access_denied` when you connect Gmail | You chose Cancel, or a test-mode app admits only its listed test users. Connect again and choose **Allow**; for your own client, publish the app or add your address under **Audience → Test users**. |
+| The Gmail page asks for a Google OAuth client although Gmail worked before, or the doctor says only the retired shared client is saved | BotBoy no longer uses a shared Google client. Create your own client (steps under **Gmail**), choose its JSON file, then choose **Connect Gmail**. |
+| Google or the Gmail page shows `redirect_uri_mismatch` or `invalid_client`, or says the file is for a Web application client | The saved client is not a **Desktop app** client, or its ID or secret is wrong. Create a Desktop app client and choose its JSON file (or save its ID and secret) again. |
+| Google shows `access_denied` when you connect Gmail | You chose Cancel, or a test-mode app admits only its listed test users. Connect again and choose **Allow**; or publish your app, or add your address under **Audience → Test users**. |
 
 ### Unverified shutdown recovery
 

@@ -1,13 +1,15 @@
 /**
- * The Gmail connection's secrets: a Google OAuth client (Desktop app) and the
+ * The Gmail connection's secrets: the owner's own Google OAuth client and the
  * refresh token Google issued for one account.
  *
- * Two client slots (GMAIL_CHAT_TOOLS_PLAN.md §7):
- *   - `teamClient`: BotBoy's shared client from the owner-issued credential
- *     file (scripts/import-credentials.sh stages it; the server applies it at
- *     boot). Teammates only choose Connect.
- *   - `client`: the owner's own client from Connections → Gmail → Advanced.
- *     It wins over the team client and is never overwritten by an import.
+ * The active client (GMAIL_CHAT_TOOLS_PLAN.md D11, D12):
+ *   - `client`: the owner's own Desktop app client from Connections → Gmail,
+ *     when saved. Every shipped install uses this one.
+ *   - otherwise a built-in client (gmail-builtin-client.ts) when that slot is
+ *     filled; source `'team'` names it. The slot ships empty (D12), so
+ *     `usableBuiltInClient` returns null and the own client is the only path.
+ * A `teamClient` slot from the retired credential-file delivery is ignored and
+ * dropped on the next write.
  * One grant rule covers every change: the connection survives only while the
  * active client keeps its ID (Google binds a refresh token to the client ID,
  * so a new secret for the same ID keeps working).
@@ -25,6 +27,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { BOTBOY_GOOGLE_CLIENT } from './gmail-builtin-client.js';
 
 export const GMAIL_CREDENTIALS_FILE = 'gmail.json';
 const SCHEMA_VERSION = 1;
@@ -48,19 +51,31 @@ export interface StoredGmailConnection {
 
 export interface StoredGmailCredentials {
   schemaVersion: typeof SCHEMA_VERSION;
-  /** The owner's own client (Advanced). Wins over `teamClient`. */
+  /** The owner's own client (Advanced). Wins over the built-in client. */
   client?: StoredGmailClient;
-  /** BotBoy's shared client from the owner-issued credential file. */
-  teamClient?: StoredGmailClient;
   connection?: StoredGmailConnection;
 }
 
+/** `'own'` = the client saved in Connections → Gmail; `'team'` = a built-in client, when that slot is filled. */
 export type GmailClientSource = 'own' | 'team';
 
-/** The client BotBoy signs in and refreshes with: the own client, else the team client. */
-export function activeGmailClient(stored: StoredGmailCredentials): { client: StoredGmailClient; source: GmailClientSource } | null {
+export type BuiltInGmailClient = Readonly<{ clientId: string; clientSecret: string }>;
+
+/**
+ * A built-in client only when both values are set. The shipped slot is empty
+ * (D12), so this is null on every install unless a private build fills it.
+ */
+export function usableBuiltInClient(client: BuiltInGmailClient | null | undefined): BuiltInGmailClient | null {
+  return client && client.clientId.trim() && client.clientSecret.trim() ? client : null;
+}
+
+/** The client BotBoy signs in and refreshes with: the own client, else the built-in one. */
+export function activeGmailClient(
+  stored: StoredGmailCredentials,
+  builtIn: BuiltInGmailClient | null,
+): { client: StoredGmailClient; source: GmailClientSource } | null {
   if (stored.client) return { client: stored.client, source: 'own' };
-  if (stored.teamClient) return { client: stored.teamClient, source: 'team' };
+  if (builtIn) return { client: { clientId: builtIn.clientId, clientSecret: builtIn.clientSecret, savedAt: '' }, source: 'team' };
   return null;
 }
 
@@ -90,7 +105,7 @@ export function clientIdSuffix(clientId: string): string {
   return `…${head.slice(-6)}`;
 }
 
-function readStored(file: string): StoredGmailCredentials {
+function readStored(file: string, builtIn: BuiltInGmailClient | null): StoredGmailCredentials {
   let raw: string;
   try {
     const stat = fs.lstatSync(file);
@@ -119,10 +134,10 @@ function readStored(file: string): StoredGmailCredentials {
   const out: StoredGmailCredentials = { schemaVersion: SCHEMA_VERSION };
   const client = parseClient(value.client);
   if (client) out.client = client;
-  const teamClient = parseClient(value.teamClient);
-  if (teamClient) out.teamClient = teamClient;
+  // A legacy `teamClient` (credential-file delivery) is not read: the
+  // built-in client took its place, and the next write drops it.
   const connection = value.connection;
-  if (activeGmailClient(out) && connection && text(connection.refreshToken) && text(connection.accountEmail)) {
+  if (activeGmailClient(out, builtIn) && connection && text(connection.refreshToken) && text(connection.accountEmail)) {
     out.connection = {
       refreshToken: text(connection.refreshToken),
       accountEmail: text(connection.accountEmail).toLowerCase(),
@@ -158,10 +173,10 @@ function writeStored(file: string, value: StoredGmailCredentials): void {
  * The one grant rule. `next` carries no connection; the previous one is kept
  * only when the active client ID is unchanged.
  */
-function keepGrantFor(previous: StoredGmailCredentials, next: StoredGmailCredentials): StoredGmailCredentials {
+function keepGrantFor(previous: StoredGmailCredentials, next: StoredGmailCredentials, builtIn: BuiltInGmailClient | null): StoredGmailCredentials {
   if (!previous.connection) return next;
-  const before = activeGmailClient(previous)?.client.clientId;
-  const after = activeGmailClient(next)?.client.clientId;
+  const before = activeGmailClient(previous, builtIn)?.client.clientId;
+  const after = activeGmailClient(next, builtIn)?.client.clientId;
   return before && before === after ? { ...next, connection: previous.connection } : next;
 }
 
@@ -169,29 +184,31 @@ export interface GmailCredentialStore {
   read(): StoredGmailCredentials;
   /** Saves the owner's own client; the grant rule decides whether the connection stays. */
   saveClient(client: { clientId: string; clientSecret: string }, now?: Date): StoredGmailCredentials;
-  /** Saves BotBoy's shared client; an own client stays active. */
-  saveTeamClient(client: { clientId: string; clientSecret: string }, now?: Date): StoredGmailCredentials;
-  /** Removes the own client; the team client (if any) becomes active. */
+  /** Removes the own client; a built-in client, if the slot is filled, becomes active. */
   removeOwnClient(): StoredGmailCredentials;
   saveConnection(connection: Omit<StoredGmailConnection, 'connectedAt'>, now?: Date): StoredGmailCredentials;
   clearConnection(): StoredGmailCredentials;
   clearAll(): void;
   readonly file: string;
   readonly privateRoot: string;
+  /** The usable built-in client, or null (always null for the shipped, empty slot). */
+  readonly builtInClient: BuiltInGmailClient | null;
 }
 
-export function createGmailCredentialStore(deps: { privateRoot?: string } = {}): GmailCredentialStore {
+export function createGmailCredentialStore(deps: { privateRoot?: string; builtInClient?: BuiltInGmailClient | null } = {}): GmailCredentialStore {
   const privateRoot = deps.privateRoot ?? path.join(os.homedir(), '.personal-productivity-tracker');
   const file = path.join(privateRoot, GMAIL_CREDENTIALS_FILE);
+  // Tests pass a fake client or null; installs use the shipped slot, which is empty (D12).
+  const builtIn = usableBuiltInClient(deps.builtInClient === undefined ? BOTBOY_GOOGLE_CLIENT : deps.builtInClient);
   let cached: StoredGmailCredentials | null = null;
 
   function current(): StoredGmailCredentials {
-    if (!cached) cached = readStored(file);
+    if (!cached) cached = readStored(file, builtIn);
     return cached;
   }
 
   function persist(next: StoredGmailCredentials): StoredGmailCredentials {
-    if (!next.client && !next.teamClient && !next.connection) fs.rmSync(file, { force: true });
+    if (!next.client && !next.connection) fs.rmSync(file, { force: true });
     else writeStored(file, next);
     cached = next;
     return next;
@@ -200,33 +217,21 @@ export function createGmailCredentialStore(deps: { privateRoot?: string } = {}):
   return {
     file,
     privateRoot,
+    builtInClient: builtIn,
     read: current,
     saveClient(client, now = new Date()) {
       const previous = current();
       return persist(keepGrantFor(previous, {
         schemaVersion: SCHEMA_VERSION,
         client: { ...client, savedAt: now.toISOString() },
-        ...(previous.teamClient ? { teamClient: previous.teamClient } : {}),
-      }));
-    },
-    saveTeamClient(client, now = new Date()) {
-      const previous = current();
-      return persist(keepGrantFor(previous, {
-        schemaVersion: SCHEMA_VERSION,
-        ...(previous.client ? { client: previous.client } : {}),
-        teamClient: { ...client, savedAt: now.toISOString() },
-      }));
+      }, builtIn));
     },
     removeOwnClient() {
-      const previous = current();
-      return persist(keepGrantFor(previous, {
-        schemaVersion: SCHEMA_VERSION,
-        ...(previous.teamClient ? { teamClient: previous.teamClient } : {}),
-      }));
+      return persist(keepGrantFor(current(), { schemaVersion: SCHEMA_VERSION }, builtIn));
     },
     saveConnection(connection, now = new Date()) {
       const previous = current();
-      if (!activeGmailClient(previous)) throw new Error('Save the Google OAuth client before connecting.');
+      if (!activeGmailClient(previous, builtIn)) throw new Error('Save the Google OAuth client before connecting.');
       return persist({ ...previous, connection: { ...connection, connectedAt: now.toISOString() } });
     },
     clearConnection() {
@@ -240,49 +245,24 @@ export function createGmailCredentialStore(deps: { privateRoot?: string } = {}):
   };
 }
 
-// ── BotBoy's shared client, staged by the credential-file import ──────────
+// ── Retired: the shared client staged by an older credential-file import ──
 
 /**
- * scripts/import-credentials.sh writes BotBoy's shared Google client here
- * (0600) from the optional `BOTBOY_GMAIL_OAUTH_CLIENT_ID` / `_SECRET` lines.
- * The server applies it once at boot and deletes it
- * (gmail-connection.ts › applyStagedTeamClient), so `gmail.json` keeps one
- * writer and the store's in-memory copy never goes stale.
+ * An importer from before D11 wrote BotBoy's shared Google client here from the
+ * `BOTBOY_GMAIL_OAUTH_CLIENT_*` lines. That delivery is retired (each install
+ * saves its own client, D12), so the server only deletes a leftover file at
+ * boot (gmail-connection.ts › retireStagedTeamClient); it is never read.
  */
 export const GMAIL_TEAM_CLIENT_INBOX = 'gmail-team-client.json';
 
-export type StagedGmailTeamClient =
-  | { status: 'none' }
-  | { status: 'invalid'; reason: string }
-  | { status: 'ready'; client: { clientId: string; clientSecret: string } };
-
-export function readStagedTeamClient(privateRoot: string): StagedGmailTeamClient {
+/** Deletes a leftover staged file (or a link planted there); true when one existed. */
+export function removeStagedTeamClient(privateRoot: string): boolean {
   const file = path.join(privateRoot, GMAIL_TEAM_CLIENT_INBOX);
-  let raw: string;
   try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink()) return { status: 'invalid', reason: 'not a regular file' };
-    if (stat.size > 4096) return { status: 'invalid', reason: 'unexpected size' };
-    raw = fs.readFileSync(file, 'utf8');
-  } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code === 'ENOENT'
-      ? { status: 'none' }
-      : { status: 'invalid', reason: 'unreadable' };
-  }
-  let value: any;
-  try {
-    value = JSON.parse(raw);
+    if (fs.lstatSync(file).isDirectory()) return false;
+    fs.rmSync(file, { force: true });
+    return true;
   } catch {
-    return { status: 'invalid', reason: 'not JSON' };
+    return false;
   }
-  if (value?.schemaVersion !== SCHEMA_VERSION) return { status: 'invalid', reason: 'unknown schema' };
-  try {
-    return { status: 'ready', client: validateGmailClient({ clientId: value.clientId, clientSecret: value.clientSecret }) };
-  } catch (error) {
-    return { status: 'invalid', reason: error instanceof GmailCredentialInputError ? `bad ${error.field}` : 'invalid client' };
-  }
-}
-
-export function removeStagedTeamClient(privateRoot: string): void {
-  fs.rmSync(path.join(privateRoot, GMAIL_TEAM_CLIENT_INBOX), { force: true });
 }

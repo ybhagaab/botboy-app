@@ -5,10 +5,14 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from './gmail-api.js';
 import { createGmailConnection, GmailAuthError } from './gmail-connection.js';
-import { createGmailCredentialStore, GmailCredentialInputError, validateGmailClient } from './gmail-credentials.js';
+import { BOTBOY_GOOGLE_CLIENT } from './gmail-builtin-client.js';
+import { createGmailCredentialStore, GmailCredentialInputError, usableBuiltInClient, validateGmailClient } from './gmail-credentials.js';
 
 const CLIENT = { clientId: '1234567890-abcdefghijkl.apps.googleusercontent.com', clientSecret: 'GOCSPX-test-secret-value' };
 const OTHER_CLIENT = { clientId: '9876543210-zyxwvutsrqpo.apps.googleusercontent.com', clientSecret: 'GOCSPX-other-secret-value' };
+/** Fills the built-in slot in tests; the shipped slot (gmail-builtin-client.ts) is empty. */
+const TEAM = { clientId: '5555555555-teamclientabc.apps.googleusercontent.com', clientSecret: 'GOCSPX-team-secret-one' };
+const NEW_TEAM = { clientId: '6666666666-teamclientxyz.apps.googleusercontent.com', clientSecret: 'GOCSPX-team-secret-new' };
 const ENDPOINTS: GoogleEndpoints = {
   authUrl: 'https://accounts.test/o/oauth2/v2/auth',
   tokenUrl: 'https://oauth.test/token',
@@ -63,44 +67,84 @@ function queryOf(url: string): URLSearchParams {
   return new URL(url).searchParams;
 }
 
+/**
+ * Release safety (GMAIL_CHAT_TOOLS_PLAN.md D12): botboy-app is public and
+ * Google's API terms forbid credentials in open source, so the built-in slot
+ * ships empty and every install connects with its own client.
+ */
+describe('Gmail built-in client slot', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-slot-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('ships empty, so an install has no client until the owner saves one', () => {
+    expect(BOTBOY_GOOGLE_CLIENT).toEqual({ clientId: '', clientSecret: '' });
+    expect(createGmailCredentialStore({ privateRoot: dir }).builtInClient).toBeNull();
+    const service = createGmailConnection({ redirectUri: REDIRECT, privateRoot: dir });
+    expect(service.status()).toMatchObject({ clientConfigured: false, clientSource: null, teamClientAvailable: false, ownClientConfigured: false, connected: false });
+    expect(() => service.beginConnect()).toThrow('Add your own client in Connections → Gmail');
+    service.saveClient(CLIENT);
+    expect(service.status()).toMatchObject({ clientConfigured: true, clientSource: 'own', teamClientAvailable: false });
+    expect(queryOf(service.beginConnect().authUrl).get('client_id')).toBe(CLIENT.clientId);
+  });
+
+  it('counts a blank or half-filled slot as no built-in client', () => {
+    expect(usableBuiltInClient(TEAM)).toBe(TEAM);
+    for (const slot of [null, undefined, { clientId: '', clientSecret: '' }, { clientId: TEAM.clientId, clientSecret: '' }, { clientId: '  ', clientSecret: TEAM.clientSecret }, { clientId: TEAM.clientId, clientSecret: ' \t' }]) {
+      expect(usableBuiltInClient(slot)).toBeNull();
+    }
+    const halfFilled = createGmailCredentialStore({ privateRoot: dir, builtInClient: { clientId: TEAM.clientId, clientSecret: '' } });
+    expect(halfFilled.builtInClient).toBeNull();
+    expect(createGmailConnection({ redirectUri: REDIRECT, store: halfFilled }).status()).toMatchObject({ clientConfigured: false, teamClientAvailable: false });
+  });
+});
+
 describe('Gmail credential store', () => {
   let dir: string;
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-store-')); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('writes an owner-only schema-1 file and keeps a connection only for the same client', () => {
-    const store = createGmailCredentialStore({ privateRoot: dir });
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
     store.saveClient(CLIENT);
     expect(fs.statSync(store.file).mode & 0o777).toBe(0o600);
     store.saveConnection({ refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
-    const reread = createGmailCredentialStore({ privateRoot: dir }).read();
+    const reread = createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read();
     expect(reread).toMatchObject({ schemaVersion: 1, client: CLIENT, connection: { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com' } });
 
     store.saveClient(CLIENT);
     expect(store.read().connection?.refreshToken).toBe('refresh-1');
     store.saveClient(OTHER_CLIENT);
     expect(store.read().connection).toBeUndefined();
-    expect(createGmailCredentialStore({ privateRoot: dir }).read().connection).toBeUndefined();
+    expect(createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read().connection).toBeUndefined();
 
     store.clearAll();
     expect(fs.existsSync(store.file)).toBe(false);
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
-  it('keeps the grant while the active client ID stays, across a new secret, an added team client, or removing an own copy', () => {
-    const store = createGmailCredentialStore({ privateRoot: dir });
+  it('keeps the grant while the active client ID stays: a new own secret, or removing an own copy of the built-in client', () => {
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: TEAM });
     store.saveClient(CLIENT);
     store.saveConnection({ refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
     store.saveClient({ clientId: CLIENT.clientId, clientSecret: 'GOCSPX-rotated-secret' });
     expect(store.read().connection?.refreshToken).toBe('refresh-1');
-    // A team client behind an active own client changes nothing.
-    store.saveTeamClient(OTHER_CLIENT);
-    expect(store.read()).toMatchObject({ client: { clientId: CLIENT.clientId }, teamClient: { clientId: OTHER_CLIENT.clientId }, connection: { refreshToken: 'refresh-1' } });
-    // Removing the own client makes the team client active: another ID, so the grant goes.
+    // Removing the own client makes the built-in one active: another ID, so the grant goes with the file.
     store.removeOwnClient();
-    expect(store.read().client).toBeUndefined();
-    expect(store.read().connection).toBeUndefined();
-    expect(createGmailCredentialStore({ privateRoot: dir }).read().teamClient?.clientId).toBe(OTHER_CLIENT.clientId);
+    expect(store.read()).toEqual({ schemaVersion: 1 });
+    expect(fs.existsSync(store.file)).toBe(false);
+
+    store.saveClient({ clientId: TEAM.clientId, clientSecret: 'GOCSPX-own-copy-secret' });
+    store.saveConnection({ refreshToken: 'refresh-2', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
+    store.removeOwnClient();
+    expect(store.read()).toEqual({ schemaVersion: 1, connection: expect.objectContaining({ refreshToken: 'refresh-2' }) });
+    // The file never holds the built-in client.
+    expect(fs.readFileSync(store.file, 'utf8')).not.toContain(TEAM.clientSecret);
+
+    // Without a built-in client a connection needs an own client, on read and on save.
+    const bare = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    expect(bare.read()).toEqual({ schemaVersion: 1 });
+    expect(() => bare.saveConnection({ refreshToken: 'refresh-3', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE })).toThrow('Save the Google OAuth client');
   });
 
   it('refuses a linked file, restores 0600, and ignores unreadable or unknown-schema files', () => {
@@ -154,8 +198,10 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
   });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
+  /** No built-in client here: these tests save their own (the built-in one is covered below). */
   function connection() {
-    return createGmailConnection({ redirectUri: REDIRECT, privateRoot: dir, fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => clock });
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    return createGmailConnection({ redirectUri: REDIRECT, store, fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => clock });
   }
 
   async function connect(service: ReturnType<typeof connection>, code = 'code-1') {
@@ -294,13 +340,14 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
 });
 
 /**
- * BotBoy's shared Google client from the credential file and the granted
- * scopes (GMAIL_CHAT_TOOLS_PLAN.md §7): the staged file is applied once at
- * boot, an own client always wins, and one grant rule covers every change.
+ * A filled built-in slot and the granted scopes (GMAIL_CHAT_TOOLS_PLAN.md
+ * D11–D12, §7). The shipped slot is empty (see the release-safety tests
+ * above); these tests fill it with a fake client to keep the mechanism honest:
+ * a built-in client is active until an own client is saved and is never
+ * written to the file, a client staged by the retired credential-file
+ * delivery is deleted unread, and one grant rule covers every change.
  */
-describe('Gmail connection: shared client and granted scopes', () => {
-  const TEAM = { clientId: '5555555555-teamclientabc.apps.googleusercontent.com', clientSecret: 'GOCSPX-team-secret-one' };
-  const NEW_TEAM = { clientId: '6666666666-teamclientxyz.apps.googleusercontent.com', clientSecret: 'GOCSPX-team-secret-new' };
+describe('Gmail connection: built-in client and granted scopes', () => {
   let dir: string;
   let google: ReturnType<typeof fakeGoogle>;
 
@@ -310,77 +357,81 @@ describe('Gmail connection: shared client and granted scopes', () => {
   });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
+  const file = () => path.join(dir, 'gmail.json');
   const staged = () => path.join(dir, 'gmail-team-client.json');
-  function stage(client: { clientId: string; clientSecret: string } | string) {
-    fs.writeFileSync(staged(), typeof client === 'string' ? client : JSON.stringify({ schemaVersion: 1, ...client }), { mode: 0o600 });
-  }
-  function connection() {
-    return createGmailConnection({ redirectUri: REDIRECT, privateRoot: dir, fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => Date.parse('2026-10-06T08:00:00Z') });
+  /** One BotBoy build: `builtInClient` is what that build's slot holds. */
+  function connection(builtInClient: { clientId: string; clientSecret: string } | null = TEAM) {
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient });
+    return createGmailConnection({ redirectUri: REDIRECT, store, fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => Date.parse('2026-10-06T08:00:00Z') });
   }
   async function connect(service: ReturnType<typeof connection>, code = 'code-1') {
     const { authUrl } = service.beginConnect();
     return service.completeConnect({ code, state: queryOf(authUrl).get('state') });
   }
   const revoked = () => google.calls.filter(call => call.url === ENDPOINTS.revokeUrl).map(call => call.form.token);
+  const lastRefresh = () => google.calls.filter(call => call.form.grant_type === 'refresh_token').at(-1)?.form;
 
-  it('applies the staged client once and deletes the file; an own client stays active over it', () => {
+  it('uses the built-in client until an own client is saved, without writing it anywhere', () => {
+    // A build without a built-in client (a fork) needs an own client to connect.
+    const bare = connection(null);
+    expect(bare.status()).toMatchObject({ clientConfigured: false, clientSource: null, teamClientAvailable: false });
+    expect(() => bare.beginConnect()).toThrow('Add your own client in Connections → Gmail');
+
     const service = connection();
-    expect(service.applyStagedTeamClient()).toEqual({ applied: false, reason: 'none' });
-    stage(TEAM);
-    expect(service.applyStagedTeamClient()).toEqual({ applied: true });
-    expect(fs.existsSync(staged())).toBe(false);
-    expect(service.status()).toMatchObject({ clientConfigured: true, clientSource: 'team', teamClientAvailable: true, ownClientConfigured: false, clientIdSuffix: '…entabc' });
+    expect(service.status()).toMatchObject({ clientConfigured: true, clientSource: 'team', teamClientAvailable: true, ownClientConfigured: false, clientIdSuffix: '…entabc', connected: false });
     expect(queryOf(service.beginConnect().authUrl).get('client_id')).toBe(TEAM.clientId);
-
-    stage(TEAM);
-    expect(service.applyStagedTeamClient()).toEqual({ applied: false, reason: 'unchanged' });
-    expect(fs.existsSync(staged())).toBe(false);
+    expect(fs.readdirSync(dir)).toEqual([]);
 
     service.saveClient(CLIENT);
-    stage(NEW_TEAM);
-    expect(service.applyStagedTeamClient()).toEqual({ applied: true });
-    expect(service.status()).toMatchObject({ clientSource: 'own', teamClientAvailable: true, ownClientConfigured: true });
-    const stored = JSON.parse(fs.readFileSync(path.join(dir, 'gmail.json'), 'utf8'));
-    expect(stored).toMatchObject({ schemaVersion: 1, client: { clientId: CLIENT.clientId }, teamClient: { clientId: NEW_TEAM.clientId } });
-    expect(fs.statSync(path.join(dir, 'gmail.json')).mode & 0o777).toBe(0o600);
+    expect(service.status()).toMatchObject({ clientSource: 'own', teamClientAvailable: true, ownClientConfigured: true, clientIdSuffix: '…ghijkl' });
+    expect(queryOf(service.beginConnect().authUrl).get('client_id')).toBe(CLIENT.clientId);
+    const stored = JSON.parse(fs.readFileSync(file(), 'utf8'));
+    expect(Object.keys(stored).sort()).toEqual(['client', 'schemaVersion']);
+    expect(fs.statSync(file()).mode & 0o777).toBe(0o600);
     expect(JSON.stringify(service.status())).not.toMatch(/GOCSPX/);
   });
 
-  it('keeps the connection across a rotated shared secret, and drops and revokes it for a new client ID', async () => {
+  it('signs in and refreshes with the built-in ID and secret; the file keeps only the connection', async () => {
     const service = connection();
-    stage(TEAM);
-    service.applyStagedTeamClient();
     expect(await connect(service)).toMatchObject({ ok: true });
-
-    stage({ clientId: TEAM.clientId, clientSecret: 'GOCSPX-team-secret-two' });
-    expect(service.applyStagedTeamClient()).toEqual({ applied: true });
-    expect(service.status().connected).toBe(true);
+    expect(google.calls.find(call => call.form.grant_type === 'authorization_code')?.form).toMatchObject({ client_id: TEAM.clientId, client_secret: TEAM.clientSecret });
     service.invalidateAccessToken();
     await service.accessToken();
-    expect(google.calls.filter(call => call.form.grant_type === 'refresh_token').at(-1)?.form.client_secret).toBe('GOCSPX-team-secret-two');
-    expect(revoked()).toEqual([]);
-
-    const pendingSignIn = service.beginConnect();
-    stage(NEW_TEAM);
-    expect(service.applyStagedTeamClient()).toEqual({ applied: true });
-    await new Promise(resolve => setTimeout(resolve, 0));
-    expect(service.status()).toMatchObject({ connected: false, clientSource: 'team', clientIdSuffix: '…entxyz' });
-    expect(revoked()).toEqual(['refresh-1']);
-    // A sign-in started with the old client cannot complete with the new one.
-    expect(await service.completeConnect({ code: 'late', state: queryOf(pendingSignIn.authUrl).get('state') })).toMatchObject({ ok: false, error: expect.stringContaining('expired or was already used') });
+    expect(lastRefresh()).toMatchObject({ client_id: TEAM.clientId, client_secret: TEAM.clientSecret, refresh_token: 'refresh-1' });
+    const stored = JSON.parse(fs.readFileSync(file(), 'utf8'));
+    expect(Object.keys(stored).sort()).toEqual(['connection', 'schemaVersion']);
+    expect(JSON.stringify(stored)).not.toContain(TEAM.clientSecret);
+    expect(fs.statSync(file()).mode & 0o777).toBe(0o600);
   });
 
-  it('removing an own client falls back to the shared one; the grant survives only for the same client ID', async () => {
+  it('an update with a new built-in secret keeps the connection; a new client ID makes Google ask for Reconnect', async () => {
+    expect(await connect(connection())).toMatchObject({ ok: true });
+
+    const rotated = connection({ clientId: TEAM.clientId, clientSecret: 'GOCSPX-team-secret-two' });
+    expect(rotated.status()).toMatchObject({ connected: true, clientSource: 'team' });
+    await rotated.accessToken();
+    expect(lastRefresh()).toMatchObject({ client_id: TEAM.clientId, client_secret: 'GOCSPX-team-secret-two', refresh_token: 'refresh-1' });
+
+    // Google binds the refresh token to the client ID, so a replaced client
+    // cannot use it: the page asks for Reconnect (rotate secrets, not clients).
+    const replaced = connection(NEW_TEAM);
+    google.refreshError = 'unauthorized_client';
+    await expect(replaced.accessToken()).rejects.toMatchObject({ code: 'reconnect_required' });
+    expect(replaced.status()).toMatchObject({ connected: true, needsReconnect: true, clientSource: 'team', clientIdSuffix: '…entxyz' });
+    expect(replaced.status().lastError).toContain('then Reconnect');
+    expect(revoked()).toEqual([]);
+  });
+
+  it('removing an own client returns to the built-in one; the grant survives only for the same client ID', async () => {
     const service = connection();
-    stage(TEAM);
-    service.applyStagedTeamClient();
     service.saveClient(CLIENT);
     await connect(service);
     const afterRemove = await service.removeClient();
     expect(afterRemove).toMatchObject({ connected: false, clientConfigured: true, clientSource: 'team', ownClientConfigured: false });
     expect(revoked()).toEqual(['refresh-1']);
+    expect(fs.existsSync(file())).toBe(false);
 
-    // An own copy of the very same client ID: removing it keeps the grant.
+    // An own copy of the built-in client ID: removing it keeps the grant.
     service.saveClient({ clientId: TEAM.clientId, clientSecret: 'GOCSPX-own-copy-secret' });
     google.grantRefreshToken = 'refresh-2';
     await connect(service, 'code-2');
@@ -388,21 +439,42 @@ describe('Gmail connection: shared client and granted scopes', () => {
     expect(revoked()).toEqual(['refresh-1']);
   });
 
-  it('refuses a damaged, foreign, or linked staged file and deletes it without touching the store', () => {
+  it('ignores a teamClient left by the credential-file delivery and drops it on the next write', async () => {
+    const connectedAt = '2026-10-05T08:00:00.000Z';
+    fs.writeFileSync(file(), JSON.stringify({
+      schemaVersion: 1,
+      teamClient: { clientId: TEAM.clientId, clientSecret: 'GOCSPX-team-secret-old', savedAt: connectedAt },
+      connection: { refreshToken: 'refresh-old', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE, connectedAt },
+    }), { mode: 0o600 });
     const service = connection();
-    service.saveClient(CLIENT);
-    for (const bad of ['not json', JSON.stringify({ schemaVersion: 2, ...TEAM }), JSON.stringify({ schemaVersion: 1, clientId: 'nope', clientSecret: TEAM.clientSecret })]) {
-      stage(bad);
-      expect(service.applyStagedTeamClient()).toEqual({ applied: false, reason: 'invalid' });
-      expect(fs.existsSync(staged())).toBe(false);
-    }
-    const elsewhere = path.join(dir, 'elsewhere.json');
-    fs.writeFileSync(elsewhere, JSON.stringify({ schemaVersion: 1, ...TEAM }));
-    fs.symlinkSync(elsewhere, staged());
-    expect(service.applyStagedTeamClient()).toEqual({ applied: false, reason: 'invalid' });
+    expect(service.status()).toMatchObject({ connected: true, clientSource: 'team', ownClientConfigured: false, accountEmail: 'jane.doe@gmail.com' });
+    await service.accessToken();
+    expect(lastRefresh()).toMatchObject({ client_id: TEAM.clientId, client_secret: TEAM.clientSecret, refresh_token: 'refresh-old' });
+
+    await connect(service);
+    expect(fs.readFileSync(file(), 'utf8')).not.toContain('teamClient');
+    expect(fs.readFileSync(file(), 'utf8')).not.toContain('GOCSPX');
+  });
+
+  it('deletes a client staged by an older import unread, removing a planted link but never a directory', () => {
+    const service = connection();
+    expect(service.retireStagedTeamClient()).toBe(false);
+    fs.writeFileSync(staged(), JSON.stringify({ schemaVersion: 1, ...OTHER_CLIENT }), { mode: 0o600 });
+    expect(service.retireStagedTeamClient()).toBe(true);
     expect(fs.existsSync(staged())).toBe(false);
-    expect(fs.existsSync(elsewhere)).toBe(true);
-    expect(service.status()).toMatchObject({ clientSource: 'own', teamClientAvailable: false });
+    expect(service.status()).toMatchObject({ clientSource: 'team', clientIdSuffix: '…entabc' });
+    expect(fs.existsSync(file())).toBe(false);
+
+    const elsewhere = path.join(dir, 'elsewhere.json');
+    fs.writeFileSync(elsewhere, 'keep me');
+    fs.symlinkSync(elsewhere, staged());
+    expect(service.retireStagedTeamClient()).toBe(true);
+    expect(() => fs.lstatSync(staged())).toThrow();
+    expect(fs.readFileSync(elsewhere, 'utf8')).toBe('keep me');
+
+    fs.mkdirSync(staged());
+    expect(service.retireStagedTeamClient()).toBe(false);
+    expect(fs.statSync(staged()).isDirectory()).toBe(true);
   });
 
   it('records what Google granted: read is required, compose is optional and upgradable', async () => {
@@ -423,19 +495,18 @@ describe('Gmail connection: shared client and granted scopes', () => {
     expect(service.canCompose()).toBe(true);
   });
 
-  it('sends a rejected shared client to the owner and a rejected own client to its settings', async () => {
+  it('sends a rejected built-in client to a BotBoy update and a rejected own client to its settings', async () => {
     const team = connection();
-    stage(TEAM);
-    team.applyStagedTeamClient();
     await connect(team);
     team.invalidateAccessToken();
     google.refreshError = 'invalid_client';
     await expect(team.accessToken()).rejects.toMatchObject({ code: 'reconnect_required' });
-    expect(team.status().lastError).toContain('Ask the BotBoy owner for a new credential file');
+    expect(team.status().lastError).toContain('Update BotBoy (./start.sh --update), then Reconnect');
 
     const ownDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-own-'));
     try {
-      const own = createGmailConnection({ redirectUri: REDIRECT, privateRoot: ownDir, fetchImpl: google.fetch, endpoints: ENDPOINTS });
+      const store = createGmailCredentialStore({ privateRoot: ownDir, builtInClient: TEAM });
+      const own = createGmailConnection({ redirectUri: REDIRECT, store, fetchImpl: google.fetch, endpoints: ENDPOINTS });
       own.saveClient(CLIENT);
       google.refreshError = '';
       await connect(own);

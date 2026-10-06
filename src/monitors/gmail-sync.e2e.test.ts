@@ -6,6 +6,7 @@ import { createStorage, getSetting, type StorageLayer } from '../core/storage.js
 import type { RawWorkItem } from '../core/types.js';
 import { GMAIL_READONLY_SCOPE, type GoogleEndpoints } from '../core/gmail-api.js';
 import { createGmailConnection } from '../core/gmail-connection.js';
+import { createGmailCredentialStore } from '../core/gmail-credentials.js';
 import { createGmailSync } from './gmail-sync.js';
 
 /**
@@ -127,7 +128,8 @@ describe('Gmail end to end (fake Google over fetch)', () => {
     const google = fakeGoogle();
     const now = () => clock;
     const connection = createGmailConnection({
-      redirectUri: 'http://127.0.0.1:7778/api/gmail-sync/oauth/callback', privateRoot: dir,
+      redirectUri: 'http://127.0.0.1:7778/api/gmail-sync/oauth/callback',
+      store: createGmailCredentialStore({ privateRoot: dir, builtInClient: null }),
       fetchImpl: google.fetch, endpoints: ENDPOINTS, now,
     });
     const emitted: RawWorkItem[] = [];

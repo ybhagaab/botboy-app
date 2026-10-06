@@ -2615,7 +2615,7 @@ function gmailSyncCardModel() {
     }
     return connection.clientConfigured
       ? { status: 'Not connected', tone: '', detail: 'OAuth client saved. Choose Connect to sign in to Google.' }
-      : { status: 'Not connected', tone: '', detail: 'For Google accounts: import the BotBoy credential file from the owner, or add your own OAuth client.' };
+      : { status: 'Not connected', tone: '', detail: 'For Google accounts: add your own Google OAuth client to connect.' };
   }
   if (connection.needsReconnect) return { status: 'Reconnect needed', tone: 'warn', detail: connection.lastError || 'Google ended BotBoy’s access to this account.' };
   if (!status.enabled) return { status: 'Paused', tone: 'warn', detail: `Automatic sync is paused for ${connection.accountEmail}` };
@@ -2665,7 +2665,7 @@ function renderGmailSyncSettings() {
         ? `<p class="page-subtitle">Client ${esc(connection.clientIdSuffix || '')} is saved on this Mac only. Paste a new ID and secret to replace it.${connection.teamClientAvailable ? ' Remove it to use BotBoy’s shared Google client instead.' : ''}</p>`
         : teamActive
           ? '<p class="page-subtitle">Optional. BotBoy’s shared Google client is in use. Save your own client only if you run your own Google Cloud project; it replaces the shared one on this Mac.</p>'
-          : '<p class="page-subtitle">Gmail needs a Google OAuth client. The simplest path is the BotBoy credential file from the owner: then you only choose Connect. Or use a client from your own Google Cloud project. BotBoy keeps the ID and secret in a private file on this Mac and never shows the secret again.</p>'}
+          : '<p class="page-subtitle">Gmail needs a Google OAuth client. Use a Desktop app client from your own Google Cloud project. BotBoy keeps the ID and secret in a private file on this Mac and never shows the secret again.</p>'}
       <label class="page-subtitle" for="gmail-sync-client-id" style="display:block;margin-top:8px">Client ID</label>
       <input id="gmail-sync-client-id" type="text" autocomplete="off" spellcheck="false" placeholder="1234567890-abc….apps.googleusercontent.com" style="width:100%">
       <label class="page-subtitle" for="gmail-sync-client-secret" style="display:block;margin-top:8px">Client secret</label>

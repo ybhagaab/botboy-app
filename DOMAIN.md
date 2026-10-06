@@ -258,8 +258,8 @@ outcome, and each attached file's source and SHA-256, for chat draft cards),
 sharepoint_sync.*), sharepoint_sync_queue / sharepoint_seen,
 pipeline_runs / pipeline_llm_audit / routing_decisions (audit),
 brains/*.md (human-editable). DB: ~/.personal-productivity-tracker/tracker.db.
-Gmail OAuth clients (BotBoy's shared client from the credential file, and an
-optional own client) + refresh token and granted scopes:
+Gmail OAuth client (the owner's own, saved in Connections → Gmail; BotBoy ships
+none) + refresh token and granted scopes:
 ~/.personal-productivity-tracker/gmail.json (0600; never in the database, env,
 or a browser response).
 Document binaries cache: ~/.personal-productivity-tracker/sharepoint-cache/.

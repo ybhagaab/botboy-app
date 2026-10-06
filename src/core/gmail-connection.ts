@@ -1,8 +1,8 @@
 /**
- * Gmail connection: the active OAuth client (the owner's own, else BotBoy's
- * shared client from the credential file), the PKCE loopback sign-in, and the
- * access-token cache the sync and the chat tools use
- * (GMAIL_API_INTEGRATION_PLAN.md §7–8, GMAIL_CHAT_TOOLS_PLAN.md §7).
+ * Gmail connection: the active OAuth client (the owner's own; a built-in client
+ * only if gmail-builtin-client.ts is filled, and it ships empty), the PKCE
+ * loopback sign-in, and the access-token cache the sync and the chat tools use
+ * (GMAIL_API_INTEGRATION_PLAN.md §7–8, GMAIL_CHAT_TOOLS_PLAN.md §7, D12).
  *
  * Sign-in: `beginConnect` mints a single-use `state` and a PKCE verifier
  * (memory only, 10-minute life) and returns Google's consent URL for
@@ -40,7 +40,6 @@ import {
   activeGmailClient,
   clientIdSuffix,
   createGmailCredentialStore,
-  readStagedTeamClient,
   removeStagedTeamClient,
   validateGmailClient,
   type GmailClientSource,
@@ -55,9 +54,9 @@ const ACCESS_TOKEN_SKEW_MS = 60_000;
 export interface GmailConnectionStatus {
   /** A client BotBoy can sign in with exists (own or team). */
   clientConfigured: boolean;
-  /** Which client is active: the owner's own (Advanced) or BotBoy's shared one. */
+  /** Which client is active: the owner's own, or a filled built-in slot. */
   clientSource: GmailClientSource | null;
-  /** BotBoy's shared client arrived in the credential file (active unless an own client is saved). */
+  /** A built-in client exists (active unless an own client is saved); false on shipped installs (D12). */
   teamClientAvailable: boolean;
   ownClientConfigured: boolean;
   /** Last characters of the active client ID, never the secret. */
@@ -98,16 +97,16 @@ export interface GmailConnection {
   /** Saves the owner's own client (Advanced); it becomes the active client. */
   saveClient(input: { clientId?: unknown; clientSecret?: unknown }): GmailConnectionStatus;
   /**
-   * Removes the own client. BotBoy's shared client, if present, becomes
+   * Removes the own client. A built-in client, if the slot is filled, becomes
    * active; a connection made with another client ID is revoked and dropped.
    */
   removeClient(): Promise<GmailConnectionStatus>;
   /**
-   * Boot step: moves BotBoy's shared client staged by the credential-file
-   * import into the store and deletes the staged file. Never replaces an own
-   * client.
+   * Boot step: deletes a shared client an older credential-file import staged
+   * (never applied: that delivery is retired, D11/D12). True when a file was
+   * removed.
    */
-  applyStagedTeamClient(): { applied: boolean; reason?: 'none' | 'invalid' | 'unchanged' };
+  retireStagedTeamClient(): boolean;
   beginConnect(): { authUrl: string };
   completeConnect(query: { code?: unknown; state?: unknown; error?: unknown }): Promise<
     { ok: true; accountEmail: string } | { ok: false; error: string }
@@ -123,10 +122,10 @@ export interface GmailConnection {
   onChange(listener: () => void): () => void;
 }
 
-/** A rejected client is fixed by whoever owns it: the owner for the shared client. */
+/** A rejected client is fixed by whoever owns it: a BotBoy update for a filled built-in slot. */
 function rejectedClientAdvice(source: GmailClientSource): string {
   return source === 'team'
-    ? 'Google rejected BotBoy’s shared Google client. Ask the BotBoy owner for a new credential file, then Reconnect.'
+    ? 'Google rejected BotBoy’s built-in Google client. Update BotBoy (./start.sh --update), then Reconnect; or add your own client under Advanced.'
     : 'Google rejected the OAuth client. Check the client ID and secret, then Reconnect.';
 }
 
@@ -167,19 +166,22 @@ export function createGmailConnection(deps: {
     }
   }
 
+  /** The own client, else the store's usable built-in one (none when the slot is empty). */
+  const activeOf = (stored: StoredGmailCredentials) => activeGmailClient(stored, store.builtInClient);
+
   function grantedScopes(stored: StoredGmailCredentials): string[] {
     return stored.connection ? stored.connection.scope.split(/\s+/).filter(Boolean) : [];
   }
 
   function status(): GmailConnectionStatus {
     const stored = store.read();
-    const active = activeGmailClient(stored);
+    const active = activeOf(stored);
     const granted = grantedScopes(stored);
     const canCompose = granted.includes(GMAIL_COMPOSE_SCOPE);
     return {
       clientConfigured: Boolean(active),
       clientSource: active?.source ?? null,
-      teamClientAvailable: Boolean(stored.teamClient),
+      teamClientAvailable: Boolean(store.builtInClient),
       ownClientConfigured: Boolean(stored.client),
       clientIdSuffix: active ? clientIdSuffix(active.client.clientId) : null,
       connected: Boolean(stored.connection),
@@ -202,7 +204,7 @@ export function createGmailConnection(deps: {
    */
   function afterClientChange(before: StoredGmailCredentials): Promise<void> {
     const after = store.read();
-    if (activeGmailClient(before)?.client.clientId !== activeGmailClient(after)?.client.clientId) pending.clear();
+    if (activeOf(before)?.client.clientId !== activeOf(after)?.client.clientId) pending.clear();
     needsReconnect = false;
     lastError = null;
     if (!before.connection || after.connection) return Promise.resolve();
@@ -228,7 +230,7 @@ export function createGmailConnection(deps: {
 
   async function refresh(): Promise<string> {
     const stored = store.read();
-    const active = activeGmailClient(stored);
+    const active = activeOf(stored);
     if (!active || !stored.connection) {
       throw new GmailAuthError('Gmail is not connected. Open Connections → Gmail and connect your account.', 'not_connected');
     }
@@ -279,36 +281,17 @@ export function createGmailConnection(deps: {
       return status();
     },
 
-    applyStagedTeamClient() {
-      const staged = readStagedTeamClient(store.privateRoot);
-      if (staged.status === 'none') return { applied: false, reason: 'none' };
-      if (staged.status === 'invalid') {
-        // The import validated it, so this is a damaged or foreign file; it
-        // can never become valid, and keeping it would warn on every start.
-        console.warn(`[Gmail] Ignored a staged Google client (${staged.reason}); ask the BotBoy owner for a new credential file.`);
-        removeStagedTeamClient(store.privateRoot);
-        return { applied: false, reason: 'invalid' };
-      }
-      const before = store.read();
-      const same = before.teamClient?.clientId === staged.client.clientId
-        && before.teamClient?.clientSecret === staged.client.clientSecret;
-      if (!same) {
-        store.saveTeamClient(staged.client);
-        void afterClientChange(before);
-        changed();
-        console.log(`[Gmail] BotBoy’s shared Google client ${clientIdSuffix(staged.client.clientId)} applied from the credential file${before.client ? ' (your own client stays active)' : ''}`);
-      }
-      // Applied (or already present) before the delete, so a crash in between
-      // only re-applies the same client on the next start.
-      removeStagedTeamClient(store.privateRoot);
-      return same ? { applied: false, reason: 'unchanged' } : { applied: true };
+    retireStagedTeamClient() {
+      const removed = removeStagedTeamClient(store.privateRoot);
+      if (removed) console.log('[Gmail] Removed a Google client staged by an older credential-file import; Gmail uses the client saved in Connections → Gmail.');
+      return removed;
     },
 
     beginConnect() {
       const stored = store.read();
-      const active = activeGmailClient(stored);
+      const active = activeOf(stored);
       if (!active) {
-        throw new GmailAuthError('Gmail has no Google client yet. Import the BotBoy credential file from the owner, or add your own client under Advanced.', 'not_connected');
+        throw new GmailAuthError('Gmail has no Google client. Add your own client in Connections → Gmail.', 'not_connected');
       }
       prunePending();
       while (pending.size >= MAX_PENDING_STATES) {
@@ -349,7 +332,7 @@ export function createGmailConnection(deps: {
       }
       const code = typeof query.code === 'string' ? query.code : '';
       if (!code) return fail('Google returned no authorization code. Choose Connect again.');
-      const active = activeGmailClient(store.read());
+      const active = activeOf(store.read());
       if (!active) return fail('The Google client was removed during sign-in. Connect again once a client is set up.');
       try {
         const tokens = await exchangeAuthorizationCode(fetchImpl, endpoints, {

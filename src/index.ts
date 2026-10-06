@@ -610,17 +610,18 @@ async function main() {
     console.warn(`[BrowserHands] Debug Chrome not ready at boot: ${error?.message ?? error}`);
   });
   // ── Gmail connection (GMAIL_API_INTEGRATION_PLAN.md, GMAIL_CHAT_TOOLS_PLAN.md) ──
-  // One refresh token in a private file, made with the active client: the
-  // owner's own (Advanced) or BotBoy's shared client, which the credential-file
-  // import stages and this boot step applies. Google returns the browser to
-  // this loopback callback. The sync (below) and the chat tools share it.
+  // One refresh token in a private file, made with the owner's own client from
+  // Connections → Gmail (the built-in slot in gmail-builtin-client.ts ships
+  // empty, D12). Google returns the browser to this loopback callback. The sync
+  // (below) and the chat tools share it. A client staged by an older
+  // credential-file import is deleted unread.
   const gmailConnection = createGmailConnection({
     redirectUri: `http://127.0.0.1:${PORT}/api${GMAIL_OAUTH_CALLBACK_PATH}`,
   });
   try {
-    gmailConnection.applyStagedTeamClient();
+    gmailConnection.retireStagedTeamClient();
   } catch (error) {
-    console.warn(`[Gmail] Could not apply the staged Google client: ${(error as Error)?.message ?? error}`);
+    console.warn(`[Gmail] Could not remove a staged Google client: ${(error as Error)?.message ?? error}`);
   }
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     brainStore,

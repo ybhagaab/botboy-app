@@ -68,7 +68,8 @@ describe('Gmail connection UI', () => {
 
   it('walks the card through setup, connection, first sync, and activity', () => {
     state.gmailSync.status = status({ connection: connection({ clientConfigured: false, connected: false, accountEmail: null, clientIdSuffix: null }) });
-    expect(load(state).gmailSyncCardModel()).toEqual({ status: 'Not connected', tone: '', detail: 'For Google accounts: import the BotBoy credential file from the owner, or add your own OAuth client.' });
+    // Every shipped install starts here: BotBoy ships no Google client (D12).
+    expect(load(state).gmailSyncCardModel()).toEqual({ status: 'Not connected', tone: '', detail: 'For Google accounts: add your own Google OAuth client to connect.' });
 
     state.gmailSync.status = status({ connection: connection({ connected: false, accountEmail: null }) });
     expect(load(state).gmailSyncCardModel().detail).toBe('OAuth client saved. Choose Connect to sign in to Google.');
@@ -117,6 +118,8 @@ describe('Gmail connection UI', () => {
     expect(document.body.textContent).toContain('Desktop app');
     expect(document.body.textContent).toContain(REDIRECT);
     expect(document.body.textContent).toContain('gmail.readonly');
+    // The credential-file delivery is retired (D11): the page never sends anyone for one.
+    expect(document.body.textContent).not.toContain('credential file');
     // Every input is labelled.
     for (const input of document.querySelectorAll('input')) {
       expect(document.querySelector(`label[for="${input.id}"]`), `label for ${input.id}`).not.toBeNull();
