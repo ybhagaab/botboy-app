@@ -85,6 +85,30 @@ describe('Batcher', () => {
     expect(batcher.transition('b', 'routed', { projectId: 'p1' })).toBe(true);
   });
 
+  it('requeues only an unplaced route_failed row, clears its batch id, and the next wave selects it', () => {
+    insert('failed', 'route_failed', '2026-07-08T06:00:00Z');
+    storage.getDb().prepare("UPDATE work_items SET batch_id = 'old-wave' WHERE id = 'failed'").run();
+    for (const state of ['captured', 'extracted', 'routed', 'orphaned', 'noise', 'extract_failed'] as ProcessState[]) {
+      insert(`other-${state}`, state);
+      expect(batcher.requeueRouteFailed(`other-${state}`)).toBe(false);
+    }
+    insert('placed', 'route_failed');
+    storage.getDb().prepare("UPDATE work_items SET project_id = 'p1' WHERE id = 'placed'").run();
+    expect(batcher.requeueRouteFailed('placed')).toBe(false);
+    storage.getDb().prepare(`
+      INSERT INTO work_items (id, type, source, title, captured_at, process_state)
+      VALUES ('ref', 'file_reference', 'filesystem', 'metrics.json', '2026-07-08T05:00:00Z', 'route_failed')
+    `).run();
+    expect(batcher.requeueRouteFailed('ref')).toBe(false);
+    expect(batcher.requeueRouteFailed('missing')).toBe(false);
+
+    expect(batcher.requeueRouteFailed('failed')).toBe(true);
+    expect(batcher.requeueRouteFailed('failed')).toBe(false); // compare-and-set: once
+    const row = storage.getDb().prepare("SELECT process_state AS state, batch_id AS batchId FROM work_items WHERE id = 'failed'").get();
+    expect(row).toEqual({ state: 'extracted', batchId: null });
+    expect(batcher.nextWave()!.items.map(item => item.id)[0]).toBe('failed');
+  });
+
   it('P5 (property): a terminal item is never returned by nextWave regardless of history', () => {
     const arbState = fc.constantFrom<ProcessState>(
       'captured', 'extracted', 'routed', 'orphaned', 'noise', 'extract_failed', 'route_failed',

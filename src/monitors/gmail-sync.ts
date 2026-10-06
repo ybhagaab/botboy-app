@@ -4,8 +4,10 @@
  *
  * Google's recommended sync model (Gmail API "Synchronize clients"):
  *   - Full sync on first connect: messages.list over the lookback window
- *     (48 h, the GRASP default), then partial sync with history.list from
+ *     (30 days, owner decision G4), then partial sync with history.list from
  *     the stored historyId (2 quota units per call; usually one per run).
+ *   - An owner-started import (§12 of the plan) lists an older window once
+ *     and works through it after new mail, every minute until done.
  *   - history.list answers 404 once the stored historyId is older than
  *     Gmail keeps history (~1 week): a bounded full sync resumes from the
  *     newest captured message.
@@ -50,6 +52,10 @@ const KEYS = {
   noiseSenders: 'gmail_sync.noise_senders',
   mailActive: 'gmail_sync.mail_active',
   lastRun: 'gmail_sync.last_run',
+  /** Older-mail import progress (GmailImportState). */
+  import: 'gmail_sync.import',
+  /** The import window's message ids, oldest first; written once per import. */
+  importIds: 'gmail_sync.import_ids',
 } as const;
 
 /** Settings keys other modules read (browser gate, DOMAIN.md). */
@@ -64,13 +70,64 @@ const PERSIST_EVERY = 10;
 export interface GmailSyncConfig {
   intervalMs?: number; // default 5 min
   initialDelayMs?: number; // default 60 s
-  lookbackHours?: number; // first-connect window (default 48 h)
+  lookbackHours?: number; // first-connect window (default 30 days = 720 h; owner decision G4)
   maxCatchUpDays?: number; // window cap after a history 404 (default 7)
   maxMessagesPerRun?: number; // messages.get budget per run (default 100)
   maxListPages?: number; // messages.list pages per full sync (default 10 × 500 ids)
   maxHistoryPages?: number; // history.list pages per run (default 10 × 500 records)
   /** Pause between messages.get calls (default 250 ms ≈ 80 quota units/s). */
   getIntervalMs?: number;
+  /** Run cadence while an older-mail import has work left (default 60 s). */
+  importIntervalMs?: number;
+  /** messages.list pages for an import window (default 20 × 500 = the newest 10,000 ids). */
+  maxImportListPages?: number;
+}
+
+/** Import windows the owner may choose (GMAIL_API_INTEGRATION_PLAN.md §12). */
+export const GMAIL_IMPORT_MONTHS: readonly number[] = Object.freeze([6]);
+
+export type GmailImportStatus = 'requested' | 'importing' | 'done' | 'stopped';
+
+/** Persisted import progress; the listed ids live in their own key, written once. */
+interface GmailImportState {
+  status: GmailImportStatus;
+  months: number;
+  requestedAt: string;
+  /** Window start, set when the window is listed. */
+  sinceIso: string | null;
+  finishedAt: string | null;
+  total: number;
+  /** Cursor into the stored ids (oldest first). */
+  nextIndex: number;
+  captured: number;
+  duplicates: number;
+  /** Not captured: automated senders, not addressed to the owner, drafts, spam, promotions, or deleted. */
+  filtered: number;
+  failed: number;
+  /** The window held more mail than the listing cap; the newest ids were kept. */
+  truncated: boolean;
+}
+
+export interface GmailImportView {
+  status: GmailImportStatus;
+  months: number;
+  requestedAt: string;
+  sinceIso: string | null;
+  finishedAt: string | null;
+  total: number;
+  checked: number;
+  captured: number;
+  duplicates: number;
+  filtered: number;
+  truncated: boolean;
+}
+
+/** A refused import request; the router maps `code` to 400 or 409. */
+export class GmailImportError extends Error {
+  constructor(message: string, readonly code: 'invalid_window' | 'not_connected' | 'import_active') {
+    super(message);
+    this.name = 'GmailImportError';
+  }
 }
 
 export interface GmailSyncCounters {
@@ -93,6 +150,17 @@ export interface GmailSyncResult {
   counters: GmailSyncCounters;
   backlog: number;
   durationMs: number;
+  /** Older-mail import work done in this run, when an import is active. */
+  import?: { checked: number; captured: number; left: number };
+}
+
+/** Every Gmail row BotBoy holds, so the page shows totals beside the last run's counters. */
+export interface GmailCapturedCounts {
+  total: number;
+  received: number;
+  sent: number;
+  /** Rows the librarian linked to a project. */
+  inProjects: number;
 }
 
 export interface GmailSyncStatusView {
@@ -105,6 +173,9 @@ export interface GmailSyncStatusView {
   backlog: number;
   hasCursor: boolean;
   lastRun: Record<string, unknown> | null;
+  captured: GmailCapturedCounts;
+  /** The older-mail import, or null when none was started for this mailbox. */
+  import: GmailImportView | null;
 }
 
 export interface GmailSyncConfigInput {
@@ -119,6 +190,14 @@ export interface GmailSync {
   isRunning(): boolean;
   getStatus(): GmailSyncStatusView;
   updateConfig(input: GmailSyncConfigInput): GmailSyncStatusView;
+  /**
+   * Owner-started import of older mail (`months` from GMAIL_IMPORT_MONTHS).
+   * The next run lists the window once; later runs work through it after new
+   * mail. Throws GmailImportError when refused.
+   */
+  requestImport(input: { months?: unknown }): GmailSyncStatusView;
+  /** Stops the import; mail already captured stays. */
+  stopImport(): GmailSyncStatusView;
 }
 
 function emptyCounters(): GmailSyncCounters {
@@ -139,19 +218,34 @@ export function createGmailSync(deps: {
   const now = deps.now ?? Date.now;
   const intervalMs = deps.config?.intervalMs ?? 5 * 60_000;
   const initialDelayMs = deps.config?.initialDelayMs ?? 60_000;
-  const lookbackHours = deps.config?.lookbackHours ?? 48;
+  const lookbackHours = deps.config?.lookbackHours ?? 30 * 24;
   const maxCatchUpDays = deps.config?.maxCatchUpDays ?? 7;
   const maxMessagesPerRun = deps.config?.maxMessagesPerRun ?? 100;
   const maxListPages = deps.config?.maxListPages ?? 10;
   const maxHistoryPages = deps.config?.maxHistoryPages ?? 10;
   const getIntervalMs = deps.config?.getIntervalMs ?? 250;
+  const importIntervalMs = deps.config?.importIntervalMs ?? 60_000;
+  const maxImportListPages = deps.config?.maxImportListPages ?? 20;
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let initialTimer: ReturnType<typeof setTimeout> | null = null;
+  let followUpTimer: ReturnType<typeof setTimeout> | null = null;
   let running = false;
   let lastLoggedError = '';
+  // Bumped by every import request, stop, and mailbox reset: a run that read
+  // the import before the change never writes its progress back over it.
+  let importGeneration = 0;
 
   const hasUrl = db.prepare('SELECT 1 FROM work_items WHERE url = ? LIMIT 1');
+  // Gmail rows are only these two types, so idx_work_items_type keeps this a
+  // few-millisecond read on the status path (no full table scan).
+  const capturedCounts = db.prepare(`
+    SELECT COUNT(*) AS total,
+           COALESCE(SUM(type = 'email_sent'), 0) AS sent,
+           COALESCE(SUM(project_id IS NOT NULL), 0) AS inProjects
+      FROM work_items
+     WHERE type IN ('email_read', 'email_sent') AND source = 'gmail'
+  `);
 
   // A different account (or a disconnect) starts over: cursors and backlog
   // belong to one mailbox.
@@ -161,13 +255,66 @@ export function createGmailSync(deps: {
   });
 
   function resetCursor(account: string | null): void {
+    importGeneration++;
     db.transaction(() => {
       setSetting(db, KEYS.account, account);
       setSetting(db, KEYS.historyId, null);
       setSetting(db, KEYS.backlog, []);
       setSetting(db, KEYS.lastMessageAt, null);
       setSetting(db, KEYS.mailActive, false);
+      setSetting(db, KEYS.import, null);
+      setSetting(db, KEYS.importIds, []);
     })();
+  }
+
+  // ── Older-mail import (owner-started; §12) ──────────────────────────────
+
+  function readImport(): GmailImportState | null {
+    const value = getSetting<GmailImportState>(db, KEYS.import);
+    return value && typeof value === 'object' && typeof value.status === 'string' ? value : null;
+  }
+
+  function importIds(): string[] {
+    const value = getSetting<unknown>(db, KEYS.importIds);
+    return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+  }
+
+  const importActive = (state: GmailImportState | null): boolean =>
+    state?.status === 'requested' || state?.status === 'importing';
+
+  function importView(): GmailImportView | null {
+    const state = readImport();
+    if (!state) return null;
+    return {
+      status: state.status,
+      months: state.months,
+      requestedAt: state.requestedAt,
+      sinceIso: state.sinceIso,
+      finishedAt: state.finishedAt,
+      total: state.total,
+      checked: state.nextIndex,
+      captured: state.captured,
+      duplicates: state.duplicates,
+      filtered: state.filtered,
+      truncated: state.truncated,
+    };
+  }
+
+  /** The window start: the same calendar day `months` ago. */
+  function importSince(months: number): number {
+    const start = new Date(now());
+    start.setUTCMonth(start.getUTCMonth() - months);
+    return start.getTime();
+  }
+
+  /** Runs again soon while an import has work left; only once the sync is started. */
+  function scheduleFollowUp(delayMs: number): void {
+    if (!timer || followUpTimer) return;
+    followUpTimer = setTimeout(() => {
+      followUpTimer = null;
+      void guardedRun();
+    }, delayMs);
+    followUpTimer.unref?.();
   }
 
   function backlog(): string[] {
@@ -268,10 +415,62 @@ export function createGmailSync(deps: {
     return { primary: account, aliases: new Set([account, ...aliases]) };
   }
 
-  async function drain(client: GmailClient, owner: GmailOwner, counters: GmailSyncCounters): Promise<number> {
+  /** One run's messages.get budget, shared by new mail (first) and an import. */
+  interface RunBudget { remaining: number; fetched: number }
+
+  type MessageOutcome =
+    | { kind: 'gone' }
+    | { kind: 'unreadable' }
+    | { kind: 'emitted'; direction: 'sent' | 'received'; at: string | null }
+    | { kind: 'filtered'; reason: GmailSkipReason; at: string | null };
+
+  /**
+   * Fetches and decides one message. Transport, quota, and auth failures
+   * throw, so the caller keeps the id for the next run.
+   */
+  async function fetchAndDecide(
+    client: GmailClient,
+    id: string,
+    owner: GmailOwner,
+    patterns: string[],
+    budget: RunBudget,
+  ): Promise<MessageOutcome> {
+    if (budget.fetched > 0 && getIntervalMs > 0) await sleep(getIntervalMs);
+    budget.fetched++;
+    budget.remaining--;
+    let message;
+    try {
+      message = await client.getMessage(id);
+    } catch (error) {
+      // Deleted between listing and fetching: nothing to capture.
+      if (error instanceof GoogleApiError && error.status === 404) return { kind: 'gone' };
+      // A structurally broken answer for this one id cannot improve on
+      // retry; skipping it keeps the rest of the queue moving.
+      if (error instanceof GoogleApiError && error.code === 'unreadable_response' && error.status === 200) {
+        console.warn(`[GmailSync] skipped an unreadable message: ${error.message}`);
+        return { kind: 'unreadable' };
+      }
+      throw error;
+    }
+    let decision;
+    try {
+      decision = decideGmailMessage(message, owner, patterns);
+    } catch (error) {
+      // One malformed message must not block every later one.
+      console.warn(`[GmailSync] skipped a message that could not be parsed: ${(error as Error)?.name ?? 'Error'}`);
+      return { kind: 'unreadable' };
+    }
+    const at = messageTimestampOf(message);
+    if (decision.kind === 'emit') {
+      emit(decision.item);
+      return { kind: 'emitted', direction: decision.direction === 'sent' ? 'sent' : 'received', at };
+    }
+    return { kind: 'filtered', reason: decision.reason, at };
+  }
+
+  async function drain(client: GmailClient, owner: GmailOwner, counters: GmailSyncCounters, budget: RunBudget): Promise<number> {
     const queue = backlog();
     const patterns = noisePatterns();
-    let fetched = 0;
     let decided = 0;
     let newest = getSetting<string>(db, KEYS.lastMessageAt) ?? '';
     const persist = () => {
@@ -288,47 +487,23 @@ export function createGmailSync(deps: {
           decided++;
           continue;
         }
-        if (fetched >= maxMessagesPerRun) break;
-        if (fetched > 0 && getIntervalMs > 0) await sleep(getIntervalMs);
-        fetched++;
-        let message;
+        if (budget.remaining <= 0) break;
+        let outcome: MessageOutcome;
         try {
-          message = await client.getMessage(id);
+          outcome = await fetchAndDecide(client, id, owner, patterns, budget);
         } catch (error) {
-          // Deleted between listing and fetching: nothing to capture.
-          if (error instanceof GoogleApiError && error.status === 404) { counters.skipped++; decided++; continue; }
-          // A structurally broken answer for this one id cannot improve on
-          // retry; skipping it keeps the rest of the queue moving.
-          if (error instanceof GoogleApiError && error.code === 'unreadable_response' && error.status === 200) {
-            console.warn(`[GmailSync] skipped an unreadable message: ${error.message}`);
-            counters.failed++;
-            decided++;
-            continue;
-          }
           // Transport, quota, and auth failures stop the run; the id stays
           // queued and the next run retries it.
           counters.failed++;
           throw error;
         }
-        let decision;
-        try {
-          decision = decideGmailMessage(message, owner, patterns);
-        } catch (error) {
-          // One malformed message must not block every later one.
-          console.warn(`[GmailSync] skipped a message that could not be parsed: ${(error as Error)?.name ?? 'Error'}`);
-          counters.failed++;
-          decided++;
-          continue;
-        }
-        if (decision.kind === 'emit') {
-          emit(decision.item);
+        if (outcome.kind === 'gone') counters.skipped++;
+        else if (outcome.kind === 'unreadable') counters.failed++;
+        else if (outcome.kind === 'emitted') {
           counters.emitted++;
-          if (decision.direction === 'sent') counters.sent++; else counters.received++;
-        } else {
-          countSkip(counters, decision.reason);
-        }
-        const at = messageTimestampOf(message);
-        if (at && at > newest) newest = at;
+          if (outcome.direction === 'sent') counters.sent++; else counters.received++;
+        } else countSkip(counters, outcome.reason);
+        if ((outcome.kind === 'emitted' || outcome.kind === 'filtered') && outcome.at && outcome.at > newest) newest = outcome.at;
         decided++;
         if (decided % PERSIST_EVERY === 0) persist();
       }
@@ -336,6 +511,75 @@ export function createGmailSync(deps: {
       persist();
     }
     return queue.length - decided;
+  }
+
+  /**
+   * An active import lists its window once (newest first, capped), stores the
+   * ids oldest first, then decides them with whatever budget new mail left.
+   * Mail already stored is skipped without a fetch. A failed fetch throws and
+   * keeps the cursor; the next run resumes there.
+   */
+  async function importStep(client: GmailClient, owner: GmailOwner, budget: RunBudget): Promise<GmailSyncResult['import']> {
+    let state = readImport();
+    if (!state || !importActive(state)) return undefined;
+    const generation = importGeneration;
+    if (state.status === 'requested') {
+      const since = importSince(state.months);
+      const query = `after:${Math.floor(since / 1000)} ${FULL_SYNC_EXCLUSIONS}`;
+      const listed: string[] = [];
+      let pageToken: string | undefined;
+      for (let page = 0; page < maxImportListPages; page++) {
+        const result = await client.listMessages({ q: query, pageToken, maxResults: 500 });
+        for (const message of result.messages) listed.push(message.id);
+        pageToken = result.nextPageToken;
+        if (!pageToken) break;
+      }
+      // Stopped, restarted, or the mailbox changed while listing.
+      if (generation !== importGeneration) return undefined;
+      if (pageToken) console.warn(`[GmailSync] import window holds more than ${listed.length} messages; importing the newest ${listed.length}`);
+      const ids = listed.reverse();
+      state = { ...state, status: 'importing', sinceIso: new Date(since).toISOString(), total: ids.length, nextIndex: 0, truncated: Boolean(pageToken) };
+      const listedState = state;
+      db.transaction(() => {
+        setSetting(db, KEYS.importIds, ids);
+        setSetting(db, KEYS.import, listedState);
+      })();
+      console.log(`[GmailSync] import listed ${ids.length} messages since ${listedState.sinceIso}`);
+    }
+    const ids = importIds();
+    const current: GmailImportState = { ...state };
+    const patterns = noisePatterns();
+    const startIndex = current.nextIndex;
+    const capturedBefore = current.captured;
+    const persist = () => {
+      if (generation !== importGeneration) return;
+      const done = current.nextIndex >= ids.length;
+      const saved: GmailImportState = done ? { ...current, status: 'done', finishedAt: new Date(now()).toISOString() } : current;
+      db.transaction(() => {
+        setSetting(db, KEYS.import, saved);
+        if (done) setSetting(db, KEYS.importIds, []);
+      })();
+    };
+    try {
+      while (current.nextIndex < ids.length && generation === importGeneration) {
+        const id = ids[current.nextIndex];
+        if (hasUrl.get(gmailItemUrl(id))) {
+          current.duplicates++;
+          current.nextIndex++;
+          continue;
+        }
+        if (budget.remaining <= 0) break;
+        const outcome = await fetchAndDecide(client, id, owner, patterns, budget);
+        if (outcome.kind === 'emitted') current.captured++;
+        else if (outcome.kind === 'unreadable') current.failed++;
+        else current.filtered++;
+        current.nextIndex++;
+        if (current.nextIndex % PERSIST_EVERY === 0) persist();
+      }
+    } finally {
+      persist();
+    }
+    return { checked: current.nextIndex - startIndex, captured: current.captured - capturedBefore, left: ids.length - current.nextIndex };
   }
 
   function countSkip(counters: GmailSyncCounters, reason: GmailSkipReason): void {
@@ -390,8 +634,11 @@ export function createGmailSync(deps: {
           : now() - lookbackHours * 3_600_000;
         await fullSync(client, since, result.counters);
       }
-      result.backlog = await drain(client, owner, result.counters);
+      const budget: RunBudget = { remaining: maxMessagesPerRun, fetched: 0 };
+      result.backlog = await drain(client, owner, result.counters, budget);
       setSetting(db, KEYS.mailActive, true);
+      // New mail first; an older-mail import gets whatever budget is left.
+      result.import = await importStep(client, owner, budget);
     } catch (error) {
       result.status = 'failed';
       result.reason = error instanceof GmailAuthError || error instanceof GoogleApiError
@@ -425,10 +672,13 @@ export function createGmailSync(deps: {
       deps.captureHealth?.reportSuccess('gmail');
       lastLoggedError = '';
       const c = result.counters;
+      const imported = result.import
+        ? `; import: ${result.import.checked} checked, ${result.import.captured} captured, ${result.import.left} left`
+        : '';
       console.log(
         `[GmailSync] ${result.mode} sync in ${(result.durationMs / 1000).toFixed(1)}s — ${c.listed} listed → `
         + `${c.emitted} emitted (${c.received} received, ${c.sent} sent; ${c.noise} noise, ${c.notAddressed} not addressed, `
-        + `${c.skipped} skipped, ${c.duplicates} dup); ${result.backlog} left`,
+        + `${c.skipped} skipped, ${c.duplicates} dup); ${result.backlog} left${imported}`,
       );
     }
     return result;
@@ -443,7 +693,14 @@ export function createGmailSync(deps: {
       return await runOnce();
     } finally {
       running = false;
+      // An import with work left runs again in a minute, not five.
+      if (importActive(readImport())) scheduleFollowUp(importIntervalMs);
     }
+  }
+
+  function captured(): GmailCapturedCounts {
+    const row = capturedCounts.get() as { total: number; sent: number; inProjects: number };
+    return { total: row.total, received: row.total - row.sent, sent: row.sent, inProjects: row.inProjects };
   }
 
   function getStatus(): GmailSyncStatusView {
@@ -457,6 +714,8 @@ export function createGmailSync(deps: {
       backlog: backlog().length,
       hasCursor: Boolean(getSetting<string>(db, KEYS.historyId)),
       lastRun: getSetting<Record<string, unknown>>(db, KEYS.lastRun) ?? null,
+      captured: captured(),
+      import: importView(),
     };
   }
 
@@ -467,6 +726,55 @@ export function createGmailSync(deps: {
     }
     if (input.noiseSenders !== undefined) {
       setSetting(db, KEYS.noiseSenders, cleanNoisePatterns(input.noiseSenders));
+    }
+    return getStatus();
+  }
+
+  function requestImport(input: { months?: unknown }): GmailSyncStatusView {
+    const months = input?.months;
+    if (typeof months !== 'number' || !GMAIL_IMPORT_MONTHS.includes(months)) {
+      throw new GmailImportError(`Choose an import window of ${GMAIL_IMPORT_MONTHS.join(' or ')} months.`, 'invalid_window');
+    }
+    if (!connection.accountEmail()) {
+      throw new GmailImportError('Connect Gmail before importing older mail.', 'not_connected');
+    }
+    if (importActive(readImport())) {
+      throw new GmailImportError('An import is already running. Stop it to start a new one.', 'import_active');
+    }
+    importGeneration++;
+    const state: GmailImportState = {
+      status: 'requested',
+      months,
+      requestedAt: new Date(now()).toISOString(),
+      sinceIso: null,
+      finishedAt: null,
+      total: 0,
+      nextIndex: 0,
+      captured: 0,
+      duplicates: 0,
+      filtered: 0,
+      failed: 0,
+      truncated: false,
+    };
+    db.transaction(() => {
+      setSetting(db, KEYS.import, state);
+      setSetting(db, KEYS.importIds, []);
+    })();
+    console.log(`[GmailSync] import of the last ${months} months requested`);
+    // A run in progress picks it up or schedules the next one when it ends.
+    if (!running) scheduleFollowUp(1_000);
+    return getStatus();
+  }
+
+  function stopImport(): GmailSyncStatusView {
+    const state = readImport();
+    if (state && importActive(state)) {
+      importGeneration++;
+      db.transaction(() => {
+        setSetting(db, KEYS.import, { ...state, status: 'stopped', finishedAt: new Date(now()).toISOString() });
+        setSetting(db, KEYS.importIds, []);
+      })();
+      console.log(`[GmailSync] import stopped after ${state.nextIndex} of ${state.total} messages`);
     }
     return getStatus();
   }
@@ -485,11 +793,14 @@ export function createGmailSync(deps: {
     stop(): void {
       if (initialTimer) { clearTimeout(initialTimer); initialTimer = null; }
       if (timer) { clearInterval(timer); timer = null; }
+      if (followUpTimer) { clearTimeout(followUpTimer); followUpTimer = null; }
     },
     runNow: guardedRun,
     isRunning: () => running,
     getStatus,
     updateConfig,
+    requestImport,
+    stopImport,
   };
 }
 

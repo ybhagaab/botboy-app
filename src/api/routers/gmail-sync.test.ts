@@ -113,6 +113,8 @@ describe('Gmail sync router', () => {
       () => request(server).post('/api/gmail-sync/disconnect').send({}),
       () => request(server).put('/api/gmail-sync/config').send({ enabled: false }),
       () => request(server).post('/api/gmail-sync/run').send({}),
+      () => request(server).post('/api/gmail-sync/import').send({ months: 6 }),
+      () => request(server).delete('/api/gmail-sync/import'),
     ];
     for (const change of changes) {
       expect((await change()).status).toBe(403);
@@ -173,6 +175,35 @@ describe('Gmail sync router', () => {
     // A callback carrying another site's Origin is refused outright.
     const foreign = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Origin', 'https://evil.example').query({ code: 'x', state: 'y' });
     expect(foreign.status).toBe(403);
+  });
+
+  it('starts and stops the older-mail import from the owner page, with a validated window', async () => {
+    const notConnected = await owner(request(server).post('/api/gmail-sync/import')).send({ months: 6 });
+    expect(notConnected.status).toBe(409);
+    expect(notConnected.body.code).toBe('not_connected');
+
+    await connectThroughCallback();
+    const wrongWindow = await owner(request(server).post('/api/gmail-sync/import')).send({ months: 3 });
+    expect(wrongWindow.status).toBe(400);
+    expect(wrongWindow.body.code).toBe('invalid_window');
+    const extra = await owner(request(server).post('/api/gmail-sync/import')).send({ months: 6, since: '2020-01-01' });
+    expect(extra.status).toBe(400);
+    expect(extra.body.code).toBe('invalid_request');
+
+    const started = await owner(request(server).post('/api/gmail-sync/import')).send({ months: 6 });
+    expect(started.status).toBe(200);
+    expect(started.headers['cache-control']).toBe('no-store');
+    expect(started.body.status.import).toMatchObject({ status: 'requested', months: 6 });
+    const again = await owner(request(server).post('/api/gmail-sync/import')).send({ months: 6 });
+    expect(again.status).toBe(409);
+    expect(again.body.code).toBe('import_active');
+
+    const stopped = await owner(request(server).delete('/api/gmail-sync/import'));
+    expect(stopped.status).toBe(200);
+    expect(stopped.body.status.import).toMatchObject({ status: 'stopped' });
+    const status = await request(server).get('/api/gmail-sync/status');
+    expect(status.body.status.import.status).toBe('stopped');
+    expect(status.body.status.captured).toEqual({ total: 0, received: 0, sent: 0, inProjects: 0 });
   });
 
   it('disconnects, pauses, and runs from the owner page', async () => {

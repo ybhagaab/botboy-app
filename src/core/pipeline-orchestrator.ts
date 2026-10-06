@@ -175,6 +175,13 @@ export function createPipelineOrchestrator(deps: {
    * is due, ahead of long document reads.
    */
   placementRepair?: { tick(reader: BrainUpdater): Promise<PlacementRepairTick> };
+  /**
+   * Failed routing calls (route-retry.ts): a bounded sweep returns retryable
+   * `route_failed` items to `extracted` at the start of an interpretation
+   * tick, so the same tick's wave routes them. Synchronous; runs under the
+   * interpretation lock.
+   */
+  routeRetry?: { sweep(): unknown };
   config?: OrchestratorConfig;
 }): PipelineOrchestrator {
   const { db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, digester, brainStore, gister } = deps;
@@ -182,6 +189,12 @@ export function createPipelineOrchestrator(deps: {
   function adoptFileReferences(): void {
     try { deps.fileReferences?.adoptOrphans(); } catch (error) {
       console.warn(`[Pipeline] file reference adoption failed: ${(error as Error)?.message ?? error}`);
+    }
+  }
+
+  function retryFailedRouting(): void {
+    try { deps.routeRetry?.sweep(); } catch (error) {
+      console.warn(`[Pipeline] routing retry sweep failed: ${(error as Error)?.message ?? error}`);
     }
   }
 
@@ -257,6 +270,8 @@ export function createPipelineOrchestrator(deps: {
     interpreting = true;
     try {
       adoptFileReferences();
+      // Requeued rows are old, so the age trigger fires their wave right below.
+      retryFailedRouting();
       if (!batcher.shouldFire()) {
         if (!(await repairPlacements())) await readDocumentPart();
         return { ran: false };

@@ -17,6 +17,7 @@ import type { DocumentParser } from './document-parser.js';
 import type { OcrEngine, OcrResult } from './ocr-engine.js';
 import type { PipelineLlm } from './pipeline-llm.js';
 import type { PlacementRepairTick } from './placement-repair.js';
+import { createRouteRetry } from './route-retry.js';
 
 describe('PipelineOrchestrator', () => {
   let storage: StorageLayer;
@@ -112,6 +113,7 @@ describe('PipelineOrchestrator', () => {
   function buildState(llm: PipelineLlm, extra: {
     documentReads?: { tick(reader: unknown): Promise<unknown> };
     placementRepair?: { tick(reader: unknown): Promise<PlacementRepairTick> };
+    routeRetry?: (deps: { db: ReturnType<StorageLayer['getDb']>; batcher: ReturnType<typeof createBatcher> }) => { sweep(): unknown };
   } = {}) {
     const db = storage.getDb();
     const contentStore = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
@@ -127,6 +129,7 @@ describe('PipelineOrchestrator', () => {
       db, extractor, batcher, librarian, brainUpdater, reconciler, organizer, brainStore,
       documentReads: extra.documentReads,
       placementRepair: extra.placementRepair,
+      routeRetry: extra.routeRetry?.({ db, batcher }),
       config: { extractionConcurrency: 2 },
     });
     return { orchestrator, brainStore };
@@ -225,6 +228,37 @@ describe('PipelineOrchestrator', () => {
     await orch.tickExtraction();
     expect((await orch.tickInterpretation()).ran).toBe(true);
     expect(placementRepair.tick).toHaveBeenCalledTimes(3); // the wave had the tick
+  });
+
+  it('retries a failed routing call on a later tick and routes the item in that same tick', async () => {
+    let librarianCalls = 0;
+    const llm: PipelineLlm = {
+      isAvailable: () => true,
+      complete: async (prompt) => {
+        if (prompt.includes('librarian')) {
+          librarianCalls++;
+          if (librarianCalls === 1) throw new Error('The operation was aborted due to timeout');
+          return JSON.stringify([{ itemId: 'a', decision: 'new', newTitle: 'Extracted Body Project' }]);
+        }
+        return JSON.stringify({ summary: 's', statusLine: 'active', tasks: [], blockers: [], people: [], newActivity: ['retried'] });
+      },
+    };
+    const orch = buildState(llm, {
+      routeRetry: ({ db, batcher }) => createRouteRetry({ db, batcher, isAvailable: () => true, config: { backoffMs: [0], minIntervalMs: 0 } }),
+    }).orchestrator;
+    const f = path.join(dir, 'a.txt');
+    writeFileSync(f, 'x');
+    insertCaptured('a', f, 'manual');
+    await orch.tickExtraction();
+    await orch.tickInterpretation(); // the routing call times out
+    const read = () => storage.getDb().prepare('SELECT process_state AS state, project_id AS projectId FROM work_items WHERE id = ?').get('a') as any;
+    expect(read().state).toBe('route_failed');
+
+    const retried = await orch.tickInterpretation();
+    expect(retried.ran).toBe(true);
+    expect(read().state).toBe('routed');
+    expect(read().projectId).toBeTruthy();
+    expect(librarianCalls).toBe(2);
   });
 
   it('interpretation tick does not fire when nothing is pending', async () => {

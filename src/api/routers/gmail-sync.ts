@@ -21,6 +21,7 @@ import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-ow
 import { GmailCredentialInputError } from '../../core/gmail-credentials.js';
 import { GmailAuthError } from '../../core/gmail-connection.js';
 import { GmailComposeError, type GmailComposeErrorCode } from '../../core/gmail-compose.js';
+import { GmailImportError } from '../../monitors/gmail-sync.js';
 
 const OWNER_UI_NEXT_ACTION = 'Open Connections → Gmail in the BotBoy window and use its controls.';
 const DRAFT_CARD_NEXT_ACTION = 'Use the Send or Discard button on the draft card in the BotBoy chat.';
@@ -167,6 +168,35 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     // A run takes seconds; waiting for the real result beats a 202.
     const result = await deps.gmailSync.runNow();
     return res.json({ result, status: deps.gmailSync.getStatus() });
+  });
+
+  // ── Older-mail import (GMAIL_API_INTEGRATION_PLAN.md §12) ──
+  // Owner-started from the Gmail page; the sync lists the window on its next
+  // run and works through it in the background, so these answer at once.
+
+  router.post('/gmail-sync/import', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Importing older Gmail mail', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.gmailSync) return unavailable(res);
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'months');
+    if (unexpected.length) return res.status(400).json({ error: 'Only months may be sent.', code: 'invalid_request' });
+    res.set('Cache-Control', 'no-store');
+    try {
+      return res.json({ status: deps.gmailSync.requestImport({ months: body.months }) });
+    } catch (error) {
+      if (error instanceof GmailImportError) {
+        return res.status(error.code === 'invalid_window' ? 400 : 409).json({ error: error.message, code: error.code });
+      }
+      console.error(`[Gmail] Starting the import failed: ${error instanceof Error ? error.name : 'Error'}`);
+      return res.status(500).json({ error: 'BotBoy could not start the import.', code: 'internal_error' });
+    }
+  });
+
+  router.delete('/gmail-sync/import', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Stopping the Gmail import', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.gmailSync) return unavailable(res);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ status: deps.gmailSync.stopImport() });
   });
 
   // ── Chat draft cards (GMAIL_CHAT_TOOLS_PLAN.md §7) ──

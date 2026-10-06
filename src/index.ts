@@ -127,6 +127,7 @@ import { createFileReferenceMigration } from './core/file-reference-migration.js
 import { createRawCaptureRepair } from './core/raw-capture-repair.js';
 import { createDocumentReads } from './core/document-reads.js';
 import { createPlacementRepair } from './core/placement-repair.js';
+import { createRouteRetry } from './core/route-retry.js';
 import { addLocalFolder } from './core/local-folders-config.js';
 import os from 'os';
 import { createDiskSpaceMonitor } from './core/disk-space.js';
@@ -792,7 +793,10 @@ async function main() {
   // projects the model chose, then their brains are updated on idle ticks
   // (placement-repair.ts, owner decision 2026-10-05).
   const placementRepair = createPlacementRepair({ db, contentStore, brainStore, llm: pipelineLlm });
-  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister, fileReferences, documentReads, placementRepair });
+  // Items whose routing call failed get bounded retries (route-retry.ts):
+  // at most three attempts in all, with backoff, never mixed with fresh work.
+  const routeRetry = createRouteRetry({ db, batcher, isAvailable: () => pipelineLlm.isAvailable() });
+  const pipelineOrchestrator = createPipelineOrchestrator({ db, extractor, batcher, librarian, brainUpdater, reconciler, organizer: projectOrganizer, digester: channelDigester, brainStore, projectRelations, gister: evidenceGister, fileReferences, documentReads, placementRepair, routeRetry });
   // A newly activated model (Settings → AI model) drains the waiting capture
   // backlog now; later work follows the normal interpretation cadence.
   kickInformationPipeline = () => {

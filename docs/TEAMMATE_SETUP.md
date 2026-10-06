@@ -259,10 +259,14 @@ own private data. When it
 refuses a file, it tells you which one and why; you can still attach that file
 yourself in Gmail.
 
-The first sync reads the last 48 hours of mail. After that, BotBoy checks for
-new mail every 5 minutes and reads at most 100 messages per sync. Received mail
-is kept when your address is in To or Cc; sent mail is always kept, including
-mail BotBoy sends for you. The client and your sign-in token stay in
+The first sync reads the last 30 days of mail. After that, BotBoy checks for
+new mail every 5 minutes and reads at most 100 messages per sync. To bring in
+older mail, choose **Import the last 6 months** on the Gmail page: BotBoy works
+through it in the background after new mail, about 100 messages a minute, and
+shows its progress; **Stop import** ends it, and mail already captured stays.
+The page shows how many emails BotBoy holds and how many reached a project.
+Received mail is kept when your address is in To or Cc; sent mail is always
+kept, including mail BotBoy sends for you. The client and your sign-in token stay in
 `~/.personal-productivity-tracker/gmail.json`, which only your user account can
 read; the BotBoy owner never sees your token or your mail. **Disconnect**
 revokes the access at Google; mail that BotBoy already captured stays.

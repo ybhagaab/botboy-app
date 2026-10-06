@@ -31,6 +31,7 @@ function load(state: Record<string, unknown>): Helpers {
     constLine('icon'), constLine('esc'), constLine('attr'), constLine('number'),
     topLevel('relativeTime'), topLevel('whenPhrase'), topLevel('pageHead'),
     topLevel('captureIssueFor'), topLevel('captureIssueDetail'),
+    topLevel('gmailImportActive'), topLevel('gmailImportDate'), topLevel('renderGmailImportCard'),
     topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
     'return { gmailSyncCardModel, renderGmailSyncSettings };',
   ].join('\n');
@@ -79,11 +80,23 @@ describe('Gmail connection UI', () => {
 
     state.gmailSync.status = status({
       backlog: 40,
+      captured: { total: 18, received: 13, sent: 5, inProjects: 0 },
       lastRun: { at: new Date().toISOString(), status: 'completed', mode: 'full', counters: { emitted: 12 } },
     });
     expect(load(state).gmailSyncCardModel()).toEqual({
-      status: 'Active', tone: 'good', detail: 'Last sync just now: 12 emails ingested from jane.doe@gmail.com; 40 more next run',
+      status: 'Active', tone: 'good', detail: '18 emails captured from jane.doe@gmail.com. Last sync just now: 12 new; 40 more next run.',
     });
+
+    // An idle 5-minute run reads as "no new mail", never as "0 captured".
+    state.gmailSync.status = status({
+      captured: { total: 18, received: 13, sent: 5, inProjects: 0 },
+      lastRun: { at: new Date().toISOString(), status: 'completed', mode: 'partial', counters: { emitted: 0 } },
+    });
+    expect(load(state).gmailSyncCardModel().detail).toBe('18 emails captured from jane.doe@gmail.com. Last sync just now: no new mail.');
+
+    // A server from before the totals still names the account.
+    state.gmailSync.status = status({ lastRun: { at: new Date().toISOString(), status: 'completed', mode: 'partial', counters: { emitted: 2 } } });
+    expect(load(state).gmailSyncCardModel().detail).toBe('Connected as jane.doe@gmail.com. Last sync just now: 2 new.');
   });
 
   it('shows Reconnect, pause, a lasting capture issue, and an unavailable API as warnings', () => {
@@ -144,7 +157,8 @@ describe('Gmail connection UI', () => {
     expect(document.querySelector('[data-action="gmail-sync-toggle"]')!.textContent).toBe('Pause automatic sync');
     expect(document.querySelector('[data-action="gmail-sync-disconnect"]')).not.toBeNull();
     expect(document.querySelector('[data-action="gmail-sync-run"]')).not.toBeNull();
-    expect(document.body.textContent).toContain('4 ingested');
+    expect(document.body.textContent).toContain('4 new');
+    expect(document.body.textContent).not.toContain('ingested');
     expect(document.body.textContent).toContain('Update just now in 1.2s for jane.doe@gmail.com');
     expect(document.body.textContent).toContain('Suppressed (this sync replaces it)');
 
@@ -152,6 +166,64 @@ describe('Gmail connection UI', () => {
     document.body.innerHTML = load(state).renderGmailSyncSettings();
     expect(document.querySelector('[data-action="gmail-sync-run"]')!.textContent).toContain('Syncing…');
     expect((document.querySelector('[data-action="gmail-sync-disconnect"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('shows what BotBoy holds beside the last run, and the 30-day window', () => {
+    state.gmailSync.status = status({ captured: { total: 1800, received: 1300, sent: 500, inProjects: 42 } });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    const details = document.querySelector('.connection-details')!.textContent!;
+    expect(details).toContain('Captured1,800 emails (1,300 received, 500 sent)');
+    expect(details).toContain('In projects42');
+    expect(document.body.textContent).toContain('captures the last 30 days of mail when you connect, then new mail as it arrives');
+    expect(document.body.textContent).toContain('searches and reads your whole mailbox');
+  });
+
+  it('offers Import the last 6 months, shows progress with Stop, and reports the finished import', () => {
+    state.gmailSync.status = status({ import: null });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    const start = document.querySelector('[data-action="gmail-sync-import"]')!;
+    expect(start.textContent).toContain('Import the last 6 months');
+    expect(document.querySelector('[data-action="gmail-sync-import-stop"]')).toBeNull();
+    expect(document.body.textContent).toContain('When you connect, BotBoy captures the last 30 days.');
+
+    state.gmailSync.status = status({ import: { status: 'requested', months: 6, requestedAt: new Date().toISOString(), sinceIso: null, finishedAt: null, total: 0, checked: 0, captured: 0, duplicates: 0, filtered: 0, truncated: false } });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    expect(document.body.textContent).toContain('BotBoy lists the last 6 months on its next sync');
+    expect(document.querySelector('[data-action="gmail-sync-import-stop"]')!.textContent).toBe('Stop import');
+
+    const importing = { status: 'importing', months: 6, requestedAt: new Date().toISOString(), sinceIso: '2026-04-06T07:00:00.000Z', finishedAt: null, total: 3900, checked: 120, captured: 30, duplicates: 10, filtered: 80, truncated: false };
+    state.gmailSync.status = status({
+      import: importing,
+      captured: { total: 48, received: 40, sent: 8, inProjects: 3 },
+      lastRun: { at: new Date().toISOString(), status: 'completed', mode: 'partial', counters: { emitted: 0 } },
+    });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    expect(document.body.textContent).toContain('120 of 3,900 checked, 30 captured. About 38 minutes left.');
+    expect(document.body.textContent).toMatch(/Importing mail since \d{1,2} Apr 2026|Importing mail since Apr \d{1,2}, 2026/);
+    expect(document.querySelector('[data-action="gmail-sync-import"]')).toBeNull();
+    expect(load(state).gmailSyncCardModel().detail).toBe('48 emails captured from jane.doe@gmail.com. Last sync just now: no new mail. Importing older mail: 120 of 3,900 checked.');
+
+    state.gmailSync.status = status({ import: { ...importing, status: 'done', checked: 3900, captured: 900, duplicates: 18, filtered: 2982, finishedAt: new Date().toISOString(), truncated: true } });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    expect(document.body.textContent).toContain('just now: 900 captured, 18 already in BotBoy, 2,982 filtered out.');
+    expect(document.body.textContent).toContain('BotBoy took the newest 10,000 messages');
+    expect(document.querySelector('[data-action="gmail-sync-import"]')).not.toBeNull();
+
+    state.gmailSync.status = status({ import: { ...importing, status: 'stopped', finishedAt: new Date().toISOString() } });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    expect(document.body.textContent).toContain('Import stopped just now after 120 of 3,900 messages: 30 captured.');
+
+    // Not connected: no import card at all.
+    state.gmailSync.status = status({ connection: connection({ connected: false, accountEmail: null }) });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    expect(document.querySelector('[data-action="gmail-sync-import"]')).toBeNull();
+
+    // The controls are wired, and the open page refreshes while an import runs.
+    expect(dashboard).toContain("request('/gmail-sync/import', { method: 'POST', body: { months: 6 } })");
+    expect(dashboard).toContain("request('/gmail-sync/import', { method: 'DELETE' })");
+    const poll = topLevel('pollVersion');
+    expect(poll).toContain("state.route.view === 'gmail-sync-settings' && !state.gmailSync.busy && gmailImportActive(state.gmailSync.status)");
+    expect(poll).toContain("startsWith('gmail-sync-')");
   });
 
   it('with BotBoy’s shared client shows only Connect, the unverified-app steps, and the own client under Advanced', () => {

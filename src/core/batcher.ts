@@ -52,6 +52,13 @@ export interface Batcher {
   shouldFire(): boolean;
   /** Apply a state transition, enforcing P5; returns false if disallowed. */
   transition(itemId: string, to: ProcessState, opts?: { projectId?: string | null }): boolean;
+  /**
+   * The retry edge for a failed routing call (route-retry.ts): compare-and-set
+   * `route_failed` → `extracted` with `batch_id` cleared, so the next wave
+   * selects the item again. Refuses any other state, a placed row, and a file
+   * reference; returns whether the row changed.
+   */
+  requeueRouteFailed(itemId: string): boolean;
 }
 
 export interface BatcherConfig {
@@ -140,6 +147,16 @@ export function createBatcher(db: Database.Database, config?: BatcherConfig): Ba
         db.prepare('UPDATE work_items SET process_state = ? WHERE id = ?').run(to, itemId);
       }
       return true;
+    },
+
+    requeueRouteFailed(itemId: string): boolean {
+      // A stale batch_id would read as "in flight" to the URL re-capture path
+      // (index.ts › isInFlight); nextWave stamps a fresh one.
+      const result = db.prepare(
+        `UPDATE work_items SET process_state = 'extracted', batch_id = NULL
+          WHERE id = ? AND process_state = 'route_failed' AND project_id IS NULL AND type <> 'file_reference'`,
+      ).run(itemId);
+      return result.changes === 1;
     },
   };
 }

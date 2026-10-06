@@ -25,6 +25,8 @@ import {
   type TodayProjectSection,
 } from '../../core/today.js';
 import { paramStr, type RouterDeps } from './deps.js';
+import { getSetting } from '../../core/storage.js';
+import { ROUTE_RETRY_RECEIPT_KEY } from '../../core/route-retry.js';
 
 const TODAY_ACTIONS = new Set<TodayItemAction>(['pin', 'unpin', 'snooze', 'dismiss', 'restore']);
 const TODAY_PROJECT_ACTIONS = new Set<TodayProjectAction>(['snooze', 'dismiss']);
@@ -250,6 +252,9 @@ export function createPipelineRouter(deps: RouterDeps): Router {
     const lastRuns = db
       .prepare('SELECT id, pass, batch_id, items_in, items_out, status, started_at, completed_at FROM pipeline_runs ORDER BY started_at DESC LIMIT 20')
       .all();
+    // The last routing-retry sweep (route-retry.ts); failures stay append-only,
+    // so a falling itemsByState.route_failed is the success signal.
+    const routeRetry = getSetting<Record<string, unknown>>(db, ROUTE_RETRY_RECEIPT_KEY) ?? null;
     res.json({
       ...health,
       itemsByState: byState,
@@ -258,6 +263,7 @@ export function createPipelineRouter(deps: RouterDeps): Router {
       documentReads,
       projectCount,
       lastRuns,
+      routeRetry,
     });
   });
 

@@ -34,6 +34,10 @@ function fakeMailbox() {
   const box = {
     pageSize: 500,
     historyExpired: false,
+    /** When set, messages.list waits for it (to stop an import mid-listing). */
+    listGate: null as Promise<void> | null,
+    /** When set, messages.get waits for it (to stop an import mid-fetch). */
+    getGate: null as Promise<void> | null,
     failGet: new Map<string, () => Error>(),
     override: new Map<string, () => GmailMessage>(),
     calls: { list: [] as string[], history: [] as string[], get: [] as string[], profile: 0 },
@@ -63,6 +67,7 @@ function fakeMailbox() {
         },
         async listMessages({ q, pageToken }) {
           box.calls.list.push(q);
+          if (box.listGate) await box.listGate;
           const after = Number(q.match(/after:(\d+)/)?.[1] ?? 0) * 1000;
           const excluded = ['DRAFT', 'SPAM', 'TRASH', 'CHAT', 'CATEGORY_PROMOTIONS', 'CATEGORY_SOCIAL'];
           const matching = [...messages.values()]
@@ -76,6 +81,7 @@ function fakeMailbox() {
         },
         async getMessage(id) {
           box.calls.get.push(id);
+          if (box.getGate) await box.getGate;
           const failure = box.failGet.get(id);
           if (failure) throw failure();
           const custom = box.override.get(id);
@@ -164,7 +170,8 @@ describe('Gmail sync', () => {
   const urls = () => emitted.map(item => item.url);
 
   function seedFirstConnectMailbox(): void {
-    box.add({ id: 'old', at: NOW - 72 * HOUR });
+    // Just outside the 30-day first-connect window.
+    box.add({ id: 'old', at: NOW - 31 * 24 * HOUR });
     box.add({ id: 'm1', at: NOW - 4 * HOUR, subject: 'Insights PRD' });
     box.add({ id: 'm2', at: NOW - 3 * HOUR, labels: ['SENT'], from: `Jane <${OWNER}>`, to: 'requester@example.com' });
     box.add({ id: 'm3', at: NOW - 2.5 * HOUR, from: 'Shop <no-reply@shop.example.com>' });
@@ -179,7 +186,7 @@ describe('Gmail sync', () => {
     const result = await gmail.runNow();
 
     expect(result).toMatchObject({ status: 'completed', mode: 'full', accountEmail: OWNER, backlog: 0 });
-    expect(box.calls.list).toEqual([`after:${Math.floor((NOW - 48 * HOUR) / 1000)} ${EXCLUSIONS}`]);
+    expect(box.calls.list).toEqual([`after:${Math.floor((NOW - 30 * 24 * HOUR) / 1000)} ${EXCLUSIONS}`]);
     expect(box.calls.get).toEqual(['m1', 'm2', 'm3', 'm4']);
     expect(urls()).toEqual(['gmail://mail/m1', 'gmail://mail/m2']);
     expect(emitted.map(item => item.type)).toEqual(['email_read', 'email_sent']);
@@ -193,7 +200,12 @@ describe('Gmail sync', () => {
     expect(setting<any>('gmail_sync.last_run')).toMatchObject({ status: 'completed', mode: 'full', accountEmail: OWNER, backlog: 0 });
     expect(health.reportSuccess).toHaveBeenCalledWith('gmail');
     expect(health.reportFailure).not.toHaveBeenCalled();
-    expect(gmail.getStatus()).toMatchObject({ enabled: true, hasCursor: true, backlog: 0, mailActive: true, intervalMinutes: 5 });
+    expect(gmail.getStatus()).toMatchObject({ enabled: true, hasCursor: true, backlog: 0, mailActive: true, intervalMinutes: 5, import: null });
+    // Totals come from the store, beside the last run's counters; Outlook mail is not Gmail.
+    storage.getDb().prepare(
+      "INSERT INTO work_items (id, type, source, title, captured_at, project_id) VALUES ('outlook', 'email_read', 'grasp', 'x', datetime('now'), 'p1')",
+    ).run();
+    expect(gmail.getStatus().captured).toEqual({ total: 2, received: 1, sent: 1, inProjects: 0 });
   });
 
   it('partial sync reads only new history, skips label-excluded adds without fetching, and moves the cursor', async () => {
@@ -366,6 +378,182 @@ describe('Gmail sync', () => {
     await gmail.runNow();
     expect(Date.now() - started).toBeGreaterThanOrEqual(45);
     expect(emitted).toHaveLength(3);
+  });
+
+  // ── Older-mail import (GMAIL_API_INTEGRATION_PLAN.md §12) ──
+
+  const DAY = 24 * HOUR;
+  const sixMonthsBefore = (at: number) => {
+    const start = new Date(at);
+    start.setUTCMonth(start.getUTCMonth() - 6);
+    return start.getTime();
+  };
+  const importQuery = (at: number) => `after:${Math.floor(sixMonthsBefore(at) / 1000)} ${EXCLUSIONS}`;
+
+  it('imports the last 6 months after new mail: one listing, oldest first, stored mail skipped, then done', async () => {
+    box.add({ id: 'ancient', at: NOW - 200 * DAY });
+    box.add({ id: 'o2', at: NOW - 90 * DAY });
+    box.add({ id: 'o1', at: NOW - 40 * DAY });
+    box.add({ id: 'recent', at: NOW - 2 * HOUR });
+    const { sync: gmail } = sync({ maxMessagesPerRun: 2 });
+    await gmail.runNow(); // first connect: the last 30 days only
+    expect(urls()).toEqual(['gmail://mail/recent']);
+
+    const requested = gmail.requestImport({ months: 6 });
+    expect(requested.import).toMatchObject({ status: 'requested', months: 6, total: 0, checked: 0 });
+
+    box.add({ id: 'new1', at: NOW + 60_000 });
+    clock = NOW + 5 * 60_000;
+    box.calls.get.length = 0;
+    const first = await gmail.runNow();
+    // New mail spent its share of the budget first; the import got the rest.
+    expect(box.calls.get).toEqual(['new1', 'o2']);
+    expect(box.calls.list.filter(query => query === importQuery(clock))).toHaveLength(1);
+    expect(first.import).toEqual({ checked: 1, captured: 1, left: 3 });
+    expect(setting('gmail_sync.import_ids')).toEqual(['o2', 'o1', 'recent', 'new1']);
+    expect(gmail.getStatus().import).toMatchObject({
+      status: 'importing', total: 4, checked: 1, captured: 1, sinceIso: new Date(sixMonthsBefore(clock)).toISOString(), truncated: false,
+    });
+
+    const second = await gmail.runNow();
+    expect(box.calls.get).toEqual(['new1', 'o2', 'o1']);
+    expect(second.import).toEqual({ checked: 3, captured: 1, left: 0 });
+    expect(urls()).toEqual(['recent', 'new1', 'o2', 'o1'].map(id => `gmail://mail/${id}`));
+    expect(gmail.getStatus().import).toMatchObject({ status: 'done', total: 4, checked: 4, captured: 2, duplicates: 2, filtered: 0 });
+    expect(gmail.getStatus().import?.finishedAt).toBe(new Date(clock).toISOString());
+    expect(setting('gmail_sync.import_ids')).toEqual([]);
+
+    // Done means done: later runs fetch nothing for it, and it may run again.
+    await gmail.runNow();
+    expect(box.calls.get).toEqual(['new1', 'o2', 'o1']);
+    expect(box.calls.list.filter(query => query.includes('after:'))).toHaveLength(2);
+    expect(gmail.requestImport({ months: 6 }).import?.status).toBe('requested');
+  });
+
+  it('counts filtered mail and resumes after a failed fetch at the same position', async () => {
+    box.add({ id: 'a1', at: NOW - 100 * DAY, from: 'Shop <no-reply@shop.example.com>' });
+    box.add({ id: 'a2', at: NOW - 90 * DAY });
+    box.add({ id: 'a3', at: NOW - 80 * DAY, to: 'everyone@example.com' });
+    box.add({ id: 'a4', at: NOW - 70 * DAY });
+    const { sync: gmail } = sync();
+    await gmail.runNow();
+    gmail.requestImport({ months: 6 });
+    box.failGet.set('a2', () => new GoogleApiError('Gmail message failed: network error (ECONNRESET)', 0, 'network'));
+    const failed = await gmail.runNow();
+    expect(failed).toMatchObject({ status: 'failed', reason: 'Gmail message failed: network error (ECONNRESET)' });
+    expect(gmail.getStatus().import).toMatchObject({ status: 'importing', total: 4, checked: 1, filtered: 1, captured: 0 });
+
+    box.failGet.clear();
+    const resumed = await gmail.runNow();
+    expect(resumed.status).toBe('completed');
+    expect(gmail.getStatus().import).toMatchObject({ status: 'done', checked: 4, captured: 2, filtered: 2 });
+    expect(urls()).toEqual(['gmail://mail/a2', 'gmail://mail/a4']);
+    expect(box.calls.get.filter(id => id === 'a2')).toHaveLength(2);
+    expect(box.calls.get.filter(id => id === 'a1')).toHaveLength(1);
+  });
+
+  it('stops on request, even mid-listing, and never writes progress back over the stop', async () => {
+    for (let index = 1; index <= 4; index++) box.add({ id: `s${index}`, at: NOW - (100 + index) * DAY });
+    const { sync: gmail } = sync({ maxMessagesPerRun: 1 });
+    await gmail.runNow();
+    gmail.requestImport({ months: 6 });
+    await gmail.runNow();
+    expect(gmail.getStatus().import).toMatchObject({ status: 'importing', checked: 1 });
+
+    const stopped = gmail.stopImport();
+    expect(stopped.import).toMatchObject({ status: 'stopped', checked: 1, total: 4 });
+    expect(setting('gmail_sync.import_ids')).toEqual([]);
+    const gets = box.calls.get.length;
+    await gmail.runNow();
+    expect(box.calls.get).toHaveLength(gets);
+    expect(gmail.getStatus().import?.status).toBe('stopped');
+
+    // A stop while the window is being listed wins over the listing.
+    gmail.requestImport({ months: 6 });
+    let release!: () => void;
+    box.listGate = new Promise<void>(resolve => { release = resolve; });
+    const running = gmail.runNow();
+    await vi.waitFor(() => expect(box.calls.list.filter(query => query === importQuery(clock)).length).toBe(2));
+    gmail.stopImport();
+    release();
+    await running;
+    box.listGate = null;
+    expect(gmail.getStatus().import).toMatchObject({ status: 'stopped', total: 0 });
+    expect(setting('gmail_sync.import_ids')).toEqual([]);
+
+    // So does a stop while a message is being fetched.
+    gmail.requestImport({ months: 6 });
+    await gmail.runNow(); // lists the window, decides one message
+    const before = box.calls.get.length;
+    let releaseGet!: () => void;
+    box.getGate = new Promise<void>(resolve => { releaseGet = resolve; });
+    const deciding = gmail.runNow();
+    await vi.waitFor(() => expect(box.calls.get).toHaveLength(before + 1));
+    gmail.stopImport();
+    releaseGet();
+    await deciding;
+    box.getGate = null;
+    expect(gmail.getStatus().import?.status).toBe('stopped');
+    expect(setting('gmail_sync.import_ids')).toEqual([]);
+  });
+
+  it('refuses another window, a disconnected mailbox, and a second import; a new account clears it', async () => {
+    const { sync: gmail, setAccount } = sync();
+    for (const months of [3, 12, '6', undefined]) {
+      expect(() => gmail.requestImport({ months })).toThrow(expect.objectContaining({ code: 'invalid_window' }));
+    }
+    gmail.requestImport({ months: 6 });
+    expect(() => gmail.requestImport({ months: 6 })).toThrow(expect.objectContaining({ code: 'import_active' }));
+    expect(gmail.stopImport().import?.status).toBe('stopped');
+    expect(gmail.stopImport().import?.status).toBe('stopped');
+
+    gmail.requestImport({ months: 6 });
+    setAccount('someone.else@gmail.com');
+    expect(gmail.getStatus().import).toBeNull();
+    expect(setting('gmail_sync.import')).toBeNull();
+
+    const disconnected = sync({}, null);
+    expect(() => disconnected.sync.requestImport({ months: 6 })).toThrow(expect.objectContaining({ code: 'not_connected' }));
+  });
+
+  it('keeps only the newest 10,000 ids of a huge window and says so', async () => {
+    box.pageSize = 2;
+    for (let index = 1; index <= 5; index++) box.add({ id: `w${index}`, at: NOW - (40 + index) * DAY });
+    const { sync: gmail } = sync({ maxImportListPages: 2, maxMessagesPerRun: 0 });
+    await gmail.runNow();
+    gmail.requestImport({ months: 6 });
+    await gmail.runNow();
+    // Two pages of two: the newest four, oldest first; the oldest (w5) is left out.
+    expect(setting('gmail_sync.import_ids')).toEqual(['w4', 'w3', 'w2', 'w1']);
+    expect(gmail.getStatus().import).toMatchObject({ status: 'importing', total: 4, truncated: true });
+  });
+
+  it('runs every minute while an import has work left, and only once the sync is started', async () => {
+    vi.useFakeTimers({ now: NOW });
+    try {
+      for (let index = 1; index <= 3; index++) box.add({ id: `f${index}`, at: NOW - (100 + index) * DAY });
+      const { sync: gmail } = sync({ maxMessagesPerRun: 1, intervalMs: 60 * 60_000, initialDelayMs: 60 * 60_000, importIntervalMs: 60_000 });
+      await gmail.runNow();
+      gmail.requestImport({ months: 6 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(gmail.getStatus().import?.status).toBe('requested'); // not started: nothing scheduled
+
+      gmail.start();
+      gmail.stopImport();
+      gmail.requestImport({ months: 6 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(gmail.getStatus().import).toMatchObject({ status: 'importing', checked: 1 });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(gmail.getStatus().import).toMatchObject({ checked: 2 });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(gmail.getStatus().import).toMatchObject({ status: 'done', checked: 3 });
+      const gets = box.calls.get.length;
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(box.calls.get).toHaveLength(gets); // done: back to the hourly cadence of this test
+      gmail.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('suppresses browser Gmail scrapes only while an enabled API sync has completed a run', () => {

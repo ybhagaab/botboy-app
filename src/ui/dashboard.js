@@ -2626,11 +2626,61 @@ function gmailSyncCardModel() {
   if (run.status === 'failed') return { status: 'Needs attention', tone: 'warn', detail: String(run.reason || 'The last sync failed') };
   const counters = run.counters || {};
   const waiting = Number(status.backlog || 0);
+  const fresh = Number(counters.emitted ?? 0);
+  // The total comes first: the last run alone reads "0" between new mails.
+  const total = status.captured
+    ? `${number(status.captured.total ?? 0)} emails captured from ${connection.accountEmail}. `
+    : `Connected as ${connection.accountEmail}. `;
+  const job = status.import;
+  const importing = gmailImportActive(status)
+    ? ` Importing older mail${job.total ? `: ${number(job.checked ?? 0)} of ${number(job.total)} checked` : ''}.`
+    : '';
   return {
     status: 'Active',
     tone: 'good',
-    detail: `Last sync ${whenPhrase(run.at)}: ${number(counters.emitted ?? 0)} emails ingested from ${connection.accountEmail}${waiting ? `; ${number(waiting)} more next run` : ''}`,
+    detail: `${total}Last sync ${whenPhrase(run.at)}: ${fresh ? `${number(fresh)} new` : 'no new mail'}${waiting ? `; ${number(waiting)} more next run` : ''}.${importing}`,
   };
+}
+
+/** An older-mail import is waiting to list or working through its window. */
+function gmailImportActive(status) {
+  const value = status?.import?.status;
+  return value === 'requested' || value === 'importing';
+}
+
+function gmailImportDate(iso) {
+  const at = iso ? new Date(iso) : null;
+  return at && !Number.isNaN(at.getTime()) ? at.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+}
+
+/** "Import older mail" (GMAIL_API_INTEGRATION_PLAN.md §12): start, progress, stop. */
+function renderGmailImportCard(status, busy) {
+  const job = status?.import || null;
+  const disabled = busy ? 'disabled' : '';
+  const active = gmailImportActive(status);
+  const since = gmailImportDate(job?.sinceIso);
+  let line = '';
+  if (job?.status === 'requested') {
+    line = 'Starting. BotBoy lists the last 6 months on its next sync, within a minute.';
+  } else if (job?.status === 'importing') {
+    const left = Math.max(0, Number(job.total || 0) - Number(job.checked || 0));
+    const minutes = Math.max(1, Math.ceil(left / 100));
+    line = `Importing mail since ${since}: ${number(job.checked ?? 0)} of ${number(job.total ?? 0)} checked, ${number(job.captured ?? 0)} captured.${left ? ` About ${number(minutes)} minute${minutes === 1 ? '' : 's'} left.` : ''}`;
+  } else if (job?.status === 'done') {
+    line = `Imported mail since ${since} ${whenPhrase(job.finishedAt)}: ${number(job.captured ?? 0)} captured, ${number(job.duplicates ?? 0)} already in BotBoy, ${number(job.filtered ?? 0)} filtered out.${job.truncated ? ' The window held more mail than one import reads, so BotBoy took the newest 10,000 messages.' : ''}`;
+  } else if (job?.status === 'stopped') {
+    line = `Import stopped ${whenPhrase(job.finishedAt)} after ${number(job.checked ?? 0)} of ${number(job.total ?? 0)} messages: ${number(job.captured ?? 0)} captured.`;
+  }
+  const action = active
+    ? `<button class="button" type="button" data-action="gmail-sync-import-stop" ${disabled}>${busy === 'import' ? 'Stopping…' : 'Stop import'}</button>`
+    : `<button class="button" type="button" data-action="gmail-sync-import" ${disabled}>${icon('download', 14)} ${busy === 'import' ? 'Starting…' : 'Import the last 6 months'}</button>`;
+  return `
+    <section class="card pad" style="margin-top:12px">
+      <h3 class="card-title">Import older mail</h3>
+      <p class="page-subtitle">When you connect, BotBoy captures the last 30 days. Import the last 6 months to bring older mail into your projects, with the same filters. It runs in the background after new mail, about 100 messages a minute, and skips mail BotBoy already has.</p>
+      ${line ? `<p>${esc(line)}</p>` : ''}
+      <div class="head-actions" style="justify-content:flex-start; margin-top:8px">${action}</div>
+    </section>`;
 }
 
 function renderGmailSyncSettings() {
@@ -2645,8 +2695,8 @@ function renderGmailSyncSettings() {
   const lastRun = run ? `
     <div class="section-heading"><div><h2>Last sync</h2><p>${esc(run.status === 'failed' ? `Failed ${whenPhrase(run.at)}: ${String(run.reason || '')}` : `${run.mode === 'full' ? 'Full sync' : 'Update'} ${whenPhrase(run.at)} in ${((run.durationMs || 0) / 1000).toFixed(1)}s for ${String(run.accountEmail || '')}`)}</p></div></div>
     <section class="grid three-col">
-      <article class="card pad"><div class="eyebrow">${icon('mail', 14)} Received</div><h3 class="card-title">${number(counters.received ?? 0)} ingested</h3><p class="page-subtitle">${number(counters.listed ?? 0)} new in Gmail: ${number(counters.noise ?? 0)} automated noise, ${number(counters.notAddressed ?? 0)} not addressed to you, ${number(counters.skipped ?? 0)} drafts, spam, or promotions, ${number(counters.duplicates ?? 0)} already stored</p></article>
-      <article class="card pad"><div class="eyebrow">${icon('send', 14)} Sent</div><h3 class="card-title">${number(counters.sent ?? 0)} ingested</h3><p class="page-subtitle">Your own sent mail is kept without filters; it carries your commitments.</p></article>
+      <article class="card pad"><div class="eyebrow">${icon('mail', 14)} Received</div><h3 class="card-title">${number(counters.received ?? 0)} new</h3><p class="page-subtitle">${number(counters.listed ?? 0)} new in Gmail: ${number(counters.noise ?? 0)} automated noise, ${number(counters.notAddressed ?? 0)} not addressed to you, ${number(counters.skipped ?? 0)} drafts, spam, or promotions, ${number(counters.duplicates ?? 0)} already stored</p></article>
+      <article class="card pad"><div class="eyebrow">${icon('send', 14)} Sent</div><h3 class="card-title">${number(counters.sent ?? 0)} new</h3><p class="page-subtitle">Your own sent mail is kept without filters; it carries your commitments.</p></article>
       <article class="card pad"><div class="eyebrow">${icon('clock', 14)} Waiting</div><h3 class="card-title">${number(status?.backlog ?? 0)} messages</h3><p class="page-subtitle">BotBoy reads at most 100 messages per sync to stay inside Gmail's per-user quota; the rest follow on the next runs.</p></article>
     </section>` : '';
   const connectActions = connection.connected
@@ -2713,11 +2763,14 @@ function renderGmailSyncSettings() {
         <span><span>Account</span><strong>${esc(connection.accountEmail || 'Not connected')}</strong></span>
         <span><span>Access</span><strong>${connection.connected ? (connection.canCompose ? 'Read, draft, and send' : 'Read only') : '—'}</strong></span>
         <span><span>Cadence</span><strong>Every ${status ? number(status.intervalMinutes) : 5} minutes</strong></span>
+        ${status?.captured ? `<span><span>Captured</span><strong>${number(status.captured.total ?? 0)} emails (${number(status.captured.received ?? 0)} received, ${number(status.captured.sent ?? 0)} sent)</strong></span>
+        <span><span>In projects</span><strong>${number(status.captured.inProjects ?? 0)}</strong></span>` : ''}
         <span><span>Browser Gmail capture</span><strong>${status?.enabled && status?.mailActive ? 'Suppressed (this sync replaces it)' : 'Active'}</strong></span>
       </div>
-      <p class="page-subtitle" style="margin-top:8px">${esc('BotBoy captures your mail and, in chat, searches and reads it. It drafts or sends only when you ask in chat. It never marks mail read, labels, archives, moves, or deletes anything in your mailbox. Disconnect revokes the access at Google; mail already captured stays.')}</p>
+      <p class="page-subtitle" style="margin-top:8px">${esc('BotBoy captures the last 30 days of mail when you connect, then new mail as it arrives; in chat, it searches and reads your whole mailbox. It drafts or sends only when you ask in chat. It never marks mail read, labels, archives, moves, or deletes anything in your mailbox. Disconnect revokes the access at Google; mail already captured stays.')}</p>
       <div class="head-actions" style="justify-content:flex-start; margin-top:8px">${connectActions}</div>
     </section>
+    ${connection.connected ? renderGmailImportCard(status, busy) : ''}
     ${lastRun}
     ${clientSection}
     <div class="section-heading"><div><h2>Filtering rules</h2><p>Received mail is kept only when your address is in To or Cc. Drafts, spam, trash, Promotions, and Social are skipped; automated senders are dropped next; meeting summaries and recaps always pass. Sent mail is always kept.</p></div></div>
@@ -8217,9 +8270,25 @@ function bindEvents() {
         const payload = await request('/gmail-sync/run', { method: 'POST', body: {} });
         if (payload.status) state.gmailSync.status = payload.status;
         const result = payload.result || {};
-        if (result.status === 'completed') toast(`Gmail sync completed: ${number(result.counters?.emitted ?? 0)} emails ingested`);
+        const fresh = Number(result.counters?.emitted ?? 0);
+        if (result.status === 'completed') toast(`Gmail sync completed: ${fresh ? `${number(fresh)} new emails` : 'no new mail'}`);
         else toast(`Gmail sync ${result.status || 'failed'}${result.reason ? `: ${result.reason}` : ''}`, 'bad');
         await refreshGmailSyncStatus();
+      });
+    }
+    if (action === 'gmail-sync-import') {
+      void gmailSyncAction('import', async () => {
+        const payload = await request('/gmail-sync/import', { method: 'POST', body: { months: 6 } });
+        state.gmailSync.status = payload.status;
+        toast('Import started: BotBoy works through the last 6 months in the background');
+      });
+    }
+    if (action === 'gmail-sync-import-stop') {
+      if (!window.confirm('Stop importing older mail? Mail already captured stays.')) return;
+      void gmailSyncAction('import', async () => {
+        const payload = await request('/gmail-sync/import', { method: 'DELETE' });
+        state.gmailSync.status = payload.status;
+        toast('Import stopped');
       });
     }
     if (action === 'gmail-sync-toggle') {
@@ -8870,6 +8939,15 @@ async function pollVersion() {
       if (['connections', 'grasp-sync-settings', 'gmail-sync-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
         renderRoute({ preserveScroll: true });
       }
+    }
+
+    // An older-mail import advances without new captures (most old mail is
+    // filtered), so the open Gmail page refreshes its status on this poll
+    // while one runs. It never repaints over a field the owner is editing.
+    if (state.route.view === 'gmail-sync-settings' && !state.gmailSync.busy && gmailImportActive(state.gmailSync.status)
+      && !String(document.activeElement?.id || '').startsWith('gmail-sync-')) {
+      await refreshGmailSyncStatus();
+      renderRoute({ preserveScroll: true });
     }
 
     // Another tab (or a provider credential problem) changed the AI model:
