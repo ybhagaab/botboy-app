@@ -699,7 +699,7 @@ async function sendChat(msg) {
               }
             }
             renderSegments();
-            hydrateLessonCards(msgEl); // expand any [[lesson:…]] markers the finished turn produced
+            hydrateChatCards(msgEl); // expand any [[lesson:…]] / [[gmail-draft:…]] markers the finished turn produced
             // Mark the bubble as FROZEN so the 5s chat poll doesn't wipe the rich segment UI
             msgEl.classList.remove('streaming-live');
             msgEl.classList.add('streaming-frozen');
@@ -1589,7 +1589,7 @@ function renderChat() {
       if (existingSigs.has(sig(m.role, m.content))) return false;
       return true;
     });
-    if (newMessages.length === 0) { hydrateLessonCards(el); return; }
+    if (newMessages.length === 0) { hydrateChatCards(el); return; }
     for (const m of newMessages) {
       const bubble = document.createElement('div');
       bubble.className = `chat-msg ${m.role}`;
@@ -1597,7 +1597,7 @@ function renderChat() {
       bubble.innerHTML = renderChatMsgInner(m);
       el.appendChild(bubble);
     }
-    hydrateLessonCards(el);
+    hydrateChatCards(el);
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
     if (nearBottom) el.scrollTop = el.scrollHeight;
     return;
@@ -1608,7 +1608,7 @@ function renderChat() {
     const idAttr = m.id ? ` data-msg-id="${m.id}"` : '';
     return `<div class="chat-msg ${m.role}"${idAttr}>${renderChatMsgInner(m)}</div>`;
   }).join('');
-  hydrateLessonCards(el);
+  hydrateChatCards(el);
   // Cold load / refresh: always scroll to bottom — newest messages should be visible.
   // Use rAF so DOM layout completes (image dims, thinking block rendering) before we measure scrollHeight.
   requestAnimationFrame(() => {
@@ -1626,22 +1626,36 @@ function renderChat() {
 // The button click IS the owner approval (POST /lessons/:id/adopt|retire),
 // the same trust model as the document workbench Approve buttons.
 const LESSON_MARKER_RE = /\[\[lesson:(lesson_[a-z0-9]{6,24})\]\]/g;
+// gmail_draft replies carry [[gmail-draft:<draftId>]]; the chat router appends
+// any token the model left out (GMAIL_CHAT_TOOLS_PLAN.md §7).
+const GMAIL_DRAFT_MARKER_RE = /\[\[gmail-draft:([A-Za-z0-9_-]{1,128})\]\]/g;
 
-function hydrateLessonCards(root) {
+/**
+ * Expands every card marker in the chat bubbles under `root`, then fills the
+ * new cards. Both marker kinds are replaced in ONE innerHTML write per bubble:
+ * a second write would detach cards whose fill is still in flight.
+ */
+function hydrateChatCards(root) {
   if (!root) return;
   const bubbles = root.classList?.contains('chat-msg') ? [root] : root.querySelectorAll('.chat-msg');
   for (const bubble of bubbles) {
+    const html = bubble.innerHTML;
     LESSON_MARKER_RE.lastIndex = 0;
-    if (LESSON_MARKER_RE.test(bubble.innerHTML)) {
-      LESSON_MARKER_RE.lastIndex = 0;
-      bubble.innerHTML = bubble.innerHTML.replace(LESSON_MARKER_RE, (_, id) =>
-        `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`);
-    }
+    GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
+    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html)) continue;
+    LESSON_MARKER_RE.lastIndex = 0;
+    GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
+    bubble.innerHTML = html
+      .replace(LESSON_MARKER_RE, (_, id) => `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`)
+      .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`);
   }
-  const scope = root.classList?.contains('chat-msg') ? root : root;
-  for (const card of scope.querySelectorAll('.lesson-card:not([data-hydrated])')) {
+  for (const card of root.querySelectorAll('.lesson-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
     void fillLessonCard(card);
+  }
+  for (const card of root.querySelectorAll('.gmail-draft-card:not([data-hydrated])')) {
+    card.dataset.hydrated = '1';
+    void fillGmailDraftCard(card);
   }
 }
 
@@ -1695,6 +1709,123 @@ document.addEventListener('click', async (event) => {
     }
     note.textContent = `Could not save that — ${String(error?.message || error)}. Try again.`;
   }
+});
+
+// ── Gmail draft cards (GMAIL_CHAT_TOOLS_PLAN.md §7) ──
+// The card shows the exact draft Gmail holds. Send and Discard act on that
+// version only: the server compares the draft's current message id with the
+// one painted here, so a draft changed since then is shown again, never sent
+// unseen. The click is the owner's approval, as on the lesson cards.
+async function fillGmailDraftCard(card) {
+  try {
+    const payload = await api(`/gmail-sync/drafts/${encodeURIComponent(card.dataset.gmailDraftId)}`);
+    if (!payload || !payload.draft) throw new Error(payload?.error || 'unavailable');
+    paintGmailDraftCard(card, payload.draft);
+  } catch {
+    card.innerHTML = '<em>Gmail draft unavailable.</em>';
+  }
+}
+
+function gmailDraftWhen(iso) {
+  const at = Date.parse(iso || '');
+  return Number.isFinite(at) ? new Date(at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }) : '';
+}
+
+// Same units as the server's formatByteSize (1024-based, as Gmail's 25 MB limit).
+function gmailFileSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return 'size unknown';
+  if (size < 1024) return `${size} bytes`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;
+  return `${(Math.ceil((size / (1024 * 1024)) * 10) / 10).toFixed(1).replace(/\.0$/, '')} MB`;
+}
+
+function paintGmailDraftCard(card, draft, note = '') {
+  const esc = lessonEsc;
+  const gmailUrl = typeof draft.gmailUrl === 'string' && draft.gmailUrl.startsWith('https://mail.google.com/') ? draft.gmailUrl : '';
+  const open = (label) => (gmailUrl ? `<a class="button small ghost" href="${esc(gmailUrl)}" target="_blank" rel="noopener noreferrer">${label}</a>` : '');
+  const fields = [['To', draft.to], ['Cc', draft.cc], ['Bcc', draft.bcc]]
+    .filter(([, list]) => Array.isArray(list) && list.length)
+    .map(([label, list]) => `<dt>${label}</dt><dd>${esc(list.join(', '))}</dd>`)
+    .join('');
+  // Files as Gmail holds them (as sent, once the draft went out).
+  const files = Array.isArray(draft.attachments)
+    ? draft.attachments.filter((file) => file && typeof file.name === 'string' && file.name)
+    : [];
+  const attached = files.length
+    ? `<dt>Attached</dt><dd><ul class="gmail-draft-files">${files.map((file) => `<li>${esc(file.name)}<span class="gmail-draft-file-size"> · ${esc(gmailFileSize(file.sizeBytes))}</span></li>`).join('')}</ul></dd>`
+    : '';
+  const facts = `<dl class="gmail-draft-fields">${fields}<dt>Subject</dt><dd>${esc(draft.subject || '(no subject)')}</dd>${attached}</dl>`;
+  const body = draft.body
+    ? `<div class="gmail-draft-body" tabindex="0" role="region" aria-label="Draft text">${esc(draft.body)}${draft.bodyTruncated ? '\n…' : ''}</div>`
+    : '';
+  // The head is small caps; the address keeps its own case.
+  const account = draft.account ? ` · <span class="gmail-draft-account">${esc(draft.account)}</span>` : '';
+  const noteHtml = note ? `<div class="gmail-draft-note">${esc(note)}</div>` : '';
+  card.dataset.messageId = draft.state === 'draft' ? String(draft.messageId || '') : '';
+  if (draft.state === 'draft') {
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft · not sent${account}</div>${facts}${body}${noteHtml}`
+      + `<div class="gmail-draft-actions"><button type="button" class="button small primary" data-gmail-draft-action="send">Send</button>${open('Open in Gmail')}<button type="button" class="button small ghost" data-gmail-draft-action="discard">Discard</button></div>`;
+  } else if (draft.state === 'sent') {
+    const when = gmailDraftWhen(draft.sentAt);
+    card.innerHTML = `<div class="gmail-draft-head">Gmail message${account}</div>${facts}`
+      + `<div class="gmail-draft-state sent">✓ Sent${when ? ` ${esc(when)}` : ''}</div><div class="gmail-draft-actions">${open('Open in Gmail')}</div>`;
+  } else if (draft.state === 'discarded') {
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div>${facts}<div class="gmail-draft-state">Discarded: deleted from Gmail Drafts, never sent.</div>`;
+  } else if (draft.state === 'send_unknown') {
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div>${facts}${body}`
+      + '<div class="gmail-draft-state warn">Gmail did not confirm the send. Check Gmail Sent before sending again; this card checks again in a couple of minutes.</div>'
+      + `<div class="gmail-draft-actions">${open('Open Gmail')}</div>`;
+  } else if (draft.state === 'missing') {
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div>${facts}<div class="gmail-draft-state">No longer in Gmail Drafts: it was sent or deleted in Gmail.</div><div class="gmail-draft-actions">${open('Open Gmail')}</div>`;
+  } else if (draft.state === 'other_account') {
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div><div class="gmail-draft-state">This draft belongs to ${esc(draft.account || 'another account')}, which is not the connected Gmail account.</div>`;
+  } else if (draft.state === 'not_connected') {
+    card.innerHTML = '<div class="gmail-draft-head">Gmail draft</div><div class="gmail-draft-state">Gmail is not connected. Connect it on <a href="#/connections/gmail-sync">Connections → Gmail</a> to see this draft.</div>';
+  } else {
+    card.innerHTML = '<em>This Gmail draft card is not available.</em>';
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-gmail-draft-action]');
+  if (!button) return;
+  const card = button.closest('.gmail-draft-card');
+  if (!card) return;
+  const action = button.dataset.gmailDraftAction === 'discard' ? 'discard' : 'send';
+  if (action === 'discard' && !window.confirm('Discard this draft? BotBoy deletes it from Gmail Drafts; nothing is sent.')) return;
+  for (const other of card.querySelectorAll('button')) other.disabled = true;
+  let payload;
+  try {
+    // Body as an OBJECT: api() stringifies it (see the lesson-card post-mortem above).
+    payload = await api(`/gmail-sync/drafts/${encodeURIComponent(card.dataset.gmailDraftId)}/${action}`, {
+      method: 'POST',
+      body: { messageId: card.dataset.messageId || '' },
+    });
+  } catch (error) {
+    payload = { error: String(error?.message || error), effect: action === 'send' ? 'unknown' : 'none' };
+  }
+  if (payload && payload.draft && !payload.error) {
+    paintGmailDraftCard(card, payload.draft);
+    return;
+  }
+  if (payload?.code === 'draft_changed' && payload.draft) {
+    paintGmailDraftCard(card, payload.draft, 'This draft changed since it was shown. Review it, then choose Send again.');
+    return;
+  }
+  // An unanswered send may have gone out: no Send button until Gmail says otherwise.
+  const unknown = action === 'send' && payload?.effect === 'unknown';
+  if (!unknown) for (const other of card.querySelectorAll('button')) other.disabled = false;
+  let note = card.querySelector('.gmail-draft-error');
+  if (!note) {
+    note = document.createElement('div');
+    note.className = 'gmail-draft-error';
+    note.setAttribute('role', 'alert');
+    card.appendChild(note);
+  }
+  note.textContent = unknown
+    ? 'Gmail did not confirm the send. Check Gmail Sent before sending again.'
+    : `${action === 'send' ? 'Not sent' : 'Not discarded'}: ${String(payload?.error || 'unexpected response')}`;
 });
 
 function renderChatMsgInner(m) {

@@ -164,6 +164,8 @@ export type SecretKind =
   | 'api_key'
   | 'google_api_key'
   | 'google_oauth_secret'
+  | 'google_access_token'
+  | 'google_refresh_token'
   | 'stripe_key'
   | 'huggingface_token'
   | 'npm_token'
@@ -183,6 +185,8 @@ const SECRET_LABELS: Record<SecretKind, string> = {
   api_key: 'an API key',
   google_api_key: 'a Google API key',
   google_oauth_secret: 'a Google OAuth client secret',
+  google_access_token: 'a Google OAuth access token',
+  google_refresh_token: 'a Google OAuth refresh token',
   stripe_key: 'a Stripe secret key',
   huggingface_token: 'a Hugging Face token',
   npm_token: 'an npm token',
@@ -221,6 +225,10 @@ const TOKEN_RULES: readonly TokenRule[] = [
   { kind: 'api_key', source: String.raw`\bsk-[a-f0-9]{32}\b` },
   { kind: 'google_api_key', source: String.raw`\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])` },
   { kind: 'google_oauth_secret', source: String.raw`\bGOCSPX-[A-Za-z0-9_-]{24,}` },
+  // Google OAuth access tokens (ya29.…) and refresh tokens (1//0…), as the
+  // Gmail connection holds them (gmail-connection.ts).
+  { kind: 'google_access_token', source: String.raw`\bya29\.[A-Za-z0-9_-]{30,}` },
+  { kind: 'google_refresh_token', source: String.raw`(?<![A-Za-z0-9_/-])1//0[A-Za-z0-9_-]{30,}` },
   { kind: 'stripe_key', source: String.raw`\b(?:sk|rk)_live_[0-9A-Za-z]{24,}\b` },
   { kind: 'huggingface_token', source: String.raw`\bhf_[A-Za-z0-9]{34,}\b` },
   { kind: 'npm_token', source: String.raw`\bnpm_[A-Za-z0-9]{36}\b` },

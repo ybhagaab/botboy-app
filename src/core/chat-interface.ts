@@ -50,7 +50,8 @@ export function createChatInterface(db: Database.Database, agent: AgentOrchestra
 
       // kiro-cli maintains chat history within the ACP session natively
       // No need to inject history — it's all in the 1M context window
-      const responseContent = await agent.executeAction(message, nodeId, { workload: 'interactive' });
+      // The owner's own chat message (non-streaming path): an owner-started run.
+      const responseContent = await agent.executeAction(message, nodeId, { workload: 'interactive', startedByOwner: true });
 
       const assistantMsg: ChatMessage = { id: uuid(), role: 'assistant', content: responseContent, createdAt: new Date() };
       insertMsg.run(assistantMsg.id, 'assistant', responseContent, null);

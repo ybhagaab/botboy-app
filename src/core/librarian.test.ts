@@ -117,9 +117,12 @@ describe('Librarian', () => {
     direct?: boolean;
     projectId?: string;
     scopeAlert?: string;
+    /** Canonical mail provider; addresses stay the same so only the provider differs. */
+    provider?: 'grasp' | 'gmail';
   }) {
     const db = storage.getDb();
     const cs = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
+    const gmail = input.provider === 'gmail';
     const ownerEmail = 'owner@amazon.com';
     const requesterEmail = 'requester@amazon.com';
     const sender = input.sender ?? (input.direction === 'sent' ? ownerEmail : requesterEmail);
@@ -138,7 +141,7 @@ describe('Librarian', () => {
     const ref = cs.put(input.id, content);
     const cols = refToColumns(ref);
     const metadata = JSON.stringify({
-      platform: 'grasp_m365', ownerEmail,
+      platform: gmail ? 'gmail_api' : 'grasp_m365', ownerEmail,
       conversationId: input.conversationId ?? 'conv-insights',
       messageTimestamp: input.timestamp,
       direction: input.direction,
@@ -146,15 +149,16 @@ describe('Librarian', () => {
       toRecipients: to,
       ccRecipients: input.cc ?? '',
       directlyAddressedToOwner: input.direct === false ? 'false' : 'true',
-      graspId: input.id,
+      ...(gmail ? { gmailId: input.id } : { graspId: input.id }),
     });
     db.prepare(
       `INSERT INTO work_items (id, type, source, title, url, captured_at, process_state, project_id, scope_alert, metadata, raw_text, content_storage, content_path, content_sha256, content_bytes)
-       VALUES (?, ?, 'grasp', 'Insights PRD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, 'Insights PRD', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.id,
       input.direction === 'sent' ? 'email_sent' : 'email_read',
-      `grasp://mail/${input.id}`,
+      gmail ? 'gmail' : 'grasp',
+      `${gmail ? 'gmail' : 'grasp'}://mail/${input.id}`,
       input.timestamp,
       input.projectId ? 'routed' : 'extracted',
       input.projectId ?? null,
@@ -346,6 +350,85 @@ describe('Librarian', () => {
       modelDecision: 'not_called',
       reason: 'deterministic outlook-sent-follows-routed-thread rule',
     });
+  });
+
+  it('routes an owner-sent Gmail reply with its already-routed Gmail thread under the Gmail proof prefix', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_insights', 'Insights PRD'), 'Insights PRD');
+    insertOutlookEmail({
+      id: 'gmail-request', body: 'Can you write the Insights PRD?', timestamp: '2026-09-14T10:00:00Z',
+      direction: 'received', projectId: 'proj_insights', provider: 'gmail',
+    });
+    insertOutlookEmail({
+      id: 'gmail-accept', body: 'WIP on the Insights PRD.', timestamp: '2026-09-14T10:05:00Z',
+      direction: 'sent', provider: 'gmail',
+    });
+    const { lib } = build(mockLlm(() => { throw new Error('model must not be called for authoritative Gmail thread routing'); }));
+
+    const result = await lib.runWave();
+    expect(result.assigned).toBe(1);
+    expect(db.prepare('SELECT process_state, project_id FROM work_items WHERE id = ?').get('gmail-accept'))
+      .toMatchObject({ process_state: 'routed', project_id: 'proj_insights' });
+    const audit = db.prepare('SELECT model_decision AS modelDecision, validation_reason AS reason FROM routing_decisions WHERE item_id = ?').get('gmail-accept') as any;
+    expect(audit).toEqual({ modelDecision: 'not_called', reason: 'deterministic gmail-sent-follows-routed-thread rule' });
+  });
+
+  it('never lets a Gmail reply inherit from an Outlook conversation with the same id, or the reverse', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_insights', 'Insights PRD'), 'Insights PRD');
+    insertOutlookEmail({
+      id: 'outlook-request', body: 'Can you write the Insights PRD?', timestamp: '2026-09-14T10:00:00Z',
+      direction: 'received', projectId: 'proj_insights', conversationId: 'conv-shared',
+    });
+    insertOutlookEmail({
+      id: 'gmail-accept', body: 'WIP on the Insights PRD.', timestamp: '2026-09-14T10:05:00Z',
+      direction: 'sent', conversationId: 'conv-shared', provider: 'gmail',
+    });
+    insertOutlookEmail({
+      id: 'gmail-request', body: 'Can you write the Insights PRD?', timestamp: '2026-09-14T11:00:00Z',
+      direction: 'received', projectId: 'proj_insights', conversationId: 'conv-other', provider: 'gmail',
+    });
+    insertOutlookEmail({
+      id: 'outlook-accept', body: 'WIP on the Insights PRD.', timestamp: '2026-09-14T11:05:00Z',
+      direction: 'sent', conversationId: 'conv-other',
+    });
+    const sentIds = ['gmail-accept', 'outlook-accept'];
+    let called = false;
+    const { lib } = build(mockLlm(() => {
+      called = true;
+      return JSON.stringify(sentIds.map((itemId) => ({ itemId, decision: 'orphan' })));
+    }));
+
+    const result = await lib.runWave();
+    expect(called).toBe(true);
+    expect(result.orphaned).toBe(2);
+    const rows = db.prepare("SELECT id,process_state,project_id FROM work_items WHERE id IN ('gmail-accept','outlook-accept')").all() as any[];
+    expect(rows.every((row) => row.process_state === 'orphaned' && row.project_id === null)).toBe(true);
+  });
+
+  it('orders a same-wave Gmail request before the owner reply under the Gmail proof prefix', async () => {
+    const db = storage.getDb();
+    const brains = createBrainStore(db, { brainsDir: path.join(dir, 'brains') });
+    brains.write(newBrain('proj_insights', 'Insights PRD'), 'Insights PRD');
+    insertOutlookEmail({
+      id: 'gmail-request', body: 'Can you write the Insights PRD?', timestamp: '2026-09-14T10:00:00Z',
+      direction: 'received', provider: 'gmail',
+    });
+    insertOutlookEmail({
+      id: 'gmail-accept', body: 'WIP on the Insights PRD.', timestamp: '2026-09-14T10:05:00Z',
+      direction: 'sent', provider: 'gmail',
+    });
+    const { lib } = build(mockLlm(() => JSON.stringify([
+      { itemId: 'gmail-accept', decision: 'orphan' },
+      { itemId: 'gmail-request', decision: 'assign', projectId: 'proj_insights' },
+    ])));
+
+    const result = await lib.runWave();
+    expect(result.assigned).toBe(2);
+    const audit = db.prepare('SELECT model_decision AS modelDecision, validation_reason AS reason FROM routing_decisions WHERE item_id = ?').get('gmail-accept') as any;
+    expect(audit).toEqual({ modelDecision: 'orphan', reason: 'deterministic gmail-sent-follows-routed-thread rule after same-wave request' });
   });
 
   it('does not blanket-inherit a future reply from a retroactively reconciled root', async () => {

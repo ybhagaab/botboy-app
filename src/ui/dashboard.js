@@ -83,6 +83,9 @@ const state = {
   // changingOften: watched files rewritten often enough to warn (Local folders panel).
   folders: { items: null, error: '', changingOften: 0 },
   graspSync: { status: null, error: '', busy: '' },
+  // Gmail API sync (non-Amazon accounts). Secrets are read from the form
+  // once, sent, and never kept in state.
+  gmailSync: { status: null, error: '', busy: '' },
   sharepointSync: { status: null, error: '', busy: '', sites: [], libraries: [], pickedSite: '' },
   // Outcome-level capture health: per-source streaks and owner warnings.
   captureHealth: { sources: null, issues: [], error: '' },
@@ -298,6 +301,7 @@ function parseRoute() {
   if (parts[0] === 'areas') return { view: 'area', areaId: parts[1] || '' };
   if (parts[0] === 'connections' && parts[1] === 'sql-context') return { view: 'mcp-settings' };
   if (parts[0] === 'connections' && parts[1] === 'mail-calendar-sync') return { view: 'grasp-sync-settings' };
+  if (parts[0] === 'connections' && parts[1] === 'gmail-sync') return { view: 'gmail-sync-settings' };
   if (parts[0] === 'connections' && parts[1] === 'document-sync') return { view: 'sharepoint-sync-settings' };
   if (parts[0] === 'connections' && parts[1] === 'add') return { view: 'mcp-add' };
   if (parts[0] === 'connections' && parts[1] && parts[2] === 'edit') return { view: 'mcp-edit', profileId: parts[1] };
@@ -433,7 +437,7 @@ async function loadCore({ quiet = false } = {}) {
   // Sources panel needs it, and the panel fetches it on open (post-mortem
   // 2026-08-18: every navigation blanked for the slowest request, which was
   // always this one).
-  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, sharepointSyncResult, captureHealthResult] = await Promise.allSettled([
+  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, gmailSyncResult, sharepointSyncResult, captureHealthResult] = await Promise.allSettled([
     request('/areas'),
     request('/projects'),
     todayRequest,
@@ -443,6 +447,7 @@ async function loadCore({ quiet = false } = {}) {
     request('/local-folders'),
     request('/mcp/profiles'),
     request('/grasp-sync/status'),
+    request('/gmail-sync/status'),
     request('/sharepoint-sync/status'),
     request('/capture-health'),
   ]);
@@ -478,6 +483,8 @@ async function loadCore({ quiet = false } = {}) {
   } else state.folders.error = foldersResult.reason.message;
   if (graspSyncResult.status === 'fulfilled') { state.graspSync.status = graspSyncResult.value.status || null; state.graspSync.error = ''; }
   else state.graspSync.error = graspSyncResult.reason.message;
+  if (gmailSyncResult.status === 'fulfilled') { state.gmailSync.status = gmailSyncResult.value.status || null; state.gmailSync.error = ''; }
+  else state.gmailSync.error = gmailSyncResult.reason.message;
   if (sharepointSyncResult.status === 'fulfilled') { state.sharepointSync.status = sharepointSyncResult.value.status || null; state.sharepointSync.error = ''; }
   else state.sharepointSync.error = sharepointSyncResult.reason.message;
   if (mcpResult.status === 'fulfilled') {
@@ -2595,6 +2602,233 @@ async function graspSyncAction(kind, work) {
   }
 }
 
+/** Card status for the Gmail sync on the Connections grid. */
+function gmailSyncCardModel() {
+  const sync = state.gmailSync;
+  if (sync.error) return { status: 'Unavailable', tone: 'warn', detail: sync.error };
+  const status = sync.status;
+  if (!status) return { status: 'Checking', tone: '', detail: 'Loading Gmail status' };
+  const connection = status.connection || {};
+  if (!connection.connected) {
+    if (connection.clientConfigured && connection.clientSource === 'team') {
+      return { status: 'Not connected', tone: '', detail: 'Choose Connect Gmail and sign in to Google.' };
+    }
+    return connection.clientConfigured
+      ? { status: 'Not connected', tone: '', detail: 'OAuth client saved. Choose Connect to sign in to Google.' }
+      : { status: 'Not connected', tone: '', detail: 'For Google accounts: import the BotBoy credential file from the owner, or add your own OAuth client.' };
+  }
+  if (connection.needsReconnect) return { status: 'Reconnect needed', tone: 'warn', detail: connection.lastError || 'Google ended BotBoy’s access to this account.' };
+  if (!status.enabled) return { status: 'Paused', tone: 'warn', detail: `Automatic sync is paused for ${connection.accountEmail}` };
+  const issue = captureIssueFor('gmail');
+  if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
+  const run = status.lastRun;
+  if (!run) return { status: 'Scheduled', tone: 'good', detail: `Connected as ${connection.accountEmail}. The first sync runs shortly.` };
+  if (run.status === 'failed') return { status: 'Needs attention', tone: 'warn', detail: String(run.reason || 'The last sync failed') };
+  const counters = run.counters || {};
+  const waiting = Number(status.backlog || 0);
+  return {
+    status: 'Active',
+    tone: 'good',
+    detail: `Last sync ${whenPhrase(run.at)}: ${number(counters.emitted ?? 0)} emails ingested from ${connection.accountEmail}${waiting ? `; ${number(waiting)} more next run` : ''}`,
+  };
+}
+
+function renderGmailSyncSettings() {
+  const sync = state.gmailSync;
+  const status = sync.status;
+  const connection = status?.connection || {};
+  const card = gmailSyncCardModel();
+  const run = status?.lastRun;
+  const busy = sync.busy;
+  const disabled = busy ? 'disabled' : '';
+  const counters = run?.counters || {};
+  const lastRun = run ? `
+    <div class="section-heading"><div><h2>Last sync</h2><p>${esc(run.status === 'failed' ? `Failed ${whenPhrase(run.at)}: ${String(run.reason || '')}` : `${run.mode === 'full' ? 'Full sync' : 'Update'} ${whenPhrase(run.at)} in ${((run.durationMs || 0) / 1000).toFixed(1)}s for ${String(run.accountEmail || '')}`)}</p></div></div>
+    <section class="grid three-col">
+      <article class="card pad"><div class="eyebrow">${icon('mail', 14)} Received</div><h3 class="card-title">${number(counters.received ?? 0)} ingested</h3><p class="page-subtitle">${number(counters.listed ?? 0)} new in Gmail: ${number(counters.noise ?? 0)} automated noise, ${number(counters.notAddressed ?? 0)} not addressed to you, ${number(counters.skipped ?? 0)} drafts, spam, or promotions, ${number(counters.duplicates ?? 0)} already stored</p></article>
+      <article class="card pad"><div class="eyebrow">${icon('send', 14)} Sent</div><h3 class="card-title">${number(counters.sent ?? 0)} ingested</h3><p class="page-subtitle">Your own sent mail is kept without filters; it carries your commitments.</p></article>
+      <article class="card pad"><div class="eyebrow">${icon('clock', 14)} Waiting</div><h3 class="card-title">${number(status?.backlog ?? 0)} messages</h3><p class="page-subtitle">BotBoy reads at most 100 messages per sync to stay inside Gmail's per-user quota; the rest follow on the next runs.</p></article>
+    </section>` : '';
+  const connectActions = connection.connected
+    ? `<button class="button" type="button" data-action="gmail-sync-connect" ${disabled}>${icon('refresh', 14)} ${busy === 'connect' ? 'Opening Google…' : 'Reconnect'}</button>
+       <button class="button" type="button" data-action="gmail-sync-toggle" ${disabled}>${status?.enabled ? 'Pause automatic sync' : 'Resume automatic sync'}</button>
+       <button class="button" type="button" data-action="gmail-sync-disconnect" ${disabled}>${busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}</button>`
+    : connection.clientConfigured
+      ? `<button class="button primary" type="button" data-action="gmail-sync-connect" ${disabled}>${icon('link', 14)} ${busy === 'connect' ? 'Opening Google…' : 'Connect Gmail'}</button>`
+      : '';
+  const teamActive = connection.clientConfigured && connection.clientSource === 'team';
+  const ownActive = connection.clientConfigured && connection.clientSource !== 'team';
+  const clientCard = `
+    <article class="card pad">
+      <h3 class="card-title">Your Google OAuth client</h3>
+      ${ownActive
+        ? `<p class="page-subtitle">Client ${esc(connection.clientIdSuffix || '')} is saved on this Mac only. Paste a new ID and secret to replace it.${connection.teamClientAvailable ? ' Remove it to use BotBoy’s shared Google client instead.' : ''}</p>`
+        : teamActive
+          ? '<p class="page-subtitle">Optional. BotBoy’s shared Google client is in use. Save your own client only if you run your own Google Cloud project; it replaces the shared one on this Mac.</p>'
+          : '<p class="page-subtitle">Gmail needs a Google OAuth client. The simplest path is the BotBoy credential file from the owner: then you only choose Connect. Or use a client from your own Google Cloud project. BotBoy keeps the ID and secret in a private file on this Mac and never shows the secret again.</p>'}
+      <label class="page-subtitle" for="gmail-sync-client-id" style="display:block;margin-top:8px">Client ID</label>
+      <input id="gmail-sync-client-id" type="text" autocomplete="off" spellcheck="false" placeholder="1234567890-abc….apps.googleusercontent.com" style="width:100%">
+      <label class="page-subtitle" for="gmail-sync-client-secret" style="display:block;margin-top:8px">Client secret</label>
+      <input id="gmail-sync-client-secret" type="password" autocomplete="off" spellcheck="false" placeholder="GOCSPX-…" style="width:100%">
+      <div style="margin-top:8px"><button class="button small" type="button" data-action="gmail-sync-save-client" ${disabled}>${busy === 'client' ? 'Saving…' : 'Save client'}</button>${connection.ownClientConfigured ? ` <button class="button small" type="button" data-action="gmail-sync-remove-client" ${disabled}>${connection.teamClientAvailable ? 'Remove my client' : 'Remove client'}</button>` : ''}</div>
+      <label class="page-subtitle" for="gmail-sync-client-file" style="display:block;margin-top:12px">Or choose the JSON file Google Cloud downloaded for the Desktop app client (<code>client_secret_….json</code>). It saves at once.</label>
+      <input id="gmail-sync-client-file" type="file" accept=".json,application/json" ${disabled}>
+    </article>`;
+  const access = '<p class="page-subtitle">BotBoy asks Google for read access (<code>gmail.readonly</code>) and for drafting and sending (<code>gmail.compose</code>). You can untick drafting and sending on Google’s screen; capture and search still work.</p>';
+  const setupCard = `
+    <article class="card pad">
+      <h3 class="card-title">Set up your own client (once)</h3>
+      <ol class="page-subtitle" style="padding-left:18px; margin:6px 0">
+        <li>In Google Cloud Console, create a project and enable the <strong>Gmail API</strong>.</li>
+        <li>Open <strong>Google Auth Platform → Branding</strong> and fill in the app name and your email. Under <strong>Audience</strong>, choose <strong>Internal</strong> for a Google Workspace account. For a personal Gmail account choose <strong>External</strong>, then <strong>Publish app</strong>; a test-mode app signs you out every 7 days.</li>
+        <li>Under <strong>Clients</strong>, choose <strong>Create client → Desktop app</strong>. No redirect address is needed.</li>
+        <li>Download the client's JSON and choose it here (or paste the client ID and secret, then save). Then choose <strong>Connect Gmail</strong>. Google may warn that the app is unverified: it is your own app, so choose Advanced → Go to the app.</li>
+      </ol>
+      ${access}
+      <p class="page-subtitle">Google returns you to <code>${esc(connection.redirectUri || '')}</code> on this Mac.</p>
+    </article>`;
+  const teamCard = `
+    <section class="card pad">
+      <h3 class="card-title">Signing in with BotBoy’s Google client</h3>
+      <p class="page-subtitle">Choose <strong>Connect Gmail</strong> and pick your Google account. Google shows <em>Google hasn’t verified this app</em> because BotBoy’s Google app has not been through Google’s review: choose <strong>Advanced</strong>, then the <strong>Go to … (unsafe)</strong> link, then <strong>Allow</strong>. Google returns you to BotBoy on this Mac; your sign-in token is stored only here, and the BotBoy owner never sees it or your mail.</p>
+      ${access}
+    </section>`;
+  const clientSection = teamActive
+    ? `${teamCard}
+    <details class="card pad" style="margin-top:12px">
+      <summary>Advanced: use your own Google OAuth client</summary>
+      <section class="grid two-col" style="margin-top:12px">${clientCard}${setupCard}</section>
+    </details>`
+    : `<section class="grid two-col">${clientCard}${setupCard}</section>`;
+  const composeBanner = connection.connected && connection.needsComposeGrant && !connection.needsReconnect
+    ? `<div class="mcp-alert">${icon('alert', 14)}<span>BotBoy can read and search this mailbox but cannot draft or send yet. Choose Reconnect and allow “Manage drafts and send emails”.</span></div>`
+    : '';
+  return `${pageHead('Connection settings', 'Gmail', 'BotBoy captures the mail you receive and send in Gmail and folds it into project synthesis, like Outlook mail. For Google accounts; Amazon mail uses Outlook mail & calendar.', connection.connected ? `<button class="button" type="button" data-action="gmail-sync-run" ${disabled}>${icon('refresh', 14)} ${busy === 'run' ? 'Syncing…' : 'Sync now'}</button>` : '')}
+    <section class="card pad">
+      <div class="connection-head"><span class="source-icon">${icon('mail', 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div>
+      <p>${esc(card.detail)}</p>
+      ${connection.lastError && !connection.needsReconnect ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(connection.lastError)}</span></div>` : ''}
+      ${composeBanner}
+      <div class="connection-details">
+        <span><span>Account</span><strong>${esc(connection.accountEmail || 'Not connected')}</strong></span>
+        <span><span>Access</span><strong>${connection.connected ? (connection.canCompose ? 'Read, draft, and send' : 'Read only') : '—'}</strong></span>
+        <span><span>Cadence</span><strong>Every ${status ? number(status.intervalMinutes) : 5} minutes</strong></span>
+        <span><span>Browser Gmail capture</span><strong>${status?.enabled && status?.mailActive ? 'Suppressed (this sync replaces it)' : 'Active'}</strong></span>
+      </div>
+      <p class="page-subtitle" style="margin-top:8px">${esc('BotBoy captures your mail and, in chat, searches and reads it. It drafts or sends only when you ask in chat. It never marks mail read, labels, archives, moves, or deletes anything in your mailbox. Disconnect revokes the access at Google; mail already captured stays.')}</p>
+      <div class="head-actions" style="justify-content:flex-start; margin-top:8px">${connectActions}</div>
+    </section>
+    ${lastRun}
+    ${clientSection}
+    <div class="section-heading"><div><h2>Filtering rules</h2><p>Received mail is kept only when your address is in To or Cc. Drafts, spam, trash, Promotions, and Social are skipped; automated senders are dropped next; meeting summaries and recaps always pass. Sent mail is always kept.</p></div></div>
+    <section class="grid two-col">
+      <article class="card pad">
+        <h3 class="card-title">Noise senders</h3>
+        <p class="page-subtitle">One pattern per line, matched case-insensitively inside the sender address and name. Mail from matching senders is skipped.</p>
+        <textarea id="gmail-sync-noise" rows="8" style="width:100%; font-family:var(--mono, monospace); font-size:12px">${esc((status?.noiseSenders || []).join('\n'))}</textarea>
+        <div style="margin-top:8px"><button class="button small" type="button" data-action="gmail-sync-save-noise" ${disabled}>${busy === 'noise' ? 'Saving…' : 'Save noise list'}</button></div>
+      </article>
+    </section>`;
+}
+
+async function refreshGmailSyncStatus() {
+  try {
+    const payload = await request('/gmail-sync/status');
+    state.gmailSync.status = payload.status || null;
+    state.gmailSync.error = '';
+  } catch (error) {
+    state.gmailSync.error = error.message;
+  }
+}
+
+// The busy repaint below recreates every field from state, so a caller must
+// read its form fields BEFORE calling (owner report 2026-10-06: Save client
+// always sent an empty ID and got "should end with .apps.googleusercontent.com").
+async function gmailSyncAction(kind, work) {
+  if (state.gmailSync.busy) return;
+  state.gmailSync.busy = kind;
+  renderRoute({ userAction: true });
+  try {
+    await work();
+    state.gmailSync.error = '';
+  } catch (error) {
+    toast(`Gmail: ${error.message}`, 'bad');
+  } finally {
+    state.gmailSync.busy = '';
+    renderRoute({ userAction: true });
+  }
+}
+
+/**
+ * The OAuth client file Google Cloud downloads (`client_secret_….json`) →
+ * its Desktop app ID and secret. A Web application client cannot use the
+ * loopback sign-in, so it gets its own message instead of a later
+ * redirect_uri_mismatch at Google.
+ */
+function parseGoogleClientJson(text) {
+  let value;
+  try {
+    value = JSON.parse(String(text ?? ''));
+  } catch {
+    throw new Error('That file is not the JSON Google Cloud downloads for an OAuth client.');
+  }
+  if (value && typeof value === 'object' && value.web && !value.installed) {
+    throw new Error('That file is for a Web application client. In Google Cloud → Clients, create a Desktop app client and choose its JSON file.');
+  }
+  const client = value && typeof value === 'object' ? value.installed : null;
+  const clientId = typeof client?.client_id === 'string' ? client.client_id.trim() : '';
+  const clientSecret = typeof client?.client_secret === 'string' ? client.client_secret.trim() : '';
+  if (!clientId || !clientSecret) {
+    throw new Error('That file has no Desktop app client ID and secret. Download the JSON again from Google Cloud → Clients → your Desktop app client.');
+  }
+  return { clientId, clientSecret };
+}
+
+/** Saves the OAuth client. The secret goes to the server once and never into state. */
+function saveGmailClient(clientId, clientSecret) {
+  return gmailSyncAction('client', async () => {
+    const payload = await request('/gmail-sync/client', {
+      method: 'PUT',
+      body: { clientId: String(clientId ?? '').trim(), clientSecret: String(clientSecret ?? '').trim() },
+    });
+    state.gmailSync.status = payload.status;
+    toast('OAuth client saved. Choose Connect Gmail to sign in.');
+  });
+}
+
+function saveGmailClientFromForm() {
+  // Read before painting: the busy repaint recreates the fields empty.
+  const clientId = document.getElementById('gmail-sync-client-id')?.value ?? '';
+  const clientSecret = document.getElementById('gmail-sync-client-secret')?.value ?? '';
+  return saveGmailClient(clientId, clientSecret);
+}
+
+async function saveGmailClientFromFile(input) {
+  const file = input?.files?.[0];
+  if (!file || state.gmailSync.busy) return;
+  let client;
+  try {
+    client = parseGoogleClientJson(await file.text());
+  } catch (error) {
+    toast(`Gmail: ${error.message}`, 'bad');
+    return;
+  } finally {
+    input.value = '';
+  }
+  await saveGmailClient(client.clientId, client.clientSecret);
+}
+
+function saveGmailNoiseFromForm() {
+  // Read before painting: the busy repaint re-renders the saved list.
+  const raw = document.getElementById('gmail-sync-noise')?.value ?? '';
+  const noiseSenders = raw.split('\n').map(line => line.trim()).filter(Boolean);
+  return gmailSyncAction('noise', async () => {
+    const payload = await request('/gmail-sync/config', { method: 'PUT', body: { noiseSenders } });
+    state.gmailSync.status = payload.status;
+    toast('Noise sender list saved');
+  });
+}
+
 async function sharepointSyncAction(kind, work) {
   if (state.sharepointSync.busy) return;
   state.sharepointSync.busy = kind;
@@ -2760,22 +2994,24 @@ function renderConnections() {
       profileId: '',
     }];
   const graspSyncCard = graspSyncCardModel();
+  const gmailSyncCard = gmailSyncCardModel();
   const sharepointSyncCard = sharepointSyncCardModel();
   const slackCard = slackCardModel(slackCount);
   const captureCards = [
     ['message', 'Slack', slackCard.status, slackCard.tone, slackCard.detail, 'slack'],
     ['folder', 'Local folders', ...localFoldersCardFields(folderCount), 'folders'],
     ['clock', 'Outlook mail & calendar', graspSyncCard.status, graspSyncCard.tone, graspSyncCard.detail, 'grasp-sync'],
+    ['mail', 'Gmail', gmailSyncCard.status, gmailSyncCard.tone, gmailSyncCard.detail, 'gmail-sync'],
     ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
     ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
   ];
-  const captureIssueSources = { slack: 'slack', 'grasp-sync': 'grasp', 'sharepoint-sync': 'sharepoint' };
+  const captureIssueSources = { slack: 'slack', 'grasp-sync': 'grasp', 'gmail-sync': 'gmail', 'sharepoint-sync': 'sharepoint' };
   const lifecycleFor = action => (captureIssueFor(captureIssueSources[action])
     ? 'Not syncing'
     : action === 'folders' && state.folders.changingOften > 0 ? 'Needs attention' : 'Healthy');
   const connectionsAsk = 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
   return `${pageHead('Sources', 'Connections', 'Manage where evidence and analytical context come from, and verify each local connection.', `<button class="button" type="button" data-prompt="${attr(connectionsAsk)}">${icon('sparkles')} Ask BotBoy to add one</button><a class="button primary" href="#/connections/add">${icon('plus', 14)} Add MCP server</a>`)}
-    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
+    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'gmail-sync' ? `<a class="button small" href="#/connections/gmail-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
     ${managedCards.map(card => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(card.icon, 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div><h3>${esc(card.name)}</h3><p>${esc(card.detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>${esc(card.handling)}</strong></span><span><span>Lifecycle</span><strong>Managed by BotBoy</strong></span></div>${card.profileId ? `<button class="button small" type="button" data-action="manage-connection" data-connection="managed" data-profile="${attr(card.profileId)}">Manage ${icon('chevron-right', 12)}</button>` : ''}</article>`).join('')}</section>
     <div class="section-heading"><div><h2>Connection principles</h2><p>Captured sources stay durable; external analytical content remains untrusted until BotBoy applies its local policy.</p></div></div><section class="grid three-col"><article class="card pad"><div class="eyebrow">${icon('database', 14)} Preserve</div><h3 class="card-title">Raw content stays intact</h3><p class="page-subtitle">Project brains can evolve while original evidence remains unchanged.</p></article><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Restrict</div><h3 class="card-title">Writes need your explicit request</h3><p class="page-subtitle">BotBoy calls read tools freely and runs mutating operations only when you ask for them in chat.</p></article><article class="card pad"><div class="eyebrow">${icon('link', 14)} Explain</div><h3 class="card-title">Analysis stays traceable</h3><p class="page-subtitle">MCP calls are audited locally without storing credentials or query results in the audit log.</p></article></section>`;
 }
@@ -7103,6 +7339,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'connections') html = renderConnections();
   if (state.route.view === 'mcp-settings') html = renderMcpSettings();
   if (state.route.view === 'grasp-sync-settings') html = renderGraspSyncSettings();
+  if (state.route.view === 'gmail-sync-settings') html = renderGmailSyncSettings();
   if (state.route.view === 'sharepoint-sync-settings') html = renderSharePointSyncSettings();
   if (state.route.view === 'doc-reader') html = renderDocReader();
   if (state.route.view === 'mcp-add') html = renderMcpServerForm();
@@ -7946,6 +8183,54 @@ function bindEvents() {
       else if (target.dataset.connection === 'mcp') go('#/connections/sql-context');
       else showIntegration(target.dataset.connection);
     }
+    if (action === 'gmail-sync-save-client') void saveGmailClientFromForm();
+    if (action === 'gmail-sync-remove-client') {
+      const teamFallback = Boolean(state.gmailSync.status?.connection?.teamClientAvailable);
+      const question = teamFallback
+        ? 'Remove your own Google OAuth client? BotBoy switches to its shared Google client. If the two clients differ, Gmail disconnects (BotBoy revokes its access at Google) and you choose Connect Gmail again. Captured mail stays.'
+        : 'Remove the Google OAuth client from BotBoy? This also disconnects Gmail and revokes BotBoy’s access at Google. Captured mail stays.';
+      if (!window.confirm(question)) return;
+      void gmailSyncAction('client', async () => {
+        const payload = await request('/gmail-sync/client', { method: 'DELETE' });
+        state.gmailSync.status = payload.status;
+        toast(teamFallback ? 'Your client was removed; BotBoy’s shared Google client is in use' : 'OAuth client removed');
+      });
+    }
+    if (action === 'gmail-sync-connect') {
+      void gmailSyncAction('connect', async () => {
+        const payload = await request('/gmail-sync/connect', { method: 'POST', body: {} });
+        // Google returns this window to BotBoy's loopback callback, which
+        // lands back on #/connections/gmail-sync with the outcome.
+        if (payload.authUrl) window.location.assign(payload.authUrl);
+      });
+    }
+    if (action === 'gmail-sync-disconnect') {
+      if (!window.confirm('Disconnect Gmail? BotBoy revokes its access at Google and stops syncing. Mail already captured stays.')) return;
+      void gmailSyncAction('disconnect', async () => {
+        const payload = await request('/gmail-sync/disconnect', { method: 'POST', body: {} });
+        state.gmailSync.status = payload.status;
+        toast('Gmail disconnected');
+      });
+    }
+    if (action === 'gmail-sync-run') {
+      void gmailSyncAction('run', async () => {
+        const payload = await request('/gmail-sync/run', { method: 'POST', body: {} });
+        if (payload.status) state.gmailSync.status = payload.status;
+        const result = payload.result || {};
+        if (result.status === 'completed') toast(`Gmail sync completed: ${number(result.counters?.emitted ?? 0)} emails ingested`);
+        else toast(`Gmail sync ${result.status || 'failed'}${result.reason ? `: ${result.reason}` : ''}`, 'bad');
+        await refreshGmailSyncStatus();
+      });
+    }
+    if (action === 'gmail-sync-toggle') {
+      void gmailSyncAction('toggle', async () => {
+        const next = !(state.gmailSync.status?.enabled ?? true);
+        const payload = await request('/gmail-sync/config', { method: 'PUT', body: { enabled: next } });
+        state.gmailSync.status = payload.status;
+        toast(next ? 'Gmail sync resumed' : 'Gmail sync paused; browser Gmail capture is active again');
+      });
+    }
+    if (action === 'gmail-sync-save-noise') void saveGmailNoiseFromForm();
     if (action === 'grasp-sync-run') {
       void graspSyncAction('run', async () => {
         const payload = await request('/grasp-sync/run', { method: 'POST', body: {} });
@@ -8084,9 +8369,10 @@ function bindEvents() {
       });
     }
     if (action === 'grasp-sync-save-noise') {
+      // Read before painting: the busy repaint re-renders the saved list.
+      const raw = document.getElementById('grasp-sync-noise')?.value ?? '';
+      const noiseSenders = raw.split('\n').map(line => line.trim()).filter(Boolean);
       void graspSyncAction('noise', async () => {
-        const raw = document.getElementById('grasp-sync-noise')?.value ?? '';
-        const noiseSenders = raw.split('\n').map(line => line.trim()).filter(Boolean);
         const payload = await request('/grasp-sync/config', { method: 'PUT', body: { noiseSenders } });
         state.graspSync.status = payload.status;
         toast('Noise sender list saved');
@@ -8346,6 +8632,10 @@ function bindEvents() {
   });
 
   document.addEventListener('change', event => {
+    if (event.target?.id === 'gmail-sync-client-file') {
+      void saveGmailClientFromFile(event.target);
+      return;
+    }
     if (event.target?.matches?.('[data-data-room-import-file]')) {
       const file = event.target.files?.[0] || null;
       state.analytics.dataRoomImportFile = file;
@@ -8577,7 +8867,7 @@ async function pollVersion() {
     if (previousCaptureHealthVersion !== null && state.lastCaptureHealthVersion !== null
       && state.lastCaptureHealthVersion !== previousCaptureHealthVersion) {
       await refreshCaptureHealth();
-      if (['connections', 'grasp-sync-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
+      if (['connections', 'grasp-sync-settings', 'gmail-sync-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
         renderRoute({ preserveScroll: true });
       }
     }

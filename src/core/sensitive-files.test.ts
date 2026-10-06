@@ -142,6 +142,18 @@ describe('secret formats in text', () => {
     expect(describeSecretKinds(['google_oauth_secret'])).toBe('Contains what looks like a Google OAuth client secret');
   });
 
+  it('finds and redacts Google OAuth access and refresh tokens (Gmail connection)', () => {
+    const access = join('ya', '29.', chars(60, `${ALNUM}_-`, 45));
+    const refresh = join('1//', '0', chars(60, `${ALNUM}_-`, 46));
+    const text = `{"access_token":"${access}","refresh_token":"${refresh}"}`;
+    expect(detectSecrets(text)).toEqual(['google_access_token', 'google_refresh_token']);
+    const redacted = redactSecrets(text);
+    expect(redacted).not.toContain(access);
+    expect(redacted).not.toContain(refresh);
+    // A URL path segment such as https://host//0abc… is not a refresh token.
+    expect(detectSecrets(`see https://example.com/a1//0${chars(40, ALNUM, 47)}`)).toEqual([]);
+  });
+
   it('ignores documentation examples, placeholders, and look-alikes', () => {
     const docs = [
       // The AWS documentation example pair.

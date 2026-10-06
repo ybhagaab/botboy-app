@@ -2013,14 +2013,17 @@ export function createSharePointSync(deps: {
     if (!cursor) {
       // First run: arm at the current high-water mark; only NEW mail reacts.
       const latest = db.prepare(`
-        SELECT MAX(created_at) AS ts FROM work_items WHERE type LIKE 'email%'
+        SELECT MAX(created_at) AS ts FROM work_items WHERE type LIKE 'email%' AND source <> 'gmail'
       `).get() as { ts: string | null };
       setSetting(db, KEYS.mailTriggerCursor, latest?.ts ?? new Date(now()).toISOString());
       return;
     }
+    // SharePoint notifications arrive in the Microsoft 365 mailbox. Gmail
+    // capture (gmail-sync.ts) must not spend this 25-row window, and any
+    // outside sender can mail a Gmail account a notification-shaped subject.
     const rows = db.prepare(`
       SELECT id, title, created_at FROM work_items
-      WHERE type LIKE 'email%' AND created_at > ?
+      WHERE type LIKE 'email%' AND source <> 'gmail' AND created_at > ?
       ORDER BY created_at LIMIT 25
     `).all(cursor) as Array<{ id: string; title: string | null; created_at: string }>;
     if (!rows.length) return;

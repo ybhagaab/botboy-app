@@ -20,7 +20,7 @@ import type Database from 'better-sqlite3';
 import { getSetting, setSetting } from './storage.js';
 import { redactSensitiveText } from './prompt-redaction.js';
 
-export type CaptureSourceId = 'slack' | 'sharepoint' | 'grasp';
+export type CaptureSourceId = 'slack' | 'sharepoint' | 'grasp' | 'gmail';
 
 export type CaptureFailureKind =
   | 'midway_auth'
@@ -81,28 +81,31 @@ export interface CaptureHealth {
 }
 
 const SETTING_KEY = 'capture_health.v1';
-const SOURCES: readonly CaptureSourceId[] = ['slack', 'sharepoint', 'grasp'];
+const SOURCES: readonly CaptureSourceId[] = ['slack', 'sharepoint', 'grasp', 'gmail'];
 
 const SOURCE_NAMES: Record<CaptureSourceId, string> = {
   slack: 'Slack',
   sharepoint: 'SharePoint documents',
   grasp: 'Outlook mail & calendar',
+  gmail: 'Gmail',
 };
 
 const SOURCE_HREFS: Record<CaptureSourceId, string> = {
   slack: '#/connections/slack',
   sharepoint: '#/connections/document-sync',
   grasp: '#/connections/mail-calendar-sync',
+  gmail: '#/connections/gmail-sync',
 };
 
 /**
  * Warn once a streak has both this many failed runs and this much age. The
- * ages match each source's cadence (Slack 90 s, GRASP 5 min, SharePoint
- * 30 min), so one transient failure never raises a warning.
+ * ages match each source's cadence (Slack 90 s, GRASP and Gmail 5 min,
+ * SharePoint 30 min), so one transient failure never raises a warning.
  */
 const WARN_AFTER: Record<CaptureSourceId, { failures: number; ms: number }> = {
   slack: { failures: 2, ms: 5 * 60_000 },
   grasp: { failures: 2, ms: 10 * 60_000 },
+  gmail: { failures: 2, ms: 10 * 60_000 },
   sharepoint: { failures: 2, ms: 25 * 60_000 },
 };
 
@@ -133,6 +136,11 @@ function nextActionFor(source: CaptureSourceId, kind: CaptureFailureKind): strin
         // names grasp-mcp login for a token that mwinit cannot renew.
         return 'Run mwinit; mail sync signs back in on its next run. If it still fails after that, run grasp-mcp login in a terminal.';
       }
+      if (source === 'gmail') {
+        // OAuth, not Midway: Google ended the grant (revoked, expired after
+        // 7 days in a Testing-mode app, or a password change).
+        return 'Open Connections → Gmail and choose Reconnect. Google ended BotBoy’s access; captured mail is kept.';
+      }
       return `Restart the ${SOURCE_NAMES[source]} connection. If that doesn’t help, run mwinit.`;
     case 'rate_limited':
       return 'Nothing to do: BotBoy slows down and retries.';
@@ -157,10 +165,10 @@ export function classifyCaptureFailure(message: string): CaptureFailureKind {
     return 'midway_auth';
   }
   if (/ratelimited|rate[ -]?limit|\b429\b|too many requests|throttl/i.test(text)) return 'rate_limited';
-  if (/invalid_auth|not_authed|token_expired|token_revoked|account_inactive|AADSTS\d+|silent authorize|\b401\b|unauthori[sz]ed|unauthenticated|authentication failed|session has expired|no valid tokens|\b403\b|forbidden/i.test(text)) {
+  if (/invalid_auth|not_authed|token_expired|token_revoked|account_inactive|invalid_grant|invalid_client|unauthorized_client|invalid_token|AADSTS\d+|silent authorize|\b401\b|unauthori[sz]ed|unauthenticated|authentication failed|session has expired|no valid tokens|\b403\b|forbidden/i.test(text)) {
     return 'service_auth';
   }
-  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|socket hang up|fetch failed|network is unreachable|status(?: code)? 5\d\d\b|\b50[234]\b|timed? ?out|timeout/i.test(text)) {
+  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|socket hang up|fetch failed|network error|network is unreachable|status(?: code)? 5\d\d\b|\b50[234]\b|timed? ?out|timeout/i.test(text)) {
     return 'network';
   }
   if (/no active transport|not running|is not installed|profile (?:missing|stopped|failed|degraded|needs_configuration)|connection closed|transport (?:closed|unavailable)/i.test(text)) {

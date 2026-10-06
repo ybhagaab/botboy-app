@@ -117,6 +117,24 @@ describe('describeEvidence', () => {
     expect(description.addressing).toBe("you're Cc'd");
     expect(description.meta).toBe("Email · you're Cc'd · RE: OP Request | PVD for IN AVOD service");
   });
+  it('Gmail mail for an owner without Outlook identity: the row’s ownerEmail marks Cc and sent mail', () => {
+    // No grasp_sync.owner_email: a Gmail-only owner.
+    const owner = createOwnerMatcher(storage.getDb());
+    const gmailMeta = {
+      ...FIXTURE_META,
+      ccRecipients: 'teammate@example.com,jane.doe@gmail.com',
+      ownerEmail: 'jane.doe@gmail.com',
+      platform: 'gmail_api',
+    };
+    const cc = describeEvidence({ id: 'g1', type: 'email_read', source: 'gmail', title: gmailMeta.subject, metadata: gmailMeta }, owner);
+    expect(cc.addressing).toBe("you're Cc'd");
+    expect(cc.meta).toBe("Email · you're Cc'd · RE: OP Request | PVD for IN AVOD service");
+    const group = describeEvidence({ id: 'g2', type: 'email_read', source: 'gmail', title: 's', metadata: { ...gmailMeta, ccRecipients: 'teammate@example.com' } }, owner);
+    expect(group.addressing).toBe('group mail');
+    const sent = describeEvidence({ id: 'g3', type: 'email_read', source: 'gmail', title: 'Re: plan', metadata: { subject: 'Re: plan', sender: 'jane.doe@gmail.com', senderName: 'Jane', toRecipients: 'a@example.com', ownerEmail: 'jane.doe@gmail.com' } }, owner);
+    expect(sent.actor).toBe('You');
+    expect(sent.actorIsOwner).toBe(true);
+  });
   it('directly addressed mail says "to you"; owner-sent mail becomes "You emailed …"', () => {
     const owner = ownerMatcherFor(storage);
     const direct = describeEvidence({ id: 'e2', type: 'email_read', source: 'grasp', title: 's', metadata: { ...FIXTURE_META, directlyAddressedToOwner: 'true' } }, owner);

@@ -44,11 +44,12 @@ import {
   type SlackThreadIdentity,
 } from './slack-thread.js';
 import {
+  isCanonicalEmailSource,
   isDirectIncomingOutlookEmail,
   isOwnerSentOutlookEmail,
-  OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX,
   parseOutlookThreadIdentity,
   sentContinuesIncomingOutlookThread,
+  sentFollowsRoutedThreadReasonPrefix,
   type OutlookThreadIdentity,
 } from './email-thread.js';
 import {
@@ -332,9 +333,10 @@ Return ONLY the JSON array.`;
     return Boolean(context && isOwnerSentOutlookEmail(context.identity));
   }
 
-  /** A canonical owner-sent Outlook message may inherit one authoritative
-   * project from strictly earlier direct incoming rows in the same exact
-   * mailbox conversation. Subject text is never an identity signal. */
+  /** A canonical owner-sent message (Outlook or Gmail) may inherit one
+   * authoritative project from strictly earlier direct incoming rows in the
+   * same exact mailbox conversation of the SAME source. Subject text is never
+   * an identity signal. */
   function routedOutlookThreadProject(itemId: string): string | null {
     const current = outlookEmailContext(itemId);
     if (!current || !isOwnerSentOutlookEmail(current.identity)) return null;
@@ -342,7 +344,7 @@ Return ONLY the JSON array.`;
       SELECT w.id, w.project_id AS projectId, w.metadata
       FROM work_items w
       JOIN projects p ON p.id = w.project_id
-      WHERE w.source = 'grasp' AND w.type = 'email_read'
+      WHERE w.source = ? AND w.type = 'email_read'
         AND w.process_state = 'routed'
         AND w.scope_alert IS NULL
         AND w.project_id IS NOT NULL
@@ -363,6 +365,7 @@ Return ONLY the JSON array.`;
     let scannedRows = 0;
     while (qualifyingRows < MAX_OUTLOOK_THREAD_CANDIDATES) {
       const rows = selectCandidates.all(
+        current.identity.source,
         current.identity.ownerEmail,
         current.identity.conversationId,
         current.identity.messageTimestamp,
@@ -374,7 +377,7 @@ Return ONLY the JSON array.`;
       for (const row of rows) {
         let metadata: Record<string, unknown> = {};
         try { metadata = JSON.parse(row.metadata ?? '{}'); } catch { continue; }
-        const request = parseOutlookThreadIdentity({ source: 'grasp', type: 'email_read', metadata });
+        const request = parseOutlookThreadIdentity({ source: current.identity.source, type: 'email_read', metadata });
         if (!request
           || !isDirectIncomingOutlookEmail(request)
           || !sentContinuesIncomingOutlookThread(request, current.identity)) continue;
@@ -706,7 +709,7 @@ Return ONLY the JSON array.`;
             modelItems.push(item);
           }
         } else if (
-          item.source === 'grasp'
+          isCanonicalEmailSource(item.source)
           && item.type === 'email_sent'
           && isOwnerSentOutlookItem(item.id)
         ) {
@@ -721,7 +724,7 @@ Return ONLY the JSON array.`;
                 modelDecision: 'not_called',
                 appliedDecision: 'assign',
                 appliedProjectId: threadProjectId,
-                validationReason: OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX,
+                validationReason: sentFollowsRoutedThreadReasonPrefix(item.source),
               });
             }
           } else {
@@ -827,7 +830,7 @@ Return ONLY the JSON array.`;
             : null;
         const deterministicReason = slackThreadProjectId
           ? 'deterministic slack-reply-follows-routed-root rule after same-wave root'
-          : `${OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX} after same-wave request`;
+          : `${sentFollowsRoutedThreadReasonPrefix(item.source)} after same-wave request`;
         const applied: AppliedRoutingDecision = deterministicThreadProjectId
           ? {
               bucket: 'assigned',

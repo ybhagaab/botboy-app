@@ -159,6 +159,12 @@ PID_FILE="${PPT_PID_FILE:-/tmp/ppt.pid}"
 # launcher only checks that it exists; it never reads it into a variable,
 # argv, or the environment.
 AI_MODEL_SETTINGS_FILE="$HOME/.personal-productivity-tracker/ai-model.json"
+# BotBoy's shared Google client staged by scripts/import-credentials.sh; the
+# server moves it into gmail.json at boot and deletes this file.
+GMAIL_TEAM_CLIENT_INBOX="$HOME/.personal-productivity-tracker/gmail-team-client.json"
+# Connections → Gmail: the Google OAuth client(s) and refresh token,
+# saved by the server (0600). Only --doctor inspects it, inside node.
+GMAIL_CREDENTIALS_FILE="$HOME/.personal-productivity-tracker/gmail.json"
 STARTUP_SAFETY_BLOCK="${PPT_STARTUP_SAFETY_BLOCK:-/tmp/ppt-startup-safety-block.json}"
 SHUTDOWN_RECEIPT_DIR="${PPT_SHUTDOWN_RECEIPT_DIR:-/tmp}"
 STARTUP_INT_GRACE_SECONDS="${PPT_STARTUP_INT_GRACE_SECONDS:-20}"
@@ -1260,6 +1266,66 @@ if [ "$DOCTOR" = "1" ]; then
     ' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
   else
     echo "ai-model: no API key saved (add an OpenAI or DeepSeek key in Settings → AI model)"
+  fi
+  # Connections → Gmail. Node reads the OAuth client and refresh token in its
+  # own memory and prints only which client is active (own or BotBoy's shared
+  # one), the client ID's last characters, the account's domain, the granted
+  # access, the file mode, and the HTTP status of one token refresh; no secret
+  # or address enters this shell, argv, or the output.
+  if [ -f "$GMAIL_TEAM_CLIENT_INBOX" ]; then
+    echo "gmail: BotBoy's shared Google client is staged from the credential file (applied at the next start)"
+  fi
+  if [ -f "$GMAIL_CREDENTIALS_FILE" ]; then
+    "$NODE" -e '
+      const fs = require("fs");
+      const file = process.argv[1];
+      const mode = (fs.lstatSync(file).mode & 0o777).toString(8);
+      let value;
+      try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+      const usable = entry => entry && typeof entry.clientId === "string" && typeof entry.clientSecret === "string";
+      const own = value && value.schemaVersion === 1 && usable(value.client) ? value.client : null;
+      const team = value && value.schemaVersion === 1 && usable(value.teamClient) ? value.teamClient : null;
+      const client = own || team;
+      if (!client) {
+        console.log(`gmail: credentials file is unreadable (mode ${mode}) — import the BotBoy credential file again or save your own client in Connections → Gmail`);
+        process.exit(0);
+      }
+      const source = own ? "own client" : "BotBoy shared client";
+      const suffix = client.clientId.replace(/\.apps\.googleusercontent\.com$/, "").slice(-6);
+      const connection = value.connection;
+      if (!connection || typeof connection.refreshToken !== "string" || !connection.refreshToken) {
+        console.log(`gmail: ${source} …${suffix} saved, not connected (mode ${mode})`);
+        process.exit(0);
+      }
+      const domain = String(connection.accountEmail || "").split("@")[1] || "unknown";
+      const scopes = String(connection.scope || "").split(/\s+/);
+      const access = scopes.includes("https://www.googleapis.com/auth/gmail.compose") ? "read + compose" : "read only (Reconnect to allow drafting and sending)";
+      console.log(`gmail: ${source} …${suffix} connected to an account at ${domain}; ${access} (mode ${mode})`);
+      fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: client.clientId,
+          client_secret: client.clientSecret,
+          refresh_token: connection.refreshToken,
+        }),
+        signal: AbortSignal.timeout(10000),
+      })
+        .then(async response => {
+          let code = "";
+          if (!response.ok) {
+            try {
+              const body = await response.json();
+              if (typeof body.error === "string") code = ` ${body.error.replace(/[^a-z_]/g, "").slice(0, 40)}`;
+            } catch {}
+          }
+          console.log(`gmail refresh probe: HTTP ${response.status}${code} (200=connected, 400 invalid_grant=choose Reconnect in Connections → Gmail)`);
+        })
+        .catch(() => console.log("gmail refresh probe: HTTP 000 (network, proxy, or VPN blocks oauth2.googleapis.com)"));
+    ' "$GMAIL_CREDENTIALS_FILE" 2>/dev/null || echo "gmail: could not inspect the credentials file"
+  else
+    echo "gmail: not set up (optional, for Google accounts: Connections → Gmail)"
   fi
   # Diagnose the same effective pair normal startup will use. A partial shell
   # override is reported directly and never completed from the stored file.

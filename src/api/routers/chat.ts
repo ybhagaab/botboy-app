@@ -48,6 +48,28 @@ import {
   type DataRoomToolName,
 } from '../../core/data-room-tool-failure.js';
 import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
+import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-chat-tools.js';
+import { gmailDraftMarker } from '../../core/gmail-compose.js';
+import { requireLocalOwnerRequest } from './local-owner.js';
+
+/** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
+const GMAIL_WRITE_TOOLS = new Set(['gmail_draft', 'gmail_send']);
+const GMAIL_TOOL_STATUS: Record<string, string> = {
+  gmail_search: '🔎 Searching Gmail...',
+  gmail_read: '📨 Reading from Gmail...',
+  gmail_draft: '📝 Saving the Gmail draft...',
+  gmail_send: '📤 Sending through Gmail...',
+};
+
+/**
+ * Every Gmail draft saved in a turn shows as its chat card (app.js expands
+ * `[[gmail-draft:<id>]]`); a token the reply left out is appended, so the
+ * owner always sees what was saved and can send or discard it.
+ */
+export function withGmailDraftCards(content: string, draftIds: Iterable<string>): string {
+  const missing = [...draftIds].map(gmailDraftMarker).filter(marker => !content.includes(marker));
+  return missing.length ? `${content.trimEnd()}\n\n${missing.join('\n')}` : content;
+}
 
 const DATA_ROOM_CHAT_TOOL_NAMES = new Set<DataRoomToolName>([
   'list_data_room_datasets',
@@ -634,6 +656,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   });
 
   router.post('/chat/messages', async (req: Request, res: Response) => {
+    // A chat turn can send email and run tools, so another website must not
+    // start one. The owner's dashboard (same loopback origin and port) and
+    // native/no-Origin clients pass; a rebinding host name does not.
+    if (!requireLocalOwnerRequest(req, res, 'Chat')) return;
     if (!chat) return res.status(503).json({ error: 'Chat not available' });
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     const message = typeof body.message === 'string' ? body.message.trim() : '';
@@ -1131,9 +1157,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
           'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony',
+          ...GMAIL_WRITE_TOOLS,
         ]);
         const toolCallMayWrite = (toolCall: any): boolean => WRITE_TOOLS.has(toolCall?.function?.name);
-        const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked)\b)/i;
+        const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added|sent|drafted)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked|sent|drafted|emailed)\b)/i;
+        // Gmail drafts saved this turn: each gets its card even when the reply omits the token.
+        const gmailDraftIds = new Set<string>();
         // Read-only SQL tools that may run as a concurrent batch (the
         // connector's profile allows 4 in-flight calls; the manager's
         // per-server gate arbitrates anything beyond that).
@@ -1537,6 +1566,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               content += '\n\n---\n⚠️ *System note: no data-modifying tool ran in this turn, so despite the wording above nothing was actually created or changed.*';
             }
 
+            content = withGmailDraftCards(content, gmailDraftIds);
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -1819,6 +1849,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: analytics-edit ${Date.now()}\n\n`); } catch {}
                 }, 10000);
+              } else if (GMAIL_TOOL_STATUS[tc.function.name]) {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: GMAIL_TOOL_STATUS[tc.function.name] })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: gmail ${Date.now()}\n\n`); } catch {}
+                }, 10000);
               } else if (PARALLEL_SQL_TOOLS.has(tc.function.name)) {
                 // Warehouse queries now run on a 35-minute budget — the SSE
                 // stream must not go silent for that long or the browser
@@ -1844,8 +1881,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 const dataRoomTool = dataRoomChatToolName(tc.function.name);
                 writeToolCalled ||= dataRoomTool
                   ? dataRoomWriteEffectConfirmed(dataRoomTool, result?.content)
-                  : true;
+                  : GMAIL_WRITE_TOOLS.has(tc.function.name)
+                    // A Gmail write counts only with its receipt (draft saved / message sent).
+                    ? gmailWriteConfirmed(tc.function.name, result?.content)
+                    : true;
               }
+              const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
+              if (savedDraftId) gmailDraftIds.add(savedDraftId);
               if (isDataRoomCreateAttempt) {
                 admittedDataRoomJobId ??= dataRoomDurableJobId(result?.content);
                 dataRoomCreateEffectNeedsRefresh ||= dataRoomCreateEffectNeedsObservation(result?.content);
@@ -2092,6 +2134,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
+        finalContent = withGmailDraftCards(finalContent, gmailDraftIds);
         const capId = `asst-${Date.now()}`;
         if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);

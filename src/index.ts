@@ -65,6 +65,12 @@ import { createSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
+import { createGmailSync, createGmailBrowserCaptureGate, isGmailWebEmailItem } from './monitors/gmail-sync.js';
+import { createGmailConnection } from './core/gmail-connection.js';
+import { createGmailCompose } from './core/gmail-compose.js';
+import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
+import { withGmailChatTools } from './core/gmail-chat-tools.js';
+import { GMAIL_OAUTH_CALLBACK_PATH } from './api/routers/gmail-sync.js';
 import { createSharePointSync } from './monitors/sharepoint-sync.js';
 import { createRouter } from './api/routes.js';
 import { createProfileRegistry } from './product-manager/profile-registry.js';
@@ -603,6 +609,19 @@ async function main() {
   await browserHands.initialize().catch((error: any) => {
     console.warn(`[BrowserHands] Debug Chrome not ready at boot: ${error?.message ?? error}`);
   });
+  // ── Gmail connection (GMAIL_API_INTEGRATION_PLAN.md, GMAIL_CHAT_TOOLS_PLAN.md) ──
+  // One refresh token in a private file, made with the active client: the
+  // owner's own (Advanced) or BotBoy's shared client, which the credential-file
+  // import stages and this boot step applies. Google returns the browser to
+  // this loopback callback. The sync (below) and the chat tools share it.
+  const gmailConnection = createGmailConnection({
+    redirectUri: `http://127.0.0.1:${PORT}/api${GMAIL_OAUTH_CALLBACK_PATH}`,
+  });
+  try {
+    gmailConnection.applyStagedTeamClient();
+  } catch (error) {
+    console.warn(`[Gmail] Could not apply the staged Google client: ${(error as Error)?.message ?? error}`);
+  }
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     brainStore,
     mcpManager,
@@ -623,10 +642,17 @@ async function main() {
     visualInspector,
     projectArtifacts,
   });
-  const toolExecutor = withProductDocumentChatTools(
-    baseToolExecutor,
-    productDocumentService,
-    productDocumentPublications,
+  // Gmail in chat (GMAIL_CHAT_TOOLS_PLAN.md): search/read live, draft/send
+  // compose-only. The same compose service backs the chat draft card. Chat
+  // images attach by their va_… id through the visual-asset registry.
+  const gmailCompose = createGmailCompose({ db, connection: gmailConnection, attachments: defaultAttachmentPolicy(visualAssets) });
+  const toolExecutor = withGmailChatTools(
+    withProductDocumentChatTools(
+      baseToolExecutor,
+      productDocumentService,
+      productDocumentPublications,
+    ),
+    { connection: gmailConnection, compose: gmailCompose },
   );
 
   // Backward-compat: llmClient implements sendPrompt() for components not yet migrated
@@ -1141,8 +1167,11 @@ async function main() {
   // browser capture passes through untouched, and disabling the sync restores
   // browser email capture.
   const graspMailSupersedesBrowser = createBrowserEmailCaptureGate(db);
+  // The same rule for Gmail web once the Gmail API sync is live (gmail-sync.ts).
+  const gmailSupersedesBrowser = createGmailBrowserCaptureGate(db);
   browserMonitor.onWorkItem(item => {
     if (isBrowserEmailItem(item) && graspMailSupersedesBrowser()) return;
+    if (isGmailWebEmailItem(item) && gmailSupersedesBrowser()) return;
     eventBus.emit(item);
   });
 
@@ -1233,6 +1262,12 @@ async function main() {
     captureHealth,
   });
 
+  // ── Gmail API sync (non-Amazon accounts; GMAIL_API_INTEGRATION_PLAN.md) ──
+  // Uses the connection built before the tool executor (the chat tools share it).
+  const gmailSync = createGmailSync({
+    db, connection: gmailConnection, emit: item => eventBus.emit(item), captureHealth,
+  });
+
   // ── SharePoint document sync (user-selected sources, discovery + drain) ──
   // Read-only MCP calls; documents flow through the same capture handler.
   // The parser powers the large-file lane (self-parsed in the drain).
@@ -1268,6 +1303,7 @@ async function main() {
         }
       };
       stop('grasp', () => graspSync.stop());
+      stop('gmail', () => gmailSync.stop());
       stop('sharepoint', () => sharePointSync.stop());
       stop('pipeline', () => pipelineOrchestrator.stop());
       stop('data-room-scheduler', () => analyticsDataRoomScheduler.stop());
@@ -1410,6 +1446,10 @@ async function main() {
     channelDigester,
     mcpManager,
     graspSync,
+    gmailSync,
+    gmailConnection,
+    gmailCompose,
+    dashboardOrigin: `http://localhost:${PORT}`,
     sharePointSync,
     contentStore,
     documentParser,
@@ -1468,7 +1508,9 @@ async function main() {
   console.log('✅ Lossless pipeline active (extraction + batched interpretation)');
 
   graspSync.start();
-  console.log('✅ GRASP sync scheduled (Outlook mail + calendar every 30 min)');
+  console.log('✅ GRASP sync scheduled (Outlook mail + calendar every 5 min)');
+  gmailSync.start();
+  console.log(`✅ Gmail sync scheduled (every 5 min; ${gmailConnection.isConnected() ? `connected as ${gmailConnection.accountEmail()}` : 'not connected'})`);
 
   sharePointSync.start();
   console.log('✅ SharePoint sync scheduled (discovery every 30 min, drain every 20 s)');

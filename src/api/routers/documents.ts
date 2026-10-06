@@ -18,6 +18,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import type { RouterDeps } from './deps.js';
+import { requireLocalOwnerRequest } from './local-owner.js';
 import {
   createPendingEdit,
   listPendingEdits,
@@ -416,6 +417,9 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
    * staged-only or ambiguous text → honest 409.
    */
   router.post('/documents/assist-edit', async (req: Request, res: Response) => {
+    // The run is owner-started and may read the owner's live mail, so a page
+    // from any other origin (including a DNS-rebinding one) cannot start it.
+    if (!requireLocalOwnerRequest(req, res, 'Document edit')) return;
     const db = deps.db;
     if (!db) return res.status(503).json({ error: 'database unavailable' });
     if (!deps.agent) return res.status(503).json({ error: 'agent unavailable' });
@@ -499,7 +503,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       '<<<CONTEXT', context, 'CONTEXT>>>',
       `Owner's instruction: ${instruction}`,
       'Rules:',
-      '- Use your tools when the instruction needs facts you do not have (read_document for the full doc, get_project_brain, search_items, MCP reads). Do NOT call any write or staging tool — the reader stages your text after the owner approves it.',
+      '- Use your tools when the instruction needs facts you do not have (read_document for the full doc, get_project_brain, search_items, gmail_search / gmail_read for the owner\'s live mail, MCP reads). Do NOT call any write or staging tool — the reader stages your text after the owner approves it.',
       '- Your FINAL message must be ONLY the replacement text for the passage, as plain markdown. No preamble, no explanation, no code fences. It replaces the passage verbatim.',
       "- Match the document's tone and heading/list conventions.",
       '- If the instruction implies removing the passage entirely, reply with exactly: [DELETE]',
@@ -508,7 +512,8 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const startedAt = Date.now();
     let out: string;
     try {
-      out = await deps.agent.executeAction(task, undefined, { workload: 'interactive' });
+      // The owner asked for this edit in the reader: an owner-started run (live Gmail reads allowed).
+      out = await deps.agent.executeAction(task, undefined, { workload: 'interactive', startedByOwner: true });
     } catch (error) {
       return res.status(502).json({ error: `BotBoy could not complete the edit: ${(error as Error).message}` });
     }

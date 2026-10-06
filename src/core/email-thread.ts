@@ -1,14 +1,42 @@
 /**
- * Strict Outlook/GRASP conversation provenance shared by capture, routing,
- * brain synthesis, and evidence gists.
+ * Strict canonical-mail conversation provenance shared by capture, routing,
+ * brain synthesis, and evidence gists. "Outlook" in the names below is
+ * historical: the same rules cover every canonical provider (GRASP for
+ * Outlook/M365, the Gmail API since 2026-10-05).
  *
- * Outlook conversationId proves membership in one mailbox conversation, not a
- * direct parent edge. Current GRASP exposes no In-Reply-To/message-parent ID,
- * so ambiguous multiple-request conversations must fail closed in recovery.
+ * A conversation id (Outlook conversationId, Gmail threadId) proves membership
+ * in one mailbox conversation, not a direct parent edge. Current GRASP exposes
+ * no In-Reply-To/message-parent ID, so ambiguous multiple-request
+ * conversations must fail closed in recovery.
  */
 
+/**
+ * Canonical relational mail comes only from these exact source → platform
+ * pairs. A row claiming one source with another source's platform is not
+ * canonical, and a thread never spans two sources.
+ */
+export const CANONICAL_EMAIL_PLATFORMS: Readonly<Record<string, string>> = Object.freeze({
+  grasp: 'grasp_m365',
+  gmail: 'gmail_api',
+});
+
+export function isCanonicalEmailSource(source: unknown): boolean {
+  return typeof source === 'string'
+    && Object.prototype.hasOwnProperty.call(CANONICAL_EMAIL_PLATFORMS, source);
+}
+
+/** Persisted in routing_decisions.validation_reason; never rename. */
 export const OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX =
   'deterministic outlook-sent-follows-routed-thread rule';
+export const GMAIL_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX =
+  'deterministic gmail-sent-follows-routed-thread rule';
+
+/** The routing proof prefix a source's owner-sent mail is stamped with. */
+export function sentFollowsRoutedThreadReasonPrefix(source: string): string {
+  return source === 'gmail'
+    ? GMAIL_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX
+    : OUTLOOK_SENT_FOLLOWS_ROUTED_THREAD_REASON_PREFIX;
+}
 
 const EMAIL_ADDRESS_PATTERN = /[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
 const ISO_MESSAGE_TIMESTAMP_PATTERN =
@@ -25,6 +53,20 @@ const QUOTED_REPLY_START = [
   /^(de|von|da)\s*:/i,
   /^sent from (my|outlook)/i,
 ];
+/**
+ * Gmail's text/plain parts wrap the reply attribution at ~76 columns, so
+ * "On Mon, Oct 5, 2026 at 9:00 AM Jane Doe <jane@x.com> wrote:" arrives as two
+ * lines. Only that shape counts: an "On …" line, the next line ending in
+ * "wrote:", and an address marker (< or @) between them.
+ */
+function isWrappedReplyAttribution(line: string, next: string): boolean {
+  return /^on\s.{4,200}$/i.test(line)
+    && /wrote:\s*$/i.test(next)
+    && next.length <= 200
+    && /[<@]/.test(`${line} ${next}`);
+}
+/** Gmail's forward separator ("---------- Forwarded message ---------"). */
+const FORWARDED_MESSAGE = /^-{2,}\s*forwarded message\s*-{2,}$/i;
 const GREETING = /^(hi|hello|hey|dear|good (morning|afternoon|evening)|team|all|folks)\b[^\n]{0,40}$/i;
 const SIGN_OFF = /^(thanks|thank you|many thanks|regards|best|best regards|kind regards|warm regards|cheers|br|sincerely|thx)\b[\s,!.]*(all|team)?[\s,!.]*$/i;
 
@@ -35,6 +77,8 @@ export interface OutlookEmailEvidenceLike {
 }
 
 export interface OutlookThreadIdentity {
+  /** Capture source of the row (`grasp` | `gmail`); part of the thread key. */
+  source: string;
   ownerEmail: string;
   conversationId: string;
   messageTimestamp: string;
@@ -99,9 +143,9 @@ export function parseOutlookMessageTimestamp(value: unknown): {
 export function parseOutlookThreadIdentity(
   evidence: OutlookEmailEvidenceLike,
 ): OutlookThreadIdentity | null {
-  if (evidence.source !== 'grasp') return null;
+  if (!isCanonicalEmailSource(evidence.source)) return null;
   const platform = String(evidence.metadata.platform ?? '').trim();
-  if (platform !== 'grasp_m365') return null;
+  if (platform !== CANONICAL_EMAIL_PLATFORMS[evidence.source]) return null;
 
   const direction = String(evidence.metadata.direction ?? '').trim();
   if (direction !== 'received' && direction !== 'sent') return null;
@@ -122,6 +166,7 @@ export function parseOutlookThreadIdentity(
     || evidence.metadata.directlyAddressedToOwner === 'true';
 
   return {
+    source: evidence.source,
     ownerEmail,
     conversationId,
     messageTimestamp: timestamp.value,
@@ -135,7 +180,7 @@ export function parseOutlookThreadIdentity(
 }
 
 export function outlookThreadKey(identity: OutlookThreadIdentity): string {
-  return `${identity.ownerEmail}\0${identity.conversationId}`;
+  return `${identity.source}\0${identity.ownerEmail}\0${identity.conversationId}`;
 }
 
 export function sameOutlookThread(
@@ -143,6 +188,7 @@ export function sameOutlookThread(
   right: OutlookThreadIdentity | null,
 ): boolean {
   return Boolean(left && right
+    && left.source === right.source
     && left.ownerEmail === right.ownerEmail
     && left.conversationId === right.conversationId);
 }
@@ -178,6 +224,27 @@ export function sentContinuesIncomingOutlookThread(
 }
 
 /**
+ * A raw message body without its quoted history, for reading a thread where
+ * every earlier message is shown once anyway (Gmail chat tools). Unlike
+ * `emailAuthoredBody`, greetings and sign-offs stay: this is for reading, not
+ * for citations. A body that is all quote (a bare forward) is returned whole.
+ */
+export function withoutQuotedHistory(body: string): string {
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
+  const kept: string[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const trimmed = lines[index].trim();
+    // A forwarded message is new to this thread, so nothing after it is history.
+    if (FORWARDED_MESSAGE.test(trimmed)) return body.replace(/\r\n?/g, '\n').trim();
+    if (QUOTED_REPLY_START.some((pattern) => pattern.test(trimmed))) break;
+    if (isWrappedReplyAttribution(trimmed, lines[index + 1]?.trim() ?? '')) break;
+    kept.push(lines[index]);
+  }
+  const text = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return text || body.trim();
+}
+
+/**
  * The authored new part of a rendered email: synthetic leading headers,
  * optional untrusted-data sentinel, greeting/sign-off, and quoted history are
  * excluded. This is the only text eligible for relational email citations.
@@ -192,6 +259,7 @@ export function emailAuthoredBody(content: string): string {
     const line = lines[index];
     const trimmed = line.trim();
     if (QUOTED_REPLY_START.some((pattern) => pattern.test(trimmed))) break;
+    if (isWrappedReplyAttribution(trimmed, lines[index + 1]?.trim() ?? '')) break;
     body.push(line);
   }
   while (body.length && body[0].trim() === '') body.shift();

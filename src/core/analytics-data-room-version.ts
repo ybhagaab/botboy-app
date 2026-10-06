@@ -64,7 +64,7 @@ export function readAnalyticsDataRoomVersion(db?: Database.Database): string {
         db,
         'work_items',
         'created_at',
-        "CASE WHEN source = 'grasp' THEN 2 ELSE 1 END",
+        "CASE WHEN source IN ('grasp','gmail') THEN 2 ELSE 1 END",
         `WHERE (
           source IN ('filesystem','sharepoint')
           AND (
@@ -72,7 +72,7 @@ export function readAnalyticsDataRoomVersion(db?: Database.Database): string {
             OR LOWER(COALESCE(url, '')) LIKE '%.xlsx'
           )
         ) OR (
-          source = 'grasp'
+          source IN ('grasp','gmail')
           AND LOWER(COALESCE(json_extract(metadata, '$.hasAttachments'), '')) = 'true'
         )`,
       ),

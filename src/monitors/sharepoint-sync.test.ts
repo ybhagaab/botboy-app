@@ -1949,12 +1949,24 @@ describe('mailTriggerSweep through the drain tick', () => {
     setSetting(storage.getDb(), 'sharepoint_sync.enabled', 'true');
   }
 
-  function insertMail(id: string, title: string, createdAt: string): void {
+  function insertMail(id: string, title: string, createdAt: string, source = 'grasp'): void {
     storage.getDb().prepare(`
       INSERT INTO work_items (id, type, source, title, url, captured_at, created_at, process_state, raw_text)
-      VALUES (?, 'email_read', 'grasp', ?, 'https://outlook/x', ?, ?, 'routed', 'mail body')
-    `).run(id, title, createdAt, createdAt);
+      VALUES (?, 'email_read', ?, ?, 'https://outlook/x', ?, ?, 'routed', 'mail body')
+    `).run(id, source, title, createdAt, createdAt);
   }
+
+  it('Gmail mail never triggers a SharePoint refresh, even with a matching comment subject', async () => {
+    insertCapture();
+    const engine = buildEngine();
+    insertMail('m0', 'Zhuo, Wei mentioned you in "HLD Final".', '2026-08-27T03:00:00Z');
+    await engine.drainNow(); // arm cursor
+    // Anyone can send a Gmail account a notification-shaped subject.
+    insertMail('g1', 'Zhuo, Wei mentioned you in "HLD Final".', '2026-08-27T03:34:00Z', 'gmail');
+    await engine.drainNow();
+    const queued = storage.getDb().prepare('SELECT COUNT(*) AS n FROM sharepoint_sync_queue').get() as any;
+    expect(queued.n).toBe(0);
+  });
 
   it('first tick arms the cursor; a NEW comment mail enqueues content + comments for the named doc', async () => {
     insertCapture();

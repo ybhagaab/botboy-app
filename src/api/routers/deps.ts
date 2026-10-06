@@ -29,6 +29,9 @@ import type { PromptManager } from '../../core/prompt-manager.js';
 import type { ConversationManager } from '../../core/conversation-manager.js';
 import type { McpManager } from '../../core/mcp-types.js';
 import type { GraspSync } from '../../monitors/grasp-sync.js';
+import type { GmailSync } from '../../monitors/gmail-sync.js';
+import type { GmailConnection } from '../../core/gmail-connection.js';
+import type { GmailCompose } from '../../core/gmail-compose.js';
 import type { SharePointSync } from '../../monitors/sharepoint-sync.js';
 import type { AnalyticsDashboardService, DashboardPublisherService } from '../../core/analytics-types.js';
 import type { AnalyticsScheduler } from '../../core/analytics-scheduler.js';
@@ -79,6 +82,13 @@ export interface RouterDeps {
   conversationManager?: ConversationManager;
   mcpManager?: McpManager;
   graspSync?: GraspSync;
+  /** Gmail API mail sync and its OAuth connection (non-Amazon accounts). */
+  gmailSync?: GmailSync;
+  gmailConnection?: GmailConnection;
+  /** Drafts and sends (chat tools + the chat draft card's owner buttons). */
+  gmailCompose?: GmailCompose;
+  /** Origin the dashboard is served on (http://localhost:<port>); OAuth callbacks redirect here. */
+  dashboardOrigin?: string;
   sharePointSync?: SharePointSync;
   analyticsService?: AnalyticsDashboardService;
   analyticsScheduler?: AnalyticsScheduler;

@@ -9,7 +9,11 @@ disagree, the code is the bug or this file is — reconcile, never ignore.
 ## 1. Evidence (`work_items`)
 Definition: everything captured from the user's environment — Slack messages,
 browser visits, app window captures, clipboard, filesystem documents, GRASP-
-synced owner-addressed email and calendar events, and SharePoint/OneDrive
+synced owner-addressed email and calendar events, Gmail-synced owner-addressed
+and sent email (source `gmail`, for non-Amazon accounts; same `email_read` /
+`email_sent` types and metadata as Outlook mail, with the Gmail thread as the
+conversation; mail BotBoy sends with `gmail_send` arrives the same way on the
+next sync, and drafts are never captured), and SharePoint/OneDrive
 documents with their Word review comments (section 8). Evidence is LOSSLESS
 and IMMUTABLE: full content lives in the content store (inline or
 file-backed, sha256-checksummed). Never delete a row; never rewrite captured
@@ -249,7 +253,13 @@ external SQL output is always untrusted and escaped before rendering.
 projects, areas, work_items (+ FTS), work_item_project_events (Today cursor),
 work_item_rejections, work_item_discards, slack_engagement, channel_digests,
 project_cross_links, app_settings (today.attention.v1, slack.*, relevance.*,
-grasp_sync.*, sharepoint_sync.*), sharepoint_sync_queue / sharepoint_seen,
+grasp_sync.*, gmail_sync.*, gmail_compose.v1 (BotBoy's Gmail drafts, their
+outcome, and each attached file's source and SHA-256, for chat draft cards),
+sharepoint_sync.*), sharepoint_sync_queue / sharepoint_seen,
 pipeline_runs / pipeline_llm_audit / routing_decisions (audit),
 brains/*.md (human-editable). DB: ~/.personal-productivity-tracker/tracker.db.
+Gmail OAuth clients (BotBoy's shared client from the credential file, and an
+optional own client) + refresh token and granted scopes:
+~/.personal-productivity-tracker/gmail.json (0600; never in the database, env,
+or a browser response).
 Document binaries cache: ~/.personal-productivity-tracker/sharepoint-cache/.

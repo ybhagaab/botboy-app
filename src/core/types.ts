@@ -19,7 +19,7 @@ export type WorkItemType =
   | 'clipboard_capture'
   | 'generic_browser';
 
-export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp' | 'sharepoint';
+export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp' | 'gmail' | 'sharepoint';
 
 // ── Raw Work Item (emitted by monitors before storage) ──
 
@@ -162,18 +162,20 @@ export interface EmailMetadata {
   direction: 'read' | 'sent' | 'received';
   /** Canonical owner identity required before an email can support a task. */
   ownerEmail?: string;
-  /** Structured addressing; canonical GRASP rows serialize these as comma-separated strings. */
+  /** Structured addressing; canonical rows (GRASP, Gmail) serialize these as comma-separated strings. */
   toRecipients?: string[] | string;
   ccRecipients?: string[] | string;
   /** Deterministic capture-layer signal for a direct-To assignment. */
   directlyAddressedToOwner?: boolean | 'true' | 'false';
-  /** Exact Outlook conversation membership; opaque and case-sensitive. */
+  /** Exact conversation membership (Outlook conversationId, Gmail threadId); opaque and case-sensitive. */
   conversationId?: string;
-  /** Direction-correct immutable event time: receivedDateTime or sentDateTime. */
+  /** Direction-correct immutable event time: receivedDateTime/sentDateTime, or Gmail internalDate. */
   messageTimestamp?: string;
-  /** Canonical relational mail must be stamped by GRASP M365 capture. */
-  platform?: 'grasp_m365' | string;
+  /** Canonical relational mail: source 'grasp' + 'grasp_m365', or source 'gmail' + 'gmail_api' (email-thread.ts). */
+  platform?: 'grasp_m365' | 'gmail_api' | string;
   graspId?: string;
+  /** Gmail message id (gmail-message.ts). */
+  gmailId?: string;
 }
 
 export interface CallSummaryMetadata {

@@ -9,6 +9,26 @@ import { ANALYTICS_CONTEXT_DIR_KEY } from '../core/analytics-context.js';
 import { createNodeManager } from '../core/node-manager.js';
 import { createPromptManager } from '../core/prompt-manager.js';
 import { createRouter } from './routes.js';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+
+/**
+ * POST /chat/messages from the dashboard's own origin. The chat guard
+ * (requireLocalOwnerRequest) matches Origin against the socket's loopback
+ * port, so these requests go to a real listening server.
+ */
+const listening: http.Server[] = [];
+afterEach(async () => {
+  await Promise.all(listening.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+});
+async function dashboardChatPost(app: express.Express) {
+  const server = http.createServer(app);
+  listening.push(server);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  // Not the supertest Test itself: an async function would resolve (send) a thenable.
+  return { send: (body: object) => request(server).post('/api/chat/messages').set('Origin', origin).send(body) };
+}
 
 function streamResult(input: { content?: string; toolCalls?: any[]; finishReason?: string }) {
   return {
@@ -357,9 +377,7 @@ describe('streamed chat exact dashboard task grounding', () => {
       chatInterface: { getHistory: () => [], sendMessage: async () => ({ message: { id: 'fallback', role: 'assistant', content: '' } }) } as any,
       conversationManager: { getActiveSessionId: () => null, createSession: () => 'session-r41-positive', appendUser: vi.fn(), appendAssistant: vi.fn(), countUserMessages: () => 1, getSummary: () => null, getMessages: () => [], getMessagesSinceId: () => [], getRecentMessages: () => [], saveSummary: vi.fn() } as any,
     }));
-    const response = await request(app).post('/api/chat/messages')
-      .set('Host', 'localhost:7778')
-      .set('Origin', 'http://localhost:7778')
+    const response = await (await dashboardChatPost(app))
       .send({
       message: 'Change this widget to an area visualization.',
       modeHint: 'analytics_dashboard',
@@ -427,9 +445,7 @@ describe('streamed chat analytics route-scope admission', () => {
       id: 'dash_scope', title: 'Scoped dashboard', widgets: canonicalWidget ? [canonicalWidget] : [],
     }));
     const { app, db, sendMessage } = appWithScope(getDashboard);
-    const response = await request(app).post('/api/chat/messages')
-      .set('Host', 'localhost:7778')
-      .set('Origin', 'http://localhost:7778')
+    const response = await (await dashboardChatPost(app))
       .send({
       message: 'Change this widget to an area view.',
       modeHint: 'analytics_dashboard',
@@ -482,9 +498,7 @@ describe('streamed chat analytics route-scope admission', () => {
   it('hands a deictic edit with no selection to the model instead of a canned "select a widget" reply', async () => {
     const getDashboard = vi.fn(() => ({ id: 'dash_scope', widgets: [{ id: 'widget_scope' }] }));
     const { app, sendMessage } = appWithScope(getDashboard);
-    const response = await request(app).post('/api/chat/messages')
-      .set('Host', 'localhost:7778')
-      .set('Origin', 'http://localhost:7778')
+    const response = await (await dashboardChatPost(app))
       .send({
         message: 'Change this widget to an area view.', modeHint: 'analytics_dashboard',
         requestId: 'request-empty-selection',
@@ -620,9 +634,7 @@ describe('streamed chat deterministic analytics edit receipt finalization', () =
         getSummary: () => null, getMessages: () => [], getMessagesSinceId: () => [], getRecentMessages: () => [], saveSummary: vi.fn(),
       } as any,
     }));
-    const response = await request(app).post('/api/chat/messages')
-      .set('Host', 'localhost:7778')
-      .set('Origin', 'http://localhost:7778')
+    const response = await (await dashboardChatPost(app))
       .send({
       message,
       modeHint: 'analytics_dashboard',
@@ -693,9 +705,7 @@ describe('streamed chat exact-task data-room isolation', () => {
         getSummary: () => null, getMessages: () => [], getMessagesSinceId: () => [], getRecentMessages: () => [], saveSummary: vi.fn(),
       } as any,
     }));
-    const response = await request(app).post('/api/chat/messages')
-      .set('Host', 'localhost:7778')
-      .set('Origin', 'http://localhost:7778')
+    const response = await (await dashboardChatPost(app))
       .send({
         message: 'Change this widget to an area visualization; ds_unrelated is unrelated.', modeHint: 'analytics_dashboard',
         requestId: 'request-unbound-isolation',
@@ -781,9 +791,7 @@ describe('streamed chat edit finalization visual disclosure', () => {
     expect(uploaded.body.visualInspection.status).toBe('unsupported');
     const attachmentId = String(uploaded.body.id);
     try {
-      const response = await request(app).post('/api/chat/messages')
-        .set('Host', 'localhost:7778')
-        .set('Origin', 'http://localhost:7778')
+      const response = await (await dashboardChatPost(app))
         .send({
           message: 'Change this widget to an area visualization.', modeHint: 'analytics_dashboard',
           requestId: 'request-unsupported-visual', attachments: [attachmentId],

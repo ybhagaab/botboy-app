@@ -93,9 +93,12 @@ describe('BrainUpdater', () => {
     cc?: string;
     direct?: boolean;
     subject?: string;
+    /** Canonical mail provider; addresses stay the same so only the provider differs. */
+    provider?: 'grasp' | 'gmail';
   }) {
     const db = storage.getDb();
     const cs = createContentStore(db, { contentDir: dir, inlineThresholdBytes: 1024 });
+    const gmail = input.provider === 'gmail';
     const ownerEmail = 'owner@amazon.com';
     const requesterEmail = 'requester@amazon.com';
     const sender = input.sender ?? (input.direction === 'sent' ? ownerEmail : requesterEmail);
@@ -115,7 +118,7 @@ describe('BrainUpdater', () => {
     const ref = cs.put(input.id, content);
     const cols = refToColumns(ref);
     const metadata = JSON.stringify({
-      platform: 'grasp_m365', ownerEmail,
+      platform: gmail ? 'gmail_api' : 'grasp_m365', ownerEmail,
       conversationId: input.conversationId ?? 'conv-insights',
       messageTimestamp: input.timestamp,
       direction: input.direction,
@@ -123,14 +126,15 @@ describe('BrainUpdater', () => {
       toRecipients: to,
       ccRecipients: input.cc ?? '',
       directlyAddressedToOwner: input.direct === false ? 'false' : 'true',
-      graspId: input.id,
+      ...(gmail ? { gmailId: input.id } : { graspId: input.id }),
     });
     db.prepare(
       `INSERT INTO work_items (id, type, source, title, captured_at, process_state, project_id, batch_id, raw_text, content_storage, content_path, content_sha256, content_bytes, metadata)
-       VALUES (?, ?, 'grasp', ?, ?, 'routed', ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, 'routed', ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       input.id,
       input.direction === 'sent' ? 'email_sent' : 'email_read',
+      gmail ? 'gmail' : 'grasp',
       subject,
       input.timestamp,
       input.projectId,
@@ -144,13 +148,17 @@ describe('BrainUpdater', () => {
     );
   }
 
-  function proveOutlookThreadRouting(itemId: string, projectId: string, batchId: string): void {
+  function proveOutlookThreadRouting(
+    itemId: string,
+    projectId: string,
+    batchId: string,
+    reason = 'deterministic outlook-sent-follows-routed-thread rule',
+  ): void {
     storage.getDb().prepare(`
       INSERT INTO routing_decisions
         (run_id,batch_id,item_id,model_decision,applied_decision,applied_project_id,validation_reason)
-      VALUES ('test-run',? ,?,'not_called','assign',?,
-              'deterministic outlook-sent-follows-routed-thread rule')
-    `).run(batchId, itemId, projectId);
+      VALUES ('test-run',? ,?,'not_called','assign',?,?)
+    `).run(batchId, itemId, projectId, reason);
   }
 
   function build(llm: PipelineLlm) {
@@ -451,6 +459,91 @@ describe('BrainUpdater', () => {
     expect(after.status).toBe('active');
     expect(after.blockers).toEqual(['Original blocker']);
     expect(after.people).toEqual(['Original person']);
+  });
+
+  it('admits a Gmail request plus owner-sent acceptance in one batch exactly like Outlook', async () => {
+    let prompt = '';
+    const { brains, updater } = build({
+      isAvailable: () => true,
+      complete: async (value) => {
+        prompt = value;
+        return JSON.stringify({
+          summary: 'Insights PRD is in progress.', statusLine: 'PRD in progress',
+          tasks: [{
+            state: 'doing', text: 'Write Insights PRD', actionBasis: 'accepted_assignment', confidence: 0.97,
+            evidence: [
+              { role: 'request', evidenceItemId: 'gmail-request', evidenceQuote: 'Can you write the Insights PRD?' },
+              { role: 'acceptance', evidenceItemId: 'gmail-accept', evidenceQuote: 'WIP on the Insights PRD.' },
+            ],
+          }],
+          blockers: [], people: [], newActivity: [],
+        });
+      },
+    });
+    brains.write(newBrain('proj_thread', 'Insights PRD'));
+    insertOutlookThread({
+      id: 'gmail-request', body: 'Can you write the Insights PRD?', projectId: 'proj_thread', batchId: 'gmail-batch',
+      timestamp: '2026-09-14T10:00:00Z', direction: 'received', provider: 'gmail',
+    });
+    insertOutlookThread({
+      id: 'gmail-accept', body: 'WIP on the Insights PRD.', projectId: 'proj_thread', batchId: 'gmail-batch',
+      timestamp: '2026-09-14T10:05:00Z', direction: 'sent', provider: 'gmail',
+    });
+
+    const result = await updater.runForBatch('gmail-batch');
+    expect(result[0].status).toBe('updated');
+    expect(prompt).toContain('THREAD_KIND: gmail');
+    expect(prompt).not.toContain('THREAD_KIND: outlook');
+    expect(brains.read('proj_thread')!.tasks).toEqual([
+      { state: 'doing', text: 'Write Insights PRD', date: '2026-09-14' },
+    ]);
+  });
+
+  it('retrieves a prior Gmail request only behind the Gmail routing proof, and never across providers', async () => {
+    let prompt = '';
+    const { brains, updater } = build({
+      isAvailable: () => true,
+      complete: async (value) => {
+        prompt = value;
+        return JSON.stringify({
+          summary: 'Changed by model', statusLine: 'Changed status',
+          tasks: [{
+            state: 'doing', text: 'Write Insights PRD', actionBasis: 'accepted_assignment', confidence: 0.98,
+            evidence: [
+              { role: 'request', evidenceItemId: 'old-gmail-request', evidenceQuote: 'Can you write the Insights PRD?' },
+              { role: 'acceptance', evidenceItemId: 'new-gmail-accept', evidenceQuote: 'WIP on the Insights PRD.' },
+            ],
+          }],
+          blockers: [], people: [], newActivity: [],
+        });
+      },
+    });
+    brains.write(newBrain('proj_thread', 'Insights PRD'));
+    insertOutlookThread({
+      id: 'old-gmail-request', body: 'Can you write the Insights PRD?', projectId: 'proj_thread', batchId: 'old-gmail-batch',
+      timestamp: '2026-09-14T10:00:00Z', direction: 'received', provider: 'gmail',
+    });
+    // Same owner and conversation id from the other provider: never the same thread.
+    insertOutlookThread({
+      id: 'outlook-same-conv', body: 'Can you write the Insights PRD?', projectId: 'proj_thread', batchId: 'old-outlook-batch',
+      timestamp: '2026-09-14T09:59:00Z', direction: 'received',
+    });
+    insertOutlookThread({
+      id: 'new-gmail-accept', body: 'WIP on the Insights PRD.', projectId: 'proj_thread', batchId: 'new-gmail-batch',
+      timestamp: '2026-09-14T10:05:00Z', direction: 'sent', provider: 'gmail',
+    });
+    // An Outlook-prefixed proof does not prove a Gmail row.
+    proveOutlookThreadRouting('new-gmail-accept', 'proj_thread', 'new-gmail-batch');
+    await updater.runForBatch('new-gmail-batch');
+    expect(prompt).not.toContain('id="old-gmail-request"');
+    expect(brains.read('proj_thread')!.tasks).toEqual([]);
+
+    proveOutlookThreadRouting('new-gmail-accept', 'proj_thread', 'new-gmail-batch', 'deterministic gmail-sent-follows-routed-thread rule');
+    const result = await updater.runForBatch('new-gmail-batch');
+    expect(result[0].status).toBe('updated');
+    expect(prompt).toContain('id="old-gmail-request"');
+    expect(prompt).not.toContain('id="outlook-same-conv"');
+    expect(brains.read('proj_thread')!.tasks).toEqual([{ state: 'doing', text: 'Write Insights PRD', date: '2026-09-14' }]);
   });
 
   it('does not retrieve prior Outlook mail without an authoritative sent-thread routing proof', async () => {
@@ -780,8 +873,8 @@ describe('BrainUpdater', () => {
       "SELECT prompt_version AS version FROM pipeline_llm_audit WHERE batch_id='recovery-batch' ORDER BY started_at, rowid",
     ).all() as Array<{ version: string }>;
     expect(versions.map((row) => row.version)).toEqual([
-      'brain-v8-relational-email',
-      'brain-v8-relational-task-recovery-only',
+      'brain-v10-provider-email',
+      'brain-v10-relational-task-recovery-only',
     ]);
   });
 

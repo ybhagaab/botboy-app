@@ -184,8 +184,14 @@ export function describeEvidence(row: EvidenceRowLike, owner: OwnerMatcher): Evi
   switch (row.type) {
     case 'email_read':
     case 'email_sent': {
+      // Canonical mail rows name their mailbox owner (GRASP or Gmail); that
+      // address is the owner's even when the global identity is another
+      // provider's (or unknown, as for a Gmail-only owner).
+      const mailboxOwner = (meta.ownerEmail ?? '').trim().toLowerCase();
+      const isMailboxOwner = (address: string): boolean => isOwnerAddress(address)
+        || (!!mailboxOwner && address.trim().toLowerCase() === mailboxOwner);
       const senderName = displayName(meta.senderName) || aliasOf(meta.sender ?? '') || 'Someone';
-      const sent = row.type === 'email_sent' || meta.direction === 'sent' || isOwnerAddress(meta.sender ?? '') || isOwnerName(meta.senderName ?? '');
+      const sent = row.type === 'email_sent' || meta.direction === 'sent' || isMailboxOwner(meta.sender ?? '') || isOwnerName(meta.senderName ?? '');
       const subject = meta.subject?.trim() || title || '(no subject)';
       if (sent) {
         const to = splitAddresses(meta.toRecipients ?? meta.recipients).map(aliasOf);
@@ -200,7 +206,7 @@ export function describeEvidence(row: EvidenceRowLike, owner: OwnerMatcher): Evi
       const cc = splitAddresses(meta.ccRecipients);
       const addressing = meta.directlyAddressedToOwner === 'true'
         ? 'to you'
-        : cc.some(isOwnerAddress) ? "you're Cc'd" : 'group mail';
+        : cc.some(isMailboxOwner) ? "you're Cc'd" : 'group mail';
       return {
         kindLabel: 'Email', icon: 'mail', actor: senderName, actorIsOwner: false,
         addressing, identifier: subject,

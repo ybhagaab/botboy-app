@@ -24,13 +24,24 @@ import {
   type ToolImageEvidence,
 } from './vision-payload.js';
 
+export interface AgentActionOptions extends Pick<LlmUsageContext, 'workload'> {
+  /**
+   * The owner started this run from BotBoy's UI (a document passage edit, a
+   * non-streaming chat message). Tools that need the owner's own request may
+   * opt in (Gmail search/read); drafting and sending stay chat-only. Never
+   * set for BotBoy's own unattended runs (lesson escalations, the sign-in
+   * sentinel). Separate from `workload`, which is accounting only.
+   */
+  startedByOwner?: boolean;
+}
+
 export interface AgentOrchestrator {
   processInboxItems(options?: ProcessOptions): Promise<ProcessingResult>;
   processItem(itemId: string): Promise<ProcessingResult>;
   executeAction(
     instruction: string,
     nodeId?: string,
-    usageContext?: Pick<LlmUsageContext, 'workload'>,
+    options?: AgentActionOptions,
   ): Promise<string>;
   getProcessingStatus(): ProcessingStatus;
 }
@@ -165,9 +176,10 @@ export function createAgentOrchestrator(
     async executeAction(
       instruction: string,
       nodeId?: string,
-      usageContext?: Pick<LlmUsageContext, 'workload'>,
+      options?: AgentActionOptions,
     ): Promise<string> {
-      const workload = usageContext?.workload ?? 'background';
+      const workload = options?.workload ?? 'background';
+      const startedByOwner = options?.startedByOwner === true;
       const nodes = nodeManager.listNodes('active');
       // Same live MCP inventory as the SSE chat route: the agent knows every
       // callable server and tool up front, no discovery round-trip needed.
@@ -270,6 +282,7 @@ Be concise, helpful, proactive. You have full authority.`;
               const result = await runInLlmModelOperation(loopOperation, () => toolExecutor.executeTool(tc, {
                 currentUserMessage: instruction,
                 callerKind: 'background',
+                ...(startedByOwner ? { ownerStartedRun: true } : {}),
               }));
               if (tc.function.name === 'get_document_writing_guide') documentAuthoringThink = true;
               messages.push({ role: 'tool', content: result.content, toolCallId: tc.id });

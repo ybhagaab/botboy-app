@@ -889,17 +889,38 @@ describe('POST /api/documents/assist-edit', () => {
 
   function appWithAgent(reply: string | ((task: string) => string)) {
     const tasks: string[] = [];
+    const options: unknown[] = [];
     const agent = {
-      executeAction: async (task: string) => {
+      executeAction: async (task: string, _nodeId?: string, runOptions?: unknown) => {
         tasks.push(task);
+        options.push(runOptions);
         return typeof reply === 'function' ? reply(task) : reply;
       },
     };
     const app = express();
     app.use(express.json());
     app.use('/api', createDocumentsRouter({ db: storage.getDb(), contentStore: cs, agent, ...( {} as Partial<RouterDeps>) } as RouterDeps));
-    return { app, tasks };
+    return { app, tasks, options };
   }
+
+  it('runs the edit as a task the owner started, which a page from another origin cannot start', async () => {
+    insertCapture();
+    const { app, tasks, options } = appWithAgent('Crisper text.');
+    const body = {
+      docKey: DOC_KEY,
+      selectedText: 'The system captures evidence continuously across sources.',
+      blockTexts: ['The system captures evidence continuously across sources.'],
+      instruction: 'use Sam’s latest email for the numbers',
+    };
+    const foreign = await request(app).post('/api/documents/assist-edit').set('Origin', 'http://attacker.example:7778').send(body);
+    expect(foreign.status).toBe(403);
+    expect(tasks).toEqual([]);
+
+    expect((await request(app).post('/api/documents/assist-edit').send(body)).status).toBe(200);
+    // Owner-started: Gmail search/read may run inside it; drafting and sending stay chat-only.
+    expect(options).toEqual([{ workload: 'interactive', startedByOwner: true }]);
+    expect(tasks[0]).toContain('gmail_search / gmail_read for the owner\'s live mail');
+  });
 
   it('derives a range shape, frames the task, strips fences, and persists NOTHING', async () => {
     insertCapture();

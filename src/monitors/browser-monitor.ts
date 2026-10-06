@@ -96,6 +96,8 @@ async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string)
       /^devtools:\/\//,
       /^chrome-extension:\/\//,
       /localhost:7778/,          // BotBoy dashboard
+      /127\.0\.0\.1:7778/,       // BotBoy loopback (Gmail OAuth callback)
+      /accounts\.google\.com/,   // Google sign-in and consent (Gmail connect)
       /midway-auth\.amazon\.com/,
       /midway\.amazon\.com/,
       /fido\.a2z\.com/,

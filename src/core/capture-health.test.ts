@@ -31,6 +31,18 @@ describe('classifyCaptureFailure', () => {
     expect(classifyCaptureFailure('inbox: API request failed with status 401: {"message":"Unauthenticated","desc":"You should authenticate (may use mwinit)"}')).toBe('midway_auth');
   });
 
+  it('classifies the Gmail client’s own failure texts', () => {
+    // gmail-api.ts › send / tokenError / apiError
+    expect(classifyCaptureFailure('Gmail message failed: network error')).toBe('network');
+    expect(classifyCaptureFailure('Gmail history failed: network error (ECONNRESET)')).toBe('network');
+    expect(classifyCaptureFailure('Gmail message list timed out after 30s')).toBe('network');
+    expect(classifyCaptureFailure('Gmail token refresh failed (HTTP 400 invalid_grant: Token has been expired or revoked.). Google ended BotBoy’s access to this account (revoked, expired, or the password changed). Choose Reconnect.')).toBe('service_auth');
+    expect(classifyCaptureFailure('Gmail message failed (HTTP 403 userRateLimitExceeded: User-rate limit exceeded)')).toBe('rate_limited');
+    expect(classifyCaptureFailure('Gmail message failed (HTTP 429 rateLimitExceeded)')).toBe('rate_limited');
+    expect(classifyCaptureFailure('Gmail profile failed (HTTP 503 backendError)')).toBe('network');
+    expect(classifyCaptureFailure('Gmail history returned an unreadable (non-JSON) response (HTTP 502)')).toBe('network');
+  });
+
   it('recognizes a connection that is not running, and leaves the rest unknown', () => {
     expect(classifyCaptureFailure('no active transport — start the Slack MCP connection')).toBe('connector_down');
     expect(classifyCaptureFailure('SharePoint connection: profile stopped')).toBe('connector_down');
@@ -115,6 +127,21 @@ describe('capture health streaks', () => {
     expect(issue.nextAction).toMatch(/mwinit/);
     expect(issue.nextAction).toMatch(/grasp-mcp login/);
     expect(issue.nextAction).not.toMatch(/Restart/);
+  });
+
+  it('sends a lasting Gmail sign-in failure to Reconnect, not to Midway', () => {
+    const health = make();
+    const reason = 'Gmail token refresh failed (HTTP 400 invalid_grant: Token has been expired or revoked.)';
+    health.reportFailure('gmail', { kind: classifyCaptureFailure(reason), reason });
+    expect(health.issues()).toEqual([]);
+    clock.value += minutes(11);
+    health.reportFailure('gmail', { kind: classifyCaptureFailure(reason), reason });
+    const [issue] = health.issues();
+    expect(issue).toMatchObject({ source: 'gmail', name: 'Gmail', kind: 'service_auth', href: '#/connections/gmail-sync', failures: 2 });
+    expect(issue.nextAction).toMatch(/Connections → Gmail.*Reconnect/);
+    expect(issue.nextAction).not.toMatch(/mwinit/);
+    expect(health.needsMidwayReauth('gmail')).toBe(false);
+    expect(health.sources().map(entry => entry.source)).toContain('gmail');
   });
 
   it('changes its version when a warning appears by age alone and when it clears', () => {

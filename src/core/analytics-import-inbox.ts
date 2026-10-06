@@ -544,9 +544,11 @@ export function createAnalyticsImportInbox(input: {
           OR LOWER(COALESCE(url, '')) LIKE '%.xlsx'
         )
     `);
+    // Canonical mail sources only (Outlook via GRASP, Gmail); keep in step
+    // with analytics-data-room-version.ts so the card refreshes.
     const reportedAttachmentMessages = countWhere(`
       SELECT COUNT(*) AS count FROM work_items
-      WHERE source = 'grasp'
+      WHERE source IN ('grasp','gmail')
         AND LOWER(COALESCE(json_extract(metadata, '$.hasAttachments'), '')) = 'true'
     `);
     return {
