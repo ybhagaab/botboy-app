@@ -101,6 +101,9 @@ const state = {
     profileNotice: {},
     // Add/edit form state for user-added MCP servers.
     serverForm: { saving: false, error: '', config: null, loadingConfig: false, deleting: false },
+    // Custom server definitions shown on their connection pages, keyed by id
+    // ({ config, error, loading, saving }). Never holds a secret value.
+    customDefinitions: {},
     // Embedded setup-terminal state: one session at a time.
     terminal: { profileId: '', session: null, output: '', starting: false, sending: false, source: null },
     // Analytics knowledge directory (a2-analytics page card).
@@ -2497,7 +2500,9 @@ function managedProfileCard(profile) {
   const tone = profile.needsReview || profile.state === 'failed' || profile.state === 'degraded' || profile.compatibilityState === 'incompatible'
     ? 'warn'
     : profile.state === 'running' && profile.compatibilityState !== 'incompatible' ? 'good' : '';
+  const missingValues = Array.isArray(profile.customDefinition?.missingValues) ? profile.customDefinition.missingValues : [];
   const detail = (profile.needsReview && 'BotBoy wrote this configuration. Review it, then press Start.')
+    || (missingValues.length && `Waiting for ${missingValues.join(', ')}. Open it to type the value.`)
     || profile.lastError
     || (profile.installationState === 'not_installed' && card.notInstalledDetail)
     || (profile.configured ? card.readyDetail : card.needsSetupDetail)
@@ -3204,6 +3209,7 @@ function renderProfileSettings(profileId) {
     .join('');
 
   const isCustom = profile.custom === true;
+  const remoteCustom = isCustom && profile.customDefinition && profile.customDefinition.transport !== 'stdio';
   const canDelete = isCustom && !profile.enabled && !running && !busy && !state.mcp.serverForm.deleting;
   const customActions = isCustom
     ? `<a class="button" href="#/connections/${encodeURIComponent(profileId)}/edit">${icon('settings')} Edit</a><button class="button" type="button" data-action="mcp-server-delete" data-profile="${attr(profileId)}" ${canDelete ? '' : 'disabled'}>${icon('close')} ${state.mcp.serverForm.deleting ? 'Deleting…' : 'Delete'}</button>`
@@ -3218,18 +3224,20 @@ function renderProfileSettings(profileId) {
   return `<div class="breadcrumb"><a href="#/connections">Connections</a>${icon('chevron-right', 11)}<span>${esc(guide.breadcrumb || profile.displayName)}</span></div>
     ${pageHead('Connection settings', profile.displayName, guide.pageSubtitle || 'BotBoy manages this local MCP connection.', `<a class="button" href="#/connections">Back</a><button class="button" type="button" data-prompt="${attr(askPrompt)}">${icon('sparkles')} Ask BotBoy to set up</button>${customActions}<button class="button" type="button" data-action="profile-action" data-profile="${attr(profileId)}" data-act="check" ${busy ? 'disabled' : ''}>${icon('refresh')} ${pendingLabel('check') ? 'Checking…' : 'Check installation'}</button>`)}
     <section class="grid three-col">
-      <article class="card pad"><div class="metric-label">Installation</div><div class="metric-value" style="font-size:24px">${esc(installation.label)}</div><div class="metric-note ${installation.tone}">Local executable</div></article>
-      <article class="card pad"><div class="metric-label">Process</div><div class="metric-value" style="font-size:24px">${esc(processState.label)}</div><div class="metric-note ${processState.tone}">Managed by BotBoy</div></article>
+      ${remoteCustom
+    ? `<article class="card pad"><div class="metric-label">Endpoint</div><div class="metric-value" style="font-size:24px;overflow-wrap:anywhere">${esc(profile.customDefinition.endpointHost || 'Remote')}</div><div class="metric-note">Remote MCP server</div></article>`
+    : `<article class="card pad"><div class="metric-label">Installation</div><div class="metric-value" style="font-size:24px">${esc(installation.label)}</div><div class="metric-note ${installation.tone}">Local executable</div></article>`}
+      <article class="card pad"><div class="metric-label">${remoteCustom ? 'Connection' : 'Process'}</div><div class="metric-value" style="font-size:24px">${esc(processState.label)}</div><div class="metric-note ${processState.tone}">${remoteCustom ? 'Connected by BotBoy' : 'Managed by BotBoy'}</div></article>
       <article class="card pad"><div class="metric-label">Compatibility</div><div class="metric-value" style="font-size:24px">${esc(compatibility.label)}</div><div class="metric-note ${compatibility.tone}">Protocol and tool check only</div></article>
     </section>
     <section class="grid mcp-settings-grid" style="margin-top:16px">
       <article class="card mcp-form">
         <div class="card-header"><div><h2 class="card-title">${esc(guide.setupHeading?.title || 'Local setup')}</h2><div class="card-meta">${esc(guide.setupHeading?.subtitle || 'Run the fixed steps for this connection.')}</div></div><span class="pill ${processState.tone}"><span class="status-dot ${processState.tone}"></span>${esc(processState.label)}</span></div>
-        ${profile.needsReview ? `<div class="mcp-alert">${icon('shield', 15)}<span>BotBoy wrote this configuration on your request. Review the command, arguments, and environment below (Edit shows the full definition). Pressing Start approves and launches it.</span></div>` : ''}
+        ${profile.needsReview ? `<div class="mcp-alert">${icon('shield', 15)}<span>BotBoy wrote this definition on your request. Review what runs and where under Definition below. Pressing Start approves and ${remoteCustom ? 'connects' : 'launches'} it; BotBoy cannot press it for you.</span></div>` : ''}
         ${profile.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(profile.lastError)}</span></div>` : ''}
         ${profileCaptureIssueAlert(profileId)}
         ${notice?.message ? `<div class="mcp-alert ${noticeTone}">${icon(noticeTone === 'good' ? 'check' : 'activity', 15)}<span>${esc(notice.message)}</span></div>` : ''}
-        <div class="mcp-form-body">${stepsHtml || `<div class="mcp-section"><h3>Server lifecycle</h3><p>BotBoy manages this connection. Use Start, Test, and Stop.</p><div class="mcp-form-actions">${actionButton('start', 'Start', 'Starting…', 'activity', canStart, true)}${actionButton('test', 'Test', 'Testing…', 'check', canTest)}${actionButton('stop', 'Stop', 'Stopping…', 'close', canStop)}</div></div>`}${renderTerminalPanel(profile, pending)}${toolsSection}</div>
+        <div class="mcp-form-body">${stepsHtml || `<div class="mcp-section"><h3>Server lifecycle</h3><p>BotBoy manages this connection. Use Start, Test, and Stop.</p><div class="mcp-form-actions">${actionButton('start', 'Start', 'Starting…', 'activity', canStart, true)}${actionButton('test', 'Test', 'Testing…', 'check', canTest)}${actionButton('stop', 'Stop', 'Stopping…', 'close', canStop)}</div></div>`}${renderTerminalPanel(profile, pending)}${isCustom ? renderCustomDefinitionSection(profileId) : ''}${toolsSection}</div>
       </article>
       <aside class="mcp-side">
         <article class="card pad"><div class="eyebrow">${icon('chevron-right', 14)} Next safe action</div><h3 class="card-title">Continue in order</h3><p class="page-subtitle">${esc(nextAction)}</p></article>
@@ -3480,7 +3488,106 @@ async function runProfileAction(profileId, action) {
     toast(message, 'bad');
   } finally {
     pending.delete(action);
+    // Start and Test can change what a custom server still needs or which transport answered.
+    if (currentProfile(profileId)?.custom) void loadCustomDefinition(profileId);
     if (state.route.view === 'profile-settings') renderRoute({ userAction: true });
+  }
+}
+
+/** A user-added server's definition for its connection page. The API never returns a secret value. */
+async function loadCustomDefinition(profileId) {
+  const entry = state.mcp.customDefinitions[profileId] || {};
+  if (entry.loading) return;
+  state.mcp.customDefinitions[profileId] = { ...entry, loading: true, error: '' };
+  try {
+    const payload = await request(`/mcp/servers/${encodeURIComponent(profileId)}/config`);
+    state.mcp.customDefinitions[profileId] = { config: payload.config, loading: false, error: '', saving: false };
+  } catch (error) {
+    state.mcp.customDefinitions[profileId] = { ...entry, loading: false, error: error.message };
+  } finally {
+    if (state.route.view === 'profile-settings' && state.route.profileId === profileId) renderRoute();
+  }
+}
+
+function mcpTransportLabel(config) {
+  if (config.transport === 'stdio') return 'A command on this Mac (stdio)';
+  if (config.transport === 'http') return 'Remote, Streamable HTTP';
+  if (config.transport === 'sse') return 'Remote, SSE (legacy)';
+  const detected = config.detectedTransport === 'http' ? 'Streamable HTTP' : config.detectedTransport === 'sse' ? 'SSE' : '';
+  return detected ? `Remote, ${detected} (found automatically)` : 'Remote, Streamable HTTP first, then SSE';
+}
+
+/**
+ * Connection page: what runs and where, who publishes it, and its values.
+ * Secret and missing values get write-only fields (PUT /mcp/servers/:id/secrets).
+ */
+function renderCustomDefinitionSection(profileId) {
+  const entry = state.mcp.customDefinitions[profileId];
+  if (!entry || (!entry.config && !entry.loading && !entry.error)) void loadCustomDefinition(profileId);
+  if (!entry?.config) {
+    return `<div class="mcp-section"><h3>Definition</h3><p class="page-subtitle">${entry?.error ? esc(`Could not load the definition: ${entry.error}`) : 'Loading the definition…'}</p></div>`;
+  }
+  const config = entry.config;
+  const remote = config.transport !== 'stdio';
+  const about = config.about || {};
+  const website = typeof about.website === 'string' && /^https?:\/\//i.test(about.website) ? about.website : '';
+  const facts = [
+    ['Runs', mcpTransportLabel(config)],
+    remote ? ['Address', config.url] : ['Command', [config.command, ...(config.args || [])].join(' ')],
+    about.publisher ? ['Published by', about.publisher] : null,
+    about.source ? ['Found in', about.source] : null,
+    ['Added by', config.origin === 'assistant' ? 'BotBoy, on your request' : 'You'],
+  ].filter(Boolean).map(([label, value]) => `<div class="mcp-fact"><span>${esc(label)}</span><strong style="word-break:break-all">${esc(value)}</strong></div>`).join('');
+  const values = [
+    ...(config.env || []).map(item => ({ ...item, kind: 'env' })),
+    ...(config.headers || []).map(item => ({ ...item, kind: 'header' })),
+  ];
+  const rows = values.map(item => {
+    const label = item.kind === 'header' ? `${item.name} header` : item.name;
+    const status = item.secret
+      ? (item.saved ? 'Saved in Keychain · secret' : item.required ? 'Needed · secret' : 'Not set · secret')
+      : (item.saved ? `= ${item.value ?? ''}` : item.required ? 'Needed' : 'Not set');
+    const field = item.secret || !item.saved
+      ? `<input type="${item.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" data-mcp-def-value data-kind="${item.kind}" data-name="${attr(item.name)}" aria-label="${attr(`Value for ${label}`)}" placeholder="${attr(item.saved ? 'Type to replace the saved value' : item.template ? `Type only the key (sent as ${item.template.replace('{value}', 'key')})` : 'Type the value')}">`
+      : '';
+    return `<div class="mcp-def-value"><div><strong>${esc(label)}</strong> <small>${esc(status)}</small></div>${field}</div>`;
+  }).join('');
+  const fillable = values.some(item => item.secret || !item.saved);
+  return `<div class="mcp-section"><h3>Definition</h3><p>${remote ? 'Every call BotBoy makes sends its arguments to this address.' : 'BotBoy runs this command without a shell, inside its sandbox.'} Edit changes it; BotBoy can also fix it from chat.</p>
+    ${facts}${website ? `<div class="mcp-fact"><span>Website</span><strong><a href="${attr(website)}" target="_blank" rel="noopener noreferrer">${esc(website)}</a></strong></div>` : ''}
+    ${values.length ? `<h3 style="margin-top:14px">Values</h3><p>Stored in your Mac's Keychain. BotBoy never sees secret values.</p>${rows}${fillable ? `<div class="mcp-form-actions"><button class="button" type="button" data-action="mcp-custom-values-save" data-profile="${attr(profileId)}" ${entry.saving ? 'disabled' : ''}>${icon('check')} ${entry.saving ? 'Saving…' : 'Save values'}</button></div>` : ''}` : ''}
+  </div>`;
+}
+
+/** Write-only save of the values typed on the connection page; the fields are cleared at once. */
+async function saveCustomDefinitionValues(profileId) {
+  const entry = state.mcp.customDefinitions[profileId];
+  if (!entry || entry.saving) return;
+  const body = {};
+  let count = 0;
+  for (const input of document.querySelectorAll('[data-mcp-def-value]')) {
+    if (!input.value) continue;
+    const kind = input.dataset.kind === 'header' ? 'headers' : 'env';
+    body[kind] = { ...(body[kind] || {}), [input.dataset.name]: input.value };
+    input.value = '';
+    count += 1;
+  }
+  if (!count) {
+    toast('Type a value first.', 'bad');
+    return;
+  }
+  entry.saving = true;
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const payload = await request(`/mcp/servers/${encodeURIComponent(profileId)}/secrets`, { method: 'PUT', body });
+    state.mcp.customDefinitions[profileId] = { config: payload.config, loading: false, error: '', saving: false };
+    toast(count === 1 ? 'Saved in your Keychain' : `${count} values saved in your Keychain`);
+    void loadProfile(profileId, { force: true });
+  } catch (error) {
+    entry.saving = false;
+    toast(`Could not save: ${error.message}`, 'bad');
+  } finally {
+    if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true, userAction: true });
   }
 }
 
@@ -3503,25 +3610,49 @@ function collectMcpServerForm() {
   const form = document.getElementById('mcp-server-form');
   if (!form) throw new Error('The server form is unavailable');
   const value = name => (form.elements[name]?.value ?? '').trim();
-  const name = value('name');
-  const command = value('command');
-  const args = (form.elements.args?.value ?? '')
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean);
+  const lines = name => (form.elements[name]?.value ?? '').split('\n').map(line => line.trim()).filter(Boolean);
+  const payload = { name: value('name') };
+  const secret = value('secret').split(/[\s,]+/).filter(Boolean);
+  if (secret.length) payload.secret = secret;
+  if (form.elements.kind?.value === 'remote') {
+    payload.url = value('url');
+    payload.transport = value('transport') || 'auto';
+    const headers = {};
+    for (const line of lines('headers')) {
+      const separator = line.indexOf(':');
+      if (separator < 1) throw new Error(`Header lines use Name: value. Fix: "${line.slice(0, 60)}"`);
+      headers[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+    }
+    payload.headers = headers;
+    return payload;
+  }
+  payload.command = value('command');
+  payload.args = lines('args');
   const env = {};
-  const envLines = (form.elements.env?.value ?? '').split('\n').map(line => line.trim()).filter(Boolean);
-  for (const line of envLines) {
+  for (const line of lines('env')) {
     const separator = line.indexOf('=');
     if (separator < 1) throw new Error(`Environment lines use NAME=value. Fix: "${line.slice(0, 60)}"`);
     env[line.slice(0, separator).trim()] = line.slice(separator + 1);
   }
-  return { name, command, args, env };
+  payload.env = env;
+  return payload;
 }
 
-/** Add and edit page for user-added MCP servers. */
+/** Mask the form shows for a saved secret; sending it back keeps the value (mcp-custom-config.ts › KEEP_SECRET_MASK). */
+const MCP_KEEP_SECRET_MASK = '••••••••';
+
+/** One env or header entry as an editable line: secrets show the mask, never a value. */
+function mcpEntryLine(entry, separator) {
+  if (entry.secret) {
+    const shown = entry.saved ? MCP_KEEP_SECRET_MASK : entry.template ? entry.template : '';
+    return `${entry.name}${separator}${shown}`;
+  }
+  return `${entry.name}${separator}${entry.value ?? (entry.template || '')}`;
+}
+
+/** Add and edit page for user-added MCP servers: a local command or a remote URL. */
 function renderMcpServerForm({ editing = false, profileId = '' } = {}) {
-  let config = { name: '', command: '', args: [], env: {} };
+  let config = { name: '', transport: 'stdio', command: '', args: [], url: '', env: [], headers: [] };
   if (editing) {
     const loaded = state.mcp.serverForm.config;
     if (!loaded || loaded.id !== profileId) {
@@ -3530,31 +3661,43 @@ function renderMcpServerForm({ editing = false, profileId = '' } = {}) {
         void loadCustomServerConfig(profileId);
       }
       if (state.mcp.serverForm.loadingConfig || !state.mcp.serverForm.error) return loadingView();
-      return `${pageHead('Connection settings', 'Edit MCP server', 'Update the local server definition.')} ${errorView(state.mcp.serverForm.error)}`;
+      return `${pageHead('Connection settings', 'Edit MCP server', 'Update the server definition.')} ${errorView(state.mcp.serverForm.error)}`;
     }
     config = loaded;
   }
+  const remote = config.transport && config.transport !== 'stdio';
   const saving = state.mcp.serverForm.saving;
-  const envText = Object.entries(config.env || {}).map(([key, value]) => `${key}=${value}`).join('\n');
+  const entries = list => (Array.isArray(list) ? list : []);
+  const envText = entries(config.env).map(entry => mcpEntryLine(entry, '=')).join('\n');
+  const headerText = entries(config.headers).map(entry => mcpEntryLine(entry, ': ')).join('\n');
+  const secretNames = [...entries(config.env), ...entries(config.headers)].filter(entry => entry.secret).map(entry => entry.name).join(', ');
+  const transport = ['auto', 'http', 'sse'].includes(config.transport) ? config.transport : 'auto';
   const title = editing ? `Edit ${config.name || 'MCP server'}` : 'Add MCP server';
   const backHref = editing ? `#/connections/${encodeURIComponent(profileId)}` : '#/connections';
   const formAsk = editing
-    ? `Help me fix the configuration of my MCP server "${config.name || profileId}" in BotBoy. Read its current definition with mcp_get_custom_server_config, check its status and last error, and propose a corrected definition with mcp_update_custom_server after confirming with me.`
-    : 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
+    ? `Help me fix my MCP server "${config.name || profileId}" in BotBoy. Read its definition with mcp_get_custom_server_config, check its status and last error, fix it with mcp_update_custom_server, and test it.`
+    : 'I want to add an MCP server to BotBoy. I will name the service or paste a link or config snippet. Find it, add it, and show me its card so I can review and start it.';
   return `<div class="breadcrumb"><a href="#/connections">Connections</a>${icon('chevron-right', 11)}<span>${esc(editing ? 'Edit server' : 'Add server')}</span></div>
-    ${pageHead('Connection settings', title, 'BotBoy starts the command directly without a shell and supervises the process. Reads run freely; writes need your explicit request in chat.', `<a class="button" href="${attr(backHref)}">Back</a><button class="button" type="button" data-prompt="${attr(formAsk)}">${icon('sparkles')} Ask BotBoy to do it</button>`)}
+    ${pageHead('Connection settings', title, 'A local command BotBoy starts and supervises, or a remote server it connects to over HTTPS. Reads run freely; writes need your explicit request in chat.', `<a class="button" href="${attr(backHref)}">Back</a><button class="button" type="button" data-prompt="${attr(formAsk)}">${icon('sparkles')} Ask BotBoy to do it</button>`)}
     <section class="grid mcp-settings-grid">
       <form id="mcp-server-form" class="card mcp-form" onsubmit="return false">
         <div class="card-header"><div><h2 class="card-title">${esc(editing ? 'Server definition' : 'New server definition')}</h2><div class="card-meta">Only you can add servers, and only from this machine.</div></div></div>
         ${state.mcp.serverForm.error ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(state.mcp.serverForm.error)}</span></div>` : ''}
         <div class="mcp-form-body">
           <label class="mcp-field"><span>Display name</span><input name="name" type="text" value="${attr(config.name)}" placeholder="Design Atlas" required></label>
-          <div class="mcp-section"><h3>Launch command</h3><p>Give one executable name from PATH or one absolute path. Put every flag on its own arguments line.</p>
-            <label class="mcp-field"><span>Command</span><input name="command" type="text" value="${attr(config.command)}" placeholder="uvx" required></label>
+          <label class="mcp-field"><span>Where it runs</span><select name="kind" data-mcp-server-kind><option value="local" ${remote ? '' : 'selected'}>A command on this Mac</option><option value="remote" ${remote ? 'selected' : ''}>A remote server (URL)</option></select></label>
+          <div class="mcp-section" data-mcp-kind-section="local" ${remote ? 'hidden' : ''}><h3>Launch command</h3><p>Give one executable name from PATH or one absolute path. Put every flag on its own arguments line.</p>
+            <label class="mcp-field"><span>Command</span><input name="command" type="text" value="${attr(config.command)}" placeholder="uvx"></label>
             <label class="mcp-field"><span>Arguments (one per line)</span><textarea name="args" rows="4" placeholder="my-mcp-server@latest">${esc((config.args || []).join('\n'))}</textarea></label>
+            <label class="mcp-field"><span>Environment variables (one NAME=value per line)</span><textarea name="env" rows="4" placeholder="FASTMCP_LOG_LEVEL=ERROR">${esc(envText)}</textarea></label>
           </div>
-          <div class="mcp-section"><h3>Environment variables</h3><p>One NAME=value per line. Values stay in the local database, so prefer short-lived credentials.</p>
-            <label class="mcp-field"><span>Variables</span><textarea name="env" rows="4" placeholder="FASTMCP_LOG_LEVEL=ERROR">${esc(envText)}</textarea></label>
+          <div class="mcp-section" data-mcp-kind-section="remote" ${remote ? '' : 'hidden'}><h3>Remote server</h3><p>BotBoy sends every call's arguments to this address. Saved keys go only to it, and BotBoy never follows a redirect to another site.</p>
+            <label class="mcp-field"><span>URL</span><input name="url" type="url" value="${attr(config.url || '')}" placeholder="https://mcp.example.com/mcp"></label>
+            <label class="mcp-field"><span>Transport</span><select name="transport"><option value="auto" ${transport === 'auto' ? 'selected' : ''}>Automatic (Streamable HTTP, then SSE)</option><option value="http" ${transport === 'http' ? 'selected' : ''}>Streamable HTTP</option><option value="sse" ${transport === 'sse' ? 'selected' : ''}>SSE (legacy)</option></select></label>
+            <label class="mcp-field"><span>Headers (one Name: value per line)</span><textarea name="headers" rows="3" placeholder="Authorization: Bearer {api_key}">${esc(headerText)}</textarea></label>
+          </div>
+          <div class="mcp-section"><h3>Secret values</h3><p>Every value is stored in your Mac's Keychain. Secret values are never shown to BotBoy: a saved one shows as ${MCP_KEEP_SECRET_MASK}, and leaving that in place keeps it. Names like API_KEY, *_TOKEN, and Authorization count as secret anyway.</p>
+            <label class="mcp-field"><span>Other secret names (comma-separated)</span><input name="secret" type="text" value="${attr(secretNames)}" placeholder="WORKSPACE_PASSPHRASE"></label>
           </div>
           <div class="mcp-form-actions">
             <button class="button primary" type="button" data-action="mcp-server-save" data-mode="${editing ? 'edit' : 'add'}" data-profile="${attr(profileId)}" ${saving ? 'disabled' : ''}>${icon('check')} ${saving ? 'Saving…' : editing ? 'Save changes' : 'Add server'}</button>
@@ -3562,8 +3705,9 @@ function renderMcpServerForm({ editing = false, profileId = '' } = {}) {
         </div>
       </form>
       <aside class="mcp-side">
+        <article class="card pad"><div class="eyebrow">${icon('sparkles', 14)} Easiest way</div><h3 class="card-title">Ask BotBoy in chat</h3><p class="page-subtitle">Name the service ("add the Notion MCP"), or paste a link or config snippet. BotBoy finds the server, fills this in, and shows you a card to review and start.</p></article>
         <article class="card pad"><div class="eyebrow">${icon('shield', 14)} Agent boundary</div><h3 class="card-title">Reads are free, writes need your request</h3><p class="page-subtitle">BotBoy can call this server's read tools whenever they help. Tools that change data run only when you explicitly ask in chat, and every call is audited.</p></article>
-        <article class="card pad"><div class="eyebrow">${icon('activity', 14)} Lifecycle</div><h3 class="card-title">Managed by BotBoy</h3><p class="page-subtitle">After you add the server, use Start, Test, and Stop on its connection page. Health checks and restarts are automatic while it stays enabled.</p></article>
+        <article class="card pad"><div class="eyebrow">${icon('activity', 14)} Lifecycle</div><h3 class="card-title">Managed by BotBoy</h3><p class="page-subtitle">After you add the server, use Start, Test, and Stop on its connection page. Health checks and reconnects are automatic while it stays enabled.</p></article>
       </aside>
     </section>`;
 }
@@ -3588,6 +3732,7 @@ async function saveMcpServer(mode, profileId) {
       : await request('/mcp/servers', { method: 'POST', body: payload });
     storeProfile(response.profile);
     state.mcp.serverForm.config = null;
+    delete state.mcp.customDefinitions[response.profile.id];
     toast(mode === 'edit' ? 'Server definition saved' : `${payload.name} added`);
     go(`#/connections/${response.profile.id}`);
   } catch (error) {
@@ -8454,6 +8599,7 @@ function bindEvents() {
     }
     if (action === 'mcp-server-save') void saveMcpServer(target.dataset.mode, target.dataset.profile || '');
     if (action === 'mcp-server-delete' && target.dataset.profile) void deleteMcpServer(target.dataset.profile);
+    if (action === 'mcp-custom-values-save' && target.dataset.profile) void saveCustomDefinitionValues(target.dataset.profile);
     if (action === 'terminal-run' && target.dataset.profile && target.dataset.command) {
       void startTerminalCommand(target.dataset.profile, target.dataset.command);
     }
@@ -8703,6 +8849,15 @@ function bindEvents() {
   document.addEventListener('change', event => {
     if (event.target?.id === 'gmail-sync-client-file') {
       void saveGmailClientFromFile(event.target);
+      return;
+    }
+    // MCP server form: show the local or the remote fields without a re-render,
+    // so nothing typed is lost.
+    if (event.target?.matches?.('[data-mcp-server-kind]')) {
+      const form = event.target.closest('form');
+      const remote = event.target.value === 'remote';
+      form?.querySelector('[data-mcp-kind-section="local"]')?.toggleAttribute('hidden', remote);
+      form?.querySelector('[data-mcp-kind-section="remote"]')?.toggleAttribute('hidden', !remote);
       return;
     }
     if (event.target?.matches?.('[data-data-room-import-file]')) {

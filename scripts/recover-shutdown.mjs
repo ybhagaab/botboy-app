@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import Database from 'better-sqlite3';
 
 const guardPath = process.env.PPT_STARTUP_SAFETY_BLOCK || '/tmp/ppt-startup-safety-block.json';
 const receiptDir = process.env.PPT_SHUTDOWN_RECEIPT_DIR || '/tmp';
@@ -68,6 +67,41 @@ function pidIsLive(pid) {
   const result = run('ps', ['-p', String(pid), '-o', 'stat=']);
   const state = result.status === 0 ? result.stdout.trim() : '';
   return Boolean(state) && !state.startsWith('Z');
+}
+
+/** Start time of a live process, from `ps -o etime=` ([[dd-]hh:]mm:ss); null when unknown. */
+function processStartMs(pid) {
+  const result = run('ps', ['-p', String(pid), '-o', 'etime=']);
+  const text = result.status === 0 ? result.stdout.trim() : '';
+  const match = text.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!match) return null;
+  const [, days = '0', hours = '0', minutes, seconds] = match;
+  const elapsedSeconds = ((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds);
+  return Date.now() - elapsedSeconds * 1000;
+}
+
+function processCommand(pid) {
+  const result = run('ps', ['-ww', '-p', String(pid), '-o', 'command=']);
+  return result.status === 0 ? result.stdout.trim() : '';
+}
+
+/**
+ * `live`: the guarded BotBoy still runs. `reused`: the PID now belongs to a
+ * process that started after the guard's boundary, so the guarded one is gone
+ * (macOS reuses PIDs). `other`: the PID runs something that is not the BotBoy
+ * server; launchers before 2026-10-07 could guard such a process from a stale
+ * PID file. `not-live`: nothing runs under it. An unknown start time counts as
+ * live, and recovery then refuses, which is the safe side. For `reused` and
+ * `other`, the tracker, port 7778, and open-database checks still protect the
+ * database.
+ */
+function targetState(target) {
+  if (!pidIsLive(target.pid)) return 'not-live';
+  const startedAt = processStartMs(target.pid);
+  // etime has one-second resolution; the margin keeps a borderline case live.
+  if (startedAt !== null && startedAt > target.notBeforeMs + 2_000) return 'reused';
+  const command = processCommand(target.pid);
+  return command && !command.includes('node dist/index.js') ? 'other' : 'live';
 }
 
 function listedPids(command, args) {
@@ -155,7 +189,7 @@ function inspect() {
     const { value, targets } = parseGuard();
     const states = targets.map(target => {
       const receipt = path.join(receiptDir, `ppt-shutdown-${target.pid}.json`);
-      return `${target.pid}:${pidIsLive(target.pid) ? 'live' : 'not-live'}:${fs.existsSync(receipt) ? 'receipt' : 'missing'}`;
+      return `${target.pid}:${targetState(target)}:${fs.existsSync(receipt) ? 'receipt' : 'missing'}`;
     });
     console.log([
       'shutdown recovery: BLOCKED',
@@ -169,18 +203,40 @@ function inspect() {
   }
 }
 
-function recover() {
+function recover(Database) {
   const { value: guard, targets } = parseGuard();
-  const liveTargets = targets.filter(target => pidIsLive(target.pid)).map(target => target.pid);
-  if (liveTargets.length) fail(`Guard target PID(s) still live: ${liveTargets.join(', ')}`);
+  const liveTargets = targets.filter(target => targetState(target) === 'live').map(target => target.pid);
+  if (liveTargets.length) {
+    const described = liveTargets.map(pid => {
+      const command = processCommand(pid).slice(0, 120);
+      return command ? `${pid} (${command})` : String(pid);
+    });
+    fail(`Guard target PID(s) still live: ${described.join(', ')}. `
+      + `That is the old BotBoy; stop it: kill -INT ${liveTargets.join(' ')}, wait 30 seconds, then run ./start.sh `
+      + '(a receipt it writes clears the guard) or ./start.sh --recover-shutdown again.');
+  }
   const servers = trackerPids();
-  if (servers.length) fail(`BotBoy process still exists (${servers.join(', ')})`);
+  if (servers.length) {
+    fail(`BotBoy process still exists (${servers.join(', ')}). Stop it: kill -INT ${servers.join(' ')}, wait 30 seconds, then retry.`);
+  }
   const listeners = listenerPids();
-  if (listeners.length) fail(`Port 7778 still has a listener (${listeners.join(', ')})`);
+  if (listeners.length) {
+    fail(`Port 7778 still has a listener (${listeners.join(', ')}). Find it with: lsof -nP -iTCP:7778 -sTCP:LISTEN`);
+  }
 
-  assertRegularFile(databasePath, 'Tracker database');
   const family = [databasePath, `${databasePath}-wal`, `${databasePath}-shm`];
   const existing = family.filter(file => fs.existsSync(file));
+  if (!existing.length) {
+    // Nothing to protect: the data folder was removed (a factory reset). No
+    // guarded process, BotBoy, or listener is left, so a new start creates a
+    // fresh database. The archived guard keeps the evidence.
+    archiveGuardWithoutDatabase(guard, targets);
+    return;
+  }
+  if (!existing.includes(databasePath)) {
+    fail(`${path.basename(databasePath)} is missing but ${existing.map(file => path.basename(file)).join(' and ')} remain; send the owner ./start.sh --doctor output and keep these files`);
+  }
+  assertRegularFile(databasePath, 'Tracker database');
   const handles = openHandlePids(existing);
   if (handles.length) fail(`Tracker database family still has open handles (${[...new Set(handles)].join(', ')})`);
 
@@ -261,9 +317,45 @@ function recover() {
   console.log('    Keep the snapshot; never restore tracker.db without its matching WAL/SHM and related private state.');
 }
 
+function archiveGuardWithoutDatabase(guard, targets) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const targetLabel = targets.length === 1 ? String(targets[0].pid) : `${targets.length}-targets`;
+  const snapshot = path.join(backupRoot, `receiptless-${targetLabel}-${stamp}`);
+  fs.mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+  fs.chmodSync(backupRoot, 0o700);
+  fs.mkdirSync(snapshot, { mode: 0o700 });
+  fs.writeFileSync(path.join(snapshot, 'source-boundary.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    capturedAt: new Date().toISOString(),
+    guardReason: guard.reason,
+    targetPids: targets.map(target => target.pid),
+    unverifiedShutdown: true,
+    databaseFamilyPresent: false,
+    source: familyState([databasePath, `${databasePath}-wal`, `${databasePath}-shm`]),
+  }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  copyExact(guardPath, path.join(snapshot, 'guard-copy.json'));
+  if (trackerPids().length || listenerPids().length || fs.existsSync(databasePath)) {
+    fail(`Runtime state changed during recovery; guard retained. Evidence: ${snapshot}`);
+  }
+  const archivedGuard = `${guardPath}.archived-${stamp}`;
+  if (fs.existsSync(archivedGuard)) fail(`Guard archive already exists: ${archivedGuard}`);
+  fs.renameSync(guardPath, archivedGuard);
+  console.log(`ℹ️  No tracker database exists at ${databasePath}, so there was nothing to back up.`);
+  console.log(`⚠️  Archived unverified shutdown guard: ${archivedGuard}`);
+  console.log('    Next: ./start.sh (it creates a new, empty database)');
+}
+
+async function loadSqlite() {
+  try {
+    return (await import('better-sqlite3')).default;
+  } catch {
+    fail('better-sqlite3 is not installed or does not load here. Run: npm install (then npm rebuild better-sqlite3 if needed), then retry');
+  }
+}
+
 try {
   if (inspectOnly) inspect();
-  else recover();
+  else recover(await loadSqlite());
 } catch (error) {
   console.error(`❌ Shutdown recovery refused: ${String(error?.message ?? error)}`);
   console.error(`    Original guard retained: ${guardPath}`);

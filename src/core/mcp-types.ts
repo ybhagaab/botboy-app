@@ -55,9 +55,11 @@ export interface McpProfileSnapshot extends McpServerSnapshot {
   /**
    * True when the assistant wrote this configuration and the user has not
    * confirmed it yet. An unreviewed server cannot start until the user
-   * presses Start on its connection page.
+   * presses Start on its card in chat or on its connection page.
    */
   needsReview?: boolean;
+  /** User-added servers only. */
+  custom?: CustomMcpProfileFacts;
 }
 
 /** Who last wrote a custom server definition. */
@@ -79,26 +81,77 @@ export interface McpProfileTestResult {
   message: string;
 }
 
+export type CustomMcpTransportName = 'stdio' | 'http' | 'sse' | 'auto';
+
 /**
- * User-supplied definition for one custom MCP server. The user owns the
- * command; BotBoy validates shape, resolves the executable without a shell,
- * and keeps the agent blocked from the server's tools.
+ * Definition of one user-added MCP server, as the owner's form, the REST API,
+ * or BotBoy's chat tools send it. A local server gives `command` (+ `args`,
+ * `env`); a remote one gives `url` (+ `type`/`transport`, `headers`). The
+ * shapes mirror common MCP client config, so a pasted snippet maps field for
+ * field. Validation lives in mcp-custom-config.ts › normalizeCustomServerInput.
  */
 export interface CustomMcpServerInput {
-  name: string;
-  command: string;
+  name?: string;
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
+  url?: string;
+  type?: string;
+  transport?: string;
+  headers?: Record<string, string>;
+  /** Names whose values are secret (also inferred from names like *_TOKEN). */
+  secret?: string[];
+  /** Names that must have a value before Start. Defaults to the secret names. */
+  required?: string[];
+  about?: { publisher?: string; description?: string; source?: string; website?: string };
 }
 
+/** One env variable or header of a custom server. Secret values are never included. */
+export interface CustomMcpValueView {
+  name: string;
+  secret: boolean;
+  required: boolean;
+  /** A value is saved (in Keychain). */
+  saved: boolean;
+  /** The saved value, for non-secret entries only. */
+  value?: string;
+  /** Header format such as `Bearer {value}`; the owner types only the key. */
+  template?: string;
+  description?: string;
+}
+
+/** Everything about a custom server except secret values. */
 export interface CustomMcpServerConfigView {
   id: string;
   name: string;
+  transport: CustomMcpTransportName;
   command: string;
   args: string[];
-  env: Record<string, string>;
+  url: string;
+  env: CustomMcpValueView[];
+  headers: CustomMcpValueView[];
+  detectedTransport?: 'http' | 'sse';
+  about: { publisher?: string; description?: string; source?: string; website?: string };
   origin: CustomMcpServerOrigin;
   reviewed: boolean;
+  /** Required values not saved yet (`API_KEY`, `header Authorization`). */
+  missingValues: string[];
+}
+
+/** Owner-entered values for existing entries. An empty string clears the value. */
+export interface CustomMcpServerValuesInput {
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+/** The custom-server facts a connection page or card shows. */
+export interface CustomMcpProfileFacts {
+  transport: CustomMcpTransportName;
+  /** Host the calls go to, for remote servers. */
+  endpointHost?: string;
+  detectedTransport?: 'http' | 'sse';
+  about: { publisher?: string; description?: string; source?: string; website?: string };
+  missingValues: string[];
 }
 
 export type McpTerminalSessionStatus = 'running' | 'completed' | 'failed' | 'timed_out' | 'stopped';
@@ -205,9 +258,17 @@ export interface McpManager {
   stopProfile(profileId: string): Promise<McpProfileSnapshot>;
   testProfile(profileId: string): Promise<McpProfileTestResult>;
   createCustomServer(input: CustomMcpServerInput, options?: { origin?: CustomMcpServerOrigin }): Promise<McpProfileSnapshot>;
+  /**
+   * Omitted fields keep their values; env/headers maps replace the set of
+   * names, keeping saved secret values for names that stay. An assistant
+   * edit needs the owner's review again only when the identity changes
+   * (command or arguments; remote origin).
+   */
   updateCustomServer(serverId: string, input: CustomMcpServerInput, options?: { origin?: CustomMcpServerOrigin }): Promise<McpProfileSnapshot>;
   deleteCustomServer(serverId: string): Promise<void>;
   getCustomServerConfig(serverId: string): Promise<CustomMcpServerConfigView | null>;
+  /** Owner-entered values (owner UI only). A running server restarts with them. */
+  setCustomServerValues(serverId: string, values: CustomMcpServerValuesInput): Promise<CustomMcpServerConfigView>;
   /** User confirmation for an assistant-written definition. User surfaces only. */
   approveCustomServer(serverId: string): Promise<McpProfileSnapshot>;
   startTerminalSession(profileId: string, commandId: string): Promise<McpTerminalSessionView>;

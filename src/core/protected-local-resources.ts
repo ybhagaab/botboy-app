@@ -12,6 +12,14 @@ function validPort(value: unknown, fallback: number): number {
   return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 65_535 ? parsed : fallback;
 }
 
+/** BotBoy's own app port and its browser control (CDP) port, as named values. */
+export function protectedLocalPortPolicy(options: { appPort?: number; cdpPort?: number } = {}): { appPort: number; cdpPort: number } {
+  return {
+    appPort: validPort(options.appPort ?? process.env.PPT_PORT, DEFAULT_APP_PORT),
+    cdpPort: validPort(options.cdpPort, DEFAULT_CDP_PORT),
+  };
+}
+
 export function protectedLocalPorts(options: { appPort?: number; cdpPort?: number } = {}): ReadonlySet<number> {
   return new Set([
     validPort(options.appPort ?? process.env.PPT_PORT, DEFAULT_APP_PORT),

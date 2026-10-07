@@ -11,6 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
 import { createMcpManager } from './core/mcp-manager.js';
+import { createMcpServerFinder } from './core/mcp-registry-lookup.js';
 import { sqlContextExportDir } from './core/mcp-profiles.js';
 import { createSqlContextExportRunner } from './core/analytics-sql-export.js';
 import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
@@ -643,6 +644,8 @@ async function main() {
     visualAssets,
     visualInspector,
     projectArtifacts,
+    // mcp_find_server: the official MCP Registry plus the owner's AIM registry.
+    mcpServerFinder: createMcpServerFinder(),
   });
   // Gmail in chat (GMAIL_CHAT_TOOLS_PLAN.md): search/read live, draft/send
   // compose-only. The same compose service backs the chat draft card. Chat

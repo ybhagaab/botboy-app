@@ -50,6 +50,7 @@ import {
 import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
 import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-chat-tools.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
+import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
 import { requireLocalOwnerRequest } from './local-owner.js';
 
 /** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
@@ -1163,6 +1164,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added|sent|drafted)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked|sent|drafted|emailed)\b)/i;
         // Gmail drafts saved this turn: each gets its card even when the reply omits the token.
         const gmailDraftIds = new Set<string>();
+        // MCP servers BotBoy added or changed this turn: each gets its review card.
+        const mcpServerCardIds = new Set<string>();
         // Read-only SQL tools that may run as a concurrent batch (the
         // connector's profile allows 4 in-flight calls; the manager's
         // per-server gate arbitrates anything beyond that).
@@ -1566,7 +1569,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               content += '\n\n---\n⚠️ *System note: no data-modifying tool ran in this turn, so despite the wording above nothing was actually created or changed.*';
             }
 
-            content = withGmailDraftCards(content, gmailDraftIds);
+            content = withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds);
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -1849,6 +1852,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: analytics-edit ${Date.now()}\n\n`); } catch {}
                 }, 10000);
+              } else if (tc.function.name === 'mcp_find_server') {
+                // A registry search can take most of a minute.
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: '🔎 Searching the MCP registries...' })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: mcp-find ${Date.now()}\n\n`); } catch {}
+                }, 10000);
               } else if (GMAIL_TOOL_STATUS[tc.function.name]) {
                 try {
                   res.write(`data: ${JSON.stringify({ type: 'status', text: GMAIL_TOOL_STATUS[tc.function.name] })}\n\n`);
@@ -1888,6 +1899,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               }
               const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
               if (savedDraftId) gmailDraftIds.add(savedDraftId);
+              // A server definition BotBoy saved is a real local effect ("I've
+              // added it" is then true), and the owner reviews it on its card.
+              const savedServerId = mcpServerIdFromToolResult(tc.function.name, result?.content);
+              if (savedServerId) {
+                mcpServerCardIds.add(savedServerId);
+                writeToolCalled = true;
+              }
               if (isDataRoomCreateAttempt) {
                 admittedDataRoomJobId ??= dataRoomDurableJobId(result?.content);
                 dataRoomCreateEffectNeedsRefresh ||= dataRoomCreateEffectNeedsObservation(result?.content);
@@ -2134,7 +2152,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
-        finalContent = withGmailDraftCards(finalContent, gmailDraftIds);
+        finalContent = withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds);
         const capId = `asst-${Date.now()}`;
         if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);

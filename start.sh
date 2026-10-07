@@ -220,6 +220,18 @@ if [ "$RECOVER_SHUTDOWN" = "1" ]; then
     echo "    BOTBOY_UPDATE_NO_START=1 ./start.sh --update"
     exit 1
   fi
+  # A fresh clone has no node_modules yet, and the helper verifies its
+  # database copy with better-sqlite3. Install first, as a normal start would.
+  if ! (cd "$PROJ_DIR" && "$NODE" -e "require('better-sqlite3')") >/dev/null 2>&1; then
+    echo "ℹ️  Installing dependencies for the recovery check — npm install" | tee -a "$LOG_FILE"
+    if ! (cd "$PROJ_DIR" && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) \
+      || ! (cd "$PROJ_DIR" && "$NODE" -e "require('better-sqlite3')") >/dev/null 2>&1; then
+      echo "❌ The recovery check needs better-sqlite3, which did not install or load (see $LOG_FILE)."
+      echo "    Run: npm install   (then: npm rebuild better-sqlite3 if it still fails; needs Xcode Command Line Tools)"
+      echo "    Then: ./start.sh --recover-shutdown"
+      exit 1
+    fi
+  fi
   PPT_STARTUP_SAFETY_BLOCK="$STARTUP_SAFETY_BLOCK" \
   PPT_SHUTDOWN_RECEIPT_DIR="$SHUTDOWN_RECEIPT_DIR" \
   PPT_PID_FILE="$PID_FILE" \
@@ -742,6 +754,7 @@ stop_startup_child() {
       echo "    Replacement starts are blocked by: $STARTUP_SAFETY_BLOCK"
       echo "    Preserve tracker.db + WAL + SHM together and inspect: $receipt"
       [ "$killed" = "0" ] || echo "    The candidate required SIGKILL."
+      print_shutdown_recovery_next_steps
       return 1
       ;;
   esac
@@ -781,6 +794,15 @@ install_app_bundle_if_missing() {
   else
     echo "⚠️  Could not install BotBoy.app (see $LOG_FILE) — run: npm run app:bundle"
   fi
+}
+
+# The PID file only names a candidate. macOS reuses PIDs, and the server never
+# removes the file itself, so after a crash or reboot it can name an unrelated
+# process. Count it only when it runs the BotBoy server (`<node> dist/index.js`,
+# the same match as the pgrep discovery); otherwise BotBoy would signal and,
+# after 30 s, kill someone else's process and then wait forever for a receipt.
+pid_runs_botboy_server() {
+  ps -ww -o command= -p "$1" 2>/dev/null | grep -q 'node dist/index.js'
 }
 
 # A foreground child remains visible as a zombie until this launcher calls
@@ -913,6 +935,22 @@ startup_safety_block_targets() {
   ' "$STARTUP_SAFETY_BLOCK"
 }
 
+# Live BotBoy servers: the pgrep match plus the PID file's entry when that
+# process runs the server too (`pid_runs_botboy_server`).
+discover_tracker_pids() {
+  local pids file_pid="" discovered_pid live_pids=""
+  pids="$(pgrep -f 'node dist/index.js' 2>/dev/null)"
+  [ -f "$PID_FILE" ] && file_pid="$(cat "$PID_FILE" 2>/dev/null)"
+  if [[ "$file_pid" =~ ^[0-9]+$ ]] && pid_runs_botboy_server "$file_pid"; then
+    pids="$pids $file_pid"
+  fi
+  pids="$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+  for discovered_pid in $pids; do
+    pid_is_live "$discovered_pid" && live_pids="$live_pids $discovered_pid"
+  done
+  echo "$live_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u
+}
+
 # Gracefully stop every exact server in the pre-signal snapshot. The
 # application owns a 25-second bounded coordinator: first signal closes
 # admission, the second escalates local resources, and SQLite closes last.
@@ -927,15 +965,7 @@ stop_existing_server() {
     fi
     pids="$exact_pid"
   else
-    pids="$(pgrep -f 'node dist/index.js' 2>/dev/null)"
-    [ -f "$PID_FILE" ] && pids="$pids $(cat "$PID_FILE" 2>/dev/null)"
-    pids="$(echo "$pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
-    local live_pids=""
-    local discovered_pid=""
-    for discovered_pid in $pids; do
-      pid_is_live "$discovered_pid" && live_pids="$live_pids $discovered_pid"
-    done
-    pids="$(echo "$live_pids" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)"
+    pids="$(discover_tracker_pids)"
   fi
   if [ -z "$pids" ]; then
     rm -f "$PID_FILE"
@@ -1042,13 +1072,25 @@ stop_existing_server() {
   return 0
 }
 
+# Every guard refusal names the command that resolves it. A teammate's clean
+# reinstall (2026-10-07) printed only "Inspect … before recovery" and stopped:
+# the guard (/tmp) and the database (~/.personal-productivity-tracker) live
+# outside the checkout, so deleting and re-cloning it changes nothing.
+print_shutdown_recovery_next_steps() {
+  echo "    Next: ./start.sh --recover-shutdown"
+  echo "      It checks that the old BotBoy is gone, backs up tracker.db with its -wal and -shm files, and clears this guard."
+  echo "    Then: ./start.sh"
+  echo "    Do not delete the guard or the database files yourself. If recovery refuses, run ./start.sh --doctor and send the owner its \"shutdown recovery\" line."
+}
+
 startup_safety_allows_takeover() {
   [ -f "$STARTUP_SAFETY_BLOCK" ] || return 0
   local targets
   targets="$(startup_safety_block_targets)"
   if [ -z "$targets" ] || [ "$targets" = "invalid" ]; then
-    echo "❌ Replacement start blocked: the shutdown safety guard is invalid."
-    echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+    echo "❌ Replacement start blocked: the shutdown safety guard is invalid ($STARTUP_SAFETY_BLOCK)."
+    echo "    Next: ./start.sh --doctor, then send the owner its \"shutdown recovery\" line."
+    echo "    Do not delete the guard or tracker.db, tracker.db-wal, or tracker.db-shm yourself."
     return 1
   fi
 
@@ -1078,7 +1120,8 @@ startup_safety_allows_takeover() {
     echo "✅ Cleared shutdown safety block from exact late DB-closure receipt(s)"
     return 0
   fi
-  echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+  echo "    Guard: $STARTUP_SAFETY_BLOCK"
+  print_shutdown_recovery_next_steps
   return 1
 }
 
@@ -1088,7 +1131,8 @@ safe_takeover() {
   local result=$?
   if [ "$result" = "1" ]; then
     echo "❌ Replacement start blocked: prior process did not prove exact, fresh DB-last closure."
-    echo "    Inspect $STARTUP_SAFETY_BLOCK and preserve tracker.db + WAL + SHM together before recovery."
+    echo "    Guard: $STARTUP_SAFETY_BLOCK"
+    print_shutdown_recovery_next_steps
     return 1
   fi
   if [ "$result" = "2" ]; then
@@ -1110,6 +1154,11 @@ fi
 if [ "${BOTBOY_TEST_STARTUP_SAFETY_CHECK:-0}" = "1" ]; then
   startup_safety_allows_takeover
   exit $?
+fi
+# Prints what a takeover would signal; signals nothing.
+if [ "${BOTBOY_TEST_DISCOVER_TRACKER_PIDS:-0}" = "1" ]; then
+  discover_tracker_pids
+  exit 0
 fi
 
 foreground_shutdown() {
@@ -1159,6 +1208,7 @@ if [ "$STOP_ONLY" = "1" ]; then
     exit 2
   fi
   echo "❌ BotBoy stop is incomplete; automatic success is refused"
+  print_shutdown_recovery_next_steps
   exit 1
 fi
 
@@ -1433,6 +1483,11 @@ if [ -n "$MISSING_DEPS" ]; then
     echo "⚠️  npm install failed — see $LOG_FILE. BotBoy starts without: $MISSING_DEPS" | tee -a "$LOG_FILE"
   fi
 fi
+
+# An unresolved shutdown guard blocks every replacement start. Report it now,
+# with its next step, instead of after the build. The dependency install above
+# stays first: the recovery helper needs better-sqlite3.
+startup_safety_allows_takeover || exit 1
 
 NEED_BUILD=""
 if [ "${BOTBOY_FORCE_BUILD:-0}" = "1" ]; then

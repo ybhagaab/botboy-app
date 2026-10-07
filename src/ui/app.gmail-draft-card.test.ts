@@ -44,8 +44,10 @@ const DRAFT = {
 
 beforeAll(() => {
   const source = [
-    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'),
+    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'),
     topLevel('hydrateChatCards'), topLevel('fillLessonCard'), topLevel('lessonEsc'), topLevel('paintLessonCard'),
+    // hydrateChatCards also expands MCP server cards (app.mcp-server-card.test.ts).
+    topLevel('fillMcpServerCard'), topLevel('mcpCardTransport'), topLevel('paintMcpServerCard'),
     topLevel('fillGmailDraftCard'), topLevel('gmailDraftWhen'), topLevel('gmailFileSize'), topLevel('paintGmailDraftCard'),
     gmailClickListener(),
     'return { hydrateChatCards };',

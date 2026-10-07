@@ -327,8 +327,25 @@ const A2_ANALYTICS_BLOCKED_TOOLS = new Set([
   'config_discover',
 ]);
 
-/** Name patterns that indicate a read-only operation on any MCP server. */
-const READ_NAME_PATTERN = /^(get|list|search|read|describe|query|fetch|show|status|check|find|count|view|inspect|preview|lookup|resolve|download)([_\-.]|$)/i;
+const READ_VERBS = ['get', 'list', 'search', 'read', 'describe', 'query', 'fetch', 'show', 'status', 'check', 'find', 'count', 'view', 'inspect', 'preview', 'lookup', 'resolve', 'download'];
+/**
+ * Name patterns that indicate a read-only operation on any MCP server: the
+ * name starts with a read verb. Many servers namespace their tools
+ * (`aws___search_documentation`, `github.list_issues`): one leading
+ * namespace ending in two or more underscores or a dot is skipped, and the
+ * verb after it decides.
+ */
+const READ_NAME_PATTERN = new RegExp(`^(?:[a-z0-9]+(?:_{2,}|\\.))?(${READ_VERBS.join('|')})([_\\-.]|$)`, 'i');
+/**
+ * The same verbs in camelCase or PascalCase (`ReadInternalWebsites`,
+ * `listIssues`): case-sensitive, so the next character must start a new
+ * word. `Readme` and `readme` stay unmatched.
+ */
+const READ_CAMEL_PATTERN = new RegExp(`^(?:[A-Za-z0-9]+(?:_{2,}|\\.))?(?:${READ_VERBS.join('|')}|${READ_VERBS.map(verb => verb[0].toUpperCase() + verb.slice(1)).join('|')})(?=[A-Z0-9])`);
+
+function isReadName(toolName: string): boolean {
+  return READ_NAME_PATTERN.test(toolName) || READ_CAMEL_PATTERN.test(toolName);
+}
 
 /**
  * Every discovered tool is callable. Reads run freely; anything classified
@@ -339,15 +356,15 @@ export function classifyMcpTool(serverKind: string, toolName: string): McpToolRi
     // Known tools first; a tool from a newer connector release is classified
     // by name like any user-added MCP (reads free, anything else needs an
     // owner request). SQL arguments are checked regardless (validateMcpToolCall).
-    return SQL_CONTEXT_READ_TOOLS.has(toolName) || READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
+    return SQL_CONTEXT_READ_TOOLS.has(toolName) || isReadName(toolName) ? 'read' : 'write';
   }
   if (serverKind === 'grasp-m365') {
     if (GRASP_READ_TOOLS.has(toolName)) return 'read';
-    return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
+    return isReadName(toolName) ? 'read' : 'write';
   }
   if (serverKind === 'slack') {
     if (SLACK_READ_TOOLS.has(toolName)) return 'read';
-    return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
+    return isReadName(toolName) ? 'read' : 'write';
   }
   if (serverKind === 'sharepoint') {
     // Deliberately NO name-pattern fallback: an unknown sharepoint_* tool
@@ -364,7 +381,7 @@ export function classifyMcpTool(serverKind: string, toolName: string): McpToolRi
     // (and the blocked set above never runs at all).
     return A2_ANALYTICS_READ_TOOLS.has(toolName) ? 'read' : 'write';
   }
-  return READ_NAME_PATTERN.test(toolName) ? 'read' : 'write';
+  return isReadName(toolName) ? 'read' : 'write';
 }
 
 export function validateMcpToolCall(

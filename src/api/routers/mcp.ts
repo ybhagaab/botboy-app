@@ -5,6 +5,7 @@ import {
   getBuiltInMcpProfile,
 } from '../../core/mcp-profiles.js';
 import { paramStr, type RouterDeps } from './deps.js';
+import { requireLocalOwnerUiRequest } from './local-owner.js';
 import { sqlToolTimeoutMs } from '../../core/tool-executor.js';
 import { getSetting } from '../../core/storage.js';
 import {
@@ -17,6 +18,19 @@ import {
 const PROFILE_LIFECYCLE_ACTIONS = new Set(['check', 'start', 'stop', 'test']);
 
 const MAX_TOOL_DESCRIPTION_CHARS = 500;
+
+/**
+ * Every MCP change needs the rendered same-origin owner interface: the
+ * Connections page or a server card in chat (MCP_REMOTE_TRANSPORTS_PLAN.md
+ * MR1). A native local process without the browser's Origin and
+ * Sec-Fetch-Site headers cannot add, approve, start, or reconfigure a server.
+ */
+function acceptsOwnerUi(req: Request, res: Response, label = 'MCP connection change'): boolean {
+  return requireLocalOwnerUiRequest(req, res, label, 'Use the MCP controls on the Connections page or the server card in chat.');
+}
+
+/** Owner-entered values: only these two maps, of name to string. */
+const SECRET_BODY_KEYS = new Set(['env', 'headers']);
 
 /**
  * Server-authored descriptors reach the browser only for profiles that allow
@@ -50,8 +64,53 @@ function publicServer(server: McpServerSnapshot | null | undefined): Record<stri
   };
 }
 
-/** Synthesized Connections copy for user-added servers. */
+/** Synthesized Connections copy for user-added servers, local or remote. */
 function customServerGuide(profile: McpProfileSnapshot): Record<string, unknown> {
+  const remote = Boolean(profile.custom && profile.custom.transport !== 'stdio');
+  const host = profile.custom?.endpointHost || 'its server';
+  const boundary = {
+    icon: 'shield',
+    eyebrow: 'Agent boundary',
+    title: 'Reads are free, writes need your request',
+    body: 'BotBoy can call read tools of this server whenever they help. Tools that change data run only when you explicitly ask in chat, and every call is audited.',
+  };
+  if (remote) {
+    return {
+      breadcrumb: profile.displayName,
+      pageSubtitle: `A remote MCP server at ${host}. BotBoy connects to it over HTTPS; reads run freely and writes need your explicit request in chat.`,
+      setupHeading: {
+        title: 'Connection',
+        subtitle: `BotBoy connects to ${host}, checks it every minute, and reconnects when it can.`,
+      },
+      steps: [],
+      nextActions: {
+        default: 'Start the server. Then test the MCP protocol connection.',
+        notInstalled: 'Review the address. Then start the server again.',
+        starting: `Wait for ${host} to answer.`,
+        failed: 'Review the address and keys. Then start the server again.',
+        runningUnchecked: 'Test the connection. The test uses MCP protocol operations only.',
+        runningCompatible: 'The connection is healthy. Ask BotBoy to use its tools in chat.',
+      },
+      sidePanels: [boundary, {
+        icon: 'globe',
+        eyebrow: 'Where calls go',
+        title: `Every call goes to ${host}`,
+        body: 'The arguments of each call BotBoy makes leave this Mac for that host. Saved keys are sent only to it, and BotBoy never follows a redirect to another site.',
+      }],
+      actionCopy: {
+        check: { pending: 'Checking the server…', success: 'Check completed.', failure: 'Could not check the server' },
+        start: { pending: 'Connecting to the MCP server…', success: 'Connected to the MCP server.', failure: 'Could not connect to the MCP server' },
+        test: { pending: 'Testing the MCP connection…', success: 'The MCP protocol test passed.', failure: 'The MCP protocol test did not pass' },
+        stop: { pending: 'Disconnecting…', success: 'Disconnected.', failure: 'Could not disconnect' },
+      },
+      card: {
+        dataHandling: 'Reads free, writes on request',
+        notInstalledDetail: 'Review the address.',
+        needsSetupDetail: 'Needs your attention. Open the server.',
+        readyDetail: `Remote MCP server · ${host}`,
+      },
+    };
+  }
   return {
     breadcrumb: profile.displayName,
     pageSubtitle: 'A user-added local MCP server. BotBoy manages the process; reads run freely and writes need your explicit request in chat.',
@@ -68,12 +127,7 @@ function customServerGuide(profile: McpProfileSnapshot): Record<string, unknown>
       runningUnchecked: 'Test the connection. The test uses MCP protocol operations only.',
       runningCompatible: 'The connection is healthy. Ask BotBoy to use its tools in chat.',
     },
-    sidePanels: [{
-      icon: 'shield',
-      eyebrow: 'Agent boundary',
-      title: 'Reads are free, writes need your request',
-      body: 'BotBoy can call read tools of this server whenever they help. Tools that change data run only when you explicitly ask in chat, and every call is audited.',
-    }],
+    sidePanels: [boundary],
     actionCopy: {
       check: { pending: 'Checking the command…', success: 'Command check completed.', failure: 'Could not check the command' },
       start: { pending: 'Starting the MCP server…', success: 'The MCP server started.', failure: 'Could not start the MCP server' },
@@ -122,6 +176,7 @@ function publicProfile(profile: McpProfileSnapshot | null | undefined): Record<s
       : [],
     settingsPage: registered?.launch.type === 'sql-context-package' ? 'sql-config' : 'managed-profile',
     custom,
+    ...(custom && profile.custom ? { customDefinition: profile.custom } : {}),
   };
 }
 
@@ -185,7 +240,9 @@ function safeProfileRouteError(
 ): { status: number; message: string } {
   const message = error instanceof Error ? error.message : String(error ?? '');
   if (!policy.redactErrors) {
-    const status = /not installed|not found|unknown/i.test(message) ? 409
+    // Owner-fixable states (a value to type, a review to give) are conflicts
+    // with a next action, not upstream failures.
+    const status = /not installed|not found|unknown|^waiting for|needs the owner's review/i.test(message) ? 409
       : /stop|running|busy|already|shutting down/i.test(message) ? 409 : 502;
     return { status, message: message || 'The MCP profile action failed.' };
   }
@@ -262,6 +319,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
     if (!PROFILE_LIFECYCLE_ACTIONS.has(action) && !isSetupAction) {
       return res.status(404).json({ error: 'Unknown MCP profile action' });
     }
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsEmptyObject(req, res)) return;
     const policy = routePolicyFor(existing);
 
@@ -310,6 +368,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
   // never a command. Output streams over SSE and is never persisted.
   router.post('/mcp/profiles/:profileId/terminal', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     const profileId = paramStr(req.params.profileId);
     const commandId = typeof req.body.commandId === 'string' ? req.body.commandId : '';
@@ -372,6 +431,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
 
   router.post('/mcp/profiles/:profileId/terminal/:sessionId/input', (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     const data = typeof req.body.data === 'string' ? req.body.data : '';
     try {
@@ -385,6 +445,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
 
   router.post('/mcp/profiles/:profileId/terminal/:sessionId/stop', (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsEmptyObject(req, res)) return;
     try {
       deps.mcpManager.stopTerminalSession(paramStr(req.params.profileId), paramStr(req.params.sessionId));
@@ -396,12 +457,14 @@ export function createMcpRouter(deps: RouterDeps): Router {
   });
 
   // ── User-added MCP servers ──
-  // The user owns these commands. Requests stay loopback-only and same-origin;
-  // BotBoy validates shape, resolves the executable without a shell, and keeps
-  // the agent blocked from the servers' tools.
+  // Local commands or remote endpoints the owner adds through the form (or
+  // BotBoy adds from chat through its tools). Every change here needs the
+  // same-origin owner interface; a definition written here counts as the
+  // owner's own, so it is reviewed. Values go to Keychain, and no response
+  // carries a secret value.
   router.post('/mcp/servers', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     try {
       const profile = await deps.mcpManager.createCustomServer(req.body);
@@ -425,7 +488,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
 
   router.put('/mcp/servers/:id/config', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res)) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     const serverId = paramStr(req.params.id);
     if (getBuiltInMcpProfile(serverId)) {
@@ -441,9 +504,38 @@ export function createMcpRouter(deps: RouterDeps): Router {
     }
   });
 
+  // Owner-typed values for a server's existing env variables and headers
+  // (the secure fields on the card and the connection page). Write-only:
+  // the response is the definition view, which never carries a secret value.
+  router.put('/mcp/servers/:id/secrets', async (req: Request, res: Response) => {
+    if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
+    if (!acceptsJsonObjectBody(req, res)) return;
+    const serverId = paramStr(req.params.id);
+    if (getBuiltInMcpProfile(serverId)) {
+      return res.status(403).json({ error: 'Built-in profiles keep their credentials on their own pages' });
+    }
+    const unexpected = Object.keys(req.body).filter(key => !SECRET_BODY_KEYS.has(key));
+    if (unexpected.length) {
+      return res.status(400).json({ error: 'Send only env and headers, each an object of name to value' });
+    }
+    try {
+      const config = await deps.mcpManager.setCustomServerValues(serverId, {
+        ...(req.body.env !== undefined ? { env: req.body.env } : {}),
+        ...(req.body.headers !== undefined ? { headers: req.body.headers } : {}),
+      });
+      res.set('Cache-Control', 'no-store');
+      res.json({ config });
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      // Validation messages name the entry, never its value.
+      res.status(/unknown custom/i.test(message) ? 404 : 400).json({ error: message });
+    }
+  });
+
   router.delete('/mcp/servers/:id', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res)) return;
     const serverId = paramStr(req.params.id);
     if (getBuiltInMcpProfile(serverId)) {
       return res.status(403).json({ error: 'Built-in profiles cannot be deleted' });
@@ -473,6 +565,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
 
   router.put('/mcp/sql-context/config', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
       return res.status(400).json({ error: 'Configuration must be a JSON object' });
     }
@@ -485,8 +578,9 @@ export function createMcpRouter(deps: RouterDeps): Router {
     }
   });
 
-  router.post('/mcp/sql-context/test', async (_req: Request, res: Response) => {
+  router.post('/mcp/sql-context/test', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     try {
       const result = await deps.mcpManager.testConnection('sql-context');
       const server = await deps.mcpManager.getServer('sql-context');
@@ -499,6 +593,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
 
   router.post('/mcp/servers/:id/restart', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
+    if (!acceptsOwnerUi(req, res)) return;
     const serverId = paramStr(req.params.id);
     const registered = getBuiltInMcpProfile(serverId);
     if (registered && !registered.policy.allowGenericRestart) {
@@ -512,13 +607,13 @@ export function createMcpRouter(deps: RouterDeps): Router {
     }
   });
 
-  // A generic native call surface for every managed connection. McpManager
-  // remains the policy boundary: reads run freely, write-classified tools
-  // require the explicit ownerRequested flag from the local caller, and every
-  // call is audited.
+  // A generic call surface for every managed connection. McpManager remains
+  // the policy boundary: reads run freely, write-classified tools require the
+  // explicit ownerRequested flag, and every call is audited. Because the flag
+  // is the owner's attestation, the request must come from the owner UI.
   router.post('/mcp/servers/:id/tools/:tool', async (req: Request, res: Response) => {
     if (!deps.mcpManager) return res.status(503).json({ error: 'Managed MCP runtime is unavailable' });
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res, 'MCP tool call')) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     const serverId = paramStr(req.params.id);
     const registered = getBuiltInMcpProfile(serverId);
@@ -553,7 +648,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
   // The local directory served by mcp_analytics_list_context /
   // mcp_analytics_load_context. Read shows the active dir + file count for
   // the a2-analytics connection page; the write (configure a different
-  // directory) is loopback-only like every config mutation here.
+  // directory) needs the owner UI like every config mutation here.
   router.get('/mcp/analytics-context', (_req: Request, res: Response) => {
     if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
     try {
@@ -571,7 +666,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
   });
 
   router.post('/mcp/analytics-context', (req: Request, res: Response) => {
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res, 'Analytics knowledge change')) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
     try {
@@ -584,13 +679,13 @@ export function createMcpRouter(deps: RouterDeps): Router {
     }
   });
 
-  // Trigger ETL preset onboarding (etl-analytics A3). Loopback-only like the
+  // Trigger ETL preset onboarding (etl-analytics A3). Owner UI only, like the
   // config write above — the button on the a2-analytics connection page is
   // the same explicit owner action the chat tool's ownerRequested gate
   // asserts. start() is idempotent: posting while a run is active returns
   // that run's progress rather than erroring.
   router.post('/mcp/analytics-context/generate', (req: Request, res: Response) => {
-    if (!acceptsLoopbackRequest(req, res)) return;
+    if (!acceptsOwnerUi(req, res, 'Analytics knowledge change')) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     if (!deps.etlOnboarding) return res.status(503).json({ error: 'ETL onboarding service unavailable' });
     const group = String(req.body?.group ?? '').trim();

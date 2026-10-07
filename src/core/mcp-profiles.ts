@@ -7,10 +7,12 @@
  * seeds it, and what the Connections UI shows. Their commands never come
  * from users, the database, or the browser.
  *
- * User-added servers: the local user supplies the command through the
- * loopback-only management API, and buildCustomServerDefinition() converts
- * the stored row into the same definition contract with a closed policy —
- * no agent tool access, no model-visible descriptors, and no shell.
+ * User-added servers: the owner (or BotBoy on the owner's request) defines a
+ * local command or a remote URL, and buildCustomServerDefinition() converts
+ * the stored row (mcp-custom-config.ts) into the same definition contract.
+ * No shell ever runs. An assistant-written definition stays unreviewed until
+ * the owner presses Start; after review its tools are agent-callable under
+ * the name-based policy (reads free, writes on an explicit owner request).
  */
 
 import { spawn } from 'node:child_process';
@@ -208,11 +210,23 @@ export type McpLaunchDefinition =
     relativeScriptPath: string;
   }
   | {
-    /** User-added server. The user supplied the command through the local UI. */
+    /**
+     * User-added local server, launched under the protected-local sandbox.
+     * Env values live in Keychain; the manager reads them at launch.
+     */
     type: 'custom-command';
     command: string;
     args: readonly string[];
-    env: Readonly<Record<string, string>>;
+  }
+  | {
+    /**
+     * User-added remote server (MCP_REMOTE_TRANSPORTS_PLAN.md MR1): no local
+     * process. Header values live in Keychain; every request goes through
+     * mcp-remote-fetch.ts › createGuardedFetch.
+     */
+    type: 'custom-remote';
+    url: string;
+    transport: 'http' | 'sse' | 'auto';
   };
 
 export interface McpServerPolicy {
@@ -891,17 +905,18 @@ export function getSetupActionDefinition(
 }
 
 /**
- * Build the manager-facing definition for one user-added MCP server. The
- * policy keeps custom servers closed to the agent: tool descriptors stay out
- * of model-visible status, and generic tool calls remain blocked because the
- * tool policy classifies unknown kinds as unknown risk.
+ * Build the manager-facing definition for one user-added MCP server. Once the
+ * owner has reviewed it, its tools are agent-visible and callable under the
+ * name-based policy (reads free, writes on an explicit owner request); the
+ * review gate is the manager's `needsReview`, not this policy object.
  */
 export function buildCustomServerDefinition(input: {
   id: string;
   displayName: string;
+  transport: 'stdio' | 'http' | 'sse' | 'auto';
   command: string;
   args: readonly string[];
-  env: Readonly<Record<string, string>>;
+  url: string;
 }): McpServerDefinition {
   return {
     id: input.id,
@@ -909,12 +924,9 @@ export function buildCustomServerDefinition(input: {
     displayName: input.displayName,
     shortName: input.displayName,
     packageVersion: 'user-defined',
-    launch: {
-      type: 'custom-command',
-      command: input.command,
-      args: input.args,
-      env: input.env,
-    },
+    launch: input.transport === 'stdio'
+      ? { type: 'custom-command', command: input.command, args: input.args }
+      : { type: 'custom-remote', url: input.url, transport: input.transport },
     setupActions: [],
     terminalCommands: [],
     requiredTools: [],

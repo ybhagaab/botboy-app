@@ -6,6 +6,29 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { McpSecretStore } from './mcp-secret-store.js';
 import { createMcpSecretStore } from './mcp-secret-store.js';
+import {
+  customServerIdentity,
+  isRemoteTransport,
+  missingRequiredValues,
+  normalizeCustomServerInput,
+  parseCustomConfig,
+  remoteHost,
+  renderHeaderValue,
+  serializeCustomConfig,
+  valueKey,
+  type CustomServerConfig,
+  type CustomValueEntry,
+  type CustomValueKind,
+} from './mcp-custom-config.js';
+import { createGuardedFetch, type DestinationPolicy, type FetchLike, type HostLookup } from './mcp-remote-fetch.js';
+import {
+  classifyRemoteFailure,
+  createRemoteTransport,
+  endRemoteSession,
+  isSessionEnded,
+  type RemoteTransport,
+  type RemoteTransportKind,
+} from './mcp-remote-transport.js';
 import { classifyMcpTool, validateMcpToolCall } from './mcp-policy.js';
 import {
   A2_ANALYTICS_PROFILE_ID,
@@ -28,10 +51,14 @@ import {
 } from './mcp-profiles.js';
 import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-session.js';
 import { createMcpTerminalEngine } from './mcp-terminal.js';
-import { modelProcessSandboxInvocation } from './protected-local-resources.js';
+import { modelProcessSandboxInvocation, protectedLocalPortPolicy } from './protected-local-resources.js';
 import { createSqlContextPackageResolver, type SqlContextPackageResolver } from './sql-context-package.js';
 import type {
   BuiltInMcpProfileId,
+  CustomMcpProfileFacts,
+  CustomMcpServerConfigView,
+  CustomMcpServerValuesInput,
+  CustomMcpValueView,
   McpCallOptions,
   McpCallResult,
   McpManager,
@@ -91,7 +118,9 @@ interface McpServerRow {
 
 interface RuntimeState {
   client: Client;
-  transport: StdioClientTransport;
+  transport: StdioClientTransport | RemoteTransport;
+  /** Remote servers only: the endpoint and the transport it answered on. */
+  remote?: { url: string; kind: RemoteTransportKind };
   expectedClose: boolean;
   tools: McpToolDescriptor[];
   stderrTail: string[];
@@ -123,6 +152,15 @@ class RuntimeBusyError extends Error {
     this.name = 'RuntimeBusyError';
   }
 }
+
+/** The child PID of a stdio runtime; remote runtimes have none. */
+function runtimePid(runtime: RuntimeState | undefined): number | null {
+  return runtime?.transport instanceof StdioClientTransport ? runtime.transport.pid ?? null : null;
+}
+
+/** A remote server must reconnect later: network trouble or a server error. */
+const REMOTE_BACKOFF_BASE_MS = 30_000;
+const REMOTE_BACKOFF_MAX_MS = 10 * 60_000;
 
 function cleanString(value: unknown, label: string, max = 1024): string {
   if (value == null) return '';
@@ -234,74 +272,6 @@ function describeProfileError(profile: McpServerDefinition | null, value: unknow
   return truncateError(value);
 }
 
-/** Parsed non-secret configuration for one user-added MCP server row. */
-function parseCustomConfig(raw: string | null | undefined): {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-  origin: 'user' | 'assistant';
-  reviewed: boolean;
-} {
-  let parsed: unknown = {};
-  try { parsed = JSON.parse(raw || '{}'); } catch { /* fall through to defaults */ }
-  const record = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? parsed as Record<string, unknown>
-    : {};
-  const command = typeof record.command === 'string' ? record.command : '';
-  const args = Array.isArray(record.args) ? record.args.filter((value): value is string => typeof value === 'string') : [];
-  const env: Record<string, string> = {};
-  if (record.env && typeof record.env === 'object' && !Array.isArray(record.env)) {
-    for (const [key, value] of Object.entries(record.env as Record<string, unknown>)) {
-      if (typeof value === 'string') env[key] = value;
-    }
-  }
-  // Rows written before review tracking default to user-authored, reviewed.
-  const origin = record.origin === 'assistant' ? 'assistant' as const : 'user' as const;
-  const reviewed = typeof record.reviewed === 'boolean' ? record.reviewed : true;
-  return { command, args, env, origin, reviewed };
-}
-
-const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Validate one user-supplied custom-server definition. Throws on bad shape. */
-function validateCustomServerInput(input: unknown): { name: string; command: string; args: string[]; env: Record<string, string> } {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error('The server definition must be a JSON object');
-  }
-  const record = input as Record<string, unknown>;
-  const name = cleanString(record.name, 'name', 80);
-  if (!name) throw new Error('name is required');
-  const command = cleanString(record.command, 'command', 1024);
-  if (!command) throw new Error('command is required');
-  if (/\s/.test(command)) {
-    throw new Error('command must be one executable name or one absolute path; put flags in arguments');
-  }
-  if (command.includes(path.sep) && !path.isAbsolute(command)) {
-    throw new Error('command must be an executable name or an absolute path');
-  }
-
-  if (record.args !== undefined && !Array.isArray(record.args)) throw new Error('args must be an array of strings');
-  const rawArgs = Array.isArray(record.args) ? record.args : [];
-  if (rawArgs.length > 64) throw new Error('args accepts at most 64 entries');
-  const args = rawArgs.map((value, index) => cleanString(value, `args[${index}]`, 2048));
-
-  if (record.env !== undefined && (typeof record.env !== 'object' || record.env === null || Array.isArray(record.env))) {
-    throw new Error('env must be an object of string values');
-  }
-  const env: Record<string, string> = {};
-  const rawEnv = (record.env ?? {}) as Record<string, unknown>;
-  const envEntries = Object.entries(rawEnv);
-  if (envEntries.length > 64) throw new Error('env accepts at most 64 variables');
-  for (const [key, value] of envEntries) {
-    if (!ENV_KEY_PATTERN.test(key) || key.length > 128) throw new Error(`env variable name '${key.slice(0, 40)}' is not valid`);
-    if (typeof value !== 'string') throw new Error(`env variable ${key} must be a string`);
-    if (value.length > 8192) throw new Error(`env variable ${key} is too long`);
-    if (value.includes('\0')) throw new Error(`env variable ${key} contains a null byte`);
-    env[key] = value;
-  }
-  return { name, command, args, env };
-}
-
 function parseTools(raw: string): McpToolDescriptor[] {
   try {
     const parsed = JSON.parse(raw);
@@ -368,9 +338,18 @@ export function createMcpManager(options: {
   healthIntervalMs?: number;
   /** Which sql-context copy to launch; defaults to the npm auto-updating resolver. */
   sqlContextPackages?: SqlContextPackageResolver;
+  /** Ports no remote MCP request may reach; defaults to BotBoy's app and CDP ports. */
+  remotePolicy?: DestinationPolicy;
+  /** Tests only: resolver and fetch under the guarded remote fetch, and its per-call answer cap. */
+  remoteLookup?: HostLookup;
+  remoteFetch?: FetchLike;
+  remoteMaxResponseBytes?: number;
+  /** Tests only: the first reconnect delay of an unreachable remote server (30 s). */
+  remoteBackoffBaseMs?: number;
 }): McpManager {
   const db = options.db;
   const secretStore = options.secretStore ?? createMcpSecretStore();
+  const remotePolicy = options.remotePolicy ?? protectedLocalPortPolicy();
   const sqlContextPackages = options.sqlContextPackages ?? createSqlContextPackageResolver();
   // Ends an in-progress connector update check or npm install when the
   // manager stops, so process shutdown never waits for a download.
@@ -408,10 +387,52 @@ export function createMcpManager(options: {
     return buildCustomServerDefinition({
       id: server.id,
       displayName: server.display_name,
+      transport: config.transport,
       command: config.command,
       args: config.args,
-      env: config.env,
+      url: config.url,
     });
+  }
+
+  /** Stop a custom server until the owner acts (a missing key, a refused credential, a wrong address). */
+  function pauseForOwner(serverId: string, message: string): string {
+    db.prepare(`
+      UPDATE mcp_servers SET enabled = 0, state = 'needs_configuration',
+        last_error = ?, pid = NULL, updated_at = datetime('now')
+      WHERE id = ?
+    `).run(message.slice(0, 2000), serverId);
+    return message;
+  }
+
+  function missingValuesMessage(missing: string[]): string {
+    // Read by the owner (card, Connections) and by BotBoy (tool errors) alike.
+    return `Waiting for ${missing.join(', ')}. Type it on the server's card in chat or on its connection page, then press Start.`;
+  }
+
+  /** Saved values for one kind of entry, read from Keychain at launch. */
+  async function readCustomValues(
+    serverId: string,
+    kind: CustomValueKind,
+    entries: readonly CustomValueEntry[],
+    legacy?: Record<string, string>,
+  ): Promise<Record<string, string>> {
+    const values: Record<string, string> = {};
+    for (const entry of entries) {
+      const saved = entry.hasValue ? await secretStore.get(serverId, valueKey(kind, entry.name)) : null;
+      const value = saved ?? (kind === 'env' ? legacy?.[entry.name] : undefined);
+      if (value) values[entry.name] = kind === 'header' ? renderHeaderValue(entry, value) : value;
+    }
+    return values;
+  }
+
+  function customFacts(config: CustomServerConfig): CustomMcpProfileFacts {
+    return {
+      transport: config.transport,
+      ...(isRemoteTransport(config.transport) ? { endpointHost: remoteHost(config) } : {}),
+      ...(config.detectedTransport ? { detectedTransport: config.detectedTransport } : {}),
+      about: config.about,
+      missingValues: missingRequiredValues(config),
+    };
   }
 
   async function withProfileLock<T>(profileId: string, operation: () => Promise<T>): Promise<T> {
@@ -482,6 +503,12 @@ export function createMcpManager(options: {
     if (profile.launch.type === 'sql-context-package') {
       return missingConfiguration(parseSqlConfig(server.config_json), await passwordConfigured()).length === 0;
     }
+    if (profile.launch.type === 'custom-remote') {
+      return missingRequiredValues(parseCustomConfig(server.config_json)).length === 0;
+    }
+    if (profile.launch.type === 'custom-command' && missingRequiredValues(parseCustomConfig(server.config_json)).length > 0) {
+      return false;
+    }
     return Boolean(await resolveDefinitionExecutable(profile));
   }
 
@@ -523,16 +550,15 @@ export function createMcpManager(options: {
     const compatibilityState = base.tools.length === 0
       ? 'unchecked'
       : missingTools.length > 0 ? 'incompatible' : 'compatible';
-    const needsReview = server.kind === CUSTOM_MCP_KIND
-      ? !parseCustomConfig(server.config_json).reviewed
-      : false;
+    const customConfig = server.kind === CUSTOM_MCP_KIND ? parseCustomConfig(server.config_json) : null;
     return {
       ...base,
       installationState,
       compatibilityState,
       requiredTools: [...profile.requiredTools],
       missingTools,
-      needsReview,
+      needsReview: customConfig ? !customConfig.reviewed : false,
+      ...(customConfig ? { custom: customFacts(customConfig) } : {}),
     };
   }
 
@@ -544,6 +570,9 @@ export function createMcpManager(options: {
     // Wake every gated waiter so it re-checks and fails fast with the
     // runtime-changed error instead of hanging on a dead gate.
     runtime.callWaiters.splice(0).forEach(release => release());
+    // A Streamable HTTP server is told the session ended; never waits past 2 s,
+    // so the 10 s MCP shutdown stage stays bounded.
+    if (runtime.remote) await endRemoteSession(runtime.transport);
     try { await runtime.client.close(); } catch { /* process may already be gone */ }
   }
 
@@ -553,12 +582,18 @@ export function createMcpManager(options: {
     if (!server || server.enabled !== 1) return;
     const failures = (consecutiveFailures.get(serverId) ?? 0) + 1;
     consecutiveFailures.set(serverId, failures);
-    const delay = Math.min(60_000, 1000 * (2 ** Math.min(failures - 1, 6)));
+    // A remote server that is unreachable or erroring reconnects slowly and
+    // reads as a connection issue, never a restart storm (sql-context once
+    // logged 8,199 restarts against an unreachable warehouse).
+    const remote = definitionFor(serverId)?.launch.type === 'custom-remote';
+    const delay = remote
+      ? Math.min(REMOTE_BACKOFF_MAX_MS, (options.remoteBackoffBaseMs ?? REMOTE_BACKOFF_BASE_MS) * (2 ** Math.min(failures - 1, 5)))
+      : Math.min(60_000, 1000 * (2 ** Math.min(failures - 1, 6)));
     db.prepare(`
       UPDATE mcp_servers SET restart_count = restart_count + 1,
-        state = 'failed', last_error = ?, pid = NULL, updated_at = datetime('now')
+        state = ?, last_error = ?, pid = NULL, updated_at = datetime('now')
       WHERE id = ?
-    `).run(reason.slice(0, 2000), serverId);
+    `).run(remote ? 'degraded' : 'failed', reason.slice(0, 2000), serverId);
     const timer = setTimeout(() => {
       restartTimers.delete(serverId);
       void startServer(serverId).catch((error) => {
@@ -566,6 +601,139 @@ export function createMcpManager(options: {
       });
     }, delay);
     restartTimers.set(serverId, timer);
+  }
+
+  /**
+   * Connect a remote server (MCP_REMOTE_TRANSPORTS_PLAN.md MR1). Runs inside
+   * startServer's start lock. `auto` tries the transport that answered last
+   * time first, then the other one when the first says it is the wrong kind
+   * of endpoint. Failures the owner must fix pause the server with the next
+   * action; network and server trouble reconnect with a slow backoff.
+   */
+  async function startRemoteServer(
+    serverId: string,
+    server: McpServerRow,
+    profile: McpServerDefinition,
+    launch: { url: string; transport: 'http' | 'sse' | 'auto' },
+  ): Promise<void> {
+    const config = parseCustomConfig(server.config_json);
+    const missing = missingRequiredValues(config);
+    if (missing.length) throw new Error(pauseForOwner(serverId, missingValuesMessage(missing)));
+    const headerValues = await readCustomValues(serverId, 'header', config.headers);
+
+    if (!active || row(serverId)?.enabled !== 1) {
+      updateState(serverId, 'stopped', { error: null, pid: null });
+      return;
+    }
+    await closeRuntime(serverId);
+    if (!active || stopping || row(serverId)?.enabled !== 1) {
+      updateState(serverId, 'stopped', { error: null, pid: null });
+      return;
+    }
+    const pendingRestart = restartTimers.get(serverId);
+    if (pendingRestart) { clearTimeout(pendingRestart); restartTimers.delete(serverId); }
+    updateState(serverId, 'starting', { error: null, pid: null });
+
+    const url = new URL(launch.url);
+    const guardedFetch = createGuardedFetch({
+      serverUrl: url,
+      policy: remotePolicy,
+      headers: () => headerValues,
+      ...(options.remoteLookup ? { lookup: options.remoteLookup } : {}),
+      ...(options.remoteFetch ? { fetchImpl: options.remoteFetch } : {}),
+      ...(options.remoteMaxResponseBytes ? { maxResponseBytes: options.remoteMaxResponseBytes } : {}),
+    });
+    const order: RemoteTransportKind[] = launch.transport === 'auto'
+      ? (config.detectedTransport === 'sse' ? ['sse', 'http'] : ['http', 'sse'])
+      : [launch.transport];
+
+    let lastError: unknown = null;
+    for (const [attempt, kind] of order.entries()) {
+      const client = new Client({ name: 'botboy-managed-mcp', version: '1.0.0' }, { capabilities: {} });
+      const transport = createRemoteTransport(kind, url, guardedFetch);
+      const runtime: RuntimeState = {
+        client,
+        transport,
+        remote: { url: launch.url, kind },
+        expectedClose: false,
+        tools: [],
+        stderrTail: [],
+        callWaiters: [],
+        pendingCalls: 0,
+        inFlightCalls: 0,
+        inFlightBySource: new Map(),
+      };
+      runtimes.set(serverId, runtime);
+      client.onerror = (error) => {
+        // The SDK reports each failed request here as well as to its caller,
+        // so one refused or oversized call must not mark the whole server
+        // degraded. The health tick's ping decides the server's state.
+        if (runtimes.get(serverId) !== runtime || runtime.expectedClose) return;
+        const message = isSessionEnded(error, transport)
+          ? `${url.host} no longer knows BotBoy's session; the next call or health check connects again.`
+          : classifyRemoteFailure(error, { url: launch.url }).message;
+        console.warn(`[MCP:${serverId}] ${message}`);
+      };
+      client.onclose = () => {
+        const expected = runtime.expectedClose;
+        if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
+        if (!expected) scheduleRestart(serverId, `The connection to ${url.host} closed.`);
+      };
+      try {
+        await client.connect(transport, { timeout: 30_000 });
+        const listed = await client.listTools(undefined, { timeout: 15_000 });
+        runtime.tools = listed.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema as Record<string, unknown>,
+          risk: classifyMcpTool(profile.kind, tool.name),
+        }));
+        if (!active || row(serverId)?.enabled !== 1 || runtimes.get(serverId) !== runtime) {
+          runtime.expectedClose = true;
+          if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
+          await endRemoteSession(transport);
+          try { await client.close(); } catch {}
+          updateState(serverId, 'stopped', { error: null, pid: null });
+          return;
+        }
+        if (launch.transport === 'auto' && config.detectedTransport !== kind) {
+          // Remember which transport answered; it is tried first next time.
+          // Not part of the identity, so review is unaffected.
+          const current = parseCustomConfig(row(serverId)?.config_json);
+          db.prepare(`UPDATE mcp_servers SET config_json = ?, updated_at = datetime('now') WHERE id = ?`)
+            .run(serializeCustomConfig({ ...current, detectedTransport: kind }), serverId);
+        }
+        const version = client.getServerVersion();
+        updateState(serverId, 'running', {
+          error: null,
+          pid: null,
+          version: version ? `${version.name}@${version.version}` : null,
+          tools: runtime.tools,
+        });
+        consecutiveFailures.set(serverId, 0);
+        return;
+      } catch (error) {
+        const interrupted = !active || row(serverId)?.enabled !== 1 || runtime.expectedClose;
+        runtime.expectedClose = true;
+        if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
+        try { await client.close(); } catch {}
+        if (interrupted) {
+          updateState(serverId, 'stopped', { error: null, pid: null });
+          return;
+        }
+        lastError = error;
+        // Only an answer that says "wrong kind of endpoint" tries the other
+        // transport; a network or credential failure would fail it too.
+        const failure = classifyRemoteFailure(error, { url: launch.url });
+        const wrongTransport = failure.kind === 'not_found' || failure.kind === 'gone' || failure.kind === 'protocol';
+        if (launch.transport === 'auto' && attempt === 0 && wrongTransport) continue;
+        break;
+      }
+    }
+    const failure = classifyRemoteFailure(lastError, { url: launch.url });
+    if (failure.retry === 'owner') throw new Error(pauseForOwner(serverId, failure.message));
+    updateState(serverId, 'degraded', { error: failure.message, pid: null });
+    throw new Error(failure.message);
   }
 
   async function startServer(serverId: string): Promise<void> {
@@ -578,6 +746,10 @@ export function createMcpManager(options: {
       if (!profile) throw new Error(`Unknown MCP profile: ${serverId}`);
       if (server.enabled !== 1) {
         updateState(serverId, 'stopped', { error: null, pid: null });
+        return;
+      }
+      if (profile.launch.type === 'custom-remote') {
+        await startRemoteServer(serverId, server, profile, profile.launch);
         return;
       }
 
@@ -621,11 +793,18 @@ export function createMcpManager(options: {
           `).run(reason, serverId);
           return;
         }
-        // User-declared environment variables extend the sanitized default
-        // environment. The user supplied both the command and its variables
-        // through the local, loopback-only UI; no shell ever runs.
+        // Declared environment variables extend the sanitized default
+        // environment. Their values come from Keychain at launch; no shell
+        // ever runs.
+        let customEnv: Record<string, string> = {};
+        if (profile.launch.type === 'custom-command') {
+          const config = parseCustomConfig(server.config_json);
+          const missing = missingRequiredValues(config);
+          if (missing.length) throw new Error(pauseForOwner(serverId, missingValuesMessage(missing)));
+          customEnv = await readCustomValues(serverId, 'env', config.env, config.legacyEnv);
+        }
         const childEnv = profile.launch.type === 'custom-command'
-          ? { ...getDefaultEnvironment(), ...profile.launch.env }
+          ? { ...getDefaultEnvironment(), ...customEnv }
           : getDefaultEnvironment();
         // AIM launch wrappers exec `aim …` from the child, so the child PATH
         // must resolve the toolchain even under a minimal-PATH launch.
@@ -868,7 +1047,7 @@ export function createMcpManager(options: {
         VALUES (?, ?, ?, ?, ?, ?, 'running')
       `).run(callId, serverId, toolName, risk, options.source ?? 'api', inputHash);
 
-      const response = await queueRuntimeCall(serverId, runtime, () => runtime.client.callTool(
+      const callOn = (target: RuntimeState) => queueRuntimeCall(serverId, target, () => target.client.callTool(
         { name: toolName, arguments: validatedArgs },
         undefined,
         {
@@ -881,6 +1060,27 @@ export function createMcpManager(options: {
           ...(options.signal ? { signal: options.signal } : {}),
         },
       ), options.source ?? 'api', options.signal);
+      let response: Awaited<ReturnType<typeof callOn>>;
+      try {
+        response = await callOn(runtime);
+      } catch (error) {
+        if (!runtime.remote) throw error;
+        if (!isSessionEnded(error, runtime.transport)) {
+          throw new Error(classifyRemoteFailure(error, { url: runtime.remote.url }).message);
+        }
+        // The server forgot BotBoy's session (HTTP 404 on the old session id)
+        // and did not run the call. Reconnect; repeat a read once. A write is
+        // never re-sent on BotBoy's own initiative.
+        await closeRuntime(serverId);
+        if (risk !== 'read') {
+          throw new Error(`${profile.displayName} had ended BotBoy's session, so it did not run ${toolName}. Nothing changed; ask again to run it.`);
+        }
+        const fresh = await ensureReady(serverId);
+        if (!fresh.tools.some(tool => tool.name === toolName)) {
+          throw new Error(`MCP server '${serverId}' does not expose tool '${toolName}'`);
+        }
+        response = await callOn(fresh);
+      }
       const extracted = extractResult(response);
       const durationMs = Date.now() - started;
       db.prepare(`
@@ -932,7 +1132,7 @@ export function createMcpManager(options: {
       const current = row(serverId);
       updateState(serverId, 'running', {
         error: null,
-        pid: runtimes.get(serverId)?.transport.pid ?? current?.pid ?? null,
+        pid: runtimePid(runtimes.get(serverId)) ?? current?.pid ?? null,
         healthy: true,
       });
     }
@@ -962,6 +1162,11 @@ export function createMcpManager(options: {
     const operation = (async () => {
       for (const server of db.prepare('SELECT * FROM mcp_servers WHERE enabled = 1').all() as McpServerRow[]) {
         if (!active) break;
+        // A reconnect is already scheduled or under way: its backoff owns the
+        // next attempt. Probing here started the server early and cleared
+        // the timer, so an unreachable remote server was retried on every
+        // tick instead of backing off to 10 minutes (live 2026-10-07).
+        if (restartTimers.has(server.id) || startLocks.has(server.id)) continue;
         let checkedRuntime: RuntimeState | undefined;
         try {
           const runtime = await ensureReady(server.id);
@@ -975,7 +1180,7 @@ export function createMcpManager(options: {
             const checked = await checkConnectionIfIdle(server.id, runtime);
             if (!checked) continue;
           } else {
-            updateState(server.id, 'running', { error: null, pid: runtime.transport.pid, healthy: true });
+            updateState(server.id, 'running', { error: null, pid: runtimePid(runtime), healthy: true });
           }
         } catch (error) {
           const currentRuntime = runtimes.get(server.id);
@@ -985,8 +1190,30 @@ export function createMcpManager(options: {
             console.warn(`[MCP:${server.id}] health probe failed while calls are pending; deferring restart: ${message}`);
             continue;
           }
+          // Decided before closeRuntime, which ends the transport's session.
+          const sessionEnded = Boolean(checkedRuntime?.remote) && isSessionEnded(error, checkedRuntime?.transport);
           await closeRuntime(server.id);
-          scheduleRestart(server.id, describeProfileError(definitionFor(server.id), error));
+          const definition = definitionFor(server.id);
+          if (definition?.launch.type === 'custom-remote' && sessionEnded) {
+            // The server answered but no longer knows BotBoy's session (it
+            // restarted or expired it). That is not a wrong address: connect
+            // again now. Paused for the owner only if the new connect says so.
+            try {
+              await startServer(server.id);
+            } catch (restartError) {
+              scheduleRestart(server.id, describeProfileError(definition, restartError));
+            }
+            continue;
+          }
+          if (definition?.launch.type === 'custom-remote') {
+            // A refused credential or a moved endpoint waits for the owner;
+            // only network and server trouble reconnect on their own.
+            const failure = classifyRemoteFailure(error, { url: definition.launch.url });
+            if (failure.retry === 'owner') pauseForOwner(server.id, failure.message);
+            else scheduleRestart(server.id, failure.message);
+            continue;
+          }
+          scheduleRestart(server.id, describeProfileError(definition, error));
         }
       }
     })();
@@ -1077,7 +1304,7 @@ export function createMcpManager(options: {
     if (profile.kind === CUSTOM_MCP_KIND) {
       const customRow = requireCustomRow(profileId);
       if (!parseCustomConfig(customRow.config_json).reviewed) {
-        throw new Error('This server configuration needs your review. Open its connection page and press Start.');
+        throw new Error('This server needs the owner\'s review first: they press Start on its card in chat or on its connection page.');
       }
     }
     if (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script') {
@@ -1135,11 +1362,21 @@ export function createMcpManager(options: {
   async function testProfileInternal(profileId: string): Promise<McpProfileTestResult> {
     const profile = definitionFor(profileId);
     if (!profile) throw new Error(`Unknown MCP profile: ${profileId}`);
-    const runtime = await ensureReady(profileId);
-    const listed = await queueRuntimeCall(profileId, runtime, async () => {
-      await runtime.client.ping({ timeout: 10_000 });
-      return runtime.client.listTools(undefined, { timeout: 15_000 });
+    let runtime = await ensureReady(profileId);
+    const probe = (current: RuntimeState) => queueRuntimeCall(profileId, current, async () => {
+      await current.client.ping({ timeout: 10_000 });
+      return current.client.listTools(undefined, { timeout: 15_000 });
     });
+    let listed: Awaited<ReturnType<typeof probe>>;
+    try {
+      listed = await probe(runtime);
+    } catch (error) {
+      // A remote server that forgot BotBoy's session is tested on a new one.
+      if (!runtime.remote || !isSessionEnded(error, runtime.transport)) throw error;
+      await closeRuntime(profileId);
+      runtime = await ensureReady(profileId);
+      listed = await probe(runtime);
+    }
     runtime.tools = listed.tools.map(tool => ({
       name: tool.name,
       description: tool.description,
@@ -1148,7 +1385,7 @@ export function createMcpManager(options: {
     }));
     updateState(profileId, 'running', {
       error: null,
-      pid: runtime.transport.pid,
+      pid: runtimePid(runtime),
       tools: runtime.tools,
       healthy: true,
     });
@@ -1196,33 +1433,57 @@ export function createMcpManager(options: {
     }
   }
 
+  /** Keychain accounts a definition's entries use. */
+  function entryKeys(config: Pick<CustomServerConfig, 'env' | 'headers'>): string[] {
+    return [
+      ...config.env.map(entry => valueKey('env', entry.name)),
+      ...config.headers.map(entry => valueKey('header', entry.name)),
+    ];
+  }
+
+  async function initialCustomState(definition: McpServerDefinition): Promise<{ state: McpServerState; error: string | null }> {
+    if (definition.launch.type !== 'custom-command') return { state: 'stopped', error: null };
+    const executable = await resolveDefinitionExecutable(definition);
+    return executable
+      ? { state: 'stopped', error: null }
+      : { state: 'needs_configuration', error: `Command not found: ${definition.launch.command}` };
+  }
+
   async function createCustomServerInternal(
     input: unknown,
     origin: 'user' | 'assistant',
   ): Promise<McpProfileSnapshot> {
-    const validated = validateCustomServerInput(input);
-    const serverId = customServerId(validated.name);
+    const normalized = normalizeCustomServerInput(input, { origin });
+    const serverId = customServerId(normalized.name);
+    const config: CustomServerConfig = {
+      version: 2,
+      transport: normalized.transport,
+      command: normalized.command,
+      args: normalized.args,
+      url: normalized.url,
+      env: normalized.env,
+      headers: normalized.headers,
+      about: normalized.about,
+      origin,
+      // Assistant-written definitions stay unreviewed until the owner presses
+      // Start on the card or the connection page. Review gates the first launch.
+      reviewed: origin === 'user',
+    };
+    // Values first: a row never claims a value Keychain does not hold.
+    for (const [key, value] of normalized.values) await secretStore.set(serverId, key, value);
     const definition = buildCustomServerDefinition({
       id: serverId,
-      displayName: validated.name,
-      command: validated.command,
-      args: validated.args,
-      env: validated.env,
+      displayName: normalized.name,
+      transport: config.transport,
+      command: config.command,
+      args: config.args,
+      url: config.url,
     });
-    const executable = await resolveDefinitionExecutable(definition);
+    const initial = await initialCustomState(definition);
     db.prepare(`
       INSERT INTO mcp_servers (id, kind, display_name, enabled, config_json, state, last_error)
       VALUES (?, ?, ?, 0, ?, ?, ?)
-    `).run(
-      serverId,
-      CUSTOM_MCP_KIND,
-      validated.name,
-      // Assistant-written definitions stay unreviewed until the user starts
-      // the server from the dashboard. Review gates the first launch.
-      JSON.stringify({ ...validated, origin, reviewed: origin === 'user' }),
-      executable ? 'stopped' : 'needs_configuration',
-      executable ? null : `Command not found: ${validated.command}`,
-    );
+    `).run(serverId, CUSTOM_MCP_KIND, normalized.name, serializeCustomConfig(config), initial.state, initial.error);
     return profileSnapshot(requireCustomRow(serverId));
   }
 
@@ -1233,29 +1494,49 @@ export function createMcpManager(options: {
   ): Promise<McpProfileSnapshot> {
     const server = requireCustomRow(serverId);
     assertCustomServerIdle(server);
-    const validated = validateCustomServerInput(input);
+    const previous = parseCustomConfig(server.config_json);
+    const normalized = normalizeCustomServerInput(input, { origin, previous, previousName: server.display_name });
+    const sameIdentity = customServerIdentity(previous) === customServerIdentity(normalized);
+    const keptLegacy = Object.fromEntries(Object.entries(previous.legacyEnv ?? {})
+      .filter(([name]) => normalized.env.some(entry => entry.name === name) && !normalized.values.has(valueKey('env', name))));
+    const next: CustomServerConfig = {
+      version: 2,
+      transport: normalized.transport,
+      command: normalized.command,
+      args: normalized.args,
+      url: normalized.url,
+      env: normalized.env,
+      headers: normalized.headers,
+      // The answering transport stays known while the endpoint is the same.
+      ...(sameIdentity && normalized.url === previous.url && previous.detectedTransport ? { detectedTransport: previous.detectedTransport } : {}),
+      about: normalized.about,
+      origin,
+      // Owner rule MD7: a user edit is its own approval; an assistant edit
+      // needs a new review only when what runs or where it connects changed.
+      reviewed: origin === 'user' ? true : previous.reviewed && sameIdentity,
+      ...(Object.keys(keptLegacy).length ? { legacyEnv: keptLegacy } : {}),
+    };
+    const kept = new Set(entryKeys(next));
+    for (const [key, value] of normalized.values) await secretStore.set(serverId, key, value);
+    for (const key of entryKeys(previous)) if (!kept.has(key)) await secretStore.delete(serverId, key);
     const definition = buildCustomServerDefinition({
       id: serverId,
-      displayName: validated.name,
-      command: validated.command,
-      args: validated.args,
-      env: validated.env,
+      displayName: normalized.name,
+      transport: next.transport,
+      command: next.command,
+      args: next.args,
+      url: next.url,
     });
-    const executable = await resolveDefinitionExecutable(definition);
-    // Stale descriptors from the previous command would be misleading, so
-    // discovery state resets with the configuration. An assistant edit also
-    // resets the review state; a user edit is its own approval.
+    const initial = await initialCustomState(definition);
+    // Discovered tools stay while the identity is unchanged; a different
+    // command or host would make them misleading.
     db.prepare(`
-      UPDATE mcp_servers SET display_name = ?, config_json = ?, state = ?,
-        last_error = ?, tools_json = '[]', server_version = NULL, updated_at = datetime('now')
+      UPDATE mcp_servers SET display_name = ?, config_json = ?, state = ?, last_error = ?,
+        tools_json = CASE WHEN ? THEN tools_json ELSE '[]' END,
+        server_version = CASE WHEN ? THEN server_version ELSE NULL END,
+        updated_at = datetime('now')
       WHERE id = ?
-    `).run(
-      validated.name,
-      JSON.stringify({ ...validated, origin, reviewed: origin === 'user' }),
-      executable ? 'stopped' : 'needs_configuration',
-      executable ? null : `Command not found: ${validated.command}`,
-      serverId,
-    );
+    `).run(normalized.name, serializeCustomConfig(next), initial.state, initial.error, sameIdentity ? 1 : 0, sameIdentity ? 1 : 0, serverId);
     return profileSnapshot(requireCustomRow(serverId));
   }
 
@@ -1265,7 +1546,7 @@ export function createMcpManager(options: {
     if (!config.reviewed) {
       db.prepare(`
         UPDATE mcp_servers SET config_json = ?, updated_at = datetime('now') WHERE id = ?
-      `).run(JSON.stringify({ ...config, reviewed: true }), serverId);
+      `).run(serializeCustomConfig({ ...config, reviewed: true }), serverId);
     }
     return profileSnapshot(requireCustomRow(serverId));
   }
@@ -1277,10 +1558,131 @@ export function createMcpManager(options: {
     if (pendingRestart) clearTimeout(pendingRestart);
     restartTimers.delete(serverId);
     consecutiveFailures.delete(serverId);
+    for (const key of entryKeys(parseCustomConfig(server.config_json))) await secretStore.delete(serverId, key);
     db.transaction(() => {
       db.prepare('DELETE FROM mcp_tool_calls WHERE server_id = ?').run(serverId);
       db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(serverId);
     })();
+  }
+
+  /** Everything about a custom server except secret values. */
+  async function customServerView(server: McpServerRow): Promise<CustomMcpServerConfigView> {
+    const config = parseCustomConfig(server.config_json);
+    const view = async (kind: CustomValueKind, entries: readonly CustomValueEntry[]): Promise<CustomMcpValueView[]> => Promise.all(entries.map(async (entry) => {
+      const legacy = kind === 'env' ? config.legacyEnv?.[entry.name] : undefined;
+      let value: string | undefined;
+      if (!entry.secret) {
+        value = legacy ?? (entry.hasValue ? (await secretStore.get(server.id, valueKey(kind, entry.name)).catch(() => null)) ?? undefined : undefined);
+      }
+      return {
+        name: entry.name,
+        secret: entry.secret,
+        required: entry.required,
+        saved: entry.hasValue || legacy !== undefined,
+        ...(value !== undefined ? { value } : {}),
+        ...(entry.template ? { template: entry.template } : {}),
+        ...(entry.description ? { description: entry.description } : {}),
+      };
+    }));
+    return {
+      id: server.id,
+      name: server.display_name,
+      transport: config.transport,
+      command: config.command,
+      args: config.args,
+      url: config.url,
+      env: await view('env', config.env),
+      headers: await view('header', config.headers),
+      ...(config.detectedTransport ? { detectedTransport: config.detectedTransport } : {}),
+      about: config.about,
+      origin: config.origin,
+      reviewed: config.reviewed,
+      missingValues: missingRequiredValues(config),
+    };
+  }
+
+  /**
+   * Owner-entered values for existing entries (the card and the connection
+   * page). An empty string clears a value. A running server restarts so the
+   * new values apply; a paused one waits for the owner's Start.
+   */
+  async function setCustomServerValuesInternal(serverId: string, input: CustomMcpServerValuesInput): Promise<CustomMcpServerConfigView> {
+    const server = requireCustomRow(serverId);
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('values must be an object with env and headers');
+    const config = parseCustomConfig(server.config_json);
+    const legacyEnv = { ...(config.legacyEnv ?? {}) };
+    const apply = async (kind: CustomValueKind, entries: CustomValueEntry[], provided: unknown): Promise<CustomValueEntry[]> => {
+      if (provided === undefined) return entries;
+      if (!provided || typeof provided !== 'object' || Array.isArray(provided)) throw new Error(`${kind === 'env' ? 'env' : 'headers'} must be an object of name to value`);
+      const next = entries.map(entry => ({ ...entry }));
+      for (const [name, value] of Object.entries(provided as Record<string, unknown>)) {
+        const entry = next.find(candidate => (kind === 'header' ? candidate.name.toLowerCase() === name.toLowerCase() : candidate.name === name));
+        if (!entry) throw new Error(`${server.display_name} has no ${kind === 'env' ? 'env variable' : 'header'} named ${name.slice(0, 80)}`);
+        if (typeof value !== 'string') throw new Error(`${name} must be a string`);
+        if (value.length > 8192 || value.includes('\0') || (kind === 'header' && /[\r\n]/.test(value))) {
+          throw new Error(`${name} is not a valid ${kind === 'env' ? 'variable' : 'header'} value`);
+        }
+        const key = valueKey(kind, entry.name);
+        if (value === '') {
+          await secretStore.delete(serverId, key);
+          entry.hasValue = false;
+        } else {
+          await secretStore.set(serverId, key, value);
+          entry.hasValue = true;
+        }
+        if (kind === 'env') delete legacyEnv[entry.name];
+      }
+      return next;
+    };
+    const env = await apply('env', config.env, input.env);
+    const headers = await apply('header', config.headers, input.headers);
+    const next: CustomServerConfig = { ...config, env, headers };
+    if (Object.keys(legacyEnv).length) next.legacyEnv = legacyEnv; else delete next.legacyEnv;
+    const missing = missingRequiredValues(next);
+    const fixedMissingValues = server.state === 'needs_configuration' && server.last_error?.startsWith('Waiting for ') && missing.length === 0;
+    db.prepare(`
+      UPDATE mcp_servers SET config_json = ?,
+        state = CASE WHEN ? THEN 'stopped' ELSE state END,
+        last_error = CASE WHEN ? THEN NULL ELSE last_error END,
+        updated_at = datetime('now')
+      WHERE id = ?
+    `).run(serializeCustomConfig(next), fixedMissingValues ? 1 : 0, fixedMissingValues ? 1 : 0, serverId);
+    if (runtimes.has(serverId) && row(serverId)?.enabled === 1) {
+      await closeRuntime(serverId);
+      try { await startServer(serverId); } catch (error) {
+        console.warn(`[MCP:${serverId}] restart with the new values failed: ${truncateError(error)}`);
+      }
+    }
+    return customServerView(requireCustomRow(serverId));
+  }
+
+  /**
+   * Version-1 rows kept env values inline in config_json, where chat's
+   * query_db could read them. Move them into Keychain once (owner decision
+   * MD4). A Keychain failure leaves the row as it was and retries next start.
+   */
+  async function migrateLegacyCustomValues(): Promise<void> {
+    const customRows = db.prepare('SELECT * FROM mcp_servers WHERE kind = ?').all(CUSTOM_MCP_KIND) as McpServerRow[];
+    for (const server of customRows) {
+      let raw: Record<string, unknown> = {};
+      try { raw = JSON.parse(server.config_json || '{}'); } catch { /* treat as version 1 */ }
+      const config = parseCustomConfig(server.config_json);
+      if (raw.version === 2 && !config.legacyEnv) continue;
+      try {
+        const env = [];
+        for (const entry of config.env) {
+          const value = config.legacyEnv?.[entry.name] ?? '';
+          if (value) await secretStore.set(server.id, valueKey('env', entry.name), value);
+          env.push({ ...entry, hasValue: value ? true : entry.hasValue && raw.version === 2 });
+        }
+        const next: CustomServerConfig = { ...config, env };
+        delete next.legacyEnv;
+        db.prepare(`UPDATE mcp_servers SET config_json = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(serializeCustomConfig(next), server.id);
+      } catch (error) {
+        console.warn(`[MCP:${server.id}] could not move env values into Keychain yet: ${truncateError(error)}`);
+      }
+    }
   }
 
   /** Child environment for embedded setup-terminal commands. */
@@ -1374,6 +1776,7 @@ export function createMcpManager(options: {
       stopping = false;
       active = true;
       if (launchPreparation.signal.aborted) launchPreparation = new AbortController();
+      await migrateLegacyCustomValues();
       const enabled = db.prepare('SELECT id FROM mcp_servers WHERE enabled = 1').all() as { id: string }[];
       const launch = async (serverId: string): Promise<void> => {
         try {
@@ -1466,17 +1869,10 @@ export function createMcpManager(options: {
     async getCustomServerConfig(serverId: string) {
       const server = row(serverId);
       if (!server || server.kind !== CUSTOM_MCP_KIND) return null;
-      const config = parseCustomConfig(server.config_json);
-      return {
-        id: server.id,
-        name: server.display_name,
-        command: config.command,
-        args: config.args,
-        env: config.env,
-        origin: config.origin,
-        reviewed: config.reviewed,
-      };
+      return customServerView(server);
     },
+
+    setCustomServerValues: (serverId, values) => withProfileLock(serverId, () => setCustomServerValuesInternal(serverId, values)),
 
     getSqlContextConfig: configView,
 

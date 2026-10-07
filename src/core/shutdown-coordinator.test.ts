@@ -420,6 +420,7 @@ describe('launcher failed-start cleanup contract', () => {
     const missingRun = runLauncher({ BOTBOY_TEST_STARTUP_CLEANUP_PID: String(missing.pid) });
     expect(missingRun.status).toBe(1);
     expect(missingRun.stdout).toContain('Replacement starts are blocked');
+    expect(missingRun.stdout).toContain('Next: ./start.sh --recover-shutdown');
     const missingGuard = JSON.parse(fs.readFileSync(safetyBlock, 'utf8'));
     expect(missingGuard).toMatchObject({
       schemaVersion: 2,
@@ -486,6 +487,9 @@ describe('launcher failed-start cleanup contract', () => {
     const blockedRetry = runLauncher({ BOTBOY_TEST_STARTUP_SAFETY_CHECK: '1' });
     expect(blockedRetry.status).toBe(1);
     expect(blockedRetry.stdout).toContain('Replacement start blocked');
+    // Teammate report 2026-10-07: the refusal used to end at "Inspect … before recovery".
+    expect(blockedRetry.stdout).toContain('Next: ./start.sh --recover-shutdown');
+    expect(blockedRetry.stdout).toContain('Then: ./start.sh');
     const ordinaryGuard = JSON.parse(fs.readFileSync(safetyBlock, 'utf8'));
     writeLateReceipt(unforcedMissing.pid ?? 0, Math.max(Date.now(), Number(ordinaryGuard.targets[0].notBeforeMs) + 1), 'clean');
     const recoveredRetry = runLauncher({ BOTBOY_TEST_STARTUP_SAFETY_CHECK: '1' });
@@ -524,6 +528,112 @@ describe('launcher failed-start cleanup contract', () => {
     expect(multiRecovered.status).toBe(0);
     expect(fs.existsSync(safetyBlock)).toBe(false);
   }, 30_000);
+});
+
+describe('launcher guard handling for a clean reinstall (teammate report 2026-10-07)', () => {
+  const launcherPath = fileURLToPath(new URL('../../start.sh', import.meta.url));
+  const launcher = fs.readFileSync(launcherPath, 'utf8');
+
+  it('never treats a PID-file entry as BotBoy unless that process runs the server', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-pid-file-'));
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+    const pidFile = path.join(root, 'ppt.pid');
+    const discover = () => spawnSync('/bin/bash', [launcherPath], {
+      cwd: path.dirname(launcherPath),
+      env: {
+        ...process.env,
+        BOTBOY_TEST_DISCOVER_TRACKER_PIDS: '1',
+        PPT_PID_FILE: pidFile,
+        PPT_LOG_FILE: path.join(root, 'launcher.log'),
+        PPT_STARTUP_SAFETY_BLOCK: path.join(root, 'guard.json'),
+        PPT_SHUTDOWN_RECEIPT_DIR: root,
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    // A stale file whose PID now belongs to someone else's process.
+    const unrelated = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+    cleanups.push(() => { try { unrelated.kill('SIGKILL'); } catch {} });
+    fs.writeFileSync(pidFile, String(unrelated.pid));
+    const stale = discover();
+    expect(stale.status).toBe(0);
+    expect(stale.stdout.split('\n')).not.toContain(String(unrelated.pid));
+
+    // A process that runs `<node> dist/index.js` is a BotBoy server candidate.
+    const appDir = path.join(root, 'app');
+    fs.mkdirSync(path.join(appDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'dist', 'index.js'), "setInterval(() => {}, 1000); console.log('ready');");
+    const server = spawn(process.execPath, ['dist/index.js'], { cwd: appDir, stdio: ['ignore', 'pipe', 'ignore'] });
+    cleanups.push(() => { try { server.kill('SIGKILL'); } catch {} });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('fixture server did not start')), 5_000);
+      server.stdout!.on('data', () => { clearTimeout(timer); resolve(); });
+    });
+    fs.writeFileSync(pidFile, String(server.pid));
+    const current = discover();
+    expect(current.status).toBe(0);
+    expect(current.stdout.split('\n')).toContain(String(server.pid));
+  });
+
+  it('reports an unresolved guard before the build, after dependencies, and installs the recovery check\'s dependency first', () => {
+    const depsAt = launcher.indexOf('MISSING_DEPS="$(missing_npm_dependencies)"');
+    const earlyCheckAt = launcher.indexOf('startup_safety_allows_takeover || exit 1\n\nNEED_BUILD=""');
+    const buildAt = launcher.indexOf('NEED_BUILD=""\nif [ "${BOTBOY_FORCE_BUILD:-0}" = "1" ]; then');
+    expect(depsAt).toBeGreaterThan(0);
+    expect(earlyCheckAt).toBeGreaterThan(depsAt);
+    expect(buildAt).toBeGreaterThan(earlyCheckAt);
+
+    const recoverStart = launcher.indexOf('if [ "$RECOVER_SHUTDOWN" = "1" ]; then');
+    const recoverEnd = launcher.indexOf('exec "$NODE" "$RECOVERY_SCRIPT"', recoverStart);
+    const recoverBranch = launcher.slice(recoverStart, recoverEnd);
+    expect(recoverBranch).toContain(`require('better-sqlite3')`);
+    expect(recoverBranch).toContain('npm install --no-audit --no-fund');
+
+    // Every guard refusal names its next step.
+    for (const refusal of ['lacks exact, fresh DB-last closure', 'prior process did not prove exact, fresh DB-last closure', 'BotBoy stop is incomplete']) {
+      const at = launcher.indexOf(refusal);
+      expect(at, refusal).toBeGreaterThan(0);
+      expect(launcher.indexOf('print_shutdown_recovery_next_steps', at), refusal).toBeGreaterThan(at);
+      expect(launcher.indexOf('print_shutdown_recovery_next_steps', at) - at, refusal).toBeLessThan(400);
+    }
+  });
+
+  it('installs dependencies before running recovery in a fresh clone', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-fresh-clone-'));
+    cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
+    // A checkout with no node_modules, so better-sqlite3 cannot load.
+    const app = path.join(root, 'app');
+    fs.mkdirSync(path.join(app, 'scripts'), { recursive: true });
+    fs.copyFileSync(launcherPath, path.join(app, 'start.sh'));
+    fs.copyFileSync(fileURLToPath(new URL('../../scripts/recover-shutdown.mjs', import.meta.url)), path.join(app, 'scripts', 'recover-shutdown.mjs'));
+    fs.writeFileSync(path.join(app, 'package.json'), '{"name":"fresh-clone","version":"1.0.0","private":true}\n');
+    // The launcher puts $HOME/homebrew/bin first; a fake npm there records the
+    // call and fails, so no real install runs.
+    const home = path.join(root, 'home');
+    const bin = path.join(home, 'homebrew', 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+    fs.writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\necho "$@" > "$HOME/npm-args.txt"\nexit 1\n', { mode: 0o755 });
+
+    const result = spawnSync('/bin/bash', [path.join(app, 'start.sh'), '--recover-shutdown'], {
+      cwd: app,
+      env: {
+        PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+        HOME: home,
+        PPT_LOG_FILE: path.join(root, 'launcher.log'),
+        PPT_STARTUP_SAFETY_BLOCK: path.join(root, 'guard.json'),
+        PPT_SHUTDOWN_RECEIPT_DIR: root,
+        PPT_PID_FILE: path.join(root, 'ppt.pid'),
+      },
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('Installing dependencies for the recovery check');
+    expect(result.stdout).toContain('The recovery check needs better-sqlite3');
+    expect(result.stdout).toContain('Then: ./start.sh --recover-shutdown');
+    expect(fs.readFileSync(path.join(home, 'npm-args.txt'), 'utf8')).toContain('install --no-audit --no-fund');
+  });
 });
 
 describe('receipt-less shutdown recovery composite', () => {
@@ -580,8 +690,20 @@ describe('receipt-less shutdown recovery composite', () => {
     expect(fs.statSync(box.guardPath).mtimeMs).toBe(before.mtimeMs);
   });
 
-  it('refuses a live guard target and leaves the original guard in place', () => {
-    const box = recoveryFixture(process.pid);
+  it('refuses a live guard target and leaves the original guard in place', async () => {
+    const box = recoveryFixture(987_654_321);
+    const appDir = path.join(box.root, 'live-app');
+    fs.mkdirSync(path.join(appDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'dist', 'index.js'), "setInterval(() => {}, 1000); console.log('ready');");
+    const server = spawn(process.execPath, ['dist/index.js'], { cwd: appDir, stdio: ['ignore', 'pipe', 'ignore'] });
+    cleanups.push(() => { try { server.kill('SIGKILL'); } catch {} });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('fixture server did not start')), 5_000);
+      server.stdout!.on('data', () => { clearTimeout(timer); resolve(); });
+    });
+    const guard = JSON.parse(fs.readFileSync(box.guardPath, 'utf8'));
+    guard.targets = [{ pid: server.pid, notBeforeMs: Date.now() + 5_000 }];
+    fs.writeFileSync(box.guardPath, `${JSON.stringify(guard, null, 2)}\n`, { mode: 0o600 });
     const bytes = fs.readFileSync(box.guardPath);
 
     const result = spawnSync(process.execPath, [recoveryScript], {
@@ -591,7 +713,7 @@ describe('receipt-less shutdown recovery composite', () => {
     });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain(`Guard target PID(s) still live: ${process.pid}`);
+    expect(result.stderr).toContain(`Guard target PID(s) still live: ${server.pid}`);
     expect(fs.readFileSync(box.guardPath)).toEqual(bytes);
     expect(fs.existsSync(box.backupRoot)).toBe(false);
   });
@@ -672,5 +794,100 @@ describe('receipt-less shutdown recovery composite', () => {
     } finally {
       reopened.close();
     }
+  });
+
+  it('names the next step when the guarded BotBoy still runs', async () => {
+    const box = recoveryFixture(987_654_321);
+    // A process that runs `<node> dist/index.js`, started before the guard.
+    const appDir = path.join(box.root, 'app');
+    fs.mkdirSync(path.join(appDir, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'dist', 'index.js'), "setInterval(() => {}, 1000); console.log('ready');");
+    const server = spawn(process.execPath, ['dist/index.js'], { cwd: appDir, stdio: ['ignore', 'pipe', 'ignore'] });
+    cleanups.push(() => { try { server.kill('SIGKILL'); } catch {} });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('fixture server did not start')), 5_000);
+      server.stdout!.on('data', () => { clearTimeout(timer); resolve(); });
+    });
+    const guard = JSON.parse(fs.readFileSync(box.guardPath, 'utf8'));
+    guard.targets = [{ pid: server.pid, notBeforeMs: Date.now() + 5_000 }];
+    fs.writeFileSync(box.guardPath, `${JSON.stringify(guard, null, 2)}\n`, { mode: 0o600 });
+
+    const inspected = spawnSync(process.execPath, [recoveryScript, '--inspect'], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(inspected.stdout).toContain(`targets=${server.pid}:live:missing`);
+    const result = spawnSync(process.execPath, [recoveryScript], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`That is the old BotBoy; stop it: kill -INT ${server.pid}, wait 30 seconds, then run ./start.sh`);
+    expect(fs.existsSync(box.guardPath)).toBe(true);
+  });
+
+  it('never asks to stop a guarded PID that is not BotBoy, and recovers past it', () => {
+    // The test runner itself: started before the guard, and not `node dist/index.js`.
+    const box = recoveryFixture(process.pid);
+    const inspected = spawnSync(process.execPath, [recoveryScript, '--inspect'], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(inspected.stdout).toContain(`targets=${process.pid}:other:missing`);
+    const result = spawnSync(process.execPath, [recoveryScript], { env: box.env, encoding: 'utf8', timeout: 20_000 });
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain('kill -INT');
+    expect(fs.existsSync(box.guardPath)).toBe(false);
+  });
+
+  it('treats a guarded PID that now belongs to a newer process as gone (macOS reuses PIDs)', async () => {
+    const box = recoveryFixture(987_654_321);
+    const reused = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+    cleanups.push(() => { try { reused.kill('SIGKILL'); } catch {} });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const guard = JSON.parse(fs.readFileSync(box.guardPath, 'utf8'));
+    // The guard is older than the process now holding the PID.
+    guard.targets = [{ pid: reused.pid, notBeforeMs: Date.now() - 10_000 }];
+    fs.writeFileSync(box.guardPath, `${JSON.stringify(guard, null, 2)}\n`, { mode: 0o600 });
+
+    const inspected = spawnSync(process.execPath, [recoveryScript, '--inspect'], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(inspected.stdout).toContain(`targets=${reused.pid}:reused:missing`);
+    const result = spawnSync(process.execPath, [recoveryScript], { env: box.env, encoding: 'utf8', timeout: 20_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('quick_check=ok');
+    expect(fs.existsSync(box.guardPath)).toBe(false);
+    // The unrelated process was left alone.
+    expect(reused.exitCode).toBeNull();
+  });
+
+  it('archives the guard when the data folder was removed, since nothing is left to protect', () => {
+    const box = recoveryFixture(987_654_321);
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${box.databasePath}${suffix}`, { force: true });
+    const result = spawnSync(process.execPath, [recoveryScript], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('nothing to back up');
+    expect(result.stdout).toContain('Next: ./start.sh');
+    expect(fs.existsSync(box.guardPath)).toBe(false);
+    const [snapshot] = fs.readdirSync(box.backupRoot);
+    const boundary = JSON.parse(fs.readFileSync(path.join(box.backupRoot, snapshot, 'source-boundary.json'), 'utf8'));
+    expect(boundary).toMatchObject({ databaseFamilyPresent: false, unverifiedShutdown: true });
+  });
+
+  it('refuses when the database is gone but its WAL remains', () => {
+    const box = recoveryFixture(987_654_321);
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${box.databasePath}${suffix}`, { force: true });
+    fs.writeFileSync(`${box.databasePath}-wal`, 'orphan');
+    const result = spawnSync(process.execPath, [recoveryScript], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('tracker.db is missing but tracker.db-wal remain');
+    expect(fs.existsSync(box.guardPath)).toBe(true);
+  });
+
+  it('inspects without better-sqlite3 installed, and says how to install it before recovering', () => {
+    const box = recoveryFixture(987_654_321);
+    // A copy outside the package resolves no node_modules, like a fresh clone.
+    const bare = path.join(box.root, 'bare');
+    fs.mkdirSync(bare);
+    const copy = path.join(bare, 'recover-shutdown.mjs');
+    fs.copyFileSync(recoveryScript, copy);
+    const inspected = spawnSync(process.execPath, [copy, '--inspect'], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(inspected.status).toBe(0);
+    expect(inspected.stdout).toContain('shutdown recovery: BLOCKED');
+    const recovered = spawnSync(process.execPath, [copy], { env: box.env, encoding: 'utf8', timeout: 10_000 });
+    expect(recovered.status).toBe(1);
+    expect(recovered.stderr).toContain('better-sqlite3 is not installed');
+    expect(recovered.stderr).toContain('Run: npm install');
+    expect(fs.existsSync(box.guardPath)).toBe(true);
   });
 });

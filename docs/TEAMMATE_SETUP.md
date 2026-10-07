@@ -47,9 +47,9 @@ cd ~/botboy-app
 
 Always use this updater instead of `git pull`. It keeps compatible BotBoy
 customizations active and safely saves anything that overlaps a new release.
-If it reports an unverified earlier shutdown, do not remove the guard or kill a
-PID from its message. Run `./start.sh --doctor`, then follow the explicit
-`./start.sh --recover-shutdown` recovery below.
+If it reports an unverified earlier shutdown, do not remove the guard yourself.
+Run `./start.sh --recover-shutdown`, then `./start.sh` (see **Unverified
+shutdown recovery** below).
 
 ### Need help?
 
@@ -181,6 +181,7 @@ guided setup.
 - **Slack** — choose and configure the channels you want BotBoy to capture.
 - **SharePoint** — install and authenticate from its connection card when you
   want document synchronization.
+- **Other MCP servers** — ask BotBoy in chat; see **Add an MCP server** below.
 - **Local folders** — BotBoy watches Downloads, Desktop, and Documents by
   default, and you can add more. Existing files import in the background after
   BotBoy is ready, so a big folder never delays startup. Data and code files
@@ -271,6 +272,34 @@ kept, including mail BotBoy sends for you. The client and your sign-in token sta
 read; the BotBoy owner never sees your token or your mail. **Disconnect**
 revokes the access at Google; mail that BotBoy already captured stays.
 
+#### Add an MCP server
+
+Ask BotBoy in chat, for example "add the DeepWiki MCP server". You can also
+name a service, paste a link to its docs, or paste a config snippet. You
+never edit a config file.
+
+1. BotBoy looks the server up in the official MCP Registry and, if you use
+   AIM, in Amazon's AIM registry. It picks the one the service itself
+   publishes where it can.
+2. It adds the server and shows a card in chat. The card says where it runs
+   (a command on your Mac, or the remote host that receives every call), who
+   publishes it, and what it needs from you.
+3. If the server needs a key or token, type it into the field on the card.
+   It is saved in your Mac's Keychain, and BotBoy never sees it. Do not paste
+   a key into chat: chat messages are kept and go to the model. If you do,
+   BotBoy does not put it into the server and points you to the card.
+4. Press **Start** on the card. That press is your approval; BotBoy cannot
+   press it for you. BotBoy then tests the server and lists its tools.
+
+If a server needs a sign-in step, such as `mwinit` or `aim mcp install` for
+an AIM server, BotBoy runs it in a terminal card in chat, and you type any
+PIN there. Reads run freely. Tools that change data run only when you ask
+in chat, and every call is audited. Later, BotBoy can fix the server on its
+own; you press Start again only if the command, its arguments, or the
+remote host change. Servers that sign in through a browser (OAuth) cannot
+be added yet; BotBoy says so and offers a local or AIM version when there is
+one. **Connections** lists every server, with **Edit** and **Delete**.
+
 ### Optional local tools
 
 - **Pandoc** is optional. Markdown downloads work without it. For Word, PDF,
@@ -339,7 +368,7 @@ credential attachment before producing the report.
 | Chat returns HTTP 401 | Ask the owner to check gateway access. |
 | Dashboard does not open | Confirm Google Chrome is installed and inspect `/tmp/ppt.log`. |
 | Chrome shows `ERR_CONNECTION_REFUSED` | Do not keep refreshing. Run `./start.sh --update`, then `./start.sh`; if startup reports failure, run `./start.sh --doctor` and share only the reviewed relevant output. |
-| `Replacement start blocked` / `shutdown recovery: BLOCKED` | Do not delete the guard or kill its PID. Follow **Unverified shutdown recovery** below. |
+| `Replacement start blocked` / `shutdown recovery: BLOCKED` | Run `./start.sh --recover-shutdown`, then `./start.sh`. Do not delete the guard yourself; deleting and re-cloning `botboy-app` does not clear it. See **Unverified shutdown recovery** below. |
 | BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
 | A connection card is missing | Run `./start.sh --update`, then reopen BotBoy. |
 | Gmail shows **Reconnect needed** | Google ended BotBoy's access: you changed your Google password, you removed BotBoy from your Google account, or your app was in testing for 7 days. Open **Connections → Gmail** and choose **Reconnect**. To stop the 7-day sign-outs, publish the app (step 2 under **Gmail**). `./start.sh --doctor` prints a `gmail refresh probe` status; `400 invalid_grant` means Reconnect. |
@@ -351,8 +380,11 @@ credential attachment before producing the report.
 ### Unverified shutdown recovery
 
 Use this only when BotBoy names `/tmp/ppt-startup-safety-block.json`. It covers
-a legacy process that exited without the newer DB-last receipt; it is not a
-normal update step.
+an earlier BotBoy that exited without proving it closed its database (for
+example an old release, or one that was running when its folder was deleted);
+it is not a normal update step. The guard sits in `/tmp` and the database in
+`~/.personal-productivity-tracker/`, both outside the checkout, so deleting
+and re-cloning `botboy-app` does not clear it. Recovery does.
 
 If the installed launcher says `--recover-shutdown` is unknown or its helper is
 missing, fetch the current release **without starting it**:
@@ -371,8 +403,13 @@ Then run:
 ./start.sh --doctor
 ```
 
-Recovery refuses to proceed while any guarded PID, BotBoy process, port 7778
-listener, or tracker DB/WAL/SHM handle remains. On a stopped system it creates a
+Recovery refuses to proceed while the old BotBoy, any BotBoy process, a port
+7778 listener, or an open tracker DB/WAL/SHM handle remains. If the old BotBoy
+is still running, it says so and names the command that stops it
+(`kill -INT <pid>`; wait 30 seconds, then `./start.sh`). A PID that now
+belongs to another program is not BotBoy, and recovery leaves it alone. If you
+removed `~/.personal-productivity-tracker/`, there is nothing to back up, and
+recovery only clears the guard. On a stopped system it creates a
 private timestamped exact snapshot under
 `~/.personal-productivity-tracker/recovery-backups/`, verifies a disposable
 copy with SQLite `quick_check` and `foreign_key_check`, and archives the guard.
@@ -415,7 +452,10 @@ under your own account when one of your saved keys' models is chosen in chat or
 in **Settings → AI model**. Connections communicate with
 the services you enable; Gmail talks only to Google's sign-in and Gmail API
 endpoints, and mail BotBoy reads for a chat answer goes to the chat model like
-any other content. Any document publication, message draft or send, or
+any other content. A remote MCP server you add receives the arguments of
+every call BotBoy makes to it; BotBoy sends its saved keys only to that
+server and never follows it to another site. When BotBoy looks up a server
+for you, only the search words go to the official MCP Registry. Any document publication, message draft or send, or
 production pipeline change requires your explicit request and follows its own
 review/approval boundary.
 

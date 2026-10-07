@@ -117,9 +117,11 @@ customizations, saves overlaps for deliberate reapplication, and never removes
 untracked files or home-directory evidence.
 
 If an old process exited without a DB-last receipt, BotBoy blocks replacement
-rather than guessing that SQLite closed cleanly. Do not delete the guard or kill
-a PID from the message. If this checkout predates the recovery helper, fetch the
-new release without starting, then run the explicit recovery:
+rather than guessing that SQLite closed cleanly. Deleting and re-cloning
+`botboy-app` does not clear this: the guard and the database live outside the
+checkout. Do not delete the guard yourself; run the explicit recovery, which
+also tells you if an old BotBoy is still running. If this checkout predates the
+recovery helper, fetch the new release without starting first:
 
 ```bash
 cd ~/botboy-app

@@ -1629,6 +1629,10 @@ const LESSON_MARKER_RE = /\[\[lesson:(lesson_[a-z0-9]{6,24})\]\]/g;
 // gmail_draft replies carry [[gmail-draft:<draftId>]]; the chat router appends
 // any token the model left out (GMAIL_CHAT_TOOLS_PLAN.md §7).
 const GMAIL_DRAFT_MARKER_RE = /\[\[gmail-draft:([A-Za-z0-9_-]{1,128})\]\]/g;
+// mcp_add_custom_server / mcp_update_custom_server replies carry
+// [[mcp-server:<id>]] (custom servers only); the chat router appends any
+// marker the model left out (MCP_REMOTE_TRANSPORTS_PLAN.md MR1).
+const MCP_SERVER_MARKER_RE = /\[\[mcp-server:(custom-[a-z0-9][a-z0-9-]{0,79})\]\]/g;
 
 /**
  * Expands every card marker in the chat bubbles under `root`, then fills the
@@ -1642,12 +1646,15 @@ function hydrateChatCards(root) {
     const html = bubble.innerHTML;
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
-    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html)) continue;
+    MCP_SERVER_MARKER_RE.lastIndex = 0;
+    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html)) continue;
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
+    MCP_SERVER_MARKER_RE.lastIndex = 0;
     bubble.innerHTML = html
       .replace(LESSON_MARKER_RE, (_, id) => `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`)
-      .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`);
+      .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`)
+      .replace(MCP_SERVER_MARKER_RE, (_, id) => `<div class="mcp-server-card" data-mcp-server-id="${id}" aria-live="polite"><em>Loading the MCP server…</em></div>`);
   }
   for (const card of root.querySelectorAll('.lesson-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
@@ -1656,6 +1663,10 @@ function hydrateChatCards(root) {
   for (const card of root.querySelectorAll('.gmail-draft-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
     void fillGmailDraftCard(card);
+  }
+  for (const card of root.querySelectorAll('.mcp-server-card:not([data-hydrated])')) {
+    card.dataset.hydrated = '1';
+    void fillMcpServerCard(card);
   }
 }
 
@@ -1826,6 +1837,164 @@ document.addEventListener('click', async (event) => {
   note.textContent = unknown
     ? 'Gmail did not confirm the send. Check Gmail Sent before sending again.'
     : `${action === 'send' ? 'Not sent' : 'Not discarded'}: ${String(payload?.error || 'unexpected response')}`;
+});
+
+// ── MCP server review cards (MCP_REMOTE_TRANSPORTS_PLAN.md MR1) ──
+// The card says in plain words what runs and where, who publishes it, and
+// what it still needs. Secret fields are write-only (PUT
+// /mcp/servers/:id/secrets) and are cleared once sent. Start is the owner's
+// review: BotBoy cannot press it. Every button posts to an owner-UI route.
+async function fillMcpServerCard(card, note = '', noteIsError = false) {
+  const id = card.dataset.mcpServerId;
+  try {
+    const [profilePayload, configPayload] = await Promise.all([
+      api(`/mcp/profiles/${encodeURIComponent(id)}`),
+      api(`/mcp/servers/${encodeURIComponent(id)}/config`),
+    ]);
+    if (!profilePayload?.profile?.id || !configPayload?.config) throw new Error('unavailable');
+    paintMcpServerCard(card, profilePayload.profile, configPayload.config, note, noteIsError);
+  } catch {
+    card.innerHTML = '<em>This MCP server is no longer set up.</em>';
+  }
+}
+
+function mcpCardTransport(config) {
+  if (config.transport === 'stdio') return 'A command on this Mac';
+  if (config.transport === 'http') return 'Remote, Streamable HTTP';
+  if (config.transport === 'sse') return 'Remote, SSE (legacy)';
+  if (config.detectedTransport) return `Remote, ${config.detectedTransport === 'http' ? 'Streamable HTTP' : 'SSE'} (found automatically)`;
+  return 'Remote, Streamable HTTP first, then SSE';
+}
+
+function paintMcpServerCard(card, profile, config, note = '', noteIsError = false) {
+  const esc = lessonEsc;
+  const remote = config.transport !== 'stdio';
+  let host = '';
+  if (remote) {
+    try { host = new URL(config.url).host; } catch { host = ''; }
+  }
+  const tools = Array.isArray(profile.tools) ? profile.tools : [];
+  const writes = tools.filter((tool) => tool.risk !== 'read');
+  const missing = Array.isArray(config.missingValues) ? config.missingValues : [];
+  const values = [
+    ...(Array.isArray(config.env) ? config.env : []).map((entry) => ({ ...entry, kind: 'env' })),
+    ...(Array.isArray(config.headers) ? config.headers : []).map((entry) => ({ ...entry, kind: 'header' })),
+  ];
+  const fillable = values.filter((entry) => entry.secret || (entry.required && !entry.saved));
+  const running = profile.state === 'running';
+  const starting = profile.state === 'starting';
+  const attention = ['failed', 'degraded', 'needs_configuration'].includes(profile.state);
+  let status = 'Stopped';
+  let tone = '';
+  if (running) { status = `Running · ${tools.length} tool${tools.length === 1 ? '' : 's'}`; tone = 'good'; }
+  else if (starting) status = 'Starting…';
+  else if (profile.needsReview) { status = 'Waiting for your review'; tone = 'warn'; }
+  else if (missing.length) { status = 'Waiting for a value'; tone = 'warn'; }
+  else if (attention) { status = 'Needs attention'; tone = 'warn'; }
+
+  const about = config.about || {};
+  const publisher = about.publisher ? ` Published by ${esc(about.publisher)}.` : '';
+  const where = remote
+    ? `Connects to <strong>${esc(host || config.url)}</strong>. Every call BotBoy makes sends its arguments there.${publisher}`
+    : `Runs <code>${esc([config.command, ...(config.args || [])].join(' '))}</code> on this Mac.${publisher}`;
+  const description = about.description ? `<div class="mcp-card-about">${esc(about.description)}</div>` : '';
+  const toolLine = tools.length
+    ? `<div class="mcp-card-line">${tools.length} tool${tools.length === 1 ? '' : 's'}: ${tools.length - writes.length} read${writes.length ? `, ${writes.length} that change data and run only when you ask` : ''}.</div>`
+    : '';
+  const fields = fillable.map((entry) => {
+    const label = entry.kind === 'header' ? `${entry.name} header` : entry.name;
+    const placeholder = entry.saved
+      ? 'Saved. Type to replace it.'
+      : entry.template ? `Type only the key (sent as ${entry.template.replace('{value}', 'key')})` : 'Type the value';
+    return `<label class="mcp-card-field"><span>${esc(label)}${entry.secret ? ' <small>secret · kept in your Keychain, never shown to BotBoy</small>' : ''}</span>`
+      + `<input type="${entry.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" data-mcp-value-kind="${entry.kind}" data-mcp-value-name="${esc(entry.name)}" placeholder="${esc(placeholder)}"></label>`;
+  }).join('');
+  const lastError = profile.lastError && !running && !/^Waiting for /.test(profile.lastError)
+    ? `<div class="mcp-card-state warn">${esc(profile.lastError)}</div>`
+    : '';
+  const review = profile.needsReview
+    ? '<div class="mcp-card-line">BotBoy wrote this on your request. Pressing Start approves it; BotBoy cannot press it for you.</div>'
+    : '';
+  const website = typeof about.website === 'string' && /^https?:\/\//i.test(about.website) ? about.website : '';
+  const valueLine = (entry) => `${entry.kind === 'header' ? 'Header ' : ''}${entry.name}: ${entry.secret ? (entry.saved ? 'secret, saved' : 'secret, not set') : entry.saved ? (entry.value ?? '') : 'not set'}`;
+  const details = [
+    ['Runs', mcpCardTransport(config)],
+    remote ? ['Address', config.url] : ['Command', [config.command, ...(config.args || [])].join(' ')],
+    ...values.map((entry) => ['Value', valueLine(entry)]),
+    about.source ? ['Found in', about.source] : null,
+    ['Added by', config.origin === 'assistant' ? 'BotBoy, on your request' : 'You'],
+    tools.length ? ['Tools', tools.map((tool) => `${tool.name}${tool.risk === 'read' ? '' : ' (changes data)'}`).join(', ')] : null,
+  ].filter(Boolean).map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('');
+  const websiteRow = website ? `<dt>Website</dt><dd><a href="${esc(website)}" target="_blank" rel="noopener noreferrer">${esc(website)}</a></dd>` : '';
+  const actions = [];
+  if (running) {
+    actions.push('<button type="button" class="button small primary" data-mcp-card-action="test">Test</button>');
+    if (fillable.length) actions.push('<button type="button" class="button small ghost" data-mcp-card-action="save">Save</button>');
+    actions.push('<button type="button" class="button small ghost" data-mcp-card-action="stop">Stop</button>');
+  } else if (!starting) {
+    actions.push('<button type="button" class="button small primary" data-mcp-card-action="start">Start</button>');
+    if (fillable.length) actions.push('<button type="button" class="button small ghost" data-mcp-card-action="save">Save without starting</button>');
+  }
+  actions.push(`<a class="button small ghost" href="#/connections/${encodeURIComponent(profile.id)}">Settings</a>`);
+  const noteHtml = note ? `<div class="${noteIsError ? 'mcp-card-error' : 'mcp-card-note'}"${noteIsError ? ' role="alert"' : ''}>${esc(note)}</div>` : '';
+  card.innerHTML = `<div class="mcp-card-head"><span>MCP server · ${esc(profile.displayName || config.name)}</span><span class="mcp-card-status ${tone}">${esc(status)}</span></div>`
+    + `<div class="mcp-card-where">${where}</div>${description}${review}${toolLine}${lastError}`
+    + (fields ? `<div class="mcp-card-fields">${fields}</div>` : '')
+    + `<details class="mcp-card-details"><summary>Details</summary><dl>${details}${websiteRow}</dl></details>`
+    + `${noteHtml}<div class="mcp-card-actions">${actions.join('')}</div>`;
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-mcp-card-action]');
+  if (!button) return;
+  const card = button.closest('.mcp-server-card');
+  if (!card) return;
+  const action = button.dataset.mcpCardAction;
+  if (!['save', 'start', 'test', 'stop'].includes(action)) return;
+  const id = card.dataset.mcpServerId;
+  const typed = { env: {}, headers: {} };
+  let count = 0;
+  for (const input of card.querySelectorAll('input[data-mcp-value-name]')) {
+    if (!input.value) continue;
+    typed[input.dataset.mcpValueKind === 'header' ? 'headers' : 'env'][input.dataset.mcpValueName] = input.value;
+    input.value = '';
+    count += 1;
+  }
+  for (const control of card.querySelectorAll('button, input')) control.disabled = true;
+  const status = card.querySelector('.mcp-card-status');
+  if (status && action !== 'save') status.textContent = action === 'start' ? 'Starting…' : action === 'test' ? 'Testing…' : 'Stopping…';
+  let note = '';
+  let failed = false;
+  try {
+    if (count && action !== 'stop') {
+      // Body as an OBJECT: api() stringifies it (see the lesson-card post-mortem above).
+      const body = {};
+      if (Object.keys(typed.env).length) body.env = typed.env;
+      if (Object.keys(typed.headers).length) body.headers = typed.headers;
+      const saved = await api(`/mcp/servers/${encodeURIComponent(id)}/secrets`, { method: 'PUT', body });
+      if (!saved || !saved.config) throw new Error(saved?.error || 'the values were not saved');
+      note = count === 1 ? 'Saved in your Keychain.' : `${count} values saved in your Keychain.`;
+    } else if (action === 'save') {
+      throw new Error('Type a value first');
+    }
+    if (action !== 'save') {
+      const result = await api(`/mcp/profiles/${encodeURIComponent(id)}/actions/${action}`, { method: 'POST', body: {} });
+      if (!result || result.error) throw new Error(result?.error || 'unexpected response');
+      if (action === 'test') {
+        failed = result.result?.compatibilityState !== 'compatible';
+        note = String(result.result?.message || (failed ? 'The test did not pass.' : 'The test passed.'));
+      } else if (action === 'start') {
+        note = `${note ? `${note} ` : ''}Started. Ask BotBoy in chat to use it.`;
+      } else {
+        note = 'Stopped.';
+      }
+    }
+  } catch (error) {
+    failed = true;
+    const message = String(error?.message || error);
+    note = /^Waiting for /.test(message) ? 'Type the value above first, then press Start.' : `${action === 'save' ? 'Not saved' : `Could not ${action}`}: ${message}`;
+  }
+  await fillMcpServerCard(card, note, failed);
 });
 
 function renderChatMsgInner(m) {

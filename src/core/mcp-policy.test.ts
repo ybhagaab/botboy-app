@@ -141,6 +141,22 @@ describe('Existing kinds unchanged (regressions)', () => {
     expect(classifyMcpTool('grasp-m365', 'get_emails')).toBe('read');
     expect(classifyMcpTool('grasp-m365', 'send_email')).toBe('write');
   });
+  it('reads the verb after a server namespace on user-added servers (AWS Knowledge through AIM, live 2026-10-07)', () => {
+    for (const tool of ['aws___read_documentation', 'aws___search_documentation', 'aws___list_regions', 'aws___get_regional_availability', 'github.list_issues']) {
+      expect(classifyMcpTool('custom', tool), tool).toBe('read');
+    }
+    for (const tool of ['aws___retrieve_skill', 'aws___delete_bucket', 'github.create_issue', 'aws_search_documentation', 'my_tool__get']) {
+      expect(classifyMcpTool('custom', tool), tool).toBe('write');
+    }
+  });
+  it('reads camelCase and PascalCase read verbs (Builder MCP, live 2026-10-07), case-sensitively', () => {
+    for (const tool of ['ReadInternalWebsites', 'ReadRemoteTestRun', 'listIssues', 'GetUser2', 'aws___GetItem', 'status', 'Status']) {
+      expect(classifyMcpTool('custom', tool), tool).toBe('read');
+    }
+    for (const tool of ['Readme', 'readme', 'InternalSearch', 'SimAddComment', 'CreateIssue', 'GETDATA', 'getaway']) {
+      expect(classifyMcpTool('custom', tool), tool).toBe('write');
+    }
+  });
   it('slack reads stay read', () => {
     expect(classifyMcpTool('slack', 'search')).toBe('read');
     expect(classifyMcpTool('slack', 'post_message')).toBe('write');
