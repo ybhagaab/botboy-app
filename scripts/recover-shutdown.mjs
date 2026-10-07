@@ -12,6 +12,9 @@ const databasePath = process.env.PPT_RECOVERY_DATABASE_PATH
   || path.join(os.homedir(), '.personal-productivity-tracker', 'tracker.db');
 const backupRoot = process.env.PPT_RECOVERY_BACKUP_ROOT
   || path.join(os.homedir(), '.personal-productivity-tracker', 'recovery-backups');
+// macOS ships SQLite (with FTS5) in the base system. Recovery falls back to it
+// when better-sqlite3 cannot open a database in this Node.
+const sqliteCli = process.env.PPT_RECOVERY_SQLITE_CLI || '/usr/bin/sqlite3';
 const inspectOnly = process.argv.includes('--inspect');
 const testIsolation = process.env.BOTBOY_TEST_RECOVERY_ISOLATED === '1';
 if (testIsolation && process.env.NODE_ENV !== 'test') {
@@ -26,6 +29,20 @@ function fail(message) {
 
 function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function oneLine(error) {
+  return String(error?.message ?? error).replace(/\s+/g, ' ').trim().slice(0, 240) || 'unknown error';
+}
+
+function guardIsAbsent() {
+  try {
+    fs.lstatSync(guardPath);
+    return false;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return true;
+    throw error;
+  }
 }
 
 function assertRegularFile(file, label) {
@@ -203,7 +220,7 @@ function inspect() {
   }
 }
 
-function recover(Database) {
+async function recover() {
   const { value: guard, targets } = parseGuard();
   const liveTargets = targets.filter(target => targetState(target) === 'live').map(target => target.pid);
   if (liveTargets.length) {
@@ -239,6 +256,7 @@ function recover(Database) {
   assertRegularFile(databasePath, 'Tracker database');
   const handles = openHandlePids(existing);
   if (handles.length) fail(`Tracker database family still has open handles (${[...new Set(handles)].join(', ')})`);
+  const verifier = await loadVerifier();
 
   const before = familyState(family);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -258,6 +276,7 @@ function recover(Database) {
     guardReason: guard.reason,
     targetPids: targets.map(target => target.pid),
     unverifiedShutdown: true,
+    integrityVerifier: verifier.name,
     source: before,
   }, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
 
@@ -284,15 +303,13 @@ function recover(Database) {
   }
 
   const verifyDatabase = path.join(verifyDir, path.basename(databasePath));
-  const db = new Database(verifyDatabase, { readonly: false, fileMustExist: true });
-  let quickCheck;
-  let foreignKeyViolations;
+  let integrity;
   try {
-    quickCheck = db.pragma('quick_check', { simple: true });
-    foreignKeyViolations = db.pragma('foreign_key_check').length;
-  } finally {
-    db.close();
+    integrity = verifier.check(verifyDatabase);
+  } catch (error) {
+    fail(`Copied database could not be checked with ${verifier.name} (${oneLine(error)}); guard retained. Evidence: ${snapshot}`);
   }
+  const { quickCheck, foreignKeyViolations } = integrity;
   if (quickCheck !== 'ok' || foreignKeyViolations !== 0) {
     fail(`Copied database integrity failed (quick_check=${quickCheck}, foreign_key_violations=${foreignKeyViolations}); guard retained. Evidence: ${snapshot}`);
   }
@@ -310,7 +327,7 @@ function recover(Database) {
   copyExact(archivedGuard, path.join(snapshot, 'guard-archived-from-tmp.json'));
 
   console.log(`✅ Exact stopped DB/WAL/SHM snapshot: ${exactDir}`);
-  console.log(`✅ Disposable copy verified: quick_check=ok, foreign_key_violations=0`);
+  console.log(`✅ Disposable copy verified: quick_check=ok, foreign_key_violations=0 (${verifier.name})`);
   console.log(`⚠️  Archived unverified shutdown guard: ${archivedGuard}`);
   console.log('    This recovery does NOT claim the old process closed cleanly.');
   console.log('    Next: ./start.sh');
@@ -345,17 +362,68 @@ function archiveGuardWithoutDatabase(guard, targets) {
   console.log('    Next: ./start.sh (it creates a new, empty database)');
 }
 
-async function loadSqlite() {
+/**
+ * The integrity check for the disposable copy: better-sqlite3 when it opens a
+ * database in this Node, else macOS's own sqlite3. A fresh clone has no
+ * node_modules, npm 12 skips native builds, and a Node switch leaves a binary
+ * built for another Node; none of that may block recovery (2026-10-07). Both
+ * run the same quick_check and foreign_key_check.
+ */
+async function loadVerifier() {
+  let reason;
   try {
-    return (await import('better-sqlite3')).default;
-  } catch {
-    fail('better-sqlite3 is not installed or does not load here. Run: npm install (then npm rebuild better-sqlite3 if needed), then retry');
+    const Database = (await import('better-sqlite3')).default;
+    new Database(':memory:').close();
+    return {
+      name: 'better-sqlite3',
+      check(file) {
+        const db = new Database(file, { readonly: false, fileMustExist: true });
+        try {
+          return {
+            quickCheck: db.pragma('quick_check', { simple: true }),
+            foreignKeyViolations: db.pragma('foreign_key_check').length,
+          };
+        } finally {
+          db.close();
+        }
+      },
+    };
+  } catch (error) {
+    reason = oneLine(error);
   }
+  let usable = false;
+  try {
+    fs.accessSync(sqliteCli, fs.constants.X_OK);
+    usable = fs.statSync(sqliteCli).isFile();
+  } catch {}
+  if (!usable) {
+    fail(`Neither better-sqlite3 (${reason}) nor ${sqliteCli} can check the database copy here. Run: npm install, then retry`);
+  }
+  return { name: sqliteCli, check: checkWithSqliteCli };
+}
+
+function checkWithSqliteCli(file) {
+  // -init /dev/null: never run the user's ~/.sqliterc against the copy.
+  const result = spawnSync(sqliteCli, [
+    '-batch', '-bail', '-init', '/dev/null', file,
+    "PRAGMA quick_check; SELECT 'foreign_key_violations=' || count(*) FROM pragma_foreign_key_check;",
+  ], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr || `${sqliteCli} exited ${result.status}`);
+  const lines = result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  const match = /^foreign_key_violations=(\d+)$/.exec(lines.pop() ?? '');
+  if (!match) throw new Error('unexpected sqlite3 output');
+  return { quickCheck: lines.join('; '), foreignKeyViolations: Number(match[1]) };
 }
 
 try {
   if (inspectOnly) inspect();
-  else recover(await loadSqlite());
+  else if (guardIsAbsent()) {
+    // Nothing blocks a start, so there is nothing to recover (a teammate
+    // used to see "refused … Original guard retained" here).
+    console.log('ℹ️  No shutdown safety guard: nothing to recover.');
+    console.log('    Next: ./start.sh');
+  } else await recover();
 } catch (error) {
   console.error(`❌ Shutdown recovery refused: ${String(error?.message ?? error)}`);
   console.error(`    Original guard retained: ${guardPath}`);

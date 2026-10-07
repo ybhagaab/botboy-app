@@ -539,6 +539,15 @@ describe('analytics data-room R1 immutable catalog and ingestion', () => {
     const tamperedBackupRoot = temporaryDirectory('analytics-canonical-tamper-');
     const tamperedBackup = path.join(tamperedBackupRoot, backup.backupId);
     fs.cpSync(backup.targetDirectory, tamperedBackup, { recursive: true });
+    // Node 26's cpSync creates directories 0755 (Node 20 kept 0700). Keep the
+    // copy private, so the restore reaches the definition check under test.
+    const keepPrivate = (directory: string): void => {
+      fs.chmodSync(directory, 0o700);
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) keepPrivate(path.join(directory, entry.name));
+      }
+    };
+    keepPrivate(tamperedBackup);
     const tamperedCatalogPath = path.join(tamperedBackup, 'catalog.json');
     const tamperedCatalog = JSON.parse(fs.readFileSync(tamperedCatalogPath, 'utf8'));
     tamperedCatalog.dataset.definition_json = '{"adapter":"tampered"}';

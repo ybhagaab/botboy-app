@@ -5,7 +5,10 @@
 You need:
 
 - a Mac with **Google Chrome**
-- **Node.js 20.16 or newer** (`node --version`; PDF reading needs 20.16)
+- **Node.js 20.16 or newer** (`node --version`; PDF reading needs 20.16).
+  Homebrew's current Node (`brew install node`, Node 26 with npm 12) works.
+  On Node 20, `npm install` builds BotBoy's database module from source, which
+  needs Xcode Command Line Tools (`xcode-select --install`).
 - **Git**
 - an AI model: the private BotBoy credential attachment sent to you by the
   owner, your own OpenAI API key, your own DeepSeek API key, or any mix of them
@@ -47,9 +50,10 @@ cd ~/botboy-app
 
 Always use this updater instead of `git pull`. It keeps compatible BotBoy
 customizations active and safely saves anything that overlaps a new release.
-If it reports an unverified earlier shutdown, do not remove the guard yourself.
-Run `./start.sh --recover-shutdown`, then `./start.sh` (see **Unverified
-shutdown recovery** below).
+If an earlier shutdown is still unverified, the updater brings the new code
+but does not start BotBoy. Do not remove the guard yourself: run
+`./start.sh --recover-shutdown`, then `./start.sh` (see **Unverified shutdown
+recovery** below).
 
 ### Need help?
 
@@ -362,6 +366,7 @@ credential attachment before producing the report.
 | Settings → AI model cannot reach api.openai.com or api.deepseek.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` status. |
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
+| `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Run `npm install` in `~/botboy-app`, read the errors at its end, fix what they name, then `./start.sh`. On Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
 | `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app`. `./start.sh --update` updates BotBoy but never reinstalls packages, so older ones stay until you do. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
@@ -387,11 +392,23 @@ it is not a normal update step. The guard sits in `/tmp` and the database in
 and re-cloning `botboy-app` does not clear it. Recovery does.
 
 If the installed launcher says `--recover-shutdown` is unknown or its helper is
-missing, fetch the current release **without starting it**:
+missing, fetch the current release first. While the guard exists, the updater
+changes the code only and never starts BotBoy:
 
 ```bash
 cd ~/botboy-app
-BOTBOY_UPDATE_NO_START=1 ./start.sh --update
+./start.sh --update
+```
+
+If the updater answers **Update paused** (releases before October 7, 2026),
+move the checkout aside and clone the current release instead; your data stays
+in `~/.personal-productivity-tracker/`:
+
+```bash
+cd ~
+mv botboy-app "botboy-app-backup-$(date +%Y%m%d-%H%M%S)"
+git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
+cd ~/botboy-app
 ```
 
 Then run:
@@ -413,6 +430,10 @@ recovery only clears the guard. On a stopped system it creates a
 private timestamped exact snapshot under
 `~/.personal-productivity-tracker/recovery-backups/`, verifies a disposable
 copy with SQLite `quick_check` and `foreign_key_check`, and archives the guard.
+It needs no `npm install`: when BotBoy's own SQLite module does not work, it
+checks the copy with the `sqlite3` built into macOS. Without a guard it says
+there is nothing to recover. A start that fails before BotBoy opens its
+database no longer leaves a guard at all.
 It never fabricates a receipt, calls the old shutdown clean, or starts BotBoy
 automatically. Keep the snapshot; never restore `tracker.db` alone without its
 matching WAL/SHM and related private state. If recovery refuses, share the
@@ -422,7 +443,9 @@ reviewed doctor line with the owner instead of bypassing it.
 
 Your evidence database and credentials live outside the checkout under
 `~/.personal-productivity-tracker/`. Preserve the old checkout until the new
-one works, because it may contain untracked customizations:
+one works, because it may contain untracked customizations. If `--stop`
+refuses because of an unverified earlier shutdown, skip it and run
+`./start.sh --recover-shutdown` in the new checkout before `./start.sh`:
 
 ```bash
 cd ~/botboy-app

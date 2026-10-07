@@ -10,6 +10,7 @@ import http from 'node:http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
+import { writeDatabaseOpenMarker } from './core/database-open-marker.js';
 import { createMcpManager } from './core/mcp-manager.js';
 import { createMcpServerFinder } from './core/mcp-registry-lookup.js';
 import { sqlContextExportDir } from './core/mcp-profiles.js';
@@ -257,6 +258,13 @@ async function main() {
     });
   });
   console.log(`✅ Port ${PORT} bound — boot page live while initialization continues`);
+
+  // ── Database-open marker ──
+  // Must stay immediately before the first tracker.db open. A launcher child
+  // that exits without it provably never opened the database, so its failed
+  // start leaves no shutdown guard (start.sh › child_never_reached_database).
+  // A failed write throws here, before the database opens.
+  writeDatabaseOpenMarker(process.env.PPT_DB_OPEN_MARKER);
 
   // ── Storage ──
   const storage = createStorage();

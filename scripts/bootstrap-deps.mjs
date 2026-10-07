@@ -9,6 +9,8 @@
  *                                                    also install the optional set (ffmpeg, whisper, ollama)
  *
  * Idempotent and safely re-runnable:
+ *   - Makes node-pty's prebuilt macOS spawn-helper executable (its npm
+ *     tarball drops the execute bit).
  *   - Builds the macOS `vision-ocr` Swift helper if it is missing or stale.
  *   - Verifies every external CLI tool BotBoy shells out to (the canonical
  *     registry lives in src/core/toolchain.ts — keep the lists aligned).
@@ -19,7 +21,7 @@
  * can sit in a guarded `postinstall` without breaking CI installs.
  */
 
-import { existsSync, mkdirSync, statSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
 import os from 'os';
 import path from 'path';
@@ -104,6 +106,28 @@ function buildVisionHelper() {
   log(`built ${bin}`);
 }
 
+/**
+ * node-pty 1.1.0 ships its macOS `spawn-helper` without the execute bit (the
+ * npm tarball stores it as 0644), so every terminal spawn fails with
+ * `posix_spawnp failed`. Its own install scripts never fix the mode. start.sh
+ * repeats this check before each start (native_modules_problem repair).
+ */
+function makePtySpawnHelperExecutable() {
+  const prebuilds = path.join(root, 'node_modules', 'node-pty', 'prebuilds');
+  for (const platform of ['darwin-arm64', 'darwin-x64']) {
+    const helper = path.join(prebuilds, platform, 'spawn-helper');
+    try {
+      const mode = statSync(helper).mode;
+      if ((mode & 0o111) !== 0o111) {
+        chmodSync(helper, (mode & 0o777) | 0o755);
+        log(`made node-pty ${platform} spawn-helper executable`);
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') log(`WARNING: could not check node-pty ${platform} spawn-helper: ${error?.message || error}`);
+    }
+  }
+}
+
 function missingEntries(entries) {
   return entries.filter((e) => e.bins.some((b) => !hasBin(b)));
 }
@@ -177,6 +201,7 @@ function verifyAndInstallTools() {
   }
 }
 
+makePtySpawnHelperExecutable();
 buildVisionHelper();
 verifyAndInstallTools();
 log('done.');

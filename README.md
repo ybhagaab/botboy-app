@@ -79,7 +79,9 @@ dedicated read-only analytics connection.
 You need macOS, Google Chrome, Git, Node.js 20.16+, and an AI model: the private
 BotBoy credential attachment sent by the owner, your own OpenAI API key, your
 own DeepSeek API key, or any mix of them. No AWS account or `aws login` is
-required.
+required. Homebrew's current Node (`brew install node`, Node 26 with npm 12)
+works; on Node 20, `npm install` builds the database module from source and
+needs Xcode Command Line Tools (`xcode-select --install`).
 
 If you have a credential attachment, download it to Downloads or Desktop.
 Then run:
@@ -120,19 +122,23 @@ If an old process exited without a DB-last receipt, BotBoy blocks replacement
 rather than guessing that SQLite closed cleanly. Deleting and re-cloning
 `botboy-app` does not clear this: the guard and the database live outside the
 checkout. Do not delete the guard yourself; run the explicit recovery, which
-also tells you if an old BotBoy is still running. If this checkout predates the
-recovery helper, fetch the new release without starting first:
+also tells you if an old BotBoy is still running. While the guard exists,
+`./start.sh --update` brings the new release without starting it:
 
 ```bash
 cd ~/botboy-app
-BOTBOY_UPDATE_NO_START=1 ./start.sh --update  # only if helper is missing
+./start.sh --update            # code only while the guard exists
 ./start.sh --doctor
 ./start.sh --recover-shutdown
 ./start.sh
 ```
 
 Recovery runs only on a stopped database, makes and verifies an exact private
-DB/WAL/SHM snapshot, archives the guard, and never calls the old exit clean.
+DB/WAL/SHM snapshot, archives the guard, and never calls the old exit clean. It
+needs no `npm install`, and a start that fails before BotBoy opens its database
+leaves no guard. If an older updater answers **Update paused**, move the
+checkout aside and clone again (see the setup guide); your data stays in
+`~/.personal-productivity-tracker/`.
 
 ## Privacy
 

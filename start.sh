@@ -74,12 +74,14 @@ if [ "$UPDATE_ONLY" = "1" ]; then
     exit 1
   fi
   UPDATE_SAFETY_BLOCK="${PPT_STARTUP_SAFETY_BLOCK:-/tmp/ppt-startup-safety-block.json}"
+  # With an unverified earlier shutdown, update the code but never start.
+  # Updating touches no database, process, or guard, and it brings the newest
+  # recovery helper; refusing it left a teammate stuck behind a guard that
+  # only a newer helper could clear (2026-10-07).
+  UPDATE_GUARDED=0
   if [ -f "$UPDATE_SAFETY_BLOCK" ]; then
-    echo "❌ Update paused: an earlier shutdown is still unverified."
-    echo "    Run: ./start.sh --doctor"
-    echo "    Then: ./start.sh --recover-shutdown"
-    echo "    The updater will not replace the existing guard or change Git state."
-    exit 1
+    UPDATE_GUARDED=1
+    echo "ℹ️  An earlier shutdown is still unverified: updating the code only. BotBoy will not start."
   fi
 
   BACKUP_PATH=""
@@ -140,6 +142,12 @@ if [ "$UPDATE_ONLY" = "1" ]; then
     fi
   fi
 
+  if [ "$UPDATE_GUARDED" = "1" ]; then
+    echo "✅ BotBoy updated. It was not started because an earlier shutdown is still unverified."
+    echo "    Next: ./start.sh --recover-shutdown"
+    echo "    Then: ./start.sh"
+    exit 0
+  fi
   echo "✅ BotBoy updated — rebuilding and starting"
   if [ "${BOTBOY_UPDATE_NO_START:-0}" = "1" ]; then
     exit 0
@@ -213,6 +221,84 @@ missing_npm_dependencies() {
   ' "$PROJ_DIR" 2>/dev/null || true
 }
 
+# Whether the native modules work in the exact Node this launcher runs. One
+# `name|ok` or `name|<error>` line per module; nonzero when either fails.
+# better-sqlite3 binds its addon only inside `new Database()`, so `require`
+# alone proves nothing (the doctor said "loads" on a teammate Mac where it
+# could not open a database); node-pty must actually spawn a terminal.
+# `repair` first restores the execute bit node-pty 1.1.0's npm tarball drops
+# from its macOS spawn-helper (`posix_spawnp failed` otherwise); `check`
+# changes nothing.
+native_modules_status() {
+  (cd "$PROJ_DIR" && "$NODE" -e '
+    const fs = require("fs");
+    const path = require("path");
+    const repair = process.argv[1] === "repair";
+    const cwd = process.cwd() + path.sep;
+    const describe = error => String((error && error.message) || error)
+      .split(cwd).join("").replace(/\s+/g, " ").replace(/ (Tried:|Require stack:) .*$/, "")
+      .trim().slice(0, 300) || "unknown error";
+    const results = [];
+    let failed = false;
+    const record = (name, error) => {
+      if (error) failed = true;
+      results.push(`${name}|${error ? describe(error) : "ok"}`);
+    };
+    const finish = () => {
+      process.stdout.write(results.join("\n") + "\n");
+      process.exit(failed ? 1 : 0);
+    };
+    try {
+      new (require("better-sqlite3"))(":memory:").close();
+      record("better-sqlite3");
+    } catch (error) {
+      record("better-sqlite3", error);
+    }
+    if (repair) {
+      for (const platform of ["darwin-arm64", "darwin-x64"]) {
+        const helper = path.join("node_modules", "node-pty", "prebuilds", platform, "spawn-helper");
+        try {
+          const mode = fs.statSync(helper).mode;
+          if ((mode & 0o111) !== 0o111) fs.chmodSync(helper, (mode & 0o777) | 0o755);
+        } catch {}
+      }
+    }
+    let terminal;
+    try {
+      terminal = require("node-pty").spawn("/usr/bin/true", [], { name: "xterm", cols: 80, rows: 24, cwd: process.cwd(), env: process.env });
+    } catch (error) {
+      record("node-pty", error);
+      finish();
+    }
+    const timer = setTimeout(() => {
+      try { terminal.kill(); } catch {}
+      record("node-pty", new Error("a test terminal did not exit within 5 seconds"));
+      finish();
+    }, 5000);
+    terminal.onExit(({ exitCode }) => {
+      clearTimeout(timer);
+      record("node-pty", exitCode === 0 ? undefined : new Error(`a test terminal exited with ${exitCode}`));
+      finish();
+    });
+  ' "${1:-check}" 2>/dev/null)
+}
+
+print_native_modules_failure() {
+  local status="$1"
+  echo "❌ BotBoy did not start: its native modules do not work with Node $("$NODE" --version 2>/dev/null) (npm $(npm --version 2>/dev/null))."
+  printf '%s\n' "$status" | grep -v '|ok$' | sed 's/|/: /; s/^/    /'
+  echo "    BotBoy never opened its database, so nothing needs recovery."
+  echo "    Next: run npm install in $PROJ_DIR, read its last errors, then ./start.sh."
+  echo "    On Node 20, better-sqlite3 is built from source and needs Xcode Command Line Tools (xcode-select --install); Node 22, 24, and 26 use a prebuilt copy."
+}
+
+# Executable test hook for the native check. Prints its lines; changes only
+# the spawn-helper mode, and only in `repair`.
+if [ -n "${BOTBOY_TEST_NATIVE_STATUS:-}" ]; then
+  native_modules_status "$BOTBOY_TEST_NATIVE_STATUS"
+  exit $?
+fi
+
 if [ "$RECOVER_SHUTDOWN" = "1" ]; then
   RECOVERY_SCRIPT="$PROJ_DIR/scripts/recover-shutdown.mjs"
   if [ ! -f "$RECOVERY_SCRIPT" ]; then
@@ -220,18 +306,10 @@ if [ "$RECOVER_SHUTDOWN" = "1" ]; then
     echo "    BOTBOY_UPDATE_NO_START=1 ./start.sh --update"
     exit 1
   fi
-  # A fresh clone has no node_modules yet, and the helper verifies its
-  # database copy with better-sqlite3. Install first, as a normal start would.
-  if ! (cd "$PROJ_DIR" && "$NODE" -e "require('better-sqlite3')") >/dev/null 2>&1; then
-    echo "ℹ️  Installing dependencies for the recovery check — npm install" | tee -a "$LOG_FILE"
-    if ! (cd "$PROJ_DIR" && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) \
-      || ! (cd "$PROJ_DIR" && "$NODE" -e "require('better-sqlite3')") >/dev/null 2>&1; then
-      echo "❌ The recovery check needs better-sqlite3, which did not install or load (see $LOG_FILE)."
-      echo "    Run: npm install   (then: npm rebuild better-sqlite3 if it still fails; needs Xcode Command Line Tools)"
-      echo "    Then: ./start.sh --recover-shutdown"
-      exit 1
-    fi
-  fi
+  # No npm install here. The helper checks its database copy with
+  # better-sqlite3 when that opens a database in this Node, and otherwise with
+  # macOS's own /usr/bin/sqlite3, so a fresh clone, npm 12 skipping native
+  # builds, or a Node switch cannot block recovery (teammate, 2026-10-07).
   PPT_STARTUP_SAFETY_BLOCK="$STARTUP_SAFETY_BLOCK" \
   PPT_SHUTDOWN_RECEIPT_DIR="$SHUTDOWN_RECEIPT_DIR" \
   PPT_PID_FILE="$PID_FILE" \
@@ -688,11 +766,42 @@ write_startup_safety_block() {
   write_shutdown_safety_block "startup_child_shutdown_unverified" "$not_before_ms" "$server_pid"
 }
 
+# One-time database-open marker path for the next server this launcher
+# spawns (passed as PPT_DB_OPEN_MARKER). index.ts writes it immediately before
+# its first tracker.db open (database-open-marker.ts).
+new_db_open_marker_path() {
+  local id
+  id="$("$NODE" -e 'process.stdout.write(require("crypto").randomUUID())' 2>/dev/null)" || return 1
+  [ -n "$id" ] || return 1
+  printf '%s/ppt-db-open-%s.json' "$SHUTDOWN_RECEIPT_DIR" "$id"
+}
+
+# A failed startup child that is gone and never wrote its marker never opened
+# tracker.db, so there is nothing a guard could protect. Only an absent marker
+# in a readable directory proves that; an unknown marker path, a live child,
+# or any file at the marker path keeps the guard.
+child_never_reached_database() {
+  local server_pid="$1"
+  local marker="${2:-}"
+  [ -n "$marker" ] || return 1
+  pid_is_live "$server_pid" && return 1
+  local marker_dir
+  marker_dir="$(dirname "$marker")"
+  [ -d "$marker_dir" ] && [ -r "$marker_dir" ] && [ -x "$marker_dir" ] || return 1
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    return 1
+  fi
+  return 0
+}
+
 # Stop an exact candidate child through the same 20/30-second DB-last contract
 # as ordinary takeover. Failed readiness/window settlement must never create a
 # five-second shortcut around the application's 25-second coordinator.
+# Returns 0 clean, 2 forced but DB-closed, 3 stopped before it opened the
+# database (no guard), 1 unverified (guard kept).
 stop_startup_child() {
   local server_pid="$1"
+  local db_open_marker="${2:-}"
   local receipt attempt_started_ms
   receipt="$(shutdown_receipt_path "$server_pid")"
   attempt_started_ms="$(current_epoch_ms)"
@@ -737,6 +846,7 @@ stop_startup_child() {
         return 1
       fi
       rm -f "$STARTUP_SAFETY_BLOCK"
+      [ -z "$db_open_marker" ] || rm -f "$db_open_marker"
       echo "✅ startup pid $server_pid stopped cleanly after failed completion (receipt: $receipt)"
       return 0
       ;;
@@ -746,10 +856,17 @@ stop_startup_child() {
         return 1
       fi
       rm -f "$STARTUP_SAFETY_BLOCK"
+      [ -z "$db_open_marker" ] || rm -f "$db_open_marker"
       echo "⚠️  startup pid $server_pid required bounded cleanup but proved SQLite closed (receipt: $receipt)"
       return 2
       ;;
     *)
+      if child_never_reached_database "$server_pid" "$db_open_marker"; then
+        rm -f "$STARTUP_SAFETY_BLOCK"
+        echo "ℹ️  BotBoy stopped before it opened its database, so nothing needs recovery."
+        echo "    The cause is at the end of $LOG_FILE; ./start.sh --doctor runs the checks."
+        return 3
+      fi
       echo "❌ Failed-start cleanup did not prove exact, fresh DB-last closure ($state)."
       echo "    Replacement starts are blocked by: $STARTUP_SAFETY_BLOCK"
       echo "    Preserve tracker.db + WAL + SHM together and inspect: $receipt"
@@ -1144,7 +1261,7 @@ safe_takeover() {
 # Executable test harness for the exact launcher state machine. All paths and
 # grace windows are environment-overridable; production never sets these.
 if [ -n "${BOTBOY_TEST_STARTUP_CLEANUP_PID:-}" ]; then
-  stop_startup_child "$BOTBOY_TEST_STARTUP_CLEANUP_PID"
+  stop_startup_child "$BOTBOY_TEST_STARTUP_CLEANUP_PID" "${BOTBOY_TEST_DB_OPEN_MARKER:-}"
   exit $?
 fi
 if [ -n "${BOTBOY_TEST_EXISTING_CLEANUP_PID:-}" ]; then
@@ -1241,12 +1358,16 @@ if [ "$DOCTOR" = "1" ]; then
   DOCTOR_MISSING_DEPS="$(missing_npm_dependencies)"
   if [ -z "$DOCTOR_MISSING_DEPS" ]; then echo "npm dependencies: installed"; else echo "npm dependencies: MISSING $DOCTOR_MISSING_DEPS — run: npm install (./start.sh also tries)"; fi
   echo "pdf readers: vision-ocr helper $([ -x "$PROJ_DIR/native/vision-ocr/bin/vision-ocr" ] && echo built || echo 'not built (needs Xcode CLT)'); pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
+  # `check` is read-only. better-sqlite3 counts only when it opens a
+  # database and node-pty only when it spawns a terminal.
+  DOCTOR_NATIVE="$(native_modules_status check)"
   for mod in better-sqlite3 node-pty; do
-    if "$NODE" -e "require('$mod')" >/dev/null 2>&1; then
-      echo "native $mod: loads"
-    else
-      echo "native $mod: FAILS to load — run: npm rebuild $mod (needs Xcode CLT)"
-    fi
+    DOCTOR_NATIVE_LINE="$(printf '%s\n' "$DOCTOR_NATIVE" | grep "^$mod|" | head -n 1)"
+    case "$DOCTOR_NATIVE_LINE" in
+      "$mod|ok") echo "native $mod: works";;
+      "") echo "native $mod: UNKNOWN — the check did not run";;
+      *) echo "native $mod: FAILS — ${DOCTOR_NATIVE_LINE#*|} — run: ./start.sh (it reinstalls native modules once)";;
+    esac
   done
   # Folder watching rides FSEvents (native fs.watch recursive): ~1 fd per
   # watched FOLDER, independent of file count. A low limit here no longer
@@ -1485,9 +1606,26 @@ if [ -n "$MISSING_DEPS" ]; then
 fi
 
 # An unresolved shutdown guard blocks every replacement start. Report it now,
-# with its next step, instead of after the build. The dependency install above
-# stays first: the recovery helper needs better-sqlite3.
+# with its next step, instead of after the build.
 startup_safety_allows_takeover || exit 1
+
+# Native modules. A server that cannot load better-sqlite3 or node-pty dies
+# at import, so check them in this exact Node first and reinstall both once.
+# Removing them first means npm writes new files instead of rewriting a
+# binary a running BotBoy has loaded. If they still fail, stop here: no child
+# starts, so no guard can be left behind (teammate on Node 26 + npm 12,
+# 2026-10-07).
+if ! NATIVE_STATUS="$(native_modules_status repair)"; then
+  echo "ℹ️  Reinstalling native modules for Node $("$NODE" --version 2>/dev/null) — npm install" | tee -a "$LOG_FILE"
+  printf '%s\n' "$NATIVE_STATUS" | grep -v '|ok$' | sed 's/|/: /; s/^/    /' | tee -a "$LOG_FILE"
+  (cd "$PROJ_DIR" && rm -rf node_modules/better-sqlite3 node_modules/node-pty \
+    && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) || true
+  if ! NATIVE_STATUS="$(native_modules_status repair)"; then
+    print_native_modules_failure "$NATIVE_STATUS" | tee -a "$LOG_FILE"
+    exit 1
+  fi
+  echo "✅ Native modules reinstalled" | tee -a "$LOG_FILE"
+fi
 
 NEED_BUILD=""
 if [ "${BOTBOY_FORCE_BUILD:-0}" = "1" ]; then
@@ -1528,7 +1666,8 @@ if [ "$FOREGROUND" = "1" ]; then
   # may own the port without satisfying the final-ready endpoint.
   safe_takeover || exit 1
 
-  "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
+  DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
+  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"
 
@@ -1538,13 +1677,14 @@ if [ "$FOREGROUND" = "1" ]; then
   trap 'foreground_shutdown HUP' HUP
 
   if ! wait_for_server "$SERVER_PID"; then
-    stop_startup_child "$SERVER_PID"
+    stop_startup_child "$SERVER_PID" "$DB_OPEN_MARKER"
     exit 1
   fi
   if ! open_dashboard_window fresh "$SERVER_PID"; then
-    stop_startup_child "$SERVER_PID"
+    stop_startup_child "$SERVER_PID" "$DB_OPEN_MARKER"
     exit 1
   fi
+  [ -z "$DB_OPEN_MARKER" ] || rm -f "$DB_OPEN_MARKER"
 
   # Startup is done — release the lock now. Foreground mode blocks for the
   # app's lifetime, and holding the lock that long would wrongly turn away
@@ -1580,18 +1720,20 @@ if ! server_is_ready; then
   # half-booted server can hold :7778. Clear every old instance before the
   # replacement starts, then verify this exact child through final readiness.
   safe_takeover || exit 1
-  nohup "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
+  DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
+  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" nohup "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"
   if ! wait_for_server "$SERVER_PID"; then
-    stop_startup_child "$SERVER_PID"
+    stop_startup_child "$SERVER_PID" "$DB_OPEN_MARKER"
     exit 1
   fi
 fi
 
 if ! open_dashboard_window fresh "$SERVER_PID"; then
-  [ -z "$SERVER_PID" ] || stop_startup_child "$SERVER_PID"
+  [ -z "$SERVER_PID" ] || stop_startup_child "$SERVER_PID" "${DB_OPEN_MARKER:-}"
   exit 1
 fi
+[ -z "${DB_OPEN_MARKER:-}" ] || rm -f "$DB_OPEN_MARKER"
 warn_if_no_llm_credentials
 install_app_bundle_if_missing
