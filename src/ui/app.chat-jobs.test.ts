@@ -37,6 +37,8 @@ beforeAll(() => {
     topLevel('closeChatLiveBubble'),
     topLevel('handleChatLiveMessage'),
     topLevel('chatJobEsc'),
+    'const chatJobDismissed = new Set();',
+    topLevel('chatJobShortGoal'),
     topLevel('renderChatJobStrip'),
     'return { renderChatJobStrip, handleChatLiveMessage, createChatStreamBubble, state };',
   ].join('\n');
@@ -90,6 +92,31 @@ describe('job strip', () => {
     ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', continuing: true, waitingRuns: [] } });
     expect(strip.querySelector('.chat-job-state')?.textContent).toBe('continuing now');
     expect(strip.classList.contains('continuing')).toBe(true);
+  });
+
+  it('nothing running reads Paused with the question, never "Working on"', () => {
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'Build the PV dashboard', phase: 'paused', pauseNote: 'Use the 2025 <i>cohort</i>?', waitingRuns: [] } });
+    const strip = document.getElementById('chat-job-strip') as HTMLElement;
+    expect(strip.querySelector('.chat-job-text strong')?.textContent).toBe('Paused:');
+    expect(strip.querySelector('.chat-job-note')?.textContent).toBe('Use the 2025 <i>cohort</i>?');
+    expect(strip.querySelector('i')).toBeNull();
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('paused, needs you');
+    expect(strip.classList.contains('paused')).toBe(true);
+    expect(strip.querySelector('[data-chat-job-stop]')?.textContent).toBe('End job');
+
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'continuing', waitingRuns: [] } });
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('continuing shortly');
+    expect(strip.classList.contains('paused')).toBe(false);
+  });
+
+  it('a job that just ended shows Done until dismissed', () => {
+    ui.renderChatJobStrip({ job: null, recent: { id: JOB_ID, goal: 'Build it', status: 'done', endReason: 'dashboard verified' } });
+    const strip = document.getElementById('chat-job-strip') as HTMLElement;
+    expect(strip.hidden).toBe(false);
+    expect(strip.querySelector('.chat-job-text')?.textContent).toBe('Done: Build it');
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('completed');
+    expect(strip.querySelector('[data-chat-job-stop]')).toBeNull();
+    expect(strip.querySelector('[data-chat-job-dismiss]')?.getAttribute('data-chat-job-dismiss')).toBe(JOB_ID);
   });
 });
 

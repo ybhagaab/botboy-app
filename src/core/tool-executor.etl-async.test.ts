@@ -179,6 +179,25 @@ describe('async ETL tools', () => {
     expect(await run(exec, 'job_update', { action: 'done' }, owner)).toMatchObject({ ok: false, code: 'no_active_job' });
   });
 
+  it('job_update continue / needs_owner declare the turn end; continue from an owner turn starts the job', async () => {
+    const exec = executor();
+    const started = await run(exec, 'job_update', { action: 'continue', nextStep: 'Pull Local weekly' }, owner);
+    expect(started).toMatchObject({ ok: true, job: { status: 'active', next: 'continue' } });
+    const job = jobs.activeJob()!;
+    expect(job).toMatchObject({ goal: 'Weekly PV players for Local', declaration: 'continue', continueReason: 'Pull Local weekly' });
+    expect(await run(exec, 'job_update', { action: 'needs_owner' }, owner)).toMatchObject({ ok: false, code: 'question_required' });
+    // 'blocked' (first build) is needs_owner: it pauses, it no longer ends the job.
+    const blocked = await run(exec, 'job_update', { action: 'blocked', question: 'Which cohort?' }, { callerKind: 'continuation', jobMandate: { jobId: job.id, goal: 'g' } });
+    expect(blocked).toMatchObject({ ok: true, job: { next: 'needs_owner' } });
+    expect(jobs.get(job.id)).toMatchObject({ status: 'active', declaration: 'needs_owner', pauseNote: 'Which cohort?' });
+    expect(await run(exec, 'job_update', { action: 'pause' }, owner)).toContain('action must be one of');
+  });
+  it('job_update continue never starts a job outside a live owner turn', async () => {
+    const exec = executor();
+    expect(await run(exec, 'job_update', { action: 'continue' }, { callerKind: 'continuation', jobMandate: { jobId: 'cj_x', goal: 'x' } }))
+      .toMatchObject({ ok: false, code: 'no_active_job' });
+    expect(jobs.activeJob()).toBeNull();
+  });
   it('ETL and shell tools run on their own bounded waits, not the executor caps', () => {
     for (const name of ['mcp_etl_run_query', 'wait_for_etl_run', 'mcp_etl_download_results']) expect(toolRunsWithoutExecutorCap(name)).toBe(true);
     expect(toolRunsWithoutExecutorCap('mcp_etl_job_run')).toBe(false);

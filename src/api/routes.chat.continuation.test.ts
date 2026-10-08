@@ -34,7 +34,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-const TOOL_DEFS = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'mcp_etl_job_run', 'create_data_room_dataset']
+const TOOL_DEFS = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'mcp_etl_job_run', 'create_data_room_dataset', 'job_update']
   .map(name => ({ type: 'function', function: { name, description: name, parameters: {} } }));
 
 describe('continuation turns in the chat route', () => {
@@ -150,7 +150,7 @@ describe('continuation turns in the chat route', () => {
       currentUserMessage: 'Build the PV dashboard',
       ownerRequestId: `cont:${job.id.replace(/_/g, '')}:4`,
     });
-    expect(llm.requests[0].tools.map((tool: any) => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query', 'mcp_etl_job_run', 'create_data_room_dataset']);
+    expect(llm.requests[0].tools.map((tool: any) => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query', 'mcp_etl_job_run', 'create_data_room_dataset', 'job_update']);
     expect(appendUser).toHaveBeenCalledWith('sess-test', expect.stringContaining('[Automatic continuation'));
     expect(promptContexts[0].conversationMode).toBe('general');
     expect(promptContexts[0].jobBlock).toContain('AUTOMATIC CONTINUATION');
@@ -294,5 +294,142 @@ describe('continuation turns in the chat route', () => {
     const posted = await request(app).post('/api/chat/agent-message').set(CONTINUATION_HEADER, bridge.secret).send({ message: '🔎 diagnostics' });
     expect(posted.status).toBe(200);
     expect(chatRows()).toEqual([{ role: 'assistant', content: '🔎 diagnostics' }]);
+  });
+
+  describe('end-of-turn settle (a job never sits "working" with nothing running)', () => {
+    function bindRunner() {
+      const runner = { request: vi.fn(), start: vi.fn(), stop: vi.fn(), tick: vi.fn(), running: () => null, forget: vi.fn() };
+      bridge.bindRunner(runner as any);
+      return runner;
+    }
+    /** A tool executor whose job_update records the declaration like the real handler. */
+    function declaringExecutor() {
+      return {
+        executeTool: vi.fn(async (call: any) => {
+          if (call.function.name === 'job_update') {
+            const args = JSON.parse(call.function.arguments);
+            const job = jobs.activeJob()!;
+            jobs.declare(job.id, args.action, args.nextStep ?? args.question);
+          }
+          return { toolCallId: call.id, content: '{"ok":true}' };
+        }),
+      };
+    }
+
+    it('a turn that declares continue starts the next turn on its own', async () => {
+      const runner = bindRunner();
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      const llm = model([
+        { tools: [{ name: 'job_update', arguments: '{"action":"continue","nextStep":"Build the widgets"}' }] },
+        { text: 'Data is in; building the widgets next.' },
+      ]);
+      const app = makeApp(llm, declaringExecutor());
+      const res = await request(app).post('/api/chat/messages').send({ message: 'build it', stream: true });
+      expect(res.status).toBe(200);
+      const after = jobs.get(job.id)!;
+      expect(after.continueRequestedAt).toBeTruthy();
+      expect(after.continueReason).toBe('Build the widgets');
+      expect(after.pausedAt).toBeUndefined();
+      expect(runner.request).toHaveBeenCalledWith(job.id);
+      const strip = await request(app).get('/api/chat/jobs/active');
+      expect(strip.body.job.phase).toBe('continuing');
+    });
+
+    it('needs_owner pauses with the question; the strip says Paused, not working', async () => {
+      const runner = bindRunner();
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      const llm = model([
+        { tools: [{ name: 'job_update', arguments: '{"action":"needs_owner","question":"Use the 2025 cohort or all years?"}' }] },
+        { text: 'Which cohort should I use?' },
+      ]);
+      const app = makeApp(llm, declaringExecutor());
+      await request(app).post('/api/chat/messages').send({ message: 'build it', stream: true });
+      const after = jobs.get(job.id)!;
+      expect(after.pausedAt).toBeTruthy();
+      expect(after.pauseNote).toBe('Use the 2025 cohort or all years?');
+      expect(runner.request).not.toHaveBeenCalled();
+      const strip = await request(app).get('/api/chat/jobs/active');
+      expect(strip.body.job).toMatchObject({ phase: 'paused', pauseNote: 'Use the 2025 cohort or all years?' });
+    });
+
+    it('an undeclared end continues once with a nudge, then a second undeclared end pauses', async () => {
+      const runner = bindRunner();
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      const ownerTurn = model([{ tools: [{ name: 'query_db', arguments: '{"sql":"select 1"}' }] }, { text: 'Loaded the data. Next I will build the widgets.' }]);
+      await request(makeApp(ownerTurn, declaringExecutor())).post('/api/chat/messages').send({ message: 'build it', stream: true });
+      let after = jobs.get(job.id)!;
+      expect(after.continueRequestedAt).toBeTruthy();
+      expect(after.continueReason).toContain('ended without saying');
+      expect(after.undeclaredEnds).toBe(1);
+      expect(runner.request).toHaveBeenCalledTimes(1);
+
+      jobs.clearContinueRequest(job.id);
+      const continuationTurn = model([{ text: 'Still thinking about the widgets.' }]);
+      await request(makeApp(continuationTurn, declaringExecutor())).post('/api/chat/messages')
+        .set(CONTINUATION_HEADER, bridge.secret).send(continuationBody(job.id));
+      after = jobs.get(job.id)!;
+      expect(after.continueRequestedAt).toBeUndefined();
+      expect(after.pausedAt).toBeTruthy();
+      expect(after.pauseNote).toContain('Still thinking about the widgets.');
+      expect(runner.request).toHaveBeenCalledTimes(1);
+    });
+
+    it('an undeclared end with watched runs pending just waits', async () => {
+      const runner = bindRunner();
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      jobs.addWatch({ runId: '77', jobId: job.id, source: 'run_query' });
+      const llm = model([{ tools: [{ name: 'query_db', arguments: '{}' }] }, { text: 'Run 77 is going; I continue when it finishes.' }]);
+      const app = makeApp(llm, declaringExecutor());
+      await request(app).post('/api/chat/messages').send({ message: 'build it', stream: true });
+      const after = jobs.get(job.id)!;
+      expect(after.continueRequestedAt).toBeUndefined();
+      expect(after.pausedAt).toBeUndefined();
+      expect(runner.request).not.toHaveBeenCalled();
+      expect((await request(app).get('/api/chat/jobs/active')).body.job.phase).toBe('waiting');
+    });
+
+    it('a failed owner turn that had done work becomes a job and continues once', async () => {
+      const runner = bindRunner();
+      let call = 0;
+      const llm = {
+        getActiveEndpoint: () => 'ecs',
+        chatCompletionStream: vi.fn(() => (async function* () {
+          call++;
+          if (call === 1) return streamResult({ toolCalls: [{ id: 'c1', type: 'function', function: { name: 'query_db', arguments: '{}' } }], finishReason: 'tool_calls' });
+          throw Object.assign(new Error('provider 500'), { status: 400 });
+          yield { type: 'content', text: '' };
+        })()),
+      };
+      await request(makeApp(llm, declaringExecutor())).post('/api/chat/messages').send({ message: 'summarize the PV weekly data', stream: true });
+      const job = jobs.activeJob();
+      expect(job?.goal).toBe('summarize the PV weekly data');
+      expect(job?.continueRequestedAt).toBeTruthy();
+      expect(job?.continueReason).toContain('failed');
+      expect(runner.request).toHaveBeenCalledWith(job!.id);
+    });
+
+    it('a plain owner question with no job and no tools creates nothing', async () => {
+      bindRunner();
+      await request(makeApp(model([{ text: 'Hi.' }]), declaringExecutor())).post('/api/chat/messages').send({ message: 'hello', stream: true });
+      expect(jobs.activeJob()).toBeNull();
+    });
+
+    it('an owner reply to a paused job that only chats keeps it paused', async () => {
+      const runner = bindRunner();
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      jobs.settle(job.id, { action: 'pause', note: 'Which cohort?' }, 'answered');
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await request(makeApp(model([{ text: 'Sure, tell me when.' }]), declaringExecutor())).post('/api/chat/messages').send({ message: 'what was the question?', stream: true });
+      expect(jobs.get(job.id)?.pauseNote).toBe('Which cohort?');
+      expect(runner.request).not.toHaveBeenCalled();
+    });
+
+    it('the strip shows a job that just finished as done', async () => {
+      const job = jobs.start({ goal: 'Build the PV dashboard' });
+      jobs.end(job.id, 'done', 'dashboard verified');
+      const res = await request(makeApp(model([{ text: 'x' }]), { executeTool: vi.fn() })).get('/api/chat/jobs/active');
+      expect(res.body.job).toBeNull();
+      expect(res.body.recent).toMatchObject({ id: job.id, status: 'done', endReason: 'dashboard verified' });
+    });
   });
 });

@@ -879,33 +879,60 @@ function chatJobEsc(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
+// Locally dismissed "Done" lines (job ids); a new job shows again.
+const chatJobDismissed = new Set();
+
+function chatJobShortGoal(job) {
+  const goal = String(job.goal || '').replace(/\s+/g, ' ').trim();
+  return { goal, shortGoal: goal.length > 120 ? `${goal.slice(0, 117)}…` : goal };
+}
+
 function renderChatJobStrip(payload) {
   const strip = document.getElementById('chat-job-strip');
   if (!strip) return;
   const job = payload && payload.job;
+  const recent = payload && payload.recent;
+  strip.classList.remove('continuing', 'paused', 'ended');
   if (!job || job.status !== 'active' || !/^cj_[a-f0-9]{24}$/.test(String(job.id || ''))) {
+    // A job that just ended says how it ended until dismissed.
+    if (recent && /^cj_[a-f0-9]{24}$/.test(String(recent.id || '')) && !chatJobDismissed.has(recent.id)) {
+      const { goal, shortGoal } = chatJobShortGoal(recent);
+      const label = recent.status === 'done' ? 'Done' : recent.status === 'stopped' ? 'Stopped' : recent.status === 'expired' ? 'Ended (idle)' : 'Ended';
+      const detail = [goal, recent.endReason || ''].filter(Boolean).join('\n');
+      strip.hidden = false;
+      strip.classList.add('ended');
+      strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${chatJobEsc(label)}:</strong> ${chatJobEsc(shortGoal)}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(recent.status === 'done' ? 'completed' : 'not running')}</span><button type="button" class="button small" data-chat-job-dismiss="${chatJobEsc(recent.id)}" aria-label="Dismiss" title="Hide this line">×</button>`;
+      return;
+    }
     strip.hidden = true;
     strip.innerHTML = '';
-    strip.classList.remove('continuing');
     return;
   }
   const waiting = Array.isArray(job.waitingRuns) ? job.waitingRuns : [];
-  const goal = String(job.goal || '').replace(/\s+/g, ' ').trim();
-  const shortGoal = goal.length > 120 ? `${goal.slice(0, 117)}…` : goal;
+  const { goal, shortGoal } = chatJobShortGoal(job);
+  // Older servers send no phase: derive it the old way.
+  const phase = job.phase || (job.continuing ? 'working' : waiting.length ? 'waiting' : 'working');
+  const paused = phase === 'paused';
   // The state stays visible at any panel width; the goal truncates.
   const progress = job.continuing
     ? 'continuing now'
-    : waiting.length
-      ? `waiting for ${waiting.length} ETL run${waiting.length === 1 ? '' : 's'}`
-      : 'working';
+    : phase === 'continuing'
+      ? 'continuing shortly'
+      : phase === 'waiting'
+        ? `waiting for ${waiting.length} ETL run${waiting.length === 1 ? '' : 's'}`
+        : paused ? 'paused, needs you' : 'working';
   const detail = [
     goal,
+    ...(paused && job.pauseNote ? [job.pauseNote] : []),
     ...waiting.map(run => `Run ${run.runId}${run.purpose ? ` (${run.purpose})` : ''}: ${run.remoteStatus || 'submitted'}`),
     ...(waiting.length && !job.continuing ? [`BotBoy continues on its own when ${waiting.length === 1 ? 'it finishes' : 'they finish'}.`] : []),
   ].join('\n');
   strip.hidden = false;
   strip.classList.toggle('continuing', Boolean(job.continuing));
-  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>Working on:</strong> ${chatJobEsc(shortGoal)}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(progress)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">Stop</button>`;
+  strip.classList.toggle('paused', paused);
+  const lead = paused ? 'Paused' : 'Working on';
+  const question = paused && job.pauseNote ? `<span class="chat-job-note">${chatJobEsc(job.pauseNote)}</span>` : '';
+  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${lead}:</strong> ${chatJobEsc(shortGoal)}${question}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(progress)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">${paused ? 'End job' : 'Stop'}</button>`;
 }
 
 async function refreshChatJobStrip() {
@@ -919,6 +946,14 @@ async function refreshChatJobStrip() {
     closeChatLiveBubble();
   }
 }
+
+document.addEventListener('click', (event) => {
+  const dismiss = event.target && event.target.closest ? event.target.closest('[data-chat-job-dismiss]') : null;
+  if (!dismiss) return;
+  chatJobDismissed.add(dismiss.getAttribute('data-chat-job-dismiss') || '');
+  const strip = document.getElementById('chat-job-strip');
+  if (strip) { strip.hidden = true; strip.innerHTML = ''; }
+});
 
 document.addEventListener('click', async (event) => {
   const button = event.target && event.target.closest ? event.target.closest('[data-chat-job-stop]') : null;

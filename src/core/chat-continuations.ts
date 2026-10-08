@@ -1,7 +1,10 @@
 /**
  * Continuation turns: when a watched ETL run finishes after the chat turn
  * that started it has ended, BotBoy continues the job in the same chat on its
- * own (ANALYTICS_AUTONOMY_PLAN.md, owner decision D2, 2026-10-08).
+ * own (ANALYTICS_AUTONOMY_PLAN.md, owner decision D2, 2026-10-08). The same
+ * runner starts a turn when the job's previous turn asked to continue, hit the
+ * tool ceiling, failed once, or ended without saying (chat-jobs.ts ›
+ * decideTurnSettlement, owner directive 2026-10-08).
  *
  * The runner starts an ordinary streamed chat turn through an internal call
  * to POST /api/chat/messages. The call carries an in-memory secret, so only
@@ -183,6 +186,21 @@ export function buildContinuationTrigger(
   return { message, note: `↻ Continued automatically: ${parts.join('; ')}.` };
 }
 
+/** The trigger for a continuation the job itself asked for (no finished run). */
+export function buildSelfContinuationTrigger(job: ChatJob, reason: string, pendingRuns: EtlRunWatch[]): { message: string; note: string } {
+  const undeclared = /ended without saying/.test(reason);
+  const message = [
+    '[Automatic continuation — not a message from the owner]',
+    `Why this turn started: ${reason}`,
+    ...(job.workingSet.nextStep ? [`Next step you recorded: ${job.workingSet.nextStep}`] : []),
+    ...(pendingRuns.length ? [`Still running (BotBoy continues again when they finish): ${pendingRuns.map(watch => watch.runId).join(', ')}.`] : []),
+    undeclared
+      ? 'Your previous turn ended without job_update. If work remains that you can do yourself, do it now. End this turn with job_update: continue (more to do), needs_owner (a question only the owner can answer), or done (verified). Without one, the job pauses.'
+      : 'Continue the job from where it stands: take the next steps and verify the deliverable. Do not repeat work already done (see the ACTIVE JOB block and the conversation). End the turn with job_update continue, needs_owner, or done.',
+  ].join('\n');
+  return { message, note: '↻ Continued automatically: the job\'s next step.' };
+}
+
 // ── Runner ──
 
 export interface ContinuationRunnerOptions {
@@ -225,7 +243,15 @@ export function createContinuationRunner(options: ContinuationRunnerOptions): Co
 
   async function runOne(job: ChatJob, finished: EtlRunWatch[]): Promise<void> {
     const ordinal = job.continuationCount + 1;
-    const { message, note } = buildContinuationTrigger(job, finished, options.jobs.watchesForJob(job.id), options.filesDir);
+    const allWatches = options.jobs.watchesForJob(job.id);
+    const selfDue = Boolean(job.continueRequestedAt);
+    const built = finished.length
+      ? buildContinuationTrigger(job, finished, allWatches, options.filesDir)
+      : buildSelfContinuationTrigger(job, job.continueReason || 'The job continues.', allWatches.filter(watch => watch.status === 'pending'));
+    const message = finished.length && selfDue && job.continueReason
+      ? `${built.message}\nAlso: ${job.continueReason}`
+      : built.message;
+    const note = built.note;
     const controller = new AbortController();
     const turnKey = `cont-${++turnCounter}-${Date.now()}`;
     let response: Response;
@@ -261,12 +287,14 @@ export function createContinuationRunner(options: ContinuationRunnerOptions): Co
       }
       if (code === 'job_not_active') return; // stopped or finished meanwhile
       for (const watch of finished) options.jobs.consumeWatch(watch.runId);
+      if (selfDue) options.jobs.clearContinueRequest(job.id);
       options.postNote(`${note}\n\nBotBoy could not continue on its own (${detail}). Reply in chat to continue the job.`);
       log(`[Continuation] job ${job.id} could not start: ${detail}`);
       return;
     }
     // The turn is admitted: these results are now its to use.
     for (const watch of finished) options.jobs.consumeWatch(watch.runId);
+    if (selfDue) options.jobs.clearContinueRequest(job.id);
     options.jobs.incrementContinuations(job.id);
     current = { jobId: job.id, turnKey, startedAt: new Date().toISOString(), controller };
     options.hub.begin({ turnKey, jobId: job.id, goal: job.goal, note, startedAt: current.startedAt });
@@ -295,17 +323,25 @@ export function createContinuationRunner(options: ContinuationRunnerOptions): Co
   }
 
   async function tick(): Promise<void> {
-    if (busy || stopped || !requested.size) return;
+    if (busy || stopped) return;
+    if (!requested.size) {
+      // A due continuation survives restarts: it lives on the job row.
+      const active = options.jobs.activeJob();
+      if (active?.continueRequestedAt) requested.add(active.id);
+      else return;
+    }
     if (options.isTurnActive()) return; // the owner goes first; retry next tick
     const jobId = requested.values().next().value as string;
     requested.delete(jobId);
     const job = options.jobs.get(jobId);
     if (!job || job.status !== 'active') return;
     const finished = options.jobs.unconsumedFinished(jobId);
-    if (!finished.length) return; // an owner turn already used the results
+    // Nothing to do: an owner turn already used the results, or no step is due.
+    if (!finished.length && !job.continueRequestedAt) return;
     if (job.continuationCount >= CHAT_JOB_MAX_CONTINUATIONS) {
-      options.jobs.end(jobId, 'stopped', `paused after ${CHAT_JOB_MAX_CONTINUATIONS} automatic continuations`);
-      options.postNote(`↻ I paused the job "${job.goal.slice(0, 160)}" after ${CHAT_JOB_MAX_CONTINUATIONS} automatic continuations. Its latest run results are ready; reply in chat to continue.`);
+      if (job.pausedAt) return; // already paused and said so; the owner's reply resets the count
+      options.jobs.settle(jobId, { action: 'pause', note: `Paused after ${CHAT_JOB_MAX_CONTINUATIONS} automatic continuations in a row. Reply to continue.` }, 'answered');
+      options.postNote(`↻ I paused the job "${job.goal.slice(0, 160)}" after ${CHAT_JOB_MAX_CONTINUATIONS} automatic continuations. Reply in chat to continue.`);
       return;
     }
     busy = true;

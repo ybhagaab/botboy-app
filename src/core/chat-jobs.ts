@@ -22,7 +22,7 @@ export type EtlWatchStatus = 'pending' | 'finished' | 'abandoned';
 
 /** A job with no owner or continuation turn for this long expires. */
 export const CHAT_JOB_IDLE_MS = 24 * 60 * 60_000;
-/** Automatic continuations per job before BotBoy pauses and asks. */
+/** Automatic continuations in a row (since the owner's last message) before BotBoy pauses and asks. */
 export const CHAT_JOB_MAX_CONTINUATIONS = 25;
 
 const MAX_GOAL_CHARS = 4_000;
@@ -38,6 +38,9 @@ export interface ChatJobWorkingSet {
   dashboards: Array<{ dashboardId: string; title?: string; at: string }>;
 }
 
+/** What a turn said should happen next (job_update continue | needs_owner). */
+export type ChatJobDeclaration = 'continue' | 'needs_owner';
+
 export interface ChatJob {
   id: string;
   goal: string;
@@ -50,6 +53,85 @@ export interface ChatJob {
   lastActivityAt: string;
   endedAt?: string;
   endReason?: string;
+  /** The latest turn's own declaration and when it was made. */
+  declaration?: ChatJobDeclaration;
+  declaredAt?: string;
+  /** Paused: nothing runs until the owner replies (or a watched run finishes). */
+  pausedAt?: string;
+  pauseNote?: string;
+  /** A continuation turn is due (the job's own next step, not an ETL run). */
+  continueRequestedAt?: string;
+  continueReason?: string;
+  /** Consecutive turn ends with no declaration / consecutive failed turns. */
+  undeclaredEnds: number;
+  failedTurns: number;
+}
+
+/** How a chat turn ended, for the job's end-of-turn settle. */
+export type ChatTurnEnd =
+  | 'answered'        // the model replied without tool calls
+  | 'ceiling'         // the runaway tool-iteration ceiling tripped
+  | 'repeat_breaker'  // tools were withheld because the model repeated a call
+  | 'failed'          // provider or stream error
+  | 'owner_stopped'   // the owner pressed Stop on the turn
+  | 'preempted'       // a continuation gave way to an owner message
+  | 'job_stopped'     // the owner ended the job
+  | 'provider_changed'
+  | 'shutdown'
+  | 'disconnected';
+
+export type ChatTurnSettlement =
+  | { action: 'none' }
+  | { action: 'continue'; reason: string; undeclared?: true }
+  | { action: 'pause'; note: string }
+  | { action: 'wait' };
+
+/**
+ * The end-of-turn decision (owner directive 2026-10-08): a job never sits
+ * "working" with nothing running. It ends done (job_update done), waits on
+ * watched runs, continues on its own, or pauses for the owner.
+ */
+export function decideTurnSettlement(input: {
+  end: ChatTurnEnd;
+  /** This turn's own declaration (made after the turn started). */
+  declaration?: ChatJobDeclaration;
+  declarationNote?: string;
+  pendingRuns: number;
+  undeclaredEnds: number;
+  failedTurns: number;
+  /** The reply's last words, used as the pause note when nothing was declared. */
+  replyExcerpt?: string;
+}): ChatTurnSettlement {
+  switch (input.end) {
+    case 'preempted':
+    case 'job_stopped':
+      return { action: 'none' };
+    case 'owner_stopped':
+      return { action: 'pause', note: 'You stopped the turn. Reply to continue.' };
+    case 'provider_changed':
+      return { action: 'pause', note: 'The AI model changed in Settings. Reply to continue.' };
+    case 'disconnected':
+      return input.pendingRuns ? { action: 'wait' } : { action: 'pause', note: 'The chat closed mid-turn. Reply to continue.' };
+    case 'shutdown':
+      return { action: 'continue', reason: 'BotBoy restarted in the middle of the previous turn.' };
+    case 'ceiling':
+      return { action: 'continue', reason: 'The previous turn reached the per-turn tool limit before the job was finished.' };
+    case 'repeat_breaker':
+      return { action: 'pause', note: 'I was repeating the same step, so I stopped. Reply with how to proceed.' };
+    case 'failed':
+      return input.failedTurns < 1
+        ? { action: 'continue', reason: 'The previous turn failed before it could finish.' }
+        : { action: 'pause', note: 'Two turns in a row failed. Reply to try again.' };
+    case 'answered':
+    default:
+      if (input.declaration === 'needs_owner') return { action: 'pause', note: input.declarationNote || 'BotBoy needs your input.' };
+      if (input.declaration === 'continue') return { action: 'continue', reason: input.declarationNote || 'The previous turn said the job continues.' };
+      if (input.pendingRuns) return { action: 'wait' };
+      if (input.undeclaredEnds < 1) {
+        return { action: 'continue', reason: 'The previous turn ended without saying whether the job is done, needs the owner, or continues.', undeclared: true };
+      }
+      return { action: 'pause', note: input.replyExcerpt || 'BotBoy stopped without finishing. Reply to continue.' };
+  }
 }
 
 /** What a finished run produced, as the continuation turn reports it. */
@@ -82,6 +164,8 @@ export interface EtlRunWatch {
 
 export interface ChatJobStore {
   activeJob(): ChatJob | null;
+  /** The most recently ended job (for the strip's Done / Ended line). */
+  lastEnded(): ChatJob | null;
   get(jobId: string): ChatJob | null;
   /** Starts a job; an active one ends as done (replaced). */
   start(input: { goal: string; modelKey?: string; thinking?: ChatJobThinking }): ChatJob;
@@ -92,6 +176,14 @@ export interface ChatJobStore {
   update(jobId: string, input: { goal?: string; nextStep?: string; notes?: string[] }): ChatJob | null;
   end(jobId: string, status: Exclude<ChatJobStatus, 'active'>, reason: string): ChatJob | null;
   incrementContinuations(jobId: string): number;
+  /** A turn's job_update continue / needs_owner. */
+  declare(jobId: string, declaration: ChatJobDeclaration, note?: string): ChatJob | null;
+  /** Applies a turn's settlement: continue request, pause, or nothing; updates the streak counters. */
+  settle(jobId: string, settlement: ChatTurnSettlement, end: ChatTurnEnd): ChatJob | null;
+  /** The owner replied: clears a pause, a due continuation, and the streaks. */
+  ownerResumed(jobId: string): void;
+  /** A continuation turn was admitted for this request. */
+  clearContinueRequest(jobId: string): void;
   /** Expires idle jobs; returns their ids. */
   expireIdle(nowMs?: number): string[];
   recordFile(jobId: string, filePath: string, label?: string): void;
@@ -180,6 +272,15 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
   // Stores created by the first build of this table (2026-10-08) lack the column.
   const watchColumns = (db.prepare('PRAGMA table_info(etl_run_watches)').all() as Array<{ name: string }>).map(column => column.name);
   if (!watchColumns.includes('prioritized_at')) db.exec('ALTER TABLE etl_run_watches ADD COLUMN prioritized_at TEXT');
+  // Turn settlement columns (2026-10-08, second build) join existing tables.
+  const jobColumns = new Set((db.prepare('PRAGMA table_info(chat_jobs)').all() as Array<{ name: string }>).map(column => column.name));
+  for (const [name, type] of [
+    ['declaration', 'TEXT'], ['declared_at', 'TEXT'], ['paused_at', 'TEXT'], ['pause_note', 'TEXT'],
+    ['continue_requested_at', 'TEXT'], ['continue_reason', 'TEXT'],
+    ['undeclared_ends', 'INTEGER NOT NULL DEFAULT 0'], ['failed_turns', 'INTEGER NOT NULL DEFAULT 0'],
+  ] as const) {
+    if (!jobColumns.has(name)) db.exec(`ALTER TABLE chat_jobs ADD COLUMN ${name} ${type}`);
+  }
 
   let changeVersion = 0;
   const changed = () => { changeVersion += 1; };
@@ -204,6 +305,14 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
       lastActivityAt: row.last_activity_at,
       ...(row.ended_at ? { endedAt: row.ended_at } : {}),
       ...(row.end_reason ? { endReason: row.end_reason } : {}),
+      ...(row.declaration === 'continue' || row.declaration === 'needs_owner' ? { declaration: row.declaration } : {}),
+      ...(row.declared_at ? { declaredAt: row.declared_at } : {}),
+      ...(row.paused_at ? { pausedAt: row.paused_at } : {}),
+      ...(row.pause_note ? { pauseNote: row.pause_note } : {}),
+      ...(row.continue_requested_at ? { continueRequestedAt: row.continue_requested_at } : {}),
+      ...(row.continue_reason ? { continueReason: row.continue_reason } : {}),
+      undeclaredEnds: Number(row.undeclared_ends) || 0,
+      failedTurns: Number(row.failed_turns) || 0,
     };
   }
 
@@ -271,6 +380,7 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
 
   return {
     activeJob: () => rowToJob(selectActive.get()),
+    lastEnded: () => rowToJob(db.prepare("SELECT * FROM chat_jobs WHERE status != 'active' AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1").get()),
     get: (jobId) => rowToJob(selectJob.get(jobId)),
     start,
     ensureActive(input) {
@@ -309,6 +419,50 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
         .run(nowIso(), jobId);
       changed();
       return Number((selectJob.get(jobId) as any)?.continuation_count) || 0;
+    },
+    declare(jobId, declaration, note) {
+      const result = db.prepare(`UPDATE chat_jobs SET declaration = ?, declared_at = ?, last_activity_at = ?
+        WHERE id = ? AND status = 'active'`).run(declaration, nowIso(), nowIso(), jobId);
+      if (note !== undefined && result.changes) {
+        db.prepare('UPDATE chat_jobs SET pause_note = CASE WHEN ? = \'needs_owner\' THEN ? ELSE pause_note END, continue_reason = CASE WHEN ? = \'continue\' THEN ? ELSE continue_reason END WHERE id = ?')
+          .run(declaration, clip(note, 600) || null, declaration, clip(note, 600) || null, jobId);
+      }
+      if (result.changes) changed();
+      return rowToJob(selectJob.get(jobId));
+    },
+    settle(jobId, settlement, end) {
+      const at = nowIso();
+      const undeclaredDelta = settlement.action === 'continue' && settlement.undeclared ? 1 : 0;
+      db.transaction(() => {
+        const failed = end === 'failed' ? 'failed_turns + 1' : end === 'answered' ? '0' : 'failed_turns';
+        const undeclared = undeclaredDelta ? 'undeclared_ends + 1' : end === 'answered' ? '0' : 'undeclared_ends';
+        db.prepare(`UPDATE chat_jobs SET failed_turns = ${failed}, undeclared_ends = ${undeclared},
+            declaration = NULL, declared_at = NULL, last_activity_at = ? WHERE id = ? AND status = 'active'`).run(at, jobId);
+        if (settlement.action === 'continue') {
+          db.prepare(`UPDATE chat_jobs SET continue_requested_at = ?, continue_reason = ?, paused_at = NULL, pause_note = NULL
+            WHERE id = ? AND status = 'active'`).run(at, clip(settlement.reason, 600), jobId);
+        } else if (settlement.action === 'pause') {
+          db.prepare(`UPDATE chat_jobs SET paused_at = ?, pause_note = ?, continue_requested_at = NULL, continue_reason = NULL
+            WHERE id = ? AND status = 'active'`).run(at, clip(settlement.note, 600), jobId);
+        } else if (settlement.action === 'wait') {
+          db.prepare(`UPDATE chat_jobs SET paused_at = NULL, pause_note = NULL, continue_requested_at = NULL, continue_reason = NULL
+            WHERE id = ? AND status = 'active'`).run(jobId);
+        }
+      })();
+      changed();
+      return rowToJob(selectJob.get(jobId));
+    },
+    ownerResumed(jobId) {
+      const result = db.prepare(`UPDATE chat_jobs SET paused_at = NULL, pause_note = NULL, continue_requested_at = NULL,
+          continue_reason = NULL, declaration = NULL, declared_at = NULL, undeclared_ends = 0, failed_turns = 0,
+          continuation_count = 0
+        WHERE id = ? AND status = 'active'`).run(jobId);
+      if (result.changes) changed();
+    },
+    clearContinueRequest(jobId) {
+      const result = db.prepare(`UPDATE chat_jobs SET continue_requested_at = NULL, paused_at = NULL, pause_note = NULL
+        WHERE id = ?`).run(jobId);
+      if (result.changes) changed();
     },
     expireIdle(nowMs = Date.now()) {
       const cutoff = nowIso(nowMs - CHAT_JOB_IDLE_MS);
@@ -437,10 +591,10 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
   const lines: string[] = [
     '## ACTIVE JOB',
     `The owner asked for this, and BotBoy is working on it: "${clip(job.goal, 1_200)}"`,
-    `Started ${job.createdAt}; ${job.continuationCount} automatic continuation(s) so far.`,
+    `Started ${job.createdAt}; ${job.continuationCount} automatic continuation(s) since the owner's last message.`,
     options.continuation
-      ? 'This turn is an AUTOMATIC CONTINUATION: no owner message started it. The owner\'s request above is your authority, so set ownerRequested=true for the job\'s steps. Take them (data reads, SQL, scratch ETL queries and their fixes, Data Room imports, BotBoy dashboards, files, checks). Tools that send, post, publish, sync, schedule, or change production return outside_job_mandate here: finish what you can and say what needs the owner\'s go-ahead.'
-      : 'The owner\'s request above authorizes every analytics step of this job, in this turn and later ones: a short "check", "continue", or "go ahead" means resume the job, not ask again. Set ownerRequested=true for job steps. If the owner\'s new message asks for something different, it is a new job: call job_update with action "start".',
+      ? 'This turn is an AUTOMATIC CONTINUATION: no owner message started it. The owner\'s request above is your authority, so set ownerRequested=true for the job\'s steps. Take them (data reads, SQL, scratch ETL queries and their fixes, Data Room imports, BotBoy dashboards, files, checks). Tools that send, post, publish, sync, schedule, or change production return outside_job_mandate here: finish what you can, then call job_update needs_owner with what needs the owner\'s go-ahead.'
+      : 'The owner\'s request above authorizes every step of this job, in this turn and later ones: a short "check", "continue", or "go ahead" means resume the job, not ask again. Set ownerRequested=true for job steps. If the owner\'s new message asks for something different, it is a new job: call job_update with action "start".',
   ];
   const set = job.workingSet;
   if (set.nextStep) lines.push(`Next step (your note): ${set.nextStep}`);
@@ -458,7 +612,8 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
   if (set.dashboards.length) {
     lines.push('Dashboards:', ...set.dashboards.slice(-8).map(dashboard => `- ${dashboard.dashboardId}${dashboard.title ? ` — ${dashboard.title}` : ''}`));
   }
-  lines.push('Keep the working set current with job_update (next step, decisions). When the deliverable is verified, call job_update with action "done"; when only the owner can unblock it, action "blocked".');
+  if (job.pausedAt && job.pauseNote) lines.push(`Paused for the owner: ${clip(job.pauseNote, 400)}`);
+  lines.push('Keep the working set current with job_update (next step, decisions). END EVERY TURN of this job with exactly one job_update: "done" when the deliverable is verified; "needs_owner" with the question when only the owner can decide or approve the next step; "continue" with the next step when there is more work you can do yourself (BotBoy starts the next turn at once). Waiting on watched ETL runs needs no call. A turn that ends without one is continued once and then paused.');
   return lines.join('\n').slice(0, 4_500);
 }
 

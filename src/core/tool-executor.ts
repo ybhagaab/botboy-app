@@ -2680,9 +2680,11 @@ export function createToolExecutor(
     },
     job_update: (args, context) => {
       if (!chatJobs) return 'Error: owner jobs are unavailable';
-      const action = String(args.action ?? '').trim();
-      if (!['start', 'update', 'done', 'blocked'].includes(action)) {
-        return 'Error: action must be one of start|update|done|blocked';
+      // 'blocked' is the first build's name for needs_owner.
+      const rawAction = String(args.action ?? '').trim();
+      const action = rawAction === 'blocked' ? 'needs_owner' : rawAction;
+      if (!['start', 'update', 'done', 'needs_owner', 'continue'].includes(action)) {
+        return 'Error: action must be one of start|update|continue|needs_owner|done';
       }
       const notes = Array.isArray(args.notes)
         ? args.notes.map((note: unknown) => String(note ?? '')).filter((note: string) => note.trim()).slice(0, 6)
@@ -2701,7 +2703,11 @@ export function createToolExecutor(
         const started = chatJobs.get(job.id)!;
         return JSON.stringify({ ok: true, job: { id: started.id, goal: started.goal, status: started.status }, note: 'BotBoy now works on this job; ETL runs you submit are watched for it, and it continues on its own when they finish.' });
       }
-      const jobId = context?.callerKind === 'continuation' ? context.jobMandate?.jobId : chatJobs.activeJob()?.id;
+      let jobId = context?.callerKind === 'continuation' ? context.jobMandate?.jobId : chatJobs.activeJob()?.id;
+      // "continue" in a live owner turn with no job makes the owner's message the job.
+      if (!jobId && action === 'continue' && context?.callerKind === 'interactive' && context.currentUserMessage?.trim()) {
+        jobId = chatJobs.start({ goal: String(args.goal ?? '').trim() || context.currentUserMessage }).id;
+      }
       const job = jobId ? chatJobs.get(jobId) : null;
       if (!job || job.status !== 'active') {
         return JSON.stringify({ ok: false, code: 'no_active_job', error: 'There is no active job.', nextAction: action === 'update' ? 'Start one with action "start" from an owner turn when the work spans async runs or several turns.' : 'Nothing to close; continue answering.' });
@@ -2713,8 +2719,23 @@ export function createToolExecutor(
       }
       const summary = String(args.summary ?? '').replace(/\s+/g, ' ').trim();
       if (notes.length || nextStep) chatJobs.update(job.id, { nextStep, notes });
+      if (action === 'continue' || action === 'needs_owner') {
+        const question = String(args.question ?? '').replace(/\s+/g, ' ').trim();
+        const note = action === 'continue' ? (nextStep || summary) : (question || summary);
+        if (action === 'needs_owner' && !note) {
+          return JSON.stringify({ ok: false, code: 'question_required', error: 'needs_owner needs the question or decision for the owner.', nextAction: 'Call job_update needs_owner again with question.' });
+        }
+        chatJobs.declare(job.id, action, note);
+        return JSON.stringify({
+          ok: true,
+          job: { id: job.id, status: 'active', next: action },
+          note: action === 'continue'
+            ? 'When this reply ends, BotBoy starts the next turn of the job on its own. End your reply with a one-line progress note.'
+            : 'When this reply ends, the job pauses until the owner answers. Ask the question in your reply.',
+        });
+      }
       const pending = chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending').map(watch => watch.runId);
-      const ended = chatJobs.end(job.id, action === 'done' ? 'done' : 'blocked', summary || (action === 'done' ? 'done' : 'needs the owner'));
+      const ended = chatJobs.end(job.id, 'done', summary || 'done');
       return JSON.stringify({
         ok: true,
         job: { id: job.id, status: ended?.status ?? action },

@@ -186,8 +186,55 @@ describe('continuation runner', () => {
     runner.request(job.id);
     await runner.tick();
     expect(fetchImpl).not.toHaveBeenCalled();
-    expect(jobs.get(job.id)?.status).toBe('stopped');
+    expect(jobs.get(job.id)?.status).toBe('active');
+    expect(jobs.get(job.id)?.pausedAt).toBeTruthy();
     expect(notes[0]).toContain(`after ${CHAT_JOB_MAX_CONTINUATIONS} automatic continuations`);
+    // Paused at the limit: later ticks neither run nor repeat the note.
+    runner.request(job.id);
+    await runner.tick();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(notes).toHaveLength(1);
+  });
+
+  it('runs a continuation the job asked for (no finished run), and picks it up after a restart', async () => {
+    const job = jobs.start({ goal: 'Build it' });
+    jobs.update(job.id, { nextStep: 'Build the widgets' });
+    jobs.settle(job.id, { action: 'continue', reason: 'The previous turn said the job continues.' }, 'answered');
+    const fetchImpl = vi.fn(async () => sse([{ type: 'done', message: { id: 'asst-2', content: 'ok' } }]));
+    const { runner } = setup(fetchImpl as any);
+    // No request(): a fresh runner finds the due continuation on the job row.
+    await runner.tick();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((fetchImpl.mock.calls[0] as any)[1].body);
+    expect(body.message).toContain('[Automatic continuation');
+    expect(body.message).toContain('Next step you recorded: Build the widgets');
+    expect(body.message).toContain('job_update continue, needs_owner, or done');
+    expect(body.continuation.note).toBe('↻ Continued automatically: the job\'s next step.');
+    expect(jobs.get(job.id)?.continueRequestedAt).toBeUndefined();
+    expect(jobs.get(job.id)?.continuationCount).toBe(1);
+    await runner.tick();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('an undeclared-end continuation tells the model to declare', async () => {
+    const job = jobs.start({ goal: 'Build it' });
+    jobs.settle(job.id, { action: 'continue', reason: 'The previous turn ended without saying whether the job is done, needs the owner, or continues.', undeclared: true }, 'answered');
+    const fetchImpl = vi.fn(async () => sse([{ type: 'done', message: { id: 'asst-3', content: 'ok' } }]));
+    const { runner } = setup(fetchImpl as any);
+    runner.request(job.id);
+    await runner.tick();
+    const body = JSON.parse((fetchImpl.mock.calls[0] as any)[1].body);
+    expect(body.message).toContain('Without one, the job pauses.');
+  });
+
+  it('a paused job with no finished run starts nothing', async () => {
+    const job = jobs.start({ goal: 'Build it' });
+    jobs.settle(job.id, { action: 'pause', note: 'Which cohort?' }, 'answered');
+    const fetchImpl = vi.fn();
+    const { runner } = setup(fetchImpl as any);
+    runner.request(job.id);
+    await runner.tick();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('a forgotten or stopped runner starts nothing', async () => {

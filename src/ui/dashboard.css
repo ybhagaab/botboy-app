@@ -1948,6 +1948,10 @@ a.data-room-row:hover { background:var(--hover); }
 .chat-job-strip .chat-job-text strong { color:var(--text); font-weight:600; }
 .chat-job-strip .chat-job-state { flex:0 0 auto; color:var(--muted); white-space:nowrap; }
 .chat-job-strip .button { flex:0 0 auto; }
+.chat-job-strip.paused .chat-job-dot { background:var(--warning, #e0a33a); }
+.chat-job-strip.ended .chat-job-dot { background:var(--success, #4caf7d); }
+.chat-job-strip.paused .chat-job-text { white-space:normal; }
+.chat-job-strip .chat-job-note { display:block; color:var(--text); white-space:normal; overflow-wrap:anywhere; max-height:4.4em; overflow:hidden; }
 @keyframes chat-job-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
 @media (prefers-reduced-motion: reduce) { .chat-job-strip.continuing .chat-job-dot { animation:none; } }
 .chat-msg.assistant.continuation { border-left:2px solid var(--accent-soft, rgba(157,140,255,.35)); }

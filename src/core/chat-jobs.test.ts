@@ -3,6 +3,7 @@ import { createStorage, type StorageLayer } from './storage.js';
 import {
   CHAT_JOB_IDLE_MS,
   createChatJobStore,
+  decideTurnSettlement,
   formatChatJobBlock,
   recordToolOutcome,
   workspaceRelativePath,
@@ -179,5 +180,81 @@ describe('job block and tool outcomes', () => {
   it('shows files-workspace paths relative to the workspace', () => {
     expect(workspaceRelativePath('/h/.ppt/files/etl-results/a.tsv', '/h/.ppt/files')).toBe('etl-results/a.tsv');
     expect(workspaceRelativePath('/elsewhere/a.tsv', '/h/.ppt/files')).toBe('/elsewhere/a.tsv');
+  });
+});
+
+describe('end-of-turn settlement (decideTurnSettlement)', () => {
+  const base = { pendingRuns: 0, undeclaredEnds: 0, failedTurns: 0 } as const;
+  it('a declaration decides an answered turn', () => {
+    expect(decideTurnSettlement({ ...base, end: 'answered', declaration: 'continue', declarationNote: 'Build widgets' })).toEqual({ action: 'continue', reason: 'Build widgets' });
+    expect(decideTurnSettlement({ ...base, end: 'answered', declaration: 'needs_owner', declarationNote: 'Which cohort?' })).toEqual({ action: 'pause', note: 'Which cohort?' });
+    // continue wins over waiting on runs: there is work to do now.
+    expect(decideTurnSettlement({ ...base, end: 'answered', declaration: 'continue', pendingRuns: 2 }).action).toBe('continue');
+  });
+  it('no declaration: wait on runs, else continue once, then pause with the reply', () => {
+    expect(decideTurnSettlement({ ...base, end: 'answered', pendingRuns: 1 })).toEqual({ action: 'wait' });
+    expect(decideTurnSettlement({ ...base, end: 'answered' })).toMatchObject({ action: 'continue', undeclared: true });
+    expect(decideTurnSettlement({ ...base, end: 'answered', undeclaredEnds: 1, replyExcerpt: 'Next I build it.' })).toEqual({ action: 'pause', note: 'Next I build it.' });
+  });
+  it('cut-off turns continue; loops, Stop, and model changes pause; owner steering does nothing', () => {
+    expect(decideTurnSettlement({ ...base, end: 'ceiling' }).action).toBe('continue');
+    expect(decideTurnSettlement({ ...base, end: 'shutdown' }).action).toBe('continue');
+    expect(decideTurnSettlement({ ...base, end: 'failed' }).action).toBe('continue');
+    expect(decideTurnSettlement({ ...base, end: 'failed', failedTurns: 1 }).action).toBe('pause');
+    expect(decideTurnSettlement({ ...base, end: 'repeat_breaker', declaration: 'continue' }).action).toBe('pause');
+    expect(decideTurnSettlement({ ...base, end: 'owner_stopped' }).action).toBe('pause');
+    expect(decideTurnSettlement({ ...base, end: 'provider_changed' }).action).toBe('pause');
+    expect(decideTurnSettlement({ ...base, end: 'disconnected', pendingRuns: 1 })).toEqual({ action: 'wait' });
+    expect(decideTurnSettlement({ ...base, end: 'preempted' })).toEqual({ action: 'none' });
+    expect(decideTurnSettlement({ ...base, end: 'job_stopped' })).toEqual({ action: 'none' });
+  });
+});
+
+describe('chat job settle state', () => {
+  let storage: StorageLayer;
+  let jobs: ChatJobStore;
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    jobs = createChatJobStore(storage.getDb());
+  });
+  afterEach(() => storage.close());
+
+  it('declare → settle → owner reply moves between continue, paused, and clear', () => {
+    const job = jobs.start({ goal: 'g' });
+    expect(jobs.declare(job.id, 'needs_owner', 'Which cohort?')).toMatchObject({ declaration: 'needs_owner', pauseNote: 'Which cohort?' });
+    jobs.settle(job.id, { action: 'pause', note: 'Which cohort?' }, 'answered');
+    expect(jobs.get(job.id)).toMatchObject({ pauseNote: 'Which cohort?', pausedAt: expect.any(String) });
+    expect(jobs.get(job.id)?.declaration).toBeUndefined();
+    jobs.settle(job.id, { action: 'continue', reason: 'r', undeclared: true }, 'answered');
+    expect(jobs.get(job.id)).toMatchObject({ continueReason: 'r', undeclaredEnds: 1 });
+    expect(jobs.get(job.id)?.pausedAt).toBeUndefined();
+    jobs.incrementContinuations(job.id);
+    jobs.settle(job.id, { action: 'continue', reason: 'failed' }, 'failed');
+    expect(jobs.get(job.id)).toMatchObject({ failedTurns: 1, undeclaredEnds: 1 });
+    jobs.ownerResumed(job.id);
+    expect(jobs.get(job.id)).toMatchObject({ failedTurns: 0, undeclaredEnds: 0, continuationCount: 0 });
+    expect(jobs.get(job.id)?.continueRequestedAt).toBeUndefined();
+    // An ended job ignores settles.
+    jobs.end(job.id, 'done', 'ok');
+    jobs.settle(job.id, { action: 'continue', reason: 'x' }, 'answered');
+    expect(jobs.get(job.id)?.continueRequestedAt).toBeUndefined();
+    expect(jobs.lastEnded()?.id).toBe(job.id);
+  });
+
+  it('adds the settle columns to a table from the first build', () => {
+    const db = storage.getDb();
+    db.exec('DROP TABLE etl_run_watches; DROP TABLE chat_jobs;');
+    db.exec(`CREATE TABLE chat_jobs (
+      id TEXT PRIMARY KEY CHECK(id GLOB 'cj_[a-f0-9]*' AND length(id) = 27), goal TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('active','done','stopped','expired','blocked')), model_key TEXT,
+      thinking TEXT NOT NULL DEFAULT 'off', working_set_json TEXT NOT NULL DEFAULT '{}',
+      continuation_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, last_activity_at TEXT NOT NULL,
+      ended_at TEXT, end_reason TEXT)`);
+    db.prepare("INSERT INTO chat_jobs (id, goal, status, created_at, last_activity_at) VALUES ('cj_aaaaaaaaaaaaaaaaaaaaaaaa', 'old', 'active', '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')").run();
+    const upgraded = createChatJobStore(db);
+    expect(upgraded.activeJob()).toMatchObject({ id: 'cj_aaaaaaaaaaaaaaaaaaaaaaaa', undeclaredEnds: 0, failedTurns: 0 });
+    upgraded.settle('cj_aaaaaaaaaaaaaaaaaaaaaaaa', { action: 'pause', note: 'n' }, 'answered');
+    expect(upgraded.activeJob()?.pauseNote).toBe('n');
   });
 });

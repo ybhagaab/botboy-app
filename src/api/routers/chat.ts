@@ -57,7 +57,7 @@ import {
   continuationRequestId,
   continuationSecretMatches,
 } from '../../core/chat-continuations.js';
-import { formatChatJobBlock, recordToolOutcome } from '../../core/chat-jobs.js';
+import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatTurnEnd } from '../../core/chat-jobs.js';
 import { filterToolsForContinuation } from '../../core/job-mandate.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
 import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
@@ -160,6 +160,12 @@ function dataRoomCreateEffectNeedsObservation(content: unknown): boolean {
 
 /** Final message for a turn stopped by a Settings → AI model provider change. */
 const PROVIDER_CHANGED_STOP_TEXT = '⏹️ Stopped because the AI model was changed in Settings. Work already completed is preserved; send your message again to continue on the new model.';
+/** The last words of a reply, used as a pause note (one or two sentences). */
+export function replyExcerptOf(text: string): string {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return clean.length > 280 ? `…${clean.slice(-279)}` : clean;
+}
+
 /** A continuation turn the owner's new message stopped (chat-continuations.ts). */
 export const CONTINUATION_PREEMPTED_TEXT = '↻ Paused this automatic continuation because you sent a message. The job continues from your message.';
 /** A continuation turn whose job the owner stopped from the chat panel. */
@@ -701,6 +707,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     /** Why a continuation ended early: the owner's message, or the owner stopped its job. */
     endReason?: 'preempted' | 'job_stopped';
     startedAt: number;
+    /** How the turn ended, for the job settle (unset: the turn never reached the tool loop). */
+    jobEnd?: ChatTurnEnd;
+    /** The final reply's tail, the pause note when the turn declared nothing. */
+    replyExcerpt?: string;
+    /** Model tool calls this turn. */
+    toolCalls?: number;
     abortController: AbortController;
     /** Resolves once the turn has persisted its reply and closed. */
     finished: Promise<void>;
@@ -728,6 +740,56 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       ]);
     }
     return stopping.length;
+  }
+
+  /**
+   * The end-of-turn settle (chat-jobs.ts › decideTurnSettlement): the job
+   * the turn worked on is done, waits on runs, continues, or pauses. Returns
+   * the job id when a continuation is due. Never throws.
+   */
+  function settleJobAfterTurn(input: {
+    end?: ChatTurnEnd;
+    continuationJobId?: string;
+    ownerMessage?: string;
+    startedAt: number;
+    toolCalls: number;
+    replyExcerpt?: string;
+  }): string | null {
+    if (!chatJobs || !input.end) return null;
+    try {
+      const startedIso = new Date(input.startedAt).toISOString();
+      let job = input.continuationJobId ? chatJobs.get(input.continuationJobId) : chatJobs.activeJob();
+      // A turn that did real work and was cut off becomes a job, so it continues.
+      if (!job && input.ownerMessage?.trim() && input.toolCalls > 0
+        && (input.end === 'ceiling' || input.end === 'failed' || input.end === 'shutdown')) {
+        job = chatJobs.start({ goal: input.ownerMessage });
+      }
+      if (!job || job.status !== 'active') return null;
+      const declared = job.declaredAt && job.declaredAt >= startedIso ? job.declaration : undefined;
+      const owner = !input.continuationJobId;
+      // The owner only chatted (no tools, no declaration) while the job was paused: it stays paused.
+      if (owner && input.end === 'answered' && !declared && input.toolCalls === 0
+        && job.createdAt < startedIso && job.pausedAt && job.pausedAt < startedIso) {
+        return null;
+      }
+      const note = declared === 'needs_owner' ? job.pauseNote : declared === 'continue' ? job.continueReason : undefined;
+      if (owner) chatJobs.ownerResumed(job.id);
+      const settlement = decideTurnSettlement({
+        end: input.end,
+        declaration: declared,
+        declarationNote: note,
+        pendingRuns: chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending').length,
+        undeclaredEnds: owner ? 0 : job.undeclaredEnds,
+        failedTurns: owner ? 0 : job.failedTurns,
+        replyExcerpt: input.replyExcerpt,
+      });
+      chatJobs.settle(job.id, settlement, input.end);
+      console.log(`[Job] ${job.id} turn ended ${input.end}${declared ? ` (declared ${declared})` : ''} → ${settlement.action}`);
+      return settlement.action === 'continue' ? job.id : null;
+    } catch (error: any) {
+      console.warn(`[Job] settle failed: ${error?.message ?? error}`);
+      return null;
+    }
   }
 
   // Replacing or removing a connection stops the turns pinned to it. Each
@@ -762,9 +824,22 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.set('Cache-Control', 'no-store');
     if (!chatJobs) return res.json({ job: null, version: 0 });
     const job = chatJobs.activeJob();
-    if (!job) return res.json({ job: null, version: chatJobs.version() });
+    if (!job) {
+      // A job that ended in the last 10 minutes still shows how it ended.
+      const last = chatJobs.lastEnded();
+      const recent = last?.endedAt && Date.now() - Date.parse(last.endedAt) < 10 * 60_000
+        ? { id: last.id, goal: last.goal, status: last.status, endedAt: last.endedAt, endReason: last.endReason ?? null }
+        : null;
+      return res.json({ job: null, recent, version: chatJobs.version() });
+    }
     const watches = chatJobs.watchesForJob(job.id);
     const running = continuations?.runner()?.running();
+    const pendingRuns = watches.filter(watch => watch.status === 'pending').length;
+    // What BotBoy is actually doing, derived from what is running (never just "active").
+    const phase = (running && running.jobId === job.id) || activeChatTurns.size > 0 ? 'working'
+      : job.continueRequestedAt ? 'continuing'
+      : pendingRuns ? 'waiting'
+      : 'paused';
     res.json({
       version: chatJobs.version(),
       job: {
@@ -783,6 +858,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         })),
         finishedRuns: watches.filter(watch => watch.status === 'finished').length,
         continuing: Boolean(running && running.jobId === job.id),
+        phase,
+        pauseNote: phase === 'paused' ? (job.pauseNote ?? 'Nothing is running. Reply in chat to continue.') : null,
       },
     });
   });
@@ -1820,6 +1897,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               content += '\n\n---\n⚠️ *System note: no data-modifying tool ran in this turn, so despite the wording above nothing was actually created or changed.*';
             }
 
+            turnState.jobEnd = toolsDisabled ? 'repeat_breaker' : 'answered';
+            turnState.replyExcerpt = replyExcerptOf(content);
             content = forTranscript(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds));
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
@@ -1830,6 +1909,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           }
 
           totalModelToolCalls += streamResult.toolCalls.length;
+          turnState.toolCalls = totalModelToolCalls;
           // Validate tool call arguments are valid JSON before pushing back into history.
           // If the model streamed malformed JSON (unterminated string, missing brace), vLLM will
           // reject the NEXT request with HTTP 400 because it strictly validates tool_call args.
@@ -2364,6 +2444,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             const content = receipt ? formatAnalyticsEditCompletion(receipt) : undefined;
             if (receipt && content) {
               analyticsWidgetEditReceipt = receipt;
+              turnState.jobEnd = 'answered';
+              turnState.replyExcerpt = replyExcerptOf(content);
               const assistantId = `asst-${Date.now()}`;
               if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
               if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -2393,6 +2475,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // A continuation the owner preempted or stopped ends with a fixed
         // line and no summary call: the owner is already steering.
         const endReason = turnState.endReason;
+        turnState.jobEnd = providerChanged ? 'provider_changed'
+          : endReason === 'preempted' ? 'preempted'
+          : endReason === 'job_stopped' ? 'job_stopped'
+          : stoppedByUser ? 'owner_stopped' : 'ceiling';
         res.write(`data: ${JSON.stringify({ type: 'status', text: providerChanged ? '⏹️ AI model changed in Settings — stopping...' : endReason ? '⏹️ Stopping...' : stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
         let finalContent = providerChanged
           ? PROVIDER_CHANGED_STOP_TEXT
@@ -2402,13 +2488,17 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           ? JOB_STOPPED_TEXT
           : stoppedByUser
           ? '⏹️ Stopped at your request. The work done so far is preserved above; tell me when to continue.'
-          : `Reached the runaway ceiling of ${HARD_ITERATION_CEILING} tool iterations — stopping to be safe.`;
+          : chatJobs
+            ? `Reached the limit of ${HARD_ITERATION_CEILING} tool steps in one turn. I continue in a fresh turn on my own.`
+            : `Reached the runaway ceiling of ${HARD_ITERATION_CEILING} tool iterations — stopping to be safe.`;
         if (!providerChanged && !endReason) try {
           messages.push({
             role: 'user',
             content: stoppedByUser
               ? 'SYSTEM (internal): the user pressed Stop. Do not request any more tools. Briefly and honestly report: what you completed, what is in progress or unverified, and the natural next step if they want you to continue. Keep it short.'
-              : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
+              : chatJobs
+                ? 'You have reached the per-turn tool limit. Do not request any more tools. In a few lines, say what is done and what remains. BotBoy continues the job in a fresh turn on its own, so do not ask the owner to continue.'
+                : 'You have reached the runaway safety ceiling for tool calls in one turn. Do not request any more tools. Using ONLY the information gathered above, answer the original question as best you can. If the evidence is thin, summarize what you found and state clearly what you could not determine.',
           });
           const synthesisSignal = stoppedByUser ? deps.shutdown?.signal : turnState.abortController.signal;
           const gen = llmClient.chatCompletionStream({
@@ -2446,9 +2536,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       } catch (err: any) {
         const interrupted = activeChatTurns.get(turnId);
         if (interrupted?.shutdownRequested || interrupted?.disconnected || deps.shutdown?.isShuttingDown()) {
+          turnState.jobEnd = interrupted?.disconnected && !interrupted?.shutdownRequested && !deps.shutdown?.isShuttingDown() ? 'disconnected' : 'shutdown';
           console.log(`[Chat] Turn ${turnId} ended during ${interrupted?.disconnected ? 'client disconnect' : 'process shutdown'}; no retry or synthetic failure was persisted`);
           try { res.end(); } catch {}
         } else if (interrupted?.stopRequested) {
+          turnState.jobEnd = interrupted.providerChanged ? 'provider_changed'
+            : interrupted.endReason === 'preempted' ? 'preempted'
+            : interrupted.endReason === 'job_stopped' ? 'job_stopped' : 'owner_stopped';
           const stopId = `asst-${Date.now()}`;
           const stopText = forTranscript(interrupted.providerChanged
             ? PROVIDER_CHANGED_STOP_TEXT
@@ -2461,6 +2555,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: stopId, role: 'assistant', content: stopText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           try { res.end(); } catch {}
         } else {
+          turnState.jobEnd = 'failed';
           console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
           // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
           // and the user saw pure silence after reload). Persist a visible
@@ -2492,8 +2587,17 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             console.warn(`[Chat] Job touch failed: ${error?.message ?? error}`);
           }
         }
+        const settledContinue = settleJobAfterTurn({
+          end: turnState.jobEnd,
+          continuationJobId: continuation?.job.id,
+          ownerMessage: continuation ? undefined : message,
+          startedAt: turnState.startedAt,
+          toolCalls: turnState.toolCalls ?? 0,
+          replyExcerpt: turnState.replyExcerpt,
+        });
         activeChatTurns.delete(turnId);
         resolveTurnFinished();
+        if (settledContinue) continuations?.runner()?.request(settledContinue);
       }
       return;
     }
