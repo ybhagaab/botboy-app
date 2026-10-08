@@ -256,7 +256,7 @@ function coverageSchema(): JsonSchema {
         properties: {
           partitionKind: { type: 'string', enum: ['day', 'month'], description: 'Canonical coverage key granularity. Month keys use YYYY-MM-01.' },
           observedRanges: { ...ranges, description: 'Inclusive ranges for all observed source partitions, including partial periods.' },
-          completeRanges: { ...ranges, description: 'Inclusive ranges containing only proven-complete source partitions.' },
+          completeRanges: { ...ranges, minItems: 0, description: 'Inclusive ranges containing only proven-complete source partitions; [] when no partition is proven complete.' },
           watermark: WATERMARK_SCHEMA,
         },
         required: ['partitionKind', 'observedRanges', 'completeRanges', 'watermark'],

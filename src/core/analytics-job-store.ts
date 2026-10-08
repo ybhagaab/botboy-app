@@ -414,7 +414,12 @@ export function createAnalyticsJobStore(input: {
       if (existing.owner_message_sha256 !== ownerMessageSha256
         || existing.intent_sha256 !== intent.sha256
         || existing.intent_json !== intent.json) {
-        fail('conflict', 'Owner request ID is already bound to a different analytics job intent.');
+        // Nothing was written: the caller may report the existing job as a
+        // known no-effect outcome instead of an unknown effect.
+        throw Object.assign(
+          new AnalyticsJobError('conflict', 'Owner request ID is already bound to a different analytics job intent.'),
+          { ownerRequestConflict: true, existingJobId: existing.id },
+        );
       }
       return { job: jobRecord(existing), joinedExisting: true };
     }

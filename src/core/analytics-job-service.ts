@@ -883,11 +883,13 @@ function normalizeCoverageRange(
   value: unknown,
   label: string,
   partitionKind: 'day' | 'month',
+  /** completeRanges may be [] (nothing proven complete), like completePartitions. */
+  minimum = 1,
 ): string[] {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
-    fail('invalid_input', `${label} must contain 1 to 128 ranges.`, dataRoomIssue({
-      code: 'wrong_item_count', path: label, message: `${label} must contain 1 to 128 inclusive ranges.`,
-      expected: { kind: 'range', type: 'array', minimum: 1, maximum: 128 }, received: value,
+  if (!Array.isArray(value) || value.length < minimum || value.length > 128) {
+    fail('invalid_input', `${label} must contain ${minimum} to 128 ranges.`, dataRoomIssue({
+      code: 'wrong_item_count', path: label, message: `${label} must contain ${minimum} to 128 inclusive ranges.`,
+      expected: { kind: 'range', type: 'array', minimum, maximum: 128 }, received: value,
     }));
   }
   const output = new Set<string>();
@@ -951,7 +953,7 @@ function normalizePreparationCoverage(value: unknown, label: string): AnalyticsD
   if (compact) {
     exactKeys(value, ['partitionKind', 'observedRanges', 'completeRanges', 'watermark'], label);
     observedPartitions = normalizeCoverageRange(value.observedRanges, `${label}.observedRanges`, partitionKind);
-    completePartitions = normalizeCoverageRange(value.completeRanges, `${label}.completeRanges`, partitionKind);
+    completePartitions = normalizeCoverageRange(value.completeRanges, `${label}.completeRanges`, partitionKind, 0);
   } else {
     exactKeys(value, ['partitionKind', 'observedPartitions', 'completePartitions', 'watermark'], label);
     completePartitions = uniqueTextArray(value.completePartitions, `${label}.completePartitions`, 10_000).sort();

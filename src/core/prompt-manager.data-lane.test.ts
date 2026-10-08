@@ -67,6 +67,28 @@ describe('prompt-manager data-lane notice', () => {
     expect(text).not.toContain('ALWAYS when it is configured and running');
   });
 
+  // REGRESSION (chat logs 2026-10-07): the notice said "stop" while
+  // a2-analytics was starting, although a call starts it and waits.
+  it('treats a starting, stopped, or degraded ETL connection as the lane: the first call starts it', () => {
+    for (const state of ['starting', 'stopped', 'degraded'] as const) {
+      const text = prompt([server({ id: 'a2-analytics', state, tools: [] })]);
+      expect(text, state).toContain('Datanet ETL is the data lane');
+      expect(text, state).toContain(`a2-analytics is ${state}; your first ETL call starts it and waits`);
+      expect(text, state).not.toContain('Neither analytics execution lane is data-ready');
+      expect(text, state).toContain(`${state.toUpperCase()} — callable: your first call starts it and waits`);
+    }
+    // Disabled or unconfigured stays closed.
+    expect(prompt([server({ id: 'a2-analytics', enabled: false })])).toContain('Neither analytics execution lane is data-ready');
+  });
+
+  it('carries the core ETL rules and the async-run contract in the notice', () => {
+    const text = prompt([server({ id: 'a2-analytics' })]);
+    expect(text).toContain('Runs are ASYNC (minutes)');
+    expect(text).toContain('never ask the owner to check back');
+    expect(text).toContain('stop and report when the same failure comes back three times');
+    expect(text).toContain('one file per domain the request names');
+  });
+
   it('stays silent only when the server inventory itself is unavailable', () => {
     expect(prompt(undefined)).not.toContain('\n## DATA LANE NOTICE\n');
     expect(prompt([])).toContain('Neither analytics execution lane is data-ready');

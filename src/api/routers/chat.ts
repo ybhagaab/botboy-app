@@ -51,7 +51,16 @@ import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
 import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-chat-tools.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
 import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
-import { requireLocalOwnerRequest } from './local-owner.js';
+import {
+  authenticateContinuationRequest,
+  CONTINUATION_HEADER,
+  continuationRequestId,
+  continuationSecretMatches,
+} from '../../core/chat-continuations.js';
+import { formatChatJobBlock, recordToolOutcome } from '../../core/chat-jobs.js';
+import { filterToolsForContinuation } from '../../core/job-mandate.js';
+import type { ToolExecutionContext } from '../../core/tool-executor.js';
+import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
 
 /** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
 const GMAIL_WRITE_TOOLS = new Set(['gmail_draft', 'gmail_send']);
@@ -60,6 +69,13 @@ const GMAIL_TOOL_STATUS: Record<string, string> = {
   gmail_read: '📨 Reading from Gmail...',
   gmail_draft: '📝 Saving the Gmail draft...',
   gmail_send: '📤 Sending through Gmail...',
+};
+/** Long-running tools: one status line, then keepalives while they run. */
+const ETL_TOOL_STATUS: Record<string, string> = {
+  mcp_etl_run_query: '⏳ Running the ETL query...',
+  wait_for_etl_run: '⏳ Waiting for the ETL run...',
+  mcp_etl_download_results: '⬇️ Downloading the ETL result...',
+  run_command: '⚙️ Running the command...',
 };
 
 /**
@@ -144,6 +160,61 @@ function dataRoomCreateEffectNeedsObservation(content: unknown): boolean {
 
 /** Final message for a turn stopped by a Settings → AI model provider change. */
 const PROVIDER_CHANGED_STOP_TEXT = '⏹️ Stopped because the AI model was changed in Settings. Work already completed is preserved; send your message again to continue on the new model.';
+/** A continuation turn the owner's new message stopped (chat-continuations.ts). */
+export const CONTINUATION_PREEMPTED_TEXT = '↻ Paused this automatic continuation because you sent a message. The job continues from your message.';
+/** A continuation turn whose job the owner stopped from the chat panel. */
+export const JOB_STOPPED_TEXT = '⏹️ Stopped: you ended this job. Work already done is kept.';
+
+/**
+ * Status reads a turn legitimately repeats while a run, job, or dashboard
+ * progresses (ANALYTICS_AUTONOMY_PLAN.md P1). The repeat breaker blocked
+ * them as "unchanged" (chat logs 2026-10-05/07); they run again, paced to
+ * one identical call per STATUS_READ_PACE_MS.
+ */
+const PACED_STATUS_TOOLS = new Set([
+  'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'get_analytics_dashboard', 'mcp_status',
+]);
+export const STATUS_READ_PACE_MS = 10_000;
+
+export function isPacedStatusRead(toolName: string, argumentsJson: string): boolean {
+  if (PACED_STATUS_TOOLS.has(toolName)) return true;
+  return toolName === 'create_data_room_dataset' && dataRoomDatasetAction(argumentsJson) === 'status';
+}
+
+/**
+ * Data Room creation fuse (replaces the four-attempt budget): validation
+ * failures write nothing, so they cost nothing until the SAME failure (same
+ * code and issue paths) comes back. At DATA_ROOM_SAME_FAILURE_STOP repeats
+ * the result tells the model to stop; at DATA_ROOM_SAME_FAILURE_BLOCK further
+ * creates are refused; DATA_ROOM_MAX_CREATE_CALLS bounds a turn overall.
+ */
+export const DATA_ROOM_SAME_FAILURE_STOP = 3;
+export const DATA_ROOM_SAME_FAILURE_BLOCK = 5;
+export const DATA_ROOM_MAX_CREATE_CALLS = 12;
+
+/** The fuse key of a no-effect Data Room failure; undefined for anything else. */
+export function dataRoomFailureSignature(content: unknown): string | undefined {
+  try {
+    const receipt = JSON.parse(String(content ?? '{}'));
+    if (receipt?.type !== 'data_room_tool_failure' || receipt?.effect?.state !== 'none') return undefined;
+    const issues: any[] = Array.isArray(receipt.issues) ? receipt.issues : [];
+    const parts = issues.map(issue => `${String(issue?.code ?? '')}@${String(issue?.path ?? '')}`).sort();
+    return `${String(receipt.code ?? '')}|${parts.join(',')}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Appends the stop instruction to a repeated no-effect failure. */
+function withRepeatedFailureStop(content: string, repeats: number): string {
+  try {
+    const receipt = JSON.parse(content);
+    receipt.nextAction = `This same validation failure has now come back ${repeats} times. Stop retrying this import: report the unresolved issue paths and what you tried, or take a different approach (another source or target shape). ${String(receipt.nextAction ?? '')}`.trim();
+    return JSON.stringify(receipt);
+  } catch {
+    return content;
+  }
+}
 
 /**
  * Transient-error detector for the chat stream retry: network hiccups,
@@ -617,7 +688,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   // local data-room query workers; remote submissions are never killed or
   // resubmitted implicitly. Stopping is a user decision, not a failure —
   // mirrors the dashboard refresh cancel semantics (2026-08-27).
-  const activeChatTurns = new Map<string, {
+  interface ChatTurnState {
     stopRequested: boolean;
     shutdownRequested: boolean;
     disconnected: boolean;
@@ -625,10 +696,39 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     providerChanged?: boolean;
     /** The model connection this turn is pinned to. */
     connectionId?: string;
+    /** Set for a turn BotBoy started to continue an owner job (chat-continuations.ts). */
+    continuationJobId?: string;
+    /** Why a continuation ended early: the owner's message, or the owner stopped its job. */
+    endReason?: 'preempted' | 'job_stopped';
     startedAt: number;
     abortController: AbortController;
-  }>();
+    /** Resolves once the turn has persisted its reply and closed. */
+    finished: Promise<void>;
+  }
+  const activeChatTurns = new Map<string, ChatTurnState>();
   let chatTurnCounter = 0;
+  const chatJobs = deps.chatJobs;
+  const continuations = deps.chatContinuations;
+  // The continuation runner waits while any chat turn is in progress.
+  continuations?.bindTurnProbe(() => activeChatTurns.size > 0);
+
+  /** Stops running continuation turns (optionally of one job) and waits briefly for them to close. */
+  async function stopContinuationTurns(reason: 'preempted' | 'job_stopped', jobId?: string): Promise<number> {
+    const stopping = [...activeChatTurns.values()].filter(turn => turn.continuationJobId
+      && (!jobId || turn.continuationJobId === jobId) && !turn.stopRequested);
+    for (const turn of stopping) {
+      turn.stopRequested = true;
+      turn.endReason = reason;
+      turn.abortController.abort(new Error(reason === 'preempted' ? 'The owner sent a message' : 'The owner stopped the job'));
+    }
+    if (stopping.length) {
+      await Promise.race([
+        Promise.all(stopping.map(turn => turn.finished)),
+        new Promise<void>(resolve => { const timer = setTimeout(resolve, 8_000); timer.unref?.(); }),
+      ]);
+    }
+    return stopping.length;
+  }
 
   // Replacing or removing a connection stops the turns pinned to it. Each
   // turn stays on the connection it started on: provider-bound replay
@@ -656,6 +756,84 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.json({ ok: true, stopped, active: activeChatTurns.size });
   });
 
+  // ── Owner jobs (ANALYTICS_AUTONOMY_PLAN.md, chat-jobs.ts) ──
+  // The chat panel shows the active job with its waiting runs and a Stop.
+  router.get('/chat/jobs/active', (_req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store');
+    if (!chatJobs) return res.json({ job: null, version: 0 });
+    const job = chatJobs.activeJob();
+    if (!job) return res.json({ job: null, version: chatJobs.version() });
+    const watches = chatJobs.watchesForJob(job.id);
+    const running = continuations?.runner()?.running();
+    res.json({
+      version: chatJobs.version(),
+      job: {
+        id: job.id,
+        goal: job.goal,
+        status: job.status,
+        continuationCount: job.continuationCount,
+        createdAt: job.createdAt,
+        lastActivityAt: job.lastActivityAt,
+        nextStep: job.workingSet.nextStep ?? null,
+        waitingRuns: watches.filter(watch => watch.status === 'pending').map(watch => ({
+          runId: watch.runId,
+          purpose: watch.purpose ?? null,
+          remoteStatus: watch.remoteStatus ?? null,
+          submittedAt: watch.submittedAt,
+        })),
+        finishedRuns: watches.filter(watch => watch.status === 'finished').length,
+        continuing: Boolean(running && running.jobId === job.id),
+      },
+    });
+  });
+
+  // Stop is an owner control: only the rendered chat panel may end a job.
+  router.post('/chat/jobs/:id/stop', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Stopping a job', 'Use Stop on the job line in the chat panel.')) return;
+    if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
+    const jobId = paramStr(req.params.id);
+    const job = chatJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    const ended = job.status === 'active' ? chatJobs.end(jobId, 'stopped', 'stopped by the owner') : job;
+    const stoppedTurns = await stopContinuationTurns('job_stopped', jobId);
+    continuations?.runner()?.forget(jobId);
+    dashboardState.bump();
+    res.json({ ok: true, job: { id: jobId, status: ended?.status ?? job.status }, stoppedTurns });
+  });
+
+  // Live view of a running continuation turn: a replay of its events so far,
+  // then each new event. The panel renders it like its own streamed turn.
+  router.get('/chat/live', (req: Request, res: Response) => {
+    if (!continuations) return res.status(503).json({ error: 'Live chat is unavailable' });
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    const send = (payload: unknown) => {
+      try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* the viewer left */ }
+    };
+    const current = continuations.hub.current();
+    if (current && !current.ended) {
+      send({ kind: 'begin', info: current.info, replay: true });
+      for (const event of current.events) send({ kind: 'event', turnKey: current.info.turnKey, event });
+    }
+    const unsubscribe = continuations.hub.subscribe((message) => {
+      if (message.kind === 'begin') send({ kind: 'begin', info: message.info });
+      else if (message.kind === 'event') send({ kind: 'event', turnKey: message.turnKey, event: message.event });
+      else send({ kind: 'end', turnKey: message.turnKey });
+    });
+    const keepAlive = setInterval(() => {
+      try { res.write(': keep-alive\n\n'); } catch { /* closed */ }
+    }, 15_000);
+    keepAlive.unref?.();
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      unsubscribe();
+    });
+  });
+
   router.post('/chat/messages', async (req: Request, res: Response) => {
     // A chat turn can send email and run tools, so another website must not
     // start one. The owner's dashboard (same loopback origin and port) and
@@ -663,9 +841,32 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     if (!requireLocalOwnerRequest(req, res, 'Chat')) return;
     if (!chat) return res.status(503).json({ error: 'Chat not available' });
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    // A continuation turn (chat-continuations.ts) carries BotBoy's in-memory
+    // secret. A wrong secret or an ended job is refused; it is never treated
+    // as the owner. Without the header this is an ordinary owner turn.
+    const continuationAuth = authenticateContinuationRequest({
+      secret: continuations?.secret,
+      header: req.get(CONTINUATION_HEADER),
+      body,
+      jobs: chatJobs,
+    });
+    if (continuationAuth && !continuationAuth.ok) {
+      return res.status(continuationAuth.status).json({ error: continuationAuth.error, code: continuationAuth.code });
+    }
+    const continuation = continuationAuth?.ok ? continuationAuth : undefined;
+    if (continuation) {
+      if (body.stream !== true || (Array.isArray(body.attachments) && body.attachments.length)) {
+        return res.status(400).json({ error: 'A continuation is a streamed turn without attachments.' });
+      }
+      // The owner goes first: the runner retries after the owner's turn.
+      if ([...activeChatTurns.values()].some(turn => !turn.continuationJobId)) {
+        return res.status(409).json({ error: 'An owner turn is in progress.', code: 'owner_turn_active' });
+      }
+    }
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     const stream = body.stream === true;
-    const requestedMode = body.mode;
+    // Continuations always run in general mode with the job's own tools.
+    const requestedMode = continuation ? undefined : body.mode;
     if (!message) return res.status(400).json({ error: 'message is required' });
     // A fresh install has no AI model until the owner adds a key in
     // Settings → AI model. Say so plainly before admitting a turn instead of
@@ -730,7 +931,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // One connection and model serve this whole turn: every tool-loop
     // iteration and provider-bound replay (encrypted reasoning) use the client
     // resolved here, even if the owner changes Settings mid-turn.
-    const chatBinding = chatModels.resolve(body.model);
+    // A continuation reuses the job's last owner model (D4); if the owner has
+    // since removed it, the default serves instead of refusing the turn.
+    const chatBinding = chatModels.resolve(body.model) ?? (continuation ? chatModels.resolve(undefined) : null);
     if (!chatBinding && body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
       const offered = chatModels.catalog()?.models.map(model => model.key) ?? [];
       const allowed = ['default', ...offered].filter((key, index, keys) => keys.indexOf(key) === index);
@@ -747,18 +950,23 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
     // open+refreshing got forced into analytics mode and queued behind the
     // refresh's MCP calls.
-    const conversationMode = resolveConversationMode({ requestedMode, modeHint: body.modeHint, message }).mode;
+    const conversationMode = continuation
+      ? 'general' as const
+      : resolveConversationMode({ requestedMode, modeHint: body.modeHint, message }).mode;
     const analyticsIntent = conversationMode === 'analytics_dashboard' && (
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
-    const routeEditAction = analyticsIntent === 'create'
+    const routeEditAction = analyticsIntent === 'create' || continuation
       ? undefined
       : routeAnalyticsWidgetEditAction(message);
     let ownerRequestId: string | undefined;
     let authoritativeAnalyticsScope: CanonicalAnalyticsRouteScope | undefined;
     if (stream) {
       try {
-        ownerRequestId = normalizeOwnerRequestId(body.requestId);
+        // One stable request identity per continuation turn of the job.
+        ownerRequestId = continuation
+          ? continuationRequestId(continuation.job.id, continuation.ordinal)
+          : normalizeOwnerRequestId(body.requestId);
         // Ambient scope is promoted only for a deictic edit ("this widget").
         // It is context for the model, never an authority gate: whatever the
         // selection count, the model resolves the target (or asks), and the
@@ -793,24 +1001,39 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
     // SSE streaming mode
     if (stream) {
+      // The owner's message comes first: a running continuation stops (its
+      // note lands before this message) and the job continues from here.
+      if (!continuation) await stopContinuationTurns('preempted');
+
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
 
       const db = deps.db;
-      if (db) db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json) VALUES (?, ?, ?, ?)').run(
+      // A continuation's trigger is BotBoy's, not the owner's: it goes to the
+      // model's history only, and the reply carries the ↻ note instead.
+      if (db && !continuation) db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json) VALUES (?, ?, ?, ?)').run(
         `user-${Date.now()}`, 'user', message, attachmentIds.length ? JSON.stringify(attachmentIds) : null,
       );
+      /** What the transcript shows: a continuation's reply leads with its ↻ note. */
+      const forTranscript = (text: string): string => (continuation?.note ? `${continuation.note}\n\n${text}` : text);
+      // D4: the job keeps the model and thinking of the owner's latest turn.
+      const jobModelKey = body.model === undefined || body.model === null || body.model === '' || body.model === 'default'
+        ? ''
+        : (chatBinding?.key ?? '');
 
       const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
-      const turnState = {
+      let resolveTurnFinished: () => void = () => {};
+      const turnState: ChatTurnState = {
         stopRequested: false,
         shutdownRequested: false,
         disconnected: false,
         ...(chatBinding ? { connectionId: chatBinding.connectionId } : {}),
+        ...(continuation ? { continuationJobId: continuation.job.id } : {}),
         startedAt: Date.now(),
         abortController: new AbortController(),
+        finished: new Promise<void>((resolve) => { resolveTurnFinished = resolve; }),
       };
       activeChatTurns.set(turnId, turnState);
       const unregisterShutdownWork = deps.shutdown?.registerWork({
@@ -836,19 +1059,29 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const toolExecutor = deps.toolExecutor;
         const promptManager = deps.promptManager;
         const convManager = deps.conversationManager;
-        const toolExecutionContext = {
-          currentUserMessage: message,
-          callerKind: 'interactive' as const,
+        // A continuation acts under the job mandate (job-mandate.ts): the
+        // owner's request that started the job is its request text, and
+        // `continuation` is never `interactive`, so live-turn-only tools
+        // (Gmail, terminals, publication) stay closed to it.
+        const toolExecutionContext: ToolExecutionContext = {
+          currentUserMessage: continuation ? continuation.job.goal : message,
+          callerKind: continuation ? 'continuation' : 'interactive',
+          ...(continuation ? { jobMandate: { jobId: continuation.job.id, goal: continuation.job.goal } } : {}),
           abortSignal: activeChatTurns.get(turnId)?.abortController.signal,
           ...(ownerRequestId ? { ownerRequestId } : {}),
           ...(authoritativeAnalyticsScope ? { authoritativeAnalyticsScope } : {}),
-          ...(projectScope ? {
+          ...(projectScope && !continuation ? {
             authoritativeProjectIds: [projectScope.projectId],
             projectContextSource: projectScope.source,
           } : {}),
         };
 
         if (!llmClient || !toolExecutor) {
+          if (continuation) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: 'Chat tools are unavailable' })}\n\n`);
+            res.end();
+            return;
+          }
           const result = await chat.sendMessage(message);
           res.write(`data: ${JSON.stringify({ type: 'done', message: result.message })}\n\n`);
           res.end();
@@ -979,6 +1212,18 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               return undefined;
             })
           : undefined;
+        // The active job (the owner's request, the mandate, the working set)
+        // rides every owner and continuation turn (ANALYTICS_AUTONOMY_PLAN.md).
+        const turnJob = continuation ? chatJobs?.get(continuation.job.id) ?? null : chatJobs?.activeJob() ?? null;
+        const jobBlock = turnJob?.status === 'active' && chatJobs
+          ? formatChatJobBlock(turnJob, chatJobs.watchesForJob(turnJob.id), { continuation: Boolean(continuation) })
+          : undefined;
+        if (turnJob?.status === 'active' && chatJobs && !continuation) {
+          chatJobs.touch(turnJob.id, { modelKey: jobModelKey, thinking: thinkingLevel });
+          // This owner turn sees the finished runs in its job block, so no
+          // continuation follows for them.
+          for (const watch of chatJobs.unconsumedFinished(turnJob.id)) chatJobs.consumeWatch(watch.runId);
+        }
         const promptContext = {
           nodes,
           conversationMode,
@@ -987,6 +1232,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           analyticsDataRoomBriefing,
           analyticsTaskGrounding: analyticsTaskGrounding?.promptBlock,
           mcpServers,
+          ...(jobBlock ? { jobBlock } : {}),
         };
         const systemPrompt = promptManager
           ? promptManager.getSystemPrompt('chat', promptContext)
@@ -1112,7 +1358,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           }
         }
 
-        const tools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
+        const chatTools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
+        // A continuation is offered only the job-scope tools (job-mandate.ts);
+        // the mandate gate refuses anything else regardless.
+        const tools = continuation ? filterToolsForContinuation(chatTools) : chatTools;
 
         // Chat replies don't need the global 16K completion budget; capping at
         // 4K frees ~12K tokens of input headroom so the pre-flight trimmer
@@ -1138,14 +1387,16 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // Repeat-call ledger for the breaker below + tools kill-switch.
         const seenToolCalls = new Map<string, number>();
         let toolsDisabled = false;
-        // Data Room creation may reveal prerequisite-aware validation waves.
-        // Permit bounded material corrections, but never an unbounded source
-        // resubmission loop; hash derivation and status observation do not
-        // consume this create-only budget.
-        const MAX_DATA_ROOM_CREATE_ATTEMPTS = 4;
-        let dataRoomCreateAttempts = 0;
-        let admittedDataRoomJobId: string | undefined;
+        // Data Room creation may reveal prerequisite-aware validation waves,
+        // and one turn may run several independent imports (each its own
+        // durable job, tool-executor.ts › dataRoomImportRequestId). Validation
+        // failures write nothing, so only a REPEATED failure trips the fuse;
+        // an unknown effect still stops creation until it is observed.
+        let dataRoomCreateCalls = 0;
+        const dataRoomFailureCounts = new Map<string, number>();
         let dataRoomCreateEffectNeedsRefresh = false;
+        // Paced status reads: when each identical status call last ran.
+        const statusReadAt = new Map<string, number>();
 
         // Action-integrity gate (post-mortems 2026-08-04, twice in one day):
         // the model claimed "Saved! Item ID: ..." with ZERO tool calls — the
@@ -1530,7 +1781,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                         analyticsWidgetEditReceipt ? `Canonical edit receipt: ${JSON.stringify(analyticsWidgetEditReceipt)}` : 'No canonical edit receipt exists; nothing was changed.',
                         'If the edit is supported and no receipt exists, call edit_analytics_dashboard once. Otherwise state the exact scoped limitation. Include every required exact anchor and one canonical scoped title/dataset term. Do not discuss another business domain.',
                       ].join('\n')
-                    : 'CONTEXT GROUNDING CHECK (internal system message — the owner cannot see it and you must not mention it): your previous draft did not name anything from the complete selected analytics contexts and was therefore rejected. Re-read the ACTIVE WORKFLOW context files. Respond using discovered presets, business domains, tables, measures, dimensions, filters, or analysis patterns. Recommend a concrete dashboard direction and ask no more than one targeted business-semantic question. Do not repeat a generic decision/metrics questionnaire.',
+                    : 'CONTEXT GROUNDING CHECK (internal system message — the owner cannot see it and you must not mention it): your previous draft did not name anything from the complete selected analytics contexts and was therefore rejected. Re-read the ACTIVE WORKFLOW context files and ground the work in their presets, business domains, tables, measures, dimensions, filters, or analysis patterns. Then act: build the dashboard or analysis with defensible defaults and say which defaults you chose. Ask one targeted business question only when the work cannot proceed without the answer. Never send a generic decision/metrics questionnaire.',
                 });
                 continue;
               }
@@ -1569,7 +1820,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               content += '\n\n---\n⚠️ *System note: no data-modifying tool ran in this turn, so despite the wording above nothing was actually created or changed.*';
             }
 
-            content = withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds);
+            content = forTranscript(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds));
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -1724,7 +1975,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             // arguments IS the designed monitoring loop (each call returns
             // fresh progress), so the repeat-breaker must not nudge or
             // kill-switch it. The session timeout bounds the total wait.
+            // Status reads (run, job, dashboard, Data Room job) legitimately
+            // repeat while work progresses: they run again, paced to one
+            // identical call per STATUS_READ_PACE_MS. wait_for_etl_run waits
+            // server-side, like wait_for_terminal.
+            const pacedStatusRead = isPacedStatusRead(tc.function.name, tc.function.arguments);
             const repeatExempt =
+              pacedStatusRead ||
+              tc.function.name === 'wait_for_etl_run' ||
               tc.function.name === 'wait_for_terminal' ||
               tc.function.name === 'read_terminal' ||
               tc.function.name === 'browser_hands' ||
@@ -1732,27 +1990,29 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               tc.function.name === 'publish_static_artifact_to_harmony';
             const repeats = repeatExempt ? 0 : (seenToolCalls.get(repeatKey) ?? 0);
             if (!repeatExempt) seenToolCalls.set(repeatKey, repeats + 1);
-            if (repeats === 0 && isDataRoomCreateAttempt && admittedDataRoomJobId) {
+            const sameFailureRepeats = Math.max(0, ...dataRoomFailureCounts.values());
+            if (repeats === 0 && isDataRoomCreateAttempt && (sameFailureRepeats >= DATA_ROOM_SAME_FAILURE_BLOCK || dataRoomCreateCalls >= DATA_ROOM_MAX_CREATE_CALLS)) {
               result = {
                 content: JSON.stringify(createDataRoomToolFailure({
                   tool: 'create_data_room_dataset',
-                  code: 'durable_job_already_admitted',
-                  message: `This owner turn already admitted durable job ${admittedDataRoomJobId}; another create plan was not executed.`,
+                  code: 'repair_budget_exhausted',
+                  message: sameFailureRepeats >= DATA_ROOM_SAME_FAILURE_BLOCK
+                    ? `The same validation failure came back ${sameFailureRepeats} times in this turn; this create was not executed.`
+                    : `This turn already made ${dataRoomCreateCalls} create calls; this one was not executed.`,
                   issues: [dataRoomIssue({
-                    code: 'status_required_after_admission',
+                    code: 'too_many_create_attempts',
                     path: 'action',
-                    message: 'Once a durable job ID exists, the source/plan is immutable for this owner request.',
-                    expected: { kind: 'relation', description: `Use {"action":"status","jobId":"${admittedDataRoomJobId}"}.` },
-                    received: 'create',
+                    message: 'Validation failures are free until the same failure repeats; this turn has reached the repeat limit.',
+                    expected: { kind: 'range', type: 'integer', maximum: DATA_ROOM_MAX_CREATE_CALLS },
+                    received: dataRoomCreateCalls + 1,
                     includeReceivedValue: true,
                   })],
-                  nextAction: `Observe ${admittedDataRoomJobId} with action=status; never resubmit or replace its source in this owner turn.`,
+                  nextAction: 'Stop creating in this turn. Report the unresolved issue paths and what you tried; a later turn may resume from the corrected plan.',
                   status: 'blocked',
                   phase: 'admission',
                   category: 'conflict',
-                  retryClass: 'observe_existing',
+                  retryClass: 'new_owner_request',
                   effect: dataRoomNoEffect(),
-                  target: { jobId: admittedDataRoomJobId },
                 })),
                 isError: true,
               };
@@ -1779,33 +2039,31 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 })),
                 isError: true,
               };
-            } else if (repeats === 0 && isDataRoomCreateAttempt && dataRoomCreateAttempts >= MAX_DATA_ROOM_CREATE_ATTEMPTS) {
-              result = {
-                content: JSON.stringify(createDataRoomToolFailure({
-                  tool: 'create_data_room_dataset',
-                  code: 'repair_budget_exhausted',
-                  message: `The bounded ${MAX_DATA_ROOM_CREATE_ATTEMPTS}-attempt Data Room creation budget is exhausted; this additional plan was not executed.`,
-                  issues: [dataRoomIssue({
-                    code: 'too_many_create_attempts',
-                    path: 'action',
-                    message: 'This turn permits at most four distinct executed create attempts; semantic-hash derivation and status calls do not count.',
-                    expected: { kind: 'range', type: 'integer', maximum: MAX_DATA_ROOM_CREATE_ATTEMPTS },
-                    received: dataRoomCreateAttempts + 1,
-                    includeReceivedValue: true,
-                  })],
-                  nextAction: 'Stop creating in this turn and report the latest unresolved structured issue paths. A later ordinary owner request may resume from the corrected plan; no special confirmation phrase is required.',
-                  status: 'blocked',
-                  phase: 'admission',
-                  category: 'conflict',
-                  retryClass: 'new_owner_request',
-                  effect: dataRoomNoEffect(),
-                })),
-                isError: true,
-              };
             } else if (repeats === 0) {
-              if (isDataRoomCreateAttempt) dataRoomCreateAttempts += 1;
+              if (isDataRoomCreateAttempt) dataRoomCreateCalls += 1;
+              if (pacedStatusRead) {
+                const lastRanAt = statusReadAt.get(repeatKey);
+                const waitMs = lastRanAt === undefined ? 0 : STATUS_READ_PACE_MS - (Date.now() - lastRanAt);
+                if (waitMs > 0) {
+                  await new Promise<void>((resolve) => {
+                    const timer = setTimeout(resolve, waitMs);
+                    turnState.abortController.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+                  });
+                }
+                statusReadAt.set(repeatKey, Date.now());
+              }
               let blockingKeepalive: ReturnType<typeof setInterval> | undefined;
-              if (tc.function.name === 'wait_for_terminal') {
+              const etlStatus = ETL_TOOL_STATUS[tc.function.name];
+              if (etlStatus) {
+                // Runs, waits, downloads, and shell commands may hold this call
+                // for up to 10 minutes; keep the stream alive meanwhile.
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: etlStatus })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: tool-wait ${Date.now()}\n\n`); } catch {}
+                }, 10000);
+              } else if (tc.function.name === 'wait_for_terminal') {
                 // Blocking waits can hold this tool call for up to 10 minutes;
                 // keep the SSE stream alive so the browser doesn't drop it.
                 try {
@@ -1907,8 +2165,28 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 writeToolCalled = true;
               }
               if (isDataRoomCreateAttempt) {
-                admittedDataRoomJobId ??= dataRoomDurableJobId(result?.content);
-                dataRoomCreateEffectNeedsRefresh ||= dataRoomCreateEffectNeedsObservation(result?.content);
+                // An admitted job is observed through status; another import
+                // from a different source may still run in this turn.
+                dataRoomCreateEffectNeedsRefresh ||= dataRoomCreateEffectNeedsObservation(result?.content)
+                  && !dataRoomDurableJobId(result?.content);
+                const signature = dataRoomFailureSignature(result?.content);
+                if (signature) {
+                  const count = (dataRoomFailureCounts.get(signature) ?? 0) + 1;
+                  dataRoomFailureCounts.set(signature, count);
+                  if (count >= DATA_ROOM_SAME_FAILURE_STOP && typeof result?.content === 'string') {
+                    result = { ...result, content: withRepeatedFailureStop(result.content, count) };
+                  }
+                }
+              }
+              // The job's working set keeps what this call produced (files,
+              // datasets, dashboards) for later turns and continuations.
+              const recordJobId = continuation?.job.id ?? chatJobs?.activeJob()?.id;
+              if (chatJobs && recordJobId && !result?.isError) {
+                try {
+                  recordToolOutcome(chatJobs, recordJobId, tc.function.name, tc.function.arguments, String(result?.content ?? ''));
+                } catch (error: any) {
+                  console.warn(`[Chat] Job working-set update failed: ${error?.message ?? error}`);
+                }
               }
             } else {
               if (repeats >= 2) toolsDisabled = true;
@@ -2112,13 +2390,20 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // A provider change ends the turn without another model call: the
         // turn is pinned to the old provider and must not receive more data.
         const providerChanged = activeChatTurns.get(turnId)?.providerChanged === true;
-        res.write(`data: ${JSON.stringify({ type: 'status', text: providerChanged ? '⏹️ AI model changed in Settings — stopping...' : stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
+        // A continuation the owner preempted or stopped ends with a fixed
+        // line and no summary call: the owner is already steering.
+        const endReason = turnState.endReason;
+        res.write(`data: ${JSON.stringify({ type: 'status', text: providerChanged ? '⏹️ AI model changed in Settings — stopping...' : endReason ? '⏹️ Stopping...' : stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
         let finalContent = providerChanged
           ? PROVIDER_CHANGED_STOP_TEXT
+          : endReason === 'preempted'
+          ? CONTINUATION_PREEMPTED_TEXT
+          : endReason === 'job_stopped'
+          ? JOB_STOPPED_TEXT
           : stoppedByUser
           ? '⏹️ Stopped at your request. The work done so far is preserved above; tell me when to continue.'
           : `Reached the runaway ceiling of ${HARD_ITERATION_CEILING} tool iterations — stopping to be safe.`;
-        if (!providerChanged) try {
+        if (!providerChanged && !endReason) try {
           messages.push({
             role: 'user',
             content: stoppedByUser
@@ -2152,7 +2437,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
-        finalContent = withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds);
+        finalContent = forTranscript(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds));
         const capId = `asst-${Date.now()}`;
         if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);
@@ -2165,9 +2450,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           try { res.end(); } catch {}
         } else if (interrupted?.stopRequested) {
           const stopId = `asst-${Date.now()}`;
-          const stopText = interrupted.providerChanged
+          const stopText = forTranscript(interrupted.providerChanged
             ? PROVIDER_CHANGED_STOP_TEXT
-            : '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.';
+            : interrupted.endReason === 'preempted'
+              ? CONTINUATION_PREEMPTED_TEXT
+              : interrupted.endReason === 'job_stopped'
+                ? JOB_STOPPED_TEXT
+                : '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.');
           if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(stopId, 'assistant', stopText);
           try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: stopId, role: 'assistant', content: stopText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           try { res.end(); } catch {}
@@ -2180,7 +2469,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // survives even though the turn died.
           try {
             const failId = `asst-${Date.now()}`;
-            const failText = `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`;
+            const failText = forTranscript(continuation
+              ? `⚠️ This automatic continuation failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Work completed before the failure is in place. Reply in chat to continue the job.`
+              : `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`);
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(failId, 'assistant', failText);
             try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: failId, role: 'assistant', content: failText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           } catch {
@@ -2191,7 +2482,18 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       } finally {
         res.off('close', handleResponseClose);
         unregisterShutdownWork?.();
+        // D4: a job this owner turn started (or continued) keeps its model
+        // and thinking for the continuations that follow.
+        if (chatJobs && !continuation) {
+          try {
+            const active = chatJobs.activeJob();
+            if (active) chatJobs.touch(active.id, { modelKey: jobModelKey, thinking: thinkingLevel });
+          } catch (error: any) {
+            console.warn(`[Chat] Job touch failed: ${error?.message ?? error}`);
+          }
+        }
         activeChatTurns.delete(turnId);
+        resolveTurnFinished();
       }
       return;
     }
@@ -2215,7 +2517,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   // ── Agent-initiated messages (agent can push messages to chat) ──
 
   router.post('/chat/agent-message', (req: Request, res: Response) => {
-    const { message } = req.body;
+    // BotBoy's own producers (dashboard escalation) carry the in-memory
+    // secret; nothing else may post as the assistant.
+    if (continuations && !continuationSecretMatches(continuations.secret, req.get(CONTINUATION_HEADER))) {
+      return res.status(403).json({ error: 'Agent messages come only from BotBoy itself.' });
+    }
+    const { message } = req.body ?? {};
     if (!message) return res.status(400).json({ error: 'message is required' });
     const db = deps.db;
     if (!db) return res.status(503).json({ error: 'DB not available' });

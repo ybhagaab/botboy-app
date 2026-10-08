@@ -70,7 +70,8 @@ export interface DataRoomFailureIssueV1 {
 
 export interface DataRoomFailureAuthorizationV1 {
   decision: 'allowed' | 'denied' | 'not_evaluated';
-  callerClass: 'interactive_owner_chat' | 'background_agent' | 'unknown';
+  /** owner_job_continuation: a turn BotBoy started to continue the owner's active job (job-mandate.ts). */
+  callerClass: 'interactive_owner_chat' | 'owner_job_continuation' | 'background_agent' | 'unknown';
   requiredAuthority: string;
   checks: Array<{
     gate: DataRoomAuthorizationGate;
@@ -226,7 +227,7 @@ export function prefixDataRoomIssues(
 }
 
 export function dataRoomAuthorization(input: {
-  callerKind?: 'interactive' | 'background';
+  callerKind?: 'interactive' | 'background' | 'continuation';
   requiredAuthority: string;
   checks?: DataRoomFailureAuthorizationV1['checks'];
   decision?: DataRoomFailureAuthorizationV1['decision'];
@@ -240,9 +241,11 @@ export function dataRoomAuthorization(input: {
     decision: input.decision ?? (checks.length ? (checks.every(check => check.passed) ? 'allowed' : 'denied') : 'not_evaluated'),
     callerClass: input.callerKind === 'interactive'
       ? 'interactive_owner_chat'
-      : input.callerKind === 'background'
-        ? 'background_agent'
-        : 'unknown',
+      : input.callerKind === 'continuation'
+        ? 'owner_job_continuation'
+        : input.callerKind === 'background'
+          ? 'background_agent'
+          : 'unknown',
     requiredAuthority: boundedText(input.requiredAuthority, 500, 'Data Room tool authority'),
     checks,
   };

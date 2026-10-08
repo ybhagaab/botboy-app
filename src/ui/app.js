@@ -445,37 +445,18 @@ function initChatAttachments() {
   }
 }
 
-async function sendChat(msg) {
-  const chatEl = document.getElementById('chat-messages');
-
-  // Consume pending image attachments for THIS turn (already uploaded; the
-  // body carries their ids). Strip clears immediately — they now belong to
-  // the user bubble below.
-  const turnAttachments = pendingChatAttachments.splice(0, pendingChatAttachments.length);
-  renderChatAttachStrip();
-  const requestContext = activeChatRequestContext(msg) || {};
-  const replayKey = chatRequestReplayKey(msg, requestContext, turnAttachments.map(attachment => attachment.id));
-  // Keep one pending ID across a dropped response/manual resend. The server
-  // binds that ID to exact message/scope/intent and rejects any collision.
-  const requestId = acquireChatRequestId({ replayKey });
-
-  // Append user bubble directly to DOM (no full rebuild — that would wipe frozen assistant bubbles from prior turns)
-  const userBubble = document.createElement('div');
-  userBubble.className = 'chat-msg user';
-  userBubble.innerHTML = renderChatMsgInner({
-    role: 'user',
-    content: msg,
-    attachments: turnAttachments.map(a => ({ id: a.id, url: `/api/chat/attachments/${a.id}` })),
-  });
-  chatEl.appendChild(userBubble);
-  chatEl.scrollTop = chatEl.scrollHeight;
-
+/**
+ * One streamed assistant bubble: the segment model (thinking, tool cards,
+ * text) and the SSE event handling shared by the owner's own turns
+ * (sendChat) and BotBoy's automatic continuation turns (the live view).
+ * hooks.onDone(event) and hooks.onToolResult(event) add caller effects.
+ */
+function createChatStreamBubble(chatEl, hooks = {}) {
   // Segment model — data-driven rendering
   const segments = []; // { type: 'thinking'|'tool_call'|'text', ... }
   const msgEl = document.createElement('div');
   msgEl.className = 'chat-msg assistant streaming-live';
   chatEl.appendChild(msgEl);
-  setChatStreaming(true);
 
   function autoScroll() {
     const isNearBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 100;
@@ -527,6 +508,268 @@ async function sendChat(msg) {
   // Helper: get or create the last segment of a given type
   function lastSeg(type) { return segments.length > 0 && segments[segments.length - 1].type === type ? segments[segments.length - 1] : null; }
 
+  function freeze() {
+    msgEl.classList.remove('streaming-live');
+    msgEl.classList.add('streaming-frozen');
+  }
+
+  /** Applies one SSE event to the bubble. */
+  function handle(event) {
+    if (!event || typeof event !== 'object') return;
+    if (event.type === 'thinking') {
+      let seg = lastSeg('thinking');
+      if (!seg || seg.complete) {
+        seg = { type: 'thinking', content: '', complete: false };
+        segments.push(seg);
+      }
+      seg.content += event.text;
+      scheduleRender();
+
+    } else if (event.type === 'token') {
+      let seg = lastSeg('text');
+      if (!seg) {
+        seg = { type: 'text', content: '' };
+        segments.push(seg);
+      } else if (seg._isStatus) {
+        // Status text is transient UI, never part of the assistant reply.
+        seg.content = '';
+        seg._isStatus = false;
+      }
+      seg.content += event.text;
+      scheduleRender();
+
+    } else if (event.type === 'status') {
+      // Show as transient text if no real content yet
+      let seg = lastSeg('text');
+      if (!seg) {
+        seg = { type: 'text', content: event.text };
+        segments.push(seg);
+        seg._isStatus = true;
+      } else if (seg._isStatus) {
+        seg.content = event.text; // replace status text
+      }
+      scheduleRender();
+
+    } else if (event.type === 'tool_start') {
+      // Close any open thinking block
+      const openThink = segments.find(s => s.type === 'thinking' && !s.complete);
+      if (openThink) openThink.complete = true;
+      // Clear status text
+      const statusSeg = segments.find(s => s._isStatus);
+      if (statusSeg) { statusSeg.content = ''; statusSeg._isStatus = false; }
+      // Interim prose before a tool call stays visible: natural progress
+      // narration ("found the CSV, checking the DB now") is useful. The
+      // old Goal/Plan boilerplate was fixed at its source (the system
+      // prompt), not by deleting the model's words here.
+
+      segments.push({ type: 'tool_call', id: event.index, name: event.name, args: '', status: 'pending', result: null });
+      scheduleRender();
+
+    } else if (event.type === 'tool_args') {
+      // Append args to the last pending tool_call
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i].type === 'tool_call' && segments[i].status !== 'done') {
+          segments[i].args += event.text;
+          break;
+        }
+      }
+      scheduleRender();
+
+    } else if (event.type === 'tool') {
+      // Mark matching tool as running
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i].type === 'tool_call' && segments[i].name === event.name && segments[i].status !== 'done') {
+          segments[i].status = 'running';
+          break;
+        }
+      }
+      scheduleRender();
+
+    } else if (event.type === 'tool_result') {
+      // Find matching tool and set result
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i].type === 'tool_call' && segments[i].name === event.name && segments[i].status !== 'done') {
+          segments[i].status = 'done';
+          segments[i].result = event.preview || null;
+          break;
+        }
+      }
+      if (typeof hooks.onToolResult === 'function') hooks.onToolResult(event);
+      scheduleRender();
+
+    } else if (event.type === 'done') {
+      // Close any open thinking
+      segments.forEach(s => { if (s.type === 'thinking') s.complete = true; });
+
+      // The terminal message is authoritative. Server-side integrity
+      // gates may append a receipt or replace rejected model prose only
+      // after streaming has finished, so reconcile the final visible
+      // text segment before freezing while preserving thinking/tool cards.
+      for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i]._isStatus) segments.splice(i, 1);
+      }
+      const authoritativeContent = event.message && typeof event.message.content === 'string'
+        ? event.message.content
+        : null;
+      if (authoritativeContent !== null) {
+        let finalTextIndex = -1;
+        for (let i = segments.length - 1; i >= 0; i--) {
+          if (segments[i].type === 'text') {
+            finalTextIndex = i;
+            break;
+          }
+        }
+        if (finalTextIndex >= 0) {
+          segments[finalTextIndex].content = authoritativeContent;
+          segments[finalTextIndex]._isStatus = false;
+        } else {
+          segments.push({ type: 'text', content: authoritativeContent });
+        }
+      }
+      renderSegments();
+      hydrateChatCards(msgEl); // expand any [[lesson:…]] / [[gmail-draft:…]] markers the finished turn produced
+      // Mark the bubble as FROZEN so the 5s chat poll doesn't wipe the rich segment UI
+      freeze();
+      if (event.message && event.message.id) msgEl.dataset.msgId = event.message.id;
+      if (typeof hooks.onDone === 'function') hooks.onDone(event);
+
+    } else if (event.type === 'retry') {
+      // Server is retrying due to a transient network error. Purge tokens/tool_args
+      // from the CURRENT (in-progress) iteration so the retry doesn't double-render.
+      // We keep completed tool cards (status=done) and their thinking blocks since those
+      // are finalized state. The last open 'text' (current iter's content) and any
+      // in-flight tool_call with pending args get cleaned.
+      for (let k = segments.length - 1; k >= 0; k--) {
+        const s = segments[k];
+        if (s.type === 'tool_call' && s.status !== 'done') {
+          // In-flight tool call got torn down — drop it
+          segments.splice(k, 1);
+        } else if (s.type === 'text' && !s._isStatus) {
+          // Drop the current in-progress text content (will be regenerated)
+          segments.splice(k, 1);
+        } else if (s.type === 'thinking' && !s.complete) {
+          // Drop in-progress thinking (will be regenerated)
+          segments.splice(k, 1);
+        }
+      }
+      // Show a subtle retry notice
+      segments.push({ type: 'text', content: `↻ ${event.message || 'Retrying...'}`, _isStatus: true });
+      renderSegments();
+
+    } else if (event.type === 'error') {
+      segments.push({ type: 'text', content: `❌ Error: ${event.error}` });
+      renderSegments();
+      freeze();
+    }
+  }
+
+  /** Reads an SSE body to its end, applying each `data:` event. */
+  async function consume(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          handle(JSON.parse(line.slice(6)));
+        } catch {}
+      }
+    }
+  }
+
+  /** Shows a failure line and freezes the bubble. */
+  function fail(text) {
+    segments.push({ type: 'text', content: text });
+    renderSegments();
+    freeze();
+  }
+
+  const isLive = () => msgEl.classList.contains('streaming-live');
+
+  /**
+   * Safety net: if stream ended without a `done` or `error` event (e.g. connection
+   * dropped, backend sent malformed SSE, ALB timeout), freeze the bubble anyway
+   * so the 5s chat poll doesn't wipe it and so the user can see partial output.
+   */
+  function finishIfLive(text) {
+    if (!isLive()) return;
+    if (!segments.length || !segments.some(s => s.type === 'text' && s.content.startsWith('❌'))) {
+      segments.push({ type: 'text', content: text });
+      renderSegments();
+    }
+    freeze();
+  }
+
+  return { msgEl, segments, handle, consume, fail, finishIfLive, isLive };
+}
+
+/** Effects of a finished tool call that other surfaces react to (both turn kinds). */
+function chatToolResultEffects(event) {
+  if (['write_file', 'publish_static_artifact_to_harmony', 'browser_screenshot', 'assign_project_artifact'].includes(event.name)) {
+    window.dispatchEvent(new CustomEvent('botboy:project-artifact-changed', { detail: { tool: event.name } }));
+  }
+  // The agent opened/closed an embedded terminal — sync the dock now
+  // so the card appears while the agent is still talking.
+  if (event.name === 'open_terminal' || event.name === 'close_terminal') {
+    void checkChatTerminal();
+  }
+}
+
+async function sendChat(msg) {
+  const chatEl = document.getElementById('chat-messages');
+
+  // Consume pending image attachments for THIS turn (already uploaded; the
+  // body carries their ids). Strip clears immediately — they now belong to
+  // the user bubble below.
+  const turnAttachments = pendingChatAttachments.splice(0, pendingChatAttachments.length);
+  renderChatAttachStrip();
+  const requestContext = activeChatRequestContext(msg) || {};
+  const replayKey = chatRequestReplayKey(msg, requestContext, turnAttachments.map(attachment => attachment.id));
+  // Keep one pending ID across a dropped response/manual resend. The server
+  // binds that ID to exact message/scope/intent and rejects any collision.
+  const requestId = acquireChatRequestId({ replayKey });
+
+  // The owner's message preempts an automatic continuation on the server;
+  // its bubble closes here so the poll can show the persisted note.
+  closeChatLiveBubble();
+
+  // Append user bubble directly to DOM (no full rebuild — that would wipe frozen assistant bubbles from prior turns)
+  const userBubble = document.createElement('div');
+  userBubble.className = 'chat-msg user';
+  userBubble.innerHTML = renderChatMsgInner({
+    role: 'user',
+    content: msg,
+    attachments: turnAttachments.map(a => ({ id: a.id, url: `/api/chat/attachments/${a.id}` })),
+  });
+  chatEl.appendChild(userBubble);
+  chatEl.scrollTop = chatEl.scrollHeight;
+
+  const bubble = createChatStreamBubble(chatEl, {
+    onToolResult(event) {
+      if (event.name === 'create_analytics_dashboard' && /"ok"\s*:\s*true/.test(event.preview || '')) {
+        clearChatRequestContext();
+      }
+      chatToolResultEffects(event);
+    },
+    onDone(event) {
+      // Only the authoritative terminal event retires the pending ID.
+      // A dropped stream keeps it so an exact manual resend replays.
+      completeChatRequestId(requestId);
+      state.chatMessages.push(event.message);
+      // Link the reply's project mentions now rather than on the next poll.
+      linkifyRenderedProjectMentions();
+    },
+  });
+  setChatStreaming(true);
+
   try {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
@@ -552,217 +795,145 @@ async function sendChat(msg) {
       } catch {}
       console.error('[sendChat] HTTP error response:', resp.status, errText);
       if (resp.status === 409) void refreshAiModelReadiness();
-      segments.push({ type: 'text', content: friendly || `❌ Error ${resp.status}: ${errText}` });
-      renderSegments();
-      msgEl.classList.remove('streaming-live');
-      msgEl.classList.add('streaming-frozen');
+      bubble.fail(friendly || `❌ Error ${resp.status}: ${errText}`);
       return;
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    await bubble.consume(resp.body);
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const event = JSON.parse(line.slice(6));
-
-          if (event.type === 'thinking') {
-            let seg = lastSeg('thinking');
-            if (!seg || seg.complete) {
-              seg = { type: 'thinking', content: '', complete: false };
-              segments.push(seg);
-            }
-            seg.content += event.text;
-            scheduleRender();
-
-          } else if (event.type === 'token') {
-            let seg = lastSeg('text');
-            if (!seg) {
-              seg = { type: 'text', content: '' };
-              segments.push(seg);
-            } else if (seg._isStatus) {
-              // Status text is transient UI, never part of the assistant reply.
-              seg.content = '';
-              seg._isStatus = false;
-            }
-            seg.content += event.text;
-            scheduleRender();
-
-          } else if (event.type === 'status') {
-            // Show as transient text if no real content yet
-            let seg = lastSeg('text');
-            if (!seg) {
-              seg = { type: 'text', content: event.text };
-              segments.push(seg);
-              seg._isStatus = true;
-            } else if (seg._isStatus) {
-              seg.content = event.text; // replace status text
-            }
-            scheduleRender();
-
-          } else if (event.type === 'tool_start') {
-            // Close any open thinking block
-            const openThink = segments.find(s => s.type === 'thinking' && !s.complete);
-            if (openThink) openThink.complete = true;
-            // Clear status text
-            const statusSeg = segments.find(s => s._isStatus);
-            if (statusSeg) { statusSeg.content = ''; statusSeg._isStatus = false; }
-            // Interim prose before a tool call stays visible: natural progress
-            // narration ("found the CSV, checking the DB now") is useful. The
-            // old Goal/Plan boilerplate was fixed at its source (the system
-            // prompt), not by deleting the model's words here.
-
-            segments.push({ type: 'tool_call', id: event.index, name: event.name, args: '', status: 'pending', result: null });
-            scheduleRender();
-
-          } else if (event.type === 'tool_args') {
-            // Append args to the last pending tool_call
-            for (let i = segments.length - 1; i >= 0; i--) {
-              if (segments[i].type === 'tool_call' && segments[i].status !== 'done') {
-                segments[i].args += event.text;
-                break;
-              }
-            }
-            scheduleRender();
-
-          } else if (event.type === 'tool') {
-            // Mark matching tool as running
-            for (let i = segments.length - 1; i >= 0; i--) {
-              if (segments[i].type === 'tool_call' && segments[i].name === event.name && segments[i].status !== 'done') {
-                segments[i].status = 'running';
-                break;
-              }
-            }
-            scheduleRender();
-
-          } else if (event.type === 'tool_result') {
-            // Find matching tool and set result
-            for (let i = segments.length - 1; i >= 0; i--) {
-              if (segments[i].type === 'tool_call' && segments[i].name === event.name && segments[i].status !== 'done') {
-                segments[i].status = 'done';
-                segments[i].result = event.preview || null;
-                break;
-              }
-            }
-            if (event.name === 'create_analytics_dashboard' && /"ok"\s*:\s*true/.test(event.preview || '')) {
-              clearChatRequestContext();
-            }
-            if (['write_file', 'publish_static_artifact_to_harmony', 'browser_screenshot', 'assign_project_artifact'].includes(event.name)) {
-              window.dispatchEvent(new CustomEvent('botboy:project-artifact-changed', { detail: { tool: event.name } }));
-            }
-            // The agent opened/closed an embedded terminal — sync the dock now
-            // so the card appears while the agent is still talking.
-            if (event.name === 'open_terminal' || event.name === 'close_terminal') {
-              void checkChatTerminal();
-            }
-            scheduleRender();
-
-          } else if (event.type === 'done') {
-            // Only the authoritative terminal event retires the pending ID.
-            // A dropped stream keeps it so an exact manual resend replays.
-            completeChatRequestId(requestId);
-            // Close any open thinking
-            segments.forEach(s => { if (s.type === 'thinking') s.complete = true; });
-
-            // The terminal message is authoritative. Server-side integrity
-            // gates may append a receipt or replace rejected model prose only
-            // after streaming has finished, so reconcile the final visible
-            // text segment before freezing while preserving thinking/tool cards.
-            for (let i = segments.length - 1; i >= 0; i--) {
-              if (segments[i]._isStatus) segments.splice(i, 1);
-            }
-            const authoritativeContent = event.message && typeof event.message.content === 'string'
-              ? event.message.content
-              : null;
-            if (authoritativeContent !== null) {
-              let finalTextIndex = -1;
-              for (let i = segments.length - 1; i >= 0; i--) {
-                if (segments[i].type === 'text') {
-                  finalTextIndex = i;
-                  break;
-                }
-              }
-              if (finalTextIndex >= 0) {
-                segments[finalTextIndex].content = authoritativeContent;
-                segments[finalTextIndex]._isStatus = false;
-              } else {
-                segments.push({ type: 'text', content: authoritativeContent });
-              }
-            }
-            renderSegments();
-            hydrateChatCards(msgEl); // expand any [[lesson:…]] / [[gmail-draft:…]] markers the finished turn produced
-            // Mark the bubble as FROZEN so the 5s chat poll doesn't wipe the rich segment UI
-            msgEl.classList.remove('streaming-live');
-            msgEl.classList.add('streaming-frozen');
-            if (event.message && event.message.id) msgEl.dataset.msgId = event.message.id;
-            state.chatMessages.push(event.message);
-            // Link the reply's project mentions now rather than on the next poll.
-            linkifyRenderedProjectMentions();
-
-          } else if (event.type === 'retry') {
-            // Server is retrying due to a transient network error. Purge tokens/tool_args
-            // from the CURRENT (in-progress) iteration so the retry doesn't double-render.
-            // We keep completed tool cards (status=done) and their thinking blocks since those
-            // are finalized state. The last open 'text' (current iter's content) and any
-            // in-flight tool_call with pending args get cleaned.
-            for (let k = segments.length - 1; k >= 0; k--) {
-              const s = segments[k];
-              if (s.type === 'tool_call' && s.status !== 'done') {
-                // In-flight tool call got torn down — drop it
-                segments.splice(k, 1);
-              } else if (s.type === 'text' && !s._isStatus) {
-                // Drop the current in-progress text content (will be regenerated)
-                segments.splice(k, 1);
-              } else if (s.type === 'thinking' && !s.complete) {
-                // Drop in-progress thinking (will be regenerated)
-                segments.splice(k, 1);
-              }
-            }
-            // Show a subtle retry notice
-            segments.push({ type: 'text', content: `↻ ${event.message || 'Retrying...'}`, _isStatus: true });
-            renderSegments();
-
-          } else if (event.type === 'error') {
-            segments.push({ type: 'text', content: `❌ Error: ${event.error}` });
-            renderSegments();
-            msgEl.classList.remove('streaming-live');
-            msgEl.classList.add('streaming-frozen');
-          }
-        } catch {}
-      }
-    }
-
-    // Safety net: if stream ended without a `done` or `error` event (e.g. connection
-    // dropped, backend sent malformed SSE, ALB timeout), freeze the bubble anyway
-    // so the 5s chat poll doesn't wipe it and so the user can see partial output.
-    if (msgEl.classList.contains('streaming-live')) {
+    if (bubble.isLive()) {
       console.warn('[sendChat] Stream ended without done/error event — freezing bubble');
-      if (!segments.length || !segments.some(s => s.type === 'text' && s.content.startsWith('❌'))) {
-        segments.push({ type: 'text', content: '⚠️ Stream ended unexpectedly (no done event)' });
-        renderSegments();
-      }
-      msgEl.classList.remove('streaming-live');
-      msgEl.classList.add('streaming-frozen');
+      bubble.finishIfLive('⚠️ Stream ended unexpectedly (no done event)');
     }
   } catch (e) {
     console.error('[sendChat] fetch/stream exception:', e);
-    segments.push({ type: 'text', content: `❌ Error: ${e.message || 'Request failed'}` });
-    renderSegments();
-    msgEl.classList.remove('streaming-live');
-    msgEl.classList.add('streaming-frozen');
+    bubble.fail(`❌ Error: ${e.message || 'Request failed'}`);
   } finally {
     setChatStreaming(false);
+    void refreshChatJobStrip();
   }
 }
+
+// ── Automatic continuation turns, live (ANALYTICS_AUTONOMY_PLAN.md D2) ──
+// When a watched ETL run finishes, BotBoy continues the job in chat on its
+// own. GET /chat/live replays that turn's events so far, then streams the
+// rest; the bubble renders exactly like an owner turn's.
+let chatLiveSource = null;
+let chatLiveTurn = null; // { turnKey, bubble, startedAt }
+
+function closeChatLiveBubble() {
+  if (!chatLiveTurn) return;
+  // A finished bubble stays; an unfinished one gives way to the persisted reply.
+  if (chatLiveTurn.bubble.isLive()) chatLiveTurn.bubble.msgEl.remove();
+  chatLiveTurn = null;
+}
+
+function handleChatLiveMessage(payload) {
+  const chatEl = document.getElementById('chat-messages');
+  if (!chatEl || !payload || typeof payload !== 'object') return;
+  if (payload.kind === 'begin') {
+    const info = payload.info || {};
+    if (typeof info.turnKey !== 'string' || !info.turnKey) return;
+    // A replay (reconnect) of the turn on screen starts its bubble over.
+    if (chatLiveTurn && chatLiveTurn.turnKey === info.turnKey && chatLiveTurn.bubble.isLive()) {
+      chatLiveTurn.bubble.msgEl.remove();
+      chatLiveTurn = null;
+    } else if (chatLiveTurn && chatLiveTurn.turnKey === info.turnKey) {
+      return; // already finished on screen
+    } else {
+      closeChatLiveBubble();
+    }
+    const bubble = createChatStreamBubble(chatEl, {
+      onToolResult: chatToolResultEffects,
+      onDone(event) {
+        if (event.message) state.chatMessages.push(event.message);
+        linkifyRenderedProjectMentions();
+        void refreshChatJobStrip();
+      },
+    });
+    bubble.msgEl.classList.add('continuation');
+    if (typeof info.note === 'string' && info.note) bubble.handle({ type: 'status', text: info.note });
+    chatLiveTurn = { turnKey: info.turnKey, bubble, startedAt: Date.now() };
+    void refreshChatJobStrip();
+  } else if (payload.kind === 'event') {
+    if (!chatLiveTurn || chatLiveTurn.turnKey !== payload.turnKey) return;
+    chatLiveTurn.bubble.handle(payload.event);
+  } else if (payload.kind === 'end') {
+    if (chatLiveTurn && chatLiveTurn.turnKey === payload.turnKey) closeChatLiveBubble();
+    void refreshChatJobStrip();
+  }
+}
+
+function connectChatLive() {
+  if (chatLiveSource || typeof EventSource === 'undefined') return;
+  chatLiveSource = new EventSource(`${API}/chat/live`);
+  chatLiveSource.onmessage = (message) => {
+    let payload;
+    try { payload = JSON.parse(message.data); } catch { return; }
+    handleChatLiveMessage(payload);
+  };
+}
+
+// ── Owner job strip (chat-jobs.ts): what BotBoy works on, and Stop ──
+function chatJobEsc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function renderChatJobStrip(payload) {
+  const strip = document.getElementById('chat-job-strip');
+  if (!strip) return;
+  const job = payload && payload.job;
+  if (!job || job.status !== 'active' || !/^cj_[a-f0-9]{24}$/.test(String(job.id || ''))) {
+    strip.hidden = true;
+    strip.innerHTML = '';
+    strip.classList.remove('continuing');
+    return;
+  }
+  const waiting = Array.isArray(job.waitingRuns) ? job.waitingRuns : [];
+  const goal = String(job.goal || '').replace(/\s+/g, ' ').trim();
+  const shortGoal = goal.length > 120 ? `${goal.slice(0, 117)}…` : goal;
+  // The state stays visible at any panel width; the goal truncates.
+  const progress = job.continuing
+    ? 'continuing now'
+    : waiting.length
+      ? `waiting for ${waiting.length} ETL run${waiting.length === 1 ? '' : 's'}`
+      : 'working';
+  const detail = [
+    goal,
+    ...waiting.map(run => `Run ${run.runId}${run.purpose ? ` (${run.purpose})` : ''}: ${run.remoteStatus || 'submitted'}`),
+    ...(waiting.length && !job.continuing ? [`BotBoy continues on its own when ${waiting.length === 1 ? 'it finishes' : 'they finish'}.`] : []),
+  ].join('\n');
+  strip.hidden = false;
+  strip.classList.toggle('continuing', Boolean(job.continuing));
+  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>Working on:</strong> ${chatJobEsc(shortGoal)}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(progress)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">Stop</button>`;
+}
+
+async function refreshChatJobStrip() {
+  let payload;
+  try { payload = await api('/chat/jobs/active'); } catch { return; }
+  renderChatJobStrip(payload);
+  // A live bubble whose turn ended while this tab was disconnected gives way
+  // to the persisted reply (the poll pauses while a bubble is live).
+  if (chatLiveTurn && chatLiveTurn.bubble.isLive() && !(payload && payload.job && payload.job.continuing)
+    && Date.now() - chatLiveTurn.startedAt > 15_000) {
+    closeChatLiveBubble();
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target && event.target.closest ? event.target.closest('[data-chat-job-stop]') : null;
+  if (!button) return;
+  const jobId = button.getAttribute('data-chat-job-stop') || '';
+  if (!/^cj_[a-f0-9]{24}$/.test(jobId)) return;
+  button.disabled = true;
+  button.textContent = 'Stopping…';
+  try {
+    await api(`/chat/jobs/${jobId}/stop`, { method: 'POST' });
+  } catch (error) {
+    console.warn('[chatJob] stop failed:', error);
+  }
+  await refreshChatJobStrip();
+});
 
 // ── Stop button for the in-flight chat turn ──
 // Cooperative: the server lets the current model/tool step finish, then the
@@ -3982,8 +4153,13 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
     } catch {}
   }, 3000);
 
+  // Owner jobs: the job strip, and continuation turns streamed live.
+  connectChatLive();
+  void refreshChatJobStrip();
+
   // Chat poll — detect new messages from DB
   setInterval(async () => {
+    void refreshChatJobStrip();
     const chatEl = document.getElementById('chat-messages');
     if (chatEl && chatEl.querySelector('.streaming-live')) return;
     const msgs = await api('/chat/history');

@@ -93,6 +93,19 @@ export function etlDashboardLaneUsable(
     && requiredToolsAvailable(server, ETL_REQUIRED_TOOLS);
 }
 
+/**
+ * Chat-side ETL lane: an enabled, configured a2-analytics that is starting,
+ * stopped, or degraded is still the ETL lane for chat, because a call to it
+ * starts the server and waits (mcp-manager.ts › ensureReady). The DATA LANE
+ * NOTICE once said "stop" while it was starting (ANALYTICS_AUTONOMY_PLAN.md).
+ * Dashboard execution keeps the strict running predicate above.
+ */
+export function etlChatLaneCallable(server: McpServerSnapshot | null | undefined): boolean {
+  if (!server || !server.enabled || !server.configured) return false;
+  if (server.state === 'running') return requiredToolsAvailable(server, ETL_REQUIRED_TOOLS);
+  return server.state === 'starting' || server.state === 'stopped' || server.state === 'degraded';
+}
+
 export function dashboardLaneAvailability(
   servers: McpServerSnapshot[] = [],
   etlRunnerPresent = true,

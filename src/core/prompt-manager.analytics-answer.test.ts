@@ -77,7 +77,10 @@ describe('direct Data Room chat prompt and tool contract', () => {
     expect(prompt).toContain('To import ANY local file');
     expect(prompt).toContain('inspect_local_file');
     expect(prompt).not.toContain('botboy_csv');
-    expect(prompt).toContain('up to four create attempts total');
+    // Validation failures are free until the same one repeats (ANALYTICS_AUTONOMY_PLAN.md P1).
+    expect(prompt).not.toContain('four create attempts');
+    expect(prompt).toContain('stop and report when the same failure comes back three times');
+    expect(prompt).toContain('Independent imports from different sources may each be created in the same turn');
     expect(prompt).toContain('existing durable AnalyticsJobService lifecycle');
     expect(prompt).toContain('Never use the old answer planner, choice workflow');
     expect(prompt).not.toContain('call answer_analytics ONCE');

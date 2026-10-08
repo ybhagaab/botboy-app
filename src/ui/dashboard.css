@@ -1940,6 +1940,17 @@ a.data-room-row:hover { background:var(--hover); }
 .chat-ai-model-notice span { min-width:0; flex:1; }
 .chat-ai-model-notice strong { display:block; color:var(--text); font-size:12px; }
 .chat-ai-model-notice .button { flex:0 0 auto; }
+/* Owner job strip: the job BotBoy works on, its waiting ETL runs, and Stop (ANALYTICS_AUTONOMY_PLAN.md). */
+.chat-job-strip:not([hidden]) { display:flex; align-items:center; gap:9px; margin:0 15px 8px; padding:8px 10px 8px 11px; border:1px solid var(--border-strong); border-radius:11px; color:var(--soft); background:var(--surface); font-size:11px; line-height:1.45; }
+.chat-job-strip .chat-job-dot { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--accent, #9d8cff); }
+.chat-job-strip.continuing .chat-job-dot { animation:chat-job-pulse 1.2s ease-in-out infinite; }
+.chat-job-strip .chat-job-text { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.chat-job-strip .chat-job-text strong { color:var(--text); font-weight:600; }
+.chat-job-strip .chat-job-state { flex:0 0 auto; color:var(--muted); white-space:nowrap; }
+.chat-job-strip .button { flex:0 0 auto; }
+@keyframes chat-job-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+@media (prefers-reduced-motion: reduce) { .chat-job-strip.continuing .chat-job-dot { animation:none; } }
+.chat-msg.assistant.continuation { border-left:2px solid var(--accent-soft, rgba(157,140,255,.35)); }
 
 /* Local folders: import states, big-file review, storage card
    (LOCAL_FOLDER_IMPORT_SAFETY_PLAN.md P1/P3). */

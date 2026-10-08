@@ -40,7 +40,7 @@ import type { McpManager } from './mcp-types.js';
 export type EtlToolCall = (
   toolName: string,
   args: Record<string, unknown>,
-  opts?: { ownerApproved?: boolean },
+  opts?: { ownerApproved?: boolean; signal?: AbortSignal },
 ) => Promise<{ isError: boolean; text: string; serverId?: string; toolName?: string }>;
 
 export const ETL_TOOL_TIMEOUT_MS = 5 * 60_000;
@@ -60,6 +60,7 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
       source: 'agent',
       timeoutMs: ETL_TOOL_TIMEOUT_MS,
       ownerApproved: opts.ownerApproved === true,
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
     let result;
     try {
@@ -111,6 +112,8 @@ export interface QueryRunResult {
   savedTo?: string;
   resultBytes?: number;
   resultSha256?: string;
+  /** alive_handoff from runQuery: the queue rescue (one PRIORITIZE) already ran. */
+  prioritized?: boolean;
   /** Non-ok: what happened, in one line the model can act on. */
   error?: string;
   /** Non-ok: the exact next action. Never leaves the model guessing. */
@@ -127,8 +130,18 @@ export interface QueryRunner {
     group?: string;
     /** Awaited immediately after submit returns the exact remote run identity. */
     onSubmitted?: (runId: string) => Promise<void> | void;
+    /** How long this call waits for the run (default: the runner's budget). */
+    pollBudgetMs?: number;
+    /** Stops WAITING (never the remote run); an aborted wait returns alive_handoff. */
+    signal?: AbortSignal;
   }): Promise<QueryRunResult>;
   readRun?(input: { runId: string }): Promise<QueryRunResult>;
+  /**
+   * The queue rescue runQuery applies after a minute, for a run whose wait
+   * ended before that point: one PRIORITIZE of an existing run (never a
+   * submit, restart, or kill). Callers use it only on BotBoy's own scratch runs.
+   */
+  prioritizeRun?(input: { runId: string }): Promise<{ ok: boolean; error?: string }>;
 }
 
 const KEYS = {
@@ -204,7 +217,16 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
   const now = options.now ?? Date.now;
   const downloadDir = options.downloadDir
     ?? path.join(os.homedir(), '.personal-productivity-tracker', 'etl-results');
-  const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+  const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
 
   function aliasForUser(): string {
     const identity = resolveOwnerIdentity(db);
@@ -526,7 +548,12 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     datasetDate?: string;
     group?: string;
     onSubmitted?: (runId: string) => Promise<void> | void;
+    pollBudgetMs?: number;
+    signal?: AbortSignal;
   }): Promise<QueryRunResult> {
+    const waitBudgetMs = input.pollBudgetMs !== undefined && Number.isFinite(input.pollBudgetMs)
+      ? Math.max(0, input.pollBudgetMs)
+      : pollBudgetMs;
     const sqlBody = String(input.sql ?? '').trim();
     if (!sqlBody) return { ok: false, error: 'sql required', nextAction: 'Call again with the SQL to run.' };
     const sql = DEP_HEADER_RE.test(sqlBody.slice(0, 500))
@@ -616,12 +643,14 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     // compute-slot QUEUE ordered strictly by priority bucket — restarting
     // forfeits the queue position (BDT wiki), so the rescue for a stuck run
     // is Datanet's own "Prioritized Run" bucket (91) via PRIORITIZE, once.
-    const deadline = now() + pollBudgetMs;
+    const deadline = now() + waitBudgetMs;
     const prioritizeAt = now() + prioritizeAfterMs;
     let prioritized = false;
     let status = 'SUBMITTED';
-    while (now() < deadline) {
-      await sleep(pollIntervalMs);
+    while (now() < deadline && !input.signal?.aborted) {
+      // Never sleep past the deadline: a short wait still gets its last poll.
+      await sleep(Math.max(0, Math.min(pollIntervalMs, deadline - now())), input.signal);
+      if (input.signal?.aborted) break;
       const poll = await call('datanet_get_job_run_status', { run_id: runId });
       if (poll.isError) continue; // transient poll failures never kill the run
       status = String(parseJson(poll.text).status ?? '').toUpperCase() || status;
@@ -663,13 +692,19 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       };
     }
     if (status !== 'SUCCESS') {
+      const waited = waitBudgetMs >= 120_000
+        ? `${Math.round(waitBudgetMs / 60_000)} minutes`
+        : `${Math.round(waitBudgetMs / 1000)} seconds`;
       return {
         ok: false,
         code: 'alive_handoff',
         runId,
         remoteStatus: status,
-        error: `Run ${runId} still ${status || 'running'} after ${Math.round(pollBudgetMs / 60000)} minutes.`,
+        error: input.signal?.aborted
+          ? `Run ${runId} is still ${status || 'running'}; this call stopped waiting.`
+          : `Run ${runId} still ${status || 'running'} after ${waited}.`,
         nextAction: `Do NOT resubmit — the run is alive. Dashboard consumers automatically reconcile this exact run when it succeeds; interactive callers can check it with mcp_etl_job_run (runId ${runId}).`,
+        ...(prioritized ? { prioritized: true } : {}),
       };
     }
 
@@ -682,5 +717,22 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     }
   }
 
-  return { id: 'etl', runQuery, readRun };
+  /**
+   * runQuery's queue rescue for a run whose wait ended first (live
+   * 2026-10-08: a canary handed off at 0 s sat WAITING_FOR_RESOURCES for over
+   * ten minutes because nothing prioritized it). One PRIORITIZE of an
+   * existing run; it never submits, restarts, or kills.
+   */
+  async function prioritizeRun(input: { runId: string }): Promise<{ ok: boolean; error?: string }> {
+    const runId = String(input.runId ?? '').trim();
+    if (!/^\d+$/.test(runId)) return { ok: false, error: 'Existing Datanet run id must be numeric.' };
+    const bump = await call('datanet_alter_run', {
+      run_id: runId,
+      action: 'PRIORITIZE', // Datanet validates these names case-sensitively
+      reason: 'BotBoy ad-hoc query queued behind batch work',
+    }, { ownerApproved: true });
+    return bump.isError ? { ok: false, error: firstLine(bump.text, 160) } : { ok: true };
+  }
+
+  return { id: 'etl', runQuery, readRun, prioritizeRun };
 }

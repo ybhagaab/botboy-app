@@ -388,6 +388,23 @@ describe('local-file Data Room lifecycle', () => {
     expect(env.counts()).toMatchObject({ datasets: 1, versions: 3 });
   });
 
+  // REGRESSION (chat logs 2026-10-07): the schema and the prompt allowed a
+  // coverage that proves no partition complete, but the service rejected
+  // completeRanges: [] and the import spent its attempts on it.
+  it('imports a file whose coverage proves no partition complete (completeRanges: [])', async () => {
+    const home = tempDir('local-file-home-');
+    const env = environment(home);
+    const file = write(path.join(home, 'Downloads', 'partial.csv'), 'date,metrics_name,total\n2026-09-01,app_open,10\n2026-09-02,app_open,12\n');
+    const partial = { ...target('2026-09-01', '2026-09-02'), coverage: { ...coverage('2026-09-01', '2026-09-02'), completeRanges: [] } };
+    const created = await env.service.prepareOrJoinAndWait(owner('partial'), plan(
+      { kind: 'local_file', alias: 'report', path: file, target: partial },
+      request('2026-09-01', '2026-09-02'),
+    ));
+    expect(created.status).toBe('completed');
+    const dataset = env.store.getDataset(created.result!.primary.datasetId)!;
+    expect(dataset.contract.coverage).toMatchObject({ observedPartitions: ['2026-09-01', '2026-09-02'], completePartitions: [] });
+  });
+
   it('rejects contract/file mismatches before any job, dataset, or version exists', async () => {
     const home = tempDir('local-file-home-');
     const env = environment(home);

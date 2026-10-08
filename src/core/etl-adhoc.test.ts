@@ -236,6 +236,17 @@ describe('etl-adhoc query runner', () => {
     expect(fake.countOf('datanet_submit_run')).toBe(1); // never restarted — queue position is sacred
   });
 
+  it('a queued run handed off after its rescue says so, so the watcher does not repeat it', async () => {
+    const fake = fakeEtl();
+    fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'WAITING_FOR_RESOURCES' }) }));
+    fake.when('datanet_alter_run', () => ({ isError: false, text: '{}' }));
+    const rescued = await runner(fake, { prioritizeAfterMs: 2, pollBudgetMs: 60 }).runQuery({ sql: 'select queued' });
+    expect(rescued).toMatchObject({ ok: false, code: 'alive_handoff', prioritized: true });
+    const early = await runner(fakeEtl(), { pollBudgetMs: 0 }).runQuery({ sql: 'select early', pollBudgetMs: 0 });
+    expect(early).toMatchObject({ code: 'alive_handoff' });
+    expect(early.prioritized).toBeUndefined();
+  });
+
   it('a busy pair is SKIPPED, not waited on: the pool grows and the query runs on a fresh pair', async () => {
     const fake = fakeEtl();
     const q = runner(fake);

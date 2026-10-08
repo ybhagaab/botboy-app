@@ -54,6 +54,8 @@ import type { DocumentReads } from '../../core/document-reads.js';
 import type { FolderImportScheduler } from '../../monitors/folder-import-scheduler.js';
 import type { StorageUsageService } from '../../core/storage-usage.js';
 import type { CaptureHealth } from '../../core/capture-health.js';
+import type { ChatJobStore } from '../../core/chat-jobs.js';
+import type { ContinuationBridge } from '../../core/chat-continuations.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -125,6 +127,10 @@ export interface RouterDeps {
   storageUsage?: StorageUsageService;
   /** Outcome-level capture health per source (Slack, SharePoint, Outlook). */
   captureHealth?: CaptureHealth;
+  /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
+  chatJobs?: ChatJobStore;
+  /** Continuation turns: secret, live hub, runner (chat-continuations.ts). */
+  chatContinuations?: ContinuationBridge;
 }
 
 /** Express 5 params can be string[]; normalize to a single string. */

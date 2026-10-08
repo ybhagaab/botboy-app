@@ -217,7 +217,16 @@ Datanet requires Python 3.10 or newer. Stock Xcode Python can be 3.9; if BotBoy
 cannot find a supported Python, install one (for example
 `brew install python@3.12`) and repeat the guided step. Reads and result
 downloads are autonomous. Submitting, restarting, prioritizing, or changing a
-pipeline happens only after you explicitly ask.
+production pipeline happens only after you explicitly ask.
+
+ETL queries take minutes. When you ask for an analysis or a dashboard, BotBoy
+runs its queries on its own scratch profile and keeps working on the request:
+a line above the chat box shows **Working on: …** with the runs it waits for.
+When a run finishes, BotBoy continues in the chat by itself (its reply starts
+with ↻), so you never need to ask it to check. An automatic continuation only
+does data work for that request; sending, publishing, or changing anything
+else still waits for you. Press **Stop** on that line to end the job. Your own
+message always goes first.
 
 #### Gmail
 

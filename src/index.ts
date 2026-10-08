@@ -16,7 +16,7 @@ import { createMcpServerFinder } from './core/mcp-registry-lookup.js';
 import { sqlContextExportDir } from './core/mcp-profiles.js';
 import { createSqlContextExportRunner } from './core/analytics-sql-export.js';
 import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
-import { createDashboardEtlRunner } from './core/analytics-runners.js';
+import { createDashboardEtlRunner, etlChatLaneCallable } from './core/analytics-runners.js';
 import { createAnalyticsScheduler } from './core/analytics-scheduler.js';
 import { createDashboardPublisherService } from './core/analytics-publisher.js';
 import { createAnalyticsDataRoomStore } from './core/analytics-data-room-store.js';
@@ -50,7 +50,11 @@ import { resolveOwnerIdentity } from './core/owner-identity.js';
 import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
-import { createToolExecutor } from './core/tool-executor.js';
+import { createToolExecutor, defaultEtlResultsDir } from './core/tool-executor.js';
+import { createChatJobStore } from './core/chat-jobs.js';
+import { createEtlRunWatcher } from './core/etl-run-watcher.js';
+import { CONTINUATION_HEADER, createContinuationBridge, createContinuationRunner } from './core/chat-continuations.js';
+import { withJobMandate } from './core/job-mandate.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
 import { createVisualAssetRegistry } from './core/visual-assets.js';
 import { createVisualInspector } from './core/visual-inspector.js';
@@ -633,7 +637,17 @@ async function main() {
   } catch (error) {
     console.warn(`[Gmail] Could not remove a staged Google client: ${(error as Error)?.message ?? error}`);
   }
+  // ── Owner jobs + ETL continuation (ANALYTICS_AUTONOMY_PLAN.md D1/D2) ──
+  // A job is the owner's request BotBoy works on; its ETL runs are watched
+  // (etl-run-watcher.ts) and a finished run continues the job in chat
+  // (chat-continuations.ts) under the job mandate (job-mandate.ts). Chat ETL
+  // results land in the files workspace, where the model's shell reads them.
+  const chatJobs = createChatJobStore(db);
+  const chatContinuations = createContinuationBridge();
+  const etlResultsDir = defaultEtlResultsDir();
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
+    chatJobs,
+    etlResultsDir,
     brainStore,
     mcpManager,
     analyticsService,
@@ -659,14 +673,48 @@ async function main() {
   // compose-only. The same compose service backs the chat draft card. Chat
   // images attach by their va_… id through the visual-asset registry.
   const gmailCompose = createGmailCompose({ db, connection: gmailConnection, attachments: defaultAttachmentPolicy(visualAssets) });
-  const toolExecutor = withGmailChatTools(
-    withProductDocumentChatTools(
-      baseToolExecutor,
-      productDocumentService,
-      productDocumentPublications,
+  // withJobMandate is the OUTERMOST wrapper: a continuation turn may reach
+  // only job-scope tools, before Gmail, document, or base handlers run.
+  const toolExecutor = withJobMandate(
+    withGmailChatTools(
+      withProductDocumentChatTools(
+        baseToolExecutor,
+        productDocumentService,
+        productDocumentPublications,
+      ),
+      { connection: gmailConnection, compose: gmailCompose },
     ),
-    { connection: gmailConnection, compose: gmailCompose },
+    { jobs: chatJobs },
   );
+  // The continuation runner calls this server's own chat route with the
+  // in-memory secret; it starts after final-ready (below).
+  const continuationRunner = createContinuationRunner({
+    jobs: chatJobs,
+    url: `http://${HOST === '::1' ? '[::1]' : '127.0.0.1'}:${PORT}/api/chat/messages`,
+    secret: chatContinuations.secret,
+    hub: chatContinuations.hub,
+    isTurnActive: () => chatContinuations.isTurnActive(),
+    postNote: (text) => {
+      db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)')
+        .run(`asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 'assistant', text);
+      const sessionId = conversationManager.getActiveSessionId('chat');
+      if (sessionId) conversationManager.appendAssistant(sessionId, text);
+    },
+    filesDir: path.dirname(etlResultsDir),
+  });
+  chatContinuations.bindRunner(continuationRunner);
+  // Read-only watcher over the job's runs, with its own runner (it never
+  // claims scratch pairs; readRun only reads status and downloads).
+  const etlWatchRunner = createEtlQueryRunner({ db, call: createEtlToolCall(mcpManager), downloadDir: etlResultsDir });
+  const etlRunWatcher = createEtlRunWatcher({
+    jobs: chatJobs,
+    readRun: (runId) => etlWatchRunner.readRun!({ runId }),
+    // runQuery's one queue rescue, for scratch runs handed off before it ran.
+    prioritizeRun: (runId) => etlWatchRunner.prioritizeRun!({ runId }),
+    // A stopped or starting a2-analytics is started by the call itself.
+    etlAvailable: async () => etlChatLaneCallable(await mcpManager.getServer('a2-analytics').catch(() => null)),
+    onRunsFinished: (jobId) => continuationRunner.request(jobId),
+  });
 
   // Backward-compat: llmClient implements sendPrompt() for components not yet migrated
   const acpClient = llmClient; // alias — same interface
@@ -746,9 +794,10 @@ async function main() {
       '',
       `_Automatic escalation from run ${event.runId} (${event.trigger}, ${event.lane} lane)._`,
     ].join('\n');
+    // The agent-message route admits only BotBoy itself (its in-memory secret).
     const response = await fetch(`http://localhost:${PORT}/api/chat/agent-message`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', [CONTINUATION_HEADER]: chatContinuations.secret },
       body: JSON.stringify({ message }),
     });
     if (!response.ok) throw new Error(`agent-message post failed: HTTP ${response.status}`);
@@ -1336,6 +1385,8 @@ async function main() {
       stop('midway-sentinel', () => midwaySentinel.stop());
       stop('chat-terminal', () => chatTerminal.shutdown());
       stop('folder-imports', () => folderImports.stop());
+      stop('etl-run-watcher', () => etlRunWatcher.stop());
+      stop('chat-continuations', () => continuationRunner.stop());
       stop('main-thread-watchdog', () => mainThreadWatchdog.stop());
       if (failures.length) throw new Error(`Quiesce failures: ${failures.join('; ')}`);
     },
@@ -1489,6 +1540,8 @@ async function main() {
     folderImports,
     storageUsage,
     captureHealth,
+    chatJobs,
+    chatContinuations,
   };
   app.use('/api', createRouter(routerDeps));
 
@@ -1554,6 +1607,11 @@ async function main() {
   // Background folder imports begin only now, after a settle delay.
   folderImports.start();
   console.log('✅ Folder imports scheduled (first pass in 30 s; big files wait for your review)');
+  // ETL watches resume from SQLite; a finished run continues its job in chat.
+  continuationRunner.start();
+  etlRunWatcher.start();
+  const activeJob = chatJobs.activeJob();
+  console.log(`✅ ETL run watcher active (every 30 s${activeJob ? `; job ${activeJob.id} has ${chatJobs.watchesForJob(activeJob.id).filter(watch => watch.status === 'pending').length} run(s) pending` : ''})`);
   console.log(`🔍 Tracking your activity. Dashboard: http://${HOST}:${PORT}`);
 
   // Every signal enters the same state machine. The first closes admission
