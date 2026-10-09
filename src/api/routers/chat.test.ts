@@ -107,3 +107,13 @@ describe('formatGmailAccountsBlock', () => {
     ]);
   });
 });
+
+
+describe('formatGmailAccountsBlock with send-as aliases', () => {
+  it('lists each account’s custom-domain addresses, even for one unlabelled account', async () => {
+    const { formatGmailAccountsBlock } = await import('./chat.js');
+    const block = formatGmailAccountsBlock([{ email: 'a@gmail.com', label: '', canCompose: true, needsReconnect: false, sendAs: ['hello@mybrand.dev'] }]);
+    expect(block).toContain('- (no label): a@gmail.com — also sends as hello@mybrand.dev');
+    expect(block).toContain('pass one as `from` to send from it');
+  });
+});

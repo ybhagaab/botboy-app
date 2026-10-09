@@ -103,6 +103,11 @@ export function resolveOwnerIdentity(db: Database.Database): OwnerIdentity {
   const ownEmails = [...new Set([
     ...(email.includes('@') ? [email] : []),
     ...(Array.isArray(directory) ? directory.map(entry => String(entry?.email ?? '').trim().toLowerCase()).filter(value => value.includes('@')) : []),
+    // Each account's verified send-as aliases (custom domains), stored by its sync.
+    ...((db.prepare("SELECT value FROM app_settings WHERE key = 'gmail_sync.send_as' OR key LIKE 'gmail_sync.acct.%.send_as'").all() as Array<{ value: string }>)
+      .flatMap(row => { try { const list = JSON.parse(row.value); return Array.isArray(list) ? list : []; } catch { return []; } })
+      .map((entry: any) => String(entry?.email ?? '').trim().toLowerCase())
+      .filter(value => value.includes('@'))),
   ])];
   return {
     known: nameTokens.length > 0 || alias.length > 0 || ownEmails.length > 0,

@@ -71,7 +71,7 @@ import { createSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
-import { createGmailSyncs, createGmailBrowserCaptureGate, isGmailWebEmailItem } from './monitors/gmail-sync.js';
+import { createGmailSyncs, createGmailBrowserCaptureGate, isGmailWebEmailItem, readGmailSendAs } from './monitors/gmail-sync.js';
 import { createGmailConnection } from './core/gmail-connection.js';
 import { createGmailCompose } from './core/gmail-compose.js';
 import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
@@ -672,7 +672,7 @@ async function main() {
   // Gmail in chat (GMAIL_CHAT_TOOLS_PLAN.md): search/read live, draft/send
   // compose-only. The same compose service backs the chat draft card. Chat
   // images attach by their va_… id through the visual-asset registry.
-  const gmailCompose = createGmailCompose({ db, connection: gmailConnection, attachments: defaultAttachmentPolicy(visualAssets) });
+  const gmailCompose = createGmailCompose({ db, connection: gmailConnection, attachments: defaultAttachmentPolicy(visualAssets), sendAsFor: accountId => readGmailSendAs(db, accountId) });
   // withJobMandate is the OUTERMOST wrapper: a continuation turn may reach
   // only job-scope tools, before Gmail, document, or base handlers run.
   const toolExecutor = withJobMandate(
@@ -1341,7 +1341,10 @@ async function main() {
   // The non-secret account directory (address + label) for owner identity and prompts.
   const writeGmailDirectory = () => {
     try {
-      setSetting(db, GMAIL_ACCOUNT_DIRECTORY_KEY, gmailConnection.accounts().map(account => ({ id: account.id, email: account.email, label: account.label })));
+      setSetting(db, GMAIL_ACCOUNT_DIRECTORY_KEY, gmailConnection.accounts().map(account => ({
+        id: account.id, email: account.email, label: account.label,
+        sendAs: readGmailSendAs(db, account.id).filter(identity => identity.email !== account.email).map(identity => identity.email),
+      })));
     } catch (error: any) {
       console.warn(`[Gmail] account directory write failed: ${error?.message ?? error}`);
     }

@@ -63,6 +63,8 @@ const KEYS = {
   import: 'gmail_sync.import',
   /** The import window's message ids, oldest first; written once per import. */
   importIds: 'gmail_sync.import_ids',
+  /** The account's verified send-as identities (GmailSendAs[]), refreshed every run. */
+  sendAs: 'gmail_sync.send_as',
 } as const;
 
 /** Settings keys other modules read (browser gate, DOMAIN.md). These are the `default` account's. */
@@ -299,6 +301,7 @@ export function createGmailSync(deps: {
       setSetting(db, KEYS.mailActive, false);
       setSetting(db, KEYS.import, null);
       setSetting(db, KEYS.importIds, []);
+      setSetting(db, KEYS.sendAs, []);
     })();
   }
 
@@ -438,7 +441,9 @@ export function createGmailSync(deps: {
   async function ownerOf(client: GmailClient, account: string): Promise<GmailOwner> {
     let aliases: string[] = [];
     try {
-      aliases = await client.listSendAsAddresses();
+      const identities = await client.listSendAs();
+      aliases = identities.map(identity => identity.email);
+      setSetting(db, KEYS.sendAs, identities);
     } catch (error) {
       // A dead grant fails the whole run at once (one refresh attempt, one
       // Reconnect message) instead of failing again on the next call.
@@ -978,7 +983,7 @@ export function createGmailSyncs(deps: {
         now: deps.now,
         account: () => accountFor(id),
         otherOwnAddresses: () => [
-          ...accountsNow().filter(account => account.id !== id).map(account => account.email),
+          ...accountsNow().filter(account => account.id !== id).flatMap(account => [account.email, ...readGmailSendAs(deps.db, account.id).map(identity => identity.email)]),
           ...(deps.extraOwnAddresses?.() ?? []),
         ],
       });
@@ -1061,4 +1066,14 @@ export function createGmailSyncs(deps: {
     },
     forAccount: (accountId) => syncs.get(accountId) ?? null,
   };
+}
+
+/** One account's stored send-as identities (empty until its first sync). */
+export function readGmailSendAs(db: Database.Database, accountId: string): Array<{ email: string; displayName: string; isPrimary: boolean; isDefault: boolean }> {
+  const value = getSetting<unknown>(db, gmailSyncKeysFor(accountId).sendAs);
+  return Array.isArray(value)
+    ? value.filter((entry: any) => entry && typeof entry.email === 'string').map((entry: any) => ({
+      email: String(entry.email).toLowerCase(), displayName: String(entry.displayName ?? ''), isPrimary: entry.isPrimary === true, isDefault: entry.isDefault === true,
+    }))
+    : [];
 }

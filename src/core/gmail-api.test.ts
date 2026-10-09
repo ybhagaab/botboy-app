@@ -414,3 +414,20 @@ describe('Gmail REST client: resumable upload for mail with attachments', () => 
     expect(huge.calls).toHaveLength(0);
   });
 });
+
+
+describe('parseSendAs', () => {
+  it('keeps the primary and accepted aliases only, lowercased, with clean display names', async () => {
+    const { parseSendAs } = await import('./gmail-api.js');
+    expect(parseSendAs({ sendAs: [
+      { sendAsEmail: 'Owner@Gmail.com', isPrimary: true, isDefault: false, displayName: 'Owner' },
+      { sendAsEmail: 'hello@mybrand.dev', verificationStatus: 'accepted', isDefault: true, displayName: 'Hello\r\nBcc: x' },
+      { sendAsEmail: 'pending@mybrand.dev', verificationStatus: 'pending' },
+      { sendAsEmail: 'not-an-address' , verificationStatus: 'accepted' },
+    ] })).toEqual([
+      { email: 'owner@gmail.com', displayName: 'Owner', isPrimary: true, isDefault: false },
+      { email: 'hello@mybrand.dev', displayName: 'Hello  Bcc: x', isPrimary: false, isDefault: true },
+    ]);
+    expect(parseSendAs({})).toEqual([]);
+  });
+});

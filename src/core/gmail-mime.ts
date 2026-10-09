@@ -374,6 +374,8 @@ export interface RawMessageInput {
   body: string;
   inReplyTo?: string;
   references?: readonly string[];
+  /** The send-as identity to write From with; omitted lets Gmail use the account's default. */
+  from?: MailAddress;
   /** Files, in order; none keeps the single text/plain message. */
   attachments?: readonly MimeAttachment[];
 }
@@ -393,6 +395,7 @@ export function buildRawMessage(input: RawMessageInput): string {
   for (const entry of [...input.to, ...(input.cc ?? []), ...(input.bcc ?? [])]) {
     if (!isMailAddress(entry.address) || HEADER_CONTROL.test(entry.name)) issues.push({ path: 'to', message: 'invalid recipient' });
   }
+  if (input.from && (!isMailAddress(input.from.address) || HEADER_CONTROL.test(input.from.name))) issues.push({ path: 'from', message: 'invalid sender address' });
   const ids = [...(input.inReplyTo ? [input.inReplyTo] : []), ...(input.references ?? [])];
   if (ids.some(id => !MESSAGE_ID_PATTERN.test(id))) issues.push({ path: 'replyToMessageId', message: 'the original message has an unusable Message-ID' });
   const attachments = input.attachments ?? [];
@@ -401,6 +404,7 @@ export function buildRawMessage(input: RawMessageInput): string {
 
   const references = (input.references ?? []).slice(-MAX_REFERENCES);
   const headers = [
+    input.from ? addressHeader('From', [input.from]) : null,
     addressHeader('To', input.to),
     addressHeader('Cc', input.cc ?? []),
     addressHeader('Bcc', input.bcc ?? []),

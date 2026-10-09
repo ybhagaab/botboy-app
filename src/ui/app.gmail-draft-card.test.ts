@@ -221,4 +221,10 @@ describe('Gmail draft card', () => {
     holder.api = async () => ({ error: 'Gmail sync is unavailable.' });
     expect((await cardFor()).textContent).toBe('Gmail draft unavailable.');
   });
+  it('shows the From Gmail holds (a send-as alias) with the account label', async () => {
+    holder.api = async () => ({ draft: { ...DRAFT, from: 'Brand <hello@mybrand.dev>', accountLabel: 'Personal' } });
+    const card = await cardFor();
+    expect(card.querySelector('dt')!.textContent).toBe('From');
+    expect(card.querySelector('dd')!.textContent).toBe('Personal · Brand <hello@mybrand.dev>');
+  });
 });

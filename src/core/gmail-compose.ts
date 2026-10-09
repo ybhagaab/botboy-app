@@ -150,6 +150,8 @@ interface DraftEntry {
   state: DraftState;
   /** Kept so an update stays in the same thread without repeating it. */
   replyToMessageId?: string;
+  /** The send-as address the draft was written From (an alias or the named primary). */
+  fromAddress?: string;
   createdAt: string;
   updatedAt: string;
   sentMessageId?: string;
@@ -191,6 +193,8 @@ export interface DraftReceipt {
   messageId: string;
   threadId: string;
   account: string;
+  /** The From line it went out with, when one was chosen (a send-as alias). */
+  from?: string;
   to: string[];
   cc: string[];
   bcc: string[];
@@ -227,6 +231,8 @@ export interface DraftView {
   state: DraftState | 'missing' | 'unknown' | 'other_account' | 'not_connected';
   /** The owner's label for the sending account, when it has one. */
   accountLabel?: string;
+  /** The From line Gmail holds for the draft (a send-as alias or the account). */
+  from?: string;
   draftId: string;
   account: string | null;
   messageId: string | null;
@@ -333,6 +339,8 @@ interface Prepared {
   attachments: ResolvedAttachment[];
   threadId?: string;
   reply?: ReplyContext;
+  /** The From identity written into the message, when one was chosen. */
+  from?: MailAddress;
   /** JSON `raw` for text-only mail; the bytes for a resumable upload with attachments. */
   message: GmailRawMessage;
 }
@@ -358,6 +366,8 @@ export function createGmailCompose(deps: {
   now?: () => number;
   /** Where attachments may come from (default: the owner's home, BotBoy's files workspace, no chat images). */
   attachments?: AttachmentPolicy;
+  /** An account's stored send-as identities (custom-domain aliases), so `from` can name one. */
+  sendAsFor?: (accountId: string) => ReadonlyArray<{ email: string }>;
 }): GmailCompose {
   const { db, connection } = deps;
   const now = deps.now ?? Date.now;
@@ -392,7 +402,7 @@ export function createGmailCompose(deps: {
    * connected account. With several accounts and no `from`, the call is
    * refused with the choices, so the sender is always an explicit decision.
    */
-  function requireCompose(selector: { from?: unknown; draftId?: unknown } = {}): { account: string; client: GmailClient } {
+  function requireCompose(selector: { from?: unknown; draftId?: unknown } = {}): { account: string; client: GmailClient; fromAddress?: string } {
     const accounts = connection.accounts();
     if (!accounts.length) throw new GmailComposeError('not_connected', 'Gmail is not connected.');
     const from = typeof selector.from === 'string' ? selector.from.trim() : '';
@@ -400,16 +410,29 @@ export function createGmailCompose(deps: {
       throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `must be one of: ${accountChoices()}` }]), 'none', 'Choosing the account');
     }
     let view: GmailAccountConnection | null = null;
+    let fromAddress: string | undefined;
     const entry = isGmailId(selector.draftId) ? entryFor(selector.draftId) : undefined;
     if (entry) {
       view = connection.account(entry.account);
       if (!view) throw new GmailComposeError('other_account', `Draft ${entry.draftId} belongs to a Gmail account that is not connected (${entry.account}).`);
-      if (from && connection.account(from)?.id !== view.id) {
+      fromAddress = entry.fromAddress;
+      const aliasOwner = from && from.includes('@') ? connection.accounts().find(account => (deps.sendAsFor?.(account.id) ?? []).some(identity => identity.email === from.toLowerCase())) : undefined;
+      if (aliasOwner && aliasOwner.id === view.id) fromAddress = from.toLowerCase();
+      else if (from && connection.account(from)?.id !== view.id) {
         throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `this draft belongs to ${entry.account}; a draft cannot move to another account (make a new draft instead)` }]), 'none', 'Choosing the account');
       }
     } else if (from) {
       view = connection.account(from);
-      if (!view) throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `"${from.slice(0, 80)}" is not a connected account; use one of: ${accountChoices()}` }]), 'none', 'Choosing the account');
+      // A send-as alias (custom domain) picks the account that owns it.
+      const alias = from.toLowerCase();
+      if (!view && alias.includes('@')) {
+        const owner = accounts.find(account => (deps.sendAsFor?.(account.id) ?? []).some(identity => identity.email === alias));
+        if (owner) { view = connection.account(owner.id); fromAddress = alias; }
+      } else if (view && alias.includes('@')) {
+        // The primary address named explicitly: write it into From too.
+        fromAddress = alias;
+      }
+      if (!view) throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `"${from.slice(0, 80)}" is not a connected account or one of its send-as addresses; use one of: ${accountChoices()}` }]), 'none', 'Choosing the account');
     } else if (accounts.length === 1) {
       view = connection.account(accounts[0].id);
     } else {
@@ -426,7 +449,32 @@ export function createGmailCompose(deps: {
     if (!view.canCompose()) {
       throw new GmailComposeError('compose_not_granted', `The connection to ${account} allows reading only, not drafting or sending.`);
     }
-    return { account, client: view.client() };
+    return { account, client: view.client(), ...(fromAddress ? { fromAddress } : {}) };
+  }
+
+  /**
+   * The From identity, checked live against Gmail's verified send-as list
+   * (the stored list can be stale). Gmail rejects an unverified From anyway;
+   * checking first keeps the failure a fixable `from` issue with effect none.
+   */
+  async function senderIdentity(client: GmailClient, account: string, fromAddress: string | undefined): Promise<MailAddress | undefined> {
+    if (!fromAddress) return undefined;
+    let identities: Array<{ email: string; displayName: string }> = [];
+    try {
+      identities = await client.listSendAs();
+    } catch (error) {
+      if (fromAddress === account) return { name: '', address: account };
+      throw composeFailure(error, 'none', 'Checking the send-as address');
+    }
+    const found = identities.find(identity => identity.email === fromAddress);
+    if (!found) {
+      if (fromAddress === account) return { name: '', address: account };
+      throw composeFailure(new GmailComposeInputError([{
+        path: 'from',
+        message: `${fromAddress} is not a verified "Send mail as" address of ${account} (Gmail settings → Accounts); use one of: ${[account, ...identities.map(identity => identity.email).filter(email => email !== account)].join(', ')}`,
+      }]), 'none', 'Choosing the sender');
+    }
+    return { name: found.displayName, address: found.email };
   }
 
   async function ownerAddresses(client: GmailClient, account: string): Promise<Set<string>> {
@@ -474,7 +522,7 @@ export function createGmailCompose(deps: {
   }
 
   /** `existing` is the draft being updated: its thread and files carry over unless the call replaces them. */
-  async function prepare(args: ComposeArgs, client: GmailClient, account: string, existing?: DraftEntry): Promise<Prepared> {
+  async function prepare(args: ComposeArgs, client: GmailClient, account: string, existing?: DraftEntry, fromAddress?: string): Promise<Prepared> {
     const keptReplyTo = existing?.replyToMessageId;
     const issues: ComposeIssue[] = [];
     const explicitTo = parseRecipients(args.to, 'to', issues);
@@ -539,9 +587,10 @@ export function createGmailCompose(deps: {
     if (total > MAX_RECIPIENTS) issues.push({ path: 'to', message: `at most ${MAX_RECIPIENTS} recipients in total (got ${total})` });
     if (subject.length > MAX_SUBJECT_CHARS) issues.push({ path: 'subject', message: `at most ${MAX_SUBJECT_CHARS} characters` });
     if (issues.length) throw new GmailComposeInputError(issues);
-
+    const from = await senderIdentity(client, account, fromAddress);
     const text = buildRawMessage({
       to, cc, bcc, subject, body, attachments,
+      ...(from ? { from } : {}),
       ...(reply?.inReplyTo ? { inReplyTo: reply.inReplyTo } : {}),
       ...(reply?.references.length ? { references: reply.references } : {}),
     });
@@ -549,13 +598,14 @@ export function createGmailCompose(deps: {
     const message: GmailRawMessage = attachments.length
       ? { rfc822: Buffer.from(text, 'utf8'), ...thread }
       : { raw: toBase64Url(text), ...thread };
-    return { to, cc, bcc, subject, body, attachments, ...(reply ? { threadId: reply.threadId, reply } : {}), message };
+    return { to, cc, bcc, subject, body, attachments, ...(from ? { from } : {}), ...(reply ? { threadId: reply.threadId, reply } : {}), message };
   }
 
   function fingerprint(account: string, prepared: Prepared): string {
     const sorted = (list: MailAddress[]) => list.map(entry => entry.address).sort();
     return createHash('sha256').update(JSON.stringify({
       account,
+      from: prepared.from?.address ?? null,
       to: sorted(prepared.to),
       cc: sorted(prepared.cc),
       bcc: sorted(prepared.bcc),
@@ -604,6 +654,7 @@ export function createGmailCompose(deps: {
       account: entry.account,
       messageId: draft.message.id,
       threadId: draft.message.threadId,
+      ...(list('from')[0] ? { from: list('from')[0] } : {}),
       to: list('to'),
       cc: list('cc'),
       bcc: list('bcc'),
@@ -657,13 +708,14 @@ export function createGmailCompose(deps: {
 
   function sentReceipt(input: {
     account: string; message: GmailMessage; verified: boolean; labelIds: string[]; via: 'chat' | 'card';
-    to: string[]; cc: string[]; bcc: string[]; subject: string; attachments: AttachmentReceipt[]; fromDraftId?: string;
+    to: string[]; cc: string[]; bcc: string[]; subject: string; attachments: AttachmentReceipt[]; fromDraftId?: string; from?: string;
   }): SendReceipt {
     return {
       status: 'sent',
       messageId: input.message.id,
       threadId: input.message.threadId,
       account: input.account,
+      ...(input.from ? { from: input.from } : {}),
       to: input.to,
       cc: input.cc,
       bcc: input.bcc,
@@ -694,7 +746,7 @@ export function createGmailCompose(deps: {
     const check = await verifySent(client, message);
     console.log(`[Gmail] Sent draft ${entry.draftId} from ${via === 'card' ? 'its chat card' : 'chat'}: message ${message.id}${check.verified ? '' : ' (not yet listed in Sent)'}`);
     const receipt = sentReceipt({
-      account, message, ...check, via, to: view.to, cc: view.cc, bcc: view.bcc, subject: view.subject,
+      account, message, ...check, via, ...(view.from ? { from: view.from } : {}), to: view.to, cc: view.cc, bcc: view.bcc, subject: view.subject,
       attachments: view.attachments, fromDraftId: entry.draftId,
     });
     saveEntry({
@@ -721,7 +773,7 @@ export function createGmailCompose(deps: {
 
   return {
     async saveDraft(args) {
-      const { account, client } = requireCompose({ from: args.from, draftId: args.draftId });
+      const { account, client, fromAddress } = requireCompose({ from: args.from, draftId: args.draftId });
       const existing = args.draftId === undefined || args.draftId === null || args.draftId === ''
         ? undefined
         : openEntry(args.draftId, account);
@@ -730,7 +782,7 @@ export function createGmailCompose(deps: {
       }
       let prepared: Prepared;
       try {
-        prepared = await prepare(args, client, account, existing);
+        prepared = await prepare(args, client, account, existing, fromAddress);
       } catch (error) {
         throw composeFailure(error, 'none', 'Preparing the draft');
       }
@@ -759,6 +811,7 @@ export function createGmailCompose(deps: {
         subject: prepared.subject,
         state: 'draft',
         ...(prepared.reply ? { replyToMessageId: prepared.reply.replyToMessageId } : {}),
+        ...(prepared.from ? { fromAddress: prepared.from.address } : {}),
         ...(prepared.attachments.length ? { attachments: prepared.attachments.map(storedAttachment) } : {}),
         createdAt: existing?.createdAt ?? at,
         updatedAt: at,
@@ -785,7 +838,7 @@ export function createGmailCompose(deps: {
     async send(args, request) {
       const ownerRequestId = String(request.ownerRequestId ?? '').trim();
       if (!ownerRequestId) throw new GmailComposeError('invalid_arguments', 'A send needs the owner request id.', 'none', [], 'Send only from the owner’s live chat turn.');
-      const { account, client } = requireCompose({ from: args.from, draftId: args.draftId });
+      const { account, client, fromAddress } = requireCompose({ from: args.from, draftId: args.draftId });
       const fromDraft = !(args.draftId === undefined || args.draftId === null || args.draftId === '');
       const tracked = requestLedger(ownerRequestId);
 
@@ -838,7 +891,7 @@ export function createGmailCompose(deps: {
 
       let prepared: Prepared;
       try {
-        prepared = await prepare(args, client, account);
+        prepared = await prepare(args, client, account, undefined, fromAddress);
       } catch (error) {
         throw composeFailure(error, 'none', 'Preparing the message');
       }
@@ -870,6 +923,7 @@ export function createGmailCompose(deps: {
       console.log(`[Gmail] Sent from chat: message ${message.id}${check.verified ? '' : ' (not yet listed in Sent)'}`);
       const receipt = sentReceipt({
         account, message, ...check, via: 'chat',
+        ...(prepared.from ? { from: formatAddress(prepared.from) } : {}),
         to: addressStrings(prepared.to), cc: addressStrings(prepared.cc), bcc: addressStrings(prepared.bcc), subject: prepared.subject,
         attachments: prepared.attachments.map(attachmentReceipt),
       });

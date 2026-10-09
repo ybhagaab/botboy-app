@@ -133,6 +133,10 @@ function fakeGmail() {
       box.calls.push('listSendAsAddresses');
       return box.sendAs;
     },
+    async listSendAs() {
+      box.calls.push('listSendAs');
+      return box.sendAs.map((email, index) => ({ email, displayName: index === 0 ? '' : 'Jane at Doe', isPrimary: index === 0, isDefault: index === 0 }));
+    },
     async createDraft(message) {
       box.calls.push(`createDraft${via(message)}`);
       failOnce('createDraft');
@@ -718,5 +722,67 @@ describe('Gmail compose with several accounts', () => {
     expect(moved.issues[0].message).toContain('cannot move to another account');
     // The card view names the account's label.
     expect(await compose.viewDraft(draft.draftId)).toMatchObject({ state: 'draft', account: 'owner@gmail.com', accountLabel: 'Personal' });
+  });
+});
+
+
+/** Custom-domain send-as aliases (Cloudflare routing + Gmail "Send mail as"). */
+describe('Gmail compose from a send-as alias', () => {
+  let storage: StorageLayer;
+  let personal: ReturnType<typeof fakeGmail>;
+  let work: ReturnType<typeof fakeGmail>;
+  let compose: GmailCompose;
+  let stored: Record<string, string[]>;
+  const NEW = { to: ['Jane Doe <jane@x.com>'], subject: 'Plan', body: 'Hi Jane' };
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    personal = fakeGmail();
+    personal.box.sendAs = ['owner@gmail.com', 'hello@mybrand.dev'];
+    work = fakeGmail();
+    work.box.sendAs = ['me@company.com'];
+    stored = { default: ['owner@gmail.com', 'hello@mybrand.dev'], ga_0123456789: ['me@company.com'] };
+    const connection = fakeGmailConnection([
+      { id: 'default', email: 'owner@gmail.com', label: 'Personal', get client() { return personal.client; } },
+      { id: 'ga_0123456789', email: 'me@company.com', label: 'Work', get client() { return work.client; } },
+    ]);
+    compose = createGmailCompose({
+      db: storage.getDb(), connection, now: () => Date.parse('2026-10-08T09:00:00Z'),
+      sendAsFor: id => (stored[id] ?? []).map(email => ({ email })),
+    });
+  });
+  afterEach(() => storage.close());
+
+  it('an alias picks its account and writes From, checked live; the draft keeps it on update', async () => {
+    const draft = await compose.saveDraft({ ...NEW, from: 'Hello@MyBrand.dev' });
+    expect(draft.account).toBe('owner@gmail.com');
+    const raw = personal.box.raws.get(draft.messageId)!;
+    expect(headerOf(raw, 'From')).toBe('Jane at Doe <hello@mybrand.dev>');
+    expect(personal.box.calls).toContain('listSendAs');
+    // An update without from keeps the alias.
+    const updated = await compose.saveDraft({ ...NEW, draftId: draft.draftId, body: 'Hi Jane, v2' });
+    expect(headerOf(personal.box.raws.get(updated.messageId)!, 'From')).toBe('Jane at Doe <hello@mybrand.dev>');
+    // Naming no address: no From header, Gmail's default identity applies.
+    const plain = await compose.saveDraft({ ...NEW, from: 'Personal' });
+    expect(headerOf(personal.box.raws.get(plain.messageId)!, 'From')).toBeUndefined();
+  });
+
+  it('refuses an alias Gmail no longer lists as verified, and an address no account sends as', async () => {
+    personal.box.sendAs = ['owner@gmail.com'];
+    const stale = await compose.saveDraft({ ...NEW, from: 'hello@mybrand.dev' }).then(() => null, caught => caught);
+    expect(stale).toBeInstanceOf(GmailComposeError);
+    expect(stale.issues[0]).toMatchObject({ path: 'from' });
+    expect(stale.issues[0].message).toContain('not a verified "Send mail as" address of owner@gmail.com');
+    expect(personal.box.drafts.size).toBe(0);
+    const unknown = await compose.saveDraft({ ...NEW, from: 'nobody@else.dev' }).then(() => null, caught => caught);
+    expect(unknown.issues[0].message).toContain('not a connected account or one of its send-as addresses');
+  });
+
+  it('a send from an alias reports its From, and is a different message than one from the primary', async () => {
+    const viaAlias = await compose.send({ ...NEW, from: 'hello@mybrand.dev' }, { ownerRequestId: 'req-1' });
+    expect(viaAlias).toMatchObject({ status: 'sent', account: 'owner@gmail.com', from: 'Jane at Doe <hello@mybrand.dev>' });
+    const viaPrimary = await compose.send({ ...NEW, from: 'owner@gmail.com' }, { ownerRequestId: 'req-1' });
+    expect(viaPrimary.alreadySent).toBeUndefined();
+    expect(viaPrimary.from).toBe('owner@gmail.com');
   });
 });

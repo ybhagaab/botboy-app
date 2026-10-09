@@ -164,6 +164,37 @@ export function buildAuthorizationUrl(endpoints: GoogleEndpoints, input: {
   return url.toString();
 }
 
+/** One "Send mail as" identity of a Gmail account (Settings → Accounts). */
+export interface GmailSendAs {
+  email: string;
+  displayName: string;
+  isPrimary: boolean;
+  isDefault: boolean;
+}
+
+/**
+ * Only identities Gmail will send as: the primary address and aliases whose
+ * verification Gmail accepted (custom domains routed through an SMTP relay,
+ * e.g. Cloudflare Email Routing + Gmail "Send mail as").
+ */
+export function parseSendAs(body: any): GmailSendAs[] {
+  if (!Array.isArray(body?.sendAs)) return [];
+  const out: GmailSendAs[] = [];
+  for (const entry of body.sendAs) {
+    const email = typeof entry?.sendAsEmail === 'string' ? entry.sendAsEmail.trim().toLowerCase() : '';
+    if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(email)) continue;
+    const isPrimary = entry.isPrimary === true;
+    if (!isPrimary && entry.verificationStatus !== 'accepted') continue;
+    out.push({
+      email,
+      displayName: typeof entry.displayName === 'string' ? entry.displayName.replace(/[\r\n\u0000-\u001f]/g, ' ').trim().slice(0, 120) : '',
+      isPrimary,
+      isDefault: entry.isDefault === true,
+    });
+  }
+  return out;
+}
+
 export interface GoogleTokenResponse {
   accessToken: string;
   expiresInSeconds: number;
@@ -312,6 +343,8 @@ export interface GmailClient {
   listHistory(input: { startHistoryId: string; pageToken?: string; maxResults?: number }): Promise<GmailHistoryPage>;
   /** Send-as addresses (primary + aliases), lowercase. */
   listSendAsAddresses(): Promise<string[]>;
+  /** The account's send-as identities Gmail lets it send as (primary + verified aliases). */
+  listSendAs(): Promise<GmailSendAs[]>;
   // ── gmail.compose (GMAIL_CHAT_TOOLS_PLAN.md §6) ──
   createDraft(message: GmailRawMessage): Promise<GmailDraft>;
   updateDraft(draftId: string, message: GmailRawMessage): Promise<GmailDraft>;
@@ -673,6 +706,10 @@ export function createGmailClient(deps: {
       };
     },
 
+    async listSendAs() {
+      const body = await get('/settings/sendAs', {}, 'Gmail send-as list');
+      return parseSendAs(body);
+    },
     async listSendAsAddresses() {
       const body = await get('/settings/sendAs', {}, 'Gmail send-as list');
       return Array.isArray(body.sendAs)

@@ -57,6 +57,7 @@ import {
   continuationRequestId,
   continuationSecretMatches,
 } from '../../core/chat-continuations.js';
+import { readGmailSendAs } from '../../monitors/gmail-sync.js';
 import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatTurnEnd } from '../../core/chat-jobs.js';
 import { filterToolsForContinuation } from '../../core/job-mandate.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
@@ -161,12 +162,14 @@ function dataRoomCreateEffectNeedsObservation(content: unknown): boolean {
 /** Final message for a turn stopped by a Settings → AI model provider change. */
 const PROVIDER_CHANGED_STOP_TEXT = '⏹️ Stopped because the AI model was changed in Settings. Work already completed is preserved; send your message again to continue on the new model.';
 /** The chat's Gmail accounts block: shown when the owner has more than one account or labelled one. */
-export function formatGmailAccountsBlock(accounts: ReadonlyArray<{ email: string; label: string; canCompose: boolean; needsReconnect: boolean }>): string {
-  if (!accounts.length || (accounts.length === 1 && !accounts[0].label)) return '';
+export function formatGmailAccountsBlock(accounts: ReadonlyArray<{ email: string; label: string; canCompose: boolean; needsReconnect: boolean; sendAs?: readonly string[] }>): string {
+  const anyAlias = accounts.some(account => account.sendAs?.length);
+  if (!accounts.length || (accounts.length === 1 && !accounts[0].label && !anyAlias)) return '';
   return [
     '## GMAIL ACCOUNTS',
     'The owner\'s connected Gmail accounts (label: address). Use the label or address as `account` (search/read) and `from` (draft/send).',
-    ...accounts.map(account => `- ${account.label || '(no label)'}: ${account.email}${account.needsReconnect ? ' — needs Reconnect' : !account.canCompose ? ' — read only' : ''}`),
+    ...(anyAlias ? ['"Also sends as" lists verified custom-domain addresses: pass one as `from` to send from it (mail to that domain\'s contacts or project usually goes from it).'] : []),
+    ...accounts.map(account => `- ${account.label || '(no label)'}: ${account.email}${account.sendAs?.length ? ` — also sends as ${account.sendAs.join(', ')}` : ''}${account.needsReconnect ? ' — needs Reconnect' : !account.canCompose ? ' — read only' : ''}`),
   ].join('\n');
 }
 
@@ -1302,7 +1305,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // The active job (the owner's request, the mandate, the working set)
         // rides every owner and continuation turn (ANALYTICS_AUTONOMY_PLAN.md).
         const turnJob = continuation ? chatJobs?.get(continuation.job.id) ?? null : chatJobs?.activeJob() ?? null;
-        const gmailAccountsBlock = formatGmailAccountsBlock(deps.gmailConnection?.accounts() ?? []);
+        const gmailAccountsBlock = formatGmailAccountsBlock((deps.gmailConnection?.accounts() ?? []).map(account => ({
+          ...account,
+          sendAs: deps.db ? readGmailSendAs(deps.db, account.id).filter(identity => identity.email !== account.email).map(identity => identity.email) : [],
+        })));
         const jobBlock = turnJob?.status === 'active' && chatJobs
           ? formatChatJobBlock(turnJob, chatJobs.watchesForJob(turnJob.id), { continuation: Boolean(continuation) })
           : undefined;

@@ -9,7 +9,7 @@ import {
   type GmailMessageRef,
 } from '../core/gmail-api.js';
 import type { GmailConnection } from '../core/gmail-connection.js';
-import { createGmailBrowserCaptureGate, createGmailSync, createGmailSyncs, isGmailWebEmailItem, type GmailSyncConfig } from './gmail-sync.js';
+import { createGmailBrowserCaptureGate, createGmailSync, createGmailSyncs, isGmailWebEmailItem, readGmailSendAs, type GmailSyncConfig } from './gmail-sync.js';
 import { fakeGmailConnection } from '../core/gmail-connection.fake.js';
 
 const OWNER = 'jane.doe@gmail.com';
@@ -102,6 +102,10 @@ function fakeMailbox(owner = OWNER) {
         },
         async listSendAsAddresses() {
           return owner === OWNER ? [OWNER, 'jane@doe.dev'] : [owner];
+        },
+        async listSendAs() {
+          return (owner === OWNER ? [OWNER, 'jane@doe.dev'] : [owner, 'me@side.dev'])
+            .map((email, index) => ({ email, displayName: '', isPrimary: index === 0, isDefault: index === 0 }));
         },
       };
     },
@@ -676,6 +680,16 @@ describe('Gmail sync with several accounts', () => {
     work.add({ id: 'w4', at: NOW });
     const results = [await syncs.runNow('default'), await syncs.runNow('ga_0123456789')];
     expect(results.map(result => result.status)).toEqual(['skipped', 'skipped']);
+  });
+
+  it('stores each account’s verified send-as aliases, and mail from another account’s alias is self-mail', async () => {
+    const { personal, work, syncs, db } = setup();
+    await syncs.runNow('ga_0123456789');
+    expect(readGmailSendAs(db, 'ga_0123456789').map(identity => identity.email)).toEqual([WORK, 'me@side.dev']);
+    personal.add({ id: 'p7', at: NOW - HOUR, from: 'Me <me@side.dev>', subject: 'From my side domain' });
+    await syncs.runNow('default');
+    expect(emitted.find(item => item.url === 'gmail://mail/p7')?.metadata.fromOwnAccount).toBe('true');
+    void work;
   });
 
   it('one failing account fails the Gmail health source by name; it recovers only when every account works', async () => {

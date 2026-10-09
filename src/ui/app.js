@@ -1973,8 +1973,10 @@ function paintGmailDraftCard(card, draft, note = '') {
     ? `<dt>Attached</dt><dd><ul class="gmail-draft-files">${files.map((file) => `<li>${esc(file.name)}<span class="gmail-draft-file-size"> · ${esc(gmailFileSize(file.sizeBytes))}</span></li>`).join('')}</ul></dd>`
     : '';
   // From first: with several accounts, the card is where the owner checks which one sends.
-  const from = draft.account
-    ? `<dt>From</dt><dd>${esc(draft.accountLabel ? `${draft.accountLabel} · ${draft.account}` : draft.account)}</dd>`
+  // Gmail's own From line wins: with a send-as alias it is the address the mail goes out as.
+  const sender = typeof draft.from === 'string' && draft.from ? draft.from : draft.account;
+  const from = sender
+    ? `<dt>From</dt><dd>${esc(draft.accountLabel ? `${draft.accountLabel} · ${sender}` : sender)}</dd>`
     : '';
   const facts = `<dl class="gmail-draft-fields">${from}${fields}<dt>Subject</dt><dd>${esc(draft.subject || '(no subject)')}</dd>${attached}</dl>`;
   const body = draft.body

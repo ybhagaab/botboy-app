@@ -145,4 +145,11 @@ describe('owner-identity', () => {
       expect(resolveOwnerIdentity(db).ownEmails).toEqual(['ybhagaab@amazon.com', 'jane.doe@gmail.com', 'me@company.com']);
     });
   });
+  it('counts each Gmail account’s verified send-as aliases as the owner', () => {
+    const db = storage.getDb();
+    setSetting(db, 'gmail_sync.send_as', [{ email: 'owner@gmail.com' }, { email: 'Hello@MyBrand.dev' }]);
+    setSetting(db, 'gmail_sync.acct.ga_0123456789.send_as', [{ email: 'me@side.dev' }]);
+    expect(resolveOwnerIdentity(db).ownEmails).toEqual(expect.arrayContaining(['hello@mybrand.dev', 'me@side.dev']));
+    expect(createOwnerMatcher(db).isOwner('Brand <hello@mybrand.dev>')).toBe(true);
+  });
 });
