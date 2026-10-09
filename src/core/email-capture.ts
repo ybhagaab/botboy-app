@@ -115,6 +115,12 @@ export interface CanonicalEmailContentInput {
   /** Same string as metadata.messageTimestamp. */
   messageTimestamp: string;
   body: string;
+  /**
+   * Which of the owner's mail accounts this is ("Work (me@x.com)"), when the
+   * owner has more than one: every reader of the content (routing, briefs,
+   * gists, chat) sees it. GRASP passes none, so its output is unchanged.
+   */
+  account?: string;
 }
 
 /**
@@ -133,6 +139,7 @@ export interface CanonicalEmailContentInput {
 export function renderCanonicalEmailContent(input: CanonicalEmailContentInput): string {
   const lines = [
     `Subject: ${input.subject}`,
+    ...(input.account ? [`Account: ${input.account}`] : []),
     `From: ${input.fromLabel}`,
     `To: ${input.to.join(', ')}`,
   ];

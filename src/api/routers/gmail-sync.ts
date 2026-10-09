@@ -22,6 +22,14 @@ import { GmailCredentialInputError } from '../../core/gmail-credentials.js';
 import { GmailAuthError } from '../../core/gmail-connection.js';
 import { GmailComposeError, type GmailComposeErrorCode } from '../../core/gmail-compose.js';
 import { GmailImportError } from '../../monitors/gmail-sync.js';
+import { deleteGmailAccountMail } from '../../core/gmail-account-mail.js';
+import { isGmailAccountId } from '../../core/gmail-credentials.js';
+
+/** An optional account id from a request body; null = missing, false = malformed. */
+function accountIdOf(value: unknown): string | null | false {
+  if (value === undefined || value === null || value === '') return null;
+  return isGmailAccountId(value) ? value : false;
+}
 
 const OWNER_UI_NEXT_ACTION = 'Open Connections → Gmail in the BotBoy window and use its controls.';
 const DRAFT_CARD_NEXT_ACTION = 'Use the Send or Discard button on the draft card in the BotBoy chat.';
@@ -123,8 +131,17 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerUiRequest(req, res, 'Connecting Gmail', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailConnection) return unavailable(res);
     res.set('Cache-Control', 'no-store');
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'accountId' && key !== 'addAccount');
+    const accountId = accountIdOf(body.accountId);
+    if (unexpected.length || accountId === false || (body.addAccount !== undefined && typeof body.addAccount !== 'boolean')) {
+      return res.status(400).json({ error: 'Only accountId (a connected account) or addAccount (true) may be sent.', code: 'invalid_request' });
+    }
     try {
-      return res.json(deps.gmailConnection.beginConnect());
+      return res.json(deps.gmailConnection.beginConnect({
+        ...(accountId ? { accountId } : {}),
+        ...(body.addAccount === true ? { addAccount: true } : {}),
+      }));
     } catch (error) {
       if (error instanceof GmailAuthError) return res.status(409).json({ error: error.message, code: error.code });
       return res.status(500).json({ error: 'BotBoy could not start the Google sign-in.', code: 'internal_error' });
@@ -137,7 +154,7 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     const query = req.query as Record<string, unknown>;
     const outcome = await deps.gmailConnection.completeConnect({ code: query.code, state: query.state, error: query.error });
     // First sync right away; the page shows progress on its next refresh.
-    if (outcome.ok) void deps.gmailSync?.runNow().catch(() => undefined);
+    if (outcome.ok) void deps.gmailSync?.runNow(outcome.accountId).catch(() => undefined);
     res.set('Cache-Control', 'no-store');
     res.set('Referrer-Policy', 'no-referrer');
     return res.redirect(302, `${deps.dashboardOrigin ?? ''}/#/connections/gmail-sync`);
@@ -147,8 +164,40 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerUiRequest(req, res, 'Disconnecting Gmail', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailSync || !deps.gmailConnection) return unavailable(res);
     res.set('Cache-Control', 'no-store');
-    await deps.gmailConnection.disconnect();
-    return res.json({ status: deps.gmailSync.getStatus() });
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'accountId' && key !== 'deleteMail');
+    const accountId = accountIdOf(body.accountId);
+    if (unexpected.length || accountId === false || (body.deleteMail !== undefined && typeof body.deleteMail !== 'boolean')) {
+      return res.status(400).json({ error: 'Only accountId and deleteMail (true or false) may be sent.', code: 'invalid_request' });
+    }
+    const target = accountId ?? deps.gmailConnection.accounts()[0]?.id ?? null;
+    if (accountId && !deps.gmailConnection.accounts().some(account => account.id === accountId)) {
+      return res.status(404).json({ error: 'That Gmail account is not connected.', code: 'not_connected' });
+    }
+    await deps.gmailConnection.disconnect(target ?? undefined);
+    // Captured mail stays unless the owner asked to delete it too.
+    const deletedMail = target && body.deleteMail === true && deps.db ? deleteGmailAccountMail(deps.db, target) : 0;
+    if (deletedMail) console.log(`[Gmail] Deleted ${deletedMail} captured messages of account ${target} at the owner's request`);
+    return res.json({ status: deps.gmailSync.getStatus(), deletedMail });
+  });
+
+  router.put('/gmail-sync/accounts/:accountId/label', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Naming a Gmail account', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.gmailSync || !deps.gmailConnection) return unavailable(res);
+    res.set('Cache-Control', 'no-store');
+    const accountId = accountIdOf(req.params.accountId);
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'label');
+    if (!accountId || unexpected.length || typeof body.label !== 'string') {
+      return res.status(400).json({ error: 'Send only label (text) for a connected account.', code: 'invalid_request' });
+    }
+    try {
+      deps.gmailConnection.setLabel(accountId, body.label);
+      return res.json({ status: deps.gmailSync.getStatus() });
+    } catch (error) {
+      if (error instanceof GmailAuthError) return res.status(404).json({ error: error.message, code: error.code });
+      return res.status(500).json({ error: 'BotBoy could not save the label.', code: 'internal_error' });
+    }
   });
 
   router.put('/gmail-sync/config', (req: Request, res: Response) => {
@@ -166,7 +215,15 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerUiRequest(req, res, 'Running Gmail sync', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailSync) return unavailable(res);
     // A run takes seconds; waiting for the real result beats a 202.
-    const result = await deps.gmailSync.runNow();
+    const accountId = accountIdOf(jsonBody(req).accountId);
+    if (accountId === false) return res.status(400).json({ error: 'accountId must name a connected account.', code: 'invalid_request' });
+    let result;
+    try {
+      result = await deps.gmailSync.runNow(accountId ?? undefined);
+    } catch (error) {
+      if (error instanceof GmailImportError) return res.status(404).json({ error: error.message, code: error.code });
+      throw error;
+    }
     return res.json({ result, status: deps.gmailSync.getStatus() });
   });
 
@@ -178,11 +235,12 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerUiRequest(req, res, 'Importing older Gmail mail', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailSync) return unavailable(res);
     const body = jsonBody(req);
-    const unexpected = Object.keys(body).filter(key => key !== 'months');
-    if (unexpected.length) return res.status(400).json({ error: 'Only months may be sent.', code: 'invalid_request' });
+    const unexpected = Object.keys(body).filter(key => key !== 'months' && key !== 'accountId');
+    const accountId = accountIdOf(body.accountId);
+    if (unexpected.length || accountId === false) return res.status(400).json({ error: 'Only months and accountId may be sent.', code: 'invalid_request' });
     res.set('Cache-Control', 'no-store');
     try {
-      return res.json({ status: deps.gmailSync.requestImport({ months: body.months }) });
+      return res.json({ status: deps.gmailSync.requestImport({ months: body.months, ...(accountId ? { accountId } : {}) }) });
     } catch (error) {
       if (error instanceof GmailImportError) {
         return res.status(error.code === 'invalid_window' ? 400 : 409).json({ error: error.message, code: error.code });
@@ -196,7 +254,14 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerUiRequest(req, res, 'Stopping the Gmail import', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailSync) return unavailable(res);
     res.set('Cache-Control', 'no-store');
-    return res.json({ status: deps.gmailSync.stopImport() });
+    const accountId = accountIdOf(typeof req.query.accountId === 'string' ? req.query.accountId : undefined);
+    if (accountId === false) return res.status(400).json({ error: 'accountId must name a connected account.', code: 'invalid_request' });
+    try {
+      return res.json({ status: deps.gmailSync.stopImport(accountId ? { accountId } : {}) });
+    } catch (error) {
+      if (error instanceof GmailImportError) return res.status(409).json({ error: error.message, code: error.code });
+      throw error;
+    }
   });
 
   // ── Chat draft cards (GMAIL_CHAT_TOOLS_PLAN.md §7) ──

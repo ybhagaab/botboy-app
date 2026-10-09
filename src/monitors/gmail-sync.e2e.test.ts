@@ -151,7 +151,7 @@ describe('Gmail end to end (fake Google over fetch)', () => {
     google.add('m1', START - 3 * HOUR, { Subject: 'Plan', From: 'Ann <ann@example.com>', To: OWNER });
     google.add('m2', START - 2 * HOUR, { Subject: 'Re: Plan', From: `Jane <${OWNER}>`, To: 'ann@example.com' }, ['SENT']);
     connection.saveClient(CLIENT);
-    expect(await connect('code-1')).toEqual({ ok: true, accountEmail: OWNER });
+    expect(await connect('code-1')).toEqual({ ok: true, accountEmail: OWNER, accountId: 'default' });
 
     // First sync: full, with the access token from the sign-in.
     const first = await sync.runNow();
@@ -191,7 +191,7 @@ describe('Gmail end to end (fake Google over fetch)', () => {
     const cursorBeforeReconnect = setting('gmail_sync.history_id');
 
     // Reconnecting the same account keeps the cursor, revokes nothing, and catches up.
-    expect(await connect('code-2')).toEqual({ ok: true, accountEmail: OWNER });
+    expect(await connect('code-2')).toEqual({ ok: true, accountEmail: OWNER, accountId: 'default' });
     expect(google.revokes).toEqual([]);
     expect(setting('gmail_sync.history_id')).toBe(cursorBeforeReconnect);
     const caughtUp = await sync.runNow();

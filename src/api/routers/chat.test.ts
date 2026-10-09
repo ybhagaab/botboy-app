@@ -87,3 +87,23 @@ describe('isTransientStreamError', () => {
     expect(isTransientStreamError('validation exception')).toBe(false);
   });
 });
+
+describe('formatGmailAccountsBlock', () => {
+  it('lists labelled or several accounts with their access, and stays empty for one unlabelled account', async () => {
+    const { formatGmailAccountsBlock } = await import('./chat.js');
+    expect(formatGmailAccountsBlock([])).toBe('');
+    expect(formatGmailAccountsBlock([{ email: 'a@x.com', label: '', canCompose: true, needsReconnect: false }])).toBe('');
+    const block = formatGmailAccountsBlock([
+      { email: 'a@x.com', label: 'Personal', canCompose: true, needsReconnect: false },
+      { email: 'me@company.com', label: 'Work', canCompose: false, needsReconnect: false },
+      { email: 'old@x.com', label: '', canCompose: true, needsReconnect: true },
+    ]);
+    expect(block.split('\n')).toEqual([
+      '## GMAIL ACCOUNTS',
+      'The owner\'s connected Gmail accounts (label: address). Use the label or address as `account` (search/read) and `from` (draft/send).',
+      '- Personal: a@x.com',
+      '- Work: me@company.com — read only',
+      '- (no label): old@x.com — needs Reconnect',
+    ]);
+  });
+});

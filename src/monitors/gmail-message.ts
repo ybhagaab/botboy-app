@@ -19,8 +19,28 @@ import { htmlToText, isNoiseEmail, renderCanonicalEmailContent } from '../core/e
 export const GMAIL_PLATFORM = 'gmail_api';
 export const GMAIL_SOURCE_APP = 'Gmail';
 
-export function gmailItemUrl(messageId: string): string {
-  return `gmail://mail/${messageId}`;
+/**
+ * The capture URL (exact-match dedup). Message ids are unique only within one
+ * mailbox, so every account but `default` names itself; `default` keeps the
+ * original form so mail captured before multi-account never re-captures.
+ */
+export function gmailItemUrl(messageId: string, accountId = 'default'): string {
+  return accountId === 'default' ? `gmail://mail/${messageId}` : `gmail://${accountId}/mail/${messageId}`;
+}
+
+/** The capture account a Gmail URL names ('default' for the original form). */
+export function gmailAccountOfUrl(url: string): string | null {
+  const match = /^gmail:\/\/(?:(ga_[a-f0-9]{10})\/)?mail\//.exec(url);
+  return match ? (match[1] ?? 'default') : null;
+}
+
+/** The account a message belongs to, as capture records it. */
+export interface GmailCaptureAccount {
+  id: string;
+  /** The owner's label; '' when unset. */
+  label: string;
+  /** Show the Account line in content (more than one account is connected, or this one has a label). */
+  named: boolean;
 }
 
 /** Labels that never become evidence, decided from the id/labels alone. */
@@ -47,6 +67,12 @@ export interface GmailOwner {
   primary: string;
   /** Send-as aliases, lowercase (may include the primary). */
   aliases: ReadonlySet<string>;
+  /**
+   * The owner's OTHER mail addresses (other connected Gmail accounts, the
+   * Outlook address). Mail from one of them is the owner writing to
+   * themselves: kept, but never an incoming request (fromOwnAccount).
+   */
+  otherOwnAddresses?: ReadonlySet<string>;
 }
 
 const GMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com']);
@@ -256,7 +282,12 @@ export type GmailDecision =
  * (automation addresses the owner directly), then received mail is kept only
  * when the owner is literally in To or Cc. Sent mail has no filters.
  */
-export function decideGmailMessage(message: GmailMessage, owner: GmailOwner, noisePatterns: readonly string[]): GmailDecision {
+export function decideGmailMessage(
+  message: GmailMessage,
+  owner: GmailOwner,
+  noisePatterns: readonly string[],
+  account: GmailCaptureAccount = { id: 'default', label: '', named: false },
+): GmailDecision {
   const labelSkip = skipByLabels(message.labelIds);
   if (labelSkip) return { kind: 'skip', reason: labelSkip };
   if (!message.id || !message.threadId) return { kind: 'skip', reason: 'unreadable' };
@@ -290,12 +321,14 @@ export function decideGmailMessage(message: GmailMessage, owner: GmailOwner, noi
   const ccMeta = unique(cc.map(entry => canonical(entry.address)));
   const subject = subjectHeader || '(no subject)';
   const labels = new Set(message.labelIds ?? []);
+  const fromOwnAccount = direction === 'received' && Boolean(from && owner.otherOwnAddresses?.has(from.address));
+  const accountName = account.label ? `${account.label} (${owner.primary})` : owner.primary;
 
   const item: RawWorkItem = {
     type: direction === 'sent' ? 'email_sent' : 'email_read',
     source: 'gmail',
     sourceApp: GMAIL_SOURCE_APP,
-    url: gmailItemUrl(message.id),
+    url: gmailItemUrl(message.id, account.id),
     title: subject,
     content: renderCanonicalEmailContent({
       subject,
@@ -305,6 +338,7 @@ export function decideGmailMessage(message: GmailMessage, owner: GmailOwner, noi
       direction,
       messageTimestamp,
       body: body.text,
+      ...(account.named ? { account: accountName } : {}),
     }),
     metadata: {
       subject: subjectHeader,
@@ -325,6 +359,9 @@ export function decideGmailMessage(message: GmailMessage, owner: GmailOwner, noi
       rfcMessageId: (headers.get('message-id') ?? '').trim().slice(0, 998),
       inReplyTo: (headers.get('in-reply-to') ?? '').trim().slice(0, 998),
       platform: GMAIL_PLATFORM,
+      gmailAccountId: account.id,
+      accountLabel: account.label,
+      ...(fromOwnAccount ? { fromOwnAccount: 'true' } : {}),
     },
     capturedAt: Number.isNaN(capturedAt.getTime()) ? new Date() : capturedAt,
   };

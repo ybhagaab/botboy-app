@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ToolCall } from './llm-client.js';
 import type { ToolExecutionContext, ToolExecutor } from './tool-executor.js';
 import { GoogleApiError, type GmailClient, type GmailMessage, type GmailMessagePart } from './gmail-api.js';
-import type { GmailConnection } from './gmail-connection.js';
+import { fakeGmailConnection } from './gmail-connection.fake.js';
 import { GmailComposeError, type GmailCompose } from './gmail-compose.js';
 import { GMAIL_CHAT_TOOL_NAMES, gmailDraftIdFromResult, gmailWriteConfirmed, withGmailChatTools } from './gmail-chat-tools.js';
 
@@ -55,12 +55,9 @@ function harness(options: { connected?: boolean; needsReconnect?: boolean } = {}
       return { id, messages: found };
     },
   } as unknown as GmailClient;
-  const connection = {
-    isConnected: () => options.connected !== false,
-    accountEmail: () => (options.connected !== false ? 'owner@gmail.com' : null),
-    status: () => ({ needsReconnect: options.needsReconnect === true }),
-    client: () => client,
-  } as unknown as GmailConnection;
+  const connection = fakeGmailConnection([{
+    id: 'default', email: 'owner@gmail.com', connected: options.connected !== false, needsReconnect: options.needsReconnect === true, client,
+  }]);
   const compose = {
     saveDraft: vi.fn(async (args: Record<string, unknown>) => ({
       status: 'drafted', updated: false, draftId: 'r-7', messageId: 'm-7', threadId: 't-7', account: 'owner@gmail.com',
@@ -359,5 +356,77 @@ describe('Gmail chat writes', () => {
     expect(gmailWriteConfirmed('gmail_send', JSON.stringify({ ok: true, status: 'sent' }))).toBe(true);
     expect(gmailWriteConfirmed('gmail_send', JSON.stringify({ ok: false, status: 'failed', effect: 'unknown' }))).toBe(false);
     expect(gmailWriteConfirmed('gmail_search', JSON.stringify({ ok: true, status: 'sent' }))).toBe(false);
+  });
+});
+
+/** Several accounts (GMAIL_API_INTEGRATION_PLAN.md §13). */
+describe('Gmail chat tools with several accounts', () => {
+  function mailbox(owner: string, found: GmailMessage[]) {
+    const byId = new Map(found.map(message => [message.id, message]));
+    const lists: Array<Record<string, unknown>> = [];
+    const client = {
+      async listMessages(input: Record<string, unknown>) {
+        lists.push(input);
+        return { messages: found.map(message => ({ id: message.id, threadId: message.threadId })), nextPageToken: `next-${owner}` };
+      },
+      async getMessage(id: string) {
+        const message = byId.get(id);
+        if (!message) throw new GoogleApiError('Gmail message failed (HTTP 404 notFound)', 404, 'notFound');
+        return message;
+      },
+      async getThread(id: string) {
+        throw new GoogleApiError(`Gmail thread failed (HTTP 404 notFound) ${id}`, 404, 'notFound');
+      },
+    } as unknown as GmailClient;
+    return { client, lists };
+  }
+  const older = mail('p-1', 't-p', { From: 'Mom <mom@x.com>', To: 'owner@gmail.com', Subject: 'Dinner' }, 'Sunday?', { internalDate: String(Date.parse('2026-10-05T08:00:00Z')) });
+  const newer = mail('w-1', 't-w', { From: 'Boss <boss@company.com>', To: 'me@company.com', Subject: 'Plan' }, 'Ship it', { internalDate: String(Date.parse('2026-10-06T08:00:00Z')) });
+  function tools(options: { workNeedsReconnect?: boolean } = {}) {
+    const personal = mailbox('owner@gmail.com', [older]);
+    const work = mailbox('me@company.com', [newer]);
+    const connection = fakeGmailConnection([
+      { id: 'default', email: 'owner@gmail.com', label: 'Personal', client: personal.client },
+      { id: 'ga_0123456789', email: 'me@company.com', label: 'Work', needsReconnect: options.workNeedsReconnect === true, client: work.client },
+    ]);
+    const base: ToolExecutor = { executeTool: vi.fn(async (toolCall: ToolCall) => ({ toolCallId: toolCall.id, content: 'base' })) };
+    return { personal, work, executor: withGmailChatTools(base, { connection, now: () => Date.parse('2026-10-06T09:00:00Z') }) };
+  }
+  const parse = (content: string) => {
+    const value = JSON.parse(content);
+    return value.result ?? value;
+  };
+
+  it('searches every account newest first, each result naming its account; paging needs one account', async () => {
+    const { executor, work } = tools();
+    const found = parse((await executor.executeTool(call('gmail_search', { query: 'newer_than:7d' }), OWNER)).content);
+    expect(found.results.map((entry: any) => [entry.account, entry.messageId])).toEqual([['me@company.com', 'w-1'], ['owner@gmail.com', 'p-1']]);
+    expect(found.accounts.map((entry: any) => [entry.name, entry.found, entry.nextPageToken])).toEqual([
+      ['Personal (owner@gmail.com)', 1, 'next-owner@gmail.com'], ['Work (me@company.com)', 1, 'next-me@company.com'],
+    ]);
+    const only = parse((await executor.executeTool(call('gmail_search', { query: 'x', account: 'work' }), OWNER)).content);
+    expect(only.account).toBe('me@company.com');
+    expect(only.results[0]).not.toHaveProperty('account');
+    expect(only.nextPageToken).toBe('next-me@company.com');
+    const paged = JSON.parse((await executor.executeTool(call('gmail_search', { query: 'x', pageToken: 'abc' }), OWNER)).content);
+    expect(paged).toMatchObject({ ok: false, code: 'invalid_arguments', issues: [{ path: 'account' }] });
+    const wrong = JSON.parse((await executor.executeTool(call('gmail_search', { query: 'x', account: 'School' }), OWNER)).content);
+    expect(wrong.issues[0].message).toContain('Personal (owner@gmail.com), Work (me@company.com)');
+    expect(work.lists).toHaveLength(2);
+  });
+
+  it('reads an id from whichever account holds it, and skips an account that needs Reconnect with a note', async () => {
+    const { executor } = tools();
+    const read = parse((await executor.executeTool(call('gmail_read', { messageId: 'w-1' }), OWNER)).content);
+    expect(read).toMatchObject({ account: 'me@company.com', message: { messageId: 'w-1', subject: 'Plan' } });
+    const scoped = JSON.parse((await executor.executeTool(call('gmail_read', { messageId: 'w-1', account: 'Personal' }), OWNER)).content);
+    expect(scoped).toMatchObject({ ok: false, code: 'not_found' });
+
+    const degraded = tools({ workNeedsReconnect: true });
+    const search = parse((await degraded.executor.executeTool(call('gmail_search', { query: 'x' }), OWNER)).content);
+    expect(search.results.map((entry: any) => entry.messageId)).toEqual(['p-1']);
+    expect(search.notSearched).toEqual(['Work (me@company.com)']);
+    const blocked = JSON.parse((await degraded.executor.executeTool(call('gmail_search', { query: 'x', account: 'Work' }), OWNER)).content);
+    expect(blocked).toMatchObject({ ok: false, code: 'reconnect_required' });
   });
 });

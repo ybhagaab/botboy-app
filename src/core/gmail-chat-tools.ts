@@ -20,12 +20,12 @@
 import type { ToolCall } from './llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from './tool-executor.js';
 import { GoogleApiError, type GmailMessage } from './gmail-api.js';
-import { GmailAuthError, type GmailConnection } from './gmail-connection.js';
+import { GmailAuthError, gmailAccountName, type GmailAccountConnection, type GmailConnection } from './gmail-connection.js';
 import { GmailComposeError, composeFailure, gmailWebUrl, type GmailCompose } from './gmail-compose.js';
 import type { ComposeIssue } from './gmail-mime.js';
 import { htmlToText } from './email-capture.js';
 import { withoutQuotedHistory } from './email-thread.js';
-import { decodeMimeWords, messageAttachments, messageBody, messageHeaders, messageTimestampOf } from '../monitors/gmail-message.js';
+import { decodeMimeWords, gmailItemUrl, messageAttachments, messageBody, messageHeaders, messageTimestampOf } from '../monitors/gmail-message.js';
 
 export const GMAIL_CHAT_TOOL_NAMES = ['gmail_search', 'gmail_read', 'gmail_draft', 'gmail_send'] as const;
 export type GmailChatToolName = typeof GMAIL_CHAT_TOOL_NAMES[number];
@@ -193,17 +193,34 @@ export function withGmailChatTools(base: ToolExecutor, deps: {
     return null;
   }
 
-  function readyToRead(): { failure: ToolFailure } | { account: string } {
+  /**
+   * The accounts a read uses: `account` (address, label, or id) when given,
+   * else every connected account that still has access. A dead grant is
+   * reported, never silently skipped, when it was the only one asked for.
+   */
+  function readyToRead(selector: unknown): { failure: ToolFailure } | { views: Array<{ view: GmailAccountConnection; email: string; name: string }>; skipped: string[] } {
     const connection = deps.connection;
     if (!connection) {
       return { failure: { code: 'unavailable', message: 'Gmail is unavailable in this BotBoy build.', effect: 'none', nextAction: 'Tell the owner Gmail tools are unavailable.' } };
     }
-    const account = connection.accountEmail();
-    if (!connection.isConnected() || !account) return { failure: fromError(new GmailAuthError('Gmail is not connected.', 'not_connected'), 'none', 'Gmail') };
-    if (connection.status().needsReconnect) {
-      return { failure: fromError(new GmailAuthError('Google ended BotBoy’s access to this Gmail account.', 'reconnect_required'), 'none', 'Gmail') };
+    const accounts = connection.accounts();
+    if (!accounts.length) return { failure: fromError(new GmailAuthError('Gmail is not connected.', 'not_connected'), 'none', 'Gmail') };
+    const wanted = typeof selector === 'string' ? selector.trim() : '';
+    if (selector !== undefined && selector !== null && selector !== '' && !wanted) {
+      return { failure: { code: 'invalid_arguments', message: 'account must be a connected account address or label.', effect: 'none', issues: [{ path: 'account', message: `one of: ${accounts.map(gmailAccountName).join(', ')}` }], nextAction: 'Fix account, then call once more.' } };
     }
-    return { account };
+    const chosen = wanted ? accounts.filter(account => connection.account(wanted)?.id === account.id) : accounts;
+    if (!chosen.length) {
+      return { failure: { code: 'invalid_arguments', message: `"${wanted.slice(0, 80)}" is not a connected Gmail account.`, effect: 'none', issues: [{ path: 'account', message: `one of: ${accounts.map(gmailAccountName).join(', ')}` }], nextAction: 'Use one of the listed accounts, or omit account to read every account.' } };
+    }
+    const usable = chosen.filter(account => !account.needsReconnect);
+    if (!usable.length) {
+      return { failure: fromError(new GmailAuthError(`Google ended BotBoy’s access to ${chosen.map(gmailAccountName).join(', ')}.`, 'reconnect_required'), 'none', 'Gmail') };
+    }
+    return {
+      views: usable.map(account => ({ view: connection.account(account.id)!, email: account.email, name: gmailAccountName(account) })),
+      skipped: chosen.filter(account => account.needsReconnect).map(gmailAccountName),
+    };
   }
 
   function untrusted(citation: Record<string, unknown>, payload: unknown): string {
@@ -229,47 +246,69 @@ export function withGmailChatTools(base: ToolExecutor, deps: {
       issues.push({ path: 'pageToken', message: 'must be the nextPageToken from the previous gmail_search' });
     }
     if (issues.length) return failed(call, { code: 'invalid_arguments', message: 'The search arguments are invalid.', effect: 'none', issues, nextAction: 'Fix every listed issue, then call once more.' });
-    const ready = readyToRead();
+    const ready = readyToRead(args.account);
     if ('failure' in ready) return failed(call, ready.failure);
-
-    const client = deps.connection!.client();
+    if (pageToken !== undefined && ready.views.length > 1) {
+      return failed(call, { code: 'invalid_arguments', message: 'A next page belongs to one account.', effect: 'none', issues: [{ path: 'account', message: 'required with pageToken: the account whose nextPageToken this is' }], nextAction: 'Call again with the account from that result.' });
+    }
     const deadline = now() + SEARCH_DEADLINE_MS;
+    const multiple = ready.views.length > 1;
     try {
-      const page = await client.listMessages({
-        q: query,
-        maxResults: maxResults as number,
-        ...(pageToken ? { pageToken: pageToken as string } : {}),
-        includeSpamTrash: /\bin:(?:trash|spam|anywhere)\b/i.test(query),
-      });
       let skipped = 0;
-      const found = await mapLimit(page.messages, SEARCH_CONCURRENCY, async (ref) => {
-        if (context?.abortSignal?.aborted || now() > deadline) { skipped++; return null; }
-        try {
-          const message = await client.getMessage(ref.id, { format: 'metadata', metadataHeaders: SEARCH_HEADERS });
-          return {
-            messageId: message.id,
-            threadId: message.threadId,
-            date: messageTimestampOf(message) || null,
-            ...headerFields(message),
-            snippet: clip(htmlToText(message.snippet ?? '').replace(/\s+/g, ' ').trim(), 300),
-            labels: labelsOf(message),
-          };
-        } catch (error) {
-          // Deleted between the list and the read: not a result any more.
-          if (error instanceof GoogleApiError && error.status === 404) return null;
-          throw error;
-        }
-      });
+      const perAccount = [];
+      for (const { view, email, name } of ready.views) {
+        const client = view.client();
+        const page = await client.listMessages({
+          q: query,
+          maxResults: maxResults as number,
+          ...(pageToken ? { pageToken: pageToken as string } : {}),
+          includeSpamTrash: /\bin:(?:trash|spam|anywhere)\b/i.test(query),
+        });
+        const found = await mapLimit(page.messages, SEARCH_CONCURRENCY, async (ref) => {
+          if (context?.abortSignal?.aborted || now() > deadline) { skipped++; return null; }
+          try {
+            const message = await client.getMessage(ref.id, { format: 'metadata', metadataHeaders: SEARCH_HEADERS });
+            return {
+              ...(multiple ? { account: email } : {}),
+              messageId: message.id,
+              threadId: message.threadId,
+              date: messageTimestampOf(message) || null,
+              ...headerFields(message),
+              snippet: clip(htmlToText(message.snippet ?? '').replace(/\s+/g, ' ').trim(), 300),
+              labels: labelsOf(message),
+            };
+          } catch (error) {
+            // Deleted between the list and the read: not a result any more.
+            if (error instanceof GoogleApiError && error.status === 404) return null;
+            throw error;
+          }
+        });
+        perAccount.push({ email, name, page, results: found.filter((entry): entry is NonNullable<typeof entry> => entry !== null) });
+        if (context?.abortSignal?.aborted) break;
+      }
       if (context?.abortSignal?.aborted) {
         return failed(call, { code: 'stopped', message: 'The owner stopped this turn.', effect: 'none', nextAction: 'Stop; the owner will say what to do next.' });
       }
-      const results = found.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-      return result(call, untrusted({ account: ready.account, query }, {
-        account: ready.account,
+      const results = perAccount.flatMap(entry => entry.results)
+        .sort((a, b) => String(b.date ?? '').localeCompare(String(a.date ?? '')));
+      const accountLabel = multiple ? ready.views.map(entry => entry.name).join(', ') : ready.views[0].email;
+      const single = perAccount.length === 1 ? perAccount[0] : null;
+      return result(call, untrusted({ account: accountLabel, query }, {
+        account: accountLabel,
         query,
         results,
-        ...(page.resultSizeEstimate !== undefined ? { resultSizeEstimate: page.resultSizeEstimate } : {}),
-        ...(page.nextPageToken ? { nextPageToken: page.nextPageToken } : {}),
+        ...(single?.page.resultSizeEstimate !== undefined ? { resultSizeEstimate: single.page.resultSizeEstimate } : {}),
+        ...(single?.page.nextPageToken ? { nextPageToken: single.page.nextPageToken } : {}),
+        ...(multiple ? {
+          accounts: perAccount.map(entry => ({
+            account: entry.email,
+            name: entry.name,
+            found: entry.results.length,
+            ...(entry.page.nextPageToken ? { nextPageToken: entry.page.nextPageToken } : {}),
+          })),
+          accountsNote: 'Results from every connected account, newest first; each names its account. Pass that account to gmail_read, and as from when replying.',
+        } : {}),
+        ...(ready.skipped.length ? { notSearched: ready.skipped, reconnect: 'These accounts need Reconnect in Connections → Gmail.' } : {}),
         ...(skipped ? { notRead: skipped, note: `${skipped} matches were not read before the ${SEARCH_DEADLINE_MS / 1000}s limit; narrow the query or page again.` } : {}),
         ...(results.length === 0 ? { note: 'No messages match this query in this mailbox. Say so, or try a broader query (fewer words, newer_than:30d).' } : {}),
       }));
@@ -302,16 +341,35 @@ export function withGmailChatTools(base: ToolExecutor, deps: {
     if (hasMessage && !isGmailId(args.messageId)) issues.push({ path: 'messageId', message: 'must be a messageId from gmail_search' });
     if (hasThread && !isGmailId(args.threadId)) issues.push({ path: 'threadId', message: 'must be a threadId from gmail_search' });
     if (issues.length) return failed(call, { code: 'invalid_arguments', message: 'The read arguments are invalid.', effect: 'none', issues, nextAction: 'Fix every listed issue, then call once more.' });
-    const ready = readyToRead();
+    const ready = readyToRead(args.account);
     if ('failure' in ready) return failed(call, ready.failure);
-    const client = deps.connection!.client();
     try {
+      // Ids belong to one mailbox: without `account`, try each until one has it.
+      let lastError: unknown = null;
+      for (const [index, { view, email }] of ready.views.entries()) {
+        const client = view.client();
+        try {
+          return await readFrom(client, email, view.id);
+        } catch (error) {
+          lastError = error;
+          const notHere = error instanceof GoogleApiError && (error.status === 404 || error.status === 400);
+          if (!notHere || index === ready.views.length - 1) throw error;
+        }
+      }
+      throw lastError;
+    } catch (error) {
+      const failure = fromError(error, 'none', 'Reading Gmail');
+      if (failure.code === 'not_found') failure.nextAction = 'Use an id returned by gmail_search in this conversation (with its account); the message may have been deleted.';
+      return failed(call, failure);
+    }
+
+    async function readFrom(client: ReturnType<GmailAccountConnection['client']>, account: string, accountId: string): Promise<ToolResult> {
       if (hasMessage) {
         const message = await client.getMessage(args.messageId as string, { format: 'full' });
-        return result(call, untrusted({ account: ready.account, messageId: message.id, url: `gmail://mail/${message.id}` }, {
-          account: ready.account,
+        return result(call, untrusted({ account, messageId: message.id, url: gmailItemUrl(message.id, accountId) }, {
+          account,
           message: readMessageView(message, MESSAGE_BODY_CHARS, false),
-          gmailUrl: gmailWebUrl(ready.account, `all/${message.threadId}`),
+          gmailUrl: gmailWebUrl(account, `all/${message.threadId}`),
         }));
       }
       const thread = await client.getThread(args.threadId as string, { format: 'full' });
@@ -328,18 +386,14 @@ export function withGmailChatTools(base: ToolExecutor, deps: {
         budget = 0;
         return { ...view, body: kept ? clip(view.body, kept) : '', bodyTruncated: true };
       }).reverse();
-      return result(call, untrusted({ account: ready.account, threadId: thread.id }, {
-        account: ready.account,
+      return result(call, untrusted({ account, threadId: thread.id }, {
+        account,
         threadId: thread.id,
         messageCount: ordered.length,
         ...(ordered.length > latest.length ? { olderMessagesOmitted: ordered.length - latest.length } : {}),
         messages: views,
-        gmailUrl: gmailWebUrl(ready.account, `all/${thread.id}`),
+        gmailUrl: gmailWebUrl(account, `all/${thread.id}`),
       }));
-    } catch (error) {
-      const failure = fromError(error, 'none', 'Reading Gmail');
-      if (failure.code === 'not_found') failure.nextAction = 'Use an id returned by gmail_search in this conversation; the message may have been deleted.';
-      return failed(call, failure);
     }
   }
 

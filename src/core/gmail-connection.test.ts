@@ -104,19 +104,19 @@ describe('Gmail credential store', () => {
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-store-')); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
-  it('writes an owner-only schema-1 file and keeps a connection only for the same client', () => {
+  it('writes an owner-only schema-2 file and keeps the accounts only for the same client', () => {
     const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
     store.saveClient(CLIENT);
     expect(fs.statSync(store.file).mode & 0o777).toBe(0o600);
-    store.saveConnection({ refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
+    store.saveConnection('default', { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
     const reread = createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read();
-    expect(reread).toMatchObject({ schemaVersion: 1, client: CLIENT, connection: { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com' } });
+    expect(reread).toMatchObject({ schemaVersion: 2, client: CLIENT, accounts: [{ id: 'default', label: '', connection: { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com' } }] });
 
     store.saveClient(CLIENT);
-    expect(store.read().connection?.refreshToken).toBe('refresh-1');
+    expect(store.read().accounts[0]?.connection.refreshToken).toBe('refresh-1');
     store.saveClient(OTHER_CLIENT);
-    expect(store.read().connection).toBeUndefined();
-    expect(createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read().connection).toBeUndefined();
+    expect(store.read().accounts).toEqual([]);
+    expect(createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read().accounts).toEqual([]);
 
     store.clearAll();
     expect(fs.existsSync(store.file)).toBe(false);
@@ -126,25 +126,25 @@ describe('Gmail credential store', () => {
   it('keeps the grant while the active client ID stays: a new own secret, or removing an own copy of the built-in client', () => {
     const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: TEAM });
     store.saveClient(CLIENT);
-    store.saveConnection({ refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
+    store.saveConnection('default', { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
     store.saveClient({ clientId: CLIENT.clientId, clientSecret: 'GOCSPX-rotated-secret' });
-    expect(store.read().connection?.refreshToken).toBe('refresh-1');
+    expect(store.read().accounts[0]?.connection.refreshToken).toBe('refresh-1');
     // Removing the own client makes the built-in one active: another ID, so the grant goes with the file.
     store.removeOwnClient();
-    expect(store.read()).toEqual({ schemaVersion: 1 });
+    expect(store.read()).toEqual({ schemaVersion: 2, accounts: [] });
     expect(fs.existsSync(store.file)).toBe(false);
 
     store.saveClient({ clientId: TEAM.clientId, clientSecret: 'GOCSPX-own-copy-secret' });
-    store.saveConnection({ refreshToken: 'refresh-2', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
+    store.saveConnection('default', { refreshToken: 'refresh-2', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE });
     store.removeOwnClient();
-    expect(store.read()).toEqual({ schemaVersion: 1, connection: expect.objectContaining({ refreshToken: 'refresh-2' }) });
+    expect(store.read()).toEqual({ schemaVersion: 2, accounts: [expect.objectContaining({ connection: expect.objectContaining({ refreshToken: 'refresh-2' }) })] });
     // The file never holds the built-in client.
     expect(fs.readFileSync(store.file, 'utf8')).not.toContain(TEAM.clientSecret);
 
     // Without a built-in client a connection needs an own client, on read and on save.
     const bare = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
-    expect(bare.read()).toEqual({ schemaVersion: 1 });
-    expect(() => bare.saveConnection({ refreshToken: 'refresh-3', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE })).toThrow('Save the Google OAuth client');
+    expect(bare.read()).toEqual({ schemaVersion: 2, accounts: [] });
+    expect(() => bare.saveConnection('default', { refreshToken: 'refresh-3', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE })).toThrow('Save the Google OAuth client');
   });
 
   it('refuses a linked file, restores 0600, and ignores unreadable or unknown-schema files', () => {
@@ -152,7 +152,7 @@ describe('Gmail credential store', () => {
     fs.writeFileSync(elsewhere, JSON.stringify({ schemaVersion: 1, client: CLIENT }));
     const file = path.join(dir, 'gmail.json');
     fs.symlinkSync(elsewhere, file);
-    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 1 });
+    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 2, accounts: [] });
     // Saving replaces the link itself and never writes through it.
     createGmailCredentialStore({ privateRoot: dir }).saveClient(OTHER_CLIENT);
     expect(fs.lstatSync(file).isSymbolicLink()).toBe(false);
@@ -163,9 +163,32 @@ describe('Gmail credential store', () => {
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
 
     fs.writeFileSync(file, 'not json');
-    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 1 });
-    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, client: CLIENT }));
-    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 1 });
+    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 2, accounts: [] });
+    fs.writeFileSync(file, JSON.stringify({ schemaVersion: 3, client: CLIENT }));
+    expect(createGmailCredentialStore({ privateRoot: dir }).read()).toEqual({ schemaVersion: 2, accounts: [] });
+  });
+
+  it('reads a schema-1 connection as the default account and adds, labels, and removes accounts', () => {
+    fs.writeFileSync(path.join(dir, 'gmail.json'), JSON.stringify({
+      schemaVersion: 1, client: CLIENT,
+      connection: { refreshToken: 'refresh-1', accountEmail: 'Jane.Doe@gmail.com', scope: GMAIL_READONLY_SCOPE, connectedAt: '2026-10-06T00:00:00Z' },
+    }), { mode: 0o600 });
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    expect(store.read().accounts).toEqual([{ id: 'default', label: '', connection: { refreshToken: 'refresh-1', accountEmail: 'jane.doe@gmail.com', scope: GMAIL_READONLY_SCOPE, connectedAt: '2026-10-06T00:00:00Z' } }]);
+    store.saveConnection('ga_0123456789', { refreshToken: 'refresh-2', accountEmail: 'work@company.com', scope: GMAIL_READONLY_SCOPE });
+    store.setLabel('ga_0123456789', '  Work\n account  ');
+    const reread = createGmailCredentialStore({ privateRoot: dir, builtInClient: null }).read();
+    expect(reread.schemaVersion).toBe(2);
+    expect(reread.accounts.map(account => [account.id, account.label, account.connection.accountEmail])).toEqual([
+      ['default', '', 'jane.doe@gmail.com'],
+      ['ga_0123456789', 'Work account', 'work@company.com'],
+    ]);
+    // One account per address: the same address under another id replaces it.
+    store.saveConnection('ga_abcdefabcd', { refreshToken: 'refresh-3', accountEmail: 'work@company.com', scope: GMAIL_READONLY_SCOPE });
+    expect(store.read().accounts.map(account => account.id)).toEqual(['default', 'ga_abcdefabcd']);
+    store.clearConnection('default');
+    expect(store.read().accounts.map(account => account.id)).toEqual(['ga_abcdefabcd']);
+    expect(() => store.saveConnection('../escape', { refreshToken: 'x', accountEmail: 'x@y.com', scope: '' })).toThrow('Unknown Gmail account id');
   });
 
   it('validates client input without echoing it', () => {
@@ -231,7 +254,7 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
     let changes = 0;
     service.onChange(() => { changes++; });
     const { authUrl, outcome } = await connect(service);
-    expect(outcome).toEqual({ ok: true, accountEmail: 'jane.doe@gmail.com' });
+    expect(outcome).toEqual({ ok: true, accountEmail: 'jane.doe@gmail.com', accountId: 'default' });
     const exchange = google.calls.find(call => call.form.grant_type === 'authorization_code')!;
     expect(exchange.form).toMatchObject({ client_id: CLIENT.clientId, client_secret: CLIENT.clientSecret, code: 'code-1', redirect_uri: REDIRECT });
     const challenge = createHash('sha256').update(exchange.form.code_verifier).digest('base64url');
@@ -273,7 +296,7 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
     google.grantRefreshToken = undefined;
     expect((await connect(service)).outcome).toMatchObject({ ok: false, error: expect.stringContaining('no refresh token') });
     expect(service.isConnected()).toBe(false);
-    expect(createGmailCredentialStore({ privateRoot: dir }).read().connection).toBeUndefined();
+    expect(createGmailCredentialStore({ privateRoot: dir }).read().accounts).toEqual([]);
   });
 
   it('refreshes once for concurrent callers and turns invalid_grant into a reconnect, then recovers', async () => {
@@ -301,20 +324,41 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
     expect(service.status()).toMatchObject({ needsReconnect: false, lastError: null });
   });
 
-  it('never revokes when the same account reconnects, but revokes another account’s old grant', async () => {
-    const service = connection();
+  it('never revokes on reconnect; another address adds an account, each with its own token, label, and disconnect', async () => {
+    let next = 0;
+    const service = createGmailConnection({ redirectUri: REDIRECT, store: createGmailCredentialStore({ privateRoot: dir, builtInClient: null }), fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => clock, newAccountId: () => `ga_${String(++next).padStart(10, '0')}` });
     service.saveClient(CLIENT);
     await connect(service);
     google.grantRefreshToken = 'refresh-2';
     await connect(service, 'code-2');
     expect(google.calls.some(call => call.url === ENDPOINTS.revokeUrl)).toBe(false);
-    expect(createGmailCredentialStore({ privateRoot: dir }).read().connection?.refreshToken).toBe('refresh-2');
+    expect(createGmailCredentialStore({ privateRoot: dir }).read().accounts[0]?.connection.refreshToken).toBe('refresh-2');
 
+    // Add another account: Google's chooser first, and a second account with its own id.
+    const { authUrl } = service.beginConnect({ addAccount: true });
+    expect(new URL(authUrl).searchParams.get('prompt')).toBe('select_account consent');
+    expect(new URL(authUrl).searchParams.get('login_hint')).toBeNull();
     google.account = 'other@example.com';
     google.grantRefreshToken = 'refresh-3';
-    await connect(service, 'code-3');
-    expect(google.calls.filter(call => call.url === ENDPOINTS.revokeUrl).map(call => call.form.token)).toEqual(['refresh-2']);
-    expect(service.accountEmail()).toBe('other@example.com');
+    const added = await service.completeConnect({ code: 'code-3', state: new URL(authUrl).searchParams.get('state') });
+    expect(added).toEqual({ ok: true, accountEmail: 'other@example.com', accountId: 'ga_0000000001' });
+    expect(google.calls.some(call => call.url === ENDPOINTS.revokeUrl)).toBe(false);
+    expect(service.accounts().map(account => [account.id, account.email])).toEqual([['default', 'jane.doe@gmail.com'], ['ga_0000000001', 'other@example.com']]);
+    // The first account stays primary; any account is found by id, address, or label.
+    expect(service.accountEmail()).toBe('jane.doe@gmail.com');
+    service.setLabel('ga_0000000001', 'Side project');
+    expect(service.account('side project')?.accountEmail()).toBe('other@example.com');
+    expect(service.account('OTHER@example.com')?.id).toBe('ga_0000000001');
+    expect(service.account('nobody@example.com')).toBeNull();
+    expect(service.status().accounts.map(account => account.label)).toEqual(['', 'Side project']);
+    // Reconnect of one account hints that account.
+    expect(new URL(service.beginConnect({ accountId: 'ga_0000000001' }).authUrl).searchParams.get('login_hint')).toBe('other@example.com');
+    expect(() => service.beginConnect({ accountId: 'ga_9999999999' })).toThrow('not connected');
+
+    // Disconnect one account: only its grant is revoked.
+    await service.disconnect('ga_0000000001');
+    expect(google.calls.filter(call => call.url === ENDPOINTS.revokeUrl).map(call => call.form.token)).toEqual(['refresh-3']);
+    expect(service.accounts().map(account => account.email)).toEqual(['jane.doe@gmail.com']);
   });
 
   it('disconnect revokes and forgets the grant but keeps the client; a new client drops and revokes the old grant', async () => {
@@ -386,7 +430,7 @@ describe('Gmail connection: built-in client and granted scopes', () => {
     expect(service.status()).toMatchObject({ clientSource: 'own', teamClientAvailable: true, ownClientConfigured: true, clientIdSuffix: '…ghijkl' });
     expect(queryOf(service.beginConnect().authUrl).get('client_id')).toBe(CLIENT.clientId);
     const stored = JSON.parse(fs.readFileSync(file(), 'utf8'));
-    expect(Object.keys(stored).sort()).toEqual(['client', 'schemaVersion']);
+    expect(Object.keys(stored).sort()).toEqual(['accounts', 'client', 'schemaVersion']);
     expect(fs.statSync(file()).mode & 0o777).toBe(0o600);
     expect(JSON.stringify(service.status())).not.toMatch(/GOCSPX/);
   });
@@ -399,7 +443,7 @@ describe('Gmail connection: built-in client and granted scopes', () => {
     await service.accessToken();
     expect(lastRefresh()).toMatchObject({ client_id: TEAM.clientId, client_secret: TEAM.clientSecret, refresh_token: 'refresh-1' });
     const stored = JSON.parse(fs.readFileSync(file(), 'utf8'));
-    expect(Object.keys(stored).sort()).toEqual(['connection', 'schemaVersion']);
+    expect(Object.keys(stored).sort()).toEqual(['accounts', 'schemaVersion']);
     expect(JSON.stringify(stored)).not.toContain(TEAM.clientSecret);
     expect(fs.statSync(file()).mode & 0o777).toBe(0o600);
   });

@@ -6,7 +6,8 @@ import path from 'path';
 import { createStorage, getSetting, type StorageLayer } from './storage.js';
 import { GoogleApiError, type GmailClient, type GmailMessage, type GmailRawMessage } from './gmail-api.js';
 import type { AttachmentPolicy } from './gmail-attachments.js';
-import { GmailAuthError, type GmailConnection } from './gmail-connection.js';
+import { GmailAuthError } from './gmail-connection.js';
+import { fakeGmailConnection } from './gmail-connection.fake.js';
 import {
   GMAIL_COMPOSE_KEY,
   GmailComposeError,
@@ -197,13 +198,14 @@ describe('Gmail compose service', () => {
     gmail = fakeGmail();
     state = { connected: true, account: 'owner@gmail.com', canCompose: true, needsReconnect: false };
     clock = Date.parse('2026-10-06T09:00:00Z');
-    const connection = {
-      isConnected: () => state.connected,
-      accountEmail: () => (state.connected ? state.account : null),
-      canCompose: () => state.canCompose,
-      status: () => ({ needsReconnect: state.needsReconnect }),
-      client: () => gmail.client,
-    } as unknown as GmailConnection;
+    const connection = fakeGmailConnection([{
+      id: 'default',
+      get email() { return state.account; },
+      get connected() { return state.connected; },
+      get canCompose() { return state.canCompose; },
+      get needsReconnect() { return state.needsReconnect; },
+      get client() { return gmail.client; },
+    }]);
     compose = createGmailCompose({ db: storage.getDb(), connection, now: () => clock });
   });
   afterEach(() => storage.close());
@@ -522,13 +524,7 @@ describe('Gmail compose with attachments', () => {
         },
       },
     };
-    const connection = {
-      isConnected: () => true,
-      accountEmail: () => 'owner@gmail.com',
-      canCompose: () => true,
-      status: () => ({ needsReconnect: false }),
-      client: () => gmail.client,
-    } as unknown as GmailConnection;
+    const connection = fakeGmailConnection([{ id: 'default', email: 'owner@gmail.com', get client() { return gmail.client; } }]);
     compose = createGmailCompose({ db: storage.getDb(), connection, now: () => clock, attachments: policy });
   });
   afterEach(() => {
@@ -665,5 +661,62 @@ describe('Gmail compose with attachments', () => {
     expect((await compose.viewDraft(kept.draftId)).attachments).toEqual([{ name: 'a.csv', mimeType: 'text/csv', sizeBytes: 4 }]);
     // An already-sent draft's receipt names its files too.
     expect((await compose.send({ draftId: kept.draftId }, { ownerRequestId: 'req-3' })).attachments).toEqual([{ name: 'a.csv', mimeType: 'text/csv', sizeBytes: 4 }]);
+  });
+});
+
+/**
+ * Several accounts (GMAIL_API_INTEGRATION_PLAN.md §13): the sender is always
+ * an explicit decision. A draft keeps its account; new mail names `from`;
+ * with several accounts and no `from` nothing is written and the choices are
+ * listed.
+ */
+describe('Gmail compose with several accounts', () => {
+  let storage: StorageLayer;
+  let personal: ReturnType<typeof fakeGmail>;
+  let work: ReturnType<typeof fakeGmail>;
+  let compose: GmailCompose;
+  const NEW = { to: ['Jane Doe <jane@x.com>'], subject: 'Plan', body: 'Hi Jane' };
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    personal = fakeGmail();
+    work = fakeGmail();
+    work.box.sendAs = ['me@company.com'];
+    const connection = fakeGmailConnection([
+      { id: 'default', email: 'owner@gmail.com', label: 'Personal', get client() { return personal.client; } },
+      { id: 'ga_0123456789', email: 'me@company.com', label: 'Work', canCompose: false, get client() { return work.client; } },
+      { id: 'ga_abcdefabcd', email: 'side@proj.dev', label: 'Side', get client() { return work.client; } },
+    ]);
+    compose = createGmailCompose({ db: storage.getDb(), connection, now: () => Date.parse('2026-10-08T09:00:00Z') });
+  });
+  afterEach(() => storage.close());
+
+  it('refuses a new message without from, naming every account, and writes nothing', async () => {
+    const error = await compose.saveDraft(NEW).then(() => null, caught => caught);
+    expect(error).toBeInstanceOf(GmailComposeError);
+    expect(error.code).toBe('invalid_arguments');
+    expect(error.issues[0].path).toBe('from');
+    expect(error.issues[0].message).toContain('Personal (owner@gmail.com), Work (me@company.com), Side (side@proj.dev)');
+    expect(personal.box.calls).toEqual([]);
+    const send = await compose.send(NEW, { ownerRequestId: 'req-1' }).then(() => null, caught => caught);
+    expect(send.issues[0].path).toBe('from');
+  });
+
+  it('writes from the named account by label or address, checks its grant, and keeps a draft in its account', async () => {
+    const draft = await compose.saveDraft({ ...NEW, from: 'personal' });
+    expect(draft).toMatchObject({ account: 'owner@gmail.com', status: 'drafted' });
+    expect(personal.box.drafts.size).toBe(1);
+    // The Work grant is read only.
+    const readOnly = await compose.saveDraft({ ...NEW, from: 'me@company.com' }).then(() => null, caught => caught);
+    expect(readOnly.code).toBe('compose_not_granted');
+    expect(readOnly.message).toContain('me@company.com');
+    const unknown = await compose.saveDraft({ ...NEW, from: 'nobody@x.com' }).then(() => null, caught => caught);
+    expect(unknown.issues[0].message).toContain('is not a connected account');
+    // An update needs no from; moving it to another account is refused.
+    expect(await compose.saveDraft({ ...NEW, draftId: draft.draftId, body: 'Hi Jane, updated' })).toMatchObject({ account: 'owner@gmail.com', updated: true });
+    const moved = await compose.saveDraft({ ...NEW, draftId: draft.draftId, body: 'x', from: 'Side' }).then(() => null, caught => caught);
+    expect(moved.issues[0].message).toContain('cannot move to another account');
+    // The card view names the account's label.
+    expect(await compose.viewDraft(draft.draftId)).toMatchObject({ state: 'draft', account: 'owner@gmail.com', accountLabel: 'Personal' });
   });
 });

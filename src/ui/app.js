@@ -1972,7 +1972,11 @@ function paintGmailDraftCard(card, draft, note = '') {
   const attached = files.length
     ? `<dt>Attached</dt><dd><ul class="gmail-draft-files">${files.map((file) => `<li>${esc(file.name)}<span class="gmail-draft-file-size"> · ${esc(gmailFileSize(file.sizeBytes))}</span></li>`).join('')}</ul></dd>`
     : '';
-  const facts = `<dl class="gmail-draft-fields">${fields}<dt>Subject</dt><dd>${esc(draft.subject || '(no subject)')}</dd>${attached}</dl>`;
+  // From first: with several accounts, the card is where the owner checks which one sends.
+  const from = draft.account
+    ? `<dt>From</dt><dd>${esc(draft.accountLabel ? `${draft.accountLabel} · ${draft.account}` : draft.account)}</dd>`
+    : '';
+  const facts = `<dl class="gmail-draft-fields">${from}${fields}<dt>Subject</dt><dd>${esc(draft.subject || '(no subject)')}</dd>${attached}</dl>`;
   const body = draft.body
     ? `<div class="gmail-draft-body" tabindex="0" role="region" aria-label="Draft text">${esc(draft.body)}${draft.bodyTruncated ? '\n…' : ''}</div>`
     : '';
@@ -1996,7 +2000,7 @@ function paintGmailDraftCard(card, draft, note = '') {
   } else if (draft.state === 'missing') {
     card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div>${facts}<div class="gmail-draft-state">No longer in Gmail Drafts: it was sent or deleted in Gmail.</div><div class="gmail-draft-actions">${open('Open Gmail')}</div>`;
   } else if (draft.state === 'other_account') {
-    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div><div class="gmail-draft-state">This draft belongs to ${esc(draft.account || 'another account')}, which is not the connected Gmail account.</div>`;
+    card.innerHTML = `<div class="gmail-draft-head">Gmail draft${account}</div><div class="gmail-draft-state">This draft belongs to ${esc(draft.account || 'another account')}, which is not connected to BotBoy.</div>`;
   } else if (draft.state === 'not_connected') {
     card.innerHTML = '<div class="gmail-draft-head">Gmail draft</div><div class="gmail-draft-state">Gmail is not connected. Connect it on <a href="#/connections/gmail-sync">Connections → Gmail</a> to see this draft.</div>';
   } else {

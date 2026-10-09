@@ -31,8 +31,9 @@ function load(state: Record<string, unknown>): Helpers {
     constLine('icon'), constLine('esc'), constLine('attr'), constLine('number'),
     topLevel('relativeTime'), topLevel('whenPhrase'), topLevel('pageHead'),
     topLevel('captureIssueFor'), topLevel('captureIssueDetail'),
+    topLevel('gmailAccountName'), topLevel('gmailMultiCardModel'),
     topLevel('gmailImportActive'), topLevel('gmailImportDate'), topLevel('renderGmailImportCard'),
-    topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
+    topLevel('renderGmailAccountCard'), topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
     'return { gmailSyncCardModel, renderGmailSyncSettings };',
   ].join('\n');
   // eslint-disable-next-line no-new-func
@@ -50,11 +51,18 @@ function connection(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** The page status: the first account's fields plus `accounts` (one account here, built from the same fields). */
 function status(overrides: Record<string, unknown> = {}) {
-  return {
+  const base: Record<string, any> = {
     enabled: true, running: false, intervalMinutes: 5, connection: connection(), noiseSenders: ['no-reply'],
     mailActive: true, backlog: 0, hasCursor: true, lastRun: null, ...overrides,
   };
+  const conn = base.connection;
+  base.accounts = overrides.accounts ?? (conn.connected ? [{
+    id: 'default', label: '', email: conn.accountEmail, connection: conn, running: false, backlog: base.backlog,
+    hasCursor: true, mailActive: true, lastRun: base.lastRun, captured: base.captured ?? { total: 0, received: 0, sent: 0, inProjects: 0 }, import: base.import ?? null,
+  }] : []);
+  return base;
 }
 
 describe('Gmail connection UI', () => {
@@ -153,25 +161,26 @@ describe('Gmail connection UI', () => {
       },
     });
     document.body.innerHTML = load(state).renderGmailSyncSettings();
-    expect(document.querySelector('[data-action="gmail-sync-connect"]')!.textContent).toContain('Reconnect');
+    expect(document.querySelector('[data-action="gmail-sync-connect"][data-account="default"]')!.textContent).toContain('Reconnect');
     expect(document.querySelector('[data-action="gmail-sync-toggle"]')!.textContent).toBe('Pause automatic sync');
-    expect(document.querySelector('[data-action="gmail-sync-disconnect"]')).not.toBeNull();
-    expect(document.querySelector('[data-action="gmail-sync-run"]')).not.toBeNull();
+    expect(document.querySelector('[data-action="gmail-sync-disconnect"][data-account="default"]')).not.toBeNull();
+    expect(document.querySelector('[data-action="gmail-sync-run"][data-account="default"]')).not.toBeNull();
+    expect(document.querySelector('[data-action="gmail-sync-add-account"]')!.textContent).toContain('Add another account');
     expect(document.body.textContent).toContain('4 new');
     expect(document.body.textContent).not.toContain('ingested');
     expect(document.body.textContent).toContain('Update just now in 1.2s for jane.doe@gmail.com');
     expect(document.body.textContent).toContain('Suppressed (this sync replaces it)');
 
-    state.gmailSync.busy = 'run';
+    state.gmailSync.busy = 'run:default';
     document.body.innerHTML = load(state).renderGmailSyncSettings();
-    expect(document.querySelector('[data-action="gmail-sync-run"]')!.textContent).toContain('Syncing…');
+    expect(document.querySelector('[data-action="gmail-sync-run"][data-account="default"]')!.textContent).toContain('Syncing…');
     expect((document.querySelector('[data-action="gmail-sync-disconnect"]') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('shows what BotBoy holds beside the last run, and the 30-day window', () => {
     state.gmailSync.status = status({ captured: { total: 1800, received: 1300, sent: 500, inProjects: 42 } });
     document.body.innerHTML = load(state).renderGmailSyncSettings();
-    const details = document.querySelector('.connection-details')!.textContent!;
+    const details = document.querySelector('.gmail-account .connection-details')!.textContent!;
     expect(details).toContain('Captured1,800 emails (1,300 received, 500 sent)');
     expect(details).toContain('In projects42');
     expect(document.body.textContent).toContain('captures the last 30 days of mail when you connect, then new mail as it arrives');
@@ -184,7 +193,8 @@ describe('Gmail connection UI', () => {
     const start = document.querySelector('[data-action="gmail-sync-import"]')!;
     expect(start.textContent).toContain('Import the last 6 months');
     expect(document.querySelector('[data-action="gmail-sync-import-stop"]')).toBeNull();
-    expect(document.body.textContent).toContain('When you connect, BotBoy captures the last 30 days.');
+    expect(document.body.textContent).toContain('BotBoy captured the last 30 days when you connected.');
+    expect(start.getAttribute('data-account')).toBe('default');
 
     state.gmailSync.status = status({ import: { status: 'requested', months: 6, requestedAt: new Date().toISOString(), sinceIso: null, finishedAt: null, total: 0, checked: 0, captured: 0, duplicates: 0, filtered: 0, truncated: false } });
     document.body.innerHTML = load(state).renderGmailSyncSettings();
@@ -219,8 +229,8 @@ describe('Gmail connection UI', () => {
     expect(document.querySelector('[data-action="gmail-sync-import"]')).toBeNull();
 
     // The controls are wired, and the open page refreshes while an import runs.
-    expect(dashboard).toContain("request('/gmail-sync/import', { method: 'POST', body: { months: 6 } })");
-    expect(dashboard).toContain("request('/gmail-sync/import', { method: 'DELETE' })");
+    expect(dashboard).toContain("request('/gmail-sync/import', { method: 'POST', body: { months: 6, ...(accountId ? { accountId } : {}) } })");
+    expect(dashboard).toContain("request(`/gmail-sync/import${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`, { method: 'DELETE' })");
     const poll = topLevel('pollVersion');
     expect(poll).toContain("state.route.view === 'gmail-sync-settings' && !state.gmailSync.busy && gmailImportActive(state.gmailSync.status)");
     expect(poll).toContain("startsWith('gmail-sync-')");
@@ -250,7 +260,7 @@ describe('Gmail connection UI', () => {
     document.body.innerHTML = load(state).renderGmailSyncSettings();
     expect(document.body.textContent).toContain('cannot draft or send yet. Choose Reconnect and allow “Manage drafts and send emails”.');
     expect(document.body.textContent).toContain('Read only');
-    expect(document.querySelector('[data-action="gmail-sync-connect"]')!.textContent).toContain('Reconnect');
+    expect(document.querySelector('[data-action="gmail-sync-connect"][data-account="default"]')!.textContent).toContain('Reconnect');
 
     state.gmailSync.status = status({ connection: connection({ clientSource: 'own', ownClientConfigured: true, canCompose: true, needsComposeGrant: false }) });
     document.body.innerHTML = load(state).renderGmailSyncSettings();
@@ -262,6 +272,43 @@ describe('Gmail connection UI', () => {
     state.gmailSync.status = status({ connection: connection({ needsReconnect: true, needsComposeGrant: true, lastError: 'Google ended BotBoy’s access.' }) });
     document.body.innerHTML = load(state).renderGmailSyncSettings();
     expect(document.body.textContent).not.toContain('cannot draft or send yet');
+  });
+
+  it('lists several accounts with their labels, totals, imports, and per-account controls', () => {
+    const work = { id: 'ga_0123456789', label: 'Work', email: 'me@company.com', connection: connection({ accountEmail: 'me@company.com', canCompose: true }), running: false, backlog: 0, hasCursor: true, mailActive: true,
+      lastRun: { at: new Date().toISOString(), status: 'completed', counters: { emitted: 3 } }, captured: { total: 40, received: 30, sent: 10, inProjects: 12 }, import: null };
+    const personal = { id: 'default', label: 'Personal <b>me</b>', email: 'jane.doe@gmail.com', connection: connection({ canCompose: false, needsComposeGrant: true }), running: false, backlog: 5, hasCursor: true, mailActive: true,
+      lastRun: null, captured: { total: 18, received: 13, sent: 5, inProjects: 0 }, import: { status: 'importing', months: 6, requestedAt: '', sinceIso: '2026-04-06T07:00:00.000Z', finishedAt: null, total: 200, checked: 50, captured: 10, duplicates: 0, filtered: 40, truncated: false } };
+    state.gmailSync.status = status({ accounts: [personal, work] });
+    expect(load(state).gmailSyncCardModel()).toEqual({
+      status: 'Active', tone: 'good', detail: '2 accounts (Personal <b>me</b>, Work): 58 emails captured. Importing older mail for 1.',
+    });
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    const cards = [...document.querySelectorAll('.gmail-account')] as HTMLElement[];
+    expect(cards.map(card => card.dataset.gmailAccount)).toEqual(['default', 'ga_0123456789']);
+    expect(document.querySelector('b')).toBeNull();
+    expect((document.getElementById('gmail-sync-label-default') as HTMLInputElement).value).toBe('Personal <b>me</b>');
+    expect(document.querySelector('label[for="gmail-sync-label-ga_0123456789"]')).not.toBeNull();
+    expect(cards[0].textContent).toContain('Read only: choose Reconnect');
+    expect(cards[0].querySelector('[data-action="gmail-sync-import-stop"]')!.getAttribute('data-account')).toBe('default');
+    expect(cards[1].querySelector('[data-action="gmail-sync-import"]')!.getAttribute('data-account')).toBe('ga_0123456789');
+    expect(cards[1].textContent).toContain('Captured40 emails (30 received, 10 sent)');
+    expect(cards[1].textContent).toContain('Last sync just now: 3 new.');
+    expect(cards[1].querySelector('[data-action="gmail-account-label"]')!.getAttribute('data-account')).toBe('ga_0123456789');
+    // With several accounts the single-account last-run section is not shown.
+    expect(document.body.textContent).not.toContain('Your own sent mail is kept without filters');
+
+    // Any account needing Reconnect turns the Connections card into a warning naming it.
+    state.gmailSync.status = status({ accounts: [personal, { ...work, connection: connection({ accountEmail: 'me@company.com', needsReconnect: true }) }] });
+    expect(load(state).gmailSyncCardModel()).toMatchObject({ status: 'Reconnect needed', tone: 'warn' });
+    expect(load(state).gmailSyncCardModel().detail).toContain('Work (me@company.com)');
+
+    // Disconnect asks about deleting the captured mail separately; the label save reads the field first.
+    const handler = dashboard.slice(dashboard.indexOf("if (action === 'gmail-sync-disconnect')"), dashboard.indexOf("if (action === 'gmail-sync-run')"));
+    expect(handler).toContain('Also delete the');
+    expect(handler).toContain('deleteMail');
+    const label = dashboard.slice(dashboard.indexOf("if (action === 'gmail-account-label')"), dashboard.indexOf("if (action === 'gmail-sync-connect')"));
+    expect(label.indexOf('field.value')).toBeLessThan(label.indexOf('gmailSyncAction('));
   });
 
   it('labels removing an own client as a switch back when the shared client is there', () => {

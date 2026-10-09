@@ -36,14 +36,18 @@ import {
   type GmailClient,
   type GoogleEndpoints,
 } from './gmail-api.js';
+import { randomBytes } from 'node:crypto';
 import {
+  GMAIL_DEFAULT_ACCOUNT_ID,
   activeGmailClient,
+  cleanAccountLabel,
   clientIdSuffix,
   createGmailCredentialStore,
   removeStagedTeamClient,
   validateGmailClient,
   type GmailClientSource,
   type GmailCredentialStore,
+  type StoredGmailAccount,
   type StoredGmailCredentials,
 } from './gmail-credentials.js';
 
@@ -68,6 +72,8 @@ export interface GmailConnectionStatus {
   needsReconnect: boolean;
   /** Owner-safe text of the last failed sign-in or refresh. */
   lastError: string | null;
+  /** Every connected account (the fields above describe the first). */
+  accounts: GmailAccountSummary[];
   /** The loopback address Google returns to (shown in setup help). */
   redirectUri: string;
   /** The scopes every sign-in requests, space-separated. */
@@ -88,17 +94,56 @@ export class GmailAuthError extends Error {
   }
 }
 
-export interface GmailConnection {
+/** One connected account, as the page, the sync, and the chat tools see it. */
+export interface GmailAccountSummary {
+  id: string;
+  /** The owner's name for it ("Work", "Personal"); '' when unset. */
+  label: string;
+  email: string;
+  connectedAt: string | null;
+  needsReconnect: boolean;
+  lastError: string | null;
+  grantedScopes: string[];
+  canCompose: boolean;
+  needsComposeGrant: boolean;
+}
+
+/** "Work (me@x.com)" or the address alone. */
+export function gmailAccountName(account: { label: string; email: string }): string {
+  return account.label ? `${account.label} (${account.email})` : account.email;
+}
+
+/** One account's tokens and client (the sync, compose, and chat tools use these). */
+export interface GmailAccountConnection {
+  readonly id: string;
+  label(): string;
   status(): GmailConnectionStatus;
   isConnected(): boolean;
   accountEmail(): string | null;
   /** The stored grant includes gmail.compose (drafts and sending). */
   canCompose(): boolean;
+  accessToken(): Promise<string>;
+  invalidateAccessToken(): void;
+  /** A Gmail REST client bound to this account's tokens. */
+  client(): GmailClient;
+  /** Changes on every connection change (any account, client save). */
+  version(): number;
+  /** Listeners run after any connect/disconnect/label change. */
+  onChange(listener: () => void): () => void;
+}
+
+/**
+ * Every connected account on one Google client (GMAIL_API_INTEGRATION_PLAN.md
+ * §13). The account methods (status, client, accessToken, …) act on the first
+ * account, which keeps one-account callers unchanged; `account(selector)`
+ * returns any account by id, address, or label.
+ */
+export interface GmailConnection extends GmailAccountConnection {
   /** Saves the owner's own client (Advanced); it becomes the active client. */
   saveClient(input: { clientId?: unknown; clientSecret?: unknown }): GmailConnectionStatus;
   /**
    * Removes the own client. A built-in client, if the slot is filled, becomes
-   * active; a connection made with another client ID is revoked and dropped.
+   * active; connections made with another client ID are revoked and dropped.
    */
   removeClient(): Promise<GmailConnectionStatus>;
   /**
@@ -107,19 +152,19 @@ export interface GmailConnection {
    * removed.
    */
   retireStagedTeamClient(): boolean;
-  beginConnect(): { authUrl: string };
+  /** Reconnect `accountId`, add another account (`addAccount`), or connect the first one. */
+  beginConnect(options?: { accountId?: string; addAccount?: boolean }): { authUrl: string };
   completeConnect(query: { code?: unknown; state?: unknown; error?: unknown }): Promise<
-    { ok: true; accountEmail: string } | { ok: false; error: string }
+    { ok: true; accountEmail: string; accountId: string } | { ok: false; error: string }
   >;
-  disconnect(): Promise<GmailConnectionStatus>;
-  accessToken(): Promise<string>;
-  invalidateAccessToken(): void;
-  /** A Gmail REST client bound to this connection's tokens. */
-  client(): GmailClient;
-  /** Changes on every connection change (connect, disconnect, client save). */
-  version(): number;
-  /** Listeners run after connect/disconnect; the sync resets per-account state. */
-  onChange(listener: () => void): () => void;
+  /** Disconnects one account (default: the first). Captured mail stays. */
+  disconnect(accountId?: string): Promise<GmailConnectionStatus>;
+  accounts(): GmailAccountSummary[];
+  /** An account by id, address, or label (case-insensitive); null when none matches. */
+  account(selector: string): GmailAccountConnection | null;
+  /** The view of one account id whether or not it is connected now (the sync's slot). */
+  slot(accountId: string): GmailAccountConnection;
+  setLabel(accountId: string, label: unknown): GmailConnectionStatus;
 }
 
 /** A rejected client is fixed by whoever owns it: a BotBoy update for a filled built-in slot. */
@@ -136,18 +181,36 @@ export function createGmailConnection(deps: {
   fetchImpl?: FetchLike;
   endpoints?: GoogleEndpoints;
   now?: () => number;
+  /** New account ids (tests pin them). */
+  newAccountId?: () => string;
 }): GmailConnection {
   const store = deps.store ?? createGmailCredentialStore({ privateRoot: deps.privateRoot });
   const fetchImpl: FetchLike = deps.fetchImpl ?? ((input, init) => fetch(input, init));
   const endpoints = deps.endpoints ?? GOOGLE_ENDPOINTS;
   const now = deps.now ?? Date.now;
-  const pending = new Map<string, { verifier: string; createdAt: number }>();
+  const newAccountId = deps.newAccountId ?? (() => `ga_${randomBytes(5).toString('hex')}`);
+  /** A sign-in in progress and what it is for: reconnect one account, or add one. */
+  const pending = new Map<string, { verifier: string; createdAt: number; accountId?: string }>();
   const listeners = new Set<() => void>();
 
-  let access: { token: string; expiresAt: number } | null = null;
-  let refreshing: Promise<string> | null = null;
-  let needsReconnect = false;
-  let lastError: string | null = null;
+  /** Per-account runtime state (memory only). */
+  interface Runtime {
+    access: { token: string; expiresAt: number } | null;
+    refreshing: Promise<string> | null;
+    needsReconnect: boolean;
+    lastError: string | null;
+  }
+  const runtimes = new Map<string, Runtime>();
+  const runtime = (accountId: string): Runtime => {
+    let entry = runtimes.get(accountId);
+    if (!entry) {
+      entry = { access: null, refreshing: null, needsReconnect: false, lastError: null };
+      runtimes.set(accountId, entry);
+    }
+    return entry;
+  };
+  /** The last failed sign-in (no account yet). */
+  let signInError: string | null = null;
   let version = 1;
 
   function changed(): void {
@@ -168,59 +231,77 @@ export function createGmailConnection(deps: {
 
   /** The own client, else the store's usable built-in one (none when the slot is empty). */
   const activeOf = (stored: StoredGmailCredentials) => activeGmailClient(stored, store.builtInClient);
+  const scopesOf = (account: StoredGmailAccount | undefined): string[] => (account ? account.connection.scope.split(/\s+/).filter(Boolean) : []);
+  const storedAccount = (accountId: string): StoredGmailAccount | undefined => store.read().accounts.find(account => account.id === accountId);
+  const firstAccount = (): StoredGmailAccount | undefined => store.read().accounts[0];
 
-  function grantedScopes(stored: StoredGmailCredentials): string[] {
-    return stored.connection ? stored.connection.scope.split(/\s+/).filter(Boolean) : [];
+  function summary(account: StoredGmailAccount): GmailAccountSummary {
+    const granted = scopesOf(account);
+    const canCompose = granted.includes(GMAIL_COMPOSE_SCOPE);
+    const state = runtime(account.id);
+    return {
+      id: account.id,
+      label: account.label,
+      email: account.connection.accountEmail,
+      connectedAt: account.connection.connectedAt || null,
+      needsReconnect: state.needsReconnect,
+      lastError: state.lastError,
+      grantedScopes: granted,
+      canCompose,
+      needsComposeGrant: !canCompose,
+    };
   }
 
-  function status(): GmailConnectionStatus {
+  /** The page's status; the account fields describe `focus` (default: the first account). */
+  function status(focus?: StoredGmailAccount): GmailConnectionStatus {
     const stored = store.read();
     const active = activeOf(stored);
-    const granted = grantedScopes(stored);
+    const account = focus ?? stored.accounts[0];
+    const granted = scopesOf(account);
     const canCompose = granted.includes(GMAIL_COMPOSE_SCOPE);
+    const state = account ? runtime(account.id) : null;
     return {
       clientConfigured: Boolean(active),
       clientSource: active?.source ?? null,
       teamClientAvailable: Boolean(store.builtInClient),
       ownClientConfigured: Boolean(stored.client),
       clientIdSuffix: active ? clientIdSuffix(active.client.clientId) : null,
-      connected: Boolean(stored.connection),
-      accountEmail: stored.connection?.accountEmail ?? null,
-      connectedAt: stored.connection?.connectedAt || null,
-      needsReconnect: Boolean(stored.connection) && needsReconnect,
-      lastError,
+      connected: Boolean(account),
+      accountEmail: account?.connection.accountEmail ?? null,
+      connectedAt: account?.connection.connectedAt || null,
+      needsReconnect: Boolean(state?.needsReconnect),
+      lastError: state?.lastError ?? signInError,
+      accounts: stored.accounts.map(summary),
       redirectUri: deps.redirectUri,
       scope: GMAIL_REQUESTED_SCOPES.join(' '),
       grantedScopes: granted,
       canCompose,
-      needsComposeGrant: Boolean(stored.connection) && !canCompose,
+      needsComposeGrant: Boolean(account) && !canCompose,
     };
   }
 
   /**
-   * After any client change: a dropped connection is revoked at Google (best
-   * effort; the grant rule already removed it locally), and sign-ins started
+   * After any client change: dropped connections are revoked at Google (best
+   * effort; the grant rule already removed them locally), and sign-ins started
    * with another client ID are void.
    */
   function afterClientChange(before: StoredGmailCredentials): Promise<void> {
     const after = store.read();
     if (activeOf(before)?.client.clientId !== activeOf(after)?.client.clientId) pending.clear();
-    needsReconnect = false;
-    lastError = null;
-    if (!before.connection || after.connection) return Promise.resolve();
-    access = null;
-    const dropped = before.connection.refreshToken;
-    return revokeToken(fetchImpl, endpoints, dropped).then(() => undefined, (error) => {
+    signInError = null;
+    for (const state of runtimes.values()) { state.needsReconnect = false; state.lastError = null; }
+    const kept = new Set(after.accounts.map(account => account.id));
+    const dropped = before.accounts.filter(account => !kept.has(account.id));
+    if (!dropped.length) return Promise.resolve();
+    for (const account of dropped) runtimes.delete(account.id);
+    return Promise.all(dropped.map(account => revokeToken(fetchImpl, endpoints, account.connection.refreshToken).then(() => undefined, (error) => {
       console.warn(`[Gmail] revoke at Google failed (local grant removed anyway): ${(error as Error)?.message ?? error}`);
-    });
+    }))).then(() => undefined);
   }
 
-  async function revokeStored(): Promise<void> {
-    const stored = store.read();
-    const token = stored.connection?.refreshToken;
-    if (!token) return;
+  async function revokeAccount(account: StoredGmailAccount): Promise<void> {
     try {
-      await revokeToken(fetchImpl, endpoints, token);
+      await revokeToken(fetchImpl, endpoints, account.connection.refreshToken);
     } catch (error) {
       // The grant is deleted locally either way; the owner can also remove
       // BotBoy at myaccount.google.com → Security → Third-party connections.
@@ -228,39 +309,109 @@ export function createGmailConnection(deps: {
     }
   }
 
-  async function refresh(): Promise<string> {
+  async function refresh(accountId: string): Promise<string> {
     const stored = store.read();
     const active = activeOf(stored);
-    if (!active || !stored.connection) {
+    const account = stored.accounts.find(entry => entry.id === accountId);
+    const state = runtime(accountId);
+    if (!active || !account) {
       throw new GmailAuthError('Gmail is not connected. Open Connections → Gmail and connect your account.', 'not_connected');
     }
     try {
       const tokens = await refreshAccessToken(fetchImpl, endpoints, {
         clientId: active.client.clientId,
         clientSecret: active.client.clientSecret,
-        refreshToken: stored.connection.refreshToken,
+        refreshToken: account.connection.refreshToken,
       });
-      access = { token: tokens.accessToken, expiresAt: now() + tokens.expiresInSeconds * 1000 };
-      if (needsReconnect) { needsReconnect = false; changed(); }
-      lastError = null;
+      state.access = { token: tokens.accessToken, expiresAt: now() + tokens.expiresInSeconds * 1000 };
+      if (state.needsReconnect) { state.needsReconnect = false; changed(); }
+      state.lastError = null;
       return tokens.accessToken;
     } catch (error) {
       if (error instanceof GoogleApiError && ['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(error.code)) {
-        if (!needsReconnect) { needsReconnect = true; changed(); }
-        lastError = error.code === 'invalid_grant'
-          ? 'Google ended BotBoy’s access to this account (revoked, expired, or the password changed). Choose Reconnect.'
+        if (!state.needsReconnect) { state.needsReconnect = true; changed(); }
+        state.lastError = error.code === 'invalid_grant'
+          ? `Google ended BotBoy’s access to ${gmailAccountName({ label: account.label, email: account.connection.accountEmail })} (revoked, expired, or the password changed). Choose Reconnect.`
           : rejectedClientAdvice(active.source);
-        throw new GmailAuthError(`${error.message}. ${lastError}`, 'reconnect_required');
+        throw new GmailAuthError(`${error.message}. ${state.lastError}`, 'reconnect_required');
       }
       throw error;
     }
   }
 
+  function accountView(accountId: string): GmailAccountConnection {
+    const view: GmailAccountConnection = {
+      id: accountId,
+      label: () => storedAccount(accountId)?.label ?? '',
+      status: () => status(storedAccount(accountId)),
+      isConnected: () => Boolean(storedAccount(accountId)),
+      accountEmail: () => storedAccount(accountId)?.connection.accountEmail ?? null,
+      canCompose: () => scopesOf(storedAccount(accountId)).includes(GMAIL_COMPOSE_SCOPE),
+      async accessToken() {
+        const state = runtime(accountId);
+        if (state.access && state.access.expiresAt - ACCESS_TOKEN_SKEW_MS > now()) return state.access.token;
+        if (!state.refreshing) {
+          state.refreshing = refresh(accountId).finally(() => { state.refreshing = null; });
+        }
+        return state.refreshing;
+      },
+      invalidateAccessToken() {
+        runtime(accountId).access = null;
+      },
+      client() {
+        return createGmailClient({
+          fetchImpl,
+          endpoints,
+          accessToken: () => view.accessToken(),
+          invalidateAccessToken: () => view.invalidateAccessToken(),
+        });
+      },
+      version: () => version,
+      onChange(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+    };
+    return view;
+  }
+
+  /** The first account's view; with no account it reads as not connected. */
+  const primaryId = (): string => firstAccount()?.id ?? GMAIL_DEFAULT_ACCOUNT_ID;
+
+  function findAccount(selector: string): StoredGmailAccount | undefined {
+    const wanted = String(selector ?? '').trim().toLowerCase();
+    if (!wanted) return undefined;
+    const accounts = store.read().accounts;
+    return accounts.find(account => account.id === wanted)
+      ?? accounts.find(account => account.connection.accountEmail === wanted)
+      ?? accounts.find(account => account.label && account.label.toLowerCase() === wanted);
+  }
+
   const service: GmailConnection = {
-    status,
-    isConnected: () => Boolean(store.read().connection),
-    accountEmail: () => store.read().connection?.accountEmail ?? null,
-    canCompose: () => grantedScopes(store.read()).includes(GMAIL_COMPOSE_SCOPE),
+    get id() { return primaryId(); },
+    label: () => firstAccount()?.label ?? '',
+    status: () => status(),
+    isConnected: () => Boolean(firstAccount()),
+    accountEmail: () => firstAccount()?.connection.accountEmail ?? null,
+    canCompose: () => scopesOf(firstAccount()).includes(GMAIL_COMPOSE_SCOPE),
+    accessToken: () => accountView(primaryId()).accessToken(),
+    invalidateAccessToken: () => accountView(primaryId()).invalidateAccessToken(),
+    client: () => accountView(primaryId()).client(),
+
+    accounts: () => store.read().accounts.map(summary),
+    account(selector) {
+      const found = findAccount(selector);
+      return found ? accountView(found.id) : null;
+    },
+
+    slot: (accountId) => accountView(accountId),
+
+    setLabel(accountId, label) {
+      if (!storedAccount(accountId)) throw new GmailAuthError('That Gmail account is not connected.', 'not_connected');
+      store.setLabel(accountId, cleanAccountLabel(label));
+      changed();
+      return status();
+    },
 
     saveClient(input) {
       const client = validateGmailClient(input);
@@ -287,11 +438,19 @@ export function createGmailConnection(deps: {
       return removed;
     },
 
-    beginConnect() {
+    beginConnect(options = {}) {
       const stored = store.read();
       const active = activeOf(stored);
       if (!active) {
         throw new GmailAuthError('Gmail has no Google client. Add your own client in Connections → Gmail.', 'not_connected');
+      }
+      const target = options.addAccount
+        ? undefined
+        : options.accountId
+          ? stored.accounts.find(account => account.id === options.accountId)
+          : stored.accounts[0];
+      if (options.accountId && !options.addAccount && !target) {
+        throw new GmailAuthError('That Gmail account is not connected.', 'not_connected');
       }
       prunePending();
       while (pending.size >= MAX_PENDING_STATES) {
@@ -301,14 +460,15 @@ export function createGmailConnection(deps: {
       }
       const state = createOAuthState();
       const pkce = createPkcePair();
-      pending.set(state, { verifier: pkce.verifier, createdAt: now() });
+      pending.set(state, { verifier: pkce.verifier, createdAt: now(), ...(target ? { accountId: target.id } : {}) });
       return {
         authUrl: buildAuthorizationUrl(endpoints, {
           clientId: active.client.clientId,
           redirectUri: deps.redirectUri,
           state,
           codeChallenge: pkce.challenge,
-          loginHint: stored.connection?.accountEmail,
+          loginHint: target?.connection.accountEmail,
+          selectAccount: Boolean(options.addAccount),
         }),
       };
     },
@@ -320,7 +480,7 @@ export function createGmailConnection(deps: {
       // Single use: a replayed or forged callback finds nothing.
       if (state) pending.delete(state);
       const fail = (error: string) => {
-        lastError = error;
+        signInError = error;
         changed();
         return { ok: false as const, error };
       };
@@ -328,7 +488,9 @@ export function createGmailConnection(deps: {
       if (typeof query.error === 'string' && query.error) {
         return fail(query.error === 'access_denied'
           ? 'Google sign-in was cancelled, so nothing changed.'
-          : `Google sign-in did not finish (${query.error.replace(/[^a-z_]/gi, '').slice(0, 40)}).`);
+          : query.error === 'admin_policy_enforced' || query.error === 'org_internal'
+            ? 'This Google account’s organization does not allow BotBoy’s Google client (a Workspace admin policy). Use another account, or ask the admin to allow the client.'
+            : `Google sign-in did not finish (${query.error.replace(/[^a-z_]/gi, '').slice(0, 40)}).`);
       }
       const code = typeof query.code === 'string' ? query.code : '';
       if (!code) return fail('Google returned no authorization code. Choose Connect again.');
@@ -357,18 +519,23 @@ export function createGmailConnection(deps: {
           invalidateAccessToken: () => {},
         });
         const profile = await probe.getProfile();
-        const previous = store.read().connection;
-        // Google revokes a whole grant (client + account), so only another
-        // account's old grant may be revoked; reconnecting the same account
-        // just replaces its token.
-        if (previous && previous.accountEmail !== profile.emailAddress) await revokeStored();
-        store.saveConnection({ refreshToken: tokens.refreshToken, accountEmail: profile.emailAddress, scope: granted.join(' ') });
-        access = { token: tokens.accessToken, expiresAt: now() + tokens.expiresInSeconds * 1000 };
-        needsReconnect = false;
-        lastError = null;
+        const email = profile.emailAddress.toLowerCase();
+        const accounts = store.read().accounts;
+        // The address decides the account: signing in to one already
+        // connected replaces its token (Google revokes a whole grant, so
+        // nothing is revoked); a new address adds an account, even when the
+        // sign-in started as a Reconnect of another one.
+        const existing = accounts.find(account => account.connection.accountEmail === email);
+        const accountId = existing?.id ?? (accounts.length ? newAccountId() : GMAIL_DEFAULT_ACCOUNT_ID);
+        store.saveConnection(accountId, { refreshToken: tokens.refreshToken, accountEmail: email, scope: granted.join(' ') });
+        const fresh = runtime(accountId);
+        fresh.access = { token: tokens.accessToken, expiresAt: now() + tokens.expiresInSeconds * 1000 };
+        fresh.needsReconnect = false;
+        fresh.lastError = null;
+        signInError = null;
         changed();
-        console.log(`[Gmail] Connected ${profile.emailAddress} (${active.source} client ${clientIdSuffix(active.client.clientId)}; ${granted.includes(GMAIL_COMPOSE_SCOPE) ? 'read + compose' : 'read only'})`);
-        return { ok: true, accountEmail: profile.emailAddress };
+        console.log(`[Gmail] ${existing ? 'Reconnected' : 'Connected'} ${email} as account ${accountId} (${active.source} client ${clientIdSuffix(active.client.clientId)}; ${granted.includes(GMAIL_COMPOSE_SCOPE) ? 'read + compose' : 'read only'})`);
+        return { ok: true, accountEmail: email, accountId };
       } catch (error) {
         const message = error instanceof GoogleApiError
           ? (error.code === 'redirect_uri_mismatch' || error.code === 'invalid_client'
@@ -381,35 +548,16 @@ export function createGmailConnection(deps: {
       }
     },
 
-    async disconnect() {
-      await revokeStored();
-      store.clearConnection();
-      access = null;
-      needsReconnect = false;
-      lastError = null;
+    async disconnect(accountId) {
+      const account = accountId ? storedAccount(accountId) : firstAccount();
+      if (account) {
+        await revokeAccount(account);
+        store.clearConnection(account.id);
+        runtimes.delete(account.id);
+      }
+      signInError = null;
       changed();
       return status();
-    },
-
-    async accessToken() {
-      if (access && access.expiresAt - ACCESS_TOKEN_SKEW_MS > now()) return access.token;
-      if (!refreshing) {
-        refreshing = refresh().finally(() => { refreshing = null; });
-      }
-      return refreshing;
-    },
-
-    invalidateAccessToken() {
-      access = null;
-    },
-
-    client() {
-      return createGmailClient({
-        fetchImpl,
-        endpoints,
-        accessToken: () => service.accessToken(),
-        invalidateAccessToken: () => service.invalidateAccessToken(),
-      });
     },
 
     version: () => version,

@@ -88,6 +88,8 @@ export interface OutlookThreadIdentity {
   toRecipients: string[];
   ccRecipients: string[];
   directlyAddressedToOwner: boolean;
+  /** Received from another of the owner's own addresses (multi-account Gmail): never a request. */
+  fromOwnAccount?: boolean;
 }
 
 export function normalizeOutlookAddress(value: unknown): string {
@@ -176,6 +178,7 @@ export function parseOutlookThreadIdentity(
     toRecipients,
     ccRecipients,
     directlyAddressedToOwner,
+    ...(evidence.metadata.fromOwnAccount === true || evidence.metadata.fromOwnAccount === 'true' ? { fromOwnAccount: true } : {}),
   };
 }
 
@@ -198,6 +201,7 @@ export function sameOutlookThread(
 export function isDirectIncomingOutlookEmail(identity: OutlookThreadIdentity): boolean {
   return identity.direction === 'received'
     && identity.sender !== identity.ownerEmail
+    && !identity.fromOwnAccount
     && identity.directlyAddressedToOwner
     && identity.toRecipients.length === 1
     && identity.toRecipients[0] === identity.ownerEmail

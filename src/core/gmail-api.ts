@@ -145,6 +145,8 @@ export function buildAuthorizationUrl(endpoints: GoogleEndpoints, input: {
   state: string;
   codeChallenge: string;
   loginHint?: string;
+  /** Adding another account: Google shows its account chooser first. */
+  selectAccount?: boolean;
 }): string {
   const url = new URL(endpoints.authUrl);
   url.searchParams.set('client_id', input.clientId);
@@ -154,7 +156,7 @@ export function buildAuthorizationUrl(endpoints: GoogleEndpoints, input: {
   // Offline access + forced consent: Google returns a refresh token on every
   // grant, so reconnecting always replaces a dead one.
   url.searchParams.set('access_type', 'offline');
-  url.searchParams.set('prompt', 'consent');
+  url.searchParams.set('prompt', input.selectAccount ? 'select_account consent' : 'consent');
   url.searchParams.set('state', input.state);
   url.searchParams.set('code_challenge', input.codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');

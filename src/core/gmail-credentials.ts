@@ -1,6 +1,7 @@
 /**
  * The Gmail connection's secrets: the owner's own Google OAuth client and the
- * refresh token Google issued for one account.
+ * refresh token Google issued for each connected account (schema 2,
+ * multi-account; GMAIL_API_INTEGRATION_PLAN.md §13).
  *
  * The active client (GMAIL_CHAT_TOOLS_PLAN.md D11, D12):
  *   - `client`: the owner's own Desktop app client from Connections → Gmail,
@@ -30,7 +31,16 @@ import path from 'path';
 import { BOTBOY_GOOGLE_CLIENT } from './gmail-builtin-client.js';
 
 export const GMAIL_CREDENTIALS_FILE = 'gmail.json';
-const SCHEMA_VERSION = 1;
+/** Schema 2 (multi-account, 2026-10-08): `accounts[]`. Schema 1's single `connection` reads as account `default`. */
+const SCHEMA_VERSION = 2;
+/**
+ * The account a schema-1 connection becomes, and the first account of a fresh
+ * install. It keeps the original settings keys (`gmail_sync.*`) and capture
+ * URLs (`gmail://mail/<id>`), so nothing already stored moves.
+ */
+export const GMAIL_DEFAULT_ACCOUNT_ID = 'default';
+const ACCOUNT_ID_PATTERN = /^(?:default|ga_[a-f0-9]{10})$/;
+export const MAX_ACCOUNT_LABEL_CHARS = 40;
 
 /** Google OAuth client IDs end with this domain (Cloud Console → Clients). */
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{4,200}\.apps\.googleusercontent\.com$/;
@@ -49,11 +59,29 @@ export interface StoredGmailConnection {
   connectedAt: string;
 }
 
+export interface StoredGmailAccount {
+  /** `default` or `ga_<10 hex>`: names its settings keys and capture URLs. */
+  id: string;
+  /** The owner's name for the account ("Work", "Personal"); '' when unset. */
+  label: string;
+  connection: StoredGmailConnection;
+}
+
 export interface StoredGmailCredentials {
   schemaVersion: typeof SCHEMA_VERSION;
   /** The owner's own client (Advanced). Wins over the built-in client. */
   client?: StoredGmailClient;
-  connection?: StoredGmailConnection;
+  /** Every connected account; one grant each, all on the active client. */
+  accounts: StoredGmailAccount[];
+}
+
+export function isGmailAccountId(value: unknown): value is string {
+  return typeof value === 'string' && ACCOUNT_ID_PATTERN.test(value);
+}
+
+/** Owner-facing label text: single line, bounded; '' clears it. */
+export function cleanAccountLabel(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_ACCOUNT_LABEL_CHARS) : '';
 }
 
 /** `'own'` = the client saved in Connections → Gmail; `'team'` = a built-in client, when that slot is filled. */
@@ -109,41 +137,54 @@ function readStored(file: string, builtIn: BuiltInGmailClient | null): StoredGma
   let raw: string;
   try {
     const stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink()) return { schemaVersion: SCHEMA_VERSION };
+    if (!stat.isFile() || stat.isSymbolicLink()) return { schemaVersion: SCHEMA_VERSION, accounts: [] };
     // Self-heal permissions: the tokens must never be readable by other users.
     if ((stat.mode & 0o077) !== 0) fs.chmodSync(file, 0o600);
     raw = fs.readFileSync(file, 'utf8');
   } catch {
-    return { schemaVersion: SCHEMA_VERSION };
+    return { schemaVersion: SCHEMA_VERSION, accounts: [] };
   }
   let value: any;
   try {
     value = JSON.parse(raw);
   } catch {
     console.warn('[Gmail] Ignoring an unreadable Gmail credentials file; saving the client again replaces it.');
-    return { schemaVersion: SCHEMA_VERSION };
+    return { schemaVersion: SCHEMA_VERSION, accounts: [] };
   }
-  if (value?.schemaVersion !== SCHEMA_VERSION) {
+  if (value?.schemaVersion !== 1 && value?.schemaVersion !== SCHEMA_VERSION) {
     console.warn('[Gmail] Ignoring a Gmail credentials file with an unknown schema; saving the client again replaces it.');
-    return { schemaVersion: SCHEMA_VERSION };
+    return { schemaVersion: SCHEMA_VERSION, accounts: [] };
   }
   const text = (entry: unknown) => (typeof entry === 'string' && entry.trim() ? entry.trim() : '');
   const parseClient = (entry: any): StoredGmailClient | undefined => (entry && text(entry.clientId) && text(entry.clientSecret)
     ? { clientId: text(entry.clientId), clientSecret: text(entry.clientSecret), savedAt: text(entry.savedAt) }
     : undefined);
-  const out: StoredGmailCredentials = { schemaVersion: SCHEMA_VERSION };
+  const out: StoredGmailCredentials = { schemaVersion: SCHEMA_VERSION, accounts: [] };
   const client = parseClient(value.client);
   if (client) out.client = client;
   // A legacy `teamClient` (credential-file delivery) is not read: the
   // built-in client took its place, and the next write drops it.
-  const connection = value.connection;
-  if (activeGmailClient(out, builtIn) && connection && text(connection.refreshToken) && text(connection.accountEmail)) {
-    out.connection = {
+  if (!activeGmailClient(out, builtIn)) return out;
+  const parseConnection = (connection: any): StoredGmailConnection | null => (connection && text(connection.refreshToken) && text(connection.accountEmail)
+    ? {
       refreshToken: text(connection.refreshToken),
       accountEmail: text(connection.accountEmail).toLowerCase(),
       scope: text(connection.scope),
       connectedAt: text(connection.connectedAt),
-    };
+    }
+    : null);
+  // Schema 1: one connection, which becomes the default account.
+  const entries: any[] = value.schemaVersion === 1
+    ? (value.connection ? [{ id: GMAIL_DEFAULT_ACCOUNT_ID, label: '', connection: value.connection }] : [])
+    : (Array.isArray(value.accounts) ? value.accounts : []);
+  const seenIds = new Set<string>();
+  const seenEmails = new Set<string>();
+  for (const entry of entries) {
+    const connection = parseConnection(entry?.connection);
+    if (!connection || !isGmailAccountId(entry?.id) || seenIds.has(entry.id) || seenEmails.has(connection.accountEmail)) continue;
+    seenIds.add(entry.id);
+    seenEmails.add(connection.accountEmail);
+    out.accounts.push({ id: entry.id, label: cleanAccountLabel(entry.label), connection });
   }
   return out;
 }
@@ -174,10 +215,10 @@ function writeStored(file: string, value: StoredGmailCredentials): void {
  * only when the active client ID is unchanged.
  */
 function keepGrantFor(previous: StoredGmailCredentials, next: StoredGmailCredentials, builtIn: BuiltInGmailClient | null): StoredGmailCredentials {
-  if (!previous.connection) return next;
+  if (!previous.accounts.length) return next;
   const before = activeGmailClient(previous, builtIn)?.client.clientId;
   const after = activeGmailClient(next, builtIn)?.client.clientId;
-  return before && before === after ? { ...next, connection: previous.connection } : next;
+  return before && before === after ? { ...next, accounts: previous.accounts } : next;
 }
 
 export interface GmailCredentialStore {
@@ -186,8 +227,11 @@ export interface GmailCredentialStore {
   saveClient(client: { clientId: string; clientSecret: string }, now?: Date): StoredGmailCredentials;
   /** Removes the own client; a built-in client, if the slot is filled, becomes active. */
   removeOwnClient(): StoredGmailCredentials;
-  saveConnection(connection: Omit<StoredGmailConnection, 'connectedAt'>, now?: Date): StoredGmailCredentials;
-  clearConnection(): StoredGmailCredentials;
+  /** Saves one account's grant (a new id adds the account; an existing id replaces its grant). */
+  saveConnection(accountId: string, connection: Omit<StoredGmailConnection, 'connectedAt'>, now?: Date): StoredGmailCredentials;
+  /** Removes one account. */
+  clearConnection(accountId: string): StoredGmailCredentials;
+  setLabel(accountId: string, label: string): StoredGmailCredentials;
   clearAll(): void;
   readonly file: string;
   readonly privateRoot: string;
@@ -208,7 +252,7 @@ export function createGmailCredentialStore(deps: { privateRoot?: string; builtIn
   }
 
   function persist(next: StoredGmailCredentials): StoredGmailCredentials {
-    if (!next.client && !next.connection) fs.rmSync(file, { force: true });
+    if (!next.client && !next.accounts.length) fs.rmSync(file, { force: true });
     else writeStored(file, next);
     cached = next;
     return next;
@@ -224,23 +268,43 @@ export function createGmailCredentialStore(deps: { privateRoot?: string; builtIn
       return persist(keepGrantFor(previous, {
         schemaVersion: SCHEMA_VERSION,
         client: { ...client, savedAt: now.toISOString() },
+        accounts: [],
       }, builtIn));
     },
     removeOwnClient() {
-      return persist(keepGrantFor(current(), { schemaVersion: SCHEMA_VERSION }, builtIn));
+      return persist(keepGrantFor(current(), { schemaVersion: SCHEMA_VERSION, accounts: [] }, builtIn));
     },
-    saveConnection(connection, now = new Date()) {
+    saveConnection(accountId, connection, now = new Date()) {
       const previous = current();
       if (!activeGmailClient(previous, builtIn)) throw new Error('Save the Google OAuth client before connecting.');
-      return persist({ ...previous, connection: { ...connection, connectedAt: now.toISOString() } });
+      if (!isGmailAccountId(accountId)) throw new Error('Unknown Gmail account id.');
+      const email = connection.accountEmail.toLowerCase();
+      const existing = previous.accounts.find(account => account.id === accountId);
+      const saved: StoredGmailAccount = {
+        id: accountId,
+        label: existing?.label ?? '',
+        connection: { ...connection, accountEmail: email, connectedAt: now.toISOString() },
+      };
+      // One account per address: another id holding this address gives way.
+      const others = previous.accounts.filter(account => account.id !== accountId && account.connection.accountEmail !== email);
+      const accounts = existing
+        ? previous.accounts.filter(account => others.includes(account) || account.id === accountId).map(account => (account.id === accountId ? saved : account))
+        : [...others, saved];
+      return persist({ ...previous, accounts });
     },
-    clearConnection() {
+    clearConnection(accountId) {
       const previous = current();
-      const { connection: _dropped, ...rest } = previous;
-      return persist(rest);
+      return persist({ ...previous, accounts: previous.accounts.filter(account => account.id !== accountId) });
+    },
+    setLabel(accountId, label) {
+      const previous = current();
+      return persist({
+        ...previous,
+        accounts: previous.accounts.map(account => (account.id === accountId ? { ...account, label: cleanAccountLabel(label) } : account)),
+      });
     },
     clearAll() {
-      persist({ schemaVersion: SCHEMA_VERSION });
+      persist({ schemaVersion: SCHEMA_VERSION, accounts: [] });
     },
   };
 }

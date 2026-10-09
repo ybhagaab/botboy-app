@@ -38,7 +38,7 @@ import {
   type GmailMessage,
   type GmailRawMessage,
 } from './gmail-api.js';
-import { GmailAuthError, type GmailConnection } from './gmail-connection.js';
+import { GmailAuthError, gmailAccountName, type GmailAccountConnection, type GmailConnection } from './gmail-connection.js';
 import {
   GmailComposeInputError,
   MAX_BODY_CHARS,
@@ -173,6 +173,8 @@ export interface ComposeArgs {
   replyToMessageId?: unknown;
   replyAll?: unknown;
   draftId?: unknown;
+  /** The account to write from (address or label); required when several are connected. */
+  from?: unknown;
 }
 
 /** One attached file as the card shows it. */
@@ -223,6 +225,8 @@ export interface SendReceipt {
 
 export interface DraftView {
   state: DraftState | 'missing' | 'unknown' | 'other_account' | 'not_connected';
+  /** The owner's label for the sending account, when it has one. */
+  accountLabel?: string;
   draftId: string;
   account: string | null;
   messageId: string | null;
@@ -377,16 +381,52 @@ export function createGmailCompose(deps: {
     setSetting(db, GMAIL_COMPOSE_KEY, { drafts: list.slice(-MAX_LEDGER_DRAFTS) });
   }
 
-  function requireCompose(): { account: string; client: GmailClient } {
-    const account = connection.accountEmail();
-    if (!connection.isConnected() || !account) throw new GmailComposeError('not_connected', 'Gmail is not connected.');
-    if (connection.status().needsReconnect) {
-      throw new GmailComposeError('reconnect_required', 'Google ended BotBoy’s access to this Gmail account.');
+  /** "Work (a@x.com), Personal (b@y.com)" for issues and next actions. */
+  function accountChoices(): string {
+    return connection.accounts().map(account => gmailAccountName(account)).join(', ');
+  }
+
+  /**
+   * The account a write uses (GMAIL_API_INTEGRATION_PLAN.md §13): a saved
+   * draft's own account; else `from` (address or label); else the only
+   * connected account. With several accounts and no `from`, the call is
+   * refused with the choices, so the sender is always an explicit decision.
+   */
+  function requireCompose(selector: { from?: unknown; draftId?: unknown } = {}): { account: string; client: GmailClient } {
+    const accounts = connection.accounts();
+    if (!accounts.length) throw new GmailComposeError('not_connected', 'Gmail is not connected.');
+    const from = typeof selector.from === 'string' ? selector.from.trim() : '';
+    if (selector.from !== undefined && selector.from !== null && selector.from !== '' && !from) {
+      throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `must be one of: ${accountChoices()}` }]), 'none', 'Choosing the account');
     }
-    if (!connection.canCompose()) {
-      throw new GmailComposeError('compose_not_granted', 'This Gmail connection allows reading only, not drafting or sending.');
+    let view: GmailAccountConnection | null = null;
+    const entry = isGmailId(selector.draftId) ? entryFor(selector.draftId) : undefined;
+    if (entry) {
+      view = connection.account(entry.account);
+      if (!view) throw new GmailComposeError('other_account', `Draft ${entry.draftId} belongs to a Gmail account that is not connected (${entry.account}).`);
+      if (from && connection.account(from)?.id !== view.id) {
+        throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `this draft belongs to ${entry.account}; a draft cannot move to another account (make a new draft instead)` }]), 'none', 'Choosing the account');
+      }
+    } else if (from) {
+      view = connection.account(from);
+      if (!view) throw composeFailure(new GmailComposeInputError([{ path: 'from', message: `"${from.slice(0, 80)}" is not a connected account; use one of: ${accountChoices()}` }]), 'none', 'Choosing the account');
+    } else if (accounts.length === 1) {
+      view = connection.account(accounts[0].id);
+    } else {
+      throw composeFailure(new GmailComposeInputError([{
+        path: 'from',
+        message: `required with several Gmail accounts: one of ${accountChoices()}. Use the account the thread belongs to, the work account for work mail; ask the owner when it is not clear`,
+      }]), 'none', 'Choosing the account');
     }
-    return { account, client: connection.client() };
+    const account = view?.accountEmail();
+    if (!view || !account) throw new GmailComposeError('not_connected', 'Gmail is not connected.');
+    if (view.status().needsReconnect) {
+      throw new GmailComposeError('reconnect_required', `Google ended BotBoy’s access to ${account}.`);
+    }
+    if (!view.canCompose()) {
+      throw new GmailComposeError('compose_not_granted', `The connection to ${account} allows reading only, not drafting or sending.`);
+    }
+    return { account, client: view.client() };
   }
 
   async function ownerAddresses(client: GmailClient, account: string): Promise<Set<string>> {
@@ -681,7 +721,7 @@ export function createGmailCompose(deps: {
 
   return {
     async saveDraft(args) {
-      const { account, client } = requireCompose();
+      const { account, client } = requireCompose({ from: args.from, draftId: args.draftId });
       const existing = args.draftId === undefined || args.draftId === null || args.draftId === ''
         ? undefined
         : openEntry(args.draftId, account);
@@ -745,7 +785,7 @@ export function createGmailCompose(deps: {
     async send(args, request) {
       const ownerRequestId = String(request.ownerRequestId ?? '').trim();
       if (!ownerRequestId) throw new GmailComposeError('invalid_arguments', 'A send needs the owner request id.', 'none', [], 'Send only from the owner’s live chat turn.');
-      const { account, client } = requireCompose();
+      const { account, client } = requireCompose({ from: args.from, draftId: args.draftId });
       const fromDraft = !(args.draftId === undefined || args.draftId === null || args.draftId === '');
       const tracked = requestLedger(ownerRequestId);
 
@@ -838,6 +878,21 @@ export function createGmailCompose(deps: {
     },
 
     async viewDraft(draftId) {
+      const view = await viewDraftOnly(draftId);
+      const label = view.account ? connection.account(view.account)?.label() : '';
+      return label ? { ...view, accountLabel: label } : view;
+    },
+
+    async sendDraftFromCard(draftId, expectedMessageId) {
+      return sendDraftFromCardImpl(draftId, expectedMessageId);
+    },
+
+    async discardDraft(draftId, expectedMessageId) {
+      return discardDraftImpl(draftId, expectedMessageId);
+    },
+  };
+
+  async function viewDraftOnly(draftId: string): Promise<DraftView> {
       const blank = (state: DraftView['state'], account: string | null): DraftView => ({
         state, draftId, account, messageId: null, threadId: null, to: [], cc: [], bcc: [], subject: '', body: '',
         bodyTruncated: false, attachments: [], updatedAt: null, gmailUrl: null,
@@ -845,11 +900,11 @@ export function createGmailCompose(deps: {
       if (!isGmailId(draftId)) return blank('unknown', null);
       const entry = entryFor(draftId);
       if (!entry) return blank('unknown', null);
-      const account = connection.isConnected() ? connection.accountEmail() : null;
-      if (!account) return { ...ledgerView(entry, 'not_connected'), gmailUrl: null };
-      if (account !== entry.account) return { ...ledgerView(entry, 'other_account'), gmailUrl: null };
+      if (!connection.accounts().length) return { ...ledgerView(entry, 'not_connected'), gmailUrl: null };
+      const owning = connection.account(entry.account);
+      if (!owning) return { ...ledgerView(entry, 'other_account'), gmailUrl: null };
       if (entry.state === 'sent' || entry.state === 'discarded') return ledgerView(entry, entry.state);
-      const draft = await currentDraft(connection.client(), entry);
+      const draft = await currentDraft(owning.client(), entry);
       if (!draft) return ledgerView(entry, 'missing');
       if (entry.state === 'send_unknown') {
         // A send that Gmail never answered removes the draft once it lands.
@@ -864,10 +919,10 @@ export function createGmailCompose(deps: {
         saveEntry({ ...entry, messageId: draft.message.id });
       }
       return draftView(draft, { ...entry, messageId: draft.message.id }, 'draft');
-    },
+  }
 
-    async sendDraftFromCard(draftId, expectedMessageId) {
-      const { account, client } = requireCompose();
+  async function sendDraftFromCardImpl(draftId: string, expectedMessageId: string): Promise<SendReceipt> {
+      const { account, client } = requireCompose({ draftId });
       const entry = openEntry(draftId, account);
       if (draftLocks.has(entry.draftId)) throw new GmailComposeError('send_in_progress', 'This draft is being sent right now.');
       draftLocks.add(entry.draftId);
@@ -883,10 +938,10 @@ export function createGmailCompose(deps: {
       } finally {
         draftLocks.delete(entry.draftId);
       }
-    },
+  }
 
-    async discardDraft(draftId, expectedMessageId) {
-      const { account, client } = requireCompose();
+  async function discardDraftImpl(draftId: string, expectedMessageId: string): Promise<DraftView> {
+      const { account, client } = requireCompose({ draftId });
       const entry = openEntry(draftId, account);
       if (draftLocks.has(entry.draftId)) throw new GmailComposeError('send_in_progress', 'This draft is being sent right now.');
       draftLocks.add(entry.draftId);
@@ -912,6 +967,5 @@ export function createGmailCompose(deps: {
       } finally {
         draftLocks.delete(entry.draftId);
       }
-    },
-  };
+  }
 }

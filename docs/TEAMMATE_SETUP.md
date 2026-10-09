@@ -248,6 +248,16 @@ Google OAuth client from your own Google Cloud project, so you create one once:
    **Advanced**, then the **Go to … (unsafe)** link, then **Allow**. Google
    returns you to BotBoy.
 
+**More than one Google account** (personal, work, a side project): choose
+**Add another account** on the Gmail page and sign in to the next account. Your
+one client works for every account; if its app is still in testing, add each
+account under **Audience → Test users** first. Give each account a **label**
+(Work, Personal…): briefs, routing, and chat use it to tell your mail apart,
+and a reply goes from the account its thread is in. **Disconnect** removes one
+account and keeps its captured mail unless you also choose to delete it. A work
+Google Workspace account may refuse your client when its admin allows only
+approved apps; BotBoy says so instead of failing silently.
+
 BotBoy asks Google for two kinds of access: reading your mail
 (`gmail.readonly`) and drafting and sending (`gmail.compose`). You can untick
 drafting and sending on Google's screen; capture and search still work, and the

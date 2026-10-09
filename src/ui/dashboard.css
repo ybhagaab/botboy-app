@@ -2001,3 +2001,7 @@ a.data-room-row:hover { background:var(--hover); }
 .lf-storage-help summary { cursor:pointer; color:var(--soft); }
 .lf-storage-actions { margin:6px 0 0; padding-left:18px; line-height:1.5; }
 .lf-storage-meta { margin:8px 0 0; color:var(--faint); font-size:10px; }
+/* Gmail accounts (GMAIL_API_INTEGRATION_PLAN.md §13) */
+.gmail-account .connection-head { gap:8px; flex-wrap:wrap; }
+.gmail-account .connection-head strong { overflow-wrap:anywhere; flex:1; min-width:0; }
+.gmail-account-import { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }

@@ -24,7 +24,7 @@ describe('Gmail chat tool definitions and guidance', () => {
     expect(schema('gmail_search').properties.maxResults).toMatchObject({ minimum: 1, maximum: 25 });
     expect(schema('gmail_draft').required).toEqual(['body', 'ownerRequested']);
     expect(schema('gmail_send').required).toEqual(['ownerRequested']);
-    expect(Object.keys(schema('gmail_send').properties)).toEqual(['to', 'cc', 'bcc', 'subject', 'body', 'attachments', 'replyToMessageId', 'replyAll', 'draftId', 'ownerRequested']);
+    expect(Object.keys(schema('gmail_send').properties)).toEqual(['to', 'cc', 'bcc', 'subject', 'body', 'attachments', 'replyToMessageId', 'replyAll', 'draftId', 'from', 'ownerRequested']);
     // Attachments: a closed list of {path} | {assetId} entries with a name, capped as Gmail is.
     for (const name of ['gmail_draft', 'gmail_send']) {
       const attachments = schema(name).properties.attachments;

@@ -2622,6 +2622,8 @@ function gmailSyncCardModel() {
       ? { status: 'Not connected', tone: '', detail: 'OAuth client saved. Choose Connect to sign in to Google.' }
       : { status: 'Not connected', tone: '', detail: 'For Google accounts: add your own Google OAuth client to connect.' };
   }
+  const accounts = Array.isArray(status.accounts) ? status.accounts : [];
+  if (accounts.length > 1) return gmailMultiCardModel(status, accounts);
   if (connection.needsReconnect) return { status: 'Reconnect needed', tone: 'warn', detail: connection.lastError || 'Google ended BotBoy’s access to this account.' };
   if (!status.enabled) return { status: 'Paused', tone: 'warn', detail: `Automatic sync is paused for ${connection.accountEmail}` };
   const issue = captureIssueFor('gmail');
@@ -2647,10 +2649,40 @@ function gmailSyncCardModel() {
   };
 }
 
+/** "Work (me@x.com)" or the address alone. */
+function gmailAccountName(account) {
+  return account?.label ? `${account.label} (${account.email})` : String(account?.email || '');
+}
+
+/** The Connections card with several Gmail accounts: totals, then any account that needs the owner. */
+function gmailMultiCardModel(status, accounts) {
+  const reconnect = accounts.filter(account => account.connection?.needsReconnect);
+  if (reconnect.length) {
+    return { status: 'Reconnect needed', tone: 'warn', detail: `${reconnect.map(gmailAccountName).join(', ')}: Google ended BotBoy’s access. Open Gmail and choose Reconnect.` };
+  }
+  if (!status.enabled) return { status: 'Paused', tone: 'warn', detail: `Automatic sync is paused for ${accounts.length} accounts` };
+  const issue = captureIssueFor('gmail');
+  if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
+  const failed = accounts.filter(account => account.lastRun?.status === 'failed');
+  if (failed.length) return { status: 'Needs attention', tone: 'warn', detail: `${failed.map(gmailAccountName).join(', ')}: the last sync failed` };
+  const total = accounts.reduce((sum, account) => sum + Number(account.captured?.total ?? 0), 0);
+  const importing = accounts.filter(account => gmailImportActive(account)).length;
+  return {
+    status: 'Active',
+    tone: 'good',
+    detail: `${number(accounts.length)} accounts (${accounts.map(account => account.label || account.email).join(', ')}): ${number(total)} emails captured.${importing ? ` Importing older mail for ${number(importing)}.` : ''}`,
+  };
+}
+
 /** An older-mail import is waiting to list or working through its window. */
 function gmailImportActive(status) {
   const value = status?.import?.status;
-  return value === 'requested' || value === 'importing';
+  if (value === 'requested' || value === 'importing') return true;
+  // The page status: any account importing.
+  return Array.isArray(status?.accounts) && status.accounts.some(account => {
+    const state = account?.import?.status;
+    return state === 'requested' || state === 'importing';
+  });
 }
 
 function gmailImportDate(iso) {
@@ -2659,10 +2691,11 @@ function gmailImportDate(iso) {
 }
 
 /** "Import older mail" (GMAIL_API_INTEGRATION_PLAN.md §12): start, progress, stop. */
-function renderGmailImportCard(status, busy) {
+function renderGmailImportCard(status, busy, accountId = '') {
   const job = status?.import || null;
   const disabled = busy ? 'disabled' : '';
-  const active = gmailImportActive(status);
+  const active = job?.status === 'requested' || job?.status === 'importing';
+  const accountAttr = accountId ? ` data-account="${esc(accountId)}"` : '';
   const since = gmailImportDate(job?.sinceIso);
   let line = '';
   if (job?.status === 'requested') {
@@ -2677,8 +2710,12 @@ function renderGmailImportCard(status, busy) {
     line = `Import stopped ${whenPhrase(job.finishedAt)} after ${number(job.checked ?? 0)} of ${number(job.total ?? 0)} messages: ${number(job.captured ?? 0)} captured.`;
   }
   const action = active
-    ? `<button class="button" type="button" data-action="gmail-sync-import-stop" ${disabled}>${busy === 'import' ? 'Stopping…' : 'Stop import'}</button>`
-    : `<button class="button" type="button" data-action="gmail-sync-import" ${disabled}>${icon('download', 14)} ${busy === 'import' ? 'Starting…' : 'Import the last 6 months'}</button>`;
+    ? `<button class="button" type="button" data-action="gmail-sync-import-stop"${accountAttr} ${disabled}>${busy === 'import' ? 'Stopping…' : 'Stop import'}</button>`
+    : `<button class="button" type="button" data-action="gmail-sync-import"${accountAttr} ${disabled}>${icon('download', 14)} ${busy === 'import' ? 'Starting…' : 'Import the last 6 months'}</button>`;
+  if (accountId) {
+    // Inside an account card: one line and its button.
+    return `<div class="gmail-account-import"><p class="page-subtitle">${esc(line || 'Older mail: BotBoy captured the last 30 days when you connected. Import the last 6 months to bring older mail in, with the same filters.')}</p><div class="head-actions" style="justify-content:flex-start">${action}</div></div>`;
+  }
   return `
     <section class="card pad" style="margin-top:12px">
       <h3 class="card-title">Import older mail</h3>
@@ -2686,6 +2723,42 @@ function renderGmailImportCard(status, busy) {
       ${line ? `<p>${esc(line)}</p>` : ''}
       <div class="head-actions" style="justify-content:flex-start; margin-top:8px">${action}</div>
     </section>`;
+}
+
+/** One connected account: label, access, totals, last sync, import, Reconnect, Disconnect. */
+function renderGmailAccountCard(account, busy) {
+  const disabled = busy ? 'disabled' : '';
+  const conn = account.connection || {};
+  const run = account.lastRun;
+  const counters = run?.counters || {};
+  const runLine = !run
+    ? 'The first sync runs shortly.'
+    : run.status === 'failed'
+      ? `Last sync failed ${whenPhrase(run.at)}: ${String(run.reason || '')}`
+      : `Last sync ${whenPhrase(run.at)}: ${Number(counters.emitted ?? 0) ? `${number(counters.emitted)} new` : 'no new mail'}${account.backlog ? `; ${number(account.backlog)} more next run` : ''}.`;
+  const access = conn.needsReconnect ? 'Reconnect needed' : conn.canCompose ? 'Read, draft, and send' : 'Read only';
+  return `
+    <article class="card pad gmail-account" data-gmail-account="${esc(account.id)}">
+      <div class="connection-head"><span class="source-icon">${icon('mail', 17)}</span><strong>${esc(account.email)}</strong><span class="pill ${conn.needsReconnect || run?.status === 'failed' ? 'warn' : 'good'}">${esc(access)}</span></div>
+      ${conn.needsReconnect && conn.lastError ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(conn.lastError)}</span></div>` : ''}
+      ${!conn.needsReconnect && conn.needsComposeGrant ? `<div class="mcp-alert">${icon('alert', 14)}<span>Read only: choose Reconnect and allow “Manage drafts and send emails” to draft and send from this account.</span></div>` : ''}
+      <label class="page-subtitle" for="gmail-sync-label-${esc(account.id)}" style="display:block;margin-top:8px">Label (how BotBoy names this account in briefs and chat)</label>
+      <div style="display:flex; gap:6px; align-items:center">
+        <input id="gmail-sync-label-${esc(account.id)}" class="gmail-sync-label" type="text" maxlength="40" autocomplete="off" placeholder="Work, Personal, Side project…" value="${esc(account.label || '')}" style="flex:1">
+        <button class="button small" type="button" data-action="gmail-account-label" data-account="${esc(account.id)}" ${disabled}>${busy === `label:${account.id}` ? 'Saving…' : 'Save label'}</button>
+      </div>
+      <div class="connection-details" style="margin-top:8px">
+        <span><span>Captured</span><strong>${number(account.captured?.total ?? 0)} emails (${number(account.captured?.received ?? 0)} received, ${number(account.captured?.sent ?? 0)} sent)</strong></span>
+        <span><span>In projects</span><strong>${number(account.captured?.inProjects ?? 0)}</strong></span>
+      </div>
+      <p class="page-subtitle">${esc(runLine)}</p>
+      ${renderGmailImportCard(account, busy, account.id)}
+      <div class="head-actions" style="justify-content:flex-start; margin-top:8px">
+        <button class="button" type="button" data-action="gmail-sync-run" data-account="${esc(account.id)}" ${disabled}>${icon('refresh', 14)} ${busy === `run:${account.id}` ? 'Syncing…' : 'Sync now'}</button>
+        <button class="button" type="button" data-action="gmail-sync-connect" data-account="${esc(account.id)}" ${disabled}>${busy === 'connect' ? 'Opening Google…' : 'Reconnect'}</button>
+        <button class="button" type="button" data-action="gmail-sync-disconnect" data-account="${esc(account.id)}" ${disabled}>${busy === `disconnect:${account.id}` ? 'Disconnecting…' : 'Disconnect'}</button>
+      </div>
+    </article>`;
 }
 
 function renderGmailSyncSettings() {
@@ -2705,9 +2778,7 @@ function renderGmailSyncSettings() {
       <article class="card pad"><div class="eyebrow">${icon('clock', 14)} Waiting</div><h3 class="card-title">${number(status?.backlog ?? 0)} messages</h3><p class="page-subtitle">BotBoy reads at most 100 messages per sync to stay inside Gmail's per-user quota; the rest follow on the next runs.</p></article>
     </section>` : '';
   const connectActions = connection.connected
-    ? `<button class="button" type="button" data-action="gmail-sync-connect" ${disabled}>${icon('refresh', 14)} ${busy === 'connect' ? 'Opening Google…' : 'Reconnect'}</button>
-       <button class="button" type="button" data-action="gmail-sync-toggle" ${disabled}>${status?.enabled ? 'Pause automatic sync' : 'Resume automatic sync'}</button>
-       <button class="button" type="button" data-action="gmail-sync-disconnect" ${disabled}>${busy === 'disconnect' ? 'Disconnecting…' : 'Disconnect'}</button>`
+    ? `<button class="button" type="button" data-action="gmail-sync-toggle" ${disabled}>${status?.enabled ? 'Pause automatic sync' : 'Resume automatic sync'}</button>`
     : connection.clientConfigured
       ? `<button class="button primary" type="button" data-action="gmail-sync-connect" ${disabled}>${icon('link', 14)} ${busy === 'connect' ? 'Opening Google…' : 'Connect Gmail'}</button>`
       : '';
@@ -2763,20 +2834,20 @@ function renderGmailSyncSettings() {
       <div class="connection-head"><span class="source-icon">${icon('mail', 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div>
       <p>${esc(card.detail)}</p>
       ${connection.lastError && !connection.needsReconnect ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(connection.lastError)}</span></div>` : ''}
-      ${composeBanner}
+      ${(status?.accounts || []).length > 1 ? '' : composeBanner}
       <div class="connection-details">
-        <span><span>Account</span><strong>${esc(connection.accountEmail || 'Not connected')}</strong></span>
-        <span><span>Access</span><strong>${connection.connected ? (connection.canCompose ? 'Read, draft, and send' : 'Read only') : '—'}</strong></span>
+        <span><span>Accounts</span><strong>${connection.connected ? number((status?.accounts || []).length || 1) : 'Not connected'}</strong></span>
         <span><span>Cadence</span><strong>Every ${status ? number(status.intervalMinutes) : 5} minutes</strong></span>
-        ${status?.captured ? `<span><span>Captured</span><strong>${number(status.captured.total ?? 0)} emails (${number(status.captured.received ?? 0)} received, ${number(status.captured.sent ?? 0)} sent)</strong></span>
-        <span><span>In projects</span><strong>${number(status.captured.inProjects ?? 0)}</strong></span>` : ''}
         <span><span>Browser Gmail capture</span><strong>${status?.enabled && status?.mailActive ? 'Suppressed (this sync replaces it)' : 'Active'}</strong></span>
       </div>
-      <p class="page-subtitle" style="margin-top:8px">${esc('BotBoy captures the last 30 days of mail when you connect, then new mail as it arrives; in chat, it searches and reads your whole mailbox. It drafts or sends only when you ask in chat. It never marks mail read, labels, archives, moves, or deletes anything in your mailbox. Disconnect revokes the access at Google; mail already captured stays.')}</p>
+      <p class="page-subtitle" style="margin-top:8px">${esc('BotBoy captures the last 30 days of mail when you connect, then new mail as it arrives; in chat, it searches and reads your whole mailbox. It drafts or sends only when you ask in chat. It never marks mail read, labels, archives, moves, or deletes anything in your mailbox. Disconnect revokes one account’s access at Google; its captured mail stays unless you choose to delete it.')}</p>
       <div class="head-actions" style="justify-content:flex-start; margin-top:8px">${connectActions}</div>
     </section>
-    ${connection.connected ? renderGmailImportCard(status, busy) : ''}
-    ${lastRun}
+    ${connection.connected ? `
+    <div class="section-heading"><div><h2>Accounts</h2><p>Each account syncs on its own, with its own sign-in. Labels tell BotBoy which account mail came from when it routes mail into projects, writes briefs, and drafts replies.</p></div>
+      <div class="head-actions"><button class="button" type="button" data-action="gmail-sync-add-account" ${disabled}>${icon('plus', 14)} ${busy === 'add' ? 'Opening Google…' : 'Add another account'}</button></div></div>
+    <section class="grid two-col">${(status?.accounts || []).map(account => renderGmailAccountCard(account, busy)).join('')}</section>` : ''}
+    ${(status?.accounts || []).length > 1 ? '' : lastRun}
     ${clientSection}
     <div class="section-heading"><div><h2>Filtering rules</h2><p>Received mail is kept only when your address is in To or Cc. Drafts, spam, trash, Promotions, and Social are skipped; automated senders are dropped next; meeting summaries and recaps always pass. Sent mail is always kept.</p></div></div>
     <section class="grid two-col">
@@ -8394,25 +8465,48 @@ function bindEvents() {
         toast(teamFallback ? 'Your client was removed; BotBoy’s shared Google client is in use' : 'OAuth client removed');
       });
     }
+    if (action === 'gmail-sync-add-account') {
+      void gmailSyncAction('add', async () => {
+        const payload = await request('/gmail-sync/connect', { method: 'POST', body: { addAccount: true } });
+        if (payload.authUrl) window.location.assign(payload.authUrl);
+      });
+    }
+    if (action === 'gmail-account-label') {
+      const accountId = target.dataset.account || '';
+      const field = document.getElementById(`gmail-sync-label-${accountId}`);
+      const label = field ? field.value : '';
+      void gmailSyncAction(`label:${accountId}`, async () => {
+        const payload = await request(`/gmail-sync/accounts/${encodeURIComponent(accountId)}/label`, { method: 'PUT', body: { label } });
+        state.gmailSync.status = payload.status;
+        toast(label.trim() ? `Account labelled “${label.trim()}”` : 'Label cleared');
+      });
+    }
     if (action === 'gmail-sync-connect') {
+      const accountId = target.dataset.account || '';
       void gmailSyncAction('connect', async () => {
-        const payload = await request('/gmail-sync/connect', { method: 'POST', body: {} });
+        const payload = await request('/gmail-sync/connect', { method: 'POST', body: accountId ? { accountId } : {} });
         // Google returns this window to BotBoy's loopback callback, which
         // lands back on #/connections/gmail-sync with the outcome.
         if (payload.authUrl) window.location.assign(payload.authUrl);
       });
     }
     if (action === 'gmail-sync-disconnect') {
-      if (!window.confirm('Disconnect Gmail? BotBoy revokes its access at Google and stops syncing. Mail already captured stays.')) return;
-      void gmailSyncAction('disconnect', async () => {
-        const payload = await request('/gmail-sync/disconnect', { method: 'POST', body: {} });
+      const accountId = target.dataset.account || '';
+      const account = (state.gmailSync.status?.accounts || []).find(entry => entry.id === accountId);
+      const name = account ? gmailAccountName(account) : 'Gmail';
+      if (!window.confirm(`Disconnect ${name}? BotBoy revokes its access at Google and stops syncing it.`)) return;
+      const count = Number(account?.captured?.total ?? 0);
+      const deleteMail = count > 0 && window.confirm(`Also delete the ${number(count)} emails BotBoy captured from ${name}?\n\nOK deletes them from BotBoy (not from Gmail). Cancel keeps them.`);
+      void gmailSyncAction(`disconnect:${accountId}`, async () => {
+        const payload = await request('/gmail-sync/disconnect', { method: 'POST', body: { ...(accountId ? { accountId } : {}), deleteMail } });
         state.gmailSync.status = payload.status;
-        toast('Gmail disconnected');
+        toast(deleteMail ? `${name} disconnected; ${number(payload.deletedMail || 0)} captured emails deleted` : `${name} disconnected; captured mail stays`);
       });
     }
     if (action === 'gmail-sync-run') {
-      void gmailSyncAction('run', async () => {
-        const payload = await request('/gmail-sync/run', { method: 'POST', body: {} });
+      const accountId = target.dataset.account || '';
+      void gmailSyncAction(accountId ? `run:${accountId}` : 'run', async () => {
+        const payload = await request('/gmail-sync/run', { method: 'POST', body: accountId ? { accountId } : {} });
         if (payload.status) state.gmailSync.status = payload.status;
         const result = payload.result || {};
         const fresh = Number(result.counters?.emitted ?? 0);
@@ -8422,16 +8516,18 @@ function bindEvents() {
       });
     }
     if (action === 'gmail-sync-import') {
+      const accountId = target.dataset.account || '';
       void gmailSyncAction('import', async () => {
-        const payload = await request('/gmail-sync/import', { method: 'POST', body: { months: 6 } });
+        const payload = await request('/gmail-sync/import', { method: 'POST', body: { months: 6, ...(accountId ? { accountId } : {}) } });
         state.gmailSync.status = payload.status;
         toast('Import started: BotBoy works through the last 6 months in the background');
       });
     }
     if (action === 'gmail-sync-import-stop') {
       if (!window.confirm('Stop importing older mail? Mail already captured stays.')) return;
+      const accountId = target.dataset.account || '';
       void gmailSyncAction('import', async () => {
-        const payload = await request('/gmail-sync/import', { method: 'DELETE' });
+        const payload = await request(`/gmail-sync/import${accountId ? `?accountId=${encodeURIComponent(accountId)}` : ''}`, { method: 'DELETE' });
         state.gmailSync.status = payload.status;
         toast('Import stopped');
       });

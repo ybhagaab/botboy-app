@@ -130,4 +130,19 @@ describe('owner-identity', () => {
       expect(matcher.nearMiss('@Wang, Chen only')).toBe(false);            // no owner token
     });
   });
+  describe('own mail addresses (Gmail accounts)', () => {
+    it('treats any connected account address as the owner, and knows the owner from addresses alone', () => {
+      const db = storage.getDb();
+      setSetting(db, 'gmail_accounts.directory', [{ id: 'default', email: 'Jane.Doe@gmail.com', label: 'Personal' }, { id: 'ga_0123456789', email: 'me@company.com', label: 'Work' }]);
+      const identity = resolveOwnerIdentity(db);
+      expect(identity.ownEmails).toEqual(['jane.doe@gmail.com', 'me@company.com']);
+      expect(identity.known).toBe(true);
+      const matcher = createOwnerMatcher(db);
+      expect(matcher.isOwner('Jane <me@company.com>')).toBe(true);
+      expect(matcher.isOwner('someone@company.com')).toBe(false);
+      // The GRASP address joins them.
+      setSetting(db, 'grasp_sync.owner_email', 'ybhagaab@amazon.com');
+      expect(resolveOwnerIdentity(db).ownEmails).toEqual(['ybhagaab@amazon.com', 'jane.doe@gmail.com', 'me@company.com']);
+    });
+  });
 });

@@ -32,12 +32,19 @@ import { getSetting, setSetting } from '../core/storage.js';
 import { classifyCaptureFailure, type CaptureHealth } from '../core/capture-health.js';
 import { DEFAULT_NOISE_SENDERS, cleanNoisePatterns } from '../core/email-capture.js';
 import { GoogleApiError, type GmailClient, type GmailMessageRef } from '../core/gmail-api.js';
-import { GmailAuthError, type GmailConnection, type GmailConnectionStatus } from '../core/gmail-connection.js';
+import {
+  GmailAuthError,
+  gmailAccountName,
+  type GmailAccountConnection,
+  type GmailConnection,
+  type GmailConnectionStatus,
+} from '../core/gmail-connection.js';
 import {
   decideGmailMessage,
   gmailItemUrl,
   messageTimestampOf,
   skipByLabels,
+  type GmailCaptureAccount,
   type GmailOwner,
   type GmailSkipReason,
 } from './gmail-message.js';
@@ -58,8 +65,25 @@ const KEYS = {
   importIds: 'gmail_sync.import_ids',
 } as const;
 
-/** Settings keys other modules read (browser gate, DOMAIN.md). */
+/** Settings keys other modules read (browser gate, DOMAIN.md). These are the `default` account's. */
 export const GMAIL_SYNC_KEYS = KEYS;
+
+/** Shared by every account: the on/off switch and the noise senders. */
+const SHARED_KEYS = new Set<string>([KEYS.enabled, KEYS.noiseSenders]);
+
+/**
+ * One account's settings keys. `default` keeps the original `gmail_sync.*`
+ * keys; another account uses `gmail_sync.acct.<id>.*` for its cursor,
+ * backlog, import, and last run.
+ */
+export function gmailSyncKeysFor(accountId: string): typeof KEYS {
+  if (accountId === 'default') return KEYS;
+  const out: Record<string, string> = {};
+  for (const [name, key] of Object.entries(KEYS)) {
+    out[name] = SHARED_KEYS.has(key) ? key : key.replace(/^gmail_sync\./, `gmail_sync.acct.${accountId}.`);
+  }
+  return out as unknown as typeof KEYS;
+}
 
 /** Full-sync query: everything but drafts, spam, trash, chats, and the bulk categories. */
 const FULL_SYNC_EXCLUSIONS = '-in:drafts -in:spam -in:trash -in:chats -category:promotions -category:social';
@@ -208,13 +232,22 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 
 export function createGmailSync(deps: {
   db: Database.Database;
-  connection: GmailConnection;
+  connection: GmailAccountConnection;
   emit: (item: RawWorkItem) => void;
   config?: GmailSyncConfig;
   captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
   now?: () => number;
+  /** Which account this sync captures for (default: `default`, unlabelled). */
+  account?: () => GmailCaptureAccount;
+  /** The owner's other mail addresses (other accounts, Outlook). */
+  otherOwnAddresses?: () => string[];
 }): GmailSync {
   const { db, connection, emit } = deps;
+  const accountId = connection.id || 'default';
+  const KEYS = gmailSyncKeysFor(accountId);
+  const captureAccount = (): GmailCaptureAccount => deps.account?.() ?? { id: accountId, label: '', named: false };
+  const itemUrl = (messageId: string) => gmailItemUrl(messageId, accountId);
+  const TAG = accountId === 'default' ? '[GmailSync]' : `[GmailSync ${accountId}]`;
   const now = deps.now ?? Date.now;
   const intervalMs = deps.config?.intervalMs ?? 5 * 60_000;
   const initialDelayMs = deps.config?.initialDelayMs ?? 60_000;
@@ -239,17 +272,19 @@ export function createGmailSync(deps: {
   const hasUrl = db.prepare('SELECT 1 FROM work_items WHERE url = ? LIMIT 1');
   // Gmail rows are only these two types, so idx_work_items_type keeps this a
   // few-millisecond read on the status path (no full table scan).
+  // This account's rows: its URL form (`default` = the original form).
   const capturedCounts = db.prepare(`
     SELECT COUNT(*) AS total,
            COALESCE(SUM(type = 'email_sent'), 0) AS sent,
            COALESCE(SUM(project_id IS NOT NULL), 0) AS inProjects
       FROM work_items
-     WHERE type IN ('email_read', 'email_sent') AND source = 'gmail'
+     WHERE type IN ('email_read', 'email_sent') AND source = 'gmail' AND url LIKE ?
   `);
+  const urlPattern = accountId === 'default' ? 'gmail://mail/%' : `gmail://${accountId}/mail/%`;
 
   // A different account (or a disconnect) starts over: cursors and backlog
   // belong to one mailbox.
-  connection.onChange(() => {
+  const offChange = connection.onChange(() => {
     const account = connection.accountEmail();
     if (account !== (getSetting<string>(db, KEYS.account) ?? null)) resetCursor(account);
   });
@@ -341,7 +376,7 @@ export function createGmailSync(deps: {
     }
     let next = existing;
     if (next.length > MAX_BACKLOG) {
-      console.warn(`[GmailSync] backlog over ${MAX_BACKLOG}; keeping the newest ${MAX_BACKLOG} ids`);
+      console.warn(`${TAG} backlog over ${MAX_BACKLOG}; keeping the newest ${MAX_BACKLOG} ids`);
       next = next.slice(-MAX_BACKLOG);
     }
     db.transaction(() => {
@@ -365,7 +400,7 @@ export function createGmailSync(deps: {
       pageToken = result.nextPageToken;
       if (!pageToken) break;
     }
-    if (pageToken) console.warn(`[GmailSync] full sync stopped at ${maxListPages} pages; older mail in the window is not captured`);
+    if (pageToken) console.warn(`${TAG} full sync stopped at ${maxListPages} pages; older mail in the window is not captured`);
     counters.listed += ids.length;
     enqueue(ids.reverse(), { historyId: profile.historyId });
   }
@@ -410,9 +445,11 @@ export function createGmailSync(deps: {
       if (error instanceof GmailAuthError) throw error;
       // Send-as needs no extra scope, but a Workspace policy may hide it;
       // the account address alone still works.
-      console.warn(`[GmailSync] send-as aliases unavailable: ${(error as Error)?.message ?? error}`);
+      console.warn(`${TAG} send-as aliases unavailable: ${(error as Error)?.message ?? error}`);
     }
-    return { primary: account, aliases: new Set([account, ...aliases]) };
+    const own = new Set([account, ...aliases]);
+    const others = new Set((deps.otherOwnAddresses?.() ?? []).map(address => address.toLowerCase()).filter(address => !own.has(address)));
+    return { primary: account, aliases: own, otherOwnAddresses: others };
   }
 
   /** One run's messages.get budget, shared by new mail (first) and an import. */
@@ -447,17 +484,17 @@ export function createGmailSync(deps: {
       // A structurally broken answer for this one id cannot improve on
       // retry; skipping it keeps the rest of the queue moving.
       if (error instanceof GoogleApiError && error.code === 'unreadable_response' && error.status === 200) {
-        console.warn(`[GmailSync] skipped an unreadable message: ${error.message}`);
+        console.warn(`${TAG} skipped an unreadable message: ${error.message}`);
         return { kind: 'unreadable' };
       }
       throw error;
     }
     let decision;
     try {
-      decision = decideGmailMessage(message, owner, patterns);
+      decision = decideGmailMessage(message, owner, patterns, captureAccount());
     } catch (error) {
       // One malformed message must not block every later one.
-      console.warn(`[GmailSync] skipped a message that could not be parsed: ${(error as Error)?.name ?? 'Error'}`);
+      console.warn(`${TAG} skipped a message that could not be parsed: ${(error as Error)?.name ?? 'Error'}`);
       return { kind: 'unreadable' };
     }
     const at = messageTimestampOf(message);
@@ -482,7 +519,7 @@ export function createGmailSync(deps: {
     try {
       while (decided < queue.length) {
         const id = queue[decided];
-        if (hasUrl.get(gmailItemUrl(id))) {
+        if (hasUrl.get(itemUrl(id))) {
           counters.duplicates++;
           decided++;
           continue;
@@ -536,7 +573,7 @@ export function createGmailSync(deps: {
       }
       // Stopped, restarted, or the mailbox changed while listing.
       if (generation !== importGeneration) return undefined;
-      if (pageToken) console.warn(`[GmailSync] import window holds more than ${listed.length} messages; importing the newest ${listed.length}`);
+      if (pageToken) console.warn(`${TAG} import window holds more than ${listed.length} messages; importing the newest ${listed.length}`);
       const ids = listed.reverse();
       state = { ...state, status: 'importing', sinceIso: new Date(since).toISOString(), total: ids.length, nextIndex: 0, truncated: Boolean(pageToken) };
       const listedState = state;
@@ -544,7 +581,7 @@ export function createGmailSync(deps: {
         setSetting(db, KEYS.importIds, ids);
         setSetting(db, KEYS.import, listedState);
       })();
-      console.log(`[GmailSync] import listed ${ids.length} messages since ${listedState.sinceIso}`);
+      console.log(`${TAG} import listed ${ids.length} messages since ${listedState.sinceIso}`);
     }
     const ids = importIds();
     const current: GmailImportState = { ...state };
@@ -563,7 +600,7 @@ export function createGmailSync(deps: {
     try {
       while (current.nextIndex < ids.length && generation === importGeneration) {
         const id = ids[current.nextIndex];
-        if (hasUrl.get(gmailItemUrl(id))) {
+        if (hasUrl.get(itemUrl(id))) {
           current.duplicates++;
           current.nextIndex++;
           continue;
@@ -623,7 +660,7 @@ export function createGmailSync(deps: {
           const lastAt = Date.parse(getSetting<string>(db, KEYS.lastMessageAt) ?? '');
           const floor = now() - maxCatchUpDays * 86_400_000;
           const since = Number.isFinite(lastAt) ? Math.max(lastAt - 5 * 60_000, floor) : now() - lookbackHours * 3_600_000;
-          console.warn(`[GmailSync] history expired; full sync from ${new Date(since).toISOString()}`);
+          console.warn(`${TAG} history expired; full sync from ${new Date(since).toISOString()}`);
           await fullSync(client, since, result.counters);
         }
       } else {
@@ -665,7 +702,7 @@ export function createGmailSync(deps: {
         reason: result.reason ?? 'sync failed',
       });
       if (result.reason !== lastLoggedError) {
-        console.warn(`[GmailSync] sync failed: ${result.reason}`);
+        console.warn(`${TAG} sync failed: ${result.reason}`);
         lastLoggedError = result.reason ?? '';
       }
     } else {
@@ -676,7 +713,7 @@ export function createGmailSync(deps: {
         ? `; import: ${result.import.checked} checked, ${result.import.captured} captured, ${result.import.left} left`
         : '';
       console.log(
-        `[GmailSync] ${result.mode} sync in ${(result.durationMs / 1000).toFixed(1)}s — ${c.listed} listed → `
+        `${TAG} ${result.mode} sync in ${(result.durationMs / 1000).toFixed(1)}s — ${c.listed} listed → `
         + `${c.emitted} emitted (${c.received} received, ${c.sent} sent; ${c.noise} noise, ${c.notAddressed} not addressed, `
         + `${c.skipped} skipped, ${c.duplicates} dup); ${result.backlog} left${imported}`,
       );
@@ -699,7 +736,7 @@ export function createGmailSync(deps: {
   }
 
   function captured(): GmailCapturedCounts {
-    const row = capturedCounts.get() as { total: number; sent: number; inProjects: number };
+    const row = capturedCounts.get(urlPattern) as { total: number; sent: number; inProjects: number };
     return { total: row.total, received: row.total - row.sent, sent: row.sent, inProjects: row.inProjects };
   }
 
@@ -760,7 +797,7 @@ export function createGmailSync(deps: {
       setSetting(db, KEYS.import, state);
       setSetting(db, KEYS.importIds, []);
     })();
-    console.log(`[GmailSync] import of the last ${months} months requested`);
+    console.log(`${TAG} import of the last ${months} months requested`);
     // A run in progress picks it up or schedules the next one when it ends.
     if (!running) scheduleFollowUp(1_000);
     return getStatus();
@@ -774,7 +811,7 @@ export function createGmailSync(deps: {
         setSetting(db, KEYS.import, { ...state, status: 'stopped', finishedAt: new Date(now()).toISOString() });
         setSetting(db, KEYS.importIds, []);
       })();
-      console.log(`[GmailSync] import stopped after ${state.nextIndex} of ${state.total} messages`);
+      console.log(`${TAG} import stopped after ${state.nextIndex} of ${state.total} messages`);
     }
     return getStatus();
   }
@@ -791,6 +828,7 @@ export function createGmailSync(deps: {
       timer.unref?.();
     },
     stop(): void {
+      offChange();
       if (initialTimer) { clearTimeout(initialTimer); initialTimer = null; }
       if (timer) { clearInterval(timer); timer = null; }
       if (followUpTimer) { clearTimeout(followUpTimer); followUpTimer = null; }
@@ -822,10 +860,205 @@ export function createGmailBrowserCaptureGate(db: Database.Database): () => bool
   return () => {
     const current = Date.now();
     if (current - checkedAt > 60_000) {
-      cached = getSetting<boolean>(db, KEYS.enabled) !== false
-        && getSetting<boolean>(db, KEYS.mailActive) === true;
+      // Any connected account whose sync has completed a run.
+      const anyActive = getSetting<boolean>(db, KEYS.mailActive) === true
+        || Boolean(db.prepare("SELECT 1 FROM app_settings WHERE key LIKE 'gmail_sync.acct.%.mail_active' AND value = 'true' LIMIT 1").get());
+      cached = getSetting<boolean>(db, KEYS.enabled) !== false && anyActive;
       checkedAt = current;
     }
     return cached;
+  };
+}
+
+// ── Every connected account (GMAIL_API_INTEGRATION_PLAN.md §13) ──────────
+
+/** One account's sync view on the page. */
+export interface GmailAccountSyncView {
+  id: string;
+  label: string;
+  email: string;
+  connection: GmailConnectionStatus;
+  running: boolean;
+  backlog: number;
+  hasCursor: boolean;
+  mailActive: boolean;
+  lastRun: Record<string, unknown> | null;
+  captured: GmailCapturedCounts;
+  import: GmailImportView | null;
+}
+
+/** The page status: the first account's fields (unchanged shape) plus every account. */
+export interface GmailSyncsStatusView extends GmailSyncStatusView {
+  accounts: GmailAccountSyncView[];
+}
+
+export interface GmailSyncs {
+  start(): void;
+  stop(): void;
+  /** Runs one account (default: every account, one after another). */
+  runNow(accountId?: string): Promise<GmailSyncResult>;
+  isRunning(): boolean;
+  getStatus(): GmailSyncsStatusView;
+  updateConfig(input: GmailSyncConfigInput): GmailSyncsStatusView;
+  requestImport(input: { months?: unknown; accountId?: unknown }): GmailSyncsStatusView;
+  stopImport(input?: { accountId?: unknown }): GmailSyncsStatusView;
+  /** The sync of one account (tests, the router). */
+  forAccount(accountId: string): GmailSync | null;
+}
+
+/**
+ * One sync per connected account, created and stopped as accounts come and
+ * go. Each account keeps its own cursor, backlog, import, and last run; the
+ * on/off switch and the noise senders are shared. Capture health has one
+ * Gmail source: any failing account fails it (named), and it recovers only
+ * when no account is failing.
+ */
+export function createGmailSyncs(deps: {
+  db: Database.Database;
+  connection: GmailConnection;
+  emit: (item: RawWorkItem) => void;
+  config?: GmailSyncConfig;
+  captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
+  now?: () => number;
+  /** The owner's Outlook address, also "the owner" in Gmail mail. */
+  extraOwnAddresses?: () => string[];
+}): GmailSyncs {
+  const syncs = new Map<string, GmailSync>();
+  const failing = new Map<string, string>();
+  let started = false;
+
+  const accountsNow = () => deps.connection.accounts();
+  const accountFor = (accountId: string): GmailCaptureAccount => {
+    const all = accountsNow();
+    const entry = all.find(account => account.id === accountId);
+    const label = entry?.label ?? '';
+    return { id: accountId, label, named: all.length > 1 || Boolean(label) };
+  };
+  const nameOf = (accountId: string): string => {
+    const entry = accountsNow().find(account => account.id === accountId);
+    return entry ? gmailAccountName(entry) : accountId;
+  };
+
+  function healthFor(accountId: string): Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'> | undefined {
+    const health = deps.captureHealth;
+    if (!health) return undefined;
+    return {
+      reportFailure(source, failure) {
+        const multi = accountsNow().length > 1;
+        const reason = multi ? `${nameOf(accountId)}: ${failure.reason}` : failure.reason;
+        failing.set(accountId, reason);
+        health.reportFailure(source, { ...failure, reason });
+      },
+      reportSuccess(source) {
+        failing.delete(accountId);
+        if (!failing.size) health.reportSuccess(source);
+      },
+    };
+  }
+
+  function reconcile(): void {
+    const ids = new Set(accountsNow().map(account => account.id));
+    // The default slot always has a sync so a first connect starts at once.
+    ids.add('default');
+    for (const [id, sync] of syncs) {
+      if (!ids.has(id)) {
+        sync.stop();
+        syncs.delete(id);
+        failing.delete(id);
+      }
+    }
+    for (const id of ids) {
+      if (syncs.has(id)) continue;
+      const sync = createGmailSync({
+        db: deps.db,
+        connection: deps.connection.slot(id),
+        emit: deps.emit,
+        config: deps.config,
+        captureHealth: healthFor(id),
+        now: deps.now,
+        account: () => accountFor(id),
+        otherOwnAddresses: () => [
+          ...accountsNow().filter(account => account.id !== id).map(account => account.email),
+          ...(deps.extraOwnAddresses?.() ?? []),
+        ],
+      });
+      syncs.set(id, sync);
+      if (started) sync.start();
+    }
+  }
+
+  reconcile();
+  deps.connection.onChange(() => reconcile());
+
+  function accountViews(): GmailAccountSyncView[] {
+    return accountsNow().map((account) => {
+      const status = syncs.get(account.id)?.getStatus();
+      return {
+        id: account.id,
+        label: account.label,
+        email: account.email,
+        connection: deps.connection.account(account.id)?.status() ?? deps.connection.status(),
+        running: status?.running ?? false,
+        backlog: status?.backlog ?? 0,
+        hasCursor: status?.hasCursor ?? false,
+        mailActive: status?.mailActive ?? false,
+        lastRun: status?.lastRun ?? null,
+        captured: status?.captured ?? { total: 0, received: 0, sent: 0, inProjects: 0 },
+        import: status?.import ?? null,
+      };
+    });
+  }
+
+  function primary(): GmailSync {
+    const first = accountsNow()[0]?.id ?? 'default';
+    return syncs.get(first) ?? syncs.get('default')!;
+  }
+
+  function getStatus(): GmailSyncsStatusView {
+    return { ...primary().getStatus(), accounts: accountViews() };
+  }
+
+  function pick(accountId: unknown): GmailSync {
+    if (accountId === undefined || accountId === null || accountId === '') return primary();
+    const sync = typeof accountId === 'string' && accountsNow().some(account => account.id === accountId) ? syncs.get(accountId) : undefined;
+    if (!sync) throw new GmailImportError('That Gmail account is not connected.', 'not_connected');
+    return sync;
+  }
+
+  return {
+    start() {
+      if (started) return;
+      started = true;
+      for (const sync of syncs.values()) sync.start();
+    },
+    stop() {
+      started = false;
+      for (const sync of syncs.values()) sync.stop();
+    },
+    async runNow(accountId) {
+      if (accountId) return pick(accountId).runNow();
+      let last: GmailSyncResult | null = null;
+      for (const account of accountsNow()) {
+        const sync = syncs.get(account.id);
+        if (sync) last = await sync.runNow();
+      }
+      return last ?? primary().runNow();
+    },
+    isRunning: () => [...syncs.values()].some(sync => sync.isRunning()),
+    getStatus,
+    updateConfig(input) {
+      // Shared keys: one write covers every account.
+      primary().updateConfig(input);
+      return getStatus();
+    },
+    requestImport(input) {
+      pick(input?.accountId).requestImport({ months: input?.months });
+      return getStatus();
+    },
+    stopImport(input) {
+      pick(input?.accountId).stopImport();
+      return getStatus();
+    },
+    forAccount: (accountId) => syncs.get(accountId) ?? null,
   };
 }

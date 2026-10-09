@@ -29,7 +29,7 @@ import type { PromptManager } from '../../core/prompt-manager.js';
 import type { ConversationManager } from '../../core/conversation-manager.js';
 import type { McpManager } from '../../core/mcp-types.js';
 import type { GraspSync } from '../../monitors/grasp-sync.js';
-import type { GmailSync } from '../../monitors/gmail-sync.js';
+import type { GmailSyncs } from '../../monitors/gmail-sync.js';
 import type { GmailConnection } from '../../core/gmail-connection.js';
 import type { GmailCompose } from '../../core/gmail-compose.js';
 import type { SharePointSync } from '../../monitors/sharepoint-sync.js';
@@ -85,7 +85,7 @@ export interface RouterDeps {
   mcpManager?: McpManager;
   graspSync?: GraspSync;
   /** Gmail API mail sync and its OAuth connection (non-Amazon accounts). */
-  gmailSync?: GmailSync;
+  gmailSync?: GmailSyncs;
   gmailConnection?: GmailConnection;
   /** Drafts and sends (chat tools + the chat draft card's owner buttons). */
   gmailCompose?: GmailCompose;

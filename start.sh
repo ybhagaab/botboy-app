@@ -1457,7 +1457,7 @@ if [ "$DOCTOR" = "1" ]; then
       // Same rule as gmail-credentials.ts › usableBuiltInClient: both values set.
       const filled = text => typeof text === "string" && text.trim() !== "";
       const usable = entry => Boolean(entry) && filled(entry.clientId) && filled(entry.clientSecret);
-      if (!value || value.schemaVersion !== 1) {
+      if (!value || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) {
         console.log(`gmail: credentials file is unreadable (mode ${mode}) — save your Google client again in Connections → Gmail`);
         process.exit(0);
       }
@@ -1476,40 +1476,48 @@ if [ "$DOCTOR" = "1" ]; then
         }
         const source = own ? "own client" : "built-in client";
         const suffix = client.clientId.replace(/\.apps\.googleusercontent\.com$/, "").slice(-6);
-        const connection = value.connection;
-        if (!connection || typeof connection.refreshToken !== "string" || !connection.refreshToken) {
+        // Schema 1: one connection; schema 2: accounts[] (multi-account).
+        const accounts = value.schemaVersion === 1
+          ? (value.connection ? [{ label: "", connection: value.connection }] : [])
+          : (Array.isArray(value.accounts) ? value.accounts : []);
+        const connected = accounts.filter(account => account && account.connection && typeof account.connection.refreshToken === "string" && account.connection.refreshToken);
+        if (!connected.length) {
           console.log(`gmail: ${source} …${suffix} ready, not connected (mode ${mode})`);
           return;
         }
-        const domain = String(connection.accountEmail || "").split("@")[1] || "unknown";
-        const scopes = String(connection.scope || "").split(/\s+/);
-        const access = scopes.includes("https://www.googleapis.com/auth/gmail.compose") ? "read + compose" : "read only (Reconnect to allow drafting and sending)";
-        console.log(`gmail: ${source} …${suffix} connected to an account at ${domain}; ${access} (mode ${mode})`);
-        let response;
-        try {
-          response = await fetch("https://oauth2.googleapis.com/token", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              grant_type: "refresh_token",
-              client_id: client.clientId,
-              client_secret: client.clientSecret,
-              refresh_token: connection.refreshToken,
-            }),
-            signal: AbortSignal.timeout(10000),
-          });
-        } catch {
-          console.log("gmail refresh probe: HTTP 000 (network, proxy, or VPN blocks oauth2.googleapis.com)");
-          return;
-        }
-        let code = "";
-        if (!response.ok) {
+        console.log(`gmail: ${source} …${suffix}; ${connected.length} account${connected.length === 1 ? "" : "s"} connected (mode ${mode})`);
+        for (const account of connected) {
+          const connection = account.connection;
+          const domain = String(connection.accountEmail || "").split("@")[1] || "unknown";
+          const name = typeof account.label === "string" && account.label ? `"${account.label.replace(/[^ -~]/g, "").slice(0, 40)}" ` : "";
+          const scopes = String(connection.scope || "").split(/\s+/);
+          const access = scopes.includes("https://www.googleapis.com/auth/gmail.compose") ? "read + compose" : "read only (Reconnect to allow drafting and sending)";
+          let response;
           try {
-            const body = await response.json();
-            if (typeof body.error === "string") code = ` ${body.error.replace(/[^a-z_]/g, "").slice(0, 40)}`;
-          } catch {}
+            response = await fetch("https://oauth2.googleapis.com/token", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({
+                grant_type: "refresh_token",
+                client_id: client.clientId,
+                client_secret: client.clientSecret,
+                refresh_token: connection.refreshToken,
+              }),
+              signal: AbortSignal.timeout(10000),
+            });
+          } catch {
+            console.log(`gmail account ${name}at ${domain}: ${access}; refresh probe HTTP 000 (network, proxy, or VPN blocks oauth2.googleapis.com)`);
+            continue;
+          }
+          let code = "";
+          if (!response.ok) {
+            try {
+              const body = await response.json();
+              if (typeof body.error === "string") code = ` ${body.error.replace(/[^a-z_]/g, "").slice(0, 40)}`;
+            } catch {}
+          }
+          console.log(`gmail account ${name}at ${domain}: ${access}; refresh probe HTTP ${response.status}${code} (200=connected, 400 invalid_grant=choose Reconnect in Connections → Gmail)`);
         }
-        console.log(`gmail refresh probe: HTTP ${response.status}${code} (200=connected, 400 invalid_grant=choose Reconnect in Connections → Gmail)`);
       })();
     ' "$GMAIL_CREDENTIALS_FILE" "$PROJ_DIR/dist/core/gmail-builtin-client.js" 2>/dev/null || echo "gmail: could not inspect the credentials file"
   else

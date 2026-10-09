@@ -86,7 +86,7 @@ describe('Gmail draft card', () => {
     expect(calls).toEqual([{ path: '/gmail-sync/drafts/r-1', options: undefined }]);
     expect(card.querySelector('.gmail-draft-head')!.textContent).toBe('Gmail draft · not sent · owner@gmail.com');
     const fields = [...card.querySelectorAll('dt')].map(dt => `${dt.textContent}: ${dt.nextElementSibling!.textContent}`);
-    expect(fields).toEqual(['To: Jane Doe <jane@x.com>', 'Cc: bob@x.com', 'Subject: Running late <img src=x onerror=alert(1)>']);
+    expect(fields).toEqual(['From: owner@gmail.com', 'To: Jane Doe <jane@x.com>', 'Cc: bob@x.com', 'Subject: Running late <img src=x onerror=alert(1)>']);
     expect(card.querySelector('img, script')).toBeNull();
     const body = card.querySelector('.gmail-draft-body') as HTMLElement;
     expect(body.textContent).toBe(DRAFT.body);
@@ -121,7 +121,7 @@ describe('Gmail draft card', () => {
     expect(sent.querySelector('.gmail-draft-files')!.textContent).toBe('Q3 report.pdf · 1.2 MB');
     // No files, no row.
     holder.api = async () => ({ draft: { ...DRAFT, attachments: [] } });
-    expect([...(await cardFor()).querySelectorAll('dt')].map(dt => dt.textContent)).toEqual(['To', 'Cc', 'Subject']);
+    expect([...(await cardFor()).querySelectorAll('dt')].map(dt => dt.textContent)).toEqual(['From', 'To', 'Cc', 'Subject']);
   });
 
   it('hydrates a lesson card and a draft card in the same bubble with one write', async () => {

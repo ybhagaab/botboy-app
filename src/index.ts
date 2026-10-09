@@ -46,7 +46,7 @@ import { createAcpClient } from './core/acp-client.js';
 import { createInferenceProviderFromEnv } from './core/inference-provider.js';
 import { createAiModelSettingsService } from './core/ai-model-settings.js';
 import { currentLlmModelOperation } from './core/llm-model-operation.js';
-import { resolveOwnerIdentity } from './core/owner-identity.js';
+import { GMAIL_ACCOUNT_DIRECTORY_KEY, resolveOwnerIdentity } from './core/owner-identity.js';
 import { createLlmUsageService } from './core/llm-usage.js';
 import { createConversationManager } from './core/conversation-manager.js';
 import { createPromptManager } from './core/prompt-manager.js';
@@ -71,7 +71,7 @@ import { createSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
-import { createGmailSync, createGmailBrowserCaptureGate, isGmailWebEmailItem } from './monitors/gmail-sync.js';
+import { createGmailSyncs, createGmailBrowserCaptureGate, isGmailWebEmailItem } from './monitors/gmail-sync.js';
 import { createGmailConnection } from './core/gmail-connection.js';
 import { createGmailCompose } from './core/gmail-compose.js';
 import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
@@ -1329,9 +1329,25 @@ async function main() {
 
   // ── Gmail API sync (non-Amazon accounts; GMAIL_API_INTEGRATION_PLAN.md) ──
   // Uses the connection built before the tool executor (the chat tools share it).
-  const gmailSync = createGmailSync({
+  // One sync per connected account (§13); the Outlook address also counts as
+  // the owner in Gmail mail.
+  const gmailSync = createGmailSyncs({
     db, connection: gmailConnection, emit: item => eventBus.emit(item), captureHealth,
+    extraOwnAddresses: () => {
+      const outlook = String(getSetting<string>(db, 'grasp_sync.owner_email') ?? '').trim().toLowerCase();
+      return outlook.includes('@') ? [outlook] : [];
+    },
   });
+  // The non-secret account directory (address + label) for owner identity and prompts.
+  const writeGmailDirectory = () => {
+    try {
+      setSetting(db, GMAIL_ACCOUNT_DIRECTORY_KEY, gmailConnection.accounts().map(account => ({ id: account.id, email: account.email, label: account.label })));
+    } catch (error: any) {
+      console.warn(`[Gmail] account directory write failed: ${error?.message ?? error}`);
+    }
+  };
+  writeGmailDirectory();
+  gmailConnection.onChange(writeGmailDirectory);
 
   // ── SharePoint document sync (user-selected sources, discovery + drain) ──
   // Read-only MCP calls; documents flow through the same capture handler.
@@ -1579,7 +1595,8 @@ async function main() {
   graspSync.start();
   console.log('✅ GRASP sync scheduled (Outlook mail + calendar every 5 min)');
   gmailSync.start();
-  console.log(`✅ Gmail sync scheduled (every 5 min; ${gmailConnection.isConnected() ? `connected as ${gmailConnection.accountEmail()}` : 'not connected'})`);
+  const gmailAccounts = gmailConnection.accounts();
+  console.log(`✅ Gmail sync scheduled (every 5 min; ${gmailAccounts.length ? `connected: ${gmailAccounts.map(account => account.label ? `${account.label} ${account.email}` : account.email).join(', ')}` : 'not connected'})`);
 
   sharePointSync.start();
   console.log('✅ SharePoint sync scheduled (discovery every 30 min, drain every 20 s)');

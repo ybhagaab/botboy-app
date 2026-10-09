@@ -238,3 +238,15 @@ describe('emailAuthoredBody', () => {
     expect(emailAuthoredBody(content)).toBe('On Monday we ship the beta.\nPlease review the checklist I wrote:\nstep one');
   });
 });
+
+describe('mail between the owner’s own accounts (multi-account Gmail)', () => {
+  it('is kept as mail but never a direct incoming request', () => {
+    const base = evidence({ type: 'email_read', direction: 'received', timestamp: '2026-10-08T10:00:00Z', source: 'gmail', platform: 'gmail_api', sender: 'me@company.com' });
+    const selfMail = parseOutlookThreadIdentity({ ...base, metadata: { ...base.metadata, fromOwnAccount: 'true' } })!;
+    expect(selfMail.fromOwnAccount).toBe(true);
+    expect(isDirectIncomingOutlookEmail(selfMail)).toBe(false);
+    const stranger = parseOutlookThreadIdentity(base)!;
+    expect(stranger.fromOwnAccount).toBeUndefined();
+    expect(isDirectIncomingOutlookEmail(stranger)).toBe(true);
+  });
+});

@@ -10,7 +10,7 @@ import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from '../../core/gmail-api.js';
 import { createGmailConnection, type GmailConnection } from '../../core/gmail-connection.js';
 import { createGmailCredentialStore } from '../../core/gmail-credentials.js';
-import { createGmailSync, type GmailSync } from '../../monitors/gmail-sync.js';
+import { createGmailSyncs, type GmailSyncs } from '../../monitors/gmail-sync.js';
 import { createGmailSyncRouter, GMAIL_OAUTH_CALLBACK_PATH } from './gmail-sync.js';
 import { GmailComposeError } from '../../core/gmail-compose.js';
 
@@ -37,13 +37,15 @@ function json(body: unknown, status = 200): Response {
 const FAKE_ACCESS_TOKEN = ['ya29', 'router-access-token-value-0123456789'].join('.');
 const FAKE_REFRESH_TOKEN = ['1/', '/0', 'router-refresh-token-value-0123456789'].join('');
 
+/** The address the fake Gmail profile reports (a second sign-in can switch it). */
+let profileEmail = 'jane.doe@gmail.com';
 const fakeFetch = async (input: string, init?: RequestInit): Promise<Response> => {
   const form = typeof init?.body === 'string' ? Object.fromEntries(new URLSearchParams(init.body)) : {};
   if (input === ENDPOINTS.tokenUrl && form.grant_type === 'authorization_code') {
     return json({ access_token: FAKE_ACCESS_TOKEN, refresh_token: FAKE_REFRESH_TOKEN, expires_in: 3600, scope: GMAIL_READONLY_SCOPE });
   }
   if (input === ENDPOINTS.revokeUrl) return json({});
-  if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) return json({ emailAddress: 'jane.doe@gmail.com', historyId: '77' });
+  if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) return json({ emailAddress: profileEmail, historyId: '77' });
   return json({ error: { code: 404, message: 'not found' } }, 404);
 };
 
@@ -53,7 +55,7 @@ describe('Gmail sync router', () => {
   let dir: string;
   let storage: StorageLayer;
   let connection: GmailConnection;
-  let sync: GmailSync;
+  let sync: GmailSyncs;
   let runNow: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
@@ -63,11 +65,12 @@ describe('Gmail sync router', () => {
     // No built-in client: these routes are tested with a client the owner saves.
     const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
     connection = createGmailConnection({ redirectUri: `http://127.0.0.1:7778/api${GMAIL_OAUTH_CALLBACK_PATH}`, store, fetchImpl: fakeFetch, endpoints: ENDPOINTS });
-    sync = createGmailSync({ db: storage.getDb(), connection, emit: () => {} });
+    profileEmail = 'jane.doe@gmail.com';
+    sync = createGmailSyncs({ db: storage.getDb(), connection, emit: () => {} });
     runNow = vi.spyOn(sync, 'runNow').mockResolvedValue({ status: 'skipped', counters: {} as any, backlog: 0, durationMs: 0 });
     const app = express();
     app.use(express.json());
-    app.use('/api', createGmailSyncRouter({ nodeManager: {} as any, gmailConnection: connection, gmailSync: sync, dashboardOrigin: DASHBOARD }));
+    app.use('/api', createGmailSyncRouter({ nodeManager: {} as any, db: storage.getDb(), gmailConnection: connection, gmailSync: sync, dashboardOrigin: DASHBOARD } as any));
     server = http.createServer(app);
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => {
       origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -115,6 +118,7 @@ describe('Gmail sync router', () => {
       () => request(server).post('/api/gmail-sync/run').send({}),
       () => request(server).post('/api/gmail-sync/import').send({ months: 6 }),
       () => request(server).delete('/api/gmail-sync/import'),
+      () => request(server).put('/api/gmail-sync/accounts/default/label').send({ label: 'Work' }),
     ];
     for (const change of changes) {
       expect((await change()).status).toBe(403);
@@ -221,6 +225,50 @@ describe('Gmail sync router', () => {
     const disconnected = await owner(request(server).post('/api/gmail-sync/disconnect')).send({});
     expect(disconnected.status).toBe(200);
     expect(disconnected.body.status.connection).toMatchObject({ connected: false, clientConfigured: true, accountEmail: null });
+  });
+
+  it('adds a second account, labels it, and disconnects one account, deleting its mail only when asked', async () => {
+    await connectThroughCallback();
+    profileEmail = 'me@company.com';
+    const started = await owner(request(server).post('/api/gmail-sync/connect')).send({ addAccount: true }).expect(200);
+    const state = new URL(started.body.authUrl).searchParams.get('state');
+    await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site').query({ code: 'auth-code-2', state }).expect(302);
+    const accounts = (await request(server).get('/api/gmail-sync/status')).body.status.accounts;
+    expect(accounts.map((account: any) => account.email)).toEqual(['jane.doe@gmail.com', 'me@company.com']);
+    const workId = accounts[1].id;
+    expect(workId).toMatch(/^ga_[a-f0-9]{10}$/);
+    expect(runNow).toHaveBeenLastCalledWith(workId);
+
+    // Body validation: unknown fields and malformed ids are refused before anything changes.
+    expect((await owner(request(server).post('/api/gmail-sync/connect')).send({ accountId: '../x' })).status).toBe(400);
+    expect((await owner(request(server).post('/api/gmail-sync/connect')).send({ addAccount: 'yes' })).status).toBe(400);
+    expect((await owner(request(server).put('/api/gmail-sync/accounts/default/label')).send({ label: 'x', other: 1 })).status).toBe(400);
+    expect((await owner(request(server).put('/api/gmail-sync/accounts/ga_9999999999/label')).send({ label: 'x' })).status).toBe(404);
+
+    const labelled = await owner(request(server).put(`/api/gmail-sync/accounts/${workId}/label`)).send({ label: '  Work  ' }).expect(200);
+    expect(labelled.body.status.accounts[1].label).toBe('Work');
+
+    // Each account's captured rows: deleting the Work account's mail leaves Personal's alone.
+    const db = storage.getDb();
+    const insert = db.prepare("INSERT INTO work_items (id, type, source, url, title, raw_text, metadata, captured_at) VALUES (?, 'email_read', 'gmail', ?, 't', 'b', '{}', '2026-10-08T00:00:00Z')");
+    insert.run('wi-p', 'gmail://mail/m1');
+    insert.run('wi-w', `gmail://${workId}/mail/m1`);
+    const kept = await owner(request(server).post('/api/gmail-sync/disconnect')).send({ accountId: workId }).expect(200);
+    expect(kept.body.deletedMail).toBe(0);
+    expect(db.prepare('SELECT id FROM work_items ORDER BY id').all()).toEqual([{ id: 'wi-p' }, { id: 'wi-w' }]);
+    expect(kept.body.status.accounts.map((account: any) => account.email)).toEqual(['jane.doe@gmail.com']);
+
+    // Reconnect Work, then disconnect it with its mail.
+    const again = await owner(request(server).post('/api/gmail-sync/connect')).send({ addAccount: true }).expect(200);
+    await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site')
+      .query({ code: 'auth-code-3', state: new URL(again.body.authUrl).searchParams.get('state') }).expect(302);
+    const newWorkId = (await request(server).get('/api/gmail-sync/status')).body.status.accounts[1].id;
+    db.prepare('UPDATE work_items SET url = ? WHERE id = ?').run(`gmail://${newWorkId}/mail/m1`, 'wi-w');
+    expect((await owner(request(server).post('/api/gmail-sync/disconnect')).send({ accountId: newWorkId, deleteMail: 'yes' })).status).toBe(400);
+    const deleted = await owner(request(server).post('/api/gmail-sync/disconnect')).send({ accountId: newWorkId, deleteMail: true }).expect(200);
+    expect(deleted.body.deletedMail).toBe(1);
+    expect(db.prepare('SELECT id FROM work_items ORDER BY id').all()).toEqual([{ id: 'wi-p' }]);
+    expect((await owner(request(server).post('/api/gmail-sync/disconnect')).send({ accountId: newWorkId })).status).toBe(404);
   });
 });
 

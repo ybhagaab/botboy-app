@@ -180,7 +180,7 @@ describe('Gmail message decision', () => {
       direction: 'received', ownerEmail: 'jane.doe@gmail.com', directlyAddressedToOwner: 'true',
       conversationId: 'thread-9', messageTimestamp: '2026-10-05T08:30:00.000Z', importance: '',
       hasAttachments: 'false', folder: 'inbox', gmailId: '18a1b2c3',
-      rfcMessageId: '<abc@mail.example.com>', inReplyTo: '', platform: 'gmail_api',
+      rfcMessageId: '<abc@mail.example.com>', inReplyTo: '', platform: 'gmail_api', gmailAccountId: 'default', accountLabel: '',
     });
     // Downstream relational rules accept it exactly like Outlook mail.
     const identity = parseOutlookThreadIdentity(item as any)!;

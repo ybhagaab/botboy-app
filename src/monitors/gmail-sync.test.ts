@@ -9,7 +9,8 @@ import {
   type GmailMessageRef,
 } from '../core/gmail-api.js';
 import type { GmailConnection } from '../core/gmail-connection.js';
-import { createGmailBrowserCaptureGate, createGmailSync, isGmailWebEmailItem, type GmailSyncConfig } from './gmail-sync.js';
+import { createGmailBrowserCaptureGate, createGmailSync, createGmailSyncs, isGmailWebEmailItem, type GmailSyncConfig } from './gmail-sync.js';
+import { fakeGmailConnection } from '../core/gmail-connection.fake.js';
 
 const OWNER = 'jane.doe@gmail.com';
 const HOUR = 3_600_000;
@@ -27,7 +28,7 @@ interface MailInput {
 }
 
 /** An in-memory mailbox speaking the GmailClient contract, with call logs. */
-function fakeMailbox() {
+function fakeMailbox(owner = OWNER) {
   const messages = new Map<string, GmailMessage>();
   const history: Array<{ id: string; messagesAdded: GmailMessageRef[] }> = [];
   let historyId = 1000;
@@ -47,7 +48,7 @@ function fakeMailbox() {
       const headers = [
         { name: 'Subject', value: input.subject ?? `Subject ${input.id}` },
         { name: 'From', value: input.from ?? 'Requester <requester@example.com>' },
-        { name: 'To', value: input.to ?? OWNER },
+        { name: 'To', value: input.to ?? owner },
       ];
       messages.set(input.id, {
         id: input.id,
@@ -63,7 +64,7 @@ function fakeMailbox() {
       return {
         async getProfile() {
           box.calls.profile++;
-          return { emailAddress: OWNER, historyId: String(historyId) };
+          return { emailAddress: owner, historyId: String(historyId) };
         },
         async listMessages({ q, pageToken }) {
           box.calls.list.push(q);
@@ -100,7 +101,7 @@ function fakeMailbox() {
           return { records: page, nextPageToken: next, historyId: String(historyId) };
         },
         async listSendAsAddresses() {
-          return [OWNER, 'jane@doe.dev'];
+          return owner === OWNER ? [OWNER, 'jane@doe.dev'] : [owner];
         },
       };
     },
@@ -569,5 +570,128 @@ describe('Gmail sync', () => {
     expect(isGmailWebEmailItem({ ...browserMail, url: 'https://outlook.office.com/mail/' })).toBe(false);
     expect(isGmailWebEmailItem({ ...browserMail, type: 'website_visit' } as RawWorkItem)).toBe(false);
     expect(isGmailWebEmailItem({ ...browserMail, source: 'gmail' } as RawWorkItem)).toBe(false);
+  });
+});
+
+
+/**
+ * Several accounts (GMAIL_API_INTEGRATION_PLAN.md §13): each account has its
+ * own cursor, backlog, URLs, and import; labels reach the captured content;
+ * mail from another of the owner's accounts is kept but marked; one failing
+ * account fails the one Gmail health source, named.
+ */
+describe('Gmail sync with several accounts', () => {
+  let storage: StorageLayer;
+  let emitted: RawWorkItem[];
+  const WORK = 'me@company.com';
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    emitted = [];
+  });
+  afterEach(() => storage.close());
+
+  function setup() {
+    const personal = fakeMailbox();
+    const work = fakeMailbox(WORK);
+    const db = storage.getDb();
+    const accounts = [
+      { id: 'default', email: OWNER, label: 'Personal', client: personal.client() },
+      { id: 'ga_0123456789', email: WORK, label: 'Work', client: work.client() },
+    ];
+    const connection = fakeGmailConnection(accounts);
+    const failures: Array<{ source: string; reason: string }> = [];
+    const successes: string[] = [];
+    const syncs = createGmailSyncs({
+      db,
+      connection,
+      emit: (item) => {
+        emitted.push(item);
+        // Store like the capture pipeline, so URL dedup sees it.
+        db.prepare('INSERT INTO work_items (id, type, source, url, title, raw_text, metadata, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(`wi-${emitted.length}`, item.type, item.source, item.url, item.title, item.content, JSON.stringify(item.metadata), item.capturedAt.toISOString());
+      },
+      config: { getIntervalMs: 0 },
+      now: () => NOW,
+      captureHealth: {
+        reportFailure: (source, failure) => { failures.push({ source, reason: failure.reason }); },
+        reportSuccess: (source) => { successes.push(source); },
+      } as any,
+      extraOwnAddresses: () => ['owner@amazon.com'],
+    });
+    return { personal, work, syncs, db, failures, successes, accounts };
+  }
+
+  it('syncs each account into its own URLs, settings keys, and totals, with the label in content', async () => {
+    const { personal, work, syncs, db } = setup();
+    personal.add({ id: 'p1', at: NOW - HOUR, subject: 'Dinner' });
+    work.add({ id: 'w1', at: NOW - HOUR, subject: 'Quarterly plan' });
+    // The same Gmail id in both mailboxes stays two rows.
+    work.add({ id: 'p1', at: NOW - HOUR, subject: 'Same id, other mailbox' });
+    await syncs.runNow();
+    expect(emitted.map(item => item.url).sort()).toEqual(['gmail://ga_0123456789/mail/p1', 'gmail://ga_0123456789/mail/w1', 'gmail://mail/p1']);
+    const workItem = emitted.find(item => item.url === 'gmail://ga_0123456789/mail/w1')!;
+    expect(workItem.content.split('\n').slice(0, 2)).toEqual(['Subject: Quarterly plan', `Account: Work (${WORK})`]);
+    expect(workItem.metadata).toMatchObject({ gmailAccountId: 'ga_0123456789', accountLabel: 'Work', ownerEmail: WORK });
+    expect(emitted.find(item => item.url === 'gmail://mail/p1')!.content).toContain(`Account: Personal (${OWNER})`);
+    // Separate cursors: the default account keeps the original keys.
+    expect(getSetting<string>(db, 'gmail_sync.history_id')).toBe(personal.historyId);
+    expect(getSetting<string>(db, 'gmail_sync.acct.ga_0123456789.history_id')).toBe(work.historyId);
+    const status = syncs.getStatus();
+    expect(status.accounts.map(account => [account.id, account.label, account.captured.total])).toEqual([['default', 'Personal', 1], ['ga_0123456789', 'Work', 2]]);
+    // A second run captures nothing twice.
+    emitted.length = 0;
+    await syncs.runNow();
+    expect(emitted).toEqual([]);
+    // The browser gate sees any active account.
+    expect(createGmailBrowserCaptureGate(db)()).toBe(true);
+  });
+
+  it('marks mail from another of the owner’s accounts, and imports per account', async () => {
+    const { personal, work, syncs, db } = setup();
+    personal.add({ id: 'p2', at: NOW - HOUR, from: `Me at work <${WORK}>`, subject: 'Note to self' });
+    personal.add({ id: 'p3', at: NOW - HOUR, from: 'Me <owner@amazon.com>', subject: 'From Outlook' });
+    await syncs.runNow('default');
+    expect(emitted.map(item => [item.url, item.metadata.fromOwnAccount]).sort()).toEqual([['gmail://mail/p2', 'true'], ['gmail://mail/p3', 'true']]);
+    expect(work.calls.profile).toBe(0);
+
+    syncs.requestImport({ months: 6, accountId: 'ga_0123456789' });
+    expect(getSetting<any>(db, 'gmail_sync.acct.ga_0123456789.import')?.status).toBe('requested');
+    expect(getSetting<any>(db, 'gmail_sync.import')).toBeNull();
+    expect(() => syncs.requestImport({ months: 6, accountId: 'ga_9999999999' })).toThrow('not connected');
+    expect(syncs.getStatus().accounts.find(account => account.id === 'ga_0123456789')!.import?.status).toBe('requested');
+    syncs.stopImport({ accountId: 'ga_0123456789' });
+    expect(getSetting<any>(db, 'gmail_sync.acct.ga_0123456789.import')?.status).toBe('stopped');
+  });
+
+  it('shares the on/off switch and the noise senders across accounts', async () => {
+    const { personal, work, syncs } = setup();
+    work.add({ id: 'w2', at: NOW - HOUR, from: 'Deals <deals@shop.example>' });
+    work.add({ id: 'w3', at: NOW - HOUR });
+    syncs.updateConfig({ noiseSenders: ['deals@shop.example'] });
+    await syncs.runNow();
+    expect(emitted.map(item => item.url)).toEqual(['gmail://ga_0123456789/mail/w3']);
+    syncs.updateConfig({ enabled: false });
+    personal.add({ id: 'p9', at: NOW });
+    work.add({ id: 'w4', at: NOW });
+    const results = [await syncs.runNow('default'), await syncs.runNow('ga_0123456789')];
+    expect(results.map(result => result.status)).toEqual(['skipped', 'skipped']);
+  });
+
+  it('one failing account fails the Gmail health source by name; it recovers only when every account works', async () => {
+    const { work, personal, syncs, failures, successes } = setup();
+    personal.add({ id: 'p4', at: NOW - HOUR });
+    work.add({ id: 'w9', at: NOW - HOUR });
+    work.failGet.set('w9', () => new GoogleApiError('Gmail quota (HTTP 429 rateLimitExceeded)', 429, 'rateLimitExceeded'));
+    await syncs.runNow();
+    expect(failures).toEqual([{ source: 'gmail', reason: `Work (${WORK}): Gmail quota (HTTP 429 rateLimitExceeded)` }]);
+    // While Work keeps failing, Personal's successes never clear the source.
+    const before = successes.length;
+    await syncs.runNow();
+    expect(successes.length).toBe(before);
+    expect(failures).toHaveLength(2);
+    work.failGet.clear();
+    await syncs.runNow();
+    expect(successes.length).toBeGreaterThan(before);
   });
 });

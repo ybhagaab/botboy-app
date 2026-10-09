@@ -31,6 +31,12 @@
 import type Database from 'better-sqlite3';
 import { getSetting } from './storage.js';
 
+/**
+ * Non-secret list of connected Gmail accounts ({id, email, label}); written by
+ * index.ts on every connection change, read here and by the chat prompt.
+ */
+export const GMAIL_ACCOUNT_DIRECTORY_KEY = 'gmail_accounts.directory';
+
 export interface OwnerIdentity {
   /** False when neither a name nor an alias could be determined. */
   known: boolean;
@@ -40,6 +46,11 @@ export interface OwnerIdentity {
   alias: string;
   /** Full email when known. */
   email: string;
+  /**
+   * Every address of the owner's own mail accounts: the GRASP address plus
+   * each connected Gmail account (settings `gmail_accounts.directory`).
+   */
+  ownEmails: string[];
   /** Normalized lowercase name tokens, e.g. ["bhagat","ab"]. */
   nameTokens: string[];
   /** Where the name came from: override | sharepoint | grasp | none. */
@@ -88,11 +99,17 @@ export function resolveOwnerIdentity(db: Database.Database): OwnerIdentity {
     overrideAlias ? 'override' : emailAlias ? 'email' : 'none';
 
   const nameTokens = normalize(displayName);
+  const directory = getSetting<Array<{ email?: unknown }>>(db, GMAIL_ACCOUNT_DIRECTORY_KEY);
+  const ownEmails = [...new Set([
+    ...(email.includes('@') ? [email] : []),
+    ...(Array.isArray(directory) ? directory.map(entry => String(entry?.email ?? '').trim().toLowerCase()).filter(value => value.includes('@')) : []),
+  ])];
   return {
-    known: nameTokens.length > 0 || alias.length > 0,
+    known: nameTokens.length > 0 || alias.length > 0 || ownEmails.length > 0,
     displayName,
     alias,
     email,
+    ownEmails,
     nameTokens,
     nameSource,
     aliasSource,
@@ -164,6 +181,9 @@ export function createMatcher(identity: OwnerIdentity): OwnerMatcher {
     identity,
     isOwner(author: string): boolean {
       if (!identity.known) return false;
+      // Any of the owner's own addresses in the author field is the owner.
+      const addresses = String(author ?? '').toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g);
+      if (addresses && (identity.ownEmails ?? []).some(own => addresses.includes(own))) return true;
       const authorTokens = normalize(author);
       if (authorTokens.length === 0) return false;
       // Alias-only author string.
