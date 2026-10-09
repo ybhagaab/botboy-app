@@ -44,6 +44,7 @@ function fakeWhatsApp(options: {
       state.box = '';
     },
     async evaluate(expression) {
+      if (expression.includes('WAWebUserPrefsMeUser')) return JSON.stringify({ ok: true, number: '6580000001', selfName: 'Me Owner' });
       if (expression === CONTACTS_READER) return JSON.stringify({ ok: true, contacts: CONTACTS });
       if (expression === CHAT_STATE_READER) return JSON.stringify({ title: state.title, group: false, box: state.box, invalid: Boolean(options.invalid) });
       const want = /const want = ("(?:[^"\\]|\\.)*")/.exec(expression);
@@ -137,6 +138,36 @@ describe('createWhatsAppSender', () => {
   });
 });
 
+describe('direct send through WhatsApp Web’s own functions', () => {
+  function directPage(result: unknown) {
+    const calls: string[] = [];
+    const page: WhatsAppPage = {
+      async evaluate(expression) { calls.push(expression.includes('sendTextMsgToChat') ? 'direct' : 'other'); return expression.includes('sendTextMsgToChat') ? JSON.stringify(result) : null; },
+      async navigate() { calls.push('navigate'); },
+      async pressSend() { calls.push('click'); },
+    };
+    return { page, calls };
+  }
+
+  it('sends without navigating or clicking and reports WhatsApp’s ack as the status', async () => {
+    const { page, calls } = directPage({ stage: 'sent', id: 'D1', ack: 2, chatName: 'Abb China' });
+    const receipt = await createWhatsAppSender({ page: async () => page, ...fast }).send({ contact: CONTACTS[0], text: 'hi', ownerRequestId: 'r' });
+    expect(receipt).toMatchObject({ messageId: 'D1', deliveryStatus: 'Delivered', to: 'Abb China' });
+    expect(calls).toEqual(['direct']);
+  });
+
+  it('never falls back to clicking after an unconfirmed direct send, and refuses a chat that is not this number', async () => {
+    const unknown = directPage({ stage: 'unknown', error: 'boom' });
+    const sender = createWhatsAppSender({ page: async () => unknown.page, ...fast });
+    await expect(sender.send({ contact: CONTACTS[0], text: 'hi', ownerRequestId: 'r' })).rejects.toMatchObject({ code: 'send_unknown_effect', effect: 'unknown' });
+    expect(await sender.send({ contact: CONTACTS[0], text: 'hi', ownerRequestId: 'r' })).toMatchObject({ alreadySent: true });
+    expect(unknown.calls).toEqual(['direct']);
+    const wrong = directPage({ stage: 'no_chat' });
+    await expect(createWhatsAppSender({ page: async () => wrong.page, ...fast }).send({ contact: CONTACTS[0], text: 'hi', ownerRequestId: 'r' })).rejects.toMatchObject({ code: 'not_on_whatsapp', effect: 'none' });
+    expect(wrong.calls).toEqual(['direct']);
+  });
+});
+
 describe('withWhatsAppChatTools', () => {
   const tools = () => {
     const wa = fakeWhatsApp();
@@ -184,5 +215,59 @@ describe('withWhatsAppChatTools', () => {
     const { executor } = tools();
     const result = JSON.parse((await executor.executeTool(call('whatsapp_send', { to: '', text: '', ownerRequested: true }), ownerTurn)).content);
     expect(result).toMatchObject({ code: 'invalid_arguments', issues: [{ path: 'to' }, { path: 'text' }] });
+  });
+});
+
+describe('whatsapp_send attachments', () => {
+  it('sends BotBoy screenshots and workspace files, refuses private data, and checks the chat before attaching', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { whatsAppFiles } = await import('./whatsapp-send.js');
+    const home = mkdtempSync(path.join(os.tmpdir(), 'wa-home-'));
+    const root = path.join(home, '.personal-productivity-tracker');
+    mkdirSync(path.join(root, 'self-eyes'), { recursive: true });
+    mkdirSync(path.join(root, 'files'), { recursive: true });
+    writeFileSync(path.join(root, 'self-eyes', 'shot.png'), 'png');
+    writeFileSync(path.join(root, 'files', 'brief.docx'), 'docx');
+    writeFileSync(path.join(root, 'tracker.db'), 'db');
+    const policy = { homeDir: home, privateRoot: root, filesDir: path.join(root, 'files') };
+    const ok = whatsAppFiles([{ path: path.join(root, 'self-eyes', 'shot.png') }, { path: path.join(root, 'files', 'brief.docx') }], policy);
+    expect(ok.issues).toEqual([]);
+    expect(ok.files.map(file => [path.basename(file.path), file.image])).toEqual([['shot.png', true], ['brief.docx', false]]);
+    const refused = whatsAppFiles([{ path: path.join(root, 'tracker.db') }], policy);
+    expect(refused.files).toEqual([]);
+    expect(refused.issues.length).toBe(1);
+
+    const calls: Array<Record<string, unknown>> = [];
+    const page: WhatsAppPage = {
+      async evaluate() { return null; }, async navigate() {}, async pressSend() {},
+      async sendFiles(input) { calls.push(input as never); return input.expectTitle('Abb China') ? { stage: 'sent', ids: ['F1'], ack: 1 } : { stage: 'not_opened', title: 'Dad' }; },
+    };
+    const sender = createWhatsAppSender({ page: async () => page, ...fast });
+    const receipt = await sender.send({ contact: CONTACTS[0], text: 'here', ownerRequestId: 'r', files: [{ path: '/x/shot.png', name: 'shot.png', image: true }] });
+    expect(receipt).toMatchObject({ messageId: 'F1', deliveryStatus: 'Sent', files: ['shot.png'] });
+    const wrongChat: WhatsAppPage = { ...page, async sendFiles() { return { stage: 'not_opened', title: 'Dad' }; } };
+    await expect(createWhatsAppSender({ page: async () => wrongChat, ...fast }).send({ contact: CONTACTS[0], text: '', ownerRequestId: 'r', files: [{ path: '/x/a.pdf', name: 'a.pdf', image: false }] }))
+      .rejects.toMatchObject({ code: 'chat_mismatch', effect: 'none' });
+  });
+});
+
+describe('first use on a new install', () => {
+  it('opens WhatsApp Web and tells the owner how to sign in, sending nothing', async () => {
+    const wa = fakeWhatsApp();
+    let opened = 0;
+    const connection = {
+      async status() { return { chrome: true, tabOpen: false, session: 'closed' as const, me: null, enabled: false, chat: null }; },
+      async openWindow() { opened++; return true; },
+      settings: () => ({ enabled: false, chatNumber: null }),
+      update: () => ({ enabled: false, chatNumber: null }),
+    };
+    const executor = withWhatsAppChatTools(base, { sender: createWhatsAppSender({ page: async () => wa.page, ...fast }), connection });
+    const result = JSON.parse((await executor.executeTool(call('whatsapp_send', { to: 'Abb China', text: 'hi', ownerRequested: true }), ownerTurn)).content);
+    expect(result).toMatchObject({ code: 'not_open', effect: 'none', whatsapp: { windowOpened: true } });
+    expect(result.nextAction).toContain('Sign in');
+    expect(opened).toBe(1);
+    expect(wa.state.enters).toBe(0);
   });
 });

@@ -77,6 +77,8 @@ import { createGmailCompose } from './core/gmail-compose.js';
 import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
 import { withGmailChatTools } from './core/gmail-chat-tools.js';
 import { cdpWhatsAppPage, createWhatsAppSender, withWhatsAppChatTools } from './core/whatsapp-send.js';
+import { createWhatsAppChatBridge } from './core/whatsapp-chat.js';
+import { createWhatsAppConnection } from './core/whatsapp-connection.js';
 import { GMAIL_OAUTH_CALLBACK_PATH } from './api/routers/gmail-sync.js';
 import { createSharePointSync } from './monitors/sharepoint-sync.js';
 import { createRouter } from './api/routes.js';
@@ -678,6 +680,7 @@ async function main() {
   // only job-scope tools, before Gmail, document, or base handlers run.
   // WhatsApp in chat: the owner's own WhatsApp Web tab (whatsapp-send.ts).
   const whatsAppSender = createWhatsAppSender({ page: cdpWhatsAppPage() });
+  const whatsAppConnection = createWhatsAppConnection({ db, page: cdpWhatsAppPage() });
   const toolExecutor = withJobMandate(
     withWhatsAppChatTools(withGmailChatTools(
       withProductDocumentChatTools(
@@ -686,9 +689,39 @@ async function main() {
         productDocumentPublications,
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { sender: whatsAppSender }),
+    ), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }),
     { jobs: chatJobs },
   );
+  // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
+  // owner's self-chat runs as an owner chat turn through this server's own
+  // chat route, the same path as the chat panel; the reply goes back there.
+  const whatsAppChat = createWhatsAppChatBridge({
+    db,
+    page: cdpWhatsAppPage(),
+    sender: whatsAppSender,
+    settings: () => whatsAppConnection.settings(),
+    isTurnActive: () => chatContinuations.isTurnActive(),
+    runTurn: async (message, requestId, mode) => {
+      const base = `http://${HOST === '::1' ? '[::1]' : '127.0.0.1'}:${PORT}`;
+      const response = await fetch(`${base}/api/chat/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: `http://localhost:${PORT}` },
+        body: JSON.stringify({ message, stream: true, requestId, mode }),
+      });
+      if (!response.ok || !response.body) throw new Error(`chat returned HTTP ${response.status}`);
+      const text = await response.text();
+      let reply = '';
+      for (const line of text.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          if (event.type === 'done' && typeof event.message?.content === 'string') reply = event.message.content;
+          if (event.type === 'error' && !reply) reply = `BotBoy hit an error: ${String(event.error ?? event.message ?? '').slice(0, 300)}`;
+        } catch { /* keepalive or partial line */ }
+      }
+      return reply;
+    },
+  });
   // The continuation runner calls this server's own chat route with the
   // in-memory secret; it starts after final-ready (below).
   const continuationRunner = createContinuationRunner({
@@ -1553,6 +1586,7 @@ async function main() {
     mcpManager,
     graspSync,
     gmailSync,
+    whatsApp: whatsAppConnection,
     gmailConnection,
     gmailCompose,
     dashboardOrigin: `http://localhost:${PORT}`,
@@ -1649,6 +1683,7 @@ async function main() {
   console.log('✅ Folder imports scheduled (first pass in 30 s; big files wait for your review)');
   // ETL watches resume from SQLite; a finished run continues its job in chat.
   continuationRunner.start();
+  whatsAppChat.start();
   etlRunWatcher.start();
   const activeJob = chatJobs.activeJob();
   console.log(`✅ ETL run watcher active (every 30 s${activeJob ? `; job ${activeJob.id} has ${chatJobs.watchesForJob(activeJob.id).filter(watch => watch.status === 'pending').length} run(s) pending` : ''})`);

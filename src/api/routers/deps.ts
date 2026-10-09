@@ -86,6 +86,8 @@ export interface RouterDeps {
   graspSync?: GraspSync;
   /** Gmail API mail sync and its OAuth connection (non-Amazon accounts). */
   gmailSync?: GmailSyncs;
+  /** Connections → WhatsApp (whatsapp-connection.ts). */
+  whatsApp?: import('../../core/whatsapp-connection.js').WhatsAppConnection;
   gmailConnection?: GmailConnection;
   /** Drafts and sends (chat tools + the chat draft card's owner buttons). */
   gmailCompose?: GmailCompose;

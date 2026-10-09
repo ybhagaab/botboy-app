@@ -86,6 +86,7 @@ const state = {
   // Gmail API sync (non-Amazon accounts). Secrets are read from the form
   // once, sent, and never kept in state.
   gmailSync: { status: null, error: '', busy: '' },
+  whatsApp: { status: null, error: '', busy: '' },
   sharepointSync: { status: null, error: '', busy: '', sites: [], libraries: [], pickedSite: '' },
   // Outcome-level capture health: per-source streaks and owner warnings.
   captureHealth: { sources: null, issues: [], error: '' },
@@ -305,6 +306,7 @@ function parseRoute() {
   if (parts[0] === 'connections' && parts[1] === 'sql-context') return { view: 'mcp-settings' };
   if (parts[0] === 'connections' && parts[1] === 'mail-calendar-sync') return { view: 'grasp-sync-settings' };
   if (parts[0] === 'connections' && parts[1] === 'gmail-sync') return { view: 'gmail-sync-settings' };
+  if (parts[0] === 'connections' && parts[1] === 'whatsapp') return { view: 'whatsapp-settings' };
   if (parts[0] === 'connections' && parts[1] === 'document-sync') return { view: 'sharepoint-sync-settings' };
   if (parts[0] === 'connections' && parts[1] === 'add') return { view: 'mcp-add' };
   if (parts[0] === 'connections' && parts[1] && parts[2] === 'edit') return { view: 'mcp-edit', profileId: parts[1] };
@@ -440,7 +442,7 @@ async function loadCore({ quiet = false } = {}) {
   // Sources panel needs it, and the panel fetches it on open (post-mortem
   // 2026-08-18: every navigation blanked for the slowest request, which was
   // always this one).
-  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, gmailSyncResult, sharepointSyncResult, captureHealthResult] = await Promise.allSettled([
+  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, gmailSyncResult, sharepointSyncResult, captureHealthResult, whatsAppResult] = await Promise.allSettled([
     request('/areas'),
     request('/projects'),
     todayRequest,
@@ -453,6 +455,7 @@ async function loadCore({ quiet = false } = {}) {
     request('/gmail-sync/status'),
     request('/sharepoint-sync/status'),
     request('/capture-health'),
+    request('/whatsapp/status'),
   ]);
   applyCaptureHealthResult(captureHealthResult);
 
@@ -488,6 +491,8 @@ async function loadCore({ quiet = false } = {}) {
   else state.graspSync.error = graspSyncResult.reason.message;
   if (gmailSyncResult.status === 'fulfilled') { state.gmailSync.status = gmailSyncResult.value.status || null; state.gmailSync.error = ''; }
   else state.gmailSync.error = gmailSyncResult.reason.message;
+  if (whatsAppResult.status === 'fulfilled') { state.whatsApp.status = whatsAppResult.value.status || null; state.whatsApp.error = ''; }
+  else state.whatsApp.error = whatsAppResult.reason.message;
   if (sharepointSyncResult.status === 'fulfilled') { state.sharepointSync.status = sharepointSyncResult.value.status || null; state.sharepointSync.error = ''; }
   else state.sharepointSync.error = sharepointSyncResult.reason.message;
   if (mcpResult.status === 'fulfilled') {
@@ -3106,6 +3111,101 @@ function renderSharePointSyncSettings() {
     </section>`;
 }
 
+// ── WhatsApp (Connections → WhatsApp, docs/maps/whatsapp-chat.md) ──
+function whatsAppCardModel() {
+  const wa = state.whatsApp;
+  if (wa.error) return { status: 'Unavailable', tone: 'warn', detail: wa.error };
+  const status = wa.status;
+  if (!status) return { status: 'Checking', tone: '', detail: 'Loading WhatsApp status' };
+  if (!status.chrome) return { status: 'Chrome not running', tone: 'warn', detail: 'Restart BotBoy with ./start.sh to use WhatsApp.' };
+  if (status.session !== 'signed_in') {
+    return status.tabOpen
+      ? { status: status.session === 'qr' ? 'Sign in' : 'Loading', tone: 'warn', detail: status.session === 'qr' ? 'Scan the QR code in BotBoy’s Chrome window with your phone (WhatsApp → Linked devices).' : 'WhatsApp Web is loading in BotBoy’s Chrome window.' }
+      : { status: 'Not connected', tone: '', detail: 'Open WhatsApp Web and sign in to send messages and talk to BotBoy from your phone.' };
+  }
+  const who = `${status.me?.name || 'Signed in'} (+${status.me?.number || ''})`;
+  if (!status.enabled) return { status: 'Signed in', tone: 'good', detail: `${who}. BotBoy can send messages. Turn on chat with BotBoy to message it from your phone.` };
+  return { status: 'Active', tone: 'good', detail: `${who}. Write @botboy in ${status.chat?.self ? 'your own chat' : (status.chat?.name || 'the BotBoy chat')} and BotBoy answers there.` };
+}
+
+async function refreshWhatsAppStatus() {
+  try {
+    const payload = await request('/whatsapp/status');
+    state.whatsApp.status = payload.status || null;
+    state.whatsApp.error = '';
+  } catch (error) {
+    state.whatsApp.error = error.message;
+  }
+}
+
+async function whatsAppAction(kind, work) {
+  if (state.whatsApp.busy) return;
+  state.whatsApp.busy = kind;
+  renderRoute({ userAction: true });
+  try {
+    await work();
+  } catch (error) {
+    toast(`WhatsApp: ${error.nextAction ? `${error.message}. ${error.nextAction}` : error.message}`, 'bad');
+  } finally {
+    state.whatsApp.busy = '';
+    renderRoute({ userAction: true });
+  }
+}
+
+function renderWhatsAppSettings() {
+  const wa = state.whatsApp;
+  const status = wa.status;
+  const card = whatsAppCardModel();
+  const busy = wa.busy;
+  const disabled = busy ? 'disabled' : '';
+  const signedIn = status?.session === 'signed_in';
+  const signIn = `
+    <article class="card pad">
+      <h3 class="card-title">1. Sign in to WhatsApp Web</h3>
+      ${signedIn
+        ? `<p class="page-subtitle">Signed in as <strong>${esc(status.me?.name || '')}</strong> (+${esc(status.me?.number || '')}). WhatsApp Web stays open in BotBoy’s Chrome window; keep that tab open.</p>`
+        : `<p class="page-subtitle">BotBoy uses your own WhatsApp through WhatsApp Web in its Chrome window. Choose Open WhatsApp Web, then on your phone open WhatsApp → Settings → <strong>Linked devices</strong> → <strong>Link a device</strong> and scan the QR code.</p>
+           ${status?.session === 'qr' ? `<div class="mcp-alert">${icon('alert', 14)}<span>Waiting for the QR scan. This page updates by itself.</span></div>` : ''}`}
+      <div class="head-actions" style="justify-content:flex-start; margin-top:8px">
+        <button class="button ${signedIn ? '' : 'primary'}" type="button" data-action="whatsapp-open" ${disabled}>${icon('link', 14)} ${busy === 'open' ? 'Opening…' : signedIn ? 'Show WhatsApp Web' : 'Open WhatsApp Web'}</button>
+      </div>
+    </article>`;
+  const chatName = status?.chat?.self
+    ? `your own chat, “${esc(status.chat.name)}” (+${esc(status.chat.number)})`
+    : status?.chat ? `“${esc(status.chat.name)}” (+${esc(status.chat.number)})` : 'your own chat';
+  const chat = `
+    <article class="card pad">
+      <h3 class="card-title">2. Talk to BotBoy from your phone</h3>
+      <p class="page-subtitle">Write <code>@botboy</code> and your request in the BotBoy chat. BotBoy runs it here on your Mac and answers in that chat, with screenshots or files when they help. Your Mac must be on with BotBoy running.</p>
+      <div class="connection-details" style="margin-top:8px">
+        <span><span>Chat with BotBoy</span><strong>${status?.enabled ? 'On' : 'Off'}</strong></span>
+        <span><span>BotBoy chat</span><strong>${signedIn ? chatName : 'After sign-in'}</strong></span>
+      </div>
+      <label class="page-subtitle" for="whatsapp-chat-number" style="display:block;margin-top:10px">BotBoy chat (default: your own “Message yourself” chat; WhatsApp creates it if you never used it). To use another chat, enter that number with its country code, for example a second number of yours.</label>
+      <div style="display:flex; gap:6px; align-items:center">
+        <input id="whatsapp-chat-number" type="text" inputmode="tel" autocomplete="off" placeholder="Your own chat" value="${esc(status?.chat && !status.chat.self ? `+${status.chat.number}` : '')}" style="flex:1" ${disabled}>
+        <button class="button small" type="button" data-action="whatsapp-chat-save" ${disabled}>${busy === 'chat' ? 'Saving…' : 'Save chat'}</button>
+        ${status?.chat && !status.chat.self ? `<button class="button small" type="button" data-action="whatsapp-chat-self" ${disabled}>Use my own chat</button>` : ''}
+      </div>
+      <div class="head-actions" style="justify-content:flex-start; margin-top:10px">
+        <button class="button ${status?.enabled ? '' : 'primary'}" type="button" data-action="whatsapp-toggle" ${disabled}>${busy === 'toggle' ? 'Saving…' : status?.enabled ? 'Turn off chat with BotBoy' : 'Turn on chat with BotBoy'}</button>
+      </div>
+    </article>`;
+  const how = `
+    <article class="card pad">
+      <h3 class="card-title">What BotBoy does on WhatsApp</h3>
+      <ul class="page-subtitle" style="padding-left:18px; margin:6px 0">
+        <li>Sends messages and files when you ask in chat (one person at a time, never groups), and confirms each one.</li>
+        <li>Reads the chat that is open in its WhatsApp tab and keeps those messages as evidence. It never opens other chats to read them.</li>
+        <li>Answers <code>@botboy</code> messages in the BotBoy chat; its replies start with 🤖.</li>
+      </ul>
+    </article>`;
+  return `${pageHead('Connection settings', 'WhatsApp', esc(card.detail), `<span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span>`)}
+    ${wa.error ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(wa.error)}</span></div>` : ''}
+    <section class="grid two-col">${signIn}${chat}</section>
+    <section class="grid">${how}</section>`;
+}
+
 function renderConnections() {
   const slackCount = state.slack.configured?.length;
   const folderCount = state.folders.items?.filter(folder => folder.enabled).length;
@@ -3126,11 +3226,13 @@ function renderConnections() {
   const gmailSyncCard = gmailSyncCardModel();
   const sharepointSyncCard = sharepointSyncCardModel();
   const slackCard = slackCardModel(slackCount);
+  const whatsAppCard = whatsAppCardModel();
   const captureCards = [
     ['message', 'Slack', slackCard.status, slackCard.tone, slackCard.detail, 'slack'],
     ['folder', 'Local folders', ...localFoldersCardFields(folderCount), 'folders'],
     ['clock', 'Outlook mail & calendar', graspSyncCard.status, graspSyncCard.tone, graspSyncCard.detail, 'grasp-sync'],
     ['mail', 'Gmail', gmailSyncCard.status, gmailSyncCard.tone, gmailSyncCard.detail, 'gmail-sync'],
+    ['message', 'WhatsApp', whatsAppCard.status, whatsAppCard.tone, whatsAppCard.detail, 'whatsapp'],
     ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
     ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
   ];
@@ -3140,7 +3242,7 @@ function renderConnections() {
     : action === 'folders' && state.folders.changingOften > 0 ? 'Needs attention' : 'Healthy');
   const connectionsAsk = 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
   return `${pageHead('Sources', 'Connections', 'Manage where evidence and analytical context come from, and verify each local connection.', `<button class="button" type="button" data-prompt="${attr(connectionsAsk)}">${icon('sparkles')} Ask BotBoy to add one</button><a class="button primary" href="#/connections/add">${icon('plus', 14)} Add MCP server</a>`)}
-    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'gmail-sync' ? `<a class="button small" href="#/connections/gmail-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
+    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'gmail-sync' ? `<a class="button small" href="#/connections/gmail-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'whatsapp' ? `<a class="button small" href="#/connections/whatsapp">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
     ${managedCards.map(card => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(card.icon, 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div><h3>${esc(card.name)}</h3><p>${esc(card.detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>${esc(card.handling)}</strong></span><span><span>Lifecycle</span><strong>Managed by BotBoy</strong></span></div>${card.profileId ? `<button class="button small" type="button" data-action="manage-connection" data-connection="managed" data-profile="${attr(card.profileId)}">Manage ${icon('chevron-right', 12)}</button>` : ''}</article>`).join('')}</section>
     <div class="section-heading"><div><h2>Connection principles</h2><p>Captured sources stay durable; external analytical content remains untrusted until BotBoy applies its local policy.</p></div></div><section class="grid three-col"><article class="card pad"><div class="eyebrow">${icon('database', 14)} Preserve</div><h3 class="card-title">Raw content stays intact</h3><p class="page-subtitle">Project brains can evolve while original evidence remains unchanged.</p></article><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Restrict</div><h3 class="card-title">Writes need your explicit request</h3><p class="page-subtitle">BotBoy calls read tools freely and runs mutating operations only when you ask for them in chat.</p></article><article class="card pad"><div class="eyebrow">${icon('link', 14)} Explain</div><h3 class="card-title">Analysis stays traceable</h3><p class="page-subtitle">MCP calls are audited locally without storing credentials or query results in the audit log.</p></article></section>`;
 }
@@ -7609,6 +7711,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'mcp-settings') html = renderMcpSettings();
   if (state.route.view === 'grasp-sync-settings') html = renderGraspSyncSettings();
   if (state.route.view === 'gmail-sync-settings') html = renderGmailSyncSettings();
+  if (state.route.view === 'whatsapp-settings') html = renderWhatsAppSettings();
   if (state.route.view === 'sharepoint-sync-settings') html = renderSharePointSyncSettings();
   if (state.route.view === 'doc-reader') html = renderDocReader();
   if (state.route.view === 'mcp-add') html = renderMcpServerForm();
@@ -8503,6 +8606,30 @@ function bindEvents() {
         toast(deleteMail ? `${name} disconnected; ${number(payload.deletedMail || 0)} captured emails deleted` : `${name} disconnected; captured mail stays`);
       });
     }
+    if (action === 'whatsapp-open') {
+      void whatsAppAction('open', async () => {
+        const payload = await request('/whatsapp/open', { method: 'POST', body: {} });
+        state.whatsApp.status = payload.status;
+        toast(payload.status?.session === 'signed_in' ? 'WhatsApp Web is open in BotBoy’s Chrome window' : 'WhatsApp Web is open in BotBoy’s Chrome window: scan the QR code with your phone');
+      });
+    }
+    if (action === 'whatsapp-toggle') {
+      void whatsAppAction('toggle', async () => {
+        const next = !state.whatsApp.status?.enabled;
+        const payload = await request('/whatsapp/config', { method: 'PUT', body: { enabled: next } });
+        state.whatsApp.status = payload.status;
+        toast(next ? 'Chat with BotBoy is on: write @botboy in the BotBoy chat' : 'Chat with BotBoy is off');
+      });
+    }
+    if (action === 'whatsapp-chat-save' || action === 'whatsapp-chat-self') {
+      // Read the field before the busy repaint recreates it.
+      const value = action === 'whatsapp-chat-self' ? 'me' : (document.getElementById('whatsapp-chat-number')?.value || '').trim() || 'me';
+      void whatsAppAction('chat', async () => {
+        const payload = await request('/whatsapp/config', { method: 'PUT', body: { chat: value } });
+        state.whatsApp.status = payload.status;
+        toast(payload.status?.chat?.self ? 'BotBoy chat: your own chat' : `BotBoy chat: ${payload.status?.chat?.name || value}`);
+      });
+    }
     if (action === 'gmail-sync-run') {
       const accountId = target.dataset.account || '';
       void gmailSyncAction(accountId ? `run:${accountId}` : 'run', async () => {
@@ -9187,7 +9314,7 @@ async function pollVersion() {
     if (previousCaptureHealthVersion !== null && state.lastCaptureHealthVersion !== null
       && state.lastCaptureHealthVersion !== previousCaptureHealthVersion) {
       await refreshCaptureHealth();
-      if (['connections', 'grasp-sync-settings', 'gmail-sync-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
+      if (['connections', 'grasp-sync-settings', 'gmail-sync-settings', 'whatsapp-settings', 'sharepoint-sync-settings', 'profile-settings'].includes(state.route.view)) {
         renderRoute({ preserveScroll: true });
       }
     }
@@ -9201,6 +9328,12 @@ async function pollVersion() {
       renderRoute({ preserveScroll: true });
     }
 
+    // The WhatsApp page follows the sign-in (QR scan) on this poll while it waits.
+    if (state.route.view === 'whatsapp-settings' && !state.whatsApp.busy
+      && state.whatsApp.status?.session !== 'signed_in' && !String(document.activeElement?.id || '').startsWith('whatsapp-')) {
+      await refreshWhatsAppStatus();
+      renderRoute({ preserveScroll: true });
+    }
     // Another tab (or a provider credential problem) changed the AI model:
     // refresh the open Settings page. Never reloads the tab.
     if (state.route.view === 'ai-model-settings' && !state.aiModel.saving && !state.aiModel.removing
