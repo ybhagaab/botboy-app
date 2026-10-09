@@ -76,6 +76,7 @@ import { createGmailConnection } from './core/gmail-connection.js';
 import { createGmailCompose } from './core/gmail-compose.js';
 import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
 import { withGmailChatTools } from './core/gmail-chat-tools.js';
+import { cdpWhatsAppPage, createWhatsAppSender, withWhatsAppChatTools } from './core/whatsapp-send.js';
 import { GMAIL_OAUTH_CALLBACK_PATH } from './api/routers/gmail-sync.js';
 import { createSharePointSync } from './monitors/sharepoint-sync.js';
 import { createRouter } from './api/routes.js';
@@ -675,15 +676,17 @@ async function main() {
   const gmailCompose = createGmailCompose({ db, connection: gmailConnection, attachments: defaultAttachmentPolicy(visualAssets), sendAsFor: accountId => readGmailSendAs(db, accountId) });
   // withJobMandate is the OUTERMOST wrapper: a continuation turn may reach
   // only job-scope tools, before Gmail, document, or base handlers run.
+  // WhatsApp in chat: the owner's own WhatsApp Web tab (whatsapp-send.ts).
+  const whatsAppSender = createWhatsAppSender({ page: cdpWhatsAppPage() });
   const toolExecutor = withJobMandate(
-    withGmailChatTools(
+    withWhatsAppChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
         productDocumentPublications,
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ),
+    ), { sender: whatsAppSender }),
     { jobs: chatJobs },
   );
   // The continuation runner calls this server's own chat route with the

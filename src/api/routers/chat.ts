@@ -49,6 +49,7 @@ import {
 } from '../../core/data-room-tool-failure.js';
 import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
 import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-chat-tools.js';
+import { whatsAppSendConfirmed } from '../../core/whatsapp-send.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
 import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
 import {
@@ -65,11 +66,15 @@ import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-ow
 
 /** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
 const GMAIL_WRITE_TOOLS = new Set(['gmail_draft', 'gmail_send']);
+/** A WhatsApp send counts only with its receipt (whatsapp-send.ts). */
+const WHATSAPP_WRITE_TOOLS = new Set(['whatsapp_send']);
 const GMAIL_TOOL_STATUS: Record<string, string> = {
   gmail_search: '🔎 Searching Gmail...',
   gmail_read: '📨 Reading from Gmail...',
   gmail_draft: '📝 Saving the Gmail draft...',
   gmail_send: '📤 Sending through Gmail...',
+  whatsapp_find_contact: '🔎 Looking up the WhatsApp contact...',
+  whatsapp_send: '💬 Sending on WhatsApp...',
 };
 /** Long-running tools: one status line, then keepalives while they run. */
 const ETL_TOOL_STATUS: Record<string, string> = {
@@ -1505,6 +1510,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony',
           ...GMAIL_WRITE_TOOLS,
+          ...WHATSAPP_WRITE_TOOLS,
         ]);
         const toolCallMayWrite = (toolCall: any): boolean => WRITE_TOOLS.has(toolCall?.function?.name);
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added|sent|drafted)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked|sent|drafted|emailed)\b)/i;
@@ -2251,7 +2257,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                   : GMAIL_WRITE_TOOLS.has(tc.function.name)
                     // A Gmail write counts only with its receipt (draft saved / message sent).
                     ? gmailWriteConfirmed(tc.function.name, result?.content)
-                    : true;
+                    : WHATSAPP_WRITE_TOOLS.has(tc.function.name)
+                      ? whatsAppSendConfirmed(tc.function.name, result?.content)
+                      : true;
               }
               const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
               if (savedDraftId) gmailDraftIds.add(savedDraftId);

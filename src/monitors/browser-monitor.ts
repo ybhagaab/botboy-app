@@ -385,7 +385,11 @@ export const WHATSAPP_READER = `(function () {
     var text = parts.join('\\n');
     if (!text && kind === 'text') continue;
     var quoted = quotedEl ? (quotedEl.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
-    var outgoing = !!row.querySelector('[data-icon^="tail-out"], [data-icon^="msg-check"], [data-icon^="msg-dblcheck"], [data-icon^="msg-time"], .message-out');
+    // A follow-up bubble has no tail icon, so the row's own labels decide:
+    // the author label reads "You:" and only sent messages carry a status.
+    var labels = Array.prototype.map.call(row.querySelectorAll('[aria-label]'), function (e) { return (e.getAttribute('aria-label') || '').trim(); });
+    var outgoing = labels[0] === 'You:' || labels.some(function (l) { return /^(pending|sent|delivered|read)$/i.test(l); })
+      || !!row.querySelector('[data-icon^="tail-out"], [data-icon^="msg-check"], [data-icon^="msg-dblcheck"], [data-icon^="msg-time"], .message-out');
     out.push({ id: id, at: m ? m[1] : '', author: m ? m[2] : '', text: text.slice(0, 8000), quoted: quoted || undefined, kind: kind, outgoing: outgoing });
   }
   return JSON.stringify({ chat: chat, group: group, messages: out });

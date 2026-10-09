@@ -76,7 +76,7 @@ describe('job mandate gate', () => {
   // base executor, so the mandate gate must wrap them all.
   it('is the outermost wrapper of the chat executor (index.ts)', () => {
     const index = readFileSync(path.join(process.cwd(), 'src/index.ts'), 'utf8');
-    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWhatsAppChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
   });
 
   it('offers a continuation only the job-scope tools', () => {

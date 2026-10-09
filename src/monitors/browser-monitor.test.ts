@@ -240,6 +240,8 @@ describe('WhatsApp Web capture', () => {
       ${row('A5', '[9:45 pm, 08/10/2026] Ravi: ', '<div data-testid="quoted-message"><span data-testid="selectable-text">Dinner at 8?</span></div><span data-testid="selectable-text">Make it 8:30</span>')}
       ${row('A6', '[9:46 pm, 08/10/2026] Ravi: ', '<div data-testid="image-thumb"></div>')}
       ${row('A7', '[9:47 pm, 08/10/2026] Ravi: ', '<span data-testid="selectable-text"> </span>')}
+      ${row('A8', '[9:48 pm, 08/10/2026] Me: ', '<span aria-label="You:"></span><span data-testid="selectable-text">Follow-up, no tail</span><span aria-label=" Delivered "></span>')}
+      ${row('A9', '[9:49 pm, 08/10/2026] Asha: ', '<span aria-label="Asha:"></span><span data-testid="selectable-text">Seen</span>')}
     </div>`, { runScripts: 'outside-only' });
     // jsdom has no layout, so innerText is textContent here.
     Object.defineProperty(dom.window.HTMLElement.prototype, 'innerText', { get() { return this.textContent; } });
@@ -252,6 +254,8 @@ describe('WhatsApp Web capture', () => {
       ['A4', 'Asha', 'image', false, 'Menu'],
       ['A5', 'Ravi', 'text', false, 'Make it 8:30'],
       ['A6', 'Ravi', 'image', false, ''],
+      ['A8', 'Me', 'text', true, 'Follow-up, no tail'],
+      ['A9', 'Asha', 'text', false, 'Seen'],
     ]);
     expect(view.messages[0].at).toBe('9:41 pm, 08/10/2026');
     expect(view.messages[4].quoted).toBe('Dinner at 8?');
