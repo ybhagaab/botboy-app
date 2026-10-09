@@ -10,11 +10,14 @@
 
 import WebSocket from 'ws';
 import type { RawWorkItem, WorkItemType } from '../core/types.js';
+import { htmlToText } from '../core/email-capture.js';
 
 export interface BrowserMonitor {
   start(): Promise<void>;
   stop(): void;
   onWorkItem(callback: (item: RawWorkItem) => void): void;
+  /** One poll now (tests; the timer calls the same). */
+  pollOnce(): Promise<void>;
 }
 
 export interface BrowserMonitorConfig {
@@ -22,7 +25,19 @@ export interface BrowserMonitorConfig {
   pollIntervalMs: number;
   /** Hands-owned targets are active automation, not ambient browsing evidence. */
   shouldSkipTarget?: (targetId: string) => boolean;
+  /**
+   * A page whose text is still thin (an app still rendering) is checked again
+   * on later polls before BotBoy settles for what it has (default 6 polls).
+   */
+  maxSettleAttempts?: number;
 }
+
+/** Below this, a page is still rendering (or is a shell) and is checked again. */
+export const THIN_PAGE_CHARS = 200;
+/** A captured static page is captured again once its text grows this much (an app that kept rendering). */
+const GROWTH_RATIO = 1.5;
+const GROWTH_MIN_CHARS = 300;
+const MAX_RECAPTURES = 3;
 
 const DEFAULT_CONFIG: BrowserMonitorConfig = {
   cdpEndpoint: 'http://127.0.0.1:9222',
@@ -78,11 +93,34 @@ export function detectPlatform(url: string, title: string): { type: WorkItemType
 
 // ── CDP helpers ──
 
+interface FrameTarget { url: string; webSocketDebuggerUrl: string }
+
+/** Ad, tracking, and consent frames: never page content. */
+const NOISE_FRAME_HOSTS = /(?:^|\.)(?:doubleclick\.net|googlesyndication\.com|googleadservices\.com|adtrafficquality\.google|2mdn\.net|adnxs\.com|amazon-adsystem\.com|criteo\.(?:com|net)|taboola\.com|outbrain\.com|flashb\.id|onetag-sys\.com|pubmatic\.com|rubiconproject\.com|casalemedia\.com|openx\.net|moatads\.com|scorecardresearch\.com|quantserve\.com|imasdk\.googleapis\.com|recaptcha\.net|cookielaw\.org|onetrust\.com|consensu\.org|hotjar\.com|intercom\.io)$/i;
+/** Per-frame and per-page bounds on frame text (a page's own text is not capped). */
+const MAX_FRAME_CHARS = 100_000;
+const MAX_FRAMES_TEXT = 200_000;
+
+export function isNoiseFrame(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (!/^https?:$/.test(parsed.protocol)) return true;
+    return NOISE_FRAME_HOSTS.test(parsed.hostname) || /\/(?:recaptcha|usersync|usync|pixel)\b/i.test(parsed.pathname);
+  } catch {
+    return true;
+  }
+}
 interface TabInfo {
   url: string;
   title: string;
   id: string;
   webSocketDebuggerUrl: string;
+  /**
+   * Cross-origin iframes (site isolation runs them as their own CDP targets
+   * with `parentId`): SharePoint/Office viewers, embedded dashboards. The
+   * page's own script cannot read them, so each is read on its own.
+   */
+  frames: FrameTarget[];
 }
 
 async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string) => boolean): Promise<TabInfo[]> {
@@ -104,6 +142,22 @@ async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string)
       /^about:/,
       /^data:/,
     ];
+    const childrenOf = new Map<string, FrameTarget[]>();
+    for (const t of tabs) {
+      if (t?.type !== 'iframe' || !t.parentId || !t.webSocketDebuggerUrl || !t.url) continue;
+      if (BLOCKED_URLS.some(p => p.test(t.url)) || isNoiseFrame(t.url)) continue;
+      const list = childrenOf.get(String(t.parentId)) ?? [];
+      list.push({ url: t.url, webSocketDebuggerUrl: t.webSocketDebuggerUrl });
+      childrenOf.set(String(t.parentId), list);
+    }
+    // A frame's own frames belong to its page too (one level is the norm; two is rare).
+    const framesFor = (id: string, depth = 0): FrameTarget[] => {
+      const direct = childrenOf.get(id) ?? [];
+      if (depth >= 2) return direct;
+      const nested = tabs.filter((t: any) => t?.type === 'iframe' && String(t.parentId) === id)
+        .flatMap((t: any) => framesFor(String(t.id), depth + 1));
+      return [...direct, ...nested].slice(0, 8);
+    };
     return tabs
       .filter((t: any) => {
         if (t.type !== 'page' || !t.url) return false;
@@ -115,6 +169,7 @@ async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string)
         title: t.title || '',
         id: t.id,
         webSocketDebuggerUrl: t.webSocketDebuggerUrl || '',
+        frames: framesFor(String(t.id)),
       }));
   } catch {
     return [];
@@ -173,7 +228,54 @@ function cdpEval(wsUrl: string, expression: string, timeout = 8000): Promise<str
   });
 }
 
-async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: string }> {
+/**
+ * Visible page text: the main content when there is enough of it, else the
+ * page without navigation and chrome; open shadow roots and same-origin
+ * iframes included. Runs inside the page (and inside each cross-origin frame).
+ */
+export const GENERIC_PAGE_TEXT = `(function() {
+  var SKIP = 'script, style, noscript, svg, template, nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], .sidebar, .nav, .footer, .header, .menu';
+  function shadowText(root, depth) {
+    if (depth > 6) return '';
+    var out = [];
+    var hosts = root.querySelectorAll('*');
+    for (var i = 0; i < hosts.length && out.length < 400; i++) {
+      var sr = hosts[i].shadowRoot;
+      if (!sr) continue;
+      var own = Array.prototype.map.call(sr.children, function (c) {
+        return c.matches && c.matches('script, style, template') ? '' : (c.innerText || c.textContent || '');
+      }).join('\\n').trim();
+      if (own) out.push(own);
+      var deeper = shadowText(sr, depth + 1);
+      if (deeper) out.push(deeper);
+    }
+    return out.join('\\n');
+  }
+  var body = document.body;
+  if (!body) return '';
+  var text = '';
+  var main = document.querySelector('article, main, [role="main"], .post-content, .entry-content, .article-body, #content');
+  if (main && (main.innerText || '').trim().length > 200) {
+    text = main.innerText.trim();
+  } else {
+    var clone = body.cloneNode(true);
+    clone.querySelectorAll(SKIP).forEach(function (el) { el.remove(); });
+    // A detached clone has no layout, so innerText falls back to textContent rules; both are fine here.
+    var stripped = (clone.innerText || clone.textContent || '').trim();
+    text = stripped.length > 200 ? stripped : (body.innerText || '').trim();
+  }
+  var shadow = shadowText(document, 0);
+  if (shadow && text.indexOf(shadow.slice(0, 80)) < 0) text += (text ? '\\n\\n' : '') + shadow;
+  document.querySelectorAll('iframe').forEach(function (f) {
+    try {
+      var t = f.contentDocument && f.contentDocument.body ? f.contentDocument.body.innerText.trim() : '';
+      if (t) text += '\\n\\n[iframe] ' + t;
+    } catch (e) {}
+  });
+  return text;
+})()`;
+
+async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: string; errorPage?: boolean }> {
   if (!tab.webSocketDebuggerUrl) return { text: '', html: '' };
   try {
     // Use platform-specific extraction for messaging apps
@@ -300,34 +402,30 @@ async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: s
         return document.body.innerText;
       })()`;
     } else {
-      // Generic: tiered extraction — try main content first, then stripped
-      // innerText. Same-origin iframe text is appended (SPAs like Pippin
-      // render artifacts inside iframes; top-document innerText misses them).
-      expression = `(function() {
-        var text = '';
-        // Try semantic content selectors first (clean content, no nav/footer)
-        var main = document.querySelector('article, main, [role="main"], .post-content, .entry-content, .article-body, #content');
-        if (main && main.innerText.trim().length > 200) {
-          text = main.innerText.trim();
-        } else {
-          // Try stripping nav, header, footer, sidebar
-          var clone = document.body.cloneNode(true);
-          clone.querySelectorAll('script, style, noscript, svg, img, nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], .sidebar, .nav, .footer, .header, .menu').forEach(function(el) { el.remove(); });
-          var stripped = clone.innerText.trim();
-          text = stripped.length > 200 ? stripped : document.body.innerText.trim();
-        }
-        // Same-origin iframes (cross-origin ones throw — skipped)
-        document.querySelectorAll('iframe').forEach(function(f) {
-          try {
-            var t = f.contentDocument && f.contentDocument.body ? f.contentDocument.body.innerText.trim() : '';
-            if (t) text += '\\n\\n[iframe] ' + t;
-          } catch (e) {}
-        });
-        return text;
-      })()`;
+      // Generic: tiered extraction (main content, else the page without its
+      // chrome), shadow-DOM aware (web-component apps render inside open
+      // shadow roots, which innerText never enters), plus same-origin iframes.
+      // Cross-origin iframes are read separately as their own targets.
+      expression = GENERIC_PAGE_TEXT;
     }
 
-    const text = await cdpEval(tab.webSocketDebuggerUrl, expression);
+    // A browser error page ("This site can't be reached") is not content.
+    const href = await cdpEval(tab.webSocketDebuggerUrl, 'String(location.href)', 4000).catch(() => '');
+    if (/^chrome-error:/i.test(href)) return { text: '', html: '', errorPage: true };
+    let text = await cdpEval(tab.webSocketDebuggerUrl, expression);
+    // Cross-origin frames (Office/SharePoint viewers, embedded dashboards).
+    const seenFrameText = new Set<string>();
+    let frameChars = 0;
+    for (const frame of tab.frames) {
+      if (frameChars >= MAX_FRAMES_TEXT) break;
+      const frameText = (await cdpEval(frame.webSocketDebuggerUrl, GENERIC_PAGE_TEXT, 6000).catch(() => '')).trim();
+      // Tiny frames are widgets (a button, a counter); repeated ones add nothing.
+      if (frameText.length < 40 || seenFrameText.has(frameText) || text.includes(frameText)) continue;
+      seenFrameText.add(frameText);
+      const kept = frameText.slice(0, Math.min(MAX_FRAME_CHARS, MAX_FRAMES_TEXT - frameChars));
+      frameChars += kept.length;
+      text += `${text ? '\n\n' : ''}[frame ${frame.url.slice(0, 200)}]\n${kept}`;
+    }
     // Raw page capture: the ENTIRE document HTML plus same-origin iframe
     // documents, losslessly (no caps — the ContentStore blobs large pages).
     let html = '';
@@ -368,7 +466,6 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const listeners: ((item: RawWorkItem) => void)[] = [];
   let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let seenStaticUrls = new Set<string>();
   // For dynamic pages: store last content hash to detect changes
   let lastDynamicContent = new Map<string, string>();
 
@@ -386,31 +483,49 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     return h.toString(36);
   }
 
+  /** Static pages: polls spent waiting for real text, and what was captured. */
+  const settleAttempts = new Map<string, number>();
+  const captured = new Map<string, { chars: number; recaptures: number }>();
+  const maxSettleAttempts = cfg.maxSettleAttempts ?? 6;
+
   async function pollOnce(): Promise<void> {
     const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
     for (const tab of tabs) {
       const dynamic = isDynamicPage(tab.url);
-
-      if (!dynamic && seenStaticUrls.has(tab.url)) continue;
+      const previous = captured.get(tab.url);
+      // A static page settled and re-captured enough: leave it.
+      if (!dynamic && previous && previous.recaptures >= MAX_RECAPTURES) continue;
 
       // Extract actual page content via CDP
-      const { text: content, html } = await extractPageContent(tab);
+      const extracted = await extractPageContent(tab);
+      if (extracted.errorPage) continue; // not content; checked again next poll
+      let content = extracted.text.trim();
+      const html = extracted.html;
 
       if (!dynamic) {
-        // Mark a static page as captured ONLY once real content arrived.
-        // SPAs (Pippin, Quip, …) return empty while loading — the old code
-        // blacklisted the URL on that first empty poll and the page was never
-        // captured at all (post-mortem 2026-08-05). Empty extractions retry
-        // on the next poll instead.
-        if (!content && !html) continue;
-        seenStaticUrls.add(tab.url);
-        if (seenStaticUrls.size > 5000) {
-          const arr = [...seenStaticUrls];
-          seenStaticUrls = new Set(arr.slice(-2500));
+        // An app still rendering returns a shell ("Loading…") or nothing.
+        // Wait for real text a few polls before settling for what there is;
+        // the page's HTML is the last resort (text read from it here).
+        if (content.length < THIN_PAGE_CHARS && !previous) {
+          const attempts = (settleAttempts.get(tab.url) ?? 0) + 1;
+          settleAttempts.set(tab.url, attempts);
+          if (attempts < maxSettleAttempts) continue;
+          if (!content && html) content = htmlToText(html).trim();
+          if (!content) continue;
+        }
+        if (previous) {
+          // Captured before: only a page that kept rendering much more text is captured again.
+          if (!(content.length >= previous.chars * GROWTH_RATIO && content.length - previous.chars >= GROWTH_MIN_CHARS)) continue;
+        }
+        settleAttempts.delete(tab.url);
+        captured.set(tab.url, { chars: content.length, recaptures: previous ? previous.recaptures + 1 : 0 });
+        if (captured.size > 5000) {
+          for (const key of [...captured.keys()].slice(0, 2500)) captured.delete(key);
         }
       }
 
       if (dynamic) {
+        if (!content) continue;
         // Only emit if content actually changed
         const hash = simpleHash(content);
         if (lastDynamicContent.get(tab.url) === hash) continue;
@@ -430,13 +545,14 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
         metadata: {
           ...metadata,
           captureMode: 'passive_observation',
+          ...(tab.frames.length ? { frames: String(tab.frames.length) } : {}),
           ...(type === 'slack_message' ? { direction: 'observed' } : {}),
         },
         capturedAt: new Date(),
       };
 
       emit(item);
-      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${html.length} chars html)`);
+      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${html.length} chars html${tab.frames.length ? `, ${tab.frames.length} frame${tab.frames.length === 1 ? '' : 's'}` : ''})`);
     }
   }
 
@@ -456,5 +572,7 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     onWorkItem(callback: (item: RawWorkItem) => void): void {
       listeners.push(callback);
     },
+
+    pollOnce,
   };
 }
