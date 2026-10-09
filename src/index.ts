@@ -1225,6 +1225,11 @@ async function main() {
   // ── Monitors ──
   const browserMonitor = createBrowserMonitor({
     shouldSkipTarget: targetId => browserHands.ownsTarget(targetId),
+    // WhatsApp messages are one row each, keyed by message id (survives restarts).
+    hasCaptured: (() => {
+      const stmt = db.prepare('SELECT 1 FROM work_items WHERE url = ? LIMIT 1');
+      return (url: string) => Boolean(stmt.get(url));
+    })(),
   });
   // Once canonical GRASP mail sync is live, browser-scraped email is a noisier
   // duplicate of the same messages — suppress ALL browser email capture at the

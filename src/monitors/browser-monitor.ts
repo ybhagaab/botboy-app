@@ -30,6 +30,16 @@ export interface BrowserMonitorConfig {
    * on later polls before BotBoy settles for what it has (default 6 polls).
    */
   maxSettleAttempts?: number;
+  /**
+   * True when a capture URL is already stored (WhatsApp messages are one row
+   * each, keyed by message id, so a restart never stores them twice).
+   */
+  hasCaptured?: (url: string) => boolean;
+}
+
+/** The capture URL of one WhatsApp message (its own WhatsApp id). */
+export function whatsAppMessageUrl(messageId: string): string {
+  return `https://web.whatsapp.com/#msg=${encodeURIComponent(messageId)}`;
 }
 
 /** Below this, a page is still rendering (or is a shell) and is checked again. */
@@ -275,6 +285,112 @@ export const GENERIC_PAGE_TEXT = `(function() {
   return text;
 })()`;
 
+// ── WhatsApp Web (DOM verified live 2026-10-09) ──
+
+/** One rendered WhatsApp message. */
+export interface WhatsAppMessage {
+  /** WhatsApp's own message id (`data-id`); the dedup key. */
+  id: string;
+  /** "[9:41 pm, 08/10/2026]" as WhatsApp writes it (locale order kept). */
+  at: string;
+  author: string;
+  text: string;
+  /** The reply's quoted message, shortened. */
+  quoted?: string;
+  kind: 'text' | 'poll' | 'image' | 'video' | 'audio' | 'document' | 'sticker' | 'other';
+  outgoing: boolean;
+}
+
+export interface WhatsAppView {
+  /** The open conversation's title; '' when no chat is open (list view). */
+  chat: string;
+  group: boolean;
+  messages: WhatsAppMessage[];
+}
+
+/**
+ * Reads the open WhatsApp conversation. WhatsApp renders only the rows on
+ * screen (offscreen rows are empty placeholders), so each poll sees the
+ * visible window; new rows are captured as they appear. Selectors are
+ * WhatsApp's own `data-testid` / `data-pre-plain-text` / `data-id`, not its
+ * generated class names, which change with every release.
+ */
+export const WHATSAPP_READER = `(function () {
+  var main = document.querySelector('#main');
+  if (!main) return JSON.stringify({ chat: '', group: false, messages: [] });
+  var titleEl = main.querySelector('[data-testid="conversation-info-header-chat-title"]') || main.querySelector('header span[dir="auto"]');
+  var chat = titleEl ? (titleEl.innerText || titleEl.textContent || '').trim() : '';
+  var group = !!main.querySelector('[data-testid="group-chat-profile-picture"]');
+  var out = [];
+  var rows = main.querySelectorAll('[role="row"]');
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    var holder = row.querySelector('[data-id]');
+    if (!holder) continue;
+    var id = holder.getAttribute('data-id') || '';
+    var copy = row.querySelector('[data-pre-plain-text]');
+    if (!id || !copy) continue; // a placeholder, a system notice, or a bare media row
+    var pre = copy.getAttribute('data-pre-plain-text') || '';
+    var m = /^\\[([^\\]]*)\\]\\s*(.*?):\\s*$/.exec(pre);
+    var quotedEl = row.querySelector('[data-testid="quoted-message"]');
+    var parts = [];
+    var pollEl = row.querySelector('[data-testid="poll-bubble"]');
+    row.querySelectorAll('[data-testid="selectable-text"], [data-testid="image-caption"]').forEach(function (el) {
+      if (quotedEl && quotedEl.contains(el)) return;
+      // A poll's option labels are listed once below, not as body text.
+      if (pollEl && parts.length) return;
+      var t = (el.innerText || el.textContent || '').trim();
+      if (t && parts.indexOf(t) < 0) parts.push(t);
+    });
+    var kind = 'text';
+    if (pollEl) {
+      kind = 'poll';
+      var options = [];
+      row.querySelectorAll('[data-testid^="poll-option-row-label"]').forEach(function (el) { var t = (el.innerText || '').trim(); if (t) options.push(t); });
+      if (options.length) parts.push('Options: ' + options.join(' | '));
+    } else if (row.querySelector('[data-testid="image-thumb"], img[src^="blob:"]')) kind = 'image';
+    else if (row.querySelector('[data-icon*="video"], [data-testid*="video"]')) kind = 'video';
+    else if (row.querySelector('[data-icon*="audio"], [data-icon*="ptt"], [data-testid*="audio"], [data-testid*="ptt"]')) kind = 'audio';
+    else if (row.querySelector('[data-testid*="document"], [data-icon*="document"]')) kind = 'document';
+    else if (row.querySelector('[data-testid*="sticker"]')) kind = 'sticker';
+    var text = parts.join('\\n');
+    if (!text && kind === 'text') continue;
+    var quoted = quotedEl ? (quotedEl.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
+    var outgoing = !!row.querySelector('[data-icon^="tail-out"], [data-icon^="msg-check"], [data-icon^="msg-dblcheck"], [data-icon^="msg-time"], .message-out');
+    out.push({ id: id, at: m ? m[1] : '', author: m ? m[2] : '', text: text.slice(0, 8000), quoted: quoted || undefined, kind: kind, outgoing: outgoing });
+  }
+  return JSON.stringify({ chat: chat, group: group, messages: out });
+})()`;
+
+/** Parses the reader's answer; anything malformed is an empty view. */
+export function parseWhatsAppView(raw: string): WhatsAppView {
+  try {
+    const value = JSON.parse(raw);
+    const messages = Array.isArray(value?.messages) ? value.messages.filter((entry: any) => entry && typeof entry.id === 'string' && entry.id && typeof entry.text === 'string') : [];
+    return { chat: typeof value?.chat === 'string' ? value.chat.trim().slice(0, 300) : '', group: value?.group === true, messages };
+  } catch {
+    return { chat: '', group: false, messages: [] };
+  }
+}
+
+/** The capture text for a batch of new messages in one chat. */
+export function renderWhatsAppBatch(view: WhatsAppView, messages: WhatsAppMessage[]): string {
+  const lines = [`Chat: ${view.chat || '(unknown chat)'} (${view.group ? 'group' : 'direct message'})`, ''];
+  for (const message of messages) {
+    const who = message.outgoing ? `${message.author || 'Me'} (me)` : (message.author || 'Unknown');
+    const tag = message.kind === 'text' ? '' : ` [${message.kind}]`;
+    lines.push(`[${message.at}] ${who}${tag}: ${message.text}`.trim());
+    if (message.quoted) lines.push(`  > replying to: ${message.quoted}`);
+  }
+  return lines.join('\n');
+}
+
+function shortHash(text: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36);
+}
+
 async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: string; errorPage?: boolean }> {
   if (!tab.webSocketDebuggerUrl) return { text: '', html: '' };
   try {
@@ -282,25 +398,7 @@ async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: s
     const url = tab.url;
     let expression: string;
 
-    if (/web\.whatsapp\.com/.test(url)) {
-      // WhatsApp: extract actual chat messages, not UI chrome
-      expression = `(function() {
-        const msgs = document.querySelectorAll('[data-pre-plain-text], .message-in .copyable-text, .message-out .copyable-text, ._amjv, ._amjw');
-        if (msgs.length > 0) {
-          return Array.from(msgs).slice(-30).map(el => {
-            const pre = el.getAttribute('data-pre-plain-text') || '';
-            const text = el.innerText || '';
-            return pre ? pre + ' ' + text : text;
-          }).filter(t => t.trim()).join('\\n');
-        }
-        // Fallback: get conversation list
-        const convos = document.querySelectorAll('[data-testid="cell-frame-container"]');
-        if (convos.length > 0) {
-          return Array.from(convos).slice(0, 20).map(el => el.innerText.replace(/\\n+/g, ' | ')).join('\\n');
-        }
-        return document.querySelector('#main')?.innerText? || '';
-      })()`;
-    } else if (/app\.slack\.com|slack\.com\/client/.test(url)) {
+    if (/app\.slack\.com|slack\.com\/client/.test(url)) {
       // Slack: extract message content from the active channel
       expression = `(function() {
         const msgs = document.querySelectorAll('.c-message__body, .p-rich_text_section');
@@ -451,7 +549,6 @@ async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: s
 
 // URLs that should be re-polled for content changes (dynamic pages)
 const DYNAMIC_URL_PATTERNS = [
-  /web\.whatsapp\.com/,
   /app\.slack\.com/,
   /slack\.com\/client/,
   /mail\.google\.com/,
@@ -488,9 +585,53 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
   const captured = new Map<string, { chars: number; recaptures: number }>();
   const maxSettleAttempts = cfg.maxSettleAttempts ?? 6;
 
+  /** WhatsApp message ids already captured this process (the store check covers restarts). */
+  const seenWhatsApp = new Set<string>();
+
+  async function captureWhatsApp(tab: TabInfo): Promise<void> {
+    const raw = await cdpEval(tab.webSocketDebuggerUrl, WHATSAPP_READER).catch(() => '');
+    const view = parseWhatsAppView(raw);
+    if (!view.chat || !view.messages.length) return;
+    const fresh = view.messages.filter((message) => {
+      if (seenWhatsApp.has(message.id)) return false;
+      seenWhatsApp.add(message.id);
+      return !cfg.hasCaptured?.(whatsAppMessageUrl(message.id));
+    });
+    if (seenWhatsApp.size > 20_000) {
+      for (const id of [...seenWhatsApp].slice(0, 10_000)) seenWhatsApp.delete(id);
+    }
+    for (const message of fresh.slice(-200)) {
+      emit({
+        type: 'whatsapp_message',
+        source: 'browser',
+        sourceApp: 'WhatsApp',
+        url: whatsAppMessageUrl(message.id),
+        title: view.chat,
+        content: renderWhatsAppBatch(view, [message]),
+        metadata: {
+          conversationName: view.chat,
+          chatType: view.group ? 'group' : 'direct',
+          author: message.author,
+          direction: message.outgoing ? 'sent' : 'received',
+          messageAt: message.at,
+          messageKind: message.kind,
+          whatsappMessageId: message.id,
+          chatKey: shortHash(view.chat),
+          captureMode: 'passive_observation',
+        },
+        capturedAt: new Date(),
+      });
+    }
+    if (fresh.length) console.log(`📄 Captured [whatsapp_message] ${fresh.length} new in "${view.chat.slice(0, 40)}"`);
+  }
+
   async function pollOnce(): Promise<void> {
     const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
     for (const tab of tabs) {
+      if (/^https:\/\/web\.whatsapp\.com\//.test(tab.url)) {
+        await captureWhatsApp(tab);
+        continue;
+      }
       const dynamic = isDynamicPage(tab.url);
       const previous = captured.get(tab.url);
       // A static page settled and re-captured enough: leave it.

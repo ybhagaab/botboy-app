@@ -219,3 +219,84 @@ describe('isNoiseFrame', () => {
     }
   });
 });
+
+/**
+ * WhatsApp Web: the reader runs against DOM shaped like the live page
+ * (verified 2026-10-09: `data-id`, `data-pre-plain-text`, `data-testid`
+ * selectors; generated class names ignored), and each new message becomes
+ * one row keyed by its WhatsApp id.
+ */
+describe('WhatsApp Web capture', () => {
+  it('reads text, captions, polls, quoted replies, and direction from the live DOM shape', async () => {
+    const { JSDOM } = await import('jsdom');
+    const { WHATSAPP_READER, parseWhatsAppView } = await import('./browser-monitor.js');
+    const row = (id: string, pre: string | null, inner: string) => `<div role="row"><div data-id="${id}"><div data-testid="msg-container">${pre === null ? inner : `<div class="copyable-text" data-pre-plain-text="${pre}">${inner}</div>`}</div></div></div>`;
+    const dom = new JSDOM(`<div id="pane-side"></div><div id="main"><header><div data-testid="conversation-info-header-chat-title"><span dir="auto">Family</span></div><img data-testid="group-chat-profile-picture"></header>
+      ${row('PLACEHOLDER1', null, '')}
+      ${row('A1', '[9:41 pm, 08/10/2026] Asha: ', '<span data-icon="tail-in"></span><span data-testid="selectable-text">Dinner at 8?</span>')}
+      ${row('A2', '[9:42 pm, 08/10/2026] Me: ', '<span data-icon="tail-out"></span><span data-testid="selectable-text">Yes, booked</span><span data-icon="msg-dblcheck"></span>')}
+      ${row('A3', '[9:43 pm, 08/10/2026] Ravi: ', '<div data-testid="poll-bubble"><span data-testid="selectable-text">Which day?</span><div data-testid="poll-option-row-label-0"><span data-testid="selectable-text">Sat</span></div><div data-testid="poll-option-row-label-1"><span data-testid="selectable-text">Sun</span></div></div>')}
+      ${row('A4', '[9:44 pm, 08/10/2026] Asha: ', '<div data-testid="image-thumb"></div><span data-testid="image-caption">Menu</span>')}
+      ${row('A5', '[9:45 pm, 08/10/2026] Ravi: ', '<div data-testid="quoted-message"><span data-testid="selectable-text">Dinner at 8?</span></div><span data-testid="selectable-text">Make it 8:30</span>')}
+      ${row('A6', '[9:46 pm, 08/10/2026] Ravi: ', '<div data-testid="image-thumb"></div>')}
+      ${row('A7', '[9:47 pm, 08/10/2026] Ravi: ', '<span data-testid="selectable-text"> </span>')}
+    </div>`, { runScripts: 'outside-only' });
+    // jsdom has no layout, so innerText is textContent here.
+    Object.defineProperty(dom.window.HTMLElement.prototype, 'innerText', { get() { return this.textContent; } });
+    const view = parseWhatsAppView(dom.window.eval(WHATSAPP_READER) as string);
+    expect(view).toMatchObject({ chat: 'Family', group: true });
+    expect(view.messages.map(m => [m.id, m.author, m.kind, m.outgoing, m.text])).toEqual([
+      ['A1', 'Asha', 'text', false, 'Dinner at 8?'],
+      ['A2', 'Me', 'text', true, 'Yes, booked'],
+      ['A3', 'Ravi', 'poll', false, 'Which day?\nOptions: Sat | Sun'],
+      ['A4', 'Asha', 'image', false, 'Menu'],
+      ['A5', 'Ravi', 'text', false, 'Make it 8:30'],
+      ['A6', 'Ravi', 'image', false, ''],
+    ]);
+    expect(view.messages[0].at).toBe('9:41 pm, 08/10/2026');
+    expect(view.messages[4].quoted).toBe('Dinner at 8?');
+    // No chat open: an empty view.
+    const list = new JSDOM('<div id="pane-side"></div>', { runScripts: 'outside-only' });
+    expect(parseWhatsAppView(list.window.eval(WHATSAPP_READER) as string)).toEqual({ chat: '', group: false, messages: [] });
+    expect(parseWhatsAppView('not json')).toEqual({ chat: '', group: false, messages: [] });
+  });
+
+  it('emits each new message once, keyed by its id, and skips ones already stored', async () => {
+    const http = await import('node:http');
+    const { WebSocketServer } = await import('ws');
+    const { createBrowserMonitor, whatsAppMessageUrl } = await import('./browser-monitor.js');
+    let view = { chat: 'Family', group: true, messages: [
+      { id: 'A1', at: '9:41 pm, 08/10/2026', author: 'Asha', text: 'Dinner at 8?', kind: 'text', outgoing: false },
+      { id: 'A2', at: '9:42 pm, 08/10/2026', author: 'Me', text: 'Yes, booked', kind: 'text', outgoing: true },
+    ] };
+    const server = http.createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(req.url === '/json/list' ? [{ type: 'page', id: 'wa', url: 'https://web.whatsapp.com/', title: '(3) WhatsApp', webSocketDebuggerUrl: `ws://127.0.0.1:${(server.address() as any).port}/devtools/page/wa` }] : {}));
+    });
+    const wss = new WebSocketServer({ server });
+    wss.on('connection', socket => socket.on('message', raw => {
+      const msg = JSON.parse(String(raw));
+      const value = msg.params.expression === 'document.readyState' ? 'complete' : JSON.stringify(view);
+      socket.send(JSON.stringify({ id: msg.id, result: { result: { value } } }));
+    }));
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const stored = new Set([whatsAppMessageUrl('A1')]);
+      const items: any[] = [];
+      const m = createBrowserMonitor({ cdpEndpoint: `http://127.0.0.1:${(server.address() as any).port}`, hasCaptured: url => stored.has(url) });
+      m.onWorkItem(item => items.push(item));
+      await m.pollOnce();
+      expect(items.map(item => item.url)).toEqual([whatsAppMessageUrl('A2')]);
+      expect(items[0]).toMatchObject({ type: 'whatsapp_message', title: 'Family', metadata: { chatType: 'group', author: 'Me', direction: 'sent', whatsappMessageId: 'A2' } });
+      expect(items[0].content).toBe('Chat: Family (group)\n\n[9:42 pm, 08/10/2026] Me (me): Yes, booked');
+      // Same view again: nothing new. A new message: only it.
+      await m.pollOnce();
+      view = { ...view, messages: [...view.messages, { id: 'A3', at: '9:50 pm, 08/10/2026', author: 'Asha', text: 'Great', kind: 'text', outgoing: false }] };
+      await m.pollOnce();
+      expect(items.map(item => item.metadata.whatsappMessageId)).toEqual(['A2', 'A3']);
+    } finally {
+      wss.close();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+});
