@@ -1230,6 +1230,18 @@ async function main() {
       const stmt = db.prepare('SELECT 1 FROM work_items WHERE url = ? LIMIT 1');
       return (url: string) => Boolean(stmt.get(url));
     })(),
+    // A PDF tab is read from its file: a private temp copy, parsed, deleted.
+    readPdf: async (bytes) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-tab-pdf-'));
+      const file = path.join(dir, 'tab.pdf');
+      try {
+        fs.writeFileSync(file, bytes, { mode: 0o600 });
+        const parsed = documentParser.parseAsync ? await documentParser.parseAsync(file) : documentParser.parse(file);
+        return parsed.success ? parsed.text ?? '' : '';
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
   });
   // Once canonical GRASP mail sync is live, browser-scraped email is a noisier
   // duplicate of the same messages — suppress ALL browser email capture at the

@@ -35,7 +35,36 @@ export interface BrowserMonitorConfig {
    * each, keyed by message id, so a restart never stores them twice).
    */
   hasCaptured?: (url: string) => boolean;
+  /**
+   * Text of a PDF's bytes (BotBoy's document parser). A PDF tab shows Chrome's
+   * viewer, which has no page text, so the file itself is read.
+   */
+  readPdf?: (bytes: Buffer) => Promise<string>;
 }
+/** Largest PDF a browser tab capture downloads. */
+export const MAX_TAB_PDF_BYTES = 25 * 1024 * 1024;
+/** A tab showing a PDF: a .pdf address, or Chrome's PDF viewer frame inside it. */
+export function isPdfTab(tab: { url: string; frames: { url: string }[] }): boolean {
+  let pathname = '';
+  try { pathname = new URL(tab.url).pathname; } catch { return false; }
+  if (/\.pdf$/i.test(pathname)) return true;
+  return tab.frames.some((frame) => frame.url.startsWith('chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/'));
+}
+/**
+ * Fetches the tab's own PDF inside the page (the owner's cookies apply, so a
+ * signed-in PDF reads too) and returns it as base64, or '' past the size cap.
+ */
+const PDF_BYTES_READER = `(async function() {
+  try {
+    const r = await fetch(location.href, { credentials: 'include' });
+    if (!r.ok) return '';
+    const b = new Uint8Array(await r.arrayBuffer());
+    if (b.length > ${25 * 1024 * 1024} || b.length < 5) return '';
+    let s = '';
+    for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode.apply(null, b.subarray(i, i + 32768));
+    return btoa(s);
+  } catch (e) { return ''; }
+})()`;
 
 /** The capture URL of one WhatsApp message (its own WhatsApp id). */
 export function whatsAppMessageUrl(messageId: string): string {
@@ -625,11 +654,50 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     if (fresh.length) console.log(`📄 Captured [whatsapp_message] ${fresh.length} new in "${view.chat.slice(0, 40)}"`);
   }
 
+  /** PDF tab addresses already read this process (the store check covers restarts). */
+  const seenPdf = new Set<string>();
+
+  async function capturePdf(tab: TabInfo): Promise<void> {
+    if (!cfg.readPdf || seenPdf.has(tab.url)) return;
+    seenPdf.add(tab.url);
+    if (cfg.hasCaptured?.(tab.url)) return;
+    const base64 = await cdpEval(tab.webSocketDebuggerUrl, PDF_BYTES_READER, 30000).catch(() => '');
+    const bytes = Buffer.from(base64, 'base64');
+    if (bytes.length < 5 || bytes.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      seenPdf.delete(tab.url); // not loaded yet, or not a PDF: try next poll
+      return;
+    }
+    const content = (await cfg.readPdf(bytes).catch(() => '')).trim();
+    if (!content) {
+      console.log(`📄 PDF tab had no readable text: ${tab.url.slice(0, 100)}`);
+      return;
+    }
+    let title = tab.title;
+    if (!title || title.includes('/') ) {
+      try { title = decodeURIComponent(new URL(tab.url).pathname.split('/').pop() || tab.url); } catch { title = tab.url; }
+    }
+    emit({
+      type: 'website_visit',
+      source: 'browser',
+      sourceApp: 'Chrome',
+      url: tab.url,
+      title,
+      content,
+      metadata: { captureMode: 'passive_observation', contentKind: 'pdf', pdfBytes: String(bytes.length) },
+      capturedAt: new Date(),
+    });
+    console.log(`📄 Captured [pdf] ${title.slice(0, 60)} (${content.length} chars text, ${bytes.length} bytes)`);
+  }
+
   async function pollOnce(): Promise<void> {
     const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
     for (const tab of tabs) {
       if (/^https:\/\/web\.whatsapp\.com\//.test(tab.url)) {
         await captureWhatsApp(tab);
+        continue;
+      }
+      if (isPdfTab(tab)) {
+        await capturePdf(tab);
         continue;
       }
       const dynamic = isDynamicPage(tab.url);

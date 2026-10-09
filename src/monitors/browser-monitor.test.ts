@@ -300,3 +300,16 @@ describe('WhatsApp Web capture', () => {
     }
   });
 });
+
+import { isPdfTab } from './browser-monitor.js';
+
+describe('isPdfTab (PDF tabs are read from the file, 2026-10-09)', () => {
+  it('knows a .pdf address and Chrome\'s PDF viewer frame', () => {
+    expect(isPdfTab({ url: 'https://northorp.com/research/competitive-intelligence.pdf', frames: [] })).toBe(true);
+    expect(isPdfTab({ url: 'https://x.com/a.PDF?dl=1#page=2', frames: [] })).toBe(true);
+    expect(isPdfTab({ url: 'https://x.com/view?id=7', frames: [{ url: 'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html' }] })).toBe(true);
+    expect(isPdfTab({ url: 'https://x.com/pdf-guide', frames: [] })).toBe(false);
+    expect(isPdfTab({ url: 'https://x.com/a.pdf.html', frames: [] })).toBe(false);
+    expect(isPdfTab({ url: 'not a url', frames: [] })).toBe(false);
+  });
+});
