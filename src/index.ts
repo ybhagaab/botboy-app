@@ -6,6 +6,7 @@
  */
 
 import { AppUpdater } from './core/app-update.js';
+import { createKeepAwake } from './core/keep-awake.js';
 import express from 'express';
 import http from 'node:http';
 import path from 'path';
@@ -1689,6 +1690,8 @@ async function main() {
   // ETL watches resume from SQLite; a finished run continues its job in chat.
   continuationRunner.start();
   whatsAppChat.start();
+  // Keep the Mac awake while a turn runs or a job is active (keep-awake.ts).
+  createKeepAwake({ busy: () => chatContinuations.isTurnActive() || Boolean(chatJobs.activeJob()) }).start();
   etlRunWatcher.start();
   const activeJob = chatJobs.activeJob();
   console.log(`✅ ETL run watcher active (every 30 s${activeJob ? `; job ${activeJob.id} has ${chatJobs.watchesForJob(activeJob.id).filter(watch => watch.status === 'pending').length} run(s) pending` : ''})`);

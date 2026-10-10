@@ -1105,6 +1105,17 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders();
+      // Turn-wide heartbeat: a long model call or tool can be silent for
+      // minutes, and an HTTP client's idle timeout (Node fetch: 300 s body
+      // timeout, used by the WhatsApp bridge) then closes the stream, which
+      // aborts the turn as "client disconnected" (owner report 2026-10-10).
+      const turnHeartbeat = setInterval(() => {
+        if (res.writableEnded) return;
+        try { res.write(`: ping ${Date.now()}\n\n`); } catch { /* closed */ }
+      }, 20_000);
+      turnHeartbeat.unref?.();
+      res.once('close', () => clearInterval(turnHeartbeat));
+      res.once('finish', () => clearInterval(turnHeartbeat));
 
       const db = deps.db;
       // A continuation's trigger is BotBoy's, not the owner's: it goes to the

@@ -134,7 +134,7 @@ export function replyChunks(text: string, size = REPLY_CHUNK_CHARS, max = MAX_RE
 
 /** What the model is told about a turn that came from WhatsApp. */
 export function whatsAppTurnMessage(request: string): string {
-  return `${request}\n\n[Sent from WhatsApp on the owner's phone. Your final reply is sent back to them on WhatsApp automatically: keep it short and readable on a phone, no tables. BotBoy pages on the laptop cannot be opened from the phone, so put the answer itself in the reply. To share a screenshot (ui_screenshot of the BotBoy route), an exported document, or another file, call whatsapp_send with to: "me", ownerRequested: true, and attachments, then say in your reply what you sent. A SharePoint link can go in the reply itself.]`;
+  return `${request}\n\n[Sent from WhatsApp on the owner's phone. Your final reply is sent back to them on WhatsApp automatically: keep it short and readable on a phone, no tables. BotBoy pages on the laptop cannot be opened from the phone, so put the answer itself in the reply. To share a screenshot (ui_screenshot of the BotBoy route), an exported document, or another file, call whatsapp_send with to: "me", ownerRequested: true, and attachments, then say in your reply what you sent. A SharePoint link can go in the reply itself. This is a live owner turn, exactly like the laptop chat: every tool is available, including browser_hands click, type, select, and key on the tabs you opened, run_command, and files. Keep working the job; the phone only changes where your reply goes.]`;
 }
 
 export interface WhatsAppChatBridge {
