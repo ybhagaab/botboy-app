@@ -5,6 +5,7 @@
  * Starts the Express API server and all background monitors.
  */
 
+import { AppUpdater } from './core/app-update.js';
 import express from 'express';
 import http from 'node:http';
 import path from 'path';
@@ -1561,6 +1562,9 @@ async function main() {
   // in chat-attachments.ts ≈ 11MB base64). Localhost single-owner app — the
   // parser limit is not a security boundary here; the store enforces its own.
   app.use(express.json({ limit: '16mb' }));
+  // In-app update (botboy-app installs only; dev checkouts report unsupported).
+  const appUpdater = new AppUpdater({ projDir: process.cwd() });
+  appUpdater.start();
   const routerDeps = {
     nodeManager,
     chatInterface,
@@ -1615,6 +1619,7 @@ async function main() {
     captureHealth,
     chatJobs,
     chatContinuations,
+    appUpdater,
   };
   app.use('/api', createRouter(routerDeps));
 

@@ -9636,3 +9636,55 @@ window.BotBoyDashboard = { refresh: () => loadCore(), go };
 // list from here so the two can never drift out of sync.
 window.botboyProjectLinkIndex = () => state.projects.map(project => ({ id: project.id, title: project.title }));
 initialize();
+
+// In-app update (botboy-app installs). The button appears only when the
+// release repo has commits this install lacks. Clicking launches the
+// detached `./start.sh --update`; BotBoy then closes and restarts, and the
+// bootId change on the version poll reloads this tab.
+(function initAppUpdate() {
+  const button = document.getElementById('app-update-button');
+  if (!button) return;
+  let updating = false;
+  const ICON = '<svg class="uc-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const paint = (mode, text) => {
+    button.classList.toggle('is-available', mode === 'available');
+    button.classList.toggle('is-updating', mode === 'updating');
+    const label = mode === 'updating' ? '<span class="uc-dots">Updating</span>' : `<span>${text}</span>`;
+    button.innerHTML = `${ICON}${label}<span class="uc-bar" aria-hidden="true"></span>`;
+    button.setAttribute('aria-label', mode === 'updating' ? 'Updating BotBoy' : text);
+  };
+  const render = (status) => {
+    if (updating) return;
+    const show = Boolean(status?.supported && (status.available || status.updating));
+    button.hidden = !show;
+    if (!show) return;
+    if (status.updating) {
+      button.disabled = true;
+      paint('updating');
+      return;
+    }
+    button.disabled = false;
+    const count = Number(status.behind || 0);
+    paint('available', count > 1 ? `Update available (${count})` : 'Update available');
+    button.title = status.latestSubject ? `Latest: ${status.latestSubject}` : 'A new BotBoy release is available';
+  };
+  const refresh = async () => {
+    try { render(await request('/app-update/status')); } catch {}
+  };
+  button.addEventListener('click', async () => {
+    if (updating) return;
+    updating = true;
+    button.disabled = true;
+    paint('updating');
+    try {
+      const result = await request('/app-update/start', { method: 'POST', body: {} });
+      toast(result?.message || 'Updating. BotBoy will restart on its own.');
+    } catch (error) {
+      updating = false;
+      toast(`Update did not start: ${error.message}`, 'bad');
+      void refresh();
+    }
+  });
+  void refresh();
+  setInterval(refresh, 5 * 60_000);
+})();

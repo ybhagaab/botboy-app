@@ -2040,3 +2040,28 @@ a.data-room-row:hover { background:var(--hover); }
 .analytics-widget.has-issues{border-color:color-mix(in srgb,var(--yellow) 55%,var(--border))}
 .analytics-issue-cell button{color:var(--yellow)!important}
 .analytics-issue-flash{box-shadow:0 0 0 3px color-mix(in srgb,var(--yellow) 70%,transparent);transition:box-shadow .3s}
+
+.topbar-actions:has(.update-chip:not([hidden])) { min-width:max-content; }.command-trigger kbd { white-space:nowrap; flex:0 0 auto; }
+.update-chip { --uc:var(--accent, #6d5bd0); position:relative; overflow:hidden; isolation:isolate; flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; padding:6px 12px 6px 9px; border:1px solid var(--uc); border-radius:999px; background:color-mix(in srgb,var(--uc) 12%,transparent); color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; cursor:pointer; transition:transform .15s ease, background .2s ease; }
+.update-chip[hidden] { display:none; }
+.update-chip:hover:not(:disabled) { transform:translateY(-1px); background:color-mix(in srgb,var(--uc) 20%,transparent); }
+.update-chip .uc-icon { width:14px; height:14px; flex:0 0 auto; }
+.update-chip .uc-bar { display:none; }
+/* Available: a soft pulsing halo, a light sweep across the pill, and a nudging arrow. */
+.update-chip.is-available { animation:uc-halo 2.4s ease-out infinite; }
+.update-chip.is-available::after { content:""; position:absolute; inset:0; z-index:-1; background:linear-gradient(110deg,transparent 30%,color-mix(in srgb,#fff 55%,transparent) 50%,transparent 70%); transform:translateX(-120%); animation:uc-sweep 3.2s ease-in-out infinite; }
+.update-chip.is-available .uc-icon { animation:uc-nudge 1.2s ease-in-out infinite; }
+@keyframes uc-halo { 0% { box-shadow:0 0 0 0 color-mix(in srgb,var(--uc) 45%,transparent); } 70% { box-shadow:0 0 0 9px transparent; } 100% { box-shadow:0 0 0 0 transparent; } }
+@keyframes uc-sweep { 0%,55% { transform:translateX(-120%); } 100% { transform:translateX(120%); } }
+@keyframes uc-nudge { 0%,100% { transform:translateY(-1px); } 50% { transform:translateY(2px); } }
+/* Updating: spinning ring plus a moving progress bar along the bottom edge. */
+.update-chip.is-updating { cursor:progress; }
+.update-chip.is-updating .uc-icon { border:2px solid color-mix(in srgb,var(--uc) 25%,transparent); border-top-color:var(--uc); border-radius:50%; box-sizing:border-box; animation:uc-spin .8s linear infinite; }
+.update-chip.is-updating .uc-icon path { display:none; }
+.update-chip.is-updating .uc-bar { display:block; position:absolute; left:0; right:0; bottom:0; height:3px; background:color-mix(in srgb,var(--uc) 18%,transparent); }
+.update-chip.is-updating .uc-bar::before { content:""; position:absolute; top:0; bottom:0; width:40%; border-radius:3px; background:linear-gradient(90deg,var(--uc),color-mix(in srgb,var(--uc) 40%,#fff)); animation:uc-progress 1.4s ease-in-out infinite; }
+.update-chip.is-updating .uc-dots::after { content:""; display:inline-block; width:1.2em; text-align:left; animation:uc-dots 1.2s steps(4,end) infinite; }
+@keyframes uc-spin { to { transform:rotate(360deg); } }
+@keyframes uc-progress { 0% { left:-40%; } 100% { left:100%; } }
+@keyframes uc-dots { 0% { content:""; } 25% { content:"."; } 50% { content:".."; } 75%,100% { content:"..."; } }
+@media (prefers-reduced-motion: reduce) { .update-chip, .update-chip *, .update-chip::after, .update-chip .uc-bar::before { animation:none !important; } }

@@ -129,6 +129,8 @@ export interface RouterDeps {
   storageUsage?: StorageUsageService;
   /** Outcome-level capture health per source (Slack, SharePoint, Outlook). */
   captureHealth?: CaptureHealth;
+  /** In-app update for botboy-app installs (app-update.ts). */
+  appUpdater?: import('../../core/app-update.js').AppUpdater;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
   chatJobs?: ChatJobStore;
   /** Continuation turns: secret, live hub, runner (chat-continuations.ts). */

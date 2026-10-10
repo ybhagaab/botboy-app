@@ -36,6 +36,7 @@ import { createVisualAssetsRouter } from './routers/visual-assets.js';
 import { createLlmUsageRouter } from './routers/llm-usage.js';
 import { createAiModelRouter } from './routers/ai-model.js';
 import { createCaptureHealthRouter } from './routers/capture-health.js';
+import { createAppUpdateRouter } from './routers/app-update.js';
 
 export type { RouterDeps } from './routers/deps.js';
 
@@ -62,6 +63,7 @@ export function createRouter(deps: RouterDeps): Router {
       : undefined,
   ));
   router.use(createCaptureHealthRouter(deps));
+  router.use(createAppUpdateRouter(deps));
   router.use(createFilesRouter(deps));
   router.use(createAgentRouter(deps));
   router.use(createSlackRouter(deps));
