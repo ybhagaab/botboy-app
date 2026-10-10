@@ -123,13 +123,13 @@ export function createVisionOcrEngine(config?: VisionOcrConfig): OcrEngine {
       const tmp = mkdtempSync(path.join(os.tmpdir(), 'ppt-ocr-pdf-'));
       try {
         try {
-          await execFileP(helperPath, ['pdf-rasterize', pdfPath, tmp, '150'], {
+          await execFileP(helperPath, ['pdf-rasterize', pdfPath, tmp, '300'], {
             timeout: 120000,
             maxBuffer: 1024 * 1024,
           });
         } catch {
           // Native rasterize failed — try poppler if present (optional).
-          await execFileP('pdftoppm', ['-png', '-r', '150', pdfPath, path.join(tmp, 'page')], {
+          await execFileP('pdftoppm', ['-png', '-r', '300', pdfPath, path.join(tmp, 'page')], {
             timeout: 120000,
           });
         }

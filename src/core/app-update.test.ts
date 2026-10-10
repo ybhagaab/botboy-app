@@ -71,6 +71,20 @@ describe('app update', () => {
     expect(u.status().updating).toBe(true);
   });
 
+  it('a failed update clears Updating and reports the log', async () => {
+    const projDir = tmp(); const dataDir = tmp();
+    fs.writeFileSync(path.join(projDir, 'start.sh'), '#!/bin/bash\n');
+    let onExit: ((code: number | null) => void) | undefined;
+    const u = new AppUpdater({ projDir, dataDir, git: fakeGit('https://github.com/ybhagaab/botboy-app.git', 'a', 'b', 1),
+      spawner: () => ({ unref() {}, on: (_e: 'exit', l: (code: number | null) => void) => { onExit = l; } }) });
+    await u.check();
+    u.startUpdate();
+    expect(u.status().updating).toBe(true);
+    onExit?.(1);
+    expect(u.status().updating).toBe(false);
+    expect(u.status().error).toMatch(/exit 1/);
+  });
+
   it('detached options put the child in its own session', () => {
     const o = detachedUpdateOptions('/x', 9);
     expect(o).toMatchObject({ cwd: '/x', detached: true, stdio: ['ignore', 9, 9] });

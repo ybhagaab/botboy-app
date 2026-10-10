@@ -31,7 +31,7 @@ export interface AppUpdateStatus {
 }
 
 export type GitRunner = (args: string[], cwd: string) => Promise<string>;
-export type Spawner = (cmd: string, args: string[], opts: SpawnOptions) => { pid?: number; unref(): void };
+export type Spawner = (cmd: string, args: string[], opts: SpawnOptions) => { pid?: number; unref(): void; on?(event: 'exit', listener: (code: number | null) => void): unknown };
 
 const defaultGit: GitRunner = (args, cwd) => new Promise((resolve, reject) => {
   execFile('git', args, { cwd, timeout: 60_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (err, stdout, stderr) => {
@@ -90,7 +90,7 @@ export class AppUpdater {
     this.logDir = path.join(opts.dataDir ?? path.join(os.homedir(), '.personal-productivity-tracker'), 'logs');
     this.git = opts.git ?? defaultGit;
     this.spawner = opts.spawner ?? defaultSpawn;
-    this.intervalMs = opts.intervalMs ?? 30 * 60_000;
+    this.intervalMs = opts.intervalMs ?? 10 * 60_000;
     this.onChange = opts.onChange;
   }
 
@@ -99,7 +99,7 @@ export class AppUpdater {
   /** First check shortly after boot, then every interval. Never throws. */
   start(): void {
     if (this.timer) return;
-    const first = setTimeout(() => { void this.check(); }, 60_000);
+    const first = setTimeout(() => { void this.check(); }, 10_000);
     first.unref?.();
     this.timer = setInterval(() => { void this.check(); }, this.intervalMs);
     this.timer.unref?.();
@@ -146,6 +146,15 @@ export class AppUpdater {
     const fd = fs.openSync(logPath, 'a');
     try {
       const child = this.spawner('/bin/bash', [script, '--update'], detachedUpdateOptions(this.projDir, fd));
+      // A successful update restarts BotBoy, so this process never sees the
+      // exit. If the updater ends while BotBoy still runs, it failed or was
+      // refused: clear "Updating…" and show the log instead of a stuck button.
+      child.on?.('exit', (code) => {
+        this.state = { ...this.state, updating: false,
+          error: code === 0 ? null : `The update stopped (exit ${code ?? 'signal'}). See ${logPath}.` };
+        this.onChange?.();
+        void this.check();
+      });
       child.unref();
     } catch (err) {
       return { ok: false, code: 'update_spawn_failed', error: `Could not start the update: ${(err as Error).message}` };

@@ -1341,6 +1341,15 @@ if [ "$DOCTOR" = "1" ]; then
   echo "checkout-mode: $([ "$BOTBOY_RELEASE_CHECKOUT" = "1" ] && echo 'teammate release (customizations supported)' || echo 'development')"
   TRACKED_DIRTY_COUNT=$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
   echo "tracked local changes: ${TRACKED_DIRTY_COUNT:-unknown}$([ "${TRACKED_DIRTY_COUNT:-0}" != "0" ] && echo ' — run ./start.sh --update before pulling' || true)"
+  if [ "$BOTBOY_RELEASE_CHECKOUT" = "1" ]; then
+    DOCTOR_HEAD="$(git -C "$PROJ_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if git -C "$PROJ_DIR" fetch --quiet origin main 2>/dev/null; then
+      DOCTOR_BEHIND="$(git -C "$PROJ_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+      echo "release: $DOCTOR_HEAD; $DOCTOR_BEHIND newer release(s) on botboy-app$([ "$DOCTOR_BEHIND" != "0" ] && echo ' — click Update in BotBoy or run ./start.sh --update' || true)"
+    else
+      echo "release: $DOCTOR_HEAD; could not reach botboy-app to check for updates"
+    fi
+  fi
   if [ -f "$PROJ_DIR/scripts/recover-shutdown.mjs" ]; then
     PPT_STARTUP_SAFETY_BLOCK="$STARTUP_SAFETY_BLOCK" \
     PPT_SHUTDOWN_RECEIPT_DIR="$SHUTDOWN_RECEIPT_DIR" \
@@ -1613,6 +1622,16 @@ if [ -n "$MISSING_DEPS" ]; then
   fi
 fi
 
+# The OCR helper is compiled locally from native/vision-ocr/main.swift. An
+# update that changes the source must rebuild it, or the old helper keeps
+# running (npm install is the only other trigger). Needs Xcode CLT; a failure
+# keeps the existing helper.
+OCR_SRC="$PROJ_DIR/native/vision-ocr/main.swift"
+OCR_BIN="$PROJ_DIR/native/vision-ocr/bin/vision-ocr"
+if [ -f "$OCR_SRC" ] && command -v swiftc >/dev/null 2>&1 && { [ ! -x "$OCR_BIN" ] || [ "$OCR_SRC" -nt "$OCR_BIN" ]; }; then
+  echo "ℹ  Rebuilding the OCR helper" | tee -a "$LOG_FILE"
+  (cd "$PROJ_DIR" && node scripts/bootstrap-deps.mjs >> "$LOG_FILE" 2>&1) || echo "⚠  OCR helper rebuild failed — see $LOG_FILE" | tee -a "$LOG_FILE"
+fi
 # An unresolved shutdown guard blocks every replacement start. Report it now,
 # with its next step, instead of after the build.
 startup_safety_allows_takeover || exit 1

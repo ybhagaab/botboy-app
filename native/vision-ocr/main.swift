@@ -18,7 +18,7 @@
 //
 //   vision-ocr pdf-rasterize <pdfPath> <outDir> [dpi]
 //     Render each page to PNG (page-001.png, ...) via CoreGraphics for OCR of
-//     scanned PDFs. Default 150 DPI. Prints JSON: { "pages": N }
+//     scanned PDFs. Default 300 DPI. Prints JSON: { "pages": N }
 //
 // Exit codes: 0 success (even if zero text), 2 usage error, 3 input load
 // failure, 4 processing failure. Errors also print a JSON object with an
@@ -51,6 +51,7 @@ func printJSON(_ obj: [String: Any]) -> Never {
 
 // ── Mode: image OCR (default, byte-compatible with the original helper) ──
 
+
 func runImageOcr(_ imagePath: String) -> Never {
     guard let dataProvider = CGDataProvider(filename: imagePath),
           let source = CGImageSourceCreateWithDataProvider(dataProvider, nil),
@@ -61,7 +62,19 @@ func runImageOcr(_ imagePath: String) -> Never {
 
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
-    request.usesLanguageCorrection = true
+    // No language correction: it "fixes" names, ID numbers and passport codes
+    // toward dictionary words (Mariia read as Marija, 2026-10-10). Literal
+    // text matters more here than prose polish.
+    request.usesLanguageCorrection = false
+    // Read Cyrillic, Chinese, etc. too, not only English (Russian diploma and
+    // birth certificate scans). Explicit list first, then auto-detect.
+    if #available(macOS 13.0, *) {
+        request.automaticallyDetectsLanguage = true
+        if let supported = try? request.supportedRecognitionLanguages() {
+            let wanted = ["en-US", "ru-RU", "uk-UA", "de-DE", "fr-FR", "es-ES", "it-IT", "pt-BR", "zh-Hans", "zh-Hant", "ja-JP", "ko-KR"]
+            request.recognitionLanguages = wanted.filter { supported.contains($0) }
+        }
+    }
 
     let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
     do {
@@ -184,7 +197,7 @@ case "pdf-text":
     runPdfText(args[2])
 case "pdf-rasterize":
     guard args.count >= 4 else { fail(2, "usage: vision-ocr pdf-rasterize <pdfPath> <outDir> [dpi]") }
-    let dpi = args.count >= 5 ? (Double(args[4]) ?? 150.0) : 150.0
+    let dpi = args.count >= 5 ? (Double(args[4]) ?? 300.0) : 300.0
     runPdfRasterize(args[2], args[3], dpi: min(max(dpi, 72), 300))
 case let imagePath:
     runImageOcr(imagePath)

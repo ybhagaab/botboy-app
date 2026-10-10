@@ -9685,6 +9685,8 @@ initialize();
       void refresh();
     }
   });
+  // The server's first check runs 10 s after boot; ask again soon after, then every minute.
   void refresh();
-  setInterval(refresh, 5 * 60_000);
+  setTimeout(refresh, 15_000);
+  setInterval(refresh, 60_000);
 })();
