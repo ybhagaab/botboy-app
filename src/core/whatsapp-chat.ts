@@ -79,14 +79,20 @@ export interface SelfInbox {
   messages?: Array<{ id: string; t: number; body: string }>;
 }
 
-interface ChatState { since: number; handled: string[] }
+interface ChatState {
+  since: number;
+  handled: string[];
+  /** The BotBoy chat (number) that got the how-to message; once per chat. */
+  welcomed?: string;
+}
 
 function readState(db: Database.Database): ChatState | null {
   const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(WHATSAPP_CHAT_STATE_KEY) as { value: string } | undefined;
   if (!row) return null;
   try {
     const parsed = JSON.parse(row.value);
-    return typeof parsed?.since === 'number' && Array.isArray(parsed.handled) ? parsed : null;
+    if (typeof parsed?.since !== 'number' || !Array.isArray(parsed.handled)) return null;
+    return { since: parsed.since, handled: parsed.handled, ...(typeof parsed.welcomed === 'string' ? { welcomed: parsed.welcomed } : {}) };
   } catch {
     return null;
   }
@@ -94,7 +100,7 @@ function readState(db: Database.Database): ChatState | null {
 
 function writeState(db: Database.Database, state: ChatState): void {
   db.prepare("INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
-    .run(WHATSAPP_CHAT_STATE_KEY, JSON.stringify({ since: state.since, handled: state.handled.slice(-HANDLED_KEEP) }));
+    .run(WHATSAPP_CHAT_STATE_KEY, JSON.stringify({ since: state.since, handled: state.handled.slice(-HANDLED_KEEP), ...(state.welcomed ? { welcomed: state.welcomed } : {}) }));
 }
 
 /** The request without its @botboy mention. */
@@ -132,6 +138,25 @@ export function replyChunks(text: string, size = REPLY_CHUNK_CHARS, max = MAX_RE
   return chunks;
 }
 
+/**
+ * Sent once to the BotBoy chat when WhatsApp is first connected (or the
+ * BotBoy chat changes), so the owner knows how to use it from the phone.
+ * It carries REPLY_PREFIX, so the reader never treats it as a request.
+ */
+export function welcomeMessage(self: boolean): string {
+  const where = self ? 'this chat (your own "Message yourself" chat)' : 'this chat';
+  return [
+    'BotBoy is connected to WhatsApp.',
+    '',
+    `To ask BotBoy something from your phone, write a message in ${where} that starts with @botboy, for example:`,
+    '@botboy what needs my attention today?',
+    '@botboy send me the latest version of my CV',
+    '',
+    'BotBoy replies here, in this chat. It can use everything it can use on your laptop: your projects, files, email, and the browser.',
+    'Messages without @botboy are ignored.',
+    'BotBoy reads WhatsApp only while your laptop is on and WhatsApp Web is open in BotBoy\u2019s Chrome window.',
+  ].join('\n');
+}
 /** What the model is told about a turn that came from WhatsApp. */
 export function whatsAppTurnMessage(request: string): string {
   return `${request}\n\n[Sent from WhatsApp on the owner's phone. Your final reply is sent back to them on WhatsApp automatically: keep it short and readable on a phone, no tables. BotBoy pages on the laptop cannot be opened from the phone, so put the answer itself in the reply. To share a screenshot (ui_screenshot of the BotBoy route), an exported document, or another file, call whatsapp_send with to: "me", ownerRequested: true, and attachments, then say in your reply what you sent. A SharePoint link can go in the reply itself. This is a live owner turn, exactly like the laptop chat: every tool is available, including browser_hands click, type, select, and key on the tabs you opened, run_command, and files. Keep working the job; the phone only changes where your reply goes.]`;
@@ -166,6 +191,7 @@ export function createWhatsAppChatBridge(deps: {
   const log = deps.log ?? ((line: string) => console.log(line));
   let timer: ReturnType<typeof setInterval> | null = null;
   let running = false;
+  let welcomeRetryAt = 0;
 
   async function reply(inbox: SelfInbox, text: string, requestId: string): Promise<void> {
     if (!inbox.number) return;
@@ -194,6 +220,23 @@ export function createWhatsAppChatBridge(deps: {
         inbox = JSON.parse(String(await page.evaluate(selfInboxReader(state.since - 5, settings.chatNumber)) ?? 'null'));
       } catch {
         inbox = null;
+      }
+      if (inbox?.ok && inbox.number && state.welcomed !== inbox.number && now() >= welcomeRetryAt) {
+        // An install that already answered requests knows how: mark it, no message.
+        if (state.handled.length > 0 && state.welcomed === undefined) {
+          state.welcomed = inbox.number;
+          writeState(deps.db, state);
+        } else {
+          try {
+            await reply(inbox, welcomeMessage(inbox.self !== false), `wa-welcome-${inbox.number}`);
+            state.welcomed = inbox.number;
+            writeState(deps.db, state);
+            log('💬 WhatsApp: sent the how-to message to the BotBoy chat');
+          } catch (error) {
+            welcomeRetryAt = now() + 10 * 60_000;
+            log(`⚠ WhatsApp how-to message failed (retrying in 10 min): ${(error as Error).message}`);
+          }
+        }
       }
       if (!inbox?.ok || !inbox.messages?.length) return;
       const next = inbox.messages.find(message => !state!.handled.includes(message.id));

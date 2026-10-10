@@ -2065,3 +2065,4 @@ a.data-room-row:hover { background:var(--hover); }
 @keyframes uc-progress { 0% { left:-40%; } 100% { left:100%; } }
 @keyframes uc-dots { 0% { content:""; } 25% { content:"."; } 50% { content:".."; } 75%,100% { content:"..."; } }
 @media (prefers-reduced-motion: reduce) { .update-chip, .update-chip *, .update-chip::after, .update-chip .uc-bar::before { animation:none !important; } }
+.chat-via-whatsapp { display:block; margin-bottom:4px; color:var(--muted); font-size:10.5px; font-weight:600; letter-spacing:.02em; }

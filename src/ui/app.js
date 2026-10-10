@@ -232,6 +232,40 @@ async function refreshAiModelReadiness() {
   try { observeAiModel(await api('/dashboard/version')); } catch {}
 }
 
+// ── WhatsApp tab (Connections → WhatsApp) ──
+// BotBoy on WhatsApp works only while WhatsApp Web is open in BotBoy's Chrome.
+// When the owner turned it on but the tab is closed, the chat panel says so,
+// with one button that opens it (owner request 2026-10-10).
+async function refreshWhatsAppNotice() {
+  const notice = document.getElementById('chat-whatsapp-notice');
+  if (!notice) return;
+  try {
+    const res = await fetch(`${API}/whatsapp/status`, { cache: 'no-store' });
+    if (!res.ok) { notice.hidden = true; return; }
+    const status = (await res.json())?.status;
+    notice.hidden = !(status && status.enabled && status.chrome && !status.tabOpen);
+  } catch { /* keep the last state */ }
+}
+function initWhatsAppNotice() {
+  const button = document.getElementById('chat-whatsapp-open');
+  button?.addEventListener('click', async () => {
+    button.disabled = true;
+    button.textContent = 'Opening…';
+    try {
+      const res = await fetch(`${API}/whatsapp/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        alert(detail?.nextAction || detail?.error || 'Could not open WhatsApp Web.');
+      }
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Open WhatsApp';
+      setTimeout(() => { void refreshWhatsAppNotice(); }, 1500);
+    }
+  });
+  void refreshWhatsAppNotice();
+  setInterval(() => { if (!document.hidden) void refreshWhatsAppNotice(); }, 30_000);
+}
 function initAiModelReadiness() {
   // Same-tab Settings save/remove: refresh immediately, not on the next poll.
   window.addEventListener('botboy:ai-model-changed', () => {
@@ -2212,8 +2246,16 @@ document.addEventListener('click', async (event) => {
   await fillMcpServerCard(card, note, failed);
 });
 
+// A request from the phone carries BotBoy's note to the model ("[Sent from
+// WhatsApp on the owner's phone. …]"). The owner sees their words and a
+// small "via WhatsApp" label, not the note.
+const WHATSAPP_NOTE_RE = /\n*\[Sent from WhatsApp on the owner's phone\.[\s\S]*\]\s*$/;
 function renderChatMsgInner(m) {
   let raw = m.content || '';
+  if (m.role === 'user' && WHATSAPP_NOTE_RE.test(raw)) {
+    raw = raw.replace(WHATSAPP_NOTE_RE, '').trim();
+    return `<span class="chat-via-whatsapp">via WhatsApp</span>${formatMarkdownContent(raw)}`;
+  }
   // Extract <think> content as reasoning
   let reasoning = m._reasoning || m.reasoning || '';
   const thinkMatch = raw.match(/<think>([\s\S]*?)<\/think>/);
@@ -4146,6 +4188,7 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
   initChatThinkingControl();
   initChatModelControl();
   initAiModelReadiness();
+  initWhatsAppNotice();
   initChatWidthControl();
   initChatAttachments();
   await Promise.all([
