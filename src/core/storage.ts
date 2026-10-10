@@ -253,6 +253,48 @@ function createSchema(db: Database.Database): void {
 
   // ── long documents read into project brains in parts (document-reads.ts) ──
   migrateDocumentReads(db);
+  // ── analytics html views (kind=html): last, after every analytics table change ──
+  migrateAnalyticsHtmlWidgetKind(db);
+}
+
+/**
+ * Lets analytics widgets be html views (kind='html', 2026-10-09). SQLite
+ * cannot alter a CHECK, so a table whose CHECK lacks 'html' is rebuilt from
+ * its own current definition (every column added by later migrations is
+ * kept), its rows copied as they are, and its indexes recreated. Foreign keys
+ * are off for the swap: dropping the old table must not cascade to bindings
+ * or controls that reference widgets.
+ */
+export function migrateAnalyticsHtmlWidgetKind(db: Database.Database): void {
+  const tables = ['analytics_widgets', 'analytics_run_widgets'];
+  const definitions = tables.map(name => ({
+    name,
+    sql: String((db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as { sql?: string } | undefined)?.sql || ''),
+  })).filter(table => table.sql && table.sql.includes("'visualization')") && !table.sql.includes("'html'"));
+  if (!definitions.length) return;
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      for (const { name, sql } of definitions) {
+        const indexes = (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").all(name) as Array<{ sql: string }>).map(row => row.sql);
+        const temp = `${name}_html_kind`;
+        const createSql = sql
+          .replace("'visualization')", "'visualization','html')")
+          .replace(new RegExp(`^CREATE TABLE\\s+(?:"?${name}"?)`, 'i'), `CREATE TABLE ${temp}`);
+        if (!createSql.startsWith(`CREATE TABLE ${temp}`)) throw new Error(`Unexpected ${name} definition; html widget kind not added`);
+        const columns = (db.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name: string }>).map(column => `"${column.name}"`).join(', ');
+        db.exec(createSql);
+        db.exec(`INSERT INTO ${temp} (${columns}) SELECT ${columns} FROM ${name}`);
+        db.exec(`DROP TABLE ${name}`);
+        db.exec(`ALTER TABLE ${temp} RENAME TO ${name}`);
+        for (const indexSql of indexes) db.exec(indexSql);
+      }
+    })();
+    const problems = db.pragma('foreign_key_check') as unknown[];
+    if (problems.length) throw new Error(`html widget kind migration left ${problems.length} foreign-key problem(s)`);
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
 }
 
 /**

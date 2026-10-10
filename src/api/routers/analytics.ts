@@ -1,3 +1,5 @@
+import { requireLocalOwnerUiRequest } from './local-owner.js';
+import { dashboardIssues, viewIssueReports } from '../../core/analytics-dashboard-issues.js';
 import { Router, Request, Response } from 'express';
 import { hasLiveMidwayCliSession } from '../../core/publish-harmony.js';
 import { DashboardPublicationError } from '../../core/analytics-publisher.js';
@@ -179,7 +181,21 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
     if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
     const dashboard = deps.analyticsService.getDashboard(paramStr(req.params.id));
     if (!dashboard) return res.status(404).json({ error: 'Dashboard not found' });
-    res.json({ dashboard });
+    res.json({ dashboard, issues: dashboardIssues(dashboard, viewIssueReports.get(dashboard.id)) });
+  });
+
+  // An html view's own checks (window.botboy.warn + BotBoy's page scan), as the
+  // owner's dashboard page last rendered them. Kept in memory only.
+  router.put('/analytics/dashboards/:id/widgets/:widgetId/view-issues', (req: Request, res: Response) => {
+    if (!deps.analyticsService) return res.status(503).json({ error: 'Analytics dashboards are unavailable' });
+    if (!requireLocalOwnerUiRequest(req, res, 'Reporting dashboard view issues', 'Open the dashboard in BotBoy.')) return;
+    const dashboard = deps.analyticsService.getDashboard(paramStr(req.params.id));
+    const widgetId = paramStr(req.params.widgetId);
+    if (!dashboard || !dashboard.widgets.some(widget => widget.id === widgetId && widget.kind === 'html')) {
+      return res.status(404).json({ error: 'No such html view on this dashboard' });
+    }
+    viewIssueReports.set(dashboard.id, widgetId, req.body?.issues);
+    return res.json({ issues: dashboardIssues(dashboard, viewIssueReports.get(dashboard.id)) });
   });
 
   router.patch('/analytics/dashboards/:id', (req: Request, res: Response) => {

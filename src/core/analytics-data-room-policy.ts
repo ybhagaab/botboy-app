@@ -728,9 +728,9 @@ export function evaluateAnalyticsCandidate(
     rejection(rejections, 'quality_error', `${qualityFailures.length} blocking quality assertion(s) failed.`);
   }
 
-  if (!contract.handling.allowedUses.includes(request.use)
-    || (request.use === 'local_answer' && !contract.handling.allowModelContext)
-    || (request.use === 'publication' && !contract.handling.allowPublication)) {
+  // Publication is never gated by dataset handling (owner directive 2026-10-10).
+  if (request.use !== 'publication' && (!contract.handling.allowedUses.includes(request.use)
+    || (request.use === 'local_answer' && !contract.handling.allowModelContext))) {
     rejection(rejections, 'handling_disallowed', `Handling policy does not permit ${request.use}.`);
   }
 

@@ -1847,6 +1847,9 @@ const MCP_SERVER_MARKER_RE = /\[\[mcp-server:(custom-[a-z0-9][a-z0-9-]{0,79})\]\
  */
 function hydrateChatCards(root) {
   if (!root) return;
+  // ```visual / ```svg / ```mermaid blocks become live sandboxed visuals
+  // (analytics-html-view.js); the source stays under "Show source".
+  window.BotBoyHtmlViews?.mountChatVisuals(root);
   const bubbles = root.classList?.contains('chat-msg') ? [root] : root.querySelectorAll('.chat-msg');
   for (const bubble of bubbles) {
     const html = bubble.innerHTML;

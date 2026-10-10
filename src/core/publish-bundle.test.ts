@@ -122,3 +122,51 @@ describe('renderDashboardBundle', () => {
     expect(require('fs').existsSync(path.join(target, 'assets', 'vega.min.js'))).toBe(true);
   });
 });
+
+/**
+ * HTML views in a published bundle (2026-10-10): Harmony serves
+ * `script-src 'self'; style-src 'self' 'nonce-…'`, so a view ships as its own
+ * same-origin page with its styles, scripts, and data as separate files.
+ */
+describe('html views in a published bundle', () => {
+  const page = {
+    id: 'widget_view', dashboardId: 'dash_1', position: 0, revision: 1, bindingRevision: 0, kind: 'html', title: 'Funnel page', subtitle: '',
+    preset: '', config: { html: '<style>.k{color:red}</style><div class="k" style="margin:4px">x</div><script>botboy.onData(d => { document.querySelector(".k").textContent = d.daily.rows.length; })</script><script src="https://evil.example/x.js"></script>', inputs: ['daily'], span: 12 },
+    result: { trust: 'local_static_content', columns: ['html'], rows: [['html view']], rowCount: 1, displayedRowCount: 1, refreshedAt: '2026-10-10T00:00:00.000Z' },
+  };
+  const data = {
+    id: 'widget_data', dashboardId: 'dash_1', position: 1, revision: 1, bindingRevision: 0, kind: 'table', title: 'Daily', subtitle: '',
+    preset: '', config: { key: 'daily', hidden: true },
+    result: { trust: 'local_verified_data', columns: ['day', 'n'], rows: [['2026-10-01', 3], ['2026-10-02', 5]], rowCount: 2, displayedRowCount: 2, refreshedAt: '2026-10-10T00:00:00.000Z' },
+  };
+
+  it('ships the page, its styles and scripts as files, its data, and frames it same-origin', () => {
+    const bundle = renderDashboardBundle(dashboard({ widgets: [page, data] as any }), '2026-10-10T01:00:00.000Z', { vendorDir });
+    const byPath = new Map(bundle.files.map(file => [file.path, String(file.content)]));
+    const view = byPath.get('assets/view-widget_view.html')!;
+    expect(view).toBeTruthy();
+    expect(view).toContain('<link rel="stylesheet" href="view-widget_view-1.css">');
+    expect(view).toContain('<script src="view-widget_view-1.js"></script>');
+    expect(view).not.toContain('evil.example');
+    expect(view).not.toMatch(/<script>(?!<)/); // no inline script left
+    expect(view).toContain("script-src 'self'");
+    expect(byPath.get('assets/view-widget_view-1.css')).toBe('.k{color:red}');
+    expect(byPath.get('assets/view-widget_view-1.js')).toContain('botboy.onData');
+    const dataFile = byPath.get('assets/view-widget_view-data.js')!;
+    expect(dataFile).toContain('"daily"');
+    expect(dataFile).toContain('{"day":"2026-10-01","n":3}');
+    expect(byPath.get('assets/view-runtime.js')).toContain('style.cssText');
+    const index = byPath.get('index.html')!;
+    expect(index).toContain('<iframe class="html-view-frame" src="assets/view-widget_view.html"');
+    expect(index).toContain("frame-src 'self'");
+    expect(index).toContain('Data behind this dashboard');
+    expect(index).not.toContain('sandbox=');
+  });
+
+  it('every view file is in the manifest, so a changed page changes the publication hash', () => {
+    const a = renderDashboardBundle(dashboard({ widgets: [page, data] as any }), '2026-10-10T01:00:00.000Z', { vendorDir });
+    const changed = { ...page, config: { ...page.config, html: page.config.html.replace('red', 'blue') } };
+    const b = renderDashboardBundle(dashboard({ widgets: [changed, data] as any }), '2026-10-10T01:00:00.000Z', { vendorDir });
+    expect(a.manifestSha256).not.toBe(b.manifestSha256);
+  });
+});

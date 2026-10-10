@@ -52,7 +52,7 @@ export interface DashboardBundle {
 const VENDOR_FILES = ['vega.min.js', 'vega-lite.min.js', 'vega-embed.min.js', 'vega-interpreter.js'] as const;
 
 /** Widget config keys that may travel into the artifact. Everything else is dropped. */
-const CONFIG_ALLOWLIST = ['spec', 'prefix', 'suffix', 'precision', 'text', 'labelColumn', 'valueColumn', 'xColumn', 'yColumn'] as const;
+const CONFIG_ALLOWLIST = ['spec', 'prefix', 'suffix', 'precision', 'text', 'labelColumn', 'valueColumn', 'xColumn', 'yColumn', 'key', 'hidden', 'inputs', 'span'] as const;
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -203,10 +203,159 @@ const RENDER_JS = `(function () {
     });
   }
 
+  // HTML view frames report their height; errors show under the frame.
+  window.addEventListener('message', function (event) {
+    var message = event.data;
+    if (!message || message.botboyHtmlView !== 1) return;
+    var frames = document.querySelectorAll('iframe.html-view-frame');
+    Array.prototype.forEach.call(frames, function (frame) {
+      if (frame.contentWindow !== event.source) return;
+      if (message.type === 'height' && isFinite(message.height)) frame.style.height = Math.min(8000, Math.max(120, message.height + 4)) + 'px';
+      if (message.type === 'error') {
+        var note = frame.parentNode.querySelector('.html-view-error');
+        if (!note) { note = document.createElement('div'); note.className = 'error html-view-error'; frame.parentNode.appendChild(note); }
+        note.textContent = 'This view hit a script error: ' + String(message.message || '');
+      }
+    });
+  });
+
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hydrate);
   else hydrate();
 })();
 `;
+
+// ── HTML views (kind=html) in a published bundle ──
+// Harmony serves the bundle under `script-src 'self'; style-src 'self'
+// 'nonce-…'` (header read live 2026-10-10). A view therefore ships as its own
+// same-origin page, assets/view-<id>.html, framed by index.html:
+//   - its inline <style>/<script> blocks become files beside it;
+//   - its data (the same rows BotBoy hands it locally) is a data file;
+//   - view-runtime.js provides window.botboy and copies style="" attributes
+//     into the CSSOM (CSP blocks attribute styles, not CSSOM writes).
+// Not sandboxed: a sandboxed (opaque-origin) frame would not carry the
+// viewer's Harmony sign-in, so its own page and assets would not load.
+
+const VIEW_RUNTIME_JS = `(function () {
+  'use strict';
+  var payload = window.BOTBOY_VIEW_DATA || { datasets: {}, theme: { mode: 'dark', colors: {} } };
+  var listeners = [];
+  function report(error) {
+    try { parent.postMessage({ botboyHtmlView: 1, type: 'error', message: String(error && error.message || error).slice(0, 300) }, '*'); } catch (e) {}
+  }
+  window.addEventListener('error', function (event) { report(event.error || event.message); });
+  window.addEventListener('unhandledrejection', function (event) { report(event.reason); });
+  var api = {
+    data: payload.datasets,
+    theme: payload.theme,
+    ready: Promise.resolve(payload.datasets),
+    // Warnings show inside BotBoy; a shared copy accepts the calls quietly.
+    warn: function () {},
+    clearWarnings: function () {},
+    onData: function (fn) {
+      listeners.push(fn);
+      Promise.resolve().then(function () { try { fn(api.data, api.theme); } catch (error) { report(error); } });
+    },
+  };
+  window.botboy = api;
+  var colors = payload.theme && payload.theme.colors || {};
+  var root = document.documentElement;
+  Object.keys(colors).forEach(function (name) { root.style.setProperty('--bb-' + name.replace(/([A-Z0-9])/g, '-$1').toLowerCase(), colors[name]); });
+  root.dataset.theme = payload.theme && payload.theme.mode || 'dark';
+  // style="" from markup or innerHTML: apply through the CSSOM.
+  var applied = new WeakMap();
+  function adopt(element) {
+    var text = element.getAttribute('style');
+    if (text == null || applied.get(element) === text) return;
+    element.style.cssText = text;
+    applied.set(element, element.getAttribute('style'));
+  }
+  function sweep(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.hasAttribute('style')) adopt(node);
+    var nested = node.querySelectorAll('[style]');
+    for (var i = 0; i < nested.length; i++) adopt(nested[i]);
+  }
+  new MutationObserver(function (records) {
+    records.forEach(function (record) {
+      if (record.type === 'attributes') adopt(record.target);
+      else Array.prototype.forEach.call(record.addedNodes, sweep);
+    });
+  }).observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ['style'] });
+  function size() {
+    var height = Math.ceil(Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0));
+    try { parent.postMessage({ botboyHtmlView: 1, type: 'height', height: height }, '*'); } catch (e) {}
+  }
+  document.addEventListener('DOMContentLoaded', function () { sweep(document.body); size(); });
+  window.addEventListener('load', size);
+  if (window.ResizeObserver) new ResizeObserver(size).observe(root);
+})();
+`;
+
+const VIEW_BASE_CSS = `:root{--bb-bg:#09090b;--bb-surface:#14141a;--bb-surface-2:#1a1a22;--bb-text:#f4f4f5;--bb-soft:#c9c9d1;--bb-muted:#9797a2;--bb-accent:#9d8cff;--bb-border:rgba(255,255,255,.1);--bb-good:#7fd6a4;--bb-warn:#f3ba63;--bb-bad:#f0777d;--bb-blue:#6faef5;color-scheme:dark}
+html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;line-height:1.45}
+`;
+
+/** The rows an html view reads, keyed like the live UI (config.key, else a title slug). */
+function viewDatasets(dashboard: AnalyticsDashboard, inputs: unknown): Record<string, unknown> {
+  const wanted = Array.isArray(inputs) && inputs.length ? new Set(inputs.map(String)) : null;
+  const out: Record<string, unknown> = {};
+  for (const widget of dashboard.widgets) {
+    if (widget.kind === 'html' || widget.kind === 'text') continue;
+    const key = typeof widget.config?.key === 'string' && widget.config.key
+      ? widget.config.key
+      : String(widget.title || widget.id).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48);
+    if (wanted && !wanted.has(key)) continue;
+    const columns = (widget.result?.columns ?? []).map(String);
+    const rows = widget.result?.rows ?? [];
+    const source = widget.config?.dataSource as Record<string, unknown> | undefined;
+    out[key] = {
+      title: widget.title,
+      subtitle: widget.subtitle ?? '',
+      columns,
+      rows: rows.map(row => Object.fromEntries(columns.map((column, index) => [column, (row as unknown[])?.[index] ?? null]))),
+      rowCount: Number(widget.result?.rowCount ?? rows.length),
+      shownRows: rows.length,
+      refreshedAt: widget.result?.refreshedAt ?? null,
+      error: widget.lastError ? 'The last refresh failed; these are the previous rows.' : null,
+      source: source
+        ? { kind: source.kind, datasetId: source.datasetId ?? null, versionId: (widget.result?.source as Record<string, unknown> | undefined)?.versionId ?? null }
+        : widget.sql ? { kind: 'warehouse_sql' } : null,
+    };
+  }
+  return out;
+}
+
+/** One html view as same-origin files: page, extracted styles/scripts, data. */
+function renderHtmlViewFiles(dashboard: AnalyticsDashboard, widget: AnalyticsWidget): BundleFile[] {
+  const base = `view-${widget.id}`;
+  const files: BundleFile[] = [];
+  let styleCount = 0;
+  let scriptCount = 0;
+  let body = String(widget.config?.html ?? '');
+  body = body.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (_whole, css: string) => {
+    styleCount += 1;
+    const name = `${base}-${styleCount}.css`;
+    files.push({ path: `assets/${name}`, content: css });
+    return `<link rel="stylesheet" href="${name}">`;
+  });
+  body = body.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (whole, attrs: string, code: string) => {
+    if (/\bsrc\s*=/i.test(attrs)) return ''; // only BotBoy's own runtime scripts load
+    const type = attrs.match(/\btype\s*=\s*(["'])(.*?)\1/i)?.[2]?.toLowerCase() ?? '';
+    if (type && !['text/javascript', 'application/javascript', 'module'].includes(type)) return whole;
+    scriptCount += 1;
+    const name = `${base}-${scriptCount}.js`;
+    files.push({ path: `assets/${name}`, content: code });
+    return `<script${type === 'module' ? ' type="module"' : ''} src="${name}"></script>`;
+  });
+  // The shared snapshot is dark (snapshot-render.ts › SNAPSHOT_CSS); views match it.
+  const data = { datasets: viewDatasets(dashboard, widget.config?.inputs), theme: { mode: 'dark', colors: {} } };
+  const json = JSON.stringify(data).replace(/</g, '\\u003c').replace(/-->/g, '--\\u003e');
+  files.push({ path: `assets/${base}-data.js`, content: `window.BOTBOY_VIEW_DATA = ${json};\n` });
+  const page = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data: blob:; font-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'"><title>${escapeHtml(widget.title)}</title><link rel="stylesheet" href="view-base.css"><script src="${base}-data.js"></script><script src="view-runtime.js"></script><script src="vega.min.js"></script><script src="vega-lite.min.js"></script><script src="vega-embed.min.js"></script><script src="vega-interpreter.js"></script></head><body>${body}</body></html>`;
+  files.push({ path: `assets/${base}.html`, content: page });
+  return files;
+}
 
 function renderWidgetShell(widget: AnalyticsWidget): string {
   let body = '<div class="empty">No successful result was available when this snapshot was created.</div>';
@@ -216,6 +365,10 @@ function renderWidgetShell(widget: AnalyticsWidget): string {
     if (widget.kind === 'bar') body = renderBars(widget);
     if (widget.kind === 'line') body = renderLine(widget);
     if (widget.kind === 'text') body = renderTextBody(widget);
+    // A model-designed page: its own same-origin file, framed here.
+    if (widget.kind === 'html') {
+      return `<article class="widget html-view"><iframe class="html-view-frame" src="assets/view-${escapeHtml(widget.id)}.html" title="${escapeHtml(widget.title)}" loading="eager"></iframe></article>`;
+    }
     if (widget.kind === 'visualization') {
       // Interactive chart hydrated by assets/render.js; the exact persisted
       // rows remain readable without JavaScript.
@@ -228,7 +381,7 @@ function renderWidgetShell(widget: AnalyticsWidget): string {
 function renderIndexHtml(dashboard: AnalyticsDashboard, snapshotCreatedAt: string): string {
   const refreshed = dashboard.lastRefreshedAt ? new Date(dashboard.lastRefreshedAt).toLocaleString() : 'Not refreshed';
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"><title>${escapeHtml(dashboard.title)}</title><link rel="stylesheet" href="assets/style.css"></head><body><main><header><span class="snapshot">Shared dashboard</span><h1>${escapeHtml(dashboard.title)}</h1>${dashboard.description ? `<p>${escapeHtml(dashboard.description)}</p>` : ''}<div class="meta"><span>Data refreshed: ${escapeHtml(refreshed)}</span><span>Published: ${escapeHtml(new Date(snapshotCreatedAt).toLocaleString())}</span><span>${dashboard.widgets.length.toLocaleString()} widgets</span></div></header><section class="grid">${dashboard.widgets.map(renderWidgetShell).join('')}</section><footer class="page-foot">Published by BotBoy from a local canonical dashboard. This copy updates only when republished. Query text, credentials, connection settings, and project identifiers are not included.</footer></main><script src="assets/vega.min.js"></script><script src="assets/vega-lite.min.js"></script><script src="assets/vega-embed.min.js"></script><script src="assets/vega-interpreter.js"></script><script src="assets/data.js"></script><script src="assets/render.js"></script></body></html>`;
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src data:; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"><title>${escapeHtml(dashboard.title)}</title><link rel="stylesheet" href="assets/style.css"></head><body><main><header><span class="snapshot">Shared dashboard</span><h1>${escapeHtml(dashboard.title)}</h1>${dashboard.description ? `<p>${escapeHtml(dashboard.description)}</p>` : ''}<div class="meta"><span>Data refreshed: ${escapeHtml(refreshed)}</span><span>Published: ${escapeHtml(new Date(snapshotCreatedAt).toLocaleString())}</span><span>${dashboard.widgets.filter(widget => widget.config?.hidden !== true).length.toLocaleString()} widgets</span></div></header><section class="grid">${dashboard.widgets.filter(widget => widget.config?.hidden !== true).map(renderWidgetShell).join('')}</section>${dashboard.widgets.some(widget => widget.config?.hidden === true) ? `<details class="hidden-data"><summary>Data behind this dashboard</summary><section class="grid">${dashboard.widgets.filter(widget => widget.config?.hidden === true).map(renderWidgetShell).join('')}</section></details>` : ''}<footer class="page-foot">Published by BotBoy from a local canonical dashboard. This copy updates only when republished. Query text, credentials, connection settings, and project identifiers are not included.</footer></main><script src="assets/vega.min.js"></script><script src="assets/vega-lite.min.js"></script><script src="assets/vega-embed.min.js"></script><script src="assets/vega-interpreter.js"></script><script src="assets/data.js"></script><script src="assets/render.js"></script></body></html>`;
 }
 
 /**
@@ -249,6 +402,11 @@ export function renderDashboardBundle(
     { path: 'assets/data.js', content: dataPayload(dashboard, snapshotCreatedAt) },
     { path: 'assets/render.js', content: RENDER_JS },
   ];
+  const views = dashboard.widgets.filter(widget => widget.kind === 'html');
+  if (views.length) {
+    files.push({ path: 'assets/view-runtime.js', content: VIEW_RUNTIME_JS }, { path: 'assets/view-base.css', content: VIEW_BASE_CSS });
+    for (const view of views) files.push(...renderHtmlViewFiles(dashboard, view));
+  }
   for (const name of VENDOR_FILES) {
     const filePath = path.join(vendorDir, name);
     if (!fs.existsSync(filePath)) {

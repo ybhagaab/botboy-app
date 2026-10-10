@@ -587,7 +587,12 @@ export function createCdpProvisionTransport(): ProvisionTransport {
       if (!isAllowedInternalOrigin(origin) || parsed.some(url => url.origin !== origin || url.username || url.password)) {
         throw new Error('artifact verification URLs must share one allowlisted HTTPS origin');
       }
-      return withInternalTab(origin, `${parsed[0].pathname}${parsed[0].search}`, async evaluate => {
+      // Fetch from a page that is not one of BotBoy's HTML files: those carry
+      // a meta CSP with no connect-src, which blocks every fetch from inside
+      // them ("Failed to fetch", live 2026-10-10). A script or style file has
+      // no meta CSP, only Harmony's own (connect-src 'self').
+      const landing = parsed.find(url => !/\.html?$/i.test(url.pathname) && !url.pathname.endsWith('/')) ?? parsed[0];
+      return withInternalTab(origin, `${landing.pathname}${landing.search}`, async evaluate => {
         const result = await evaluate(`
           Promise.all(${JSON.stringify(urls)}.map(async requestedUrl => {
             try {

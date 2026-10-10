@@ -1,3 +1,4 @@
+import { dashboardIssues, viewIssueReports } from './analytics-dashboard-issues.js';
 /**
  * Tool Executor — executes tool calls returned by the LLM.
  * Replaces kiro-cli's built-in bash/file tools with sandboxed, scoped operations.
@@ -951,7 +952,7 @@ export function createToolExecutor(
     const localActive = Boolean(localRun && (localRun.status === 'queued' || localRun.status === 'running'));
     const widgets = dashboard.widgets.map(widget => {
       const dataSource = isDataRoomRecord(widget.config?.dataSource) ? widget.config!.dataSource as Record<string, unknown> : undefined;
-      const source = widget.kind === 'text' ? 'text' : dataSource?.kind === 'data_room_query' ? 'data_room' : 'warehouse';
+      const source = widget.kind === 'text' || widget.kind === 'html' ? 'text' : dataSource?.kind === 'data_room_query' ? 'data_room' : 'warehouse';
       const state = source === 'text' ? 'static'
         : widget.lastError ? 'failed'
           : widget.result ? 'loaded'
@@ -3801,7 +3802,10 @@ export function createToolExecutor(
       const dashboardId = String(args.dashboardId ?? '').trim();
       if (!dashboardId) return 'Error: dashboardId required';
       const dashboard = analyticsService.getDashboard(dashboardId);
-      return dashboard ? JSON.stringify(dashboardForModel(dashboard, context), null, 1) : `Error: dashboard ${dashboardId} not found`;
+      if (!dashboard) return `Error: dashboard ${dashboardId} not found`;
+      // Warnings & issues the owner sees on the page (data checks + view checks).
+      const issues = dashboardIssues(dashboard, viewIssueReports.get(dashboard.id));
+      return JSON.stringify({ ...dashboardForModel(dashboard, context), issues }, null, 1);
     },
 
     create_analytics_dashboard: async (args, context) => {

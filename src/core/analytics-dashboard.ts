@@ -60,7 +60,19 @@ import {
 } from './data-room-tool-failure.js';
 import type { AnalyticsControlApplyInput, AnalyticsDatasetControlState } from './analytics-data-room-types.js';
 
-const WIDGET_KINDS = new Set<AnalyticsWidgetKind>(['metric', 'table', 'bar', 'line', 'text', 'visualization']);
+const WIDGET_KINDS = new Set<AnalyticsWidgetKind>(['metric', 'table', 'bar', 'line', 'text', 'visualization', 'html']);
+/**
+ * Widgets with no data source of their own: text, and html views (model-
+ * designed pages that read their sibling widgets' rows at render time).
+ */
+export function isStaticWidgetKind(kind: unknown): boolean {
+  return kind === 'text' || kind === 'html';
+}
+/** An html view's own markup, CSS, and script (sandboxed in the UI). */
+export const MAX_HTML_WIDGET_BYTES = 400 * 1024;
+const WIDGET_KEY_RE = /^[a-z][a-z0-9_]{0,47}$/;
+/** Rows a Data Room widget may carry (html views cut and filter them in the page). */
+export const MAX_DATA_ROOM_WIDGET_ROWS = 5000;
 const EDITABLE_DASHBOARD_STATUSES = new Set<AnalyticsDashboardStatus>(['draft', 'ready', 'refreshing', 'degraded', 'archived']);
 const LOCAL_WIDGET_CONCURRENCY = 4;
 const WAITING_FOR_DATA_PREFIX = '[WAITING_FOR_DATA] ';
@@ -75,9 +87,14 @@ const VEGA_LITE_MARKS = new Set([
   'arc', 'area', 'bar', 'circle', 'geoshape', 'line', 'point',
   'rect', 'rule', 'square', 'text', 'tick', 'trail',
 ]);
+/**
+ * Data and network stay out of authored specs. Expressions (calculate, expr,
+ * signals, string filters) are allowed since 2026-10-09: the UI and published
+ * bundles run them in Vega's AST interpreter, never as JavaScript.
+ */
 const FORBIDDEN_VEGA_KEYS = new Set([
-  '$schema', '__proto__', 'constructor', 'data', 'datasets', 'expr', 'href',
-  'prototype', 'signal', 'signals', 'url',
+  '$schema', '__proto__', 'constructor', 'data', 'datasets', 'href',
+  'prototype', 'url',
 ]);
 const EXTERNAL_VEGA_STRING_RE = /(?:\b(?:https?|data|javascript|file):|url\s*\(|^\/\/)/i;
 
@@ -189,7 +206,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * Validate the declarative Vega-Lite subset accepted for persisted widgets.
  * Query results are injected by the trusted UI at render time, so authored
- * specs cannot provide data, network locations, links, or expression code.
+ * specs cannot provide data, network locations, or links (expressions run in
+ * Vega's interpreter in the UI and in published bundles).
  */
 export function validateVisualizationSpec(value: unknown): Record<string, unknown> {
   if (!isPlainObject(value)) throw new Error('Visualization config.spec must be a plain object');
@@ -232,11 +250,8 @@ export function validateVisualizationSpec(value: unknown): Record<string, unknow
     for (const [key, child] of Object.entries(node)) {
       const normalizedKey = key.toLowerCase();
       const childPath = `${path}.${key}`;
-      if (FORBIDDEN_VEGA_KEYS.has(normalizedKey) || normalizedKey.endsWith('expr') || normalizedKey === 'calculate') {
+      if (FORBIDDEN_VEGA_KEYS.has(normalizedKey)) {
         throw new Error(`Visualization ${childPath} is not allowed`);
-      }
-      if ((normalizedKey === 'filter' || normalizedKey === 'test') && typeof child === 'string') {
-        throw new Error(`Visualization ${childPath} must use a declarative predicate, not an expression string`);
       }
       if (normalizedKey === 'mark') {
         const mark = typeof child === 'string'
@@ -473,10 +488,24 @@ function normalizeWidget(
     throw new Error(`Widget ${position + 1} config.dataSource is server-owned; give the widget's data source as widget.source instead ({kind:"data_room_query", datasetId, sql} for a Data Room dataset)`);
   }
   const source = input.source as unknown;
+  validateLayoutConfig(config, position);
   if (input.kind === 'text') {
     if (source !== undefined) throw new Error(`Widget ${position + 1} is a text widget; remove source`);
     const text = cleanText(config.text, `Widget ${position + 1} text`, 20_000, true);
     return { kind: input.kind, title, subtitle, preset, config: { ...config, text } };
+  }
+  if (input.kind === 'html') {
+    if (source !== undefined || (typeof input.sql === 'string' && input.sql.trim())) {
+      throw new Error(`Widget ${position + 1} is an html view: it has no source of its own. Give the data to sibling widgets (each with config.key, config.hidden=true to keep them off the page) and list their keys in config.inputs`);
+    }
+    const html = typeof config.html === 'string' ? config.html : '';
+    if (!html.trim()) throw new Error(`Widget ${position + 1} html view needs config.html (the page's HTML, CSS, and script)`);
+    if (Buffer.byteLength(html, 'utf8') > MAX_HTML_WIDGET_BYTES) throw new Error(`Widget ${position + 1} config.html exceeds ${MAX_HTML_WIDGET_BYTES / 1024} KB`);
+    const inputs = config.inputs;
+    if (inputs !== undefined && (!Array.isArray(inputs) || inputs.length > MAX_WIDGETS || inputs.some(key => typeof key !== 'string' || !WIDGET_KEY_RE.test(key)))) {
+      throw new Error(`Widget ${position + 1} config.inputs must be a list of sibling widget keys (lowercase, digits, underscore)`);
+    }
+    return { kind: input.kind, title, subtitle, preset: '', config: { ...config, html } };
   }
   let sql: string | undefined;
   let nextConfig: Record<string, unknown> = config;
@@ -513,10 +542,34 @@ function normalizeWidget(
   return { kind: input.kind, title, subtitle, ...(sql ? { sql } : {}), preset, config: nextConfig };
 }
 
+/** Layout fields any widget may carry: key (html views read it by key), hidden, span (1–12 columns). */
+function validateLayoutConfig(config: Record<string, unknown>, position: number): void {
+  if (config.key !== undefined && (typeof config.key !== 'string' || !WIDGET_KEY_RE.test(config.key))) {
+    throw new Error(`Widget ${position + 1} config.key must be lowercase letters, digits, or underscore, starting with a letter (≤48)`);
+  }
+  if (config.hidden !== undefined && typeof config.hidden !== 'boolean') throw new Error(`Widget ${position + 1} config.hidden must be true or false`);
+  if (config.span !== undefined && (!Number.isInteger(config.span) || (config.span as number) < 1 || (config.span as number) > 12)) {
+    throw new Error(`Widget ${position + 1} config.span must be a whole number of columns from 1 to 12`);
+  }
+}
+
 function normalizeWidgets(value: unknown, resolveDataRoomSource?: DataRoomWidgetSourceResolver): AnalyticsWidgetInput[] {
   if (!Array.isArray(value) || value.length === 0) throw new Error('At least one dashboard widget is required');
   if (value.length > MAX_WIDGETS) throw new Error(`A dashboard can contain at most ${MAX_WIDGETS} widgets`);
-  return value.map((widget, position) => normalizeWidget(widget as AnalyticsWidgetInput, position, resolveDataRoomSource));
+  const widgets = value.map((widget, position) => normalizeWidget(widget as AnalyticsWidgetInput, position, resolveDataRoomSource));
+  const keys = new Set<string>();
+  for (const widget of widgets) {
+    const key = widget.config?.key;
+    if (typeof key !== 'string') continue;
+    if (keys.has(key)) throw new Error(`Two widgets use config.key "${key}"; keys must be unique in a dashboard`);
+    keys.add(key);
+  }
+  for (const [position, widget] of widgets.entries()) {
+    if (widget.kind !== 'html' || !Array.isArray(widget.config?.inputs)) continue;
+    const missing = (widget.config.inputs as string[]).filter(key => !keys.has(key));
+    if (missing.length) throw new Error(`Widget ${position + 1} config.inputs names ${missing.join(', ')}, which no widget in this dashboard has as config.key`);
+  }
+  return widgets;
 }
 
 function isDataRoomQueryWidget(widget: { config?: Record<string, unknown> }): boolean {
@@ -545,7 +598,7 @@ function widgetSourceFromConfig(configValue: unknown): AnalyticsWidgetSourceV1 |
   const limit = Number(raw.limit ?? 100);
   if (!DATASET_ID_RE.test(datasetId) || !VERSION_ID_RE.test(versionId)
     || !sql || params.length > 100 || params.some(value => value !== null && !['string', 'number', 'boolean'].includes(typeof value))
-    || !Number.isInteger(limit) || limit < 1 || limit > 200) {
+    || !Number.isInteger(limit) || limit < 1 || limit > MAX_DATA_ROOM_WIDGET_ROWS) {
     throw new Error('Widget dataSource query identity or limits are malformed');
   }
   return {
@@ -993,7 +1046,7 @@ export function createAnalyticsDashboardService(options: {
     }
     const normalized = normalizeWidget(input.widget, Number(current.position));
     const binding = dataRoom?.getBinding(widgetId);
-    if (binding && normalized.kind === 'text') throw new Error('A bound analytical widget cannot become static text');
+    if (binding && isStaticWidgetKind(normalized.kind)) throw new Error('A bound analytical widget cannot become static text or an html view');
     db.transaction(() => {
       const changed = db.prepare(`
         UPDATE analytics_widgets
@@ -1117,10 +1170,10 @@ export function createAnalyticsDashboardService(options: {
       }));
     }
     const limit = source.limit ?? 100;
-    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 200) {
-      widgetSourceError('invalid_input', `${prefix}Data Room widget limit must be from 1 to 200`, `Use an integer ${path}.limit from 1 to 200.`, dataRoomIssue({
-        code: 'out_of_range', path: `${path}.limit`, message: `${path}.limit must be an integer from 1 to 200.`,
-        expected: { kind: 'range', type: 'integer', minimum: 1, maximum: 200 }, received: source.limit, includeReceivedValue: true,
+    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > MAX_DATA_ROOM_WIDGET_ROWS) {
+      widgetSourceError('invalid_input', `${prefix}Data Room widget limit must be from 1 to ${MAX_DATA_ROOM_WIDGET_ROWS}`, `Use an integer ${path}.limit from 1 to ${MAX_DATA_ROOM_WIDGET_ROWS}.`, dataRoomIssue({
+        code: 'out_of_range', path: `${path}.limit`, message: `${path}.limit must be an integer from 1 to ${MAX_DATA_ROOM_WIDGET_ROWS}.`,
+        expected: { kind: 'range', type: 'integer', minimum: 1, maximum: MAX_DATA_ROOM_WIDGET_ROWS }, received: source.limit, includeReceivedValue: true,
       }));
     }
     return {
@@ -1143,7 +1196,7 @@ export function createAnalyticsDashboardService(options: {
     const dashboard = getDashboard(dashboardId);
     if (!dashboard?.widgets.some(isDataRoomQueryWidget)) return undefined;
     const widgetIds = dashboard.widgets
-      .filter(widget => isDataRoomQueryWidget(widget) || widget.kind === 'text')
+      .filter(widget => isDataRoomQueryWidget(widget) || isStaticWidgetKind(widget.kind))
       .map(widget => widget.id);
     return enqueueDashboard(dashboard, 'agent', widgetIds);
   }
@@ -1208,8 +1261,8 @@ export function createAnalyticsDashboardService(options: {
         expected: { kind: 'literal', value: currentRevision }, received: input.expectedWidgetRevision, includeReceivedValue: true,
       }));
     }
-    if (current.kind === 'text') {
-      sourceError('invalid_input', 'Static text widgets do not have an analytical data source', 'Select one non-text analytics widget.', dataRoomIssue({
+    if (isStaticWidgetKind(current.kind)) {
+      sourceError('invalid_input', 'Static text and html view widgets do not have an analytical data source', 'Select one non-text analytics widget.', dataRoomIssue({
         code: 'unsupported_widget_kind', path: 'widgetId', message: 'The selected widget must have an analytical data source.',
         expected: { kind: 'relation', description: 'Widget kind is metric, table, bar, line, or visualization.' }, received: widgetId, includeReceivedValue: true,
       }));
@@ -2408,7 +2461,7 @@ export function createAnalyticsDashboardService(options: {
               WHERE snapshot.run_id = child.run_id AND snapshot.widget_id = child.widget_id
             ) AS data_room_snapshot,
             json_extract(child.config_json, '$.dataSource.kind') = 'data_room_query' AS independent_data_source,
-            child.kind = 'text' AS static_text
+            child.kind IN ('text','html') AS static_text
           FROM analytics_run_widgets child
           WHERE child.run_id = ? AND child.status IN ('queued','running','failed')
           ORDER BY child.position
@@ -3059,6 +3112,18 @@ export function createAnalyticsDashboardService(options: {
       };
     }
 
+    if (row.kind === 'html') {
+      // The page is in config.html; its data is the sibling widgets' rows,
+      // handed to the sandboxed view at render time.
+      return {
+        trust: 'local_static_content',
+        columns: ['html'],
+        rows: [['html view']],
+        rowCount: 1,
+        displayedRowCount: 1,
+        refreshedAt: new Date().toISOString(),
+      };
+    }
     if (row.kind === 'text') {
       const config = parseJson<Record<string, unknown>>(row.config_json, {});
       const text = cleanText(config.text, `${row.title} text`, 20_000, true);
@@ -3433,7 +3498,7 @@ export function createAnalyticsDashboardService(options: {
             WHERE snapshot.run_id = child.run_id AND snapshot.widget_id = child.widget_id
           ))
           OR json_extract(child.config_json, '$.dataSource.kind') = 'data_room_query'
-          OR child.kind = 'text'
+          OR child.kind IN ('text','html')
         )
     `).get(runId, dataRoomEnabled ? 1 : 0) as { count: number }).count);
     if (!count) return { ownershipLost, cancelSeen };
@@ -3458,7 +3523,7 @@ export function createAnalyticsDashboardService(options: {
                 WHERE snapshot.run_id = run_widget.run_id AND snapshot.widget_id = run_widget.widget_id
               ))
               OR json_extract(run_widget.config_json, '$.dataSource.kind') = 'data_room_query'
-              OR run_widget.kind = 'text'
+              OR run_widget.kind IN ('text','html')
             )
             AND run.worker_id = ? AND run.worker_pid = ?
           ORDER BY run_widget.position LIMIT 1
@@ -3492,7 +3557,7 @@ export function createAnalyticsDashboardService(options: {
             ? result.source
             : null;
           // Static text carries no data source receipt; everything else must.
-          const staticText = child.kind === 'text' && result.trust === 'local_static_content';
+          const staticText = isStaticWidgetKind(child.kind) && result.trust === 'local_static_content';
           if (!source && !staticText) throw new Error('Local Data Room execution returned no exact source receipt');
           const runWidget = db.prepare(`
             UPDATE analytics_run_widgets SET status = 'completed', error = NULL, completed_at = ?

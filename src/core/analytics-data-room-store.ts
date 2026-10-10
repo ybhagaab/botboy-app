@@ -612,9 +612,11 @@ function observedSchema(contract: AnalyticsDatasetContract): AnalyticsFieldContr
 }
 
 function assertHandling(handling: AnalyticsDatasetContract['handling'], use: AnalyticsDataRoomUse): void {
+  // Publishing is the owner's decision alone (owner directive 2026-10-10):
+  // a dataset never blocks what the owner chooses to publish.
+  if (use === 'publication') return;
   const allowed = handling.allowedUses.includes(use)
-    && (use !== 'local_answer' || handling.allowModelContext)
-    && (use !== 'publication' || handling.allowPublication);
+    && (use !== 'local_answer' || handling.allowModelContext);
   if (!allowed) fail('policy_denied', `Version handling policy does not permit ${use}.`);
 }
 

@@ -6,7 +6,7 @@ import type {
   AnalyticsSemanticReceipt,
 } from './analytics-data-room-types.js';
 
-export type AnalyticsWidgetKind = 'metric' | 'table' | 'bar' | 'line' | 'text' | 'visualization';
+export type AnalyticsWidgetKind = 'metric' | 'table' | 'bar' | 'line' | 'text' | 'visualization' | 'html';
 export type AnalyticsDashboardStatus = 'draft' | 'ready' | 'refreshing' | 'degraded' | 'waiting_for_data' | 'archived';
 export type AnalyticsRefreshTrigger = 'manual' | 'scheduled' | 'agent';
 
@@ -348,6 +348,23 @@ export interface DashboardPublicationDataRoomIdentityV1 {
   semanticReceiptSha256: string;
 }
 
+/**
+ * An independent Data Room widget (config.dataSource kind data_room_query) at
+ * publication: its result came from exactly this configured source, the
+ * dataset's current head, and a version that verifies for publication now.
+ */
+export interface DashboardPublicationDataRoomQueryIdentityV1 {
+  datasetId: string;
+  versionId: string;
+  headRevision: number;
+  sourceConfigSha256: string;
+  querySha256: string;
+  compilerVersion: string;
+  contentSha256: string;
+  schemaSha256: string;
+  contractSha256: string;
+  definitionSha256: string;
+}
 export interface DashboardPublicationWidgetSnapshotV1 {
   widgetId: string;
   position: number;
@@ -356,6 +373,7 @@ export interface DashboardPublicationWidgetSnapshotV1 {
   presentationSha256: string;
   resultSha256?: string;
   dataRoom?: DashboardPublicationDataRoomIdentityV1;
+  dataRoomQuery?: DashboardPublicationDataRoomQueryIdentityV1;
 }
 
 export interface DashboardPublicationSnapshotV1 {

@@ -433,6 +433,9 @@ body.chat-width-expand.assistant-open .workspace { margin-right:0; }
 .analytics-widget:hover { border-color:var(--border-strong); box-shadow:0 16px 44px rgba(0,0,0,.1); }
 .analytics-widget.is-botboy-selected { border-color:color-mix(in srgb,var(--accent) 55%,var(--border)); box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 18%,transparent),0 16px 44px rgba(0,0,0,.1); }
 /* Row packer output — every row sums to 12, so the grid never leaves dead zones. */
+.analytics-span-1 { grid-column:span 1; }
+.analytics-span-2 { grid-column:span 2; }
+.analytics-span-3 { grid-column:span 3; }
 .analytics-span-4 { grid-column:span 4; }
 .analytics-span-5 { grid-column:span 5; }
 .analytics-span-6 { grid-column:span 6; }
@@ -2005,3 +2008,35 @@ a.data-room-row:hover { background:var(--hover); }
 .gmail-account .connection-head { gap:8px; flex-wrap:wrap; }
 .gmail-account .connection-head strong { overflow-wrap:anywhere; flex:1; min-width:0; }
 .gmail-account-import { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); }
+/* HTML views (kind=html): a model-designed page in a sandboxed frame. */
+.analytics-html-widget .analytics-widget-body{padding:0 4px 4px}
+.analytics-html-frame{display:block;width:100%;border:0;background:transparent;min-height:80px}
+.analytics-html-error{margin:8px 12px;padding:8px 10px;border-radius:10px;background:var(--yellow-soft);color:var(--yellow);font-size:12px}
+.analytics-hidden-data{margin-top:16px;padding:12px 16px}
+.analytics-hidden-data>summary{cursor:pointer;display:flex;align-items:center;gap:8px;color:var(--muted);font-weight:600}
+.analytics-hidden-data[open]>summary{margin-bottom:12px}
+/* Chat visuals: ```visual / ```svg / ```mermaid replies in a sandboxed frame. */
+.chat-visual{margin:10px 0 12px;padding:6px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2)}
+.chat-visual-frame{display:block;width:100%;border:0;background:transparent}
+.chat-visual-error{margin:6px 4px;color:var(--yellow);font-size:11px}
+.chat-visual-source>summary{cursor:pointer;color:var(--muted);font-size:10px;padding:2px 4px}
+.chat-visual-source pre{margin:6px 0 0}
+/* Warnings & issues (analytics-dashboard-issues.ts + html view checks) */
+.analytics-issues{margin:0 0 16px;padding:12px 16px;border-color:color-mix(in srgb,var(--yellow) 45%,var(--border))}
+.analytics-issues.bad{border-color:color-mix(in srgb,var(--red) 45%,var(--border))}
+.analytics-issues>summary{display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--yellow)}
+.analytics-issues.bad>summary{color:var(--red)}
+.analytics-issues>summary strong{color:var(--text)}
+.analytics-issues-note{color:var(--muted);font-size:11px;margin-left:4px}
+.analytics-issues ul{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
+.analytics-issue-jump{width:100%;display:grid;grid-template-columns:minmax(160px,.35fr) 1fr auto;gap:12px;align-items:baseline;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--yellow);border-radius:8px;background:var(--surface-2);color:var(--soft);text-align:left;cursor:pointer;font:inherit;font-size:12px}
+.analytics-issues li.error .analytics-issue-jump{border-left-color:var(--red)}
+.analytics-issue-jump:hover{background:var(--hover)}
+.analytics-issue-where{color:var(--text);font-weight:600}
+.analytics-issue-source{color:var(--faint);font-size:10px}
+.analytics-issues-ask{margin-top:10px}
+.analytics-widget-issue{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;background:var(--yellow-soft);color:var(--yellow);font-size:10px;font-weight:700;cursor:help}
+.analytics-widget-issue.error{background:var(--red-soft);color:var(--red)}
+.analytics-widget.has-issues{border-color:color-mix(in srgb,var(--yellow) 55%,var(--border))}
+.analytics-issue-cell button{color:var(--yellow)!important}
+.analytics-issue-flash{box-shadow:0 0 0 3px color-mix(in srgb,var(--yellow) 70%,transparent);transition:box-shadow .3s}

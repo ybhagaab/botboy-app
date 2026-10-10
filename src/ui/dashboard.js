@@ -112,6 +112,7 @@ const state = {
     analyticsContextPending: false,
   },
   analytics: {
+    issues: new Map(), // dashboardId -> server issues (data checks + views' last reports)
     items: null,
     details: new Map(),
     error: '',
@@ -5262,6 +5263,7 @@ async function loadAnalyticsDashboard(id, { force = false, preserveScroll = fals
   try {
     const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}`);
     state.analytics.details.set(id, payload.dashboard);
+    if (Array.isArray(payload.issues)) state.analytics.issues.set(id, payload.issues);
     updateAnalyticsSummary(payload.dashboard);
     state.analytics.error = '';
   } catch (error) {
@@ -5389,6 +5391,7 @@ async function pollActiveAnalyticsDashboard() {
     if (progressChanged || terminal) {
       const payload = await request(`/analytics/dashboards/${encodeURIComponent(id)}`);
       dashboard = payload.dashboard;
+      if (Array.isArray(payload.issues)) state.analytics.issues.set(id, payload.issues);
     } else {
       const recentRuns = (previous.recentRuns || []).map(run => run.id === persistedRun.id ? persistedRun : run);
       dashboard = { ...previous, recentRuns };
@@ -5463,7 +5466,7 @@ function renderAnalyticsMetric(widget, result) {
  * spread across that row's widgets, right side first.
  */
 function analyticsWidgetSpans(widgets) {
-  const natural = kind => kind === 'metric' ? 4 : kind === 'table' ? 12 : 6;
+  const natural = kind => kind === 'metric' ? 4 : kind === 'table' || kind === 'html' ? 12 : 6;
   const spans = new Map();
   let row = [];
   let used = 0;
@@ -5480,7 +5483,9 @@ function analyticsWidgetSpans(widgets) {
     used = 0;
   };
   for (const widget of widgets) {
-    const span = natural(widget.kind);
+    // The model may size a widget itself (config.span, 1–12 columns).
+    const authored = Number(widget.config?.span);
+    const span = Number.isInteger(authored) && authored >= 1 && authored <= 12 ? authored : natural(widget.kind);
     if (used + span > 12) closeRow();
     row.push(widget.id);
     spans.set(widget.id, span);
@@ -5703,10 +5708,14 @@ async function hydrateAnalyticsVisualizations(dashboardId, expectedEpoch) {
       materializeAnalyticsContainerWidths(spec, plotWidth);
       if (hasVegaView) spec.autosize = { type: 'pad', contains: 'padding', resize: false };
       container.replaceChildren();
+      // Expressions (calculate, expr, signals) run in Vega's interpreter, never
+      // as page JavaScript: no eval in BotBoy's own origin.
       const embedded = await window.vegaEmbed(container, spec, {
         actions: false,
         renderer: 'svg',
         tooltip: true,
+        ast: true,
+        expr: window.vega?.expressionInterpreter,
       });
       if (expectedEpoch !== analyticsVisualizationEpoch || !container.isConnected) {
         try { embedded.view.finalize(); } catch {}
@@ -5850,6 +5859,8 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelec
     if (widget.kind === 'visualization') body = `<div class="analytics-vega" data-scroll-key="analytics:vega:${attr(widget.id)}" data-analytics-visualization="${attr(widget.id)}" role="img" aria-label="${attr(widget.title)}"><span>Preparing interactive visualization…</span></div>`;
     if (widget.kind === 'text') body = `<div class="analytics-text">${renderAnalyticsText(result.rows?.[0]?.[0] ?? widget.config?.text ?? '')}</div>`;
   }
+  // An html view mounts even before its own run: its data is its siblings'.
+  if (widget.kind === 'html') body = `<div class="analytics-html" data-analytics-html="${attr(widget.id)}"><div class="analytics-html-slot"></div><div class="analytics-html-error" role="alert" hidden></div></div>`;
   const spanClass = span ? ` analytics-span-${span}` : '';
   const wideMetric = widget.kind === 'metric' && span >= 8 ? ' analytics-metric-wide' : '';
   const selectedClass = selectedForChat ? ' is-botboy-selected' : '';
@@ -5863,7 +5874,23 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelec
       : widget.kind === 'text' && !widget.sql ? ''
         : `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Query & provenance</span><b>${esc([String(result?.trust || 'not refreshed').replaceAll('_', ' ').toLowerCase(), laneLabel].filter(Boolean).join(' · '))}</b></summary>${configuredSource?.kind === 'warehouse_sql' ? '<div><span>Source</span><strong>Independent warehouse SQL</strong></div>' : ''}${laneLabel ? `<div><span>Data lane</span><strong>Datanet ETL (SQL warehouse connection was down)</strong></div>` : ''}${widget.preset ? `<div><span>Schema preset</span><strong>${esc(widget.preset)}</strong></div>` : ''}${widget.sql ? `<pre>${esc(widget.sql)}</pre>` : ''}</details>`;
   const manage = renderAnalyticsManageData(widget);
-  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}${selectedClass}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${chip}${chatSelector}${manageButton}</div></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${manage}${provenance}</article>`;
+  const widgetIssues = analyticsIssuesFor(widget.dashboardId).filter(issue => issue.widgetId === widget.id);
+  const issueBadge = widgetIssues.length
+    ? `<span class="analytics-widget-issue ${widgetIssues.some(issue => issue.severity === 'error') ? 'error' : 'warn'}" title="${attr(widgetIssues.map(issue => `${issue.metric ? `${issue.metric}: ` : ''}${issue.message}`).join('\n'))}">${icon('alert', 12)} ${number(widgetIssues.length)}</span>`
+    : '';
+  const issueClass = widgetIssues.length ? ' has-issues' : '';
+  if (widget.kind === 'html') {
+    const inputs = Array.isArray(widget.config?.inputs) ? widget.config.inputs : [];
+    return `<article class="card analytics-widget analytics-html-widget${spanClass}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chatSelector}</div></div><div class="analytics-widget-body">${body}</div>${inputs.length ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Data behind this view</span><b>${esc(inputs.join(', '))}</b></summary><div><span>Reads</span><strong>${esc(inputs.join(', '))}</strong></div><div><span>Runs</span><strong>Sandboxed: no network, no access to BotBoy</strong></div></details>` : ''}</article>`;
+  }
+  // Columns an issue names are marked in the table header and metric value.
+  if (widgetIssues.length) {
+    const flagged = new Set(widgetIssues.map(issue => issue.metric).filter(Boolean));
+    body = body.replace(/<th([^>]*)><button([^>]*)>([^<]+)/g, (whole, thAttrs, buttonAttrs, label) => flagged.has(label.trim())
+      ? `<th${thAttrs} class="analytics-issue-cell"><button${buttonAttrs} title="${attr(widgetIssues.filter(issue => issue.metric === label.trim()).map(issue => issue.message).join('\n'))}">⚠ ${label}`
+      : whole);
+  }
+  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chip}${chatSelector}${manageButton}</div></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${manage}${provenance}</article>`;
 }
 
 function renderAnalyticsList() {
@@ -5931,6 +5958,54 @@ function renderAnalyticsManagement(dashboard) {
   return `<article class="card analytics-management-card"><div class="card-header"><div><h2 class="card-title">Dashboard management</h2><div class="card-meta">Project context and local lifecycle</div></div><span class="pill">${number(selected.size)} linked</span></div><form class="analytics-project-form" data-dashboard="${attr(dashboard.id)}"><div class="analytics-linked-summary">${linkedSummary}</div><fieldset ${saving || deleting ? 'disabled' : ''}><legend>Linked projects</legend><p>Linking adds project context and navigation; it does not copy SQL results into project evidence.</p><label class="analytics-project-search-label"><span class="visually-hidden">Filter projects</span><input class="analytics-project-search" type="search" placeholder="Filter projects by name or area…" autocomplete="off"></label><div class="analytics-project-options">${choices}</div></fieldset><div class="analytics-management-actions"><span>${icon('branch', 13)} Choose any relevant projects, then save the complete linkage set.</span><button class="button" type="submit" ${saving || deleting ? 'disabled' : ''}>${saving ? 'Saving links…' : 'Save project links'}</button></div></form><div class="analytics-delete-zone"><div><strong>Delete local dashboard</strong><span>${esc(deleteReason)}</span></div><button class="button danger" type="button" data-action="analytics-delete" data-dashboard="${attr(dashboard.id)}" ${deleteBlocked ? 'disabled' : ''}>${icon('trash', 15)} ${deleting ? 'Deleting…' : 'Delete dashboard…'}</button></div></article>`;
 }
 
+/**
+ * Visible widgets in the grid; hidden data widgets (config.hidden, the rows an
+ * html view reads) in a collapsed section below, still with full provenance.
+ */
+/** Warnings & issues: data checks and the html views' own checks, newest render. */
+function analyticsIssuesFor(dashboardId) {
+  return state.analytics.issues.get(dashboardId) || [];
+}
+
+// An html view reported its own checks: store them on the server (so chat sees
+// them too) and repaint the panel. Same report twice changes nothing.
+const lastViewIssueReport = new Map();
+window.addEventListener('botboy:view-issues', event => {
+  const { widgetId, issues } = event.detail || {};
+  const dashboardId = state.route.view === 'analytics-dashboard' ? state.route.dashboardId : '';
+  if (!dashboardId || !widgetId) return;
+  const key = `${dashboardId}/${widgetId}`;
+  const signature = JSON.stringify(issues || []);
+  if (lastViewIssueReport.get(key) === signature) return;
+  lastViewIssueReport.set(key, signature);
+  void request(`/analytics/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}/view-issues`, { method: 'PUT', body: { issues: issues || [] } })
+    .then(payload => {
+      if (!Array.isArray(payload?.issues)) return;
+      state.analytics.issues.set(dashboardId, payload.issues);
+      if (state.route.view === 'analytics-dashboard' && state.route.dashboardId === dashboardId) renderRoute({ preserveScroll: true });
+    })
+    .catch(() => {});
+});
+
+function renderAnalyticsIssues(dashboard) {
+  const issues = analyticsIssuesFor(dashboard.id);
+  if (!issues.length) return '';
+  const errors = issues.filter(issue => issue.severity === 'error').length;
+  const tone = errors ? 'bad' : 'warn';
+  const sourceLabel = { data: 'Data check', view: 'Page check', auto: 'Page scan' };
+  return `<details class="card analytics-issues ${tone}" open><summary>${icon('alert', 15)}<strong>Warnings &amp; issues</strong><span class="pill ${tone}">${number(issues.length)}</span><span class="analytics-issues-note">Figures that look wrong. They are not hidden or changed; check them before you rely on them.</span></summary><ul>${issues.map(issue => `<li class="${issue.severity === 'error' ? 'error' : 'warn'}"><button type="button" class="analytics-issue-jump" data-action="analytics-issue-jump" data-widget="${attr(issue.widgetId)}" data-metric="${attr(issue.metric || '')}"><span class="analytics-issue-where">${esc(issue.widgetTitle)}${issue.metric ? ` · ${esc(issue.metric)}` : ''}</span><span class="analytics-issue-message">${esc(issue.message)}</span><span class="analytics-issue-source">${esc(sourceLabel[issue.source] || issue.source)}</span></button></li>`).join('')}</ul><div class="analytics-issues-ask"><button class="button small" type="button" data-prompt="${attr(`Check the warnings on the "${dashboard.title}" dashboard: find the cause of each one in the data, fix the dashboard where its logic is wrong, and tell me which are real data gaps.`)}">${icon('sparkles', 12)} Ask BotBoy to investigate</button></div></details>`;
+}
+
+function renderAnalyticsWidgetGrid(dashboard, activeRun, chatSelection) {
+  const visible = dashboard.widgets.filter(widget => widget.config?.hidden !== true);
+  const hidden = dashboard.widgets.filter(widget => widget.config?.hidden === true);
+  const spans = analyticsWidgetSpans(visible);
+  const grid = `<section class="analytics-widget-grid">${visible.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, spans.get(widget.id), chatSelection)).join('')}</section>`;
+  if (!hidden.length) return grid;
+  const hiddenSpans = analyticsWidgetSpans(hidden.map(widget => ({ ...widget, config: { ...widget.config, span: 6 } })));
+  return `${grid}<details class="card analytics-hidden-data"${analyticsIssuesFor(dashboard.id).some(issue => hidden.some(widget => widget.id === issue.widgetId)) ? ' open' : ''}><summary>${icon('database', 13)} Data behind this dashboard <span class="pill">${number(hidden.length)}</span></summary><section class="analytics-widget-grid">${hidden.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, hiddenSpans.get(widget.id), chatSelection)).join('')}</section></details>`;
+}
+
 function renderAnalyticsDashboard(id) {
   const dashboard = state.analytics.details.get(id);
   if (!dashboard && !state.analytics.error) {
@@ -5967,7 +6042,7 @@ function renderAnalyticsDashboard(id) {
     : '';
   const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const schedule = dashboard.schedule;
-  return `<header class="analytics-dashboard-head"><div class="analytics-dashboard-utility"><div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div><div class="head-actions">${actions}</div></div><div class="analytics-dashboard-heading"><div class="eyebrow"><span class="eyebrow-dot"></span>Analytical dashboard</div><h1 class="page-title">${esc(dashboard.title)}</h1>${dashboard.description ? `<p class="page-subtitle">${esc(dashboard.description)}</p>` : ''}</div></header><div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${successfulPublication ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(successfulPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}${renderLatestDashboardPublication(dashboard)}<section class="analytics-widget-grid">${(spans => dashboard.widgets.map(widget => renderAnalyticsWidget(widget, activeRun?.currentWidgetId, spans.get(widget.id), chatSelection)).join(''))(analyticsWidgetSpans(dashboard.widgets))}</section><section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
+  return `<header class="analytics-dashboard-head"><div class="analytics-dashboard-utility"><div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div><div class="head-actions">${actions}</div></div><div class="analytics-dashboard-heading"><div class="eyebrow"><span class="eyebrow-dot"></span>Analytical dashboard</div><h1 class="page-title">${esc(dashboard.title)}</h1>${dashboard.description ? `<p class="page-subtitle">${esc(dashboard.description)}</p>` : ''}</div></header><div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${successfulPublication ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(successfulPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}${renderLatestDashboardPublication(dashboard)}${renderAnalyticsIssues(dashboard)}${renderAnalyticsWidgetGrid(dashboard, activeRun, chatSelection)}<section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
 }
 
 function currentAnalyticsWidget(dashboardId, widgetId) {
@@ -7731,7 +7806,14 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
   if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
+  window.BotBoyHtmlViews?.park();
   view.innerHTML = html;
+  if (state.route.view === 'analytics-dashboard') {
+    const shown = state.analytics.details.get(state.route.dashboardId);
+    if (shown) window.BotBoyHtmlViews?.mount(shown);
+  } else {
+    window.BotBoyHtmlViews?.mount({ widgets: [] });
+  }
   if (state.route.view === 'documents') {
     hydrateDocumentPreview();
     syncDocumentReaderPresentation(document, state.documents);
@@ -8605,6 +8687,15 @@ function bindEvents() {
         state.gmailSync.status = payload.status;
         toast(deleteMail ? `${name} disconnected; ${number(payload.deletedMail || 0)} captured emails deleted` : `${name} disconnected; captured mail stays`);
       });
+    }
+    if (action === 'analytics-issue-jump') {
+      const card = document.querySelector(`[data-widget-id="${CSS.escape(target.dataset.widget || '')}"]`);
+      const hiddenSection = card?.closest('details.analytics-hidden-data');
+      if (hiddenSection) hiddenSection.open = true;
+      card?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      card?.classList.add('analytics-issue-flash');
+      setTimeout(() => card?.classList.remove('analytics-issue-flash'), 1800);
+      window.BotBoyHtmlViews?.focusIssue(target.dataset.widget || '', target.dataset.metric || '');
     }
     if (action === 'whatsapp-open') {
       void whatsAppAction('open', async () => {

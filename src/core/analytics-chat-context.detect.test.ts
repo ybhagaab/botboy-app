@@ -63,10 +63,32 @@ describe('resolveConversationMode', () => {
   });
 
   it('unknown hint values are ignored, not honored', () => {
-    // 'add a chart…' corroborates only via the page-hint path; a bogus hint
+    // 'refresh it…' corroborates only via the page-hint path; a bogus hint
     // must not unlock it, so this falls through to strict detection → general.
-    expect(resolveConversationMode({ modeHint: 'bogus', message: 'add a chart of weekly captures' }))
+    expect(resolveConversationMode({ modeHint: 'bogus', message: 'refresh it and tell me what changed' }))
       .toEqual({ mode: 'general', via: 'default' });
+  });
+});
+
+describe('ordinary work questions stay general (owner report 2026-10-09)', () => {
+  it('work nouns need a time grain or trend to count as analytics', () => {
+    for (const message of [
+      'what are my top 3 attention items today?',
+      'summarize my tasks for this week',
+      'how many projects do I have',
+      'rank my open tasks by urgency',
+      'compare these two projects for me',
+      'give me a report of what changed in the Fatafat project',
+    ]) {
+      expect(resolveConversationMode({ message }), message).toEqual({ mode: 'general', via: 'default' });
+    }
+    for (const message of [
+      'how many items landed by month',
+      'chart my captures over time',
+      'show messages per day for the last month',
+    ]) {
+      expect(resolveConversationMode({ message }).mode, message).toBe('analytics_dashboard');
+    }
   });
 });
 

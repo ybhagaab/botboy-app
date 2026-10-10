@@ -33,6 +33,7 @@ import type {
   AnalyticsWidgetDataRoomBindingInput,
   AnalyticsWidgetResult,
   DashboardPublicationDataRoomIdentityV1,
+  DashboardPublicationDataRoomQueryIdentityV1,
 } from './analytics-types.js';
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -171,6 +172,11 @@ export interface AnalyticsDashboardDataRoomBridge {
   executeSnapshot(runId: string, widgetId: string, signal?: AbortSignal): Promise<AnalyticsWidgetResult>;
   markApplied(runId: string, widgetId: string, receipt: AnalyticsWidgetResult): void;
   validatePublicationResult(widgetId: string, result: AnalyticsWidgetResult): DashboardPublicationDataRoomIdentityV1;
+  /** Independent (config.dataSource) Data Room widget at publication; throws when it is not exact. */
+  validateIndependentPublicationResult(
+    widget: { id: string; revision: number; sourceConfigSha256: string; datasetId: string },
+    result: AnalyticsWidgetResult,
+  ): DashboardPublicationDataRoomQueryIdentityV1;
   listChangedBindings(limit?: number): AnalyticsChangedBindingGroup[];
   refreshDashboardDataState(dashboardId: string): void;
 }
@@ -573,7 +579,7 @@ export function createAnalyticsDashboardDataRoomBridge(input: {
     raw: AnalyticsWidgetDataRoomBindingInput,
   ): Omit<AnalyticsWidgetDataRoomBinding, 'revision' | 'compatibility' | 'compatibilityError' | 'observedHeadRevision' | 'lastQueuedVersionId' | 'lastAppliedVersionId' | 'createdAt' | 'updatedAt'> {
     const widget = widgetRow(widgetId);
-    if (widget.kind === 'text') fail('invalid_input', 'Static text widgets cannot bind analytical data.');
+    if (widget.kind === 'text' || widget.kind === 'html') fail('invalid_input', 'Static text and html view widgets cannot bind analytical data.');
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('invalid_input', 'Binding input must be an object.');
     const datasetId = boundedIdentity(raw.datasetId, 'datasetId');
     if (!['pinned', 'latest_compatible', 'latest_fresh'].includes(raw.versionPolicy)) {
@@ -1291,6 +1297,48 @@ export function createAnalyticsDashboardDataRoomBridge(input: {
     if (binding.changes !== 1) fail('conflict', 'Binding changed before the local result apply.');
   }
 
+  function validateIndependentPublicationResult(
+    widget: { id: string; revision: number; sourceConfigSha256: string; datasetId: string },
+    result: AnalyticsWidgetResult,
+  ): DashboardPublicationDataRoomQueryIdentityV1 {
+    const source = result.source as Record<string, any> | undefined;
+    if (result.trust !== 'local_verified_data' || source?.provider !== 'data-room-query') {
+      fail('conflict', `Widget ${widget.id} has no verified Data Room result for publication. Refresh it first.`);
+    }
+    if (source.sourceConfigSha256 !== widget.sourceConfigSha256 || source.datasetId !== widget.datasetId) {
+      fail('conflict', `Widget ${widget.id} result came from a different source than the widget now has. Refresh it first.`);
+    }
+    if (Number(source.widgetRevision) !== widget.revision) {
+      fail('conflict', `Widget ${widget.id} changed after its result was read. Refresh it first.`);
+    }
+    const head = store.getHead(widget.datasetId);
+    if (!head || head.versionId !== source.versionId) {
+      fail('conflict', `Dataset ${widget.datasetId} has a newer version than widget ${widget.id} shows. Refresh the dashboard first.`);
+    }
+    const version = store.getDatasetVersion(source.versionId);
+    if (!version || version.datasetId !== widget.datasetId
+      || source.contentSha256 !== version.materializedSha256
+      || source.schemaSha256 !== version.observedSchemaSha256
+      || source.contractSha256 !== version.contractSha256
+      || source.definitionSha256 !== version.definitionSha256) {
+      fail('conflict', `Widget ${widget.id} result does not match dataset version ${source.versionId}.`);
+    }
+    // Re-reads the stored files and applies the dataset's publication policy.
+    store.verifyVersion(version.id, 'publication');
+    return {
+      datasetId: widget.datasetId,
+      versionId: version.id,
+      headRevision: head.headRevision,
+      sourceConfigSha256: String(source.sourceConfigSha256),
+      querySha256: String(source.querySha256),
+      compilerVersion: String(source.compilerVersion),
+      contentSha256: String(source.contentSha256),
+      schemaSha256: String(source.schemaSha256),
+      contractSha256: String(source.contractSha256),
+      definitionSha256: String(source.definitionSha256),
+    };
+  }
+
   function validatePublicationResult(
     widgetId: string,
     result: AnalyticsWidgetResult,
@@ -1467,6 +1515,7 @@ export function createAnalyticsDashboardDataRoomBridge(input: {
     executeSnapshot,
     markApplied,
     validatePublicationResult,
+    validateIndependentPublicationResult,
     listChangedBindings,
     refreshDashboardDataState,
   };

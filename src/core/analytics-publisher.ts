@@ -1,3 +1,4 @@
+import { analyticsSha256 } from './analytics-data-room-policy.js';
 import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -89,6 +90,8 @@ function renderWidget(widget: AnalyticsWidget): string {
     // Vega widgets therefore degrade to their exact persisted rows.
     if (widget.kind === 'visualization') body = renderTable(widget);
     if (widget.kind === 'text') body = renderTextBody(widget);
+    // An html view runs scripts in BotBoy only; a shared copy shows its data widgets.
+    if (widget.kind === 'html') body = '<div class="empty">This interactive view is available in BotBoy. Its data appears in the widgets of this snapshot.</div>';
   }
   return `<article class="widget ${escapeHtml(widget.kind)}"><header><div><span>${escapeHtml(widget.kind)}</span><h2>${escapeHtml(widget.title)}</h2>${widget.subtitle ? `<p>${escapeHtml(widget.subtitle)}</p>` : ''}</div>${widget.lastError ? '<b class="warn">Stale</b>' : ''}</header>${widget.lastError ? `<div class="error">Latest refresh error: ${escapeHtml(widget.lastError)}${widget.result ? ' · showing the previous successful result' : ''}</div>` : ''}<section>${body}</section><footer>${widget.result ? `Updated ${escapeHtml(new Date(widget.result.refreshedAt).toLocaleString())}` : 'Not refreshed'} · external analytical data</footer></article>`;
 }
@@ -487,6 +490,18 @@ export function createDashboardPublisherService(options: {
         dashboard,
         createdAt,
         dataRoom ? (widgetId, result) => dataRoom.validatePublicationResult(widgetId, result) : undefined,
+        dataRoom ? (widget, result) => {
+          const configured = widget.config?.dataSource as Record<string, unknown> | undefined;
+          if (!configured || configured.kind !== 'data_room_query' || typeof configured.datasetId !== 'string') {
+            throw new Error(`Widget ${widget.id} has a Data Room result but no Data Room source now. Refresh it first.`);
+          }
+          return dataRoom.validateIndependentPublicationResult({
+            id: widget.id,
+            revision: widget.revision,
+            datasetId: configured.datasetId,
+            sourceConfigSha256: analyticsSha256(configured),
+          }, result);
+        } : undefined,
       );
     } catch (error: any) {
       const policyDenied = error?.code === 'policy_denied';
@@ -596,6 +611,17 @@ export function createDashboardPublisherService(options: {
       && isSha256(value.semanticReceiptSha256);
   }
 
+  function isDataRoomQueryPublicationIdentity(value: unknown): boolean {
+    if (!isRecord(value)) return false;
+    return typeof value.datasetId === 'string' && value.datasetId.length > 0
+      && typeof value.versionId === 'string' && value.versionId.length > 0
+      && isInteger(value.headRevision)
+      && isSha256(value.sourceConfigSha256)
+      && isSha256(value.querySha256)
+      && typeof value.compilerVersion === 'string' && value.compilerVersion.length > 0
+      && isSha256(value.contentSha256) && isSha256(value.schemaSha256)
+      && isSha256(value.contractSha256) && isSha256(value.definitionSha256);
+  }
   function parsePreparedSnapshot(raw: string): DashboardPublicationSnapshotV1 | null {
     const value = parseJson<unknown>(raw, null);
     if (!isRecord(value) || value.version !== 1
@@ -611,7 +637,8 @@ export function createDashboardPublisherService(options: {
         || !isInteger(widget.bindingGeneration)
         || !isSha256(widget.presentationSha256)
         || (widget.resultSha256 !== undefined && !isSha256(widget.resultSha256))
-        || (widget.dataRoom !== undefined && !isDataRoomPublicationIdentity(widget.dataRoom))) return null;
+        || (widget.dataRoom !== undefined && !isDataRoomPublicationIdentity(widget.dataRoom))
+        || (widget.dataRoomQuery !== undefined && !isDataRoomQueryPublicationIdentity(widget.dataRoomQuery))) return null;
       widgetIds.add(widget.widgetId);
     }
     return value as unknown as DashboardPublicationSnapshotV1;
@@ -644,6 +671,19 @@ export function createDashboardPublisherService(options: {
         || next.bindingGeneration !== widget.bindingGeneration
         || next.presentationSha256 !== widget.presentationSha256) add('widget', widget.widgetId);
       if (next.resultSha256 !== widget.resultSha256) add('result', widget.widgetId);
+      const leftQuery = widget.dataRoomQuery;
+      const rightQuery = next.dataRoomQuery;
+      if (leftQuery || rightQuery) {
+        if (!leftQuery || !rightQuery || leftQuery.sourceConfigSha256 !== rightQuery.sourceConfigSha256 || leftQuery.datasetId !== rightQuery.datasetId) {
+          add('binding', widget.widgetId);
+        } else {
+          if (leftQuery.headRevision !== rightQuery.headRevision) add('dataset_head', widget.widgetId);
+          if (leftQuery.versionId !== rightQuery.versionId || leftQuery.querySha256 !== rightQuery.querySha256
+            || leftQuery.compilerVersion !== rightQuery.compilerVersion || leftQuery.contentSha256 !== rightQuery.contentSha256
+            || leftQuery.schemaSha256 !== rightQuery.schemaSha256 || leftQuery.contractSha256 !== rightQuery.contractSha256
+            || leftQuery.definitionSha256 !== rightQuery.definitionSha256) add('dataset_version', widget.widgetId);
+        }
+      }
       const left = widget.dataRoom;
       const right = next.dataRoom;
       if (!left && !right) continue;

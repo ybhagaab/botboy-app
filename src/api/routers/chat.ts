@@ -1045,9 +1045,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
     // open+refreshing got forced into analytics mode and queued behind the
     // refresh's MCP calls.
-    const conversationMode = continuation
-      ? 'general' as const
-      : resolveConversationMode({ requestedMode, modeHint: body.modeHint, message }).mode;
+    const modeResolution = continuation
+      ? { mode: 'general' as const, via: 'default' as const }
+      : resolveConversationMode({ requestedMode, modeHint: body.modeHint, message });
+    const conversationMode = modeResolution.mode;
     const analyticsIntent = conversationMode === 'analytics_dashboard' && (
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
@@ -1886,6 +1887,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 });
                 continue;
               }
+              // A turn only DETECTED as analytics (no dashboard CTA, no build
+              // request) keeps the model's own answer: an ordinary question
+              // must never end in the canned dashboard refusal (2026-10-09).
+              const dashboardAsked = modeResolution.via === 'explicit' || analyticsIntent === 'create';
+              if (!analyticsTaskGrounding && !dashboardAsked) {
+                console.warn('[Chat] Analytics grounding gate: detected-only turn stayed ungrounded — keeping the model reply');
+              } else {
               console.warn('[Chat] Analytics grounding gate: second ungrounded reply — replacing it with an honest scoped failure/receipt');
               if (analyticsTaskGrounding) {
                 const scope = analyticsTaskGrounding.requiredExactAnchors.join(', ');
@@ -1899,6 +1907,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               } else {
                 const loadedPresets = analyticsBriefing?.presets.join(', ') || '';
                 content = `I loaded the selected business/schema knowledge${loadedPresets ? ` (${loadedPresets})` : ''}, but I could not produce a reliable knowledge-grounded dashboard proposal in this turn. Nothing was created. Please retry from the dashboard CTA; if it repeats, check the knowledge sources (#/connections/sql-context, analytics knowledge directory) and the BotBoy log.`;
+              }
               }
             }
 

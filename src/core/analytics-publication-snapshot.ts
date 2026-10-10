@@ -3,6 +3,7 @@ import type {
   AnalyticsDashboard,
   AnalyticsWidget,
   DashboardPublicationDataRoomIdentityV1,
+  DashboardPublicationDataRoomQueryIdentityV1,
   DashboardPublicationSnapshotV1,
 } from './analytics-types.js';
 
@@ -48,14 +49,24 @@ export function buildDashboardPublicationSnapshot(
     widgetId: string,
     result: NonNullable<AnalyticsWidget['result']>,
   ) => DashboardPublicationDataRoomIdentityV1,
+  validateDataRoomQueryWidget?: (
+    widget: AnalyticsWidget,
+    result: NonNullable<AnalyticsWidget['result']>,
+  ) => DashboardPublicationDataRoomQueryIdentityV1,
 ): DashboardPublicationSnapshotBuild {
   const widgets = [...dashboard.widgets]
     .sort((left, right) => left.position - right.position || left.id.localeCompare(right.id))
     .map(widget => {
       const result = widgetResult(widget);
       let dataRoom: DashboardPublicationDataRoomIdentityV1 | undefined;
+      let dataRoomQuery: DashboardPublicationDataRoomQueryIdentityV1 | undefined;
       if (widget.result?.source?.provider === 'data-room-query') {
-        throw new Error(`Independent Data Room widget ${widget.id} requires exact source revalidation before publication; publication was blocked rather than treating it as legacy data.`);
+        // An independent Data Room source publishes only when its result is
+        // exactly the configured source on the dataset's current head.
+        if (!validateDataRoomQueryWidget) {
+          throw new Error(`Independent Data Room widget ${widget.id} has no publication verifier in this build.`);
+        }
+        dataRoomQuery = validateDataRoomQueryWidget(widget, widget.result);
       }
       if (widget.binding) {
         if (!widget.result || !validateDataRoomWidget) {
@@ -71,6 +82,7 @@ export function buildDashboardPublicationSnapshot(
         presentationSha256: analyticsSha256(widgetPresentation(widget)),
         ...(result ? { resultSha256: analyticsSha256(result) } : {}),
         ...(dataRoom ? { dataRoom } : {}),
+        ...(dataRoomQuery ? { dataRoomQuery } : {}),
       };
     });
   const snapshot: DashboardPublicationSnapshotV1 = {

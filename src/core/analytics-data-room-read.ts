@@ -37,6 +37,9 @@ const MAX_QUERY_PARAMS = 100;
 const MAX_QUERY_CHARS = 20_000;
 const MAX_QUERY_ROWS = 200;
 const MAX_QUERY_BYTES = 30_000;
+/** Dashboard widgets (html views cut these rows in the page) carry more than a model reply. */
+const MAX_DASHBOARD_QUERY_ROWS = 5000;
+const MAX_DASHBOARD_QUERY_BYTES = 2_000_000;
 const QUERY_TIMEOUT_MS = 5_000;
 const DIRECT_QUERY_COMPILER_VERSION = 'data-room-select-v1';
 
@@ -428,6 +431,7 @@ function runDirectQueryWorker(input: {
   sql: string;
   params: QueryParameter[];
   rowLimit: number;
+  byteLimit?: number;
   signal?: AbortSignal;
 }): Promise<QueryWorkerResult> {
   if (input.signal?.aborted) {
@@ -442,7 +446,7 @@ function runDirectQueryWorker(input: {
         sql: input.sql,
         params: input.params.map(value => typeof value === 'boolean' ? (value ? 1 : 0) : value),
         rowLimit: input.rowLimit,
-        byteLimit: MAX_QUERY_BYTES,
+        byteLimit: input.byteLimit ?? MAX_QUERY_BYTES,
       },
     });
     let settled = false;
@@ -633,13 +637,16 @@ export function createAnalyticsDataRoomReadService(input: {
       }
     }
     const params = normalizeParameters(value.params);
-    const rowLimit = boundedInteger(value.limit, 100, 1, MAX_QUERY_ROWS, 'limit');
+    const dashboardUse = use === 'dashboard';
+    const rowLimit = boundedInteger(value.limit, 100, 1, dashboardUse ? MAX_DASHBOARD_QUERY_ROWS : MAX_QUERY_ROWS, 'limit');
+    const byteLimit = dashboardUse ? MAX_DASHBOARD_QUERY_BYTES : MAX_QUERY_BYTES;
     const startedAt = Date.now();
     const output = await runDirectQueryWorker({
       sources: resolved,
       sql,
       params,
       rowLimit,
+      byteLimit,
       signal: options.signal,
     });
     const sourceReceipts = resolved.map(source => ({
@@ -691,7 +698,7 @@ export function createAnalyticsDataRoomReadService(input: {
         compilerVersion: DIRECT_QUERY_COMPILER_VERSION,
         elapsedMs: Date.now() - startedAt,
         rowLimit,
-        byteLimit: MAX_QUERY_BYTES,
+        byteLimit,
         resultBytes: output.bytes,
         statementKind: 'read_only_select',
         effects: {

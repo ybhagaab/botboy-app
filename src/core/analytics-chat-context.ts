@@ -102,7 +102,15 @@ export interface AnalyticsSchemaBriefingLoaderOptions {
 
 const ANALYTICS_STRONG_SIGNAL_RE = /\b(?:analytics?|business intelligence|data (?:analysis|exploration|insights?)|kpis?|cohort(?: analysis)?|funnel(?: analysis)?|retention(?: analysis)?|attribution(?: analysis)?|segmentation|time[- ]series)\b/i;
 const ANALYTICS_ACTION_RE = /\b(?:analy[sz]e|compare|measure|trend|break(?:down)?|segment|aggregate|visuali[sz]e|chart|graph|plot|report|rank|correlate|forecast|summari[sz]e)\b/i;
-const ANALYTICS_NOUN_RE = /\b(?:data|metrics?|performance|activity|events?|items?|tasks?|projects?|users?|customers?|audience|revenue|sales|conversion|engagement|retention|attribution|campaigns?|cohorts?|funnels?|distribution|schema|tables?|columns?|rows?)\b/i;
+const ANALYTICS_NOUN_RE = /\b(?:data|metrics?|performance|users?|customers?|audience|revenue|sales|conversion|engagement|retention|attribution|campaigns?|cohorts?|funnels?|distribution|schema|tables?|columns?|rows?)\b/i;
+/**
+ * BotBoy's own work vocabulary (captured items, tasks, projects, activity).
+ * "top 3 attention items" or "summarize my tasks" is ordinary work, not
+ * analytics (owner report 2026-10-09): these nouns count only with a time
+ * grain or trend ("items by month", "tasks over time").
+ */
+const WORK_NOUN_RE = /\b(?:activity|events?|items?|tasks?|projects?|captures?|messages?|emails?)\b/i;
+const TIME_GRAIN_RE = /\b(?:over time|trend(?:s|ing)?|by (?:hour|day|week|month|quarter|year)|per (?:day|week|month)|daily|weekly|monthly|week[- ]over[- ]week|month[- ]over[- ]month|time[- ]series)\b/i;
 const ANALYTICS_QUESTION_RE = /\b(?:how many|what (?:percentage|percent|share|rate)|average|total|distribution|top \d+|over time|by (?:day|week|month|quarter|year)|week[- ]over[- ]week|month[- ]over[- ]month)\b/i;
 const DASHBOARD_ARTIFACT_RE = /\b(?:dashboard|report|chart|graph|visuali[sz]ation)\b/i;
 const DASHBOARD_CREATE_RE = /\b(?:create|build|design|make|generate|set up|put together)\b[\s\S]{0,80}\b(?:analytics? )?(?:dashboard|reporting view|report)\b|\b(?:analytics? )?(?:dashboard|reporting view|report)\b[\s\S]{0,80}\b(?:create|build|design|make|generate|set up|put together)\b/i;
@@ -123,7 +131,8 @@ export function detectAnalyticsConversation(message: string): boolean {
   if (ANALYTICS_STRONG_SIGNAL_RE.test(text)) return true;
   if (DASHBOARD_CREATE_RE.test(text)) return true;
   if (ANALYTICS_ACTION_RE.test(text) && ANALYTICS_NOUN_RE.test(text)) return true;
-  return ANALYTICS_QUESTION_RE.test(text) && ANALYTICS_NOUN_RE.test(text);
+  if (ANALYTICS_QUESTION_RE.test(text) && ANALYTICS_NOUN_RE.test(text)) return true;
+  return WORK_NOUN_RE.test(text) && TIME_GRAIN_RE.test(text);
 }
 
 /** Creation is inferred only from explicit build/design wording for a dashboard/report. */

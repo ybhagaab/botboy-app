@@ -1930,11 +1930,9 @@ describe('analytics dashboard publication verifier', () => {
     ]) expect(value).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it('fails with policy_denied when the exact version is not approved for publication', async () => {
+  it('publishes a version whose dataset handling says allowPublication=false (owner directive 2026-10-10)', async () => {
     const { environment, targetId, widget } = await publicationBridgeFixture(false);
-    const failure = capturedError(() => environment.bridge.validatePublicationResult(targetId, widget.result!));
-    expect(failure.code).toBe('policy_denied');
-    expect(failure.message).toMatch(/publication/i);
+    expect(environment.bridge.validatePublicationResult(targetId, widget.result!)).toMatchObject({ versionId: expect.any(String) });
   });
 
   it.each([
@@ -2148,11 +2146,37 @@ describe('analytics dashboard direct Data Room widget sources', () => {
     expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
   });
 
+  it('an html view page reads hidden Data Room widgets: it loads locally with no warehouse, and keys are checked', async () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Page',
+      widgets: [
+        { kind: 'html', title: 'Events page', config: { html: '<div id="app"></div><script>botboy.onData(d => { app.textContent = d.daily.rowCount; })</script>', inputs: ['daily'], span: 12 } },
+        { kind: 'table', title: 'Daily events', source: roomSource({ limit: 5000 }), config: { key: 'daily', hidden: true } },
+      ] as any,
+    });
+    expect(dashboard.widgets.map(widget => widget.kind)).toEqual(['html', 'table']);
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    const loaded = environment.dashboards.getDashboard(dashboard.id)!;
+    expect(loaded.widgets[0].result).toMatchObject({ trust: 'local_static_content' });
+    expect(loaded.widgets[1].result?.rows.length).toBeGreaterThan(0);
+    expect(loaded.widgets[1].config).toMatchObject({ key: 'daily', hidden: true });
+    expect(environment.mcp.stats()).toEqual({ sqlCalls: [], connectionProbes: 0 });
+    for (const [widgets, message] of [
+      [[{ kind: 'html', title: 'P', config: { html: '<p>x</p>', inputs: ['nope'] } }], /config\.inputs names nope/],
+      [[{ kind: 'html', title: 'P', config: { html: '' } }], /needs config\.html/],
+      [[{ kind: 'html', title: 'P', config: { html: '<p>x</p>' }, source: roomSource() }], /no source of its own/],
+      [[{ kind: 'table', title: 'A', source: roomSource(), config: { key: 'k' } }, { kind: 'table', title: 'B', source: roomSource(), config: { key: 'k' } }], /keys must be unique/],
+      [[{ kind: 'metric', title: 'S', sql: 'SELECT 1', config: { span: 13 } }], /config\.span/],
+    ] as const) {
+      expect(() => environment.dashboards.createDashboard({ title: 'Bad', widgets: widgets as any })).toThrow(message);
+    }
+  });
   it.each([
     ['an unknown dataset', { kind: 'line', title: 'Missing', source: roomSource({ datasetId: 'ds_missing' }) }, 'not_found', 'widgets[1].source.datasetId'],
     ['SQL that does not read source.data', { kind: 'line', title: 'Wrong table', source: roomSource({ sql: 'SELECT 1' }) }, 'invalid_input', 'widgets[1].source.sql'],
     ['an unsupported source field', { kind: 'line', title: 'Pinned', source: roomSource({ versionId: 'dsv_x' }) }, 'invalid_input', 'widgets[1].source.versionId'],
-    ['an out-of-range limit', { kind: 'table', title: 'Big', source: roomSource({ limit: 500 }) }, 'invalid_input', 'widgets[1].source.limit'],
+    ['an out-of-range limit', { kind: 'table', title: 'Big', source: roomSource({ limit: 5001 }) }, 'invalid_input', 'widgets[1].source.limit'],
   ])('rejects %s with its issue path and zero effect', (_label, widget, code, path) => {
     const environment = readyEnvironment();
     const failure = captured(() => environment.dashboards.createDashboard({
