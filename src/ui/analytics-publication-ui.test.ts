@@ -99,10 +99,12 @@ describe('analytics publication UI projection', () => {
     expect(dashboard).toContain('Prepare updated snapshot');
     expect(dashboard).toContain('Prepared snapshot is stale');
     expect(dashboard).toContain('External publication');
-    for (const label of [
-      'Snapshot manifest SHA-256', 'Artifact content SHA-256', 'Publisher config SHA-256',
-      'Binding SHA-256', 'Control values SHA-256', 'Semantic receipt SHA-256',
-    ]) expect(dashboard).toContain(label);
+    // The confirmation is a short owner step (owner decision 2026-10-10):
+    // hashes stay in the request and receipt, not on screen.
+    for (const label of ['Snapshot manifest SHA-256', 'Artifact content SHA-256', 'Publisher config SHA-256', 'Exact Data Room provenance']) {
+      expect(dashboard).not.toContain(label);
+    }
+    expect(dashboard).toContain('Publish this dashboard?');
     expect(dashboard).toContain('renderRoute({ userAction: true, preserveScroll: true })');
     expect(dashboard).toContain('restoreDashboardShareFocus();');
     expect(dashboard).toContain('renderLatestDashboardPublication(dashboard)');
