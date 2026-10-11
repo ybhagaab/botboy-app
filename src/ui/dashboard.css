@@ -2041,7 +2041,9 @@ a.data-room-row:hover { background:var(--hover); }
 .analytics-issue-cell button{color:var(--yellow)!important}
 .analytics-issue-flash{box-shadow:0 0 0 3px color-mix(in srgb,var(--yellow) 70%,transparent);transition:box-shadow .3s}
 
-.topbar-actions:has(.update-chip:not([hidden])) { min-width:max-content; }.command-trigger kbd { white-space:nowrap; flex:0 0 auto; }
+/* The actions column keeps its content width (any chip: update, a long health warning), so the search box shrinks instead of being overlapped. */
+.topbar-actions { min-width:max-content; }
+.command-trigger { min-width:0; }.command-trigger kbd { white-space:nowrap; flex:0 0 auto; }
 .update-chip { --uc:var(--accent, #6d5bd0); position:relative; overflow:hidden; isolation:isolate; flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; padding:6px 12px 6px 9px; border:1px solid var(--uc); border-radius:999px; background:color-mix(in srgb,var(--uc) 12%,transparent); color:var(--text); font-size:12px; font-weight:600; white-space:nowrap; cursor:pointer; transition:transform .15s ease, background .2s ease; }
 .update-chip[hidden] { display:none; }
 .update-chip:hover:not(:disabled) { transform:translateY(-1px); background:color-mix(in srgb,var(--uc) 20%,transparent); }
