@@ -66,7 +66,7 @@ import { afterEach, beforeEach } from 'vitest';
 import { createBrowserMonitor, GENERIC_PAGE_TEXT, THIN_PAGE_CHARS } from './browser-monitor.js';
 
 describe('browser page capture', () => {
-  type Answer = { href?: string; ready?: string; text?: string; html?: string };
+  type Answer = { href?: string; ready?: string; text?: string; html?: string; fields?: string };
   let server: http.Server;
   let wss: WebSocketServer;
   let base: string;
@@ -90,6 +90,7 @@ describe('browser page capture', () => {
         const expression = String(msg.params?.expression ?? '');
         const value = expression === 'document.readyState' ? (answer.ready ?? 'complete')
           : expression === 'String(location.href)' ? (answer.href ?? 'https://x.test/')
+          : expression.includes('botboyCollectFields') ? (answer.fields ?? '')
           : expression.includes('outerHTML') ? (answer.html ?? '')
           : (answer.text ?? '');
         socket.send(JSON.stringify({ id: msg.id, result: { result: { value } } }));
@@ -199,6 +200,98 @@ describe('browser page capture', () => {
       await m.pollOnce();
     }
     expect(items).toHaveLength(4);
+  });
+
+  const formFields = (name: string, extra: any[] = []) => JSON.stringify({ fields: [
+    { kind: 'textbox', label: 'Full name', value: name, path: '#n', native: true },
+    { kind: 'textbox', label: 'Password', withheld: true, filled: true, path: '#p', native: true },
+    ...extra,
+  ], truncated: 0 });
+
+  it('appends a Fields section with values and withheld secrets, and redacts the HTML', async () => {
+    page('form', 'https://forms.test/apply', 'Apply', () => ({ text: LONG, fields: formFields('Asha Rao'), html: '<html><body>password=SuperSecret123 <input value="[withheld]"></body></html>' }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    const content = items[0].content as string;
+    expect(content.startsWith(LONG.trim())).toBe(true);
+    expect(content).toContain('--- Fields (2) ---\nFull name: Asha Rao\nPassword: [withheld]');
+    expect(items[0].rawHtml).not.toContain('SuperSecret123');
+  });
+
+  it('a mostly-form page counts its fields as content and is captured without settling', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({ kind: 'textbox', label: `Question ${i + 1}`, value: `Answer number ${i + 1}`, path: `#q${i}` }));
+    page('short', 'https://forms.test/short', 'Short', () => ({ text: 'Form', fields: formFields('Asha', many) }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    expect(items[0].content).toContain('Question 12: Answer number 12');
+  });
+
+  it('captures a field change again only after it holds for two polls, a bounded number of times', async () => {
+    let name = 'Asha';
+    page('edit', 'https://forms.test/edit', 'Edit', () => ({ text: LONG, fields: formFields(name) }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    name = 'Asha Rao';
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    await m.pollOnce();
+    expect(items).toHaveLength(2);
+    expect(items[1].content).toContain('Full name: Asha Rao');
+    await m.pollOnce();
+    expect(items).toHaveLength(2);
+    for (let round = 0; round < 6; round++) {
+      name = `Name ${round}`;
+      await m.pollOnce();
+      await m.pollOnce();
+    }
+    expect(items).toHaveLength(4);
+  });
+
+  it('never captures a form mid-typing, even when a textarea grows past the growth ratio', async () => {
+    let typed = 'x';
+    const notes = () => Array.from({ length: 5 }, (_, i) => ({ kind: 'textbox', label: `Notes ${i}`, value: typed, path: `#t${i}` }));
+    page('typing', 'https://forms.test/typing', 'Typing', () => ({ text: LONG, fields: formFields(typed, notes()) }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    for (let round = 0; round < 8; round++) {
+      typed = `${round} ${typed}${'y'.repeat(typed.length + 400)}`;
+      await m.pollOnce();
+    }
+    expect(items).toHaveLength(1);
+  });
+
+  it('a cross-origin frame field edit recaptures after two equal polls; a failed frame read is no change', async () => {
+    let frameName = 'Frame A';
+    let frameDown = false;
+    page('host', 'https://share.test/host', 'Host', () => ({ text: LONG, fields: formFields('Asha') }));
+    targets.push({ type: 'iframe', id: 'ff', parentId: 'host', url: 'https://office.test/form?x=1', webSocketDebuggerUrl: `ws://${base}/devtools/page/ff` });
+    answers.set('ff', () => ({ text: 'Frame form', fields: frameDown ? '' : JSON.stringify({ fields: [{ kind: 'textbox', label: 'Frame name', value: frameName, path: '#f' }] }) }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    expect(items[0].content).toContain('[frame https://office.test/form?x=1]\n--- Fields (1) ---\nFrame name: Frame A');
+    frameDown = true;
+    await m.pollOnce();
+    frameDown = false;
+    await m.pollOnce();
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    frameName = 'Frame B';
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    await m.pollOnce();
+    expect(items).toHaveLength(2);
+    expect(items[1].content).toContain('Frame name: Frame B');
+  });
+
+  it('platform pages are not read for fields', async () => {
+    page('slack', 'https://app.slack.com/client/T1/C1', 'general', () => ({ text: LONG, fields: formFields('Asha') }));
+    const { m, items } = monitor();
+    await m.pollOnce();
+    expect(items).toHaveLength(1);
+    expect(items[0].content).not.toContain('--- Fields');
   });
 
   it('the in-page reader enters open shadow roots and skips page chrome', () => {

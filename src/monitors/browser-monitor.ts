@@ -11,6 +11,14 @@
 import WebSocket from 'ws';
 import type { RawWorkItem, WorkItemType } from '../core/types.js';
 import { htmlToText } from '../core/email-capture.js';
+import { redactSecrets } from '../core/sensitive-files.js';
+import {
+  FORM_FIELDS_READER,
+  HTML_FIELD_REDACTION_SNIPPET,
+  fieldsFingerprint,
+  parseFieldsAnswer,
+  renderFieldsSection,
+} from '../core/form-fields.js';
 
 export interface BrowserMonitor {
   start(): Promise<void>;
@@ -424,12 +432,44 @@ function shortHash(text: string): string {
   return (h >>> 0).toString(36);
 }
 
-async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: string; errorPage?: boolean }> {
-  if (!tab.webSocketDebuggerUrl) return { text: '', html: '' };
+/** What one read of a tab produced. */
+interface PageContent {
+  text: string;
+  html: string;
+  errorPage?: boolean;
+  /** Prose characters (page and frame text without Fields lines): the growth rule's measure. */
+  proseChars: number;
+  /** Characters of rendered Fields lines (counted by the thin-page settle). */
+  fieldsChars: number;
+  fieldCount: number;
+  /** Field fingerprint per segment (`main`, then `frame:<i>:<url>`); null = not read this poll. */
+  fieldSegments: Array<[string, string | null]>;
+}
+
+function emptyContent(extra: Partial<PageContent> = {}): PageContent {
+  return { text: '', html: '', proseChars: 0, fieldsChars: 0, fieldCount: 0, fieldSegments: [], ...extra };
+}
+
+/** Field read of one target: the rendered section plus its fingerprint, or null when unread. */
+async function readFields(wsUrl: string): Promise<{ section: string; fingerprint: string; count: number } | null> {
+  const parsed = parseFieldsAnswer(await cdpEval(wsUrl, FORM_FIELDS_READER, 6000).catch(() => ''));
+  if (!parsed) return null;
+  return { section: renderFieldsSection(parsed.fields, parsed.truncated), fingerprint: fieldsFingerprint(parsed.fields), count: parsed.fields.length + parsed.truncated };
+}
+
+function urlWithoutQuery(url: string): string {
+  return url.replace(/[?#].*$/, '');
+}
+
+async function extractPageContent(tab: TabInfo): Promise<PageContent> {
+  if (!tab.webSocketDebuggerUrl) return emptyContent();
   try {
     // Use platform-specific extraction for messaging apps
     const url = tab.url;
     let expression: string;
+    // Form fields are read on generic pages only: platform compose boxes churn,
+    // and those pages have their own readers.
+    let generic = false;
 
     if (/app\.slack\.com|slack\.com\/client/.test(url)) {
       // Slack: extract message content from the active channel
@@ -538,45 +578,75 @@ async function extractPageContent(tab: TabInfo): Promise<{ text: string; html: s
       // shadow roots, which innerText never enters), plus same-origin iframes.
       // Cross-origin iframes are read separately as their own targets.
       expression = GENERIC_PAGE_TEXT;
+      generic = true;
     }
 
     // A browser error page ("This site can't be reached") is not content.
     const href = await cdpEval(tab.webSocketDebuggerUrl, 'String(location.href)', 4000).catch(() => '');
-    if (/^chrome-error:/i.test(href)) return { text: '', html: '', errorPage: true };
-    let text = await cdpEval(tab.webSocketDebuggerUrl, expression);
+    if (/^chrome-error:/i.test(href)) return emptyContent({ errorPage: true });
+    const prose = await cdpEval(tab.webSocketDebuggerUrl, expression);
+    const fieldSegments: Array<[string, string | null]> = [];
+    let fieldsChars = 0;
+    let fieldCount = 0;
+    let mainFields = '';
+    if (generic) {
+      const main = await readFields(tab.webSocketDebuggerUrl);
+      fieldSegments.push(['main', main?.fingerprint ?? null]);
+      if (main?.section) {
+        mainFields = main.section;
+        fieldsChars += main.section.length;
+        fieldCount += main.count;
+      }
+    }
     // Cross-origin frames (Office/SharePoint viewers, embedded dashboards).
     const seenFrameText = new Set<string>();
     let frameChars = 0;
-    for (const frame of tab.frames) {
-      if (frameChars >= MAX_FRAMES_TEXT) break;
-      const frameText = (await cdpEval(frame.webSocketDebuggerUrl, GENERIC_PAGE_TEXT, 6000).catch(() => '')).trim();
-      // Tiny frames are widgets (a button, a counter); repeated ones add nothing.
-      if (frameText.length < 40 || seenFrameText.has(frameText) || text.includes(frameText)) continue;
-      seenFrameText.add(frameText);
-      const kept = frameText.slice(0, Math.min(MAX_FRAME_CHARS, MAX_FRAMES_TEXT - frameChars));
-      frameChars += kept.length;
-      text += `${text ? '\n\n' : ''}[frame ${frame.url.slice(0, 200)}]\n${kept}`;
+    const frameBlocks: string[] = [];
+    let proseChars = prose.length;
+    for (const [index, frame] of tab.frames.entries()) {
+      const frameFields = generic ? await readFields(frame.webSocketDebuggerUrl) : null;
+      if (generic) fieldSegments.push([`frame:${index}:${urlWithoutQuery(frame.url)}`, frameFields?.fingerprint ?? null]);
+      const fieldsBlock = frameFields?.section ?? '';
+      let kept = '';
+      if (frameChars < MAX_FRAMES_TEXT) {
+        const frameText = (await cdpEval(frame.webSocketDebuggerUrl, GENERIC_PAGE_TEXT, 6000).catch(() => '')).trim();
+        // Tiny frames are widgets (a button, a counter); repeated ones add nothing.
+        if (frameText.length >= 40 && !seenFrameText.has(frameText) && !prose.includes(frameText)) {
+          seenFrameText.add(frameText);
+          kept = frameText.slice(0, Math.min(MAX_FRAME_CHARS, MAX_FRAMES_TEXT - frameChars));
+          frameChars += kept.length;
+        }
+      }
+      if (!kept && !fieldsBlock) continue;
+      proseChars += kept.length;
+      fieldsChars += fieldsBlock.length;
+      fieldCount += frameFields?.count ?? 0;
+      frameBlocks.push(`[frame ${frame.url.slice(0, 200)}]\n${[kept, fieldsBlock].filter(Boolean).join('\n\n')}`);
     }
+    const text = [prose, mainFields, ...frameBlocks].filter(part => part.trim()).join('\n\n');
     // Raw page capture: the ENTIRE document HTML plus same-origin iframe
     // documents, losslessly (no caps — the ContentStore blobs large pages).
+    // Serialized from a clone with hidden-input values removed and withheld
+    // fields blanked; the final string also passes the secret-format redaction.
     let html = '';
     try {
-      html = await cdpEval(tab.webSocketDebuggerUrl, `(function() {
-        var h = document.documentElement ? document.documentElement.outerHTML : '';
+      html = await cdpEval(tab.webSocketDebuggerUrl, `(function() {${HTML_FIELD_REDACTION_SNIPPET}
+        var h = botboyRedactedHtml(document.documentElement);
         document.querySelectorAll('iframe').forEach(function(f, i) {
           try {
-            var d = f.contentDocument && f.contentDocument.documentElement ? f.contentDocument.documentElement.outerHTML : '';
+            var d = f.contentDocument && f.contentDocument.documentElement ? botboyRedactedHtml(f.contentDocument.documentElement) : '';
             if (d) h += '\\n<!-- botboy:iframe[' + i + '] src=' + (f.src || '') + ' -->\\n' + d;
           } catch (e) {}
         });
         return h;
       })()`, 15000);
+      html = redactSecrets(html);
     } catch { /* raw html is best-effort; text capture stands on its own */ }
 
-    return { text, html };
+    return { text, html, proseChars, fieldsChars, fieldCount, fieldSegments };
   } catch (err) {
     console.error(`Content extraction failed for ${tab.url}:`, (err as Error).message);
-    return { text: '', html: '' };
+    return emptyContent();
   }
 }
 
@@ -615,7 +685,22 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
 
   /** Static pages: polls spent waiting for real text, and what was captured. */
   const settleAttempts = new Map<string, number>();
-  const captured = new Map<string, { chars: number; recaptures: number }>();
+  /**
+   * `chars` is prose length (the growth rule never sees field values);
+   * `fields` is the captured field fingerprint, `pendingFields` a changed one
+   * waiting for a second equal poll, and `segments` the last read of each
+   * field segment (a frame that fails one poll keeps its previous read).
+   */
+  const captured = new Map<string, { chars: number; recaptures: number; fields: string; pendingFields?: string; segments: Map<string, string> }>();
+  const lastSegments = new Map<string, Map<string, string>>();
+
+  /** The tab's combined field fingerprint, filling unread segments from the previous poll. */
+  function mergeFieldSegments(url: string, read: Array<[string, string | null]>): { fingerprint: string; segments: Map<string, string> } {
+    const previous = captured.get(url)?.segments ?? lastSegments.get(url);
+    const segments = new Map<string, string>();
+    for (const [key, value] of read) segments.set(key, value ?? previous?.get(key) ?? `${key}|unread`);
+    return { fingerprint: [...segments].map(([key, value]) => `${key}=${value}`).join('\n'), segments };
+  }
   const maxSettleAttempts = cfg.maxSettleAttempts ?? 6;
 
   /** WhatsApp message ids already captured this process (the store check covers restarts). */
@@ -716,24 +801,40 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
       const html = extracted.html;
 
       if (!dynamic) {
+        const { fingerprint, segments } = mergeFieldSegments(tab.url, extracted.fieldSegments);
+        let chars = extracted.proseChars;
         // An app still rendering returns a shell ("Loading…") or nothing.
         // Wait for real text a few polls before settling for what there is;
-        // the page's HTML is the last resort (text read from it here).
-        if (content.length < THIN_PAGE_CHARS && !previous) {
+        // the page's HTML is the last resort (text read from it here). A
+        // mostly-form page counts its fields as real content.
+        if (extracted.proseChars + extracted.fieldsChars < THIN_PAGE_CHARS && !previous) {
+          lastSegments.set(tab.url, segments);
           const attempts = (settleAttempts.get(tab.url) ?? 0) + 1;
           settleAttempts.set(tab.url, attempts);
           if (attempts < maxSettleAttempts) continue;
-          if (!content && html) content = htmlToText(html).trim();
+          if (!content && html) { content = htmlToText(html).trim(); chars = content.length; }
           if (!content) continue;
         }
         if (previous) {
-          // Captured before: only a page that kept rendering much more text is captured again.
-          if (!(content.length >= previous.chars * GROWTH_RATIO && content.length - previous.chars >= GROWTH_MIN_CHARS)) continue;
+          previous.segments = segments;
+          // Captured before: a page that kept rendering much more prose is
+          // captured again; field values never count toward growth.
+          const grew = chars >= previous.chars * GROWTH_RATIO && chars - previous.chars >= GROWTH_MIN_CHARS;
+          if (!grew) {
+            // A field change is captured once it holds for two consecutive
+            // polls, so a form mid-typing is never captured.
+            if (fingerprint === previous.fields) { previous.pendingFields = undefined; continue; }
+            if (previous.pendingFields !== fingerprint) { previous.pendingFields = fingerprint; continue; }
+          }
         }
         settleAttempts.delete(tab.url);
-        captured.set(tab.url, { chars: content.length, recaptures: previous ? previous.recaptures + 1 : 0 });
+        lastSegments.delete(tab.url);
+        captured.set(tab.url, { chars, recaptures: previous ? previous.recaptures + 1 : 0, fields: fingerprint, pendingFields: undefined, segments });
         if (captured.size > 5000) {
           for (const key of [...captured.keys()].slice(0, 2500)) captured.delete(key);
+        }
+        if (lastSegments.size > 5000) {
+          for (const key of [...lastSegments.keys()].slice(0, 2500)) lastSegments.delete(key);
         }
       }
 
@@ -765,7 +866,7 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
       };
 
       emit(item);
-      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${html.length} chars html${tab.frames.length ? `, ${tab.frames.length} frame${tab.frames.length === 1 ? '' : 's'}` : ''})`);
+      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${html.length} chars html${extracted.fieldCount ? `, ${extracted.fieldCount} field${extracted.fieldCount === 1 ? '' : 's'}` : ''}${tab.frames.length ? `, ${tab.frames.length} frame${tab.frames.length === 1 ? '' : 's'}` : ''})`);
     }
   }
 

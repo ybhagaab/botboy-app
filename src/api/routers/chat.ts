@@ -200,6 +200,29 @@ const PACED_STATUS_TOOLS = new Set([
 ]);
 export const STATUS_READ_PACE_MS = 10_000;
 
+/**
+ * The tool-call preview streamed to the chat panel. A browser_hands fill shows
+ * which fields it targets, never the values (a value may be a password the
+ * owner supplied).
+ */
+export function previewToolArgs(name: string, argumentsJson: string): string {
+  const raw = String(argumentsJson ?? '');
+  if (name === 'browser_hands') {
+    try {
+      const args = JSON.parse(raw);
+      if (Array.isArray(args?.fields)) {
+        const targets = args.fields
+          .map((entry: any) => String(entry?.label ?? entry?.ref ?? '?').slice(0, 40))
+          .join(', ');
+        return JSON.stringify({ action: args.action, tabId: args.tabId, fields: targets }).slice(0, 100);
+      }
+    } catch {
+      return raw.includes('"fields"') ? '{"action":"fill"}' : raw.slice(0, 100);
+    }
+  }
+  return raw.slice(0, 100);
+}
+
 export function isPacedStatusRead(toolName: string, argumentsJson: string): boolean {
   if (PACED_STATUS_TOOLS.has(toolName)) return true;
   return toolName === 'create_data_room_dataset' && dataRoomDatasetAction(argumentsJson) === 'status';
@@ -2020,7 +2043,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           if (sqlParallelBatch) {
             for (const [index, tc] of sanitizedToolCalls.entries()) {
               seenToolCalls.set(sqlBatchKeys[index], 1);
-              res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: tc.function.arguments.slice(0, 100) })}\n\n`);
+              res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: previewToolArgs(tc.function.name, tc.function.arguments) })}\n\n`);
             }
             res.write(`data: ${JSON.stringify({ type: 'status', text: `🗄️ Running ${sanitizedToolCalls.length} queries in parallel...` })}\n\n`);
             const sqlKeepalive = setInterval(() => {
@@ -2039,7 +2062,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             }
           } else
           for (const tc of sanitizedToolCalls) {
-            res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: tc.function.arguments.slice(0, 100) })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'tool', name: tc.function.name, args: previewToolArgs(tc.function.name, tc.function.arguments) })}\n\n`);
             // Repeat-call breaker: a byte-identical call can only return the
             // same result (post-mortem 2026-08-03: 12 identical search_items
             // calls burned the whole iteration budget). First repeat gets a

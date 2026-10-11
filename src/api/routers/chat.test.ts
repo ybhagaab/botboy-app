@@ -7,7 +7,18 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { isTransientStreamError } from './chat.js';
+import { isTransientStreamError, previewToolArgs } from './chat.js';
+describe('previewToolArgs', () => {
+  it('shows browser_hands fill targets without their values', () => {
+    const args = JSON.stringify({ action: 'fill', tabId: 'tab_1', fields: [{ label: 'Password', value: 'Hunter2-Very-Secret' }, { ref: 'r3', value: 'Christianity' }] });
+    const preview = previewToolArgs('browser_hands', args);
+    expect(preview).toContain('Password, r3');
+    expect(preview).not.toContain('Hunter2');
+    expect(preview).not.toContain('Christianity');
+    expect(previewToolArgs('browser_hands', '{"action":"fill","fields":[{"label":"P","value":"Hunter2')).not.toContain('Hunter2');
+    expect(previewToolArgs('get_today', '{"a":1}')).toBe('{"a":1}');
+  });
+});
 
 describe('isTransientStreamError', () => {
   describe('provider-side 5xx (the 2026-09-03 incident class) — retryable', () => {
