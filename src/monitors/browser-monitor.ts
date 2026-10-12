@@ -4,13 +4,14 @@
  * Connects to a running Chrome instance (debug port 9222) and:
  * 1. Polls /json/list for open tabs
  * 2. Connects to each new tab via CDP WebSocket
- * 3. Extracts visible text content using Runtime.evaluate
+ * 3. Extracts visible text content using Runtime.evaluate, in two phases:
+ *    a probe (text, fields, frames) on one WebSocket per tab, then the page's
+ *    HTML only when a capture will be emitted
  * 4. Detects platform-specific pages by URL pattern
  */
 
 import WebSocket from 'ws';
 import type { RawWorkItem, WorkItemType } from '../core/types.js';
-import { htmlToText } from '../core/email-capture.js';
 import { redactSecrets } from '../core/sensitive-files.js';
 import {
   FORM_FIELDS_READER,
@@ -19,6 +20,57 @@ import {
   parseFieldsAnswer,
   renderFieldsSection,
 } from '../core/form-fields.js';
+import {
+  THIN_PAGE_CHARS,
+  decideDynamicCapture,
+  decideStaticCapture,
+  isStaticCaptureExhausted,
+  type CapturedState,
+  type StaticProbe,
+  type StaticTabState,
+} from './browser-capture-decision.js';
+import {
+  createPollGovernor,
+  initialPlanState,
+  medianOf,
+  planTabReads,
+  type PlannedTab,
+} from './browser-poll-governor.js';
+import { loadPerCpu, readMemoryPressure, type MemoryPressure } from '../core/system-pressure.js';
+
+export { THIN_PAGE_CHARS };
+
+/** What the pacing governor and the Connections card read about the monitor. */
+export interface BrowserCaptureStatus {
+  /** The owner paused browser capture (no /json/list, no CDP while true). */
+  paused: boolean;
+  /** The interval in force now, and the configured base. */
+  intervalMs: number;
+  baseIntervalMs: number;
+  /** Why polls are slowed (for example `memory pressure: warn`); null when calm. */
+  slowedReason: string | null;
+  lastPollMs: number | null;
+  lastPollAt: number | null;
+  tabsSeen: number;
+  tabsRead: number;
+  tabsDeferred: number;
+}
+
+/** One read phase of one tab in one poll (measurement only). */
+export interface PollTabStat {
+  id: string;
+  phase: 'probe' | 'html' | 'whatsapp' | 'pdf';
+  ms: number;
+  bytes: number;
+}
+
+export interface PollStats {
+  wallMs: number;
+  tabsSeen: number;
+  tabsRead: number;
+  tabsDeferred: number;
+  perTab: PollTabStat[];
+}
 
 export interface BrowserMonitor {
   start(): Promise<void>;
@@ -26,6 +78,12 @@ export interface BrowserMonitor {
   onWorkItem(callback: (item: RawWorkItem) => void): void;
   /** One poll now (tests; the timer calls the same). */
   pollOnce(): Promise<void>;
+  /**
+   * Back to the base interval and poll now (the owner resumed capture).
+   * During a poll it runs exactly one follow-up when that poll ends.
+   */
+  wake(): void;
+  status(): BrowserCaptureStatus;
 }
 
 export interface BrowserMonitorConfig {
@@ -48,6 +106,33 @@ export interface BrowserMonitorConfig {
    * viewer, which has no page text, so the file itself is read.
    */
   readPdf?: (bytes: Buffer) => Promise<string>;
+  /**
+   * Wall-time bound of one poll (default 20 s), checked between tabs and
+   * between a tab's read phases. The first tab of a poll is always read in
+   * full; a tab left for the next poll keeps its remembered state untouched.
+   */
+  maxPollWallMs?: number;
+  /** Clock for the wall bound and poll timings (tests). */
+  now?: () => number;
+  /**
+   * Adaptive pacing (default off): the interval doubles up to 5 minutes while
+   * polls are slow or the Mac is under memory pressure or load, and returns to
+   * `pollIntervalMs` after three calm polls. Calm behaves exactly as without it.
+   */
+  adaptive?: boolean;
+  /** Soft per-poll tab budget, applied only while slowed (default 12). */
+  maxTabsPerPoll?: number;
+  /** Memory pressure and load per core, sampled after each poll (default: the OS). */
+  sampleSystem?: () => { pressure: MemoryPressure; loadPerCpu: number };
+  /**
+   * True while the owner has paused browser capture: no /json/list and no CDP
+   * call is made, checked before every CDP call and before every emit.
+   */
+  isPaused?: () => boolean;
+  /** Measurement per poll (never affects capture). */
+  onPollStats?: (stats: PollStats) => void;
+  /** The interval or the slowed reason changed. */
+  onStatusChange?: (status: BrowserCaptureStatus) => void;
 }
 /** Largest PDF a browser tab capture downloads. */
 export const MAX_TAB_PDF_BYTES = 25 * 1024 * 1024;
@@ -79,12 +164,8 @@ export function whatsAppMessageUrl(messageId: string): string {
   return `https://web.whatsapp.com/#msg=${encodeURIComponent(messageId)}`;
 }
 
-/** Below this, a page is still rendering (or is a shell) and is checked again. */
-export const THIN_PAGE_CHARS = 200;
-/** A captured static page is captured again once its text grows this much (an app that kept rendering). */
-const GROWTH_RATIO = 1.5;
-const GROWTH_MIN_CHARS = 300;
-const MAX_RECAPTURES = 3;
+/** A poll that has used this much wall time leaves its remaining tabs for the next poll. */
+const DEFAULT_MAX_POLL_WALL_MS = 20_000;
 
 const DEFAULT_CONFIG: BrowserMonitorConfig = {
   cdpEndpoint: 'http://127.0.0.1:9222',
@@ -172,7 +253,8 @@ interface TabInfo {
 
 async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string) => boolean): Promise<TabInfo[]> {
   try {
-    const resp = await fetch(`${endpoint}/json/list`);
+    // A DevTools endpoint that accepts and never answers must not hold the (non-overlapping) poll forever.
+    const resp = await fetch(`${endpoint}/json/list`, { signal: AbortSignal.timeout(10_000) });
     if (!resp.ok) return [];
     const tabs = await resp.json() as any[];
     // URL blocklist — skip these entirely
@@ -273,6 +355,138 @@ function cdpEval(wsUrl: string, expression: string, timeout = 8000): Promise<str
       reject(err);
     });
   });
+}
+
+/**
+ * One CDP connection to one target, reused for every evaluation of a read.
+ *
+ * Per call it behaves exactly like `cdpEval`: `document.readyState` is
+ * checked first (answered `''` when the page is not `complete`, with no
+ * expression injected), ids only grow, requests go out one at a time, and a
+ * call that times out or hits a socket error rejects and discards the
+ * connection. The next call on a discarded session reopens it lazily, so one
+ * failed tolerated read never poisons the reads after it. A session opens no
+ * socket until its first call; `close()` is always safe.
+ */
+export interface CdpSession {
+  eval(expression: string, timeout?: number): Promise<string>;
+  /** Bytes received from the target so far. */
+  readonly bytes: number;
+  close(): void;
+}
+
+export function openCdpSession(wsUrl: string): CdpSession {
+  let socket: WebSocket | null = null;
+  let bytes = 0;
+  let nextId = 1;
+
+  function connection(): WebSocket {
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) return socket;
+    const fresh = new WebSocket(wsUrl);
+    // A dead socket is never reused; the call waiting on it reports the error.
+    const forget = () => { if (socket === fresh) socket = null; };
+    fresh.on('error', forget);
+    fresh.on('close', forget);
+    socket = fresh;
+    return fresh;
+  }
+
+  function discard(): void {
+    const dead = socket;
+    socket = null;
+    if (!dead) return;
+    try { dead.close(); } catch { /* already gone */ }
+  }
+
+  function evaluate(expression: string, timeout = 8000): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let ws: WebSocket | undefined;
+      const readyId = nextId++;
+      const expressionId = nextId++;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const detach = () => {
+        if (timer) clearTimeout(timer);
+        ws?.off('message', onMessage);
+        ws?.off('error', onError);
+        ws?.off('open', start);
+      };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        discard();
+        reject(err);
+      };
+      const succeed = (value: string) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        resolve(value);
+      };
+      function onError(err: Error): void { fail(err); }
+      function start(): void {
+        try {
+          // First check if page is fully loaded before injecting anything
+          ws!.send(JSON.stringify({
+            id: readyId,
+            method: 'Runtime.evaluate',
+            params: { expression: 'document.readyState', returnByValue: true },
+          }));
+        } catch (err) { fail(err as Error); }
+      }
+      function onMessage(data: Buffer): void {
+        bytes += data.length;
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === readyId) {
+            const readyState = msg.result?.result?.value;
+            if (readyState !== 'complete') {
+              // Page not fully loaded — skip this read, don't interfere
+              succeed('');
+              return;
+            }
+            // Page is loaded — now extract content
+            ws!.send(JSON.stringify({
+              id: expressionId,
+              method: 'Runtime.evaluate',
+              params: { expression, returnByValue: true, awaitPromise: true },
+            }));
+          }
+          if (msg.id === expressionId) {
+            const val = msg.result?.result?.value;
+            succeed(typeof val === 'string' ? val : '');
+          }
+        } catch { /* ignore parse errors */ }
+      }
+      timer = setTimeout(() => fail(new Error('CDP eval timeout')), timeout);
+      try {
+        ws = connection();
+      } catch (err) {
+        fail(err as Error);
+        return;
+      }
+      ws.on('message', onMessage);
+      ws.on('error', onError);
+      if (ws.readyState === WebSocket.OPEN) start(); else ws.once('open', start);
+    });
+  }
+
+  return {
+    eval: evaluate,
+    get bytes() { return bytes; },
+    close: discard,
+  };
+}
+
+/** Opens a session for one tab and always closes it. */
+async function withTabSession<T>(tab: { webSocketDebuggerUrl: string }, fn: (session: CdpSession) => Promise<T>): Promise<T> {
+  const session = openCdpSession(tab.webSocketDebuggerUrl);
+  try {
+    return await fn(session);
+  } finally {
+    session.close();
+  }
 }
 
 /**
@@ -432,27 +646,26 @@ function shortHash(text: string): string {
   return (h >>> 0).toString(36);
 }
 
-/** What one read of a tab produced. */
-interface PageContent {
-  text: string;
-  html: string;
+/**
+ * What one probe of a tab read: everything but the page's HTML, which is read
+ * only when a capture will actually be emitted (`readTabHtml`).
+ */
+interface TabProbe extends StaticProbe {
+  /** The tab's address and visibility as the page reports them. */
+  href: string;
+  /** `visible`, `hidden`, … — `unknown` when the answer was not the expected pair. */
+  visibility: string;
   errorPage?: boolean;
-  /** Prose characters (page and frame text without Fields lines): the growth rule's measure. */
-  proseChars: number;
-  /** Characters of rendered Fields lines (counted by the thin-page settle). */
-  fieldsChars: number;
   fieldCount: number;
-  /** Field fingerprint per segment (`main`, then `frame:<i>:<url>`); null = not read this poll. */
-  fieldSegments: Array<[string, string | null]>;
 }
 
-function emptyContent(extra: Partial<PageContent> = {}): PageContent {
-  return { text: '', html: '', proseChars: 0, fieldsChars: 0, fieldCount: 0, fieldSegments: [], ...extra };
+function emptyProbe(extra: Partial<TabProbe> = {}): TabProbe {
+  return { text: '', proseChars: 0, fieldsChars: 0, fieldCount: 0, fieldSegments: [], href: '', visibility: 'unknown', ...extra };
 }
 
 /** Field read of one target: the rendered section plus its fingerprint, or null when unread. */
-async function readFields(wsUrl: string): Promise<{ section: string; fingerprint: string; count: number } | null> {
-  const parsed = parseFieldsAnswer(await cdpEval(wsUrl, FORM_FIELDS_READER, 6000).catch(() => ''));
+async function readFields(session: CdpSession): Promise<{ section: string; fingerprint: string; count: number } | null> {
+  const parsed = parseFieldsAnswer(await session.eval(FORM_FIELDS_READER, 6000).catch(() => ''));
   if (!parsed) return null;
   return { section: renderFieldsSection(parsed.fields, parsed.truncated), fingerprint: fieldsFingerprint(parsed.fields), count: parsed.fields.length + parsed.truncated };
 }
@@ -461,8 +674,34 @@ function urlWithoutQuery(url: string): string {
   return url.replace(/[?#].*$/, '');
 }
 
-async function extractPageContent(tab: TabInfo): Promise<PageContent> {
-  if (!tab.webSocketDebuggerUrl) return emptyContent();
+/** The address probe: the page's own address and whether it is visible. */
+const HREF_PROBE = 'JSON.stringify([location.href, document.visibilityState])';
+
+/** An answer that is not the expected pair is the address itself (visibility unknown). */
+export function parseHrefProbe(raw: string): { href: string; visibility: string } {
+  try {
+    const value = JSON.parse(raw);
+    if (Array.isArray(value) && typeof value[0] === 'string') {
+      return { href: value[0], visibility: typeof value[1] === 'string' ? value[1] : 'unknown' };
+    }
+  } catch { /* not the pair */ }
+  return { href: raw, visibility: 'unknown' };
+}
+
+/** Thrown by a guarded session when the owner paused capture mid-read. */
+class PausedError extends Error {
+  constructor() { super('Browser capture is paused'); }
+}
+
+/**
+ * Phase one of a read: the address, the page text, form fields, and
+ * cross-origin frames (each on its own connection). Failure policy, exactly
+ * as before the split: the address is tolerated (`''`); the page text is fatal
+ * for this tab this poll (logged, empty probe); main fields, frame fields, and
+ * frame text are tolerated.
+ */
+async function readTabProbe(session: CdpSession, tab: TabInfo, openFrame: (wsUrl: string) => CdpSession = openCdpSession): Promise<TabProbe> {
+  if (!tab.webSocketDebuggerUrl) return emptyProbe({ unavailable: true });
   try {
     // Use platform-specific extraction for messaging apps
     const url = tab.url;
@@ -582,15 +821,15 @@ async function extractPageContent(tab: TabInfo): Promise<PageContent> {
     }
 
     // A browser error page ("This site can't be reached") is not content.
-    const href = await cdpEval(tab.webSocketDebuggerUrl, 'String(location.href)', 4000).catch(() => '');
-    if (/^chrome-error:/i.test(href)) return emptyContent({ errorPage: true });
-    const prose = await cdpEval(tab.webSocketDebuggerUrl, expression);
+    const { href, visibility } = parseHrefProbe(await session.eval(HREF_PROBE, 4000).catch(() => ''));
+    if (/^chrome-error:/i.test(href)) return emptyProbe({ errorPage: true, href, visibility });
+    const prose = await session.eval(expression);
     const fieldSegments: Array<[string, string | null]> = [];
     let fieldsChars = 0;
     let fieldCount = 0;
     let mainFields = '';
     if (generic) {
-      const main = await readFields(tab.webSocketDebuggerUrl);
+      const main = await readFields(session);
       fieldSegments.push(['main', main?.fingerprint ?? null]);
       if (main?.section) {
         mainFields = main.section;
@@ -604,33 +843,48 @@ async function extractPageContent(tab: TabInfo): Promise<PageContent> {
     const frameBlocks: string[] = [];
     let proseChars = prose.length;
     for (const [index, frame] of tab.frames.entries()) {
-      const frameFields = generic ? await readFields(frame.webSocketDebuggerUrl) : null;
-      if (generic) fieldSegments.push([`frame:${index}:${urlWithoutQuery(frame.url)}`, frameFields?.fingerprint ?? null]);
-      const fieldsBlock = frameFields?.section ?? '';
-      let kept = '';
-      if (frameChars < MAX_FRAMES_TEXT) {
-        const frameText = (await cdpEval(frame.webSocketDebuggerUrl, GENERIC_PAGE_TEXT, 6000).catch(() => '')).trim();
-        // Tiny frames are widgets (a button, a counter); repeated ones add nothing.
-        if (frameText.length >= 40 && !seenFrameText.has(frameText) && !prose.includes(frameText)) {
-          seenFrameText.add(frameText);
-          kept = frameText.slice(0, Math.min(MAX_FRAME_CHARS, MAX_FRAMES_TEXT - frameChars));
-          frameChars += kept.length;
+      const frameSession = openFrame(frame.webSocketDebuggerUrl);
+      try {
+        const frameFields = generic ? await readFields(frameSession) : null;
+        if (generic) fieldSegments.push([`frame:${index}:${urlWithoutQuery(frame.url)}`, frameFields?.fingerprint ?? null]);
+        const fieldsBlock = frameFields?.section ?? '';
+        let kept = '';
+        if (frameChars < MAX_FRAMES_TEXT) {
+          const frameText = (await frameSession.eval(GENERIC_PAGE_TEXT, 6000).catch(() => '')).trim();
+          // Tiny frames are widgets (a button, a counter); repeated ones add nothing.
+          if (frameText.length >= 40 && !seenFrameText.has(frameText) && !prose.includes(frameText)) {
+            seenFrameText.add(frameText);
+            kept = frameText.slice(0, Math.min(MAX_FRAME_CHARS, MAX_FRAMES_TEXT - frameChars));
+            frameChars += kept.length;
+          }
         }
+        if (!kept && !fieldsBlock) continue;
+        proseChars += kept.length;
+        fieldsChars += fieldsBlock.length;
+        fieldCount += frameFields?.count ?? 0;
+        frameBlocks.push(`[frame ${frame.url.slice(0, 200)}]\n${[kept, fieldsBlock].filter(Boolean).join('\n\n')}`);
+      } finally {
+        frameSession.close();
       }
-      if (!kept && !fieldsBlock) continue;
-      proseChars += kept.length;
-      fieldsChars += fieldsBlock.length;
-      fieldCount += frameFields?.count ?? 0;
-      frameBlocks.push(`[frame ${frame.url.slice(0, 200)}]\n${[kept, fieldsBlock].filter(Boolean).join('\n\n')}`);
     }
     const text = [prose, mainFields, ...frameBlocks].filter(part => part.trim()).join('\n\n');
-    // Raw page capture: the ENTIRE document HTML plus same-origin iframe
-    // documents, losslessly (no caps — the ContentStore blobs large pages).
-    // Serialized from a clone with hidden-input values removed and withheld
-    // fields blanked; the final string also passes the secret-format redaction.
-    let html = '';
-    try {
-      html = await cdpEval(tab.webSocketDebuggerUrl, `(function() {${HTML_FIELD_REDACTION_SNIPPET}
+    return { text, proseChars, fieldsChars, fieldCount, fieldSegments, href, visibility };
+  } catch (err) {
+    if (err instanceof PausedError) throw err;
+    console.error(`Content extraction failed for ${tab.url}:`, (err as Error).message);
+    return emptyProbe({ unavailable: true });
+  }
+}
+
+/**
+ * Phase two of a read, run only when a capture will be emitted: the ENTIRE
+ * document HTML plus same-origin iframe documents, losslessly (no caps — the
+ * ContentStore blobs large pages). Serialized from a clone with hidden-input
+ * values removed and withheld fields blanked; the final string also passes the
+ * secret-format redaction. Best-effort: a failed read is `''` and the text
+ * capture stands on its own.
+ */
+const PAGE_HTML_READER = `(function() {${HTML_FIELD_REDACTION_SNIPPET}
         var h = botboyRedactedHtml(document.documentElement);
         document.querySelectorAll('iframe').forEach(function(f, i) {
           try {
@@ -639,17 +893,15 @@ async function extractPageContent(tab: TabInfo): Promise<PageContent> {
           } catch (e) {}
         });
         return h;
-      })()`, 15000);
-      html = redactSecrets(html);
-    } catch { /* raw html is best-effort; text capture stands on its own */ }
+      })()`;
 
-    return { text, html, proseChars, fieldsChars, fieldCount, fieldSegments };
-  } catch (err) {
-    console.error(`Content extraction failed for ${tab.url}:`, (err as Error).message);
-    return emptyContent();
+async function readTabHtml(session: CdpSession): Promise<string> {
+  try {
+    return redactSecrets(await session.eval(PAGE_HTML_READER, 15000));
+  } catch {
+    return ''; // raw html is best-effort; text capture stands on its own
   }
 }
-
 // URLs that should be re-polled for content changes (dynamic pages)
 const DYNAMIC_URL_PATTERNS = [
   /app\.slack\.com/,
@@ -665,7 +917,61 @@ function isDynamicPage(url: string): boolean {
 export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): BrowserMonitor {
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const listeners: ((item: RawWorkItem) => void)[] = [];
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  const now = cfg.now ?? Date.now;
+  const maxPollWallMs = cfg.maxPollWallMs ?? DEFAULT_MAX_POLL_WALL_MS;
+  const baseMs = cfg.pollIntervalMs;
+  const governor = cfg.adaptive ? createPollGovernor({ baseMs }) : null;
+  const maxTabsPerPoll = cfg.maxTabsPerPoll ?? 12;
+  let planState = initialPlanState();
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+  let generation = 0;
+  let inFlight: Promise<void> | null = null;
+  let chainBusy = false;
+  let wakePending = false;
+  let lastPoll: Pick<BrowserCaptureStatus, 'lastPollMs' | 'lastPollAt' | 'tabsSeen' | 'tabsRead' | 'tabsDeferred'> = {
+    lastPollMs: null, lastPollAt: null, tabsSeen: 0, tabsRead: 0, tabsDeferred: 0,
+  };
+
+  /** The owner's pause, read fresh each time; a failing getter never pauses capture. */
+  function paused(): boolean {
+    try { return cfg.isPaused?.() === true; } catch { return false; }
+  }
+
+  /** A session that refuses every call once capture is paused. */
+  function guarded(session: CdpSession): CdpSession {
+    if (!cfg.isPaused) return session;
+    return {
+      eval: (expression, timeout) => (paused() ? Promise.reject(new PausedError()) : session.eval(expression, timeout)),
+      get bytes() { return session.bytes; },
+      close: () => session.close(),
+    };
+  }
+  const openGuarded = (wsUrl: string): CdpSession => guarded(openCdpSession(wsUrl));
+
+  const currentInterval = (): number => governor?.intervalMs() ?? cfg.pollIntervalMs;
+
+  function status(): BrowserCaptureStatus {
+    return {
+      paused: paused(),
+      intervalMs: currentInterval(),
+      baseIntervalMs: baseMs,
+      slowedReason: governor?.reason() ?? null,
+      ...lastPoll,
+    };
+  }
+
+  function notifyStatus(): void {
+    try { cfg.onStatusChange?.(status()); } catch (err) { console.error('BrowserMonitor status listener error:', err); }
+  }
+
+  function sampleSystem(): { pressure: MemoryPressure; loadPerCpu: number } {
+    try {
+      return cfg.sampleSystem?.() ?? { pressure: readMemoryPressure(), loadPerCpu: loadPerCpu() };
+    } catch {
+      return { pressure: 'normal', loadPerCpu: 0 };
+    }
+  }
   // For dynamic pages: store last content hash to detect changes
   let lastDynamicContent = new Map<string, string>();
 
@@ -675,39 +981,36 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     }
   }
 
-  function simpleHash(text: string): string {
-    let h = 0;
-    for (let i = 0; i < text.length; i++) {
-      h = ((h << 5) - h + text.charCodeAt(i)) | 0;
-    }
-    return h.toString(36);
-  }
-
-  /** Static pages: polls spent waiting for real text, and what was captured. */
+  /** Static pages: polls spent waiting for real text, and what was captured (see `browser-capture-decision.ts`). */
   const settleAttempts = new Map<string, number>();
-  /**
-   * `chars` is prose length (the growth rule never sees field values);
-   * `fields` is the captured field fingerprint, `pendingFields` a changed one
-   * waiting for a second equal poll, and `segments` the last read of each
-   * field segment (a frame that fails one poll keeps its previous read).
-   */
-  const captured = new Map<string, { chars: number; recaptures: number; fields: string; pendingFields?: string; segments: Map<string, string> }>();
+  const captured = new Map<string, CapturedState>();
   const lastSegments = new Map<string, Map<string, string>>();
-
-  /** The tab's combined field fingerprint, filling unread segments from the previous poll. */
-  function mergeFieldSegments(url: string, read: Array<[string, string | null]>): { fingerprint: string; segments: Map<string, string> } {
-    const previous = captured.get(url)?.segments ?? lastSegments.get(url);
-    const segments = new Map<string, string>();
-    for (const [key, value] of read) segments.set(key, value ?? previous?.get(key) ?? `${key}|unread`);
-    return { fingerprint: [...segments].map(([key, value]) => `${key}=${value}`).join('\n'), segments };
-  }
   const maxSettleAttempts = cfg.maxSettleAttempts ?? 6;
+
+  function staticStateFor(url: string): StaticTabState {
+    return { captured: captured.get(url), lastSegments: lastSegments.get(url), settleAttempts: settleAttempts.get(url) ?? 0 };
+  }
+
+  /** Applies a decision's next state; `evict` only when a capture was emitted (bounds the maps). */
+  function applyStaticState(url: string, next: StaticTabState, evict: boolean): void {
+    if (next.settleAttempts > 0) settleAttempts.set(url, next.settleAttempts); else settleAttempts.delete(url);
+    if (next.lastSegments) lastSegments.set(url, next.lastSegments); else lastSegments.delete(url);
+    if (next.captured) captured.set(url, next.captured);
+    if (!evict) return;
+    if (captured.size > 5000) {
+      for (const key of [...captured.keys()].slice(0, 2500)) captured.delete(key);
+    }
+    if (lastSegments.size > 5000) {
+      for (const key of [...lastSegments.keys()].slice(0, 2500)) lastSegments.delete(key);
+    }
+  }
 
   /** WhatsApp message ids already captured this process (the store check covers restarts). */
   const seenWhatsApp = new Set<string>();
 
   async function captureWhatsApp(tab: TabInfo): Promise<void> {
     const raw = await cdpEval(tab.webSocketDebuggerUrl, WHATSAPP_READER).catch(() => '');
+    if (paused()) return; // nothing is marked seen, so it is read when capture resumes
     const view = parseWhatsAppView(raw);
     if (!view.chat || !view.messages.length) return;
     const fresh = view.messages.filter((message) => {
@@ -751,12 +1054,14 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     seenPdf.add(tab.url);
     if (cfg.hasCaptured?.(tab.url)) return;
     const base64 = await cdpEval(tab.webSocketDebuggerUrl, PDF_BYTES_READER, 30000).catch(() => '');
+    if (paused()) { seenPdf.delete(tab.url); return; }
     const bytes = Buffer.from(base64, 'base64');
     if (bytes.length < 5 || bytes.subarray(0, 5).toString('latin1') !== '%PDF-') {
       seenPdf.delete(tab.url); // not loaded yet, or not a PDF: try next poll
       return;
     }
     const content = (await cfg.readPdf(bytes).catch(() => '')).trim();
+    if (paused()) { seenPdf.delete(tab.url); return; }
     if (!content) {
       console.log(`📄 PDF tab had no readable text: ${tab.url.slice(0, 100)}`);
       return;
@@ -778,72 +1083,91 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     console.log(`📄 Captured [pdf] ${title.slice(0, 60)} (${content.length} chars text, ${bytes.length} bytes)`);
   }
 
-  async function pollOnce(): Promise<void> {
-    const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
-    for (const tab of tabs) {
-      if (/^https:\/\/web\.whatsapp\.com\//.test(tab.url)) {
-        await captureWhatsApp(tab);
-        continue;
-      }
-      if (isPdfTab(tab)) {
-        await capturePdf(tab);
-        continue;
-      }
-      const dynamic = isDynamicPage(tab.url);
-      const previous = captured.get(tab.url);
-      // A static page settled and re-captured enough: leave it.
-      if (!dynamic && previous && previous.recaptures >= MAX_RECAPTURES) continue;
+  /** What one poll learned about its tabs (measurement; the governor reads the probe times). */
+  interface PollRecord {
+    perTab: PollTabStat[];
+    /** Probe times of tabs whose text was read (a timed-out or unreadable tab is left out). */
+    probeMs: number[];
+  }
 
-      // Extract actual page content via CDP
-      const extracted = await extractPageContent(tab);
-      if (extracted.errorPage) continue; // not content; checked again next poll
-      let content = extracted.text.trim();
-      const html = extracted.html;
+  /**
+   * One tab, in two phases. Phase one (the probe) reads text and fields;
+   * the decision is made from it; phase two (the HTML) is read only when a
+   * capture will be emitted. `late()` is true once the poll has used its wall
+   * budget and this is not the poll's first tab: the tab is then left for the
+   * next poll with none of its remembered state advanced. While capture is
+   * paused a tab is left alone the same way: no read, no state change, no emit.
+   */
+  async function pollTab(tab: TabInfo, late: () => boolean, record: PollRecord): Promise<void> {
+    if (paused()) return;
+    if (/^https:\/\/web\.whatsapp\.com\//.test(tab.url)) {
+      const startedAt = now();
+      await captureWhatsApp(tab);
+      record.perTab.push({ id: String(tab.id), phase: 'whatsapp', ms: now() - startedAt, bytes: 0 });
+      return;
+    }
+    if (isPdfTab(tab)) {
+      const startedAt = now();
+      await capturePdf(tab);
+      record.perTab.push({ id: String(tab.id), phase: 'pdf', ms: now() - startedAt, bytes: 0 });
+      return;
+    }
+    const dynamic = isDynamicPage(tab.url);
+    // A static page settled and re-captured enough: leave it.
+    if (!dynamic && isStaticCaptureExhausted(staticStateFor(tab.url))) return;
+
+    await withTabSession(tab, async (rawSession) => {
+      const session = guarded(rawSession);
+      const probeStartedAt = now();
+      const probe = await readTabProbe(session, tab, openGuarded);
+      const probeMs = now() - probeStartedAt;
+      record.perTab.push({ id: String(tab.id), phase: 'probe', ms: probeMs, bytes: session.bytes });
+      if (paused()) return; // a pause mid-read: nothing read counts
+      if (!probe.unavailable) {
+        record.probeMs.push(probeMs);
+        if (probe.visibility === 'visible' || probe.visibility === 'unknown') planState.lastVisibleId = String(tab.id);
+      }
+      if (probe.errorPage) return; // not content; checked again next poll
+      let content = probe.text.trim();
+      let html: string | undefined;
+
+      const readHtml = async (): Promise<string> => {
+        const startedAt = now();
+        const bytesBefore = session.bytes;
+        const result = await readTabHtml(session);
+        record.perTab.push({ id: String(tab.id), phase: 'html', ms: now() - startedAt, bytes: session.bytes - bytesBefore });
+        return result;
+      };
 
       if (!dynamic) {
-        const { fingerprint, segments } = mergeFieldSegments(tab.url, extracted.fieldSegments);
-        let chars = extracted.proseChars;
-        // An app still rendering returns a shell ("Loading…") or nothing.
-        // Wait for real text a few polls before settling for what there is;
-        // the page's HTML is the last resort (text read from it here). A
-        // mostly-form page counts its fields as real content.
-        if (extracted.proseChars + extracted.fieldsChars < THIN_PAGE_CHARS && !previous) {
-          lastSegments.set(tab.url, segments);
-          const attempts = (settleAttempts.get(tab.url) ?? 0) + 1;
-          settleAttempts.set(tab.url, attempts);
-          if (attempts < maxSettleAttempts) continue;
-          if (!content && html) { content = htmlToText(html).trim(); chars = content.length; }
-          if (!content) continue;
+        const state = staticStateFor(tab.url);
+        let decision = decideStaticCapture({ state, probe, maxSettleAttempts });
+        if (decision.action === 'need-html') {
+          if (late() || paused()) return;
+          html = await readHtml();
+          decision = decideStaticCapture({ state, probe, html, maxSettleAttempts });
         }
-        if (previous) {
-          previous.segments = segments;
-          // Captured before: a page that kept rendering much more prose is
-          // captured again; field values never count toward growth.
-          const grew = chars >= previous.chars * GROWTH_RATIO && chars - previous.chars >= GROWTH_MIN_CHARS;
-          if (!grew) {
-            // A field change is captured once it holds for two consecutive
-            // polls, so a form mid-typing is never captured.
-            if (fingerprint === previous.fields) { previous.pendingFields = undefined; continue; }
-            if (previous.pendingFields !== fingerprint) { previous.pendingFields = fingerprint; continue; }
-          }
+        if (decision.action !== 'emit') {
+          if (paused()) return;
+          applyStaticState(tab.url, decision.next, false);
+          return;
         }
-        settleAttempts.delete(tab.url);
-        lastSegments.delete(tab.url);
-        captured.set(tab.url, { chars, recaptures: previous ? previous.recaptures + 1 : 0, fields: fingerprint, pendingFields: undefined, segments });
-        if (captured.size > 5000) {
-          for (const key of [...captured.keys()].slice(0, 2500)) captured.delete(key);
+        if (html === undefined) {
+          if (late() || paused()) return;
+          // A tab whose text could not be read has no HTML read either (as before the split).
+          html = probe.unavailable ? '' : await readHtml();
         }
-        if (lastSegments.size > 5000) {
-          for (const key of [...lastSegments.keys()].slice(0, 2500)) lastSegments.delete(key);
-        }
-      }
-
-      if (dynamic) {
-        if (!content) continue;
-        // Only emit if content actually changed
-        const hash = simpleHash(content);
-        if (lastDynamicContent.get(tab.url) === hash) continue;
-        lastDynamicContent.set(tab.url, hash);
+        // Immediately before the emit: a pause that arrived during the HTML read wins.
+        if (paused()) return;
+        applyStaticState(tab.url, decision.next, true);
+        content = decision.content;
+      } else {
+        const decision = decideDynamicCapture(lastDynamicContent.get(tab.url), content);
+        if (decision.action !== 'emit') return;
+        if (late() || paused()) return;
+        html = await readHtml();
+        if (paused()) return;
+        lastDynamicContent.set(tab.url, decision.hash);
       }
 
       const { type, metadata } = detectPlatform(tab.url, tab.title);
@@ -866,19 +1190,116 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
       };
 
       emit(item);
-      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${html.length} chars html${extracted.fieldCount ? `, ${extracted.fieldCount} field${extracted.fieldCount === 1 ? '' : 's'}` : ''}${tab.frames.length ? `, ${tab.frames.length} frame${tab.frames.length === 1 ? '' : 's'}` : ''})`);
+      console.log(`📄 Captured [${type}] ${tab.title.slice(0, 60)} (${content.length} chars text, ${(html ?? '').length} chars html${probe.fieldCount ? `, ${probe.fieldCount} field${probe.fieldCount === 1 ? '' : 's'}` : ''}${tab.frames.length ? `, ${tab.frames.length} frame${tab.frames.length === 1 ? '' : 's'}` : ''})`);
+    });
+  }
+
+  /** What the planner needs to know about a tab, from the remembered state. */
+  type PlannedBrowserTab = PlannedTab & { tab: TabInfo };
+
+  function describeTab(tab: TabInfo): PlannedBrowserTab {
+    const url = tab.url;
+    const whatsApp = /^https:\/\/web\.whatsapp\.com\//.test(url);
+    const pdf = !whatsApp && isPdfTab(tab);
+    const dynamic = !whatsApp && !pdf && isDynamicPage(url);
+    const staticTab = !whatsApp && !pdf && !dynamic;
+    const state = staticTab ? staticStateFor(url) : null;
+    return {
+      id: String(tab.id),
+      tab,
+      firstSight: !!state && !state.captured,
+      pendingFields: !!state?.captured?.pendingFields,
+      alwaysServe: whatsApp || dynamic || (pdf && !!cfg.readPdf && !seenPdf.has(url)),
+      // Reading these costs nothing: a settled static page, or a PDF already read (or unreadable here).
+      capped: (!!state && isStaticCaptureExhausted(state)) || (pdf && (!cfg.readPdf || seenPdf.has(url))),
+    };
+  }
+
+  async function runPoll(): Promise<void> {
+    // Paused: not even the tab list is fetched.
+    if (paused()) return;
+    const startedAt = now();
+    const tabs = await fetchTabs(cfg.cdpEndpoint, cfg.shouldSkipTarget);
+    // Calm (or ungoverned): Chrome's order, every tab. Slowed: the planner's soft budget.
+    const slowed = governor?.slowed() === true;
+    const plan = governor && slowed
+      ? planTabReads(tabs.map(describeTab), planState, { slowed: true, maxTabsPerPoll })
+      : null;
+    if (plan) planState = plan.state;
+    const order = plan ? plan.order.map(entry => entry.tab) : tabs;
+    const record: PollRecord = { perTab: [], probeMs: [] };
+    let started = 0;
+    // The wall bound is checked between tabs and phases; a poll's first tab is
+    // always read in full, so a slow tab cannot starve itself.
+    const overBudget = () => now() - startedAt >= maxPollWallMs;
+    const late = () => started > 1 && overBudget();
+    for (const tab of order) {
+      if (paused()) break;
+      if (started > 0 && overBudget()) {
+        console.log(`[BrowserMonitor] poll used its ${Math.round(maxPollWallMs / 1000)}s budget; ${order.length - started} tab(s) wait for the next poll`);
+        break;
+      }
+      started++;
+      try {
+        await pollTab(tab, late, record);
+      } catch (err) {
+        if (err instanceof PausedError) break;
+        throw err;
+      }
+    }
+    if (paused()) return;
+    const wallMs = now() - startedAt;
+    lastPoll = { lastPollMs: wallMs, lastPollAt: now(), tabsSeen: tabs.length, tabsRead: started, tabsDeferred: tabs.length - started };
+    try {
+      cfg.onPollStats?.({ wallMs, tabsSeen: tabs.length, tabsRead: started, tabsDeferred: tabs.length - started, perTab: record.perTab });
+    } catch (err) { console.error('BrowserMonitor stats listener error:', err); }
+    if (governor) {
+      const system = sampleSystem();
+      const result = governor.observe({ wallMs, medianProbeMs: medianOf(record.probeMs), pressure: system.pressure, loadPerCpu: system.loadPerCpu });
+      if (result.changed) notifyStatus();
     }
   }
 
-  return {
-    async start(): Promise<void> {
+  /**
+   * One poll; a poll never overlaps itself (a caller during a poll gets that
+   * poll's completion). A wake() that arrived during it adds exactly one more.
+   */
+  function pollOnce(): Promise<void> {
+    if (inFlight) return inFlight;
+    const run = (async () => {
+      do {
+        wakePending = false;
+        await runPoll();
+      } while (wakePending && running);
+    })().finally(() => { if (inFlight === run) inFlight = null; });
+    inFlight = run;
+    return run;
+  }
+
+  async function tick(mine: number): Promise<void> {
+    pollTimer = null;
+    chainBusy = true;
+    try {
       await pollOnce();
-      pollTimer = setInterval(() => { pollOnce().catch(console.error); }, cfg.pollIntervalMs);
+      while (wakePending && running && mine === generation) await pollOnce();
+    } catch (err) { console.error(err); }
+    chainBusy = false;
+    if (running && mine === generation) pollTimer = setTimeout(() => { void tick(mine); }, currentInterval());
+  }
+
+  return {
+    /** Starts polling; the first poll is fired, not awaited, so a slow Chrome cannot stall boot. */
+    async start(): Promise<void> {
+      if (running) return;
+      running = true;
+      void tick(++generation);
     },
 
     stop(): void {
+      running = false;
+      wakePending = false;
       if (pollTimer) {
-        clearInterval(pollTimer);
+        clearTimeout(pollTimer);
         pollTimer = null;
       }
     },
@@ -888,5 +1309,24 @@ export function createBrowserMonitor(config?: Partial<BrowserMonitorConfig>): Br
     },
 
     pollOnce,
+
+    wake(): void {
+      if (!running) return;
+      if (governor) {
+        const result = governor.reset();
+        if (result.changed) notifyStatus();
+      }
+      if (inFlight || chainBusy) {
+        wakePending = true;
+        return;
+      }
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      void tick(generation);
+    },
+
+    status,
   };
 }

@@ -92,6 +92,9 @@ const state = {
   sharepointSync: { status: null, error: '', busy: '', sites: [], libraries: [], pickedSite: '' },
   // Outcome-level capture health: per-source streaks and owner warnings.
   captureHealth: { sources: null, issues: [], error: '' },
+  // Browser capture pacing and the owner's pause (GET /browser-capture); null = unknown.
+  browserCapture: null,
+  browserCaptureBusy: false,
   mcp: {
     servers: null,
     config: null,
@@ -231,6 +234,7 @@ const state = {
   lastAiModelVersion: null,
   lastAiModelState: null,
   lastCaptureHealthVersion: null,
+  lastBrowserCaptureVersion: null,
   lastWorkplaceVersion: null,
 };
 
@@ -447,7 +451,7 @@ async function loadCore({ quiet = false } = {}) {
   // Sources panel needs it, and the panel fetches it on open (post-mortem
   // 2026-08-18: every navigation blanked for the slowest request, which was
   // always this one).
-  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, gmailSyncResult, sharepointSyncResult, captureHealthResult, whatsAppResult] = await Promise.allSettled([
+  const [areasResult, projectsResult, todayResult, healthResult, inboxResult, slackConfigResult, foldersResult, mcpResult, graspSyncResult, gmailSyncResult, sharepointSyncResult, captureHealthResult, whatsAppResult, browserCaptureResult] = await Promise.allSettled([
     request('/areas'),
     request('/projects'),
     todayRequest,
@@ -461,8 +465,10 @@ async function loadCore({ quiet = false } = {}) {
     request('/sharepoint-sync/status'),
     request('/capture-health'),
     request('/whatsapp/status'),
+    request('/browser-capture'),
   ]);
   applyCaptureHealthResult(captureHealthResult);
+  applyBrowserCaptureResult(browserCaptureResult);
 
   const criticalErrors = [];
   if (areasResult.status === 'fulfilled') state.areas = normalizeAreas(areasResult.value); else criticalErrors.push(`areas: ${areasResult.reason.message}`);
@@ -808,6 +814,51 @@ async function refreshCaptureHealth() {
   updateGlobalHealth();
 }
 
+function applyBrowserCaptureResult(result) {
+  // An older server or a failed read leaves the state unknown: the card then reads "Available" as before.
+  state.browserCapture = result?.status === 'fulfilled' && result.value && typeof result.value === 'object' ? result.value : null;
+}
+async function refreshBrowserCapture() {
+  try {
+    applyBrowserCaptureResult({ status: 'fulfilled', value: await request('/browser-capture') });
+  } catch (error) {
+    applyBrowserCaptureResult({ status: 'rejected', reason: error });
+  }
+  updateGlobalHealth();
+}
+/** Pause or resume browser capture (owner UI only), then repaint the card and the chip. */
+async function setBrowserCapturePaused(paused) {
+  if (state.browserCaptureBusy) return;
+  state.browserCaptureBusy = true;
+  try {
+    const payload = await request('/browser-capture/pause', { method: 'PUT', body: { paused: Boolean(paused) } });
+    applyBrowserCaptureResult({ status: 'fulfilled', value: payload });
+  } catch (error) {
+    toast(`Could not ${paused ? 'pause' : 'resume'} browser capture: ${error?.payload?.error || error?.message || error}`, 'bad');
+  }
+  state.browserCaptureBusy = false;
+  updateGlobalHealth();
+  renderRoute({ preserveScroll: true, userAction: true });
+  document.querySelector('[data-action="browser-capture-pause"]')?.focus({ preventScroll: true });
+}
+/** The Connections card for browser capture: paused by the owner, slowed by the Mac, or available. */
+function browserCaptureCardModel(detail) {
+  const live = state.browserCapture;
+  if (live?.paused) {
+    return { status: 'Paused by you', tone: 'warn', detail: 'BotBoy is not reading your browser tabs. Resume to capture again.', paused: true };
+  }
+  if (live?.slowedReason) {
+    const memory = String(live.slowedReason).startsWith('memory pressure');
+    const every = Number(live.intervalMs) >= 60000 ? `${Math.round(Number(live.intervalMs) / 60000)} min` : `${Math.round(Number(live.intervalMs) / 1000)} s`;
+    return {
+      status: memory ? 'Slowed: memory pressure' : 'Slowed: busy Mac',
+      tone: 'warn',
+      detail: `Checking your tabs every ${every} while your Mac is under strain. It speeds up again when things calm down.`,
+      paused: false,
+    };
+  }
+  return { status: 'Available', tone: 'good', detail, paused: false };
+}
 function captureIssueFor(source) {
   return (state.captureHealth.issues || []).find(issue => issue.source === source) || null;
 }
@@ -859,6 +910,15 @@ function updateGlobalHealth() {
     if (chip) {
       chip.setAttribute('href', '#/connections');
       chip.title = 'A watched file keeps changing, and every change is reprocessed in full. Open Connections → Local folders to pause it or keep processing.';
+    }
+    return;
+  }
+  if (state.browserCapture?.paused) {
+    label.textContent = 'Browser capture paused by you';
+    dot.classList.add('warn');
+    if (chip) {
+      chip.setAttribute('href', '#/connections');
+      chip.title = 'You paused browser capture. Open Connections → Browser capture to resume it.';
     }
     return;
   }
@@ -2625,6 +2685,9 @@ function gmailSyncCardModel() {
   if (!status) return { status: 'Checking', tone: '', detail: 'Loading Gmail status' };
   const connection = status.connection || {};
   if (!connection.connected) {
+    if (connection.clientConfigured && gmailSignInFresh(connection.pageSignIn) && connection.pageSignIn.ok === false) {
+      return { status: 'Connect failed', tone: 'warn', detail: 'The last sign-in did not finish. Open Gmail for details, then choose Connect Gmail to try again.' };
+    }
     if (connection.clientConfigured && connection.clientSource === 'team') {
       return { status: 'Not connected', tone: '', detail: 'Choose Connect Gmail and sign in to Google.' };
     }
@@ -2735,20 +2798,68 @@ function renderGmailImportCard(status, busy, accountId = '') {
     </section>`;
 }
 
-/** Google Drive on one Gmail account: Connect Google Drive, then the sources BotBoy captures. */
+/** Fifteen minutes: how long the result of a Connect attempt stays (the server applies the same rule). */
+const GMAIL_SIGN_IN_NOTICE_MS = 15 * 60_000;
+
+/** A sign-in result worth showing: it has words and is not older than its 15 minutes. */
+function gmailSignInFresh(attempt) {
+  if (!attempt || !attempt.message) return false;
+  const at = Date.parse(attempt.at);
+  return Number.isFinite(at) && Date.now() - at < GMAIL_SIGN_IN_NOTICE_MS;
+}
+
+/**
+ * The result of one Connect attempt, shown only in the section that made it:
+ * what happened and what to do (the message), when, and a Dismiss button.
+ * Health (Active, Reconnect needed) is separate and never reads this.
+ */
+function renderGmailSignInNotice(attempt) {
+  if (!gmailSignInFresh(attempt)) return '';
+  const ok = attempt.ok === true;
+  const at = Date.parse(attempt.at);
+  return `<div class="mcp-alert gmail-signin-notice ${ok ? 'good' : 'warn'}" role="status" data-gmail-signin="${attr(attempt.action)}">${icon(ok ? 'check' : 'alert', 14)}<span class="gmail-signin-text"><span>${esc(attempt.message)}</span><time datetime="${attr(attempt.at)}" title="${attr(new Date(at).toLocaleString())}">${esc(relativeTime(attempt.at))}</time></span><button class="button small ghost" type="button" data-action="gmail-signin-dismiss" data-account="${attr(attempt.accountId || '')}" data-signin-action="${attr(attempt.action)}">Dismiss</button></div>`;
+}
+
+/**
+ * Drive's state on one account, derived from the grant and the last attempt
+ * (never stored). A Drive box left unticked is told by the notice, so the
+ * state still follows the scopes Google granted.
+ */
+function gdriveStateOf(conn) {
+  const read = Boolean(conn?.canReadDrive);
+  const publish = Boolean(conn?.canPublishDrive);
+  if (read && publish) return { key: 'connected', label: 'Connected (read + publish)', tone: 'good' };
+  if (read) return { key: 'read_only', label: 'Connected (read only)', tone: 'warn' };
+  if (publish) return { key: 'publish_only', label: 'Connected (publish only)', tone: 'warn' };
+  const attempt = conn?.signIn?.drive;
+  if (gmailSignInFresh(attempt) && attempt.ok === false && attempt.kind !== 'drive_not_granted') {
+    return { key: 'connect_failed', label: 'Connect failed — try again', tone: 'warn' };
+  }
+  return { key: 'not_connected', label: 'Not connected', tone: '' };
+}
+
+/** Google Drive on one Gmail account: its state, the last Connect result, then the sources BotBoy captures. */
 function renderGdriveSection(account, busy) {
   const conn = account.connection || {};
   const disabled = busy ? 'disabled' : '';
   const id = esc(account.id);
+  const driveState = gdriveStateOf(conn);
+  const head = `<div class="connection-head" style="gap:10px"><h3 class="card-title" style="margin:0">Google Drive</h3><span class="pill ${driveState.tone}" data-gdrive-state="${driveState.key}">${esc(driveState.label)}</span></div>`;
+  const notice = renderGmailSignInNotice(conn.signIn?.drive);
+  // Drive's own capture trouble (for example the Drive API is not enabled) belongs here, not only on the top-bar chip.
+  const issue = conn.canReadDrive || conn.canPublishDrive ? captureIssueFor('gdrive') : null;
+  const issueAlert = issue ? `<div class="mcp-alert warn gdrive-issue" role="status">${icon('alert', 14)}<span><strong>Drive is not syncing.</strong> ${esc(captureIssueDetail(issue))}</span></div>` : '';
   if (!conn.canReadDrive || !conn.canPublishDrive) {
-    return `<section class="card pad" style="margin-top:8px"><h3 class="card-title">Google Drive</h3>
+    return `<section class="card pad" style="margin-top:8px">${head}
       <p class="page-subtitle">${conn.canReadDrive || conn.canPublishDrive ? 'Drive is only partly allowed. Connect again and tick both Drive boxes.' : 'Capture the Drive files you choose and publish BotBoy documents to Drive. Google asks you to allow Drive for this account.'}</p>
-      <button class="button" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled}>${icon('link', 14)} ${busy === `drive:${account.id}` ? 'Opening Google…' : 'Connect Google Drive'}</button></section>`;
+      ${notice}${issueAlert}
+      <button class="button" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled} style="margin-top:8px">${icon('link', 14)} ${busy === `drive:${account.id}` ? 'Opening Google…' : 'Connect Google Drive'}</button></section>`;
   }
   const sources = conn.drive?.sources || { ownedByMe: false, sharedWithMe: false, folderIds: [] };
   const enabled = conn.drive?.enabled !== false;
-  return `<section class="card pad" style="margin-top:8px" data-gdrive-account="${id}"><h3 class="card-title">Google Drive</h3>
+  return `<section class="card pad" style="margin-top:8px" data-gdrive-account="${id}">${head}
     <p class="page-subtitle">BotBoy reads only what you choose here. It never changes Drive files it did not publish.</p>
+    ${notice}${issueAlert}
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-enabled ${enabled ? 'checked' : ''}> Capture from Drive</label>
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-owned ${sources.ownedByMe ? 'checked' : ''}> Files I own</label>
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-shared ${sources.sharedWithMe ? 'checked' : ''}> Shared with me</label>
@@ -2773,6 +2884,7 @@ function renderGmailAccountCard(account, busy) {
     <article class="card pad gmail-account" data-gmail-account="${esc(account.id)}">
       <div class="connection-head"><span class="source-icon">${icon('mail', 17)}</span><strong>${esc(account.email)}</strong><span class="pill ${conn.needsReconnect || run?.status === 'failed' ? 'warn' : 'good'}">${esc(access)}</span></div>
       ${conn.needsReconnect && conn.lastError ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(conn.lastError)}</span></div>` : ''}
+      ${renderGmailSignInNotice(conn.signIn?.gmail)}
       ${!conn.needsReconnect && conn.needsComposeGrant ? `<div class="mcp-alert">${icon('alert', 14)}<span>Read only: choose Reconnect and allow “Manage drafts and send emails” to draft and send from this account.</span></div>` : ''}
       <label class="page-subtitle" for="gmail-sync-label-${esc(account.id)}" style="display:block;margin-top:8px">Label (how BotBoy names this account in briefs and chat)</label>
       <div style="display:flex; gap:6px; align-items:center">
@@ -2866,7 +2978,7 @@ function renderGmailSyncSettings() {
     <section class="card pad">
       <div class="connection-head"><span class="source-icon">${icon('mail', 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div>
       <p>${esc(card.detail)}</p>
-      ${connection.lastError && !connection.needsReconnect ? `<div class="mcp-alert warn">${icon('alert', 14)}<span>${esc(connection.lastError)}</span></div>` : ''}
+      ${renderGmailSignInNotice(connection.pageSignIn)}
       ${(status?.accounts || []).length > 1 ? '' : composeBanner}
       <div class="connection-details">
         <span><span>Accounts</span><strong>${connection.connected ? number((status?.accounts || []).length || 1) : 'Not connected'}</strong></span>
@@ -3259,6 +3371,7 @@ function renderConnections() {
   const sharepointSyncCard = sharepointSyncCardModel();
   const slackCard = slackCardModel(slackCount);
   const whatsAppCard = whatsAppCardModel();
+  const browserCard = browserCaptureCardModel(total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`);
   const captureCards = [
     ['message', 'Slack', slackCard.status, slackCard.tone, slackCard.detail, 'slack'],
     ['folder', 'Local folders', ...localFoldersCardFields(folderCount), 'folders'],
@@ -3266,7 +3379,7 @@ function renderConnections() {
     ['mail', 'Gmail', gmailSyncCard.status, gmailSyncCard.tone, gmailSyncCard.detail, 'gmail-sync'],
     ['message', 'WhatsApp', whatsAppCard.status, whatsAppCard.tone, whatsAppCard.detail, 'whatsapp'],
     ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
-    ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
+    ['globe', 'Browser capture', browserCard.status, browserCard.tone, browserCard.detail, 'browser'],
   ].filter(([, , , , , action]) => amazonEmployeeOn() || !AMAZON_ONLY_CAPTURE_CARDS.includes(action));
   const captureIssueSources = { slack: 'slack', 'grasp-sync': 'grasp', 'gmail-sync': 'gmail', 'sharepoint-sync': 'sharepoint' };
   const lifecycleFor = action => (captureIssueFor(captureIssueSources[action])
@@ -3274,7 +3387,7 @@ function renderConnections() {
     : action === 'folders' && state.folders.changingOften > 0 ? 'Needs attention' : 'Healthy');
   const connectionsAsk = 'I want to add a new MCP server to BotBoy. I will paste a link to its documentation, npm, or GitHub page. Fetch the link, derive the launch command, arguments, and environment variables, confirm anything ambiguous with me, then add it with mcp_add_custom_server so I can review and start it.';
   return `${pageHead('Sources', 'Connections', 'Manage where evidence and analytical context come from, and verify each local connection.', `<button class="button" type="button" data-prompt="${attr(connectionsAsk)}">${icon('sparkles')} Ask BotBoy to add one</button><a class="button primary" href="#/connections/add">${icon('plus', 14)} Add MCP server</a>`)}
-    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'gmail-sync' ? `<a class="button small" href="#/connections/gmail-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'whatsapp' ? `<a class="button small" href="#/connections/whatsapp">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
+    <section class="grid three-col">${captureCards.map(([ico, name, status, tone, detail, action]) => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(ico, 19)}</span><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(status)}</span></div><h3>${esc(name)}</h3><p>${esc(detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>Local evidence store</strong></span><span><span>Lifecycle</span><strong>${lifecycleFor(action)}</strong></span></div>${action === 'browser' ? `<a class="button small" href="#/pipeline">View capture health ${icon('chevron-right', 12)}</a>${state.browserCapture ? ` <button class="button small" type="button" data-action="browser-capture-pause" data-pause="${browserCard.paused ? 'false' : 'true'}"${state.browserCaptureBusy ? ' disabled' : ''}>${browserCard.paused ? 'Resume' : 'Pause'}</button>` : ''}` : action === 'grasp-sync' ? `<a class="button small" href="#/connections/mail-calendar-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'gmail-sync' ? `<a class="button small" href="#/connections/gmail-sync">Manage ${icon('chevron-right', 12)}</a>` : action === 'whatsapp' ? `<a class="button small" href="#/connections/whatsapp">Manage ${icon('chevron-right', 12)}</a>` : action === 'sharepoint-sync' ? `<a class="button small" href="#/connections/document-sync">Manage ${icon('chevron-right', 12)}</a>` : `<button class="button small" type="button" data-action="manage-connection" data-connection="${action}">Manage ${icon('chevron-right', 12)}</button>`}</article>`).join('')}
     ${managedCards.map(card => `<article class="card connection-card"><div class="connection-head"><span class="source-icon">${icon(card.icon, 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div><h3>${esc(card.name)}</h3><p>${esc(card.detail)}</p><div class="connection-details"><span><span>Data handling</span><strong>${esc(card.handling)}</strong></span><span><span>Lifecycle</span><strong>Managed by BotBoy</strong></span></div>${card.profileId ? `<button class="button small" type="button" data-action="manage-connection" data-connection="managed" data-profile="${attr(card.profileId)}">Manage ${icon('chevron-right', 12)}</button>` : ''}</article>`).join('')}</section>
     <div class="section-heading"><div><h2>Connection principles</h2><p>Captured sources stay durable; external analytical content remains untrusted until BotBoy applies its local policy.</p></div></div><section class="grid three-col"><article class="card pad"><div class="eyebrow">${icon('database', 14)} Preserve</div><h3 class="card-title">Raw content stays intact</h3><p class="page-subtitle">Project brains can evolve while original evidence remains unchanged.</p></article><article class="card pad"><div class="eyebrow">${icon('shield', 14)} Restrict</div><h3 class="card-title">Writes need your explicit request</h3><p class="page-subtitle">BotBoy calls read tools freely and runs mutating operations only when you ask for them in chat.</p></article><article class="card pad"><div class="eyebrow">${icon('link', 14)} Explain</div><h3 class="card-title">Analysis stays traceable</h3><p class="page-subtitle">MCP calls are audited locally without storing credentials or query results in the audit log.</p></article></section>`;
 }
@@ -4483,6 +4596,7 @@ async function applyWorkplaceVersionChange() {
     state.mcp.servers = null;
   }
   await refreshCaptureHealth();
+  await refreshBrowserCapture();
   if (['connections', 'workplace-settings', 'documents', 'analytics-dashboard', 'settings', 'gmail-sync-settings', 'ai-model-settings',
     'mcp-settings', 'profile-settings', 'grasp-sync-settings', 'sharepoint-sync-settings', 'publisher-settings'].includes(state.route.view)) {
     renderRoute({ preserveScroll: true });
@@ -8856,6 +8970,7 @@ function bindEvents() {
       });
     }
     if (action === 'documents-delete') void deleteDocument(target.dataset.artifact);
+    if (action === 'browser-capture-pause') void setBrowserCapturePaused(target.dataset.pause === 'true');
     if (action === 'manage-connection') {
       if (target.dataset.connection === 'managed' && target.dataset.profile) go(`#/connections/${target.dataset.profile}`);
       else if (target.dataset.connection === 'mcp') go('#/connections/sql-context');
@@ -8897,6 +9012,14 @@ function bindEvents() {
         if (payload.authUrl) window.location.assign(payload.authUrl);
       });
     }
+    if (action === 'gmail-signin-dismiss') {
+      const accountId = target.dataset.account || '';
+      const signInAction = target.dataset.signinAction || '';
+      void gmailSyncAction('signin-dismiss', async () => {
+        const payload = await request('/gmail-sync/sign-in/dismiss', { method: 'POST', body: { ...(accountId ? { accountId } : {}), action: signInAction } });
+        if (payload.status) state.gmailSync.status = payload.status;
+      });
+    }
     if (action === 'gdrive-save-sources') {
       const accountId = target.dataset.account || '';
       // Read the fields before the busy repaint recreates them.
@@ -8917,8 +9040,9 @@ function bindEvents() {
       const accountId = target.dataset.account || '';
       void gmailSyncAction('connect', async () => {
         const payload = await request('/gmail-sync/connect', { method: 'POST', body: accountId ? { accountId } : {} });
-        // Google returns this window to BotBoy's loopback callback, which
-        // lands back on #/connections/gmail-sync with the outcome.
+        // Google returns this window to BotBoy's loopback callback page, which
+        // says whether the sign-in worked and links back to
+        // #/connections/gmail-sync (a success goes there by itself after a moment).
         if (payload.authUrl) window.location.assign(payload.authUrl);
       });
     }
@@ -9619,6 +9743,8 @@ async function pollVersion() {
     state.lastAiModelState = payload.aiModelState ?? null;
     const previousCaptureHealthVersion = state.lastCaptureHealthVersion;
     state.lastCaptureHealthVersion = payload.captureHealthVersion ?? null;
+    const previousBrowserCaptureVersion = state.lastBrowserCaptureVersion;
+    state.lastBrowserCaptureVersion = payload.browserCaptureVersion ?? null;
     const previousWorkplaceVersion = state.lastWorkplaceVersion;
     state.lastWorkplaceVersion = payload.workplaceVersion ?? null;
 
@@ -9678,6 +9804,12 @@ async function pollVersion() {
       }
     }
 
+    // Browser capture was paused, resumed, or its pacing changed (this or another tab).
+    if (previousBrowserCaptureVersion !== null && state.lastBrowserCaptureVersion !== null
+      && state.lastBrowserCaptureVersion !== previousBrowserCaptureVersion) {
+      await refreshBrowserCapture();
+      if (state.route.view === 'connections') renderRoute({ preserveScroll: true });
+    }
     // Amazon Employee changed (this or another tab): reload the setting, the
     // server-filtered connection list, and capture health, then repaint the
     // views it gates. The chat model picker follows the AI model version.

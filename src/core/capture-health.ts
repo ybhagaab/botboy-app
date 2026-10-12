@@ -133,7 +133,7 @@ export type SlackConnectedVia = 'oauth' | 'token' | null;
 export const SLACK_SIGN_IN_AGAIN = 'Open Connections → Slack and sign in with Slack again.';
 export const GDRIVE_RECONNECT = 'Reconnect Google (Connections → Gmail). Google ended BotBoy’s access; captured files are kept.';
 export const GDRIVE_CONNECT = 'Open Connections → Gmail and choose Connect Google Drive on the account.';
-export const GDRIVE_ENABLE_API = 'Enable the Google Drive API in your Cloud project, then wait a minute.';
+export const GDRIVE_ENABLE_API = 'Enable the Google Drive API in the same Google Cloud project as your Gmail client (APIs & Services → Library → Google Drive API), then wait a minute.';
 
 function nextActionFor(
   source: CaptureSourceId,

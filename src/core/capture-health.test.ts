@@ -276,7 +276,7 @@ describe('capture health while Amazon Employee is off (Settings → Workplace)',
     const cases: Array<[string, RegExp]> = [
       ['invalid_grant: Token has been expired or revoked.', /Reconnect Google/],
       ['403 insufficientPermissions: Request had insufficient authentication scopes.', /Connect Google Drive/],
-      ['403 accessNotConfigured: Google Drive API has not been used in project 1 before or it is disabled.', /Enable the Google Drive API/],
+      ['403 accessNotConfigured: Google Drive API has not been used in project 1 before or it is disabled.', /Enable the Google Drive API in the same Google Cloud project as your Gmail client \(APIs & Services → Library → Google Drive API\)/],
     ];
     for (const [reason, action] of cases) {
       health.reportSuccess('gdrive');

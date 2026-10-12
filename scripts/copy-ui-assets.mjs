@@ -1,6 +1,30 @@
-import { copyFileSync, cpSync, mkdirSync, readdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { accessSync, constants, copyFileSync, cpSync, mkdirSync, readdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+// git on a Mac without Xcode Command Line Tools is the /usr/bin shim, which
+// raises the macOS "install developer tools" dialog when run. Use the first git
+// on PATH, and run the /usr/bin one only after `xcode-select -p` answers.
+function gitUsable() {
+  let found = null;
+  for (const dir of (process.env.PATH || '').split(delimiter)) {
+    if (!dir) continue;
+    try {
+      accessSync(join(dir, 'git'), constants.X_OK);
+      found = join(dir, 'git');
+      break;
+    } catch {
+      // keep looking
+    }
+  }
+  if (!found) return false;
+  if (found !== '/usr/bin/git') return true;
+  try {
+    execFileSync('/usr/bin/xcode-select', ['-p'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Copy ONLY when bytes differ. The served UI dir's mtimes ARE the uiVersion
 // stamp (/api/dashboard/version → open tabs auto-reload on change), so an
@@ -76,8 +100,10 @@ cpSync(sourceProductManagerConfig, destinationProductManagerConfig, {
 // git HEAD to rebuild automatically after a git pull — without it, pulled
 // fixes silently never activate because dist/ is stale rather than missing.
 try {
-  const hash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim();
-  writeFileSync(join(root, 'dist', '.build-commit'), `${hash}\n`);
+  if (gitUsable()) {
+    const hash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim();
+    writeFileSync(join(root, 'dist', '.build-commit'), `${hash}\n`);
+  }
 } catch {
   // No git (tarball install) — start.sh falls back to missing-file detection.
 }

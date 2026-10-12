@@ -354,6 +354,12 @@ body.chat-width-expand.assistant-open .workspace { margin-right:0; }
 .mcp-form .card-header { position:sticky; z-index:3; top:-34px; border-radius:var(--radius-lg) var(--radius-lg) 0 0; background:color-mix(in srgb,var(--surface) 94%,transparent); backdrop-filter:blur(18px); }
 .mcp-alert { display:flex; align-items:flex-start; gap:9px; margin:16px 22px 0; padding:11px 12px; border:1px solid rgba(243,186,99,.25); border-radius:10px; color:var(--yellow); background:var(--yellow-soft); font-size:11px; overflow-wrap:anywhere; }
 .mcp-alert svg { flex:0 0 auto; margin-top:1px; }
+.mcp-alert.good { border-color:rgba(86,214,154,.25); color:var(--green); background:var(--green-soft); }
+.gmail-signin-notice { margin:10px 0 0; align-items:center; }
+.gmail-signin-notice .gmail-signin-text { flex:1 1 auto; min-width:0; display:grid; gap:2px; }
+.gmail-signin-notice time { color:var(--muted); font-size:10px; }
+.gmail-signin-notice .button { flex:0 0 auto; }
+.gdrive-issue { margin:10px 0 0; }
 .mcp-toggle-row { display:flex; align-items:center; justify-content:space-between; gap:24px; margin:20px 0 4px; padding:15px 16px; border:1px solid rgba(157,140,255,.22); border-radius:12px; background:linear-gradient(115deg,var(--accent-soft),transparent 70%); }
 .mcp-toggle-row strong,.mcp-toggle-row small { display:block; }
 .mcp-toggle-row strong { color:var(--soft); font-size:12px; }

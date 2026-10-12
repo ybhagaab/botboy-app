@@ -13,6 +13,10 @@ export interface FakeSlackServer {
   access: Record<string, unknown>;
   /** auth.test answer per token. */
   authTest: (token: string) => Record<string, unknown>;
+  /** The next N requests are read, then their connection is dropped without an answer (a reset). */
+  dropNext: number;
+  /** Requests are read but never answered (the client's deadline decides). */
+  hang: boolean;
   close(): Promise<void>;
 }
 
@@ -23,6 +27,8 @@ export async function startFakeSlack(): Promise<FakeSlackServer> {
     requests: [],
     access: { ok: true, authed_user: { id: 'U1', access_token: FAKE_SLACK_USER_TOKEN, token_type: 'user' }, team: { id: 'T1', name: 'Team' } },
     authTest: token => (token === FAKE_SLACK_USER_TOKEN ? { ok: true, user: 'owner', team: 'Acme' } : { ok: false, error: 'invalid_auth' }),
+    dropNext: 0,
+    hang: false,
   };
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -32,6 +38,12 @@ export async function startFakeSlack(): Promise<FakeSlackServer> {
       const body = Object.fromEntries(new URLSearchParams(raw));
       const authorization = String(req.headers.authorization ?? '');
       fake.requests.push({ method, body, authorization });
+      if (fake.hang) return;
+      if (fake.dropNext > 0) {
+        fake.dropNext--;
+        req.socket.destroy();
+        return;
+      }
       let answer: Record<string, unknown>;
       if (method === 'oauth.v2.access') answer = fake.access;
       else if (method === 'auth.test') answer = fake.authTest(authorization.replace(/^Bearer\s+/i, '') || body.token || '');
@@ -44,6 +56,6 @@ export async function startFakeSlack(): Promise<FakeSlackServer> {
   const { port } = server.address() as AddressInfo;
   return Object.assign(fake, {
     url: `http://127.0.0.1:${port}/`,
-    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+    close: () => new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections?.(); }),
   }) as FakeSlackServer;
 }

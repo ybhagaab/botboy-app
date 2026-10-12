@@ -2,8 +2,9 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from './gmail-api.js';
+import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE } from './gdrive-api.js';
 import { createGmailConnection, GmailAuthError } from './gmail-connection.js';
 import { BOTBOY_GOOGLE_CLIENT } from './gmail-builtin-client.js';
 import { createGmailCredentialStore, GmailCredentialInputError, usableBuiltInClient, validateGmailClient } from './gmail-credentials.js';
@@ -36,11 +37,22 @@ function fakeGoogle() {
     refreshError: '' as string,
     refreshDelayMs: 0,
     issued: 0,
+    /** Thrown, in order, by the next code exchanges (a connect timeout, the 30 s deadline, …). */
+    exchangeFailures: [] as Error[],
+    /** Thrown, in order, by the next Gmail profile reads. */
+    profileFailures: [] as Error[],
+    /** When set, every Gmail profile read answers with this HTTP status and body (a Cloud project with the API off, say). */
+    profileHttpError: null as { status: number; body: unknown } | null,
+    /** When set, the code exchange answers HTTP 400 with this error code. */
+    exchangeError: '' as string,
     fetch: async (input: string, init?: RequestInit): Promise<Response> => {
       const form = typeof init?.body === 'string' ? Object.fromEntries(new URLSearchParams(init.body)) : {};
       const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
       calls.push({ url: input, form, auth });
       if (input === ENDPOINTS.tokenUrl && form.grant_type === 'authorization_code') {
+        const failure = google.exchangeFailures.shift();
+        if (failure) throw failure;
+        if (google.exchangeError) return json({ error: google.exchangeError, error_description: 'Bad Request' }, 400);
         google.issued++;
         return json({
           access_token: `access-${google.issued}`, expires_in: 3600, scope: google.grantScope, token_type: 'Bearer',
@@ -55,6 +67,9 @@ function fakeGoogle() {
       }
       if (input === ENDPOINTS.revokeUrl) return json({});
       if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) {
+        const failure = google.profileFailures.shift();
+        if (failure) throw failure;
+        if (google.profileHttpError) return json(google.profileHttpError.body, google.profileHttpError.status);
         return json({ emailAddress: google.account, historyId: '4242', messagesTotal: 10 });
       }
       return json({ error: { code: 404, message: 'not found' } }, 404);
@@ -284,7 +299,8 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
     clock += 11 * 60_000;
     expect(await service.completeConnect({ code: 'x', state: queryOf(late.authUrl).get('state') })).toMatchObject({ ok: false, error: expect.stringContaining('expired') });
     expect(google.calls.some(call => call.form.grant_type === 'authorization_code')).toBe(false);
-    expect(service.status()).toMatchObject({ connected: false, lastError: expect.stringContaining('expired') });
+    // A failed sign-in is a sign-in result, never a connection error: health stays clean.
+    expect(service.status()).toMatchObject({ connected: false, lastError: null, pageSignIn: { action: 'unknown', kind: 'state_expired', ok: false, message: expect.stringContaining('expired') } });
   });
 
   it('refuses a grant without read access or without a refresh token, storing nothing', async () => {
@@ -561,5 +577,575 @@ describe('Gmail connection: built-in client and granted scopes', () => {
     } finally {
       fs.rmSync(ownDir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Owner report 2026-10-12: a green "Active" badge beside "Google sign-in
+ * failed: network error (ETIMEDOUT)". Health (needsReconnect / lastError) and
+ * the result of the last sign-in attempt (signIn / pageSignIn) are separate
+ * answers; the attempt is shown where it was made, ends after 15 minutes or on
+ * Dismiss, and a failure that a later success outdates is not shown. The
+ * measured cause of the ETIMEDOUT itself (Node's 250 ms connect limit) is
+ * network-defaults.test.ts; here the code exchange meets the failure it caused.
+ */
+const WITH_DRIVE = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`;
+const GMAIL_ONLY = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE}`;
+const errnoError = (code: string, syscall = 'connect') => Object.assign(new Error(`${syscall} ${code}`), { code, syscall });
+/** What Node threw for every fetch to Google on the owner's Mac: a failed connect to both addresses. */
+const connectFailure = () => Object.assign(new TypeError('fetch failed'), {
+  cause: Object.assign(new AggregateError([errnoError('ETIMEDOUT'), errnoError('EHOSTUNREACH')], ''), { code: 'ETIMEDOUT' }),
+});
+const lookupFailure = () => Object.assign(new TypeError('fetch failed'), { cause: errnoError('ENOTFOUND', 'getaddrinfo') });
+const deadlineFailure = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+
+describe('Gmail sign-in results: the last attempt is not the connection’s health', () => {
+  let dir: string;
+  let google: ReturnType<typeof fakeGoogle>;
+  let clock: number;
+  let pauses: number[];
+  let warnings: string[];
+  let logs: string[];
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-signin-'));
+    google = fakeGoogle();
+    clock = Date.parse('2026-10-12T06:00:00Z');
+    pauses = [];
+    warnings = [];
+    logs = [];
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => { warnings.push(args.map(String).join(' ')); });
+    vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function make() {
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    const service = createGmailConnection({
+      redirectUri: REDIRECT, store, fetchImpl: google.fetch, endpoints: ENDPOINTS, now: () => clock,
+      sleep: async (ms) => { pauses.push(ms); },
+      newAccountId: (() => { let n = 0; return () => `ga_${String(++n).padStart(10, '0')}`; })(),
+    });
+    service.saveClient(CLIENT);
+    return { store, service };
+  }
+  async function signIn(service: ReturnType<typeof make>['service'], options?: Parameters<ReturnType<typeof make>['service']['beginConnect']>[0], code = 'code-1') {
+    const { authUrl } = service.beginConnect(options);
+    const state = queryOf(authUrl).get('state');
+    return { authUrl, state, result: await service.completeSignIn({ code, state }) };
+  }
+  const exchanges = () => google.calls.filter(call => call.form.grant_type === 'authorization_code');
+  const gmailJson = () => fs.readFileSync(path.join(dir, 'gmail.json'), 'utf8');
+
+  it('retries the code exchange once after a connect timeout, with the same code and verifier, then connects', async () => {
+    const { service } = make();
+    google.exchangeFailures = [connectFailure()];
+    const { authUrl, result } = await signIn(service);
+    expect(result).toMatchObject({ connected: true, accountId: 'default', accountEmail: 'jane.doe@gmail.com', replay: false, attempt: { action: 'gmail_connect', kind: 'ok', ok: true } });
+    expect(exchanges()).toHaveLength(2);
+    const [first, second] = exchanges();
+    expect(second.form).toEqual(first.form);
+    expect(createHash('sha256').update(second.form.code_verifier).digest('base64url')).toBe(queryOf(authUrl).get('code_challenge'));
+    expect(pauses).toEqual([1500]);
+    expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null, pageSignIn: null });
+    expect(warnings.join('\n')).toContain('sign-in could not reach Google (ETIMEDOUT+EHOSTUNREACH); trying once more');
+  });
+
+  it('after two connect timeouts says so plainly, writes no grant, and leaves the existing one untouched', async () => {
+    const { service, store } = make();
+    await signIn(service);
+    const before = gmailJson();
+    const callsBefore = exchanges().length;
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    google.grantRefreshToken = 'refresh-2';
+    const { result } = await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-drive');
+    expect(result.connected).toBe(false);
+    expect(result.attempt).toMatchObject({ action: 'drive_connect', kind: 'network', ok: false, accountId: 'default' });
+    expect(result.attempt!.message).toBe("Couldn't connect Google Drive: BotBoy couldn't reach Google (timed out on a slow route to Google). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    expect(exchanges().length - callsBefore).toBe(2);
+    expect(pauses).toEqual([1500]);
+    // No tokens came back, so Gmail was never asked who signed in, and nothing was written.
+    expect(google.calls.filter(call => call.url.includes('/profile'))).toHaveLength(1);
+    expect(gmailJson()).toBe(before);
+    expect(store.read().accounts[0].connection.refreshToken).toBe('refresh-1');
+    expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null });
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'network', ok: false });
+    expect(service.status().signIn.gmail?.ok).toBe(true);
+  });
+
+  it('writes no grant when a first connect times out twice', async () => {
+    const { service, store } = make();
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    const { result } = await signIn(service);
+    expect(result).toMatchObject({ connected: false, accountId: null, attempt: { action: 'gmail_connect', kind: 'network', accountId: null } });
+    expect(result.attempt!.message).toBe("Couldn't connect Gmail: BotBoy couldn't reach Google (timed out on a slow route to Google). Press Connect Gmail to try again.");
+    expect(store.read().accounts).toEqual([]);
+    expect(service.isConnected()).toBe(false);
+    expect(service.status()).toMatchObject({ connected: false, lastError: null, pageSignIn: { kind: 'network', ok: false } });
+  });
+
+  it('never sends the code again after Google answered or after the 30 s deadline', async () => {
+    const { service } = make();
+    google.exchangeError = 'invalid_grant';
+    const answered = (await signIn(service)).result;
+    expect(answered.attempt).toMatchObject({ kind: 'invalid_grant', ok: false });
+    expect(answered.attempt!.message).toBe("Couldn't connect Gmail: Google rejected the sign-in code (it was already used or expired). Press Connect Gmail to try again.");
+    expect(exchanges()).toHaveLength(1);
+    google.exchangeError = '';
+    google.exchangeFailures = [deadlineFailure()];
+    const timedOut = (await signIn(service, undefined, 'code-2')).result;
+    expect(timedOut.attempt).toMatchObject({ kind: 'timeout', ok: false });
+    expect(timedOut.attempt!.message).toBe("Couldn't connect Gmail: Google didn't answer within 30 seconds. Press Connect Gmail to try again.");
+    expect(exchanges()).toHaveLength(2);
+    expect(pauses).toEqual([]);
+    expect(service.isConnected()).toBe(false);
+  });
+
+  it('retries the Gmail profile read once instead of losing the refresh token Google just issued', async () => {
+    const { service } = make();
+    google.profileFailures = [connectFailure()];
+    const { result } = await signIn(service);
+    expect(result.connected).toBe(true);
+    expect(exchanges()).toHaveLength(1);
+    expect(google.calls.filter(call => call.url.includes('/profile'))).toHaveLength(2);
+    expect(pauses).toEqual([1500]);
+
+    google.profileFailures = [connectFailure(), connectFailure()];
+    const lost = await signIn(make().service, undefined, 'code-3').catch(error => error);
+    expect(lost.result.connected).toBe(false);
+    expect(lost.result.attempt).toMatchObject({ kind: 'network', ok: false });
+  });
+
+  it('puts each failure in words that name the action, the cause, and the next step', async () => {
+    const { service } = make();
+    await signIn(service);
+    const fail = async (options: Parameters<typeof service.beginConnect>[0], setup: () => void = () => {}) => {
+      setup();
+      return (await signIn(service, options, 'code-x')).result.attempt!;
+    };
+    const drive = { accountId: 'default', purpose: 'drive' as const };
+
+    google.exchangeFailures = [lookupFailure(), lookupFailure()];
+    expect((await fail(drive)).message).toBe("Couldn't connect Google Drive: BotBoy couldn't reach Google (Google's address could not be looked up). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    google.exchangeFailures = [deadlineFailure()];
+    expect((await fail(drive)).message).toBe("Couldn't connect Google Drive: Google didn't answer within 30 seconds. Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    google.exchangeError = 'invalid_grant';
+    expect((await fail(drive)).message).toBe("Couldn't connect Google Drive: Google rejected the sign-in code (it was already used or expired). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    google.exchangeError = 'redirect_uri_mismatch';
+    const redirect = await fail(drive);
+    expect(redirect).toMatchObject({ kind: 'client_rejected' });
+    expect(redirect.message).toContain('does not match this OAuth client (redirect mismatch)');
+    expect(redirect.message).toContain('Desktop app OAuth client');
+    google.exchangeError = 'invalid_client';
+    expect((await fail(drive)).message).toContain('Google rejected the OAuth client ID or secret');
+    google.exchangeError = '503';
+    expect((await fail(drive)).message).toBe("Couldn't connect Google Drive: Google answered with an error (HTTP 400 503). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    google.exchangeError = '';
+
+    // The owner pressed Cancel on Google's Drive screen.
+    const cancelled = service.beginConnect(drive);
+    const denied = await service.completeSignIn({ error: 'access_denied', state: queryOf(cancelled.authUrl).get('state') });
+    expect(denied.attempt).toMatchObject({ kind: 'cancelled', action: 'drive_connect' });
+    expect(denied.attempt!.message).toBe('Drive not granted: the Google sign-in was cancelled, so nothing changed. Press Connect Google Drive to try again.');
+
+    // A link that matches no sign-in (BotBoy restarted, or the page was opened twice).
+    const stale = await service.completeSignIn({ code: 'x', state: 'never-issued' });
+    expect(stale.attempt).toMatchObject({ action: 'unknown', kind: 'state_expired', accountId: null });
+    expect(stale.attempt!.message).toBe('That sign-in link expired or was already used (BotBoy restarted, or the page was opened twice). Choose Connect again.');
+
+    // A Reconnect names Reconnect and says the current connection is unchanged.
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    expect((await fail({ accountId: 'default' })).message).toBe("Couldn't reconnect Gmail: BotBoy couldn't reach Google (timed out on a slow route to Google). Your current Gmail connection is unchanged. Press Reconnect to try again.");
+    // Adding a second account names that button.
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    expect((await fail({ addAccount: true })).message).toContain('Press Add another account to try again.');
+  });
+
+  it('says the Gmail API is turned off, and what to do, when Google answers the profile read with accessNotConfigured', async () => {
+    const { service, store } = make();
+    const fix = (button: string) => `Enable the Gmail API in the same Google Cloud project as your OAuth client (APIs & Services → Library → Gmail API), wait a minute, then press ${button} to try again.`;
+    const off = {
+      error: {
+        code: 403,
+        message: 'Gmail API has not been used in project 1234567890 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/gmail.googleapis.com/overview?project=1234567890 then retry.',
+        errors: [{ message: 'Access Not Configured.', domain: 'usageLimits', reason: 'accessNotConfigured' }],
+        status: 'PERMISSION_DENIED',
+      },
+    };
+
+    // A first connect: Google issued tokens, then the profile read said the API is off.
+    google.profileHttpError = { status: 403, body: off };
+    const first = (await signIn(service)).result;
+    expect(first).toMatchObject({ connected: false, attempt: { action: 'gmail_connect', kind: 'api_not_enabled', ok: false, accountId: null } });
+    expect(first.attempt!.message).toBe(`Couldn't connect Gmail: Google says the Gmail API is turned off. ${fix('Connect Gmail')}`);
+    expect(first.attempt!.nextAction).toBe(fix('Connect Gmail'));
+    // Google answered, so nothing is retried, and no grant is written.
+    expect(google.calls.filter(call => call.url.includes('/profile'))).toHaveLength(1);
+    expect(pauses).toEqual([]);
+    expect(store.read().accounts).toEqual([]);
+    expect(warnings).toContain('[Gmail] sign-in failed: action=gmail_connect kind=api_not_enabled code=403 accessNotConfigured');
+
+    // Connected, a Drive attempt names its own button, leaves the grant alone, and
+    // gives no Gmail reassurance (Gmail itself is the cause).
+    google.profileHttpError = null;
+    await signIn(service, undefined, 'code-2');
+    const before = gmailJson();
+    google.profileHttpError = { status: 403, body: off };
+    const drive = (await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-3')).result;
+    expect(drive.attempt).toMatchObject({ action: 'drive_connect', kind: 'api_not_enabled', accountId: 'default' });
+    expect(drive.attempt!.message).toBe(`Couldn't connect Google Drive: Google says the Gmail API is turned off. ${fix('Connect Google Drive')}`);
+    expect(gmailJson()).toBe(before);
+    expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null });
+
+    // Newer error bodies carry no reason list (the reason reads PERMISSION_DENIED): the text says it.
+    google.profileHttpError = { status: 403, body: { error: { code: 403, message: 'Gmail API has not been used in project 1 before or it is disabled.', status: 'PERMISSION_DENIED' } } };
+    expect((await signIn(service, { accountId: 'default' }, 'code-4')).result.attempt).toMatchObject({ kind: 'api_not_enabled' });
+    google.profileHttpError = { status: 403, body: { error: { code: 403, message: 'Service disabled.', errors: [{ reason: 'SERVICE_DISABLED' }] } } };
+    expect((await signIn(service, { accountId: 'default' }, 'code-5')).result.attempt).toMatchObject({ kind: 'api_not_enabled' });
+
+    // Other 403s, and other statuses, are not mistaken for it.
+    google.profileHttpError = { status: 403, body: { error: { code: 403, message: 'Request had insufficient authentication scopes.', errors: [{ reason: 'insufficientPermissions' }] } } };
+    const other = (await signIn(service, { accountId: 'default' }, 'code-6')).result.attempt!;
+    expect(other.kind).toBe('google_error');
+    expect(other.message).toBe("Couldn't reconnect Gmail: Google answered with an error (HTTP 403 insufficientPermissions). Your current Gmail connection is unchanged. Press Reconnect to try again.");
+    google.profileHttpError = { status: 500, body: { error: { code: 500, message: 'Backend is disabled for maintenance.' } } };
+    expect((await signIn(service, { accountId: 'default' }, 'code-7')).result.attempt!.kind).toBe('google_error');
+  });
+
+  it('never states Gmail’s health in a notice that outlives the moment it was written', async () => {
+    // A notice stays 15 minutes; "Gmail is still working" could outlast an outage that turns the badge amber.
+    const { service } = make();
+    await signIn(service);
+    const messages: string[] = [];
+    const record = async (options: Parameters<typeof service.beginConnect>[0]) => {
+      messages.push((await signIn(service, options, 'code-h')).result.attempt!.message);
+    };
+    const drive = { accountId: 'default', purpose: 'drive' as const };
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await record(drive);
+    google.exchangeFailures = [deadlineFailure()];
+    await record(drive);
+    google.exchangeError = 'invalid_grant';
+    await record(drive);
+    google.exchangeError = '';
+    google.grantScope = GMAIL_ONLY;
+    await record(drive);
+    google.grantScope = `${GMAIL_ONLY} ${GDRIVE_READONLY_SCOPE}`;
+    await record(drive);
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await record({ accountId: 'default' });
+    expect(messages).toHaveLength(6);
+    for (const message of messages) expect(message).not.toMatch(/working|still works/i);
+    // What the failed attempts say instead is true of the attempt itself: it left the connection alone.
+    expect(messages.filter(message => message.includes('Your current Gmail connection is unchanged.'))).toHaveLength(4);
+  });
+
+  it('says a Drive box was left unticked, for none or one of the two, and keeps Gmail connected', async () => {
+    const { service } = make();
+    await signIn(service);
+    google.grantScope = GMAIL_ONLY;
+    const none = (await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-2')).result;
+    expect(none).toMatchObject({ connected: true, attempt: { kind: 'drive_not_granted', ok: false, action: 'drive_connect' } });
+    expect(none.attempt!.message).toBe('Drive not granted: Google connected, but both Drive boxes were left unticked. Press Connect Google Drive and tick both Drive boxes.');
+    google.grantScope = `${GMAIL_ONLY} ${GDRIVE_READONLY_SCOPE}`;
+    const some = (await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-3')).result;
+    expect(some.attempt!.message).toBe('Drive not granted in full: Google allowed reading Drive but not publishing to it. Press Connect Google Drive and tick both Drive boxes.');
+    expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: false, drive: null, lastError: null });
+  });
+
+  it('keeps a partial Drive grant’s notice through later token refreshes (it is a fact, not a transient error)', async () => {
+    const { service } = make();
+    await signIn(service);
+    google.grantScope = GMAIL_ONLY;
+    await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-2');
+    clock += 60_000;
+    service.invalidateAccessToken();
+    await service.accessToken();
+    await service.client().getProfile();
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'drive_not_granted' });
+    expect(service.accounts()[0].signIn.drive).toMatchObject({ kind: 'drive_not_granted' });
+    expect(service.status().lastError).toBeNull();
+  });
+
+  it('never shows a failed Reconnect as health, and hides it once a refresh, an API answer, or a grant save outdates it', async () => {
+    const { service } = make();
+    await signIn(service);
+    const failReconnect = async () => {
+      clock += 60_000;
+      google.exchangeFailures = [connectFailure(), connectFailure()];
+      await signIn(service, { accountId: 'default' }, 'code-r');
+      expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null, signIn: { gmail: { kind: 'network', ok: false } } });
+      expect(service.accounts()[0].signIn.gmail).toMatchObject({ kind: 'network' });
+    };
+
+    // 1. the hourly token refresh works
+    await failReconnect();
+    clock += 60_000;
+    service.invalidateAccessToken();
+    await service.accessToken();
+    expect(service.status().signIn.gmail).toBeNull();
+    expect(service.accounts()[0].signIn.gmail).toBeNull();
+
+    // 2. a Gmail call answers with the cached token (a sync run)
+    await failReconnect();
+    clock += 60_000;
+    await service.client().getProfile();
+    expect(service.status().signIn.gmail).toBeNull();
+
+    // 3. the next Connect saves a grant
+    await failReconnect();
+    clock += 60_000;
+    expect((await signIn(service, { accountId: 'default' }, 'code-ok')).result.connected).toBe(true);
+    expect(service.status().signIn.gmail).toMatchObject({ kind: 'ok', ok: true });
+    expect(service.status().signIn.gmail?.message).toBe('Gmail reconnected as jane.doe@gmail.com.');
+  });
+
+  it('keeps a Drive failure through Gmail successes; it ends on Dismiss, after 15 minutes, or when Drive connects', async () => {
+    const { service } = make();
+    await signIn(service);
+    const failDrive = async () => {
+      clock += 60_000;
+      google.exchangeFailures = [connectFailure(), connectFailure()];
+      await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-d');
+      return Date.parse(service.status().signIn.drive!.at);
+    };
+
+    // Gmail working says nothing about the Drive grant.
+    let at = await failDrive();
+    clock += 60_000;
+    service.invalidateAccessToken();
+    await service.accessToken();
+    await service.client().getProfile();
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'network', ok: false });
+
+    // Fifteen minutes after the attempt it is gone (14:59.999 still shows it).
+    clock = at + 15 * 60_000 - 1;
+    expect(service.status().signIn.drive).not.toBeNull();
+    clock = at + 15 * 60_000;
+    expect(service.status().signIn.drive).toBeNull();
+
+    // Dismiss ends it early, only for that account and action.
+    at = await failDrive();
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await signIn(service, { accountId: 'default' }, 'code-g');
+    service.dismissSignIn('default', 'drive_connect');
+    expect(service.status().signIn.drive).toBeNull();
+    expect(service.status().signIn.gmail).toMatchObject({ kind: 'network' });
+    service.dismissSignIn('default', 'gmail_connect');
+    expect(service.status().signIn.gmail).toBeNull();
+
+    // A successful Drive connect replaces the failure with its own result.
+    await failDrive();
+    google.grantScope = WITH_DRIVE;
+    clock += 60_000;
+    expect((await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-ok')).result.connected).toBe(true);
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'ok', ok: true, message: 'Google Drive connected. Choose the Drive sources BotBoy should capture below.' });
+    expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: true });
+  });
+
+  it('shows a first connect’s failure on the page level, dismissable, and clears it on the next success', async () => {
+    const { service } = make();
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await signIn(service);
+    expect(service.status().pageSignIn).toMatchObject({ action: 'gmail_connect', accountId: null, kind: 'network' });
+    expect(service.status().signIn).toEqual({ gmail: null, drive: null });
+    service.dismissSignIn(null, 'gmail_connect');
+    expect(service.status().pageSignIn).toBeNull();
+
+    // A link that matched nothing sits in the same page-level place and also ends on the next success.
+    await service.completeSignIn({ code: 'x', state: 'forged' });
+    expect(service.status().pageSignIn).toMatchObject({ action: 'unknown', kind: 'state_expired' });
+    await signIn(service, undefined, 'code-ok');
+    expect(service.status()).toMatchObject({ connected: true, pageSignIn: null });
+  });
+
+  it('scopes a second account’s results to that account', async () => {
+    const { service } = make();
+    await signIn(service);
+    google.account = 'work@example.com';
+    google.grantRefreshToken = 'refresh-2';
+    const { result } = await signIn(service, { addAccount: true }, 'code-2');
+    const workId = result.accountId!;
+    expect(workId).toBe('ga_0000000001');
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await signIn(service, { accountId: workId }, 'code-3');
+    expect(service.account(workId)!.status().signIn.gmail).toMatchObject({ kind: 'network', accountId: workId });
+    // The first account keeps its own (successful) result; the failure is not copied to it.
+    expect(service.account('default')!.status().signIn.gmail).toMatchObject({ kind: 'ok', ok: true });
+    expect(service.accounts().find(account => account.id === workId)!.signIn.gmail).toMatchObject({ kind: 'network' });
+    expect(service.accounts().find(account => account.id === 'default')!.signIn.gmail).toMatchObject({ kind: 'ok' });
+    // Disconnecting the account takes its results with it.
+    await service.disconnect(workId);
+    expect(service.status().accounts.map(account => account.id)).toEqual(['default']);
+    expect(service.status().pageSignIn).toBeNull();
+  });
+
+  it('does not record a failure when a callback BotBoy already handled is opened again', async () => {
+    const { service } = make();
+    const { state, result } = await signIn(service);
+    expect(result.connected).toBe(true);
+    const again = await service.completeSignIn({ code: 'code-1', state });
+    expect(again).toEqual({ connected: false, accountId: null, accountEmail: null, attempt: null, replay: true });
+    expect(await service.completeConnect({ code: 'code-1', state })).toMatchObject({ ok: false, error: expect.stringContaining('expired or was already used') });
+    expect(exchanges()).toHaveLength(1);
+    expect(service.status()).toMatchObject({ connected: true, pageSignIn: null, signIn: { gmail: { kind: 'ok' } } });
+  });
+
+  it('keeps health separate: a rejected grant sets lastError, a good refresh clears it, and sign-in results never touch it', async () => {
+    const { service } = make();
+    await signIn(service);
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-d');
+    expect(service.status().lastError).toBeNull();
+
+    service.invalidateAccessToken();
+    google.refreshError = 'invalid_grant';
+    await expect(service.accessToken()).rejects.toMatchObject({ code: 'reconnect_required' });
+    expect(service.status()).toMatchObject({ needsReconnect: true, lastError: expect.stringContaining('Choose Reconnect'), signIn: { drive: { kind: 'network' } } });
+    expect(service.accounts()[0].lastError).toContain('Choose Reconnect');
+
+    google.refreshError = '';
+    await service.accessToken();
+    expect(service.status()).toMatchObject({ needsReconnect: false, lastError: null });
+    expect(service.accounts()[0].lastError).toBeNull();
+  });
+
+  it('logs one token-free warning per failed attempt and a connected line that names Drive', async () => {
+    const { service } = make();
+    google.grantScope = GMAIL_ONLY;
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    google.grantRefreshToken = 'refresh-secret-value';
+    await signIn(service, undefined, 'code-secret-value');
+    const failed = warnings.filter(line => line.startsWith('[Gmail] sign-in failed'));
+    expect(failed).toEqual(['[Gmail] sign-in failed: action=gmail_connect kind=network code=ETIMEDOUT+EHOSTUNREACH']);
+
+    await signIn(service, undefined, 'code-2');
+    expect(logs.find(line => line.includes('Connected jane.doe@gmail.com'))).toContain('(own client …ghijkl; read + compose; no Drive)');
+
+    google.grantScope = GMAIL_ONLY;
+    await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-3');
+    expect(logs.filter(line => line.includes('Reconnected')).at(-1)).toContain('; Drive not granted)');
+    expect(warnings.filter(line => line.startsWith('[Gmail] sign-in failed')).length).toBe(1);
+
+    google.grantScope = WITH_DRIVE;
+    await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-4');
+    expect(logs.filter(line => line.includes('Reconnected')).at(-1)).toContain('; Drive read + publish)');
+
+    google.exchangeError = 'invalid_grant';
+    await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-5');
+    expect(warnings.filter(line => line.startsWith('[Gmail] sign-in failed')).at(-1)).toBe('[Gmail] sign-in failed: action=drive_connect kind=invalid_grant code=400 invalid_grant account=default');
+    const everything = [...warnings, ...logs].join('\n');
+    for (const secret of ['code-secret-value', 'refresh-secret-value', 'access-1', CLIENT.clientSecret, 'refresh-1']) expect(everything).not.toContain(secret);
+  });
+});
+
+/**
+ * Owner follow-up 2026-10-12: Drive consent worked as soon as the connect
+ * limit was raised, and the stale "Google sign-in failed" label changed in the
+ * same restart. These tests pin that the label was only a symptom: a recorded
+ * failure never refuses, short-circuits, or alters the next attempt.
+ */
+describe('Regression: a recorded sign-in failure never gates a new attempt', () => {
+  let dir: string;
+  let google: ReturnType<typeof fakeGoogle>;
+  let pauses: number[];
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ppt-gmail-nogate-'));
+    google = fakeGoogle();
+    pauses = [];
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function make() {
+    const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
+    const service = createGmailConnection({
+      redirectUri: REDIRECT, store, fetchImpl: google.fetch, endpoints: ENDPOINTS,
+      now: () => Date.parse('2026-10-12T06:00:00Z'), sleep: async ms => { pauses.push(ms); },
+    });
+    service.saveClient(CLIENT);
+    return { store, service };
+  }
+  const exchanges = () => google.calls.filter(call => call.form.grant_type === 'authorization_code');
+
+  it('with a failed first connect on record, a new start → callback → exchange connects, saves the grant, and replaces the failure', async () => {
+    const { service, store } = make();
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    const first = service.beginConnect();
+    const failed = await service.completeSignIn({ code: 'old-code', state: queryOf(first.authUrl).get('state') });
+    expect(failed.attempt).toMatchObject({ kind: 'network', ok: false });
+    expect(service.status().pageSignIn).toMatchObject({ kind: 'network' });
+    expect(store.read().accounts).toEqual([]);
+    const before = exchanges().length;
+
+    // The failure is still on record. A new start is not refused…
+    const second = service.beginConnect();
+    const state = queryOf(second.authUrl).get('state');
+    expect(state).not.toBe(queryOf(first.authUrl).get('state'));
+    expect(service.status().pageSignIn).toMatchObject({ kind: 'network' });
+    // …and its callback runs its own exchange with its own code and verifier.
+    const done = await service.completeSignIn({ code: 'new-code', state });
+    expect(done).toMatchObject({ connected: true, accountId: 'default', replay: false, attempt: { action: 'gmail_connect', kind: 'ok', ok: true } });
+    expect(exchanges().length - before).toBe(1);
+    const exchange = exchanges().at(-1)!;
+    expect(exchange.form.code).toBe('new-code');
+    expect(createHash('sha256').update(exchange.form.code_verifier).digest('base64url')).toBe(queryOf(second.authUrl).get('code_challenge'));
+    expect(store.read().accounts[0].connection.refreshToken).toBe('refresh-1');
+    expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null, pageSignIn: null, signIn: { gmail: { kind: 'ok', ok: true } } });
+  });
+
+  it('reads no recorded result anywhere on the connect path: beginConnect and completeSignIn only write results', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'src/core/gmail-connection.ts'), 'utf8');
+    const start = source.indexOf('    beginConnect(options = {}) {');
+    const end = source.indexOf('    async completeConnect(query) {');
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const connectPath = source.slice(start, end);
+    // The readers of a result are status(), summary(), and the helpers they use; the connect path calls none of them.
+    for (const reader of ['signInView(', 'pageSignIn(', 'visibleAttempt(', 'isVisible(', 'attempts.get(', 'attempts.has(', '.signIn', 'pageSignIn']) {
+      expect(connectPath, `the connect path must not read ${reader}`).not.toContain(reader);
+    }
+    // The only reader of the attempts map is the visibility helper.
+    expect(source.match(/attempts\.get\(/g)).toHaveLength(1);
+    expect(source.match(/\bsignInError\b/g)).toBeNull();
+  });
+
+  it('with a stale failed Drive attempt on record, a new Connect Google Drive start → callback → exchange connects Drive and replaces the failure', async () => {
+    const { service, store } = make();
+    const gmail = service.beginConnect();
+    await service.completeSignIn({ code: 'gmail-code', state: queryOf(gmail.authUrl).get('state') });
+
+    // The owner's two attempts: both lost to the connect limit, so a failure notice is on record.
+    google.exchangeFailures = [connectFailure(), connectFailure()];
+    const lost = service.beginConnect({ accountId: 'default', purpose: 'drive' });
+    const failed = await service.completeSignIn({ code: 'lost-code', state: queryOf(lost.authUrl).get('state') });
+    expect(failed.attempt).toMatchObject({ action: 'drive_connect', kind: 'network', ok: false });
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'network' });
+    expect(service.accounts()[0]).toMatchObject({ canReadDrive: false, canPublishDrive: false, drive: null });
+    const before = exchanges().length;
+
+    // With the notice still visible a new Drive start is accepted and asks for both Drive scopes.
+    google.grantScope = WITH_DRIVE;
+    const retry = service.beginConnect({ accountId: 'default', purpose: 'drive' });
+    expect(queryOf(retry.authUrl).get('scope')).toContain(GDRIVE_READONLY_SCOPE);
+    expect(queryOf(retry.authUrl).get('scope')).toContain(GDRIVE_FILE_SCOPE);
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'network' });
+    const done = await service.completeSignIn({ code: 'retry-code', state: queryOf(retry.authUrl).get('state') });
+
+    expect(done).toMatchObject({ connected: true, accountId: 'default', attempt: { action: 'drive_connect', kind: 'ok', ok: true } });
+    expect(exchanges().length - before).toBe(1);
+    expect(exchanges().at(-1)!.form.code).toBe('retry-code');
+    expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true } });
+    expect(store.read().accounts[0].connection.scope).toContain(GDRIVE_FILE_SCOPE);
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'ok', ok: true });
+    expect(pauses).toEqual([1500]);
   });
 });

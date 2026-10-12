@@ -347,6 +347,7 @@ describe('launcher failed-start cleanup contract', () => {
     const safetyBlock = path.join(root, 'startup-block.json');
     const baseEnv = {
       ...process.env,
+      BOTBOY_NO_ARCH_REEXEC: '1',
       PPT_LOG_FILE: path.join(root, 'launcher.log'),
       PPT_PID_FILE: pidFile,
       PPT_STARTUP_SAFETY_BLOCK: safetyBlock,
@@ -549,6 +550,7 @@ describe('a failed start that never reached the database leaves no guard (teamma
       cwd: path.dirname(launcherPath),
       env: {
         ...process.env,
+        BOTBOY_NO_ARCH_REEXEC: '1',
         PPT_LOG_FILE: path.join(root, 'launcher.log'),
         PPT_PID_FILE: path.join(root, 'ppt.pid'),
         PPT_STARTUP_SAFETY_BLOCK: safetyBlock,
@@ -651,6 +653,7 @@ describe('launcher guard handling for a clean reinstall (teammate report 2026-10
       cwd: path.dirname(launcherPath),
       env: {
         ...process.env,
+        BOTBOY_NO_ARCH_REEXEC: '1',
         BOTBOY_TEST_DISCOVER_TRACKER_PIDS: '1',
         PPT_PID_FILE: pidFile,
         PPT_LOG_FILE: path.join(root, 'launcher.log'),
@@ -748,6 +751,7 @@ describe('launcher guard handling for a clean reinstall (teammate report 2026-10
         PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
         HOME: home,
         NODE_ENV: 'test',
+        BOTBOY_NO_ARCH_REEXEC: '1',
         BOTBOY_TEST_RECOVERY_ISOLATED: '1',
         PPT_LOG_FILE: path.join(root, 'launcher.log'),
         PPT_STARTUP_SAFETY_BLOCK: guardPath,
@@ -809,7 +813,7 @@ describe('launcher guard handling for a clean reinstall (teammate report 2026-10
     fs.mkdirSync(home);
     const result = spawnSync('/bin/bash', [path.join(app, 'start.sh'), '--update'], {
       cwd: app,
-      env: { ...gitEnv, HOME: home, PPT_STARTUP_SAFETY_BLOCK: guardPath, PPT_LOG_FILE: path.join(root, 'launcher.log') },
+      env: { ...gitEnv, HOME: home, BOTBOY_NO_ARCH_REEXEC: '1', PPT_STARTUP_SAFETY_BLOCK: guardPath, PPT_LOG_FILE: path.join(root, 'launcher.log') },
       encoding: 'utf8',
       timeout: 30_000,
     });

@@ -58,7 +58,7 @@ function app(sqlite: SqliteStub) {
   fs.chmodSync(helper, 0o644);
   const run = (mode: 'check' | 'repair') => spawnSync('/bin/bash', [path.join(dir, 'start.sh')], {
     cwd: dir,
-    env: { ...process.env, BOTBOY_TEST_NATIVE_STATUS: mode, PPT_LOG_FILE: path.join(root, 'launcher.log') },
+    env: { ...process.env, BOTBOY_NO_ARCH_REEXEC: '1', BOTBOY_TEST_NATIVE_STATUS: mode, PPT_LOG_FILE: path.join(root, 'launcher.log') },
     encoding: 'utf8',
     timeout: 20_000,
   });
@@ -116,7 +116,7 @@ describe('start.sh › native_modules_status', () => {
     expect(preflightAt).toBeGreaterThan(0);
     // Remove, then install: npm writes new files instead of rewriting a
     // binary a running BotBoy has loaded.
-    expect(block).toContain('rm -rf node_modules/better-sqlite3 node_modules/node-pty \\\n    && npm install --no-audit --no-fund');
+    expect(block).toContain('rm -rf node_modules/better-sqlite3 node_modules/node-pty \\\n    && native_exec npm install --no-audit --no-fund');
     expect(block.indexOf('print_native_modules_failure')).toBeGreaterThan(block.indexOf('npm install'));
     expect(block).toMatch(/print_native_modules_failure "\$NATIVE_STATUS" \| tee -a "\$LOG_FILE"\n\s+exit 1/);
     // Every server spawn comes after the check.

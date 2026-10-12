@@ -396,6 +396,14 @@ npm run app:bundle
 With Xcode Command Line Tools, the native launcher keeps the Dock icon present
 while BotBoy runs. Without them, BotBoy still runs from Terminal.
 
+On a Mac with Apple silicon, BotBoy, its Node server, and its debug Chrome run
+natively, not under Rosetta. If Terminal or an older `BotBoy.app` starts
+`./start.sh` under Rosetta, it relaunches itself natively. It also adds the
+architecture setting to `/Applications/BotBoy.app` by itself, without
+developer tools. That change reaches the app the next time it opens: quit and
+reopen BotBoy. `./start.sh --doctor` shows each of these on its `hardware`,
+`this shell`, `chrome arch`, `node arch`, and `app launcher` lines.
+
 BotBoy reads the text of PDFs on every Mac: its pdf.js reader is installed by
 `npm install`, and `./start.sh` installs it after an update if it is missing.
 Xcode Command Line Tools also build BotBoy's native reader, which is faster
@@ -450,12 +458,16 @@ credential attachment before producing the report.
 | Chrome shows `ERR_CONNECTION_REFUSED` | Do not keep refreshing. Run `./start.sh --update`, then `./start.sh`; if startup reports failure, run `./start.sh --doctor` and share only the reviewed relevant output. |
 | `Replacement start blocked` / `shutdown recovery: BLOCKED` | Run `./start.sh --recover-shutdown`, then `./start.sh`. Do not delete the guard yourself; deleting and re-cloning `botboy-app` does not clear it. See **Unverified shutdown recovery** below. |
 | BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
+| Activity Monitor shows BotBoy, `node`, or Chrome as **Intel**, the Mac feels slow, or the doctor says `this shell: translated (Rosetta)`, `chrome arch: x86_64 only`, or `architecture priority: missing` | Run `./start.sh --update` in `~/botboy-app`, then quit and reopen BotBoy. Starting from `./start.sh` relaunches BotBoy and its Chrome natively and fixes the app's architecture setting by itself, but a Chrome that is already running as Intel is never restarted for you: quit it once (⌘Q), then start BotBoy again. If the doctor still reports an Intel-only Chrome (Migration Assistant can copy the Intel build), install **Chrome for Mac with Apple chip** from google.com/chrome and replace the app. An Intel-only Node needs an Apple-silicon Node (the nodejs.org installer, or Homebrew in `/opt/homebrew`). Terminal set to **Open using Rosetta** is handled, but you can clear that box in its Get Info. This was verified on macOS 26 only. |
+| BotBoy.app still starts under Rosetta after the update | Start BotBoy once from Terminal with `./start.sh` so it can patch the app, then quit and reopen BotBoy. Without developer tools you can apply the same change by hand: `/usr/libexec/PlistBuddy -c "Delete :LSArchitecturePriority" /Applications/BotBoy.app/Contents/Info.plist` (an error is fine), then `/usr/libexec/PlistBuddy -c "Add :LSArchitecturePriority array" -c "Add :LSArchitecturePriority:0 string arm64" -c "Add :LSArchitecturePriority:1 string x86_64" /Applications/BotBoy.app/Contents/Info.plist`, then `touch /Applications/BotBoy.app`. Deleting the app (`rm -rf /Applications/BotBoy.app`) and running `npm run app:bundle` only helped Macs with developer tools before this update; after it, BotBoy patches the app itself, and a regenerated app carries the setting on every Mac. |
+| BotBoy slows its browser capture, or the doctor shows `memory pressure: warn` or `swap used` | The Mac is short of memory. BotBoy polls less often until pressure drops, then returns to normal on its own. Close other apps, or choose **Pause** on **Connections → Browser capture** to stop reading your tabs until you resume. |
 | A connection card is missing | Run `./start.sh --update`, then reopen BotBoy. |
 | Gmail shows **Reconnect needed** | Google ended BotBoy's access: you changed your Google password, you removed BotBoy from your Google account, or your app was in testing for 7 days. Open **Connections → Gmail** and choose **Reconnect**. To stop the 7-day sign-outs, publish the app (step 2 under **Gmail**). `./start.sh --doctor` prints a `gmail refresh probe` status; `400 invalid_grant` means Reconnect. |
 | BotBoy says it may not draft or send, or the Gmail page shows **Reconnect to allow drafting and sending** | The connection has read access only. Choose **Reconnect** and leave **Manage drafts and send emails** ticked on Google's screen. |
 | The Gmail page asks for a Google OAuth client although Gmail worked before, or the doctor says only the retired shared client is saved | BotBoy no longer uses a shared Google client. Create your own client (steps under **Gmail**), choose its JSON file, then choose **Connect Gmail**. |
 | Google or the Gmail page shows `redirect_uri_mismatch` or `invalid_client`, or says the file is for a Web application client | The saved client is not a **Desktop app** client, or its ID or secret is wrong. Create a Desktop app client and choose its JSON file (or save its ID and secret) again. |
 | Google shows `access_denied` when you connect Gmail | You chose Cancel, or a test-mode app admits only its listed test users. Connect again and choose **Allow**; or publish your app, or add your address under **Audience → Test users**. |
+| Connecting Gmail, Google Drive, or Slack says BotBoy couldn't reach the service (a timeout such as `ETIMEDOUT`) while your browser reaches it fine | BotBoy waits up to 2 seconds for each connection attempt; Node's own limit is 0.25 seconds, which is too short on some networks. `./start.sh --doctor` prints the `node connect timeout:` and `connect probe:` lines. To wait longer or shorter (250 to 10000 ms), start BotBoy with `BOTBOY_NET_ATTEMPT_TIMEOUT_MS=5000 ./start.sh`. |
 
 ### Unverified shutdown recovery
 

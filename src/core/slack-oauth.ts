@@ -17,6 +17,7 @@
 
 import crypto from 'crypto';
 import { WebClient } from '@slack/web-api';
+import { allConnectPhase, retryAfterBackoff, transportCodesOf } from './transport-errors.js';
 
 /** The user scopes BotBoy requests; rendered on the Slack card from this constant. */
 export const SLACK_USER_SCOPES = [
@@ -44,6 +45,8 @@ export const SLACK_METHOD_SCOPES: Readonly<Record<string, readonly string[]>> = 
 export const SLACK_AUTHORIZE_URL = 'https://slack.com/oauth/v2/authorize';
 const STATE_TTL_MS = 10 * 60_000;
 export const MAX_PASTE_CHARS = 4096;
+/** Every Slack call of the sign-in has this deadline (the client's own default is none). */
+export const SLACK_REQUEST_TIMEOUT_MS = 30_000;
 
 export type SlackOAuthErrorCode =
   | 'slack_client_missing'
@@ -53,6 +56,7 @@ export type SlackOAuthErrorCode =
   | 'access_denied'
   | 'rotation_enabled'
   | 'exchange_failed'
+  | 'network_error'
   | 'auth_test_failed'
   | 'not_user_token';
 
@@ -133,6 +137,46 @@ export interface SlackExchangeResult {
 }
 
 /**
+ * A Slack call that never got an answer: the client wraps the transport error
+ * (`slack_webapi_request_error`, the axios error under `original`). A refusal
+ * from Slack (`data.error`) and an HTTP error status are NOT this.
+ */
+function isTransportFailure(error: any): boolean {
+  return error?.code === 'slack_webapi_request_error';
+}
+
+/** The errno codes under the client's wrapper (its own `code` names the wrapper, not the cause). */
+function slackTransportCodes(error: any): string[] {
+  return transportCodesOf(error?.original ?? error?.cause ?? null);
+}
+
+/** The request provably never reached Slack, so a single-use code may be sent once more. */
+function isConnectPhaseFailure(error: any): boolean {
+  return isTransportFailure(error) && allConnectPhase(slackTransportCodes(error));
+}
+
+/** The owner-facing words for a call that failed without a Slack answer. */
+function transportFailureMessage(error: any, doing: string, timeoutMs: number): string {
+  const codes = slackTransportCodes(error);
+  const timedOut = codes.includes('ECONNABORTED') || /timeout/i.test(String(error?.original?.message ?? ''));
+  const cause = timedOut
+    ? `Slack didn't answer within ${Math.round(timeoutMs / 1000)} seconds`
+    : codes.includes('ETIMEDOUT')
+      ? 'timed out on a slow route to Slack'
+      : codes.some(code => code === 'ENOTFOUND' || code === 'EAI_AGAIN')
+        ? "Slack's address could not be looked up"
+        : 'network error';
+  return `Couldn't reach Slack ${doing} (${cause}). Nothing was saved. Choose Sign in with Slack again.`;
+}
+
+/** Slack's own refusal code, or the transport failure's words, or a plain "request failed". */
+function slackFailure(code: SlackOAuthErrorCode, error: any, doing: string, timeoutMs: number, refusal: (slackCode: string) => string): SlackOAuthError {
+  if (isTransportFailure(error)) return new SlackOAuthError('network_error', transportFailureMessage(error, doing, timeoutMs));
+  const slackCode = typeof error?.data?.error === 'string' ? error.data.error : 'request_failed';
+  return new SlackOAuthError(code, refusal(slackCode.replace(/[^a-z0-9_]/gi, '').slice(0, 60)));
+}
+
+/**
  * Exchanges a code for the user token and proves it. Nothing is returned (and
  * so nothing is saved) unless every check passes.
  */
@@ -143,19 +187,30 @@ export async function exchangeSlackCode(input: {
   redirectUri: string;
   /** Tests point this at a fake Slack server. */
   slackApiUrl?: string;
+  /** Tests record the pause before the single retry instead of waiting. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Tests shorten the 30 s deadline. */
+  timeoutMs?: number;
 }): Promise<SlackExchangeResult> {
-  const options = { retryConfig: { retries: 0 }, ...(input.slackApiUrl ? { slackApiUrl: input.slackApiUrl } : {}) };
+  const timeoutMs = input.timeoutMs ?? SLACK_REQUEST_TIMEOUT_MS;
+  const options = { retryConfig: { retries: 0 }, timeout: timeoutMs, ...(input.slackApiUrl ? { slackApiUrl: input.slackApiUrl } : {}) };
+  // The code is single use, so a call is repeated only when it never reached Slack
+  // (a connect-phase failure); never after Slack answered or after a timeout.
+  const retryable = <T>(run: () => Promise<T>): Promise<T> => retryAfterBackoff(run, {
+    shouldRetry: isConnectPhaseFailure,
+    sleep: input.sleep,
+    onRetry: () => console.warn('[Slack] sign-in could not reach Slack; trying once more'),
+  });
   let access: any;
   try {
-    access = await new WebClient(undefined, options).oauth.v2.access({
+    access = await retryable(() => new WebClient(undefined, options).oauth.v2.access({
       client_id: input.clientId,
       client_secret: input.clientSecret,
       code: input.code,
       redirect_uri: input.redirectUri,
-    });
+    }));
   } catch (error: any) {
-    const code = typeof error?.data?.error === 'string' ? error.data.error : 'request_failed';
-    throw new SlackOAuthError('exchange_failed', `Slack refused the sign-in (${code.replace(/[^a-z0-9_]/gi, '').slice(0, 60)}).`);
+    throw slackFailure('exchange_failed', error, 'to finish the sign-in', timeoutMs, slackCode => `Slack refused the sign-in (${slackCode}).`);
   }
   const user = access?.authed_user ?? {};
   if (user.expires_in !== undefined || user.refresh_token !== undefined || access?.expires_in !== undefined || access?.refresh_token !== undefined) {
@@ -164,11 +219,11 @@ export async function exchangeSlackCode(input: {
   const token = typeof user.access_token === 'string' ? user.access_token : '';
   if (!token.startsWith('xoxp-')) throw new SlackOAuthError('not_user_token', 'Slack did not return a user token. Check that the app asks for User Token Scopes.');
   try {
-    const auth: any = await new WebClient(token, options).auth.test();
+    // auth.test only reads, so it may be repeated after the same connect-phase failures.
+    const auth: any = await retryable(() => new WebClient(token, options).auth.test());
     return { token, identity: { user: String(auth.user ?? ''), team: String(auth.team ?? '') } };
   } catch (error: any) {
-    const code = typeof error?.data?.error === 'string' ? error.data.error : 'request_failed';
-    throw new SlackOAuthError('auth_test_failed', `Slack did not accept the new token (${code.replace(/[^a-z0-9_]/gi, '').slice(0, 60)}).`);
+    throw slackFailure('auth_test_failed', error, 'to check the new token', timeoutMs, slackCode => `Slack did not accept the new token (${slackCode}).`);
   }
 }
 

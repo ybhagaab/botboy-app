@@ -21,7 +21,7 @@
  * can sit in a guarded `postinstall` without breaking CI installs.
  */
 
-import { chmodSync, existsSync, mkdirSync, statSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
 import os from 'os';
 import path from 'path';
@@ -34,6 +34,13 @@ const bin = path.join(binDir, 'vision-ocr');
 
 const INSTALL = process.argv.includes('--install');
 const WITH_OPTIONAL = process.argv.includes('--with-optional');
+
+// Absolute system tools. The Xcode shims in /usr/bin raise the macOS install
+// dialog on a Mac without Command Line Tools, so they run only through
+// detectSwiftToolchain, and `xcode-select -p` always runs first. The
+// BOTBOY_TEST_* overrides exist for tests; production never sets them.
+const XCODE_SELECT_BIN = process.env.BOTBOY_TEST_XCODE_SELECT_BIN || '/usr/bin/xcode-select';
+const XCRUN_BIN = process.env.BOTBOY_TEST_XCRUN_BIN || '/usr/bin/xcrun';
 
 // Keep aligned with TOOL_REGISTRY in src/core/toolchain.ts.
 // Core is EMPTY by design: BotBoy's own pdf.js reader (scripts/pdf-text.mjs,
@@ -79,31 +86,92 @@ function findBrew() {
   return candidates.find((c) => c && existsSync(c)) || null;
 }
 
+/**
+ * Whether a Swift compiler is reachable, without ever raising the macOS
+ * "install developer tools" dialog: `xcode-select -p` answers silently, and
+ * only after it succeeds is `xcrun --find swiftc` asked for the real path.
+ * Never launches `xcode-select --install`.
+ */
+export function detectSwiftToolchain({ run = execFileSync } = {}) {
+  try {
+    run(XCODE_SELECT_BIN, ['-p'], { stdio: 'pipe' });
+  } catch {
+    return { ok: false, reason: 'no-clt' };
+  }
+  try {
+    const swiftc = String(run(XCRUN_BIN, ['--find', 'swiftc'], { stdio: 'pipe', encoding: 'utf8' })).trim();
+    if (swiftc) return { ok: true, swiftc };
+  } catch {
+    // fall through
+  }
+  return { ok: false, reason: 'no-swiftc' };
+}
+
+/**
+ * Arguments that point swiftc at the macOS SDK. The shim in /usr/bin/swiftc
+ * runs through xcrun, which sets SDKROOT; the absolute path xcrun returns does
+ * not, and then fails with "unable to load standard library" (seen 2026-10-12
+ * on a Mac with Command Line Tools). Best effort: no answer means no argument.
+ */
+export function swiftSdkArgs({ run = execFileSync } = {}) {
+  try {
+    const sdk = String(run(XCRUN_BIN, ['--show-sdk-path'], { stdio: 'pipe', encoding: 'utf8' })).trim();
+    return sdk ? ['-sdk', sdk] : [];
+  } catch {
+    return [];
+  }
+}
+
+export function ocrNotBuiltNote() {
+  return 'OCR helper not built: install Xcode Command Line Tools with `xcode-select --install`; BotBoy works without it except text from images and scanned PDFs';
+}
+
+export function ocrBuildFailedNote(firstLine) {
+  return `OCR helper build failed (${firstLine || 'unknown error'}); BotBoy works without it except text from images and scanned PDFs`;
+}
+
+/** True when this file is the script node was started with, also through symlinks (os.tmpdir() is one on macOS). */
+export function isMainModule(metaUrl, argv1) {
+  try {
+    if (!argv1) return false;
+    return fileURLToPath(metaUrl) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+/** Returns 'ok', 'no-toolchain' (expected, exit 0), or 'failed' (compile error). */
 function buildVisionHelper() {
   if (process.platform !== 'darwin') {
     log('skip: Apple Vision OCR helper only builds on macOS (non-darwin platform).');
-    return;
+    return 'ok';
   }
   if (!existsSync(swiftSrc)) {
     log(`skip: helper source not found at ${swiftSrc}`);
-    return;
+    return 'ok';
   }
   // Idempotent: rebuild only if binary is missing or older than the source.
   const needsBuild = !existsSync(bin) || statSync(bin).mtimeMs < statSync(swiftSrc).mtimeMs;
   if (!needsBuild) {
     log('vision-ocr helper is up to date.');
-    return;
+    return 'ok';
   }
-  try {
-    execFileSync('which', ['swiftc'], { stdio: 'ignore' });
-  } catch {
-    log('WARNING: swiftc not found. Install Xcode Command Line Tools: xcode-select --install');
-    return;
+  const toolchain = detectSwiftToolchain();
+  if (!toolchain.ok) {
+    log(ocrNotBuiltNote());
+    return 'no-toolchain';
   }
   mkdirSync(binDir, { recursive: true });
   log('building vision-ocr helper...');
-  execFileSync('swiftc', ['-O', swiftSrc, '-o', bin], { stdio: 'inherit' });
+  try {
+    execFileSync(toolchain.swiftc, [...swiftSdkArgs(), '-O', swiftSrc, '-o', bin], { stdio: 'inherit' });
+  } catch (error) {
+    const firstLine = String(error?.message || error).split('\n')[0].trim();
+    log(`WARNING: ${ocrBuildFailedNote(firstLine)}`);
+    return 'failed';
+  }
   log(`built ${bin}`);
+  return 'ok';
 }
 
 /**
@@ -201,7 +269,25 @@ function verifyAndInstallTools() {
   }
 }
 
-makePtySpawnHelperExecutable();
-buildVisionHelper();
-verifyAndInstallTools();
-log('done.');
+/**
+ * Returns the exit status. A missing toolchain is expected (exit 0). A compile
+ * error or unexpected throw exits 0 only inside `npm install` (postinstall must
+ * never fail the install) and 2 otherwise.
+ */
+export function main() {
+  const lenient = process.env.npm_lifecycle_event === 'postinstall';
+  try {
+    makePtySpawnHelperExecutable();
+    const built = buildVisionHelper();
+    verifyAndInstallTools();
+    log('done.');
+    return built === 'failed' && !lenient ? 2 : 0;
+  } catch (error) {
+    log(`WARNING: unexpected failure: ${error?.message || error}`);
+    return lenient ? 0 : 2;
+  }
+}
+
+if (isMainModule(import.meta.url, process.argv[1])) {
+  process.exitCode = main();
+}

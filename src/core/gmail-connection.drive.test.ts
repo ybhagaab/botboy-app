@@ -91,7 +91,9 @@ describe('Connect Google Drive (incremental grant on the Gmail account)', () => 
     const [account] = service.accounts();
     expect(account.canReadDrive).toBe(true);
     expect(account.canPublishDrive).toBe(false);
-    expect(account.lastError).toMatch(/Drive not granted/);
+    // The partial grant is a sign-in result for the Drive section, not a connection error.
+    expect(account.lastError).toBeNull();
+    expect(account.signIn.drive).toMatchObject({ action: 'drive_connect', kind: 'drive_not_granted', ok: false, accountId: 'default', message: expect.stringMatching(/Drive not granted/) });
     expect(account.drive).toBeNull();
   });
 

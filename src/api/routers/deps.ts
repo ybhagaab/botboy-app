@@ -159,6 +159,11 @@ export interface RouterDeps {
   storageUsage?: StorageUsageService;
   /** Outcome-level capture health per source (Slack, SharePoint, Outlook). */
   captureHealth?: CaptureHealth;
+  /** Browser capture pacing status and the owner's pause switch (browser-capture.ts). */
+  browserCapture?: {
+    state: import('../../core/browser-capture-state.js').BrowserCaptureState;
+    monitor: Pick<import('../../monitors/browser-monitor.js').BrowserMonitor, 'status' | 'wake'>;
+  };
   /** In-app update for botboy-app installs (app-update.ts). */
   appUpdater?: import('../../core/app-update.js').AppUpdater;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */

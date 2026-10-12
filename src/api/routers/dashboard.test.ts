@@ -87,3 +87,20 @@ describe('dashboard Data Room version receipt', () => {
     }
   });
 });
+describe('dashboard browser capture version', () => {
+  const versionOf = async (callback?: () => { version: number }) => {
+    const app = express();
+    app.use('/api', createDashboardRouter(createDashboardState(), undefined, undefined, undefined, undefined, undefined, callback));
+    return (await request(app).get('/api/dashboard/version')).body;
+  };
+  it('carries browserCaptureVersion from the new optional callback and follows it', async () => {
+    let version = 3;
+    expect((await versionOf(() => ({ version }))).browserCaptureVersion).toBe(3);
+    version = 4;
+    expect((await versionOf(() => ({ version }))).browserCaptureVersion).toBe(4);
+  });
+  it('omits the field when nothing is wired and survives a throwing callback', async () => {
+    expect(await versionOf()).not.toHaveProperty('browserCaptureVersion');
+    expect(await versionOf(() => { throw new Error('boom'); })).not.toHaveProperty('browserCaptureVersion');
+  });
+});

@@ -8,6 +8,7 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from '../../core/gmail-api.js';
+import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE } from '../../core/gdrive-api.js';
 import { createGmailConnection, type GmailConnection } from '../../core/gmail-connection.js';
 import { createGmailCredentialStore } from '../../core/gmail-credentials.js';
 import { createGmailSyncs, type GmailSyncs } from '../../monitors/gmail-sync.js';
@@ -39,13 +40,32 @@ const FAKE_REFRESH_TOKEN = ['1/', '/0', 'router-refresh-token-value-0123456789']
 
 /** The address the fake Gmail profile reports (a second sign-in can switch it). */
 let profileEmail = 'jane.doe@gmail.com';
+/** What the fake token endpoint does with the next code exchanges. */
+let exchangeMode: 'ok' | 'connect_timeout' | 'invalid_grant' | 'drive_all' | 'drive_read_only' | 'api_not_enabled' = 'ok';
+const errno = (code: string) => Object.assign(new Error(`connect ${code}`), { code, syscall: 'connect' });
 const fakeFetch = async (input: string, init?: RequestInit): Promise<Response> => {
   const form = typeof init?.body === 'string' ? Object.fromEntries(new URLSearchParams(init.body)) : {};
   if (input === ENDPOINTS.tokenUrl && form.grant_type === 'authorization_code') {
-    return json({ access_token: FAKE_ACCESS_TOKEN, refresh_token: FAKE_REFRESH_TOKEN, expires_in: 3600, scope: GMAIL_READONLY_SCOPE });
+    // What Node threw for every fetch to Google on the owner's Mac: a failed connect to both addresses.
+    if (exchangeMode === 'connect_timeout') {
+      throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([errno('ETIMEDOUT'), errno('EHOSTUNREACH')], ''), { code: 'ETIMEDOUT' }) });
+    }
+    if (exchangeMode === 'invalid_grant') return json({ error: 'invalid_grant', error_description: 'Bad Request' }, 400);
+    const scope = exchangeMode === 'drive_all'
+      ? `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`
+      : exchangeMode === 'drive_read_only'
+        ? `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE}`
+        : GMAIL_READONLY_SCOPE;
+    return json({ access_token: FAKE_ACCESS_TOKEN, refresh_token: FAKE_REFRESH_TOKEN, expires_in: 3600, scope });
   }
   if (input === ENDPOINTS.revokeUrl) return json({});
-  if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) return json({ emailAddress: profileEmail, historyId: '77' });
+  if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) {
+    // Google's answer when the Gmail API is switched off in the OAuth client's Cloud project.
+    if (exchangeMode === 'api_not_enabled') {
+      return json({ error: { code: 403, message: 'Gmail API has not been used in project 1234567890 before or it is disabled.', errors: [{ reason: 'accessNotConfigured' }], status: 'PERMISSION_DENIED' } }, 403);
+    }
+    return json({ emailAddress: profileEmail, historyId: '77' });
+  }
   return json({ error: { code: 404, message: 'not found' } }, 404);
 };
 
@@ -64,8 +84,9 @@ describe('Gmail sync router', () => {
     storage.initialize();
     // No built-in client: these routes are tested with a client the owner saves.
     const store = createGmailCredentialStore({ privateRoot: dir, builtInClient: null });
-    connection = createGmailConnection({ redirectUri: `http://127.0.0.1:7778/api${GMAIL_OAUTH_CALLBACK_PATH}`, store, fetchImpl: fakeFetch, endpoints: ENDPOINTS });
+    connection = createGmailConnection({ redirectUri: `http://127.0.0.1:7778/api${GMAIL_OAUTH_CALLBACK_PATH}`, store, fetchImpl: fakeFetch, endpoints: ENDPOINTS, sleep: async () => {} });
     profileEmail = 'jane.doe@gmail.com';
+    exchangeMode = 'ok';
     sync = createGmailSyncs({ db: storage.getDb(), connection, emit: () => {} });
     runNow = vi.spyOn(sync, 'runNow').mockResolvedValue({ status: 'skipped', counters: {} as any, backlog: 0, durationMs: 0 });
     const app = express();
@@ -163,22 +184,153 @@ describe('Gmail sync router', () => {
 
   it('completes the cross-site callback, redirects to the Gmail page, and starts the first sync', async () => {
     const callback = await connectThroughCallback();
-    expect(callback.status).toBe(302);
-    expect(callback.headers.location).toBe(`${DASHBOARD}/#/connections/gmail-sync`);
+    // The callback page says plainly that it worked and sends the browser on to the Gmail page.
+    expect(callback.status).toBe(200);
+    expect(callback.headers['content-type']).toMatch(/text\/html/);
+    expect(callback.text).toContain('Gmail connected');
+    expect(callback.text).toContain(`location.replace(${JSON.stringify(`${DASHBOARD}/#/connections/gmail-sync`)})`);
+    expect(callback.text).toContain(`href="${DASHBOARD}/#/connections/gmail-sync"`);
     expect(callback.headers['referrer-policy']).toBe('no-referrer');
     expect(callback.headers['cache-control']).toBe('no-store');
     expect(connection.status()).toMatchObject({ connected: true, accountEmail: 'jane.doe@gmail.com' });
     expect(runNow).toHaveBeenCalledTimes(1);
 
-    // A replayed callback changes nothing and starts nothing.
+    // A callback that matches no sign-in changes nothing and starts nothing; it is a sign-in result, not a connection error.
     const replay = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).query({ code: 'auth-code', state: 'replayed' });
-    expect(replay.status).toBe(302);
-    expect(connection.status().lastError).toMatch(/expired or was already used/);
+    expect(replay.status).toBe(400);
+    expect(replay.text).toContain('expired or was already used');
+    expect(replay.text).toContain('Use the link below to go back to Connections → Gmail, then start the sign-in again.');
+    expect(replay.text).not.toMatch(/close this tab/i);
+    expect(connection.status().lastError).toBeNull();
+    expect(connection.status().pageSignIn).toMatchObject({ kind: 'state_expired', ok: false });
     expect(runNow).toHaveBeenCalledTimes(1);
 
     // A callback carrying another site's Origin is refused outright.
     const foreign = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Origin', 'https://evil.example').query({ code: 'x', state: 'y' });
     expect(foreign.status).toBe(403);
+  });
+
+  /** Connects Gmail, then returns the callback of a Drive consent started from the owner page. */
+  async function driveCallback(mode: typeof exchangeMode, extraQuery: Record<string, string> = {}) {
+    await connectThroughCallback();
+    const started = await owner(request(server).post('/api/gmail-sync/accounts/default/drive/connect')).send({}).expect(200);
+    const state = new URL(started.body.authUrl).searchParams.get('state')!;
+    exchangeMode = mode;
+    return request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site')
+      .query({ ...(extraQuery.error ? {} : { code: 'drive-code' }), state, ...extraQuery });
+  }
+
+  it('says plainly on the callback page that Drive was not connected, and to go back with the link and press the button again', async () => {
+    const callback = await driveCallback('connect_timeout');
+    expect(callback.status).toBe(502);
+    expect(callback.text).toContain('Google Drive was not connected');
+    expect(callback.text).toContain("Couldn&#39;t connect Google Drive: BotBoy couldn&#39;t reach Google (timed out on a slow route to Google). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.");
+    // Connect sent BotBoy's own window to Google, so this page is that window: the way back is the link, never "close the tab".
+    expect(callback.text).toContain('Use the link below to go back to Connections → Gmail, then press Connect Google Drive again.');
+    expect(callback.text).not.toMatch(/close this tab/i);
+    expect(callback.text).toContain(`href="${DASHBOARD}/#/connections/gmail-sync"`);
+    // A failure does not send the browser anywhere on its own, and starts no sync.
+    expect(callback.text).not.toContain('<script>');
+    expect(runNow).toHaveBeenCalledTimes(1);
+
+    // Gmail is untouched and healthy; the Drive section carries the result.
+    const status = (await request(server).get('/api/gmail-sync/status')).body.status;
+    expect(status.connection).toMatchObject({ connected: true, needsReconnect: false, lastError: null, canReadDrive: false, signIn: { drive: { kind: 'network', ok: false } } });
+    expect(status.accounts[0].connection.signIn.drive.message).toContain('Press Connect Google Drive to try again.');
+    expect(JSON.stringify(status)).not.toMatch(/GOCSPX|router-secret|ya29\.|refresh-token/);
+  });
+
+  it('words the other outcomes of a Drive consent: connected, a box left unticked, cancelled', async () => {
+    const connected = await driveCallback('drive_all');
+    expect(connected.status).toBe(200);
+    expect(connected.text).toContain('Google Drive connected');
+    expect(connected.text).toContain('location.replace(');
+
+    const partial = await driveCallback('drive_read_only');
+    expect(partial.status).toBe(200);
+    expect(partial.text).toContain('Google connected, but Drive was not allowed');
+    expect(partial.text).toContain('Drive not granted in full: Google allowed reading Drive but not publishing to it.');
+    expect(partial.text).toContain('Use the link below to go back to Connections → Gmail, then press Connect Google Drive again.');
+    expect(partial.text).not.toMatch(/close this tab/i);
+    expect(partial.text).not.toContain('<script>');
+    // Gmail is connected either way, so the first sync starts.
+    expect(runNow).toHaveBeenLastCalledWith('default');
+  });
+
+  it('tells the owner on the callback page to turn the Gmail API on, with the link back and no tab to close', async () => {
+    await owner(request(server).put('/api/gmail-sync/client')).send(CLIENT).expect(200);
+    const started = await owner(request(server).post('/api/gmail-sync/connect')).send({}).expect(200);
+    const state = new URL(started.body.authUrl).searchParams.get('state');
+    exchangeMode = 'api_not_enabled';
+    const callback = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site').query({ code: 'auth-code', state });
+    expect(callback.status).toBe(400);
+    expect(callback.text).toContain('Gmail was not connected');
+    expect(callback.text).toContain('Google says the Gmail API is turned off.');
+    expect(callback.text).toContain('Enable the Gmail API in the same Google Cloud project as your OAuth client (APIs &amp; Services → Library → Gmail API), wait a minute, then press Connect Gmail to try again.');
+    expect(callback.text).toContain('Use the link below to go back to Connections → Gmail, then press Connect Gmail (or Reconnect) again.');
+    expect(callback.text).toContain(`href="${DASHBOARD}/#/connections/gmail-sync"`);
+    expect(callback.text).not.toMatch(/close this tab/i);
+    expect(callback.text).not.toContain('<script>');
+    // Nothing was saved, nothing started, and the status carries the result for the page.
+    expect(connection.isConnected()).toBe(false);
+    expect(runNow).not.toHaveBeenCalled();
+    expect(connection.status().pageSignIn).toMatchObject({ kind: 'api_not_enabled', ok: false });
+  });
+
+  it('says a cancelled or expired sign-in did not finish, and never prints what the browser sent', async () => {
+    const cancelled = await driveCallback('ok', { error: 'access_denied' });
+    expect(cancelled.status).toBe(400);
+    expect(cancelled.text).toContain('Sign-in cancelled');
+    expect(cancelled.text).toContain('Drive not granted: the Google sign-in was cancelled, so nothing changed.');
+
+    const hostile = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).query({ error: '<script>alert(1)</script>', state: 'nope' });
+    expect(hostile.status).toBe(400);
+    expect(hostile.text).toContain('Sign-in did not finish');
+    expect(hostile.text).toContain('Use the link below to go back to Connections → Gmail, then start the sign-in again.');
+    expect(hostile.text).not.toContain('alert(1)');
+    expect(hostile.text).not.toContain('<script>');
+
+    // Reloading a callback that was already handled says so and records no new failure.
+    const handled = await connectThroughCallback();
+    expect(handled.status).toBe(200);
+    const handledState = new URL(handled.request.url).searchParams.get('state')!;
+    const before = (await request(server).get('/api/gmail-sync/status')).body.status.connection;
+    const replay = await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site')
+      .query({ code: 'auth-code', state: handledState });
+    expect(replay.status).toBe(400);
+    expect(replay.text).toContain('This sign-in link was already used');
+    const after = (await request(server).get('/api/gmail-sync/status')).body.status.connection;
+    expect(after.pageSignIn).toEqual(before.pageSignIn);
+    expect(after.signIn).toEqual(before.signIn);
+  });
+
+  it('dismisses one sign-in notice from the owner page only, with a strict body', async () => {
+    await driveCallback('connect_timeout');
+    expect(connection.status().signIn.drive).not.toBeNull();
+    const dismiss = () => request(server).post('/api/gmail-sync/sign-in/dismiss').send({ accountId: 'default', action: 'drive_connect' });
+    expect((await dismiss()).status).toBe(403);
+    expect((await dismiss().set('Origin', origin)).status).toBe(403);
+    expect((await dismiss().set('Origin', 'http://evil.example').set('Sec-Fetch-Site', 'same-origin')).status).toBe(403);
+    expect(connection.status().signIn.drive).not.toBeNull();
+
+    for (const body of [{ action: 'other' }, { accountId: '../x', action: 'drive_connect' }, { action: 'drive_connect', extra: 1 }, {}]) {
+      const bad = await owner(request(server).post('/api/gmail-sync/sign-in/dismiss')).send(body);
+      expect(bad.status, JSON.stringify(body)).toBe(400);
+      expect(bad.body.code).toBe('invalid_request');
+    }
+    expect(connection.status().signIn.drive).not.toBeNull();
+
+    const ok = await owner(request(server).post('/api/gmail-sync/sign-in/dismiss')).send({ accountId: 'default', action: 'drive_connect' });
+    expect(ok.status).toBe(200);
+    expect(ok.headers['cache-control']).toBe('no-store');
+    expect(ok.body.status.connection.signIn.drive).toBeNull();
+    expect(connection.status().signIn.drive).toBeNull();
+
+    // The page-level notice (no account) is dismissed without an accountId.
+    await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).query({ code: 'x', state: 'forged' });
+    expect(connection.status().pageSignIn).not.toBeNull();
+    await owner(request(server).post('/api/gmail-sync/sign-in/dismiss')).send({ action: 'unknown' }).expect(200);
+    expect(connection.status().pageSignIn).toBeNull();
   });
 
   it('starts and stops the older-mail import from the owner page, with a validated window', async () => {
@@ -232,7 +384,7 @@ describe('Gmail sync router', () => {
     profileEmail = 'me@company.com';
     const started = await owner(request(server).post('/api/gmail-sync/connect')).send({ addAccount: true }).expect(200);
     const state = new URL(started.body.authUrl).searchParams.get('state');
-    await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site').query({ code: 'auth-code-2', state }).expect(302);
+    await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site').query({ code: 'auth-code-2', state }).expect(200);
     const accounts = (await request(server).get('/api/gmail-sync/status')).body.status.accounts;
     expect(accounts.map((account: any) => account.email)).toEqual(['jane.doe@gmail.com', 'me@company.com']);
     const workId = accounts[1].id;
@@ -261,7 +413,7 @@ describe('Gmail sync router', () => {
     // Reconnect Work, then disconnect it with its mail.
     const again = await owner(request(server).post('/api/gmail-sync/connect')).send({ addAccount: true }).expect(200);
     await request(server).get(`/api${GMAIL_OAUTH_CALLBACK_PATH}`).set('Sec-Fetch-Site', 'cross-site')
-      .query({ code: 'auth-code-3', state: new URL(again.body.authUrl).searchParams.get('state') }).expect(302);
+      .query({ code: 'auth-code-3', state: new URL(again.body.authUrl).searchParams.get('state') }).expect(200);
     const newWorkId = (await request(server).get('/api/gmail-sync/status')).body.status.accounts[1].id;
     db.prepare('UPDATE work_items SET url = ? WHERE id = ?').run(`gmail://${newWorkId}/mail/m1`, 'wi-w');
     expect((await owner(request(server).post('/api/gmail-sync/disconnect')).send({ accountId: newWorkId, deleteMail: 'yes' })).status).toBe(400);

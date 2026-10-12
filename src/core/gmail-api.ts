@@ -13,6 +13,13 @@
 
 import { createHash, randomBytes } from 'crypto';
 import { redactSecrets } from './sensitive-files.js';
+import {
+  CONNECT_PHASE_RETRYABLE_CODES,
+  NEVER_CONNECTED_CODES,
+  allConnectPhase,
+  retryAfterBackoff,
+  transportCodesOf,
+} from './transport-errors.js';
 
 export const GMAIL_READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 /** Drafts and sending (GMAIL_CHAT_TOOLS_PLAN.md §6). Never gmail.modify: no mailbox state changes. */
@@ -44,9 +51,13 @@ const UPLOAD_MIN_BYTES_PER_SECOND = 128 * 1024;
 /** After one interruption the upload resumes once; then Google's status decides. */
 const MAX_UPLOAD_RESUMES = 1;
 /** Transport failures that happen before a request can reach Google. */
-export const GOOGLE_NEVER_CONNECTED: ReadonlySet<string> = new Set([
-  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT',
-]);
+export const GOOGLE_NEVER_CONNECTED: ReadonlySet<string> = NEVER_CONNECTED_CODES;
+/**
+ * Transport failures after which the single-use sign-in code may be sent once
+ * more: the never-connected set plus ETIMEDOUT (a connect attempt that ran out
+ * of time) and ECONNRESET (reset before any response). Never after a response.
+ */
+export const GOOGLE_CONNECT_PHASE_RETRYABLE: ReadonlySet<string> = CONNECT_PHASE_RETRYABLE_CODES;
 
 /**
  * A Google or transport failure. `code` is Google's error code
@@ -63,6 +74,8 @@ export class GoogleApiError extends Error {
     readonly transportCode?: string,
     /** Set by a resumable upload, which knows whether Google kept the message; otherwise the caller judges from the status. */
     readonly effect?: 'none' | 'unknown',
+    /** For `network`: every code the failure carried (a failed connect to two addresses lists both), `transportCode` first. */
+    readonly transportCodes?: readonly string[],
   ) {
     super(message);
     this.name = 'GoogleApiError';
@@ -72,8 +85,40 @@ export class GoogleApiError extends Error {
 /** The same failure with the effect the upload established; other errors pass through. */
 function withEffect(error: unknown, effect: 'none' | 'unknown'): unknown {
   return error instanceof GoogleApiError
-    ? new GoogleApiError(error.message, error.status, error.code, error.transportCode, effect)
+    ? new GoogleApiError(error.message, error.status, error.code, error.transportCode, effect, error.transportCodes)
     : error;
+}
+
+/**
+ * The request provably never reached Google: a network failure (never a
+ * timeout, never an HTTP answer) whose every code is a connect-phase one. The
+ * owner's Mac showed the shape: `AggregateError` ETIMEDOUT (IPv4, connect) +
+ * EHOSTUNREACH (IPv6, connect) after Node's 250 ms attempt limit.
+ */
+export function isConnectPhaseFailure(error: unknown): boolean {
+  if (!(error instanceof GoogleApiError) || error.code !== 'network' || error.status !== 0) return false;
+  const codes = error.transportCodes?.length ? error.transportCodes : error.transportCode ? [error.transportCode] : [];
+  return allConnectPhase(codes);
+}
+
+/**
+ * Runs a request and, only after a connect-phase failure, once more after a
+ * short pause. A response of any kind (even an error status) and a timeout are
+ * never retried: the single-use code may already be spent.
+ */
+export function retryConnectPhase<T>(run: () => Promise<T>, options: {
+  backoffMs?: number;
+  retries?: number;
+  sleep?: (ms: number) => Promise<void>;
+  onRetry?: (error: GoogleApiError) => void;
+} = {}): Promise<T> {
+  return retryAfterBackoff(run, {
+    shouldRetry: isConnectPhaseFailure,
+    backoffMs: options.backoffMs,
+    retries: options.retries,
+    sleep: options.sleep,
+    onRetry: error => options.onRetry?.(error as GoogleApiError),
+  });
 }
 
 function safeText(value: unknown, limit = 200): string {
@@ -88,10 +133,19 @@ async function send(fetchImpl: FetchLike, url: string, init: RequestInit, what: 
     if (name === 'TimeoutError' || name === 'AbortError') {
       throw new GoogleApiError(`${what} timed out after ${Math.round(timeoutMs / 1000)}s`, 0, 'timeout');
     }
-    // fetch failed: DNS, refused, reset. The cause text is transport-only.
-    const cause = (error as { cause?: { code?: string } })?.cause?.code;
-    const transportCode = typeof cause === 'string' ? cause.replace(/[^A-Z0-9_]/gi, '').slice(0, 40) : undefined;
-    throw new GoogleApiError(`${what} failed: network error${transportCode ? ` (${transportCode})` : ''}`, 0, 'network', transportCode);
+    // fetch failed: DNS, refused, reset, or a connect that ran out of time. The
+    // codes are transport-only; a connect to several addresses lists them all
+    // (AggregateError: ETIMEDOUT for one address, EHOSTUNREACH for the other).
+    const codes = transportCodesOf((error as { cause?: unknown })?.cause);
+    const transportCode = codes[0];
+    throw new GoogleApiError(
+      `${what} failed: network error${codes.length ? ` (${codes.join('+')})` : ''}`,
+      0,
+      'network',
+      transportCode,
+      undefined,
+      codes.length > 1 ? codes : undefined,
+    );
   }
 }
 
@@ -229,22 +283,33 @@ async function postForm(fetchImpl: FetchLike, url: string, form: Record<string, 
   return { status: response.status, body: await readJson(response, what) };
 }
 
+/**
+ * Trades the single-use authorization code for tokens. The request gets the
+ * usual 30 s deadline. When it fails before a connection opened (a connect-phase
+ * failure, see isConnectPhaseFailure) it is sent ONCE more after a short pause;
+ * after any HTTP answer or a timeout it is never repeated.
+ */
 export async function exchangeAuthorizationCode(fetchImpl: FetchLike, endpoints: GoogleEndpoints, input: {
   clientId: string;
   clientSecret: string;
   code: string;
   codeVerifier: string;
   redirectUri: string;
-}): Promise<GoogleTokenResponse> {
+}, options: {
+  /** Tests pass a recording sleep. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Called before the retry's pause; lets the caller log it (no secrets). */
+  onRetry?: (error: GoogleApiError) => void;
+} = {}): Promise<GoogleTokenResponse> {
   const what = 'Google sign-in';
-  const { status, body } = await postForm(fetchImpl, endpoints.tokenUrl, {
+  const { status, body } = await retryConnectPhase(() => postForm(fetchImpl, endpoints.tokenUrl, {
     client_id: input.clientId,
     client_secret: input.clientSecret,
     code: input.code,
     code_verifier: input.codeVerifier,
     grant_type: 'authorization_code',
     redirect_uri: input.redirectUri,
-  }, what);
+  }, what), { sleep: options.sleep, onRetry: options.onRetry });
   if (status !== 200) throw tokenError(status, body, what);
   return parseTokenResponse(body, what, status);
 }

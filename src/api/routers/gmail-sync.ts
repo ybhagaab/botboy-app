@@ -7,8 +7,10 @@
  * The OAuth callback is Google's top-level redirect back to BotBoy: it has no
  * Origin and is cross-site by nature, so it is accepted on loopback only and
  * proves itself with the single-use `state` minted by POST /connect
- * (gmail-connection.ts). It always redirects to the Gmail page, which shows
- * the outcome.
+ * (gmail-connection.ts). It answers with a plain page that says whether the
+ * sign-in worked and, if not, what to do (go back to Connections → Gmail with
+ * the link on the page and press the button again); a success also sends the
+ * browser on to the Gmail page.
  *
  * The chat draft card (gmail-compose.ts) reads one BotBoy draft locally and
  * sends or discards it only from the same-origin owner page, naming the exact
@@ -19,7 +21,7 @@ import { Router, type Request, type Response } from 'express';
 import type { RouterDeps } from './deps.js';
 import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
 import { GmailCredentialInputError } from '../../core/gmail-credentials.js';
-import { GmailAuthError } from '../../core/gmail-connection.js';
+import { GmailAuthError, SIGN_IN_REPLAY_MESSAGE, type GmailSignInAction, type GmailSignInResult } from '../../core/gmail-connection.js';
 import { GmailComposeError, type GmailComposeErrorCode } from '../../core/gmail-compose.js';
 import { GmailImportError } from '../../monitors/gmail-sync.js';
 import { deleteGmailAccountMail } from '../../core/gmail-account-mail.js';
@@ -29,6 +31,57 @@ import { isGmailAccountId } from '../../core/gmail-credentials.js';
 function accountIdOf(value: unknown): string | null | false {
   if (value === undefined || value === null || value === '') return null;
   return isGmailAccountId(value) ? value : false;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]!));
+}
+
+/** The page Google's redirect lands on: what happened, what to do, and the way back. */
+function signInPage(page: { title: string; detail: string; todo?: string; ok: boolean; backUrl: string }): string {
+  const script = page.ok
+    ? `<script>setTimeout(function(){location.replace(${JSON.stringify(page.backUrl).replace(/</g, '\\u003c')})},2500)</script>`
+    : '';
+  return '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>' + escapeHtml(page.title) + '</title>'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    + '<style>body{font:15px -apple-system,system-ui,sans-serif;max-width:560px;margin:15vh auto;padding:0 20px;color:#1d1d1f}a{color:#0a66c2}h1{font-size:22px}.todo{font-weight:600}</style>'
+    + `</head><body><main><h1 role="${page.ok ? 'status' : 'alert'}">${escapeHtml(page.title)}</h1><p>${escapeHtml(page.detail)}</p>`
+    + (page.todo ? `<p class="todo">${escapeHtml(page.todo)}</p>` : '')
+    + `<p><a href="${escapeHtml(page.backUrl)}">Back to Connections → Gmail</a></p></main>${script}</body></html>`;
+}
+
+/**
+ * The sentence that tells the owner what to press next (a failure page always
+ * carries one). Connect sends BotBoy's own window to Google and Google returns
+ * that same window here, so this page IS the BotBoy window: the way back is the
+ * link below it, never "close the tab" (that would close BotBoy).
+ */
+function signInTodo(action: GmailSignInAction | undefined): string {
+  const back = 'Use the link below to go back to Connections → Gmail, then';
+  if (action === 'drive_connect') return `${back} press Connect Google Drive again.`;
+  if (action === 'gmail_connect') return `${back} press Connect Gmail (or Reconnect) again.`;
+  return `${back} start the sign-in again.`;
+}
+
+/** The page and status code for one callback outcome. */
+function signInOutcomePage(result: GmailSignInResult, backUrl: string): { status: number; html: string } {
+  const attempt = result.attempt;
+  if (result.replay || !attempt) {
+    return { status: 400, html: signInPage({ title: 'This sign-in link was already used', detail: SIGN_IN_REPLAY_MESSAGE, ok: false, backUrl }) };
+  }
+  if (attempt.ok) {
+    return { status: 200, html: signInPage({ title: attempt.action === 'drive_connect' ? 'Google Drive connected' : 'Gmail connected', detail: attempt.message, ok: true, backUrl }) };
+  }
+  if (result.connected) {
+    // Gmail is connected; the Drive consent left a box unticked.
+    return { status: 200, html: signInPage({ title: 'Google connected, but Drive was not allowed', detail: attempt.message, todo: signInTodo(attempt.action), ok: false, backUrl }) };
+  }
+  const title = attempt.kind === 'cancelled' ? 'Sign-in cancelled'
+    : attempt.action === 'drive_connect' ? 'Google Drive was not connected'
+      : attempt.action === 'gmail_connect' ? 'Gmail was not connected'
+        : 'Sign-in did not finish';
+  const status = attempt.kind === 'network' || attempt.kind === 'timeout' || attempt.kind === 'google_error' ? 502 : 400;
+  return { status, html: signInPage({ title, detail: attempt.message, todo: signInTodo(attempt.action), ok: false, backUrl }) };
 }
 
 const OWNER_UI_NEXT_ACTION = 'Open Connections → Gmail in the BotBoy window and use its controls.';
@@ -152,12 +205,42 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerRequest(req, res, 'Gmail sign-in')) return;
     if (!deps.gmailConnection) return unavailable(res);
     const query = req.query as Record<string, unknown>;
-    const outcome = await deps.gmailConnection.completeConnect({ code: query.code, state: query.state, error: query.error });
-    // First sync right away; the page shows progress on its next refresh.
-    if (outcome.ok) void deps.gmailSync?.runNow(outcome.accountId).catch(() => undefined);
+    const backUrl = `${deps.dashboardOrigin ?? ''}/#/connections/gmail-sync`;
     res.set('Cache-Control', 'no-store');
     res.set('Referrer-Policy', 'no-referrer');
-    return res.redirect(302, `${deps.dashboardOrigin ?? ''}/#/connections/gmail-sync`);
+    let result: GmailSignInResult;
+    try {
+      result = await deps.gmailConnection.completeSignIn({ code: query.code, state: query.state, error: query.error });
+    } catch (error) {
+      console.error(`[Gmail] Sign-in callback failed: ${error instanceof Error ? error.name : 'Error'}`);
+      return res.status(500).send(signInPage({
+        title: 'Sign-in could not be finished',
+        detail: 'BotBoy could not finish the Google sign-in.',
+        todo: signInTodo(undefined),
+        ok: false,
+        backUrl,
+      }));
+    }
+    // First sync right away; the page shows progress on its next refresh.
+    if (result.connected && result.accountId) void deps.gmailSync?.runNow(result.accountId).catch(() => undefined);
+    const page = signInOutcomePage(result, backUrl);
+    return res.status(page.status).send(page.html);
+  });
+
+  // Dismiss one sign-in notice (the result of a Connect attempt) before its 15 minutes end.
+  router.post('/gmail-sync/sign-in/dismiss', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Dismissing a Gmail sign-in notice', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.gmailSync || !deps.gmailConnection) return unavailable(res);
+    res.set('Cache-Control', 'no-store');
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'accountId' && key !== 'action');
+    const accountId = accountIdOf(body.accountId);
+    const action = body.action;
+    if (unexpected.length || accountId === false || (action !== 'gmail_connect' && action !== 'drive_connect' && action !== 'unknown')) {
+      return res.status(400).json({ error: 'Only action (gmail_connect, drive_connect, or unknown) and accountId (a connected account) may be sent.', code: 'invalid_request' });
+    }
+    deps.gmailConnection.dismissSignIn(accountId, action);
+    return res.json({ status: deps.gmailSync.getStatus() });
   });
 
   router.post('/gmail-sync/disconnect', async (req: Request, res: Response) => {

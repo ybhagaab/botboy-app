@@ -114,6 +114,32 @@ describe('Sign in with Slack routes', () => {
     expect(replay.status).toBe(400);
   });
 
+  it('a Slack that cannot be reached is named as such on the callback page, and nothing is saved', async () => {
+    await ownerCall('put', '/api/slack/oauth/client', CLIENT);
+    const start = await ownerCall('post', '/api/slack/oauth/start');
+    const state = new URL(start.body.authorizeUrl).searchParams.get('state')!;
+    fake.dropNext = 2; // the first try and its one retry both reset
+    const res = await request(app).get(`/api${SLACK_OAUTH_CALLBACK_PATH}?code=c1234567&state=${encodeURIComponent(state)}`);
+    expect(res.status).toBe(400);
+    expect(res.text).toContain('Sign-in failed');
+    expect(res.text).toContain('Couldn&#39;t reach Slack to finish the sign-in (network error). Nothing was saved. Choose Sign in with Slack again.');
+    expect(res.text).not.toContain('refused');
+    expect(readLocalEnvValue('SLACK_USER_TOKEN')).toBeUndefined();
+    expect(reload).not.toHaveBeenCalled();
+    expect(fake.requests.filter(r => r.method === 'oauth.v2.access')).toHaveLength(2);
+  });
+
+  it('a reset that the single retry recovers from still signs in', async () => {
+    await ownerCall('put', '/api/slack/oauth/client', CLIENT);
+    const start = await ownerCall('post', '/api/slack/oauth/start');
+    const state = new URL(start.body.authorizeUrl).searchParams.get('state')!;
+    fake.dropNext = 1;
+    const res = await request(app).get(`/api${SLACK_OAUTH_CALLBACK_PATH}?code=c1234567&state=${encodeURIComponent(state)}`);
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('Connected as owner in Acme');
+    expect(readLocalEnvValue('SLACK_USER_TOKEN')).toBe(FAKE_SLACK_USER_TOKEN);
+  });
+
   it('a rotating token is refused and nothing is saved', async () => {
     fake.access = { ok: true, authed_user: { access_token: 'xoxp-1-a', refresh_token: 'r', expires_in: 10 } };
     await ownerCall('put', '/api/slack/oauth/client', CLIENT);

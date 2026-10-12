@@ -29,6 +29,7 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     connectedAt: null,
     needsReconnect: account.needsReconnect === true,
     lastError: null,
+    signIn: { gmail: null, drive: null },
     grantedScopes: [],
     canCompose: account.canCompose !== false,
     needsComposeGrant: account.canCompose === false,
@@ -39,7 +40,10 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
   const view = (account: FakeGmailAccount): GmailAccountConnection => ({
     id: account.id,
     label: () => account.label ?? '',
-    status: () => ({ needsReconnect: account.needsReconnect === true, connected: account.connected !== false, accountEmail: account.email } as any),
+    status: () => ({
+      needsReconnect: account.needsReconnect === true, connected: account.connected !== false, accountEmail: account.email,
+      lastError: null, signIn: { gmail: null, drive: null }, pageSignIn: null,
+    } as any),
     isConnected: () => account.connected !== false,
     accountEmail: () => (account.connected !== false ? account.email : null),
     canCompose: () => account.canCompose !== false,
@@ -88,6 +92,8 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     retireStagedTeamClient: () => false,
     beginConnect: () => { throw new Error('not in the fake'); },
     completeConnect: async () => ({ ok: false, error: 'not in the fake' }),
+    completeSignIn: async () => ({ connected: false, accountId: null, accountEmail: null, attempt: null, replay: true }),
+    dismissSignIn: () => { throw new Error('not in the fake'); },
     disconnect: async () => { throw new Error('not in the fake'); },
   } as unknown as GmailConnection;
 }

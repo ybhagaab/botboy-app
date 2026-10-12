@@ -77,6 +77,8 @@ export function createDashboardRouter(
   captureHealth?: () => { version: number; issues: number },
   /** Settings → Workplace (Amazon Employee) change counter; open tabs repaint gated views on change. */
   workplace?: () => { version: number; amazonEmployee: boolean },
+  /** Browser capture pause/pacing change counter; open tabs refetch /browser-capture on change. */
+  browserCapture?: () => { version: number },
 ): Router {
   const router = Router();
 
@@ -204,6 +206,15 @@ export function createDashboardRouter(
         try {
           const summary = workplace?.();
           return summary ? { workplaceVersion: summary.version, amazonEmployee: summary.amazonEmployee } : {};
+        } catch {
+          return {};
+        }
+      })(),
+      // In-memory: changes when the owner pauses or resumes browser capture, or pacing changes.
+      ...(() => {
+        try {
+          const summary = browserCapture?.();
+          return summary ? { browserCaptureVersion: summary.version } : {};
         } catch {
           return {};
         }

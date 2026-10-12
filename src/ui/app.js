@@ -2989,6 +2989,10 @@ function bindSlackTokenCard() {
 
 let slackSignInBound = false;
 let slackSignInView = null;
+// True while a loopback sign-in waits in another tab. "Approve in Slack; this page
+// updates when you come back" must stay true: on return the card re-reads Slack's
+// state instead of leaving that line (and a stale status line) on screen.
+let slackSignInPending = false;
 
 function slackSignInMessage(text) {
   const result = document.getElementById('slack-signin-result');
@@ -3076,12 +3080,21 @@ function bindSlackSignInCard() {
     try {
       const { authorizeUrl, redirectMode } = await slackSignInRequest('/api/slack/oauth/start', 'POST');
       window.open(authorizeUrl, '_blank', 'noopener');
+      // The pasted-address flow keeps its instruction until the owner finishes it.
+      slackSignInPending = redirectMode !== 'https_paste';
       slackSignInMessage(redirectMode === 'https_paste'
         ? 'Approve in Slack. The browser then shows an error page; copy its whole address and paste it below.'
         : 'Approve in Slack; this page updates when you come back.');
       const finish = document.getElementById('slack-signin-finish');
       if (finish) finish.hidden = redirectMode !== 'https_paste';
     } catch (e) { slackSignInMessage(e.message); }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !slackSignInPending) return;
+    slackSignInPending = false;
+    slackSignInMessage('');
+    void refreshSlackSignIn();
+    void refreshSlackTokenStatus();
   });
   document.getElementById('slack-signin-finish-btn')?.addEventListener('click', async () => {
     const input = document.getElementById('slack-signin-paste');

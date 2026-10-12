@@ -2,9 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   GMAIL_MAX_UPLOAD_BYTES,
   GMAIL_READONLY_SCOPE,
+  GOOGLE_CONNECT_PHASE_RETRYABLE,
+  GOOGLE_NEVER_CONNECTED,
   GoogleApiError,
   createGmailClient,
+  exchangeAuthorizationCode,
+  isConnectPhaseFailure,
   refreshAccessToken,
+  retryConnectPhase,
   revokeToken,
   type GoogleEndpoints,
 } from './gmail-api.js';
@@ -429,5 +434,114 @@ describe('parseSendAs', () => {
       { email: 'hello@mybrand.dev', displayName: 'Hello  Bcc: x', isPrimary: false, isDefault: true },
     ]);
     expect(parseSendAs({})).toEqual([]);
+  });
+});
+
+/**
+ * The sign-in code is single use, so the exchange is repeated only when the
+ * request provably never reached Google (a connect-phase failure) and never
+ * after any answer. The owner's Mac showed the shape: every fetch to Google
+ * failed with AggregateError ETIMEDOUT + EHOSTUNREACH after Node's 250 ms
+ * connect attempt limit, while curl worked.
+ */
+describe('sign-in code exchange: connect-phase retry', () => {
+  const errno = (code: string, syscall = 'connect') => Object.assign(new Error(`${syscall} ${code}`), { code, syscall });
+  const aggregate = () => Object.assign(new AggregateError([errno('ETIMEDOUT'), errno('EHOSTUNREACH')], ''), { code: 'ETIMEDOUT' });
+  const fetchFailed = (cause: unknown) => Object.assign(new TypeError('fetch failed'), { cause });
+  const INPUT = { clientId: 'client-id', clientSecret: 'client-secret', code: 'the-code', codeVerifier: 'the-verifier', redirectUri: 'http://127.0.0.1:7778/api/cb' };
+  const GOOD = () => json({ access_token: 'access', expires_in: 3600, refresh_token: 'refresh', scope: GMAIL_READONLY_SCOPE });
+
+  /** A token endpoint that answers (or throws) in order and records the forms it received. */
+  function endpoint(steps: Array<() => Response | never>) {
+    const forms: Array<Record<string, string>> = [];
+    const pauses: number[] = [];
+    let index = 0;
+    const fetchImpl = async (_url: string, init?: RequestInit) => {
+      forms.push(Object.fromEntries(new URLSearchParams(String(init?.body ?? ''))));
+      return steps[Math.min(index++, steps.length - 1)]();
+    };
+    const run = () => exchangeAuthorizationCode(fetchImpl, ENDPOINTS, INPUT, { sleep: async ms => { pauses.push(ms); } });
+    return { forms, pauses, run };
+  }
+
+  it('reads every address’s code from a failed connect and names them in the message', async () => {
+    const offline = clientFor(async () => { throw fetchFailed(aggregate()); });
+    const error = await offline.client.getProfile().catch(caught => caught);
+    expect(error).toMatchObject({
+      status: 0, code: 'network', transportCode: 'ETIMEDOUT', transportCodes: ['ETIMEDOUT', 'EHOSTUNREACH'],
+      message: 'Gmail profile failed: network error (ETIMEDOUT+EHOSTUNREACH)',
+    });
+    // A single code keeps the message every earlier test and consumer relies on.
+    const single = clientFor(async () => { throw fetchFailed(errno('ECONNRESET')); });
+    const one = await single.client.getProfile().catch(caught => caught);
+    expect(one).toMatchObject({ transportCode: 'ECONNRESET', message: 'Gmail profile failed: network error (ECONNRESET)' });
+    expect(one.transportCodes).toBeUndefined();
+  });
+
+  it('calls a request unsent only for a network failure whose every code is a connect-phase one', () => {
+    const network = (...codes: string[]) => new GoogleApiError('x', 0, 'network', codes[0], undefined, codes.length > 1 ? codes : undefined);
+    for (const codes of [['ETIMEDOUT'], ['ECONNRESET'], ['ENOTFOUND'], ['EAI_AGAIN'], ['ECONNREFUSED'], ['ENETUNREACH'], ['EHOSTUNREACH'], ['ETIMEDOUT', 'EHOSTUNREACH']]) {
+      expect(isConnectPhaseFailure(network(...codes)), codes.join('+')).toBe(true);
+    }
+    expect(isConnectPhaseFailure(network('EPIPE'))).toBe(false);
+    expect(isConnectPhaseFailure(network('ETIMEDOUT', 'EPIPE'))).toBe(false);
+    expect(isConnectPhaseFailure(new GoogleApiError('x', 0, 'network'))).toBe(false);
+    // The 30 s deadline fired: the request may have been sent.
+    expect(isConnectPhaseFailure(new GoogleApiError('x', 0, 'timeout'))).toBe(false);
+    // Any HTTP answer, even an error, means Google saw the code.
+    expect(isConnectPhaseFailure(new GoogleApiError('x', 400, 'invalid_grant'))).toBe(false);
+    expect(isConnectPhaseFailure(new GoogleApiError('x', 503, 'http_503'))).toBe(false);
+    expect(isConnectPhaseFailure(new Error('network'))).toBe(false);
+    // The retryable set is the never-connected set plus the two connect-time errnos.
+    expect([...GOOGLE_CONNECT_PHASE_RETRYABLE].sort()).toEqual([...GOOGLE_NEVER_CONNECTED, 'ETIMEDOUT', 'ECONNRESET'].sort());
+  });
+
+  it('sends the same code once more after a connect timeout, after one pause, and succeeds', async () => {
+    const { forms, pauses, run } = endpoint([() => { throw fetchFailed(aggregate()); }, GOOD]);
+    const tokens = await run();
+    expect(tokens).toMatchObject({ accessToken: 'access', refreshToken: 'refresh' });
+    expect(forms).toHaveLength(2);
+    expect(forms[1]).toEqual(forms[0]);
+    expect(forms[0]).toMatchObject({ code: 'the-code', code_verifier: 'the-verifier', grant_type: 'authorization_code' });
+    expect(pauses).toEqual([1500]);
+  });
+
+  it('stops after that one retry: two connect timeouts are two requests and a clear network error', async () => {
+    const { forms, pauses, run } = endpoint([() => { throw fetchFailed(aggregate()); }]);
+    const error = await run().catch(caught => caught);
+    expect(error).toBeInstanceOf(GoogleApiError);
+    expect(error).toMatchObject({ code: 'network', transportCodes: ['ETIMEDOUT', 'EHOSTUNREACH'] });
+    expect(forms).toHaveLength(2);
+    expect(pauses).toEqual([1500]);
+  });
+
+  it('never sends the code again after Google answered, even with an error status', async () => {
+    for (const answer of [
+      () => json({ error: 'invalid_grant', error_description: 'Bad Request' }, 400),
+      () => json({ error: 'invalid_client' }, 401),
+      () => new Response('<html>502</html>', { status: 502 }),
+    ]) {
+      const { forms, pauses, run } = endpoint([answer]);
+      await expect(run()).rejects.toBeInstanceOf(GoogleApiError);
+      expect(forms, 'one request per answer').toHaveLength(1);
+      expect(pauses).toEqual([]);
+    }
+  });
+
+  it('never sends the code again after the 30 s deadline, and a reset before any answer counts as unsent', async () => {
+    const deadline = endpoint([() => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); }]);
+    expect(await deadline.run().catch(caught => caught)).toMatchObject({ code: 'timeout', message: 'Google sign-in timed out after 30s' });
+    expect(deadline.forms).toHaveLength(1);
+    expect(deadline.pauses).toEqual([]);
+
+    const reset = endpoint([() => { throw fetchFailed(errno('ECONNRESET', 'read')); }, GOOD]);
+    expect((await reset.run()).accessToken).toBe('access');
+    expect(reset.forms).toHaveLength(2);
+  });
+
+  it('retryConnectPhase leaves errors that are not Google transport failures alone', async () => {
+    let calls = 0;
+    await expect(retryConnectPhase(async () => { calls++; throw new Error('local bug'); }, { sleep: async () => {} })).rejects.toThrow('local bug');
+    expect(calls).toBe(1);
   });
 });

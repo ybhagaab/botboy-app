@@ -5,6 +5,9 @@
  * Starts the Express API server and all background monitors.
  */
 
+// FIRST import on purpose: it raises Node's 250 ms connect attempt timeout before any
+// module opens a socket, so Google, Slack, and remote MCP connections get time to connect.
+import './core/network-defaults-boot.js';
 import { AppUpdater } from './core/app-update.js';
 import { createKeepAwake } from './core/keep-awake.js';
 import express from 'express';
@@ -67,6 +70,8 @@ import { createChatInterface } from './core/chat-interface.js';
 import { createMidwaySentinel } from './core/midway-sentinel.js';
 import { createCaptureHealth } from './core/capture-health.js';
 import { createBrowserMonitor } from './monitors/browser-monitor.js';
+import { createBrowserCaptureState } from './core/browser-capture-state.js';
+import { loadPerCpu, readMemoryPressure } from './core/system-pressure.js';
 import { createAppMonitor } from './monitors/app-monitor.js';
 import { createClipboardMonitor } from './monitors/clipboard-monitor.js';
 import { createSlackMonitor, type ReloadableSlackMonitor } from './monitors/slack-monitor.js';
@@ -1306,8 +1311,15 @@ async function main() {
   });
 
   // ── Monitors ──
+  // The owner's pause switch and pacing change counter (Connections → Browser capture).
+  const browserCaptureState = createBrowserCaptureState({ db });
   const browserMonitor = createBrowserMonitor({
     shouldSkipTarget: targetId => browserHands.ownsTarget(targetId),
+    // Pacing: slower polls under memory pressure or load. BOTBOY_BROWSER_ADAPTIVE=0 turns it off.
+    adaptive: process.env.BOTBOY_BROWSER_ADAPTIVE !== '0',
+    sampleSystem: () => ({ pressure: readMemoryPressure(), loadPerCpu: loadPerCpu() }),
+    isPaused: () => browserCaptureState.paused(),
+    onStatusChange: () => browserCaptureState.noteStatusChange(),
     // WhatsApp messages are one row each, keyed by message id (survives restarts).
     hasCaptured: (() => {
       const stmt = db.prepare('SELECT 1 FROM work_items WHERE url = ? LIMIT 1');
@@ -1698,6 +1710,7 @@ async function main() {
     chatJobs,
     chatContinuations,
     appUpdater,
+    browserCapture: { state: browserCaptureState, monitor: browserMonitor },
     workplace,
     exportFooter,
   };

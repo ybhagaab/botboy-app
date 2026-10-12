@@ -24,17 +24,23 @@ function constLine(name: string): string {
 }
 
 type Card = { status: string; tone: string; detail: string };
-type Helpers = { gmailSyncCardModel(): Card; renderGmailSyncSettings(): string };
+type Helpers = {
+  gmailSyncCardModel(): Card;
+  renderGmailSyncSettings(): string;
+  renderGdriveSection(account: Record<string, any>, busy: string): string;
+  gdriveStateOf(conn: Record<string, any>): { key: string; label: string; tone: string };
+};
 
 function load(state: Record<string, unknown>): Helpers {
   const source = [
-    constLine('icon'), constLine('esc'), constLine('attr'), constLine('number'),
+    constLine('icon'), constLine('esc'), constLine('attr'), constLine('number'), constLine('GMAIL_SIGN_IN_NOTICE_MS'),
     topLevel('relativeTime'), topLevel('whenPhrase'), topLevel('pageHead'),
     topLevel('captureIssueFor'), topLevel('captureIssueDetail'),
     topLevel('gmailAccountName'), topLevel('gmailMultiCardModel'),
     topLevel('gmailImportActive'), topLevel('gmailImportDate'), topLevel('renderGmailImportCard'),
-    topLevel('amazonEmployeeOn'), topLevel('renderGdriveSection'), topLevel('renderGmailAccountCard'), topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
-    'return { gmailSyncCardModel, renderGmailSyncSettings };',
+    topLevel('amazonEmployeeOn'), topLevel('gmailSignInFresh'), topLevel('renderGmailSignInNotice'), topLevel('gdriveStateOf'),
+    topLevel('renderGdriveSection'), topLevel('renderGmailAccountCard'), topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
+    'return { gmailSyncCardModel, renderGmailSyncSettings, renderGdriveSection, gdriveStateOf };',
   ].join('\n');
   // eslint-disable-next-line no-new-func
   return new Function('state', source)(state) as Helpers;
@@ -441,5 +447,186 @@ describe('Gmail client and noise saves', () => {
     const handler = dashboard.slice(start, start + 700);
     expect(handler.indexOf("getElementById('grasp-sync-noise')")).toBeGreaterThan(0);
     expect(handler.indexOf("getElementById('grasp-sync-noise')")).toBeLessThan(handler.indexOf('graspSyncAction('));
+  });
+});
+
+/**
+ * Owner report 2026-10-12: "Active" beside "Google sign-in failed: network
+ * error (ETIMEDOUT)". Health (the badge) and the result of a Connect attempt
+ * are separate: the result shows only where the attempt was made, with its
+ * time and a Dismiss button, and never as a banner beside a healthy badge.
+ */
+describe('Gmail sign-in notices: the badge and any message never contradict', () => {
+  let state: Record<string, any>;
+  const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const DRIVE_FAILURE = "Couldn't connect Google Drive: BotBoy couldn't reach Google (timed out on a slow route to Google). Your current Gmail connection is unchanged. Press Connect Google Drive to try again.";
+  const attempt = (overrides: Record<string, unknown> = {}) => ({
+    action: 'drive_connect', kind: 'network', ok: false, at: ago(30_000), message: DRIVE_FAILURE,
+    nextAction: 'Press Connect Google Drive to try again.', accountId: 'default', ...overrides,
+  });
+  const idle = { lastRun: { at: new Date().toISOString(), status: 'completed', mode: 'partial', counters: { emitted: 0 } }, captured: { total: 50, received: 44, sent: 6, inProjects: 0 } };
+  const page = () => {
+    document.body.innerHTML = load(state).renderGmailSyncSettings();
+    return document.body;
+  };
+
+  beforeEach(() => {
+    state = {
+      gmailSync: { status: status(idle), error: '', busy: '' },
+      captureHealth: { sources: [], issues: [], error: '' },
+    };
+  });
+
+  it('shows no banner beside Active for the stale error an earlier server left in lastError (the owner report)', () => {
+    state.gmailSync.status = status({ ...idle, connection: connection({ lastError: 'Google sign-in failed: network error (ETIMEDOUT)', needsReconnect: false }) });
+    const body = page();
+    expect(load(state).gmailSyncCardModel()).toMatchObject({ status: 'Active', tone: 'good' });
+    expect(body.textContent).toContain('Active');
+    expect(body.textContent).not.toContain('Google sign-in failed');
+    expect(body.textContent).not.toContain('ETIMEDOUT');
+    expect(body.querySelector('[data-gmail-signin]')).toBeNull();
+  });
+
+  it('shows a health message only while Google rejects the grant, as the Reconnect state, not as a second banner', () => {
+    state.gmailSync.status = status({ connection: connection({ needsReconnect: true, lastError: 'Google ended BotBoy’s access to this account. Choose Reconnect.' }) });
+    const body = page();
+    expect(body.textContent).toContain('Reconnect needed');
+    expect(body.textContent).toContain('Google ended BotBoy’s access');
+    expect(body.querySelectorAll('[data-gmail-signin]')).toHaveLength(0);
+  });
+
+  it('puts a failed Drive Connect in the Drive section only, with its time and a Dismiss button', () => {
+    const drive = attempt();
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: false, canPublishDrive: false, signIn: { gmail: null, drive }, pageSignIn: null }) });
+    const body = page();
+    const notices = body.querySelectorAll('[data-gmail-signin]');
+    expect(notices).toHaveLength(1);
+    const notice = notices[0] as HTMLElement;
+    expect(notice.getAttribute('data-gmail-signin')).toBe('drive_connect');
+    expect(notice.closest('section')!.textContent).toContain('Google Drive');
+    expect(notice.textContent).toContain(DRIVE_FAILURE);
+    expect(notice.getAttribute('role')).toBe('status');
+    const time = notice.querySelector('time')!;
+    expect(time.getAttribute('datetime')).toBe(drive.at);
+    expect(time.textContent).toBe('Just now');
+    const dismiss = notice.querySelector('button[data-action="gmail-signin-dismiss"]') as HTMLButtonElement;
+    expect(dismiss.dataset.account).toBe('default');
+    expect(dismiss.dataset.signinAction).toBe('drive_connect');
+    // Gmail's own card says Active, with nothing about the Drive attempt above its badge.
+    expect(load(state).gmailSyncCardModel()).toMatchObject({ status: 'Active', tone: 'good' });
+    const top = body.querySelector('section.card.pad')!;
+    expect(top.textContent).not.toContain("Couldn't connect");
+  });
+
+  it('keeps the Connect Google Drive control rendered and enabled while a failure notice is visible', () => {
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: false, canPublishDrive: false, signIn: { gmail: null, drive: attempt() }, pageSignIn: null }) });
+    const body = page();
+    expect(body.querySelector('[data-gmail-signin="drive_connect"]')).not.toBeNull();
+    const connect = body.querySelector('button[data-action="gdrive-connect"]') as HTMLButtonElement;
+    expect(connect).not.toBeNull();
+    expect(connect.disabled).toBe(false);
+    expect(connect.textContent).toContain('Connect Google Drive');
+    expect(connect.dataset.account).toBe('default');
+    // Only a request in flight disables it.
+    state.gmailSync.busy = 'drive:default';
+    expect((page().querySelector('button[data-action="gdrive-connect"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('names Drive’s state: Not connected, Connect failed, read only, and read + publish', () => {
+    const helpers = load(state);
+    expect(helpers.gdriveStateOf({})).toEqual({ key: 'not_connected', label: 'Not connected', tone: '' });
+    expect(helpers.gdriveStateOf({ signIn: { gmail: null, drive: null } }).label).toBe('Not connected');
+    expect(helpers.gdriveStateOf({ signIn: { drive: attempt() } })).toEqual({ key: 'connect_failed', label: 'Connect failed — try again', tone: 'warn' });
+    // A box left unticked is told by the notice; the state follows what Google granted.
+    expect(helpers.gdriveStateOf({ signIn: { drive: attempt({ kind: 'drive_not_granted' }) } }).label).toBe('Not connected');
+    expect(helpers.gdriveStateOf({ canReadDrive: true, signIn: { drive: attempt({ kind: 'drive_not_granted' }) } })).toEqual({ key: 'read_only', label: 'Connected (read only)', tone: 'warn' });
+    expect(helpers.gdriveStateOf({ canPublishDrive: true }).label).toBe('Connected (publish only)');
+    expect(helpers.gdriveStateOf({ canReadDrive: true, canPublishDrive: true, signIn: { drive: attempt() } })).toEqual({ key: 'connected', label: 'Connected (read + publish)', tone: 'good' });
+    // A notice older than its 15 minutes does not turn the state into a failure.
+    expect(helpers.gdriveStateOf({ signIn: { drive: attempt({ at: ago(16 * 60_000) }) } }).label).toBe('Not connected');
+
+    const sectionOf = (conn: Record<string, any>) => {
+      document.body.innerHTML = helpers.renderGdriveSection({ id: 'default', connection: conn }, '');
+      return document.body;
+    };
+    expect(sectionOf({}).querySelector('[data-gdrive-state]')!.textContent).toBe('Not connected');
+    expect(sectionOf({ signIn: { drive: attempt() } }).querySelector('[data-gdrive-state]')!.textContent).toBe('Connect failed — try again');
+    const partial = sectionOf({ canReadDrive: true, signIn: { drive: attempt({ kind: 'drive_not_granted', message: 'Drive not granted in full: Google allowed reading Drive but not publishing to it. Press Connect Google Drive and tick both Drive boxes.' }) } });
+    expect(partial.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (read only)');
+    expect(partial.textContent).toContain('Drive not granted in full');
+    expect(partial.querySelector('button[data-action="gdrive-connect"]')).not.toBeNull();
+    const full = sectionOf({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true, sources: { ownedByMe: true, sharedWithMe: false, folderIds: [] } } });
+    expect(full.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (read + publish)');
+    expect(full.querySelector('button[data-action="gdrive-connect"]')).toBeNull();
+    expect(full.querySelector('button[data-action="gdrive-save-sources"]')).not.toBeNull();
+  });
+
+  it('shows a success notice in a good tone, and hides any notice older than 15 minutes', () => {
+    const connected = attempt({ kind: 'ok', ok: true, message: 'Google Drive connected. Choose the Drive sources BotBoy should capture below.' });
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true, sources: { ownedByMe: false, sharedWithMe: false, folderIds: [] } }, signIn: { gmail: null, drive: connected }, pageSignIn: null }) });
+    const notice = page().querySelector('[data-gmail-signin="drive_connect"]')!;
+    expect(notice.classList.contains('good')).toBe(true);
+    expect(notice.textContent).toContain('Google Drive connected.');
+
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: false, canPublishDrive: false, signIn: { gmail: null, drive: attempt({ at: ago(16 * 60_000) }) }, pageSignIn: null }) });
+    expect(page().querySelector('[data-gmail-signin]')).toBeNull();
+  });
+
+  it('shows a first connect’s failure on the page card, dismissable, and the Connections card says Connect failed', () => {
+    const first = attempt({ action: 'gmail_connect', accountId: null, message: "Couldn't connect Gmail: BotBoy couldn't reach Google (timed out on a slow route to Google). Press Connect Gmail to try again." });
+    state.gmailSync.status = status({ connection: connection({ connected: false, accountEmail: null, signIn: { gmail: null, drive: null }, pageSignIn: first }) });
+    const body = page();
+    const notice = body.querySelector('[data-gmail-signin="gmail_connect"]')!;
+    expect(notice.textContent).toContain("Couldn't connect Gmail");
+    expect((notice.querySelector('button[data-action="gmail-signin-dismiss"]') as HTMLButtonElement).dataset.account).toBe('');
+    expect((body.querySelector('button[data-action="gmail-sync-connect"]') as HTMLButtonElement).disabled).toBe(false);
+    expect(load(state).gmailSyncCardModel()).toEqual({ status: 'Connect failed', tone: 'warn', detail: 'The last sign-in did not finish. Open Gmail for details, then choose Connect Gmail to try again.' });
+
+    // Dismissed (the server stops sending it): back to the plain not-connected card.
+    state.gmailSync.status = status({ connection: connection({ connected: false, accountEmail: null, signIn: { gmail: null, drive: null }, pageSignIn: null }) });
+    expect(load(state).gmailSyncCardModel()).toMatchObject({ status: 'Not connected' });
+    // A connected account never reads Connect failed: the card and the page agree on health.
+    state.gmailSync.status = status({ ...idle, connection: connection({ pageSignIn: first }) });
+    expect(load(state).gmailSyncCardModel()).toMatchObject({ status: 'Active' });
+  });
+
+  it('shows an account’s failed Reconnect on its own card, not on the page card', () => {
+    const reconnect = attempt({ action: 'gmail_connect', message: "Couldn't reconnect Gmail: BotBoy couldn't reach Google (timed out on a slow route to Google). Your current Gmail connection is unchanged. Press Reconnect to try again." });
+    state.gmailSync.status = status({ ...idle, connection: connection({ signIn: { gmail: reconnect, drive: null }, pageSignIn: null }) });
+    const body = page();
+    const notice = body.querySelector('[data-gmail-signin="gmail_connect"]')!;
+    expect(notice.closest('article.gmail-account')).not.toBeNull();
+    expect(body.querySelectorAll('[data-gmail-signin]')).toHaveLength(1);
+  });
+
+  it('shows Drive’s own capture trouble in the Drive section, for example the Drive API not enabled', () => {
+    const issue = {
+      source: 'gdrive', name: 'Google Drive', kind: 'service_auth', cause: 'The service rejected BotBoy’s sign-in',
+      nextAction: 'Enable the Google Drive API in the same Google Cloud project as your Gmail client (APIs & Services → Library → Google Drive API), then wait a minute.',
+      since: new Date().toISOString(), lastSuccessAt: null, failures: 3, reason: '403 accessNotConfigured', href: '#/connections/gmail-sync',
+    };
+    state.captureHealth.issues = [issue];
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true, sources: { ownedByMe: true, sharedWithMe: false, folderIds: [] } } }) });
+    const section = page().querySelector('[data-gdrive-account]')!;
+    expect(section.textContent).toContain('Drive is not syncing.');
+    expect(section.textContent).toContain('Enable the Google Drive API in the same Google Cloud project as your Gmail client');
+    // Not connected: nothing to sync, so the section does not repeat an old issue.
+    state.gmailSync.status = status({ ...idle, connection: connection({ canReadDrive: false, canPublishDrive: false }) });
+    expect(page().textContent).not.toContain('Drive is not syncing.');
+  });
+});
+
+/** The Dismiss button must reach the server route, and the page must not read the old error for anything. */
+describe('Gmail sign-in notices: wiring', () => {
+  it('Dismiss posts the notice’s account and action to /gmail-sync/sign-in/dismiss', () => {
+    const handler = dashboard.slice(dashboard.indexOf("if (action === 'gmail-signin-dismiss')"), dashboard.indexOf("if (action === 'gdrive-save-sources')"));
+    expect(handler).toContain("request('/gmail-sync/sign-in/dismiss', { method: 'POST', body: { ...(accountId ? { accountId } : {}), action: signInAction } })");
+    expect(handler).toContain('target.dataset.signinAction');
+  });
+
+  it('no render path reads connection.lastError except the Reconnect health states', () => {
+    const uses = dashboard.split('\n').filter(line => /connection\.lastError|conn\.lastError/.test(line));
+    expect(uses.length).toBeGreaterThan(0);
+    for (const line of uses) expect(line, line).toMatch(/needsReconnect/);
   });
 });

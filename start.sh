@@ -50,9 +50,245 @@ UPDATE_ONLY=0
 # launcher silently breaks the moment the repo moves.
 PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Tool paths are variables, not PATH lookups, so tests can substitute them
+# (start.sh prepends several directories to PATH, which makes PATH shims
+# unreliable). Production never sets the BOTBOY_TEST_* names.
+XCODE_SELECT_BIN="${BOTBOY_TEST_XCODE_SELECT_BIN:-/usr/bin/xcode-select}"
+XCRUN_BIN="${BOTBOY_TEST_XCRUN_BIN:-/usr/bin/xcrun}"
+NPM_BIN="${BOTBOY_TEST_NPM_BIN:-npm}"
+GIT_SHIM="${BOTBOY_TEST_GIT_SHIM:-/usr/bin/git}"
+ARCH_BIN="${BOTBOY_TEST_ARCH_BIN:-/usr/bin/arch}"
+SYSCTL_BIN="${BOTBOY_TEST_SYSCTL_BIN:-/usr/sbin/sysctl}"
+FILE_BIN="${BOTBOY_TEST_FILE_BIN:-/usr/bin/file}"
+
+# ── Native architecture on Apple Silicon ─────────────────────────────────────
+# A shell that runs under Rosetta hands that translation to everything it
+# starts: Chrome, Node, npm, and the native modules npm installs. A Rosetta
+# Terminal, or a shell-script .app that macOS starts translated, was enough to
+# run all of BotBoy 2-5x slower (teammate Mac, 2026-10-12). Three layers keep
+# it native:
+#   1. The early re-exec below. This is the guaranteed layer: a translated
+#      start.sh replaces itself with a native one (same PID, same arguments).
+#   2. The prefix arrays (arch_plan): when the re-exec cannot happen
+#      (BOTBOY_NO_ARCH_REEXEC=1), Chrome and the server still start native.
+#   3. LSArchitecturePriority in BotBoy.app's Info.plist (make-app-bundle.mjs,
+#      app_launcher_plan) makes the app itself start native.
+# Hardware is judged by `sysctl hw.optional.arm64` (a translated process
+# still sees an Intel-looking uname), and ALL probing is skipped on Intel
+# Macs, which therefore never run `arch` or `file`. Binaries are inspected
+# with /usr/bin/file, never lipo or otool: those are Xcode shims that raise
+# the install dialog on a Mac without Command Line Tools.
+HW_ARM64=0
+SHELL_TRANSLATED=0
+ARCH_PROBE_OK=0
+REEXEC_NATIVE=0
+CHROME_ARCHS=""
+NODE_ARCHS=""
+WARN_CHROME_INTEL=0
+WARN_NODE_INTEL=0
+# Command-prefix arrays (bash 3.2). Expanded as ${NAME[@]+"${NAME[@]}"} in
+# front of a spawned program, so `$!` stays the program's PID: `arch -arm64`
+# replaces itself with the program. Never a function in front of `nohup` or `&`.
+CHROME_PREFIX=()
+SERVER_PREFIX=()
+NODE_PREFIX=()
+
+# Gather the hardware facts. BOTBOY_TEST_HW_ARM64 / _SHELL_TRANSLATED /
+# _ARCH_PROBE_OK inject them for tests; production never sets them.
+arch_facts() {
+  local hw translated
+  HW_ARM64=0
+  SHELL_TRANSLATED=0
+  ARCH_PROBE_OK=0
+  if [ -n "${BOTBOY_TEST_HW_ARM64+x}" ]; then
+    hw="$BOTBOY_TEST_HW_ARM64"
+  else
+    hw="$("$SYSCTL_BIN" -n hw.optional.arm64 2>/dev/null)"
+  fi
+  [ "$hw" = "1" ] || return 0
+  HW_ARM64=1
+  if [ -n "${BOTBOY_TEST_HW_ARM64+x}" ]; then
+    translated="${BOTBOY_TEST_SHELL_TRANSLATED:-0}"
+  else
+    translated="$("$SYSCTL_BIN" -n sysctl.proc_translated 2>/dev/null)"
+  fi
+  [ "$translated" = "1" ] && SHELL_TRANSLATED=1
+  if [ -n "${BOTBOY_TEST_ARCH_PROBE_OK+x}" ]; then
+    [ "$BOTBOY_TEST_ARCH_PROBE_OK" = "1" ] && ARCH_PROBE_OK=1
+  elif "$ARCH_BIN" -arm64 /usr/bin/true >/dev/null 2>&1; then
+    ARCH_PROBE_OK=1
+  fi
+  return 0
+}
+
+# Pure: should this process replace itself with a native one?
+arch_reexec_wanted() {
+  [ "$HW_ARM64" = "1" ] || return 1
+  [ "$SHELL_TRANSLATED" = "1" ] || return 1
+  [ "$ARCH_PROBE_OK" = "1" ] || return 1
+  [ -z "${BOTBOY_NATIVE_REEXEC:-}" ] || return 1
+  [ "${BOTBOY_NO_ARCH_REEXEC:-0}" != "1" ] || return 1
+  return 0
+}
+
+# The architectures a Mach-O file holds, space separated and empty when
+# unknown (a script, a missing file, an unreadable answer). `file -b` lists a
+# universal binary as `[x86_64:Mach-O ...] [arm64:Mach-O ...]` and a thin one
+# as `Mach-O 64-bit executable arm64`. Never judged by the word "universal".
+file_description_archs() {
+  local description="$1" archs
+  case "$description" in
+    Mach-O*) ;;
+    *) return 0 ;;
+  esac
+  archs="$(printf '%s\n' "$description" | grep -o '\[[a-z0-9_]*:' | tr -d '[:' | tr '\n' ' ')"
+  if [ -z "$archs" ]; then
+    archs="${description##* }"
+  fi
+  printf '%s' "${archs% }"
+}
+
+binary_archs() {
+  local description
+  [ -e "$1" ] || return 0
+  description="$("$FILE_BIN" -b "$1" 2>/dev/null)" || return 0
+  file_description_archs "$description"
+}
+
+# Whether a `binary_archs` answer includes an arm64-capable slice (arm64e too).
+archs_include_arm64() {
+  case " $1 " in
+    *" arm64 "*|*" arm64e "*) return 0 ;;
+  esac
+  return 1
+}
+
+# Pure: from HW_ARM64, SHELL_TRANSLATED, ARCH_PROBE_OK, CHROME_ARCHS, and
+# NODE_ARCHS, decide the prefixes and the warnings. A program is wrapped only
+# while this shell is translated (a native shell's children already run
+# natively), only when its own slices include arm64, and only when
+# `arch -arm64` demonstrably works. Unknown architectures neither wrap nor warn.
+arch_plan() {
+  REEXEC_NATIVE=0
+  WARN_CHROME_INTEL=0
+  WARN_NODE_INTEL=0
+  CHROME_PREFIX=()
+  SERVER_PREFIX=()
+  NODE_PREFIX=()
+  [ "$HW_ARM64" = "1" ] || return 0
+  arch_reexec_wanted && REEXEC_NATIVE=1
+  if [ -n "$CHROME_ARCHS" ] && ! archs_include_arm64 "$CHROME_ARCHS"; then
+    WARN_CHROME_INTEL=1
+  fi
+  if [ -n "$NODE_ARCHS" ] && ! archs_include_arm64 "$NODE_ARCHS"; then
+    WARN_NODE_INTEL=1
+  fi
+  [ "$ARCH_PROBE_OK" = "1" ] || return 0
+  [ "$SHELL_TRANSLATED" = "1" ] || return 0
+  if archs_include_arm64 "$CHROME_ARCHS"; then
+    CHROME_PREFIX=("$ARCH_BIN" -arm64)
+  fi
+  if archs_include_arm64 "$NODE_ARCHS"; then
+    SERVER_PREFIX=("$ARCH_BIN" -arm64)
+    NODE_PREFIX=("$ARCH_BIN" -arm64)
+  fi
+  return 0
+}
+
+# Synchronous commands (npm, `node -e`, node scripts) run through the same
+# prefix. Spawned programs use the prefix arrays directly instead.
+native_exec() {
+  if [ "${#NODE_PREFIX[@]}" -gt 0 ]; then
+    "${NODE_PREFIX[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
+arch_facts
+
+# Executable test hook: print the plan from injected facts and exit.
+if [ "${BOTBOY_TEST_ARCH_PLAN:-0}" = "1" ]; then
+  CHROME_ARCHS="${BOTBOY_TEST_CHROME_ARCHS:-}"
+  NODE_ARCHS="${BOTBOY_TEST_NODE_ARCHS:-}"
+  arch_plan
+  echo "hw_arm64=$HW_ARM64 shell_translated=$SHELL_TRANSLATED arch_probe_ok=$ARCH_PROBE_OK"
+  echo "reexec=$REEXEC_NATIVE"
+  echo "chrome_prefix=${CHROME_PREFIX[*]-}"
+  echo "server_prefix=${SERVER_PREFIX[*]-}"
+  echo "node_prefix=${NODE_PREFIX[*]-}"
+  echo "warn_chrome_intel=$WARN_CHROME_INTEL warn_node_intel=$WARN_NODE_INTEL"
+  exit 0
+fi
+
+# The early re-exec. Same PID and arguments, so the app launcher's child
+# relationship, its SIGINT forwarding, and --foreground behave as before.
+# `arch -arm64 /usr/bin/true` already succeeded (ARCH_PROBE_OK), and execfail
+# keeps a late failure from ending a non-interactive shell: it falls through
+# and the launcher continues translated, with the prefix arrays as backup.
+# BOTBOY_NATIVE_REEXEC is the loop guard; BOTBOY_NO_ARCH_REEXEC=1 turns the
+# re-exec off. The app launcher discards stdout, so one line also goes to the
+# log file directly.
+if arch_reexec_wanted; then
+  echo "ℹ️  This shell was running under Rosetta; continuing natively on Apple Silicon"
+  printf '%s This shell was running under Rosetta; continuing natively on Apple Silicon (start.sh %s)\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${PPT_LOG_FILE:-/tmp/ppt.log}" 2>/dev/null || true
+  export BOTBOY_NATIVE_REEXEC=1
+  export BOTBOY_REEXEC_FROM=translated
+  shopt -s execfail
+  exec "$ARCH_BIN" -arm64 /bin/bash "$0" "$@"
+  # Only reached when exec failed: this process stays translated.
+  unset BOTBOY_NATIVE_REEXEC BOTBOY_REEXEC_FROM
+fi
+
+# Executable test hook: report what this (possibly re-executed) process is,
+# keep running so a test can signal it, and start nothing.
+if [ "${BOTBOY_TEST_REEXEC_PROBE:-0}" = "1" ]; then
+  echo "pid=$$ args=$* guard=${BOTBOY_NATIVE_REEXEC:-} from=${BOTBOY_REEXEC_FROM:-} translated=$("$SYSCTL_BIN" -n sysctl.proc_translated 2>/dev/null)"
+  sleep 30 &
+  PROBE_SLEEP_PID=$!
+  trap 'echo got-INT; kill "$PROBE_SLEEP_PID" 2>/dev/null; exit 0' INT
+  wait "$PROBE_SLEEP_PID"
+  exit 0
+fi
+
+# Whether Xcode Command Line Tools answer. `xcode-select -p` is silent; the
+# /usr/bin shims (git, swiftc, lipo, otool) raise the macOS install dialog on a
+# Mac without them, so nothing on the start or doctor path may touch a shim
+# first.
+clt_installed() {
+  "$XCODE_SELECT_BIN" -p >/dev/null 2>&1
+}
+
+# The Swift compiler is reachable (CLT installed and xcrun finds swiftc).
+clt_toolchain_ok() {
+  clt_installed && "$XCRUN_BIN" --find swiftc >/dev/null 2>&1
+}
+
+# git is safe to run: found, and not the /usr/bin shim without CLT behind it.
+git_usable() {
+  local found
+  found="$(command -v git 2>/dev/null)"
+  [ -n "$found" ] || return 1
+  if [ "$found" = "$GIT_SHIM" ]; then
+    clt_installed
+    return $?
+  fi
+  return 0
+}
+
 # Release checkouts are customizable runtime snapshots. Detect from the
 # generated marker (current releases) or origin URL (backward compatibility).
-BOTBOY_REMOTE_URL="$(git -C "$PROJ_DIR" remote get-url origin 2>/dev/null || true)"
+BOTBOY_REMOTE_URL=""
+if git_usable; then
+  BOTBOY_REMOTE_URL="$(git -C "$PROJ_DIR" remote get-url origin 2>/dev/null || true)"
+fi
+# Executable test hook: prints whether git is usable; the guard above has
+# already run, so a stub git that records calls proves it was never invoked.
+if [ "${BOTBOY_TEST_GIT_USABLE:-0}" = "1" ]; then
+  git_usable && echo "git_usable: yes" || echo "git_usable: no"
+  exit 0
+fi
 if [ -f "$PROJ_DIR/.botboy-distribution" ] || [[ "$BOTBOY_REMOTE_URL" == *"/botboy-app.git" ]] || [[ "$BOTBOY_REMOTE_URL" == *"/botboy-app" ]]; then
   BOTBOY_RELEASE_CHECKOUT=1
 else
@@ -67,6 +303,10 @@ fi
 if [ "$UPDATE_ONLY" = "1" ]; then
   if [ "$BOTBOY_RELEASE_CHECKOUT" != "1" ]; then
     echo "❌ --update is for botboy-app teammate checkouts only; update the development repo with Git directly."
+    exit 1
+  fi
+  if ! git_usable; then
+    echo "❌ --update needs git, which needs Xcode Command Line Tools: run xcode-select --install, then ./start.sh --update."
     exit 1
   fi
   if ! git -C "$PROJ_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -178,7 +418,7 @@ SHUTDOWN_RECEIPT_DIR="${PPT_SHUTDOWN_RECEIPT_DIR:-/tmp}"
 STARTUP_INT_GRACE_SECONDS="${PPT_STARTUP_INT_GRACE_SECONDS:-20}"
 STARTUP_TERM_GRACE_SECONDS="${PPT_STARTUP_TERM_GRACE_SECONDS:-10}"
 DEBUG_PROFILE="$HOME/.chrome-debug-profile"
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME="${BOTBOY_TEST_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 export PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
 # Resolve node without hardcoding any machine-specific path. BotBoy.app
@@ -188,7 +428,7 @@ export PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/b
 # shell init runs, so `command -v node` fails in app launches and bare
 # shells — that produced ':x: node not found' on a machine with a
 # perfectly good nvm-managed Node 22 (2026-08-24).
-NODE="$(command -v node)"
+NODE="${BOTBOY_TEST_NODE_BIN:-$(command -v node)}"
 if [ -z "$NODE" ]; then
   for candidate in "$HOME"/n/n/versions/node/*/bin/node "$HOME"/.n/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
     [ -x "$candidate" ] && NODE="$candidate"
@@ -198,6 +438,77 @@ if [ -z "$NODE" ]; then
   echo "❌ node not found — install Node 20.16+ (e.g. brew install node), then re-run ./start.sh" | tee -a "$LOG_FILE"
   exit 1
 fi
+
+LSOF_BIN="${BOTBOY_TEST_LSOF_BIN:-lsof}"
+PS_BIN="${BOTBOY_TEST_PS_BIN:-ps}"
+
+# On Apple Silicon, prefer a Node that holds an arm64 slice over an Intel-only
+# one found first on PATH (a leftover Intel Homebrew or an old installer).
+# Candidates are inspected with `file`, never run.
+pick_native_node() {
+  local candidate archs
+  [ "$HW_ARM64" = "1" ] || return 0
+  [ -n "$NODE_ARCHS" ] && ! archs_include_arm64 "$NODE_ARCHS" || return 0
+  for candidate in "$HOME/homebrew/bin/node" /opt/homebrew/bin/node \
+    "$HOME"/n/n/versions/node/*/bin/node "$HOME"/.n/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
+    [ -x "$candidate" ] || continue
+    archs="$(binary_archs "$candidate")"
+    if archs_include_arm64 "$archs"; then
+      NODE="$candidate"
+      NODE_ARCHS="$archs"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Read the real architectures once (Apple Silicon only), choose the native
+# Node, and compute the plan. Warnings are calm, once per start, and never fatal.
+arch_prepare() {
+  CHROME_ARCHS=""
+  NODE_ARCHS=""
+  if [ "$HW_ARM64" = "1" ]; then
+    CHROME_ARCHS="$(binary_archs "$CHROME")"
+    NODE_ARCHS="$(binary_archs "$NODE")"
+    pick_native_node
+  fi
+  arch_plan
+}
+
+# The debug Chrome that is already listening on 9222: native, translated,
+# none, or unknown. Reads its process flags (bit 0x20000 = translated);
+# best effort and fail-open, and it touches nothing.
+running_debug_chrome_state() {
+  local pid flags
+  [ "$HW_ARM64" = "1" ] || { echo unknown; return 0; }
+  pid="$("$LSOF_BIN" -nP -iTCP:9222 -sTCP:LISTEN -t 2>/dev/null | head -n 1)"
+  [ -n "$pid" ] || { echo none; return 0; }
+  flags="$("$PS_BIN" -o flags= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ "$flags" =~ ^[0-9a-fA-F]+$ ]] || { echo unknown; return 0; }
+  if [ $(( 0x$flags & 0x20000 )) -ne 0 ]; then echo translated; else echo native; fi
+}
+
+warn_if_running_chrome_translated() {
+  [ "$(running_debug_chrome_state)" = "translated" ] || return 0
+  echo "⚠️  The running debug Chrome is translated (slow): quit it and run ./start.sh again, or run ./start.sh --doctor" | tee -a "$LOG_FILE"
+}
+
+# The once-per-start architecture warnings (start modes only; the doctor has
+# its own rows).
+arch_print_warnings() {
+  if [ "$WARN_CHROME_INTEL" = "1" ]; then
+    echo "⚠️  Chrome is the Intel build and runs 2-5x slower on this Mac: download Chrome for Mac with Apple chip from google.com/chrome and replace it" | tee -a "$LOG_FILE"
+  fi
+  if [ "$WARN_NODE_INTEL" = "1" ]; then
+    echo "⚠️  Node is the Intel build and runs under Rosetta: install an Apple-silicon Node (nodejs.org installer for Apple silicon, or Homebrew in /opt/homebrew)" | tee -a "$LOG_FILE"
+  fi
+}
+
+arch_prepare
+if [ "$DOCTOR$STOP_ONLY$RECOVER_SHUTDOWN$OPEN_WINDOW_ONLY" = "0000" ]; then
+  arch_print_warnings
+fi
+
 # Make the chosen node's bin dir visible to child processes (npm, npx).
 PATH="$(dirname "$NODE"):$PATH"
 export PATH
@@ -205,7 +516,7 @@ export PATH
 # Packages package.json declares that node_modules lacks, or holds at another
 # version than an exact pin. Space-separated; empty when everything is there.
 missing_npm_dependencies() {
-  "$NODE" -e '
+  native_exec "$NODE" -e '
     const fs = require("fs");
     const path = require("path");
     const dir = process.argv[1];
@@ -221,6 +532,462 @@ missing_npm_dependencies() {
   ' "$PROJ_DIR" 2>/dev/null || true
 }
 
+print_ocr_note() {
+  echo "ℹ  OCR helper not built: install Xcode Command Line Tools with \`xcode-select --install\`; BotBoy works without it except text from images and scanned PDFs" | tee -a "$LOG_FILE"
+}
+
+# Dependency self-heal. `--update` fast-forwards package.json but never ran
+# npm, so a new or re-pinned dependency (BotBoy's pdf.js reader, an SDK pin)
+# never reached teammates. Install only when something is missing; a failed
+# install warns, and BotBoy starts with what it has. npm can exit nonzero
+# (a native build step, say) after every package landed, so the verdict
+# comes from a second look at node_modules, not from npm's exit code.
+DEPS_INSTALLED=0
+heal_missing_npm_dependencies() {
+  local missing still
+  missing="$(missing_npm_dependencies)"
+  [ -n "$missing" ] || return 0
+  echo "ℹ️  Installing dependencies ($missing) — npm install" | tee -a "$LOG_FILE"
+  if (cd "$PROJ_DIR" && native_exec "$NPM_BIN" install --no-audit --no-fund >> "$LOG_FILE" 2>&1); then
+    echo "✅ Dependencies installed" | tee -a "$LOG_FILE"
+    DEPS_INSTALLED=1
+    return 0
+  fi
+  still="$(missing_npm_dependencies)"
+  if [ -z "$still" ]; then
+    echo "⚠️  npm install reported an error, but every BotBoy package is present (see $LOG_FILE); continuing" | tee -a "$LOG_FILE"
+  else
+    echo "⚠️  npm install failed — see $LOG_FILE. BotBoy starts without: $still" | tee -a "$LOG_FILE"
+  fi
+}
+
+# The OCR helper is compiled locally from native/vision-ocr/main.swift. An
+# update that changes the source must rebuild it, or the old helper keeps
+# running (npm install is the only other trigger). Needs Xcode CLT. Without
+# it the helper is simply absent: one calm note, no "rebuild failed" warning,
+# and no compiler shim is ever run. A failure keeps the existing helper.
+OCR_SRC="$PROJ_DIR/native/vision-ocr/main.swift"
+OCR_BIN="$PROJ_DIR/native/vision-ocr/bin/vision-ocr"
+rebuild_ocr_helper_if_needed() {
+  [ -f "$OCR_SRC" ] || return 0
+  if [ -x "$OCR_BIN" ] && ! [ "$OCR_SRC" -nt "$OCR_BIN" ]; then
+    return 0
+  fi
+  if ! clt_toolchain_ok; then
+    [ -x "$OCR_BIN" ] || print_ocr_note
+    return 0
+  fi
+  echo "ℹ  Rebuilding the OCR helper" | tee -a "$LOG_FILE"
+  if ! (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs >> "$LOG_FILE" 2>&1) || [ ! -x "$OCR_BIN" ]; then
+    echo "⚠  OCR helper rebuild failed — see $LOG_FILE" | tee -a "$LOG_FILE"
+  fi
+}
+
+# Doctor rows for the Swift toolchain and the readers that depend on it.
+# Says "installed (swiftc found)", not "works": it proves the compiler is
+# reachable, nothing more.
+doctor_toolchain_rows() {
+  local helper
+  if clt_toolchain_ok; then
+    echo "xcode-clt: installed (swiftc found)"
+  else
+    echo "xcode-clt: MISSING — run: xcode-select --install; without it BotBoy cannot read text inside images or scanned PDFs (text PDFs still work)"
+  fi
+  if [ -x "$OCR_BIN" ]; then
+    helper="vision-ocr helper built"
+  elif clt_toolchain_ok; then
+    helper="vision-ocr helper not built (tools present; run ./start.sh)"
+  else
+    helper="vision-ocr helper not built (Xcode Command Line Tools missing: images and scanned PDFs unavailable)"
+  fi
+  echo "pdf readers: $helper; pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
+}
+
+# Executable test hooks for the three functions above. They change nothing
+# beyond what the function itself does.
+if [ "${BOTBOY_TEST_HEAL_DEPS:-0}" = "1" ]; then
+  heal_missing_npm_dependencies
+  exit 0
+fi
+if [ "${BOTBOY_TEST_OCR_REBUILD:-0}" = "1" ]; then
+  rebuild_ocr_helper_if_needed
+  exit 0
+fi
+if [ "${BOTBOY_TEST_DOCTOR_TOOLCHAIN:-0}" = "1" ]; then
+  doctor_toolchain_rows
+  exit 0
+fi
+
+# Doctor rows for this machine. They never fail the doctor, and every warning
+# says what to do.
+DF_BIN="${BOTBOY_TEST_DF_BIN:-df}"
+doctor_machine_rows() {
+  local ram_bytes ram_gb free_kb free_gb pressure level swap_text swap_gb swap_high chrome_state node_text
+  if [ "$HW_ARM64" = "1" ]; then
+    echo "hardware: Apple Silicon"
+  else
+    echo "hardware: Intel"
+  fi
+  if [ "$HW_ARM64" != "1" ]; then
+    echo "this shell: native"
+  elif [ "$SHELL_TRANSLATED" = "1" ]; then
+    if [ "${BOTBOY_NO_ARCH_REEXEC:-0}" = "1" ]; then
+      echo "this shell: translated (Rosetta) — BOTBOY_NO_ARCH_REEXEC=1 is set, so start.sh does not re-launch natively; unset it"
+    else
+      echo "this shell: translated (Rosetta) — start.sh could not re-launch natively; BotBoy runs slower. Open a native Terminal and run ./start.sh"
+    fi
+  elif [ -n "${BOTBOY_REEXEC_FROM:-}" ]; then
+    echo "this shell: native (re-launched from a Rosetta shell)"
+  else
+    echo "this shell: native"
+  fi
+  if [ "$HW_ARM64" != "1" ]; then
+    echo "chrome arch: not checked (Intel Mac)"
+    echo "node arch: not checked (Intel Mac)"
+  else
+    if [ -z "$CHROME_ARCHS" ]; then
+      echo "chrome arch: unknown"
+    elif archs_include_arm64 "$CHROME_ARCHS"; then
+      echo "chrome arch: $(printf '%s' "$CHROME_ARCHS" | sed 's/ /+/g') (runs native)"
+    else
+      echo "chrome arch: $CHROME_ARCHS only (Rosetta, 2-5x slower) — download Chrome for Mac with Apple chip from google.com/chrome and replace it"
+    fi
+    if [ -z "$NODE_ARCHS" ]; then
+      node_text="unknown"
+    elif archs_include_arm64 "$NODE_ARCHS"; then
+      node_text="$(printf '%s' "$NODE_ARCHS" | sed 's/ /+/g') (runs native)"
+    else
+      node_text="$NODE_ARCHS only (Rosetta) — install an Apple-silicon Node (nodejs.org installer for Apple silicon, or Homebrew in /opt/homebrew)"
+    fi
+    echo "node arch: $node_text"
+  fi
+  ram_bytes="$("$SYSCTL_BIN" -n hw.memsize 2>/dev/null)"
+  if [[ "$ram_bytes" =~ ^[0-9]+$ ]]; then
+    ram_gb="$(awk -v b="$ram_bytes" 'BEGIN { printf "%.0f", b / 1073741824 }')"
+    echo "RAM: ${ram_gb} GB"
+  else
+    ram_bytes=""
+    echo "RAM: unknown"
+  fi
+  free_kb="$("$DF_BIN" -k "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ "$free_kb" =~ ^[0-9]+$ ]]; then
+    free_gb="$(awk -v k="$free_kb" 'BEGIN { printf "%.1f", k / 1048576 }')"
+    if [ "$free_kb" -lt 5242880 ]; then
+      echo "free disk: ${free_gb} GB — WARN: free some space; BotBoy needs room for its database and Chrome profile"
+    else
+      echo "free disk: ${free_gb} GB"
+    fi
+  else
+    echo "free disk: unknown"
+  fi
+  level="$("$SYSCTL_BIN" -n kern.memorystatus_vm_pressure_level 2>/dev/null)"
+  case "$level" in
+    1) pressure="normal" ;;
+    2) pressure="warn" ;;
+    4) pressure="critical" ;;
+    *) pressure="" ;;
+  esac
+  case "$pressure" in
+    normal) echo "memory pressure: normal" ;;
+    warn|critical) echo "memory pressure: $pressure — close other apps or restart the Mac; BotBoy slows its browser capture while this lasts" ;;
+    *) echo "memory pressure: unknown" ;;
+  esac
+  # Swap alone is normal on macOS. It warns only while memory pressure is up
+  # and more than a quarter of RAM is swapped out.
+  swap_text="$("$SYSCTL_BIN" -n vm.swapusage 2>/dev/null)"
+  swap_gb="$(printf '%s\n' "$swap_text" | awk '{
+    for (i = 1; i <= NF; i++) if ($i == "used" && $(i + 1) == "=") {
+      v = $(i + 2); unit = substr(v, length(v)); n = substr(v, 1, length(v) - 1) + 0
+      if (unit == "G") printf "%.1f", n; else if (unit == "M") printf "%.1f", n / 1024; else if (unit == "K") printf "%.1f", n / 1048576; else printf "%.1f", 0
+    }
+  }')"
+  if [ -n "$swap_gb" ]; then
+    swap_high=0
+    if [ -n "$ram_bytes" ] && [ -n "$pressure" ] && [ "$pressure" != "normal" ]; then
+      swap_high="$(awk -v s="$swap_gb" -v b="$ram_bytes" 'BEGIN { print (s * 1073741824 > b / 4) ? 1 : 0 }')"
+    fi
+    if [ "$swap_high" = "1" ]; then
+      echo "swap used: ${swap_gb} GB — WARN: more than a quarter of RAM is swapped out while memory pressure is up; close other apps or restart the Mac"
+    else
+      echo "swap used: ${swap_gb} GB"
+    fi
+  else
+    echo "swap used: unknown"
+  fi
+  chrome_state="$(running_debug_chrome_state)"
+  case "$chrome_state" in
+    native) echo "running debug Chrome: native" ;;
+    translated) echo "running debug Chrome: translated (slow) — quit it and run ./start.sh again" ;;
+    none) echo "running debug Chrome: not running" ;;
+    *) echo "running debug Chrome: not checked" ;;
+  esac
+}
+
+# ── BotBoy.app launcher ──────────────────────────────────────────────────────
+# macOS starts a shell-script .app, and a compiled launcher with no arm64
+# slice, under Rosetta unless Info.plist prefers arm64 (measured 2026-10-12:
+# a plain script app ran with proc_translated=1 and passed it to every
+# child; the same bundle with LSArchitecturePriority [arm64, x86_64] ran
+# native). The plan below is a pure function of facts, so the table is
+# testable. It never deletes a bundle and never replaces a working native
+# launcher with the shell fallback.
+APP_BUNDLE="${BOTBOY_TEST_APP_BUNDLE:-/Applications/BotBoy.app}"
+PLISTBUDDY_BIN="${BOTBOY_TEST_PLISTBUDDY_BIN:-/usr/libexec/PlistBuddy}"
+LSREGISTER_BIN="${BOTBOY_TEST_LSREGISTER_BIN:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
+APP_EXISTS=0
+APP_KIND=none
+APP_ARCHS=""
+APP_PRIORITY0=""
+APP_OWNED=0
+APP_TOOLCHAIN=0
+APP_MARKER_BLOCKS=0
+APP_PLAN=none
+APP_PLIST_CHANGED=0
+
+app_launcher_marker_file() {
+  printf '%s/.personal-productivity-tracker/app-launcher.v1' "$HOME"
+}
+
+# `size:mtime` of a file, or empty.
+app_file_signature() {
+  stat -f '%z:%m' "$1" 2>/dev/null || true
+}
+
+# A failed rebuild is recorded with the launcher and builder it saw, so a
+# start never retries the same failure: it waits for the launcher or the
+# builder script to change.
+app_launcher_marker_blocks() {
+  local marker launcher_sig builder_sig recorded_launcher recorded_builder recorded_result
+  marker="$(app_launcher_marker_file)"
+  [ -f "$marker" ] || return 1
+  launcher_sig="$(app_file_signature "$APP_BUNDLE/Contents/MacOS/BotBoy")"
+  builder_sig="$(app_file_signature "$PROJ_DIR/scripts/make-app-bundle.mjs")"
+  recorded_launcher="$(sed -n 's/^launcher=//p' "$marker" | head -n 1)"
+  recorded_builder="$(sed -n 's/^builder=//p' "$marker" | head -n 1)"
+  recorded_result="$(sed -n 's/^result=//p' "$marker" | head -n 1)"
+  [ "$recorded_result" = "failed" ] || return 1
+  [ -n "$launcher_sig" ] && [ "$recorded_launcher" = "$launcher_sig" ] && [ "$recorded_builder" = "$builder_sig" ]
+}
+
+app_launcher_marker_write() {
+  local marker
+  marker="$(app_launcher_marker_file)"
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || return 0
+  {
+    echo "launcher=$(app_file_signature "$APP_BUNDLE/Contents/MacOS/BotBoy")"
+    echo "builder=$(app_file_signature "$PROJ_DIR/scripts/make-app-bundle.mjs")"
+    echo "result=$1"
+    echo "date=$(date '+%Y-%m-%dT%H:%M:%S')"
+  } > "$marker" 2>/dev/null || true
+}
+
+# Gather the facts. On Intel nothing beyond "does the bundle exist" is read.
+app_launcher_facts() {
+  local exe description
+  APP_EXISTS=0
+  APP_KIND=none
+  APP_ARCHS=""
+  APP_PRIORITY0=""
+  APP_OWNED=0
+  APP_TOOLCHAIN=0
+  APP_MARKER_BLOCKS=0
+  [ -d "$APP_BUNDLE" ] || return 0
+  APP_EXISTS=1
+  exe="$APP_BUNDLE/Contents/MacOS/BotBoy"
+  if [ ! -f "$exe" ]; then
+    APP_KIND=missing
+    return 0
+  fi
+  [ "$HW_ARM64" = "1" ] || return 0
+  description="$("$FILE_BIN" -b "$exe" 2>/dev/null)"
+  case "$description" in
+    Mach-O*) APP_KIND=macho; APP_ARCHS="$(file_description_archs "$description")" ;;
+    *script*|*text*) APP_KIND=script ;;
+    *) APP_KIND=unknown ;;
+  esac
+  APP_PRIORITY0="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
+  if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
+    grep -aqF "$PROJ_DIR/start.sh" "$exe" 2>/dev/null && APP_OWNED=1
+    clt_toolchain_ok && APP_TOOLCHAIN=1
+    app_launcher_marker_blocks && APP_MARKER_BLOCKS=1
+  fi
+  return 0
+}
+
+# Pure: APP_PLAN is create | patch_plist | rebuild | warn_harmless | none.
+app_launcher_plan() {
+  APP_PLAN=none
+  if [ "$APP_EXISTS" != "1" ] || [ "$APP_KIND" = "missing" ]; then
+    APP_PLAN=create
+    return 0
+  fi
+  [ "$HW_ARM64" = "1" ] || return 0
+  if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
+    # An Intel-only launcher: only a rebuild can make the app itself native.
+    if [ "$APP_TOOLCHAIN" = "1" ] && [ "$APP_OWNED" = "1" ] && [ "$FOREGROUND" != "1" ] && [ "$APP_MARKER_BLOCKS" != "1" ]; then
+      APP_PLAN=rebuild
+    else
+      APP_PLAN=warn_harmless
+    fi
+    return 0
+  fi
+  [ "$APP_PRIORITY0" = "arm64" ] || APP_PLAN=patch_plist
+  return 0
+}
+
+# Make Info.plist prefer arm64 without a compiler. Idempotent and atomic: the
+# change is made on a copy, verified by READING it back (PlistBuddy's exit
+# codes are not trusted), and moved over the original in one rename. The
+# temporary copy never outlives the call. Returns 0 when the plist is right
+# afterwards, 1 otherwise; APP_PLIST_CHANGED=1 when it had to be changed.
+patch_app_plist_arch() {
+  local plist="$APP_BUNDLE/Contents/Info.plist" temp first second third
+  APP_PLIST_CHANGED=0
+  [ -f "$plist" ] || return 1
+  first="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$plist" 2>/dev/null || true)"
+  [ "$first" = "arm64" ] && return 0
+  temp="$plist.botboy-new"
+  rm -f "$temp"
+  cp "$plist" "$temp" 2>/dev/null || { rm -f "$temp"; return 1; }
+  "$PLISTBUDDY_BIN" -c 'Delete :LSArchitecturePriority' "$temp" >/dev/null 2>&1 || true
+  "$PLISTBUDDY_BIN" -c 'Add :LSArchitecturePriority array' -c 'Add :LSArchitecturePriority:0 string arm64' -c 'Add :LSArchitecturePriority:1 string x86_64' "$temp" >/dev/null 2>&1 || true
+  first="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$temp" 2>/dev/null || true)"
+  second="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:1' "$temp" 2>/dev/null || true)"
+  third="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:2' "$temp" 2>/dev/null || true)"
+  if [ "$first" != "arm64" ] || [ "$second" != "x86_64" ] || [ -n "$third" ]; then
+    rm -f "$temp"
+    return 1
+  fi
+  if ! mv -f "$temp" "$plist" 2>/dev/null; then
+    rm -f "$temp"
+    return 1
+  fi
+  rm -f "$temp"
+  first="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$plist" 2>/dev/null || true)"
+  [ "$first" = "arm64" ] || return 1
+  APP_PLIST_CHANGED=1
+  touch "$APP_BUNDLE" 2>/dev/null || true
+  if [ -f "$APP_BUNDLE/Contents/MacOS/BotBoy" ]; then
+    "$LSREGISTER_BIN" -f "$APP_BUNDLE" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+apply_app_launcher_plan() {
+  local builder="$PROJ_DIR/scripts/make-app-bundle.mjs"
+  case "$APP_PLAN" in
+    create)
+      echo "ℹ️  Installing BotBoy.app into $(dirname "$APP_BUNDLE") (first run)"
+      if native_exec "$NODE" "$builder" --dest "$APP_BUNDLE" >> "$LOG_FILE" 2>&1; then
+        echo "✅ BotBoy.app installed — launch from Spotlight or the Dock next time"
+      else
+        echo "⚠️  Could not install BotBoy.app (see $LOG_FILE) — run: npm run app:bundle"
+      fi
+      ;;
+    patch_plist)
+      if patch_app_plist_arch; then
+        [ "$APP_PLIST_CHANGED" = "1" ] && echo "ℹ️  BotBoy.app now prefers Apple Silicon; this takes effect at the next app launch: quit and reopen BotBoy" | tee -a "$LOG_FILE"
+      else
+        echo "ℹ️  Could not update BotBoy.app's architecture setting (harmless: start.sh still runs BotBoy natively)" | tee -a "$LOG_FILE"
+      fi
+      ;;
+    rebuild)
+      echo "ℹ️  Rebuilding BotBoy.app's launcher for Apple Silicon (the installed one is the Intel build)" | tee -a "$LOG_FILE"
+      if native_exec "$NODE" "$builder" --launcher-only --dest "$APP_BUNDLE" >> "$LOG_FILE" 2>&1; then
+        app_launcher_marker_write ok
+        patch_app_plist_arch || true
+        echo "✅ BotBoy.app launcher rebuilt; this takes effect at the next app launch: quit and reopen BotBoy" | tee -a "$LOG_FILE"
+      else
+        app_launcher_marker_write failed
+        echo "ℹ️  BotBoy.app's launcher is the Intel build and starts translated; harmless, because start.sh re-launches BotBoy natively (rebuild failed, see $LOG_FILE)" | tee -a "$LOG_FILE"
+      fi
+      ;;
+    warn_harmless)
+      echo "ℹ️  BotBoy.app's launcher is the Intel build and starts translated; harmless, because start.sh re-launches BotBoy natively" | tee -a "$LOG_FILE"
+      ;;
+  esac
+  return 0
+}
+
+doctor_app_launcher_row() {
+  local kind priority
+  app_launcher_facts
+  if [ "$APP_EXISTS" != "1" ] || [ "$APP_KIND" = "missing" ]; then
+    echo "app launcher: not installed (./start.sh installs it on its first successful start)"
+    return 0
+  fi
+  if [ "$HW_ARM64" != "1" ]; then
+    echo "app launcher: installed (Intel Mac: nothing to check)"
+    return 0
+  fi
+  case "$APP_KIND" in
+    macho)
+      if [ -z "$APP_ARCHS" ]; then
+        kind="compiled"
+      elif archs_include_arm64 "$APP_ARCHS"; then
+        case " $APP_ARCHS " in
+          *" x86_64 "*) kind="compiled universal" ;;
+          *) kind="compiled arm64" ;;
+        esac
+      else
+        kind="compiled x86_64 only"
+      fi
+      ;;
+    script) kind="shell script" ;;
+    *) kind="unknown" ;;
+  esac
+  if [ "$APP_PRIORITY0" = "arm64" ]; then
+    priority="arm64 first"
+  elif [ "$APP_KIND" = "macho" ] && archs_include_arm64 "$APP_ARCHS"; then
+    priority="missing (harmless for a compiled launcher with an arm64 slice; start.sh adds the key on its next start)"
+  else
+    priority="missing (the app itself starts translated; BotBoy's own processes are still native because start.sh re-launches natively; start.sh adds the key on its next start)"
+  fi
+  echo "app launcher: $kind; architecture priority: $priority"
+}
+
+# Self-heal the Dock/Applications launcher: build /Applications/BotBoy.app on
+# the first start after a clone (or after someone deletes the app), and on
+# Apple Silicon keep an existing one starting natively (app_launcher_plan).
+# Runs after the dashboard is already open so it never delays startup, and a
+# failure never breaks the tracker: the app is cosmetic + lifecycle
+# convenience, not a runtime dependency. It never rebuilds in --foreground
+# (the app that is running may be this very launcher).
+install_app_bundle_if_missing() {
+  [ -f "$PROJ_DIR/scripts/make-app-bundle.mjs" ] || return 0
+  app_launcher_facts
+  app_launcher_plan
+  apply_app_launcher_plan
+}
+
+# Executable test hooks. They read the facts and print them; the apply hook
+# runs the real flow against BOTBOY_TEST_APP_BUNDLE only.
+if [ "${BOTBOY_TEST_DOCTOR_MACHINE:-0}" = "1" ]; then
+  doctor_machine_rows
+  exit 0
+fi
+if [ "${BOTBOY_TEST_APP_LAUNCHER_PLAN:-0}" = "1" ]; then
+  app_launcher_facts
+  app_launcher_plan
+  echo "plan=$APP_PLAN"
+  echo "kind=$APP_KIND archs=$APP_ARCHS priority=$APP_PRIORITY0 owned=$APP_OWNED toolchain=$APP_TOOLCHAIN marker_blocks=$APP_MARKER_BLOCKS"
+  exit 0
+fi
+if [ "${BOTBOY_TEST_APP_PLIST_PATCH:-0}" = "1" ]; then
+  patch_app_plist_arch
+  status=$?
+  echo "patch_status=$status changed=$APP_PLIST_CHANGED"
+  exit 0
+fi
+if [ "${BOTBOY_TEST_DOCTOR_APP:-0}" = "1" ]; then
+  doctor_app_launcher_row
+  exit 0
+fi
+if [ "${BOTBOY_TEST_APP_LAUNCHER_APPLY:-0}" = "1" ]; then
+  install_app_bundle_if_missing
+  exit 0
+fi
+
 # Whether the native modules work in the exact Node this launcher runs. One
 # `name|ok` or `name|<error>` line per module; nonzero when either fails.
 # better-sqlite3 binds its addon only inside `new Database()`, so `require`
@@ -230,7 +997,7 @@ missing_npm_dependencies() {
 # from its macOS spawn-helper (`posix_spawnp failed` otherwise); `check`
 # changes nothing.
 native_modules_status() {
-  (cd "$PROJ_DIR" && "$NODE" -e '
+  (cd "$PROJ_DIR" && native_exec "$NODE" -e '
     const fs = require("fs");
     const path = require("path");
     const repair = process.argv[1] === "repair";
@@ -289,6 +1056,16 @@ print_native_modules_failure() {
   printf '%s\n' "$status" | grep -v '|ok$' | sed 's/|/: /; s/^/    /'
   echo "    BotBoy never opened its database, so nothing needs recovery."
   echo "    Next: run npm install in $PROJ_DIR, read its last errors, then ./start.sh."
+  if [ "$HW_ARM64" = "1" ]; then
+    case "$NODE_ARCHS" in
+      "") ;;
+      *) if archs_include_arm64 "$NODE_ARCHS"; then
+           echo "    This Mac is Apple Silicon and Node is native ($NODE_ARCHS); native modules must be built for arm64."
+         else
+           echo "    This Mac is Apple Silicon but this Node is the Intel build ($NODE_ARCHS): install an Apple-silicon Node, then npm install."
+         fi ;;
+    esac
+  fi
   echo "    On Node 20, better-sqlite3 is built from source and needs Xcode Command Line Tools (xcode-select --install); Node 22, 24, and 26 use a prebuilt copy."
 }
 
@@ -354,7 +1131,7 @@ fi
 
 # 1. Start debug Chrome if not already running
 if ! curl -s http://127.0.0.1:9222/json >/dev/null 2>&1; then
-  "$CHROME" \
+  ${CHROME_PREFIX[@]+"${CHROME_PREFIX[@]}"} "$CHROME" \
     --remote-debugging-port=9222 \
     --user-data-dir="$DEBUG_PROFILE" \
     --no-first-run --no-default-browser-check >/dev/null 2>&1 &
@@ -366,6 +1143,13 @@ if ! curl -s http://127.0.0.1:9222/json >/dev/null 2>&1; then
     curl -s --max-time 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
     sleep 1
   done
+else
+  # Already running (started by an older launcher or by hand): say so once if
+  # it is a translated Chrome. Best effort; it never stops or restarts it,
+  # and the doctor reports it in its own row.
+  if [ "$DOCTOR$STOP_ONLY$OPEN_WINDOW_ONLY" = "000" ]; then
+    warn_if_running_chrome_translated
+  fi
 fi
 
 # Teammate zero-config: if an owner-issued botboy-credentials plaintext file
@@ -613,7 +1397,7 @@ open_dashboard_window() {
     PRELAUNCH_TARGET_IDS=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
       | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).filter(x=>x.type==='page').map(x=>String(x.id||'')).filter(Boolean).join('\n'))}catch{}})" 2>/dev/null)
     local window_started=$SECONDS
-    "$CHROME" \
+    ${CHROME_PREFIX[@]+"${CHROME_PREFIX[@]}"} "$CHROME" \
       --user-data-dir="$DEBUG_PROFILE" \
       --app="$REOPEN_URL" >/dev/null 2>&1 &
     # Chrome can take several seconds to open an --app window while it is
@@ -895,22 +1679,6 @@ warn_if_no_llm_credentials() {
   echo "⚠️  No AI model set up yet — chat and background organizing stay off until you add one."
   echo "    In BotBoy, open Settings → AI model and paste an OpenAI or DeepSeek API key (it takes effect right away)."
   echo "    Or, if the owner sent you a botboy-credentials file, put it in ~/Downloads and re-run ./start.sh."
-}
-
-# Self-heal the Dock/Applications launcher: build /Applications/BotBoy.app on
-# the first start after a clone (or after someone deletes the app). Runs only
-# when the bundle is missing, after the dashboard is already open so it never
-# delays startup, and a failure never breaks the tracker — the app is
-# cosmetic + lifecycle convenience, not a runtime dependency.
-install_app_bundle_if_missing() {
-  [ -d "/Applications/BotBoy.app" ] && return 0
-  [ -f "$PROJ_DIR/scripts/make-app-bundle.mjs" ] || return 0
-  echo "ℹ️  Installing BotBoy.app into /Applications (first run)"
-  if "$NODE" "$PROJ_DIR/scripts/make-app-bundle.mjs" >> "$LOG_FILE" 2>&1; then
-    echo "✅ BotBoy.app installed — launch from Spotlight or the Dock next time"
-  else
-    echo "⚠️  Could not install BotBoy.app (see $LOG_FILE) — run: npm run app:bundle"
-  fi
 }
 
 # The PID file only names a candidate. macOS reuses PIDs, and the server never
@@ -1339,9 +2107,13 @@ if [ "$DOCTOR" = "1" ]; then
   echo "node:  $NODE ($("$NODE" --version 2>/dev/null))"
   echo "npm:   $(command -v npm) ($(npm --version 2>/dev/null))"
   echo "checkout-mode: $([ "$BOTBOY_RELEASE_CHECKOUT" = "1" ] && echo 'teammate release (customizations supported)' || echo 'development')"
-  TRACKED_DIRTY_COUNT=$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
-  echo "tracked local changes: ${TRACKED_DIRTY_COUNT:-unknown}$([ "${TRACKED_DIRTY_COUNT:-0}" != "0" ] && echo ' — run ./start.sh --update before pulling' || true)"
-  if [ "$BOTBOY_RELEASE_CHECKOUT" = "1" ]; then
+  if git_usable; then
+    TRACKED_DIRTY_COUNT=$(git -C "$PROJ_DIR" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+    echo "tracked local changes: ${TRACKED_DIRTY_COUNT:-unknown}$([ "${TRACKED_DIRTY_COUNT:-0}" != "0" ] && echo ' — run ./start.sh --update before pulling' || true)"
+  else
+    echo "tracked local changes: unknown (git needs Xcode Command Line Tools: xcode-select --install)"
+  fi
+  if [ "$BOTBOY_RELEASE_CHECKOUT" = "1" ] && git_usable; then
     DOCTOR_HEAD="$(git -C "$PROJ_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     if git -C "$PROJ_DIR" fetch --quiet origin main 2>/dev/null; then
       DOCTOR_BEHIND="$(git -C "$PROJ_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
@@ -1360,13 +2132,14 @@ if [ "$DOCTOR" = "1" ]; then
   else
     echo "shutdown recovery: no active safety guard"
   fi
-  if xcode-select -p >/dev/null 2>&1; then echo "xcode-clt: installed"; else echo "xcode-clt: MISSING — run: xcode-select --install"; fi
+  doctor_machine_rows
+  doctor_app_launcher_row
+  doctor_toolchain_rows
   [ -x "$CHROME" ] && echo "chrome: installed" || echo "chrome: MISSING at $CHROME"
   [ -f "$PROJ_DIR/dist/index.js" ] && echo "build: dist/index.js present" || echo "build: MISSING — run: npm run build"
   [ -f "$PROJ_DIR/dist/ui/index.html" ] && [ -f "$PROJ_DIR/dist/ui/dashboard.css" ] && echo "ui-assets: present" || echo "ui-assets: MISSING/PARTIAL — run: npm run build"
   DOCTOR_MISSING_DEPS="$(missing_npm_dependencies)"
   if [ -z "$DOCTOR_MISSING_DEPS" ]; then echo "npm dependencies: installed"; else echo "npm dependencies: MISSING $DOCTOR_MISSING_DEPS — run: npm install (./start.sh also tries)"; fi
-  echo "pdf readers: vision-ocr helper $([ -x "$PROJ_DIR/native/vision-ocr/bin/vision-ocr" ] && echo built || echo 'not built (needs Xcode CLT)'); pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
   # `check` is read-only. better-sqlite3 counts only when it opens a
   # database and node-pty only when it spawns a terminal.
   DOCTOR_NATIVE="$(native_modules_status check)"
@@ -1382,6 +2155,34 @@ if [ "$DOCTOR" = "1" ]; then
   # watched FOLDER, independent of file count. A low limit here no longer
   # implicates watched-folder size — look at sockets/subprocesses instead.
   echo "fd limit: $(ulimit -n) (folder watching costs ~1 fd per folder)"
+  # Node's connect attempt limit (src/core/network-defaults.ts). Node 20 gives each
+  # address 250 ms to finish its TCP handshake; a route to Google slower than that
+  # (seen at ~310 ms) made every request to Google fail with "network error
+  # (ETIMEDOUT)" while curl worked. BotBoy raises the limit when it boots. This
+  # prints both numbers and times one real TCP connect (no data is sent).
+  "$NODE" -e '
+    const net = require("net");
+    const limit = typeof net.getDefaultAutoSelectFamilyAttemptTimeout === "function" ? net.getDefaultAutoSelectFamilyAttemptTimeout() : null;
+    const raw = process.env.BOTBOY_NET_ATTEMPT_TIMEOUT_MS || "";
+    const override = /^\s*\d{1,9}\s*$/.test(raw) ? Math.min(10000, Math.max(250, Number(raw))) : null;
+    const sets = override !== null ? override : (limit !== null && limit > 2000 ? limit : 2000);
+    console.log(`node connect timeout: default ${limit === null ? "n/a (this Node cannot change it)" : `${limit} ms`}; BotBoy sets ${limit === null ? "nothing" : `${sets} ms`} at boot${override !== null ? " (BOTBOY_NET_ATTEMPT_TIMEOUT_MS)" : ""}`);
+    const started = Date.now();
+    const socket = net.connect({ host: "oauth2.googleapis.com", port: 443, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 5000 });
+    const finish = (text) => { console.log(text); socket.destroy(); process.exit(0); };
+    socket.setTimeout(10000, () => finish("connect probe: oauth2.googleapis.com:443 gave no answer in 10 s (network, proxy, or VPN blocks it)"));
+    socket.once("error", (error) => finish(`connect probe: oauth2.googleapis.com:443 FAILED (${(error && (error.code || (Array.isArray(error.errors) && error.errors.map((inner) => inner.code).join("+")))) || "error"})`));
+    socket.once("connect", () => {
+      const ms = Date.now() - started;
+      let note = "";
+      if (ms > 200) {
+        note = limit !== null && ms >= limit
+          ? ` - SLOW: slower than the ${limit} ms Node limit, so a plain Node request fails here ("network error (ETIMEDOUT)" in Gmail and Drive); BotBoy raises the limit to ${sets} ms at boot`
+          : ` - slow (above 200 ms): close to the 250 ms Node default; BotBoy keeps a ${sets} ms limit so requests still connect`;
+      }
+      finish(`connect probe: oauth2.googleapis.com:443 connected in ${ms} ms (${socket.remoteFamily || "?"})${note}`);
+    });
+  ' 2>/dev/null || echo "node connect timeout: could not run the check"
   # Managed MCP executables (installed via aim; searched the same way BotBoy
   # resolves them — PATH plus the AIM wrapper directory).
   if command -v amazon-sharepoint-mcp >/dev/null 2>&1 || [ -x "$HOME/.aim/mcp-servers/amazon-sharepoint-mcp" ]; then
@@ -1606,32 +2407,8 @@ trap release_start_lock EXIT
 #   2. dist/.build-commit differs from git HEAD — stale build after git pull.
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
-# Dependency self-heal. `--update` fast-forwards package.json but never ran
-# npm, so a new or re-pinned dependency (BotBoy's pdf.js reader, an SDK pin)
-# never reached teammates. Install only when something is missing; a failed
-# install warns, and BotBoy starts with what it has.
-DEPS_INSTALLED=0
-MISSING_DEPS="$(missing_npm_dependencies)"
-if [ -n "$MISSING_DEPS" ]; then
-  echo "ℹ️  Installing dependencies ($MISSING_DEPS) — npm install" | tee -a "$LOG_FILE"
-  if (cd "$PROJ_DIR" && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1); then
-    echo "✅ Dependencies installed" | tee -a "$LOG_FILE"
-    DEPS_INSTALLED=1
-  else
-    echo "⚠️  npm install failed — see $LOG_FILE. BotBoy starts without: $MISSING_DEPS" | tee -a "$LOG_FILE"
-  fi
-fi
-
-# The OCR helper is compiled locally from native/vision-ocr/main.swift. An
-# update that changes the source must rebuild it, or the old helper keeps
-# running (npm install is the only other trigger). Needs Xcode CLT; a failure
-# keeps the existing helper.
-OCR_SRC="$PROJ_DIR/native/vision-ocr/main.swift"
-OCR_BIN="$PROJ_DIR/native/vision-ocr/bin/vision-ocr"
-if [ -f "$OCR_SRC" ] && command -v swiftc >/dev/null 2>&1 && { [ ! -x "$OCR_BIN" ] || [ "$OCR_SRC" -nt "$OCR_BIN" ]; }; then
-  echo "ℹ  Rebuilding the OCR helper" | tee -a "$LOG_FILE"
-  (cd "$PROJ_DIR" && node scripts/bootstrap-deps.mjs >> "$LOG_FILE" 2>&1) || echo "⚠  OCR helper rebuild failed — see $LOG_FILE" | tee -a "$LOG_FILE"
-fi
+heal_missing_npm_dependencies
+rebuild_ocr_helper_if_needed
 # An unresolved shutdown guard blocks every replacement start. Report it now,
 # with its next step, instead of after the build.
 startup_safety_allows_takeover || exit 1
@@ -1646,7 +2423,7 @@ if ! NATIVE_STATUS="$(native_modules_status repair)"; then
   echo "ℹ️  Reinstalling native modules for Node $("$NODE" --version 2>/dev/null) — npm install" | tee -a "$LOG_FILE"
   printf '%s\n' "$NATIVE_STATUS" | grep -v '|ok$' | sed 's/|/: /; s/^/    /' | tee -a "$LOG_FILE"
   (cd "$PROJ_DIR" && rm -rf node_modules/better-sqlite3 node_modules/node-pty \
-    && npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) || true
+    && native_exec npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) || true
   if ! NATIVE_STATUS="$(native_modules_status repair)"; then
     print_native_modules_failure "$NATIVE_STATUS" | tee -a "$LOG_FILE"
     exit 1
@@ -1662,7 +2439,8 @@ elif [ "$DEPS_INSTALLED" = "1" ]; then
 elif [ ! -f "$PROJ_DIR/dist/index.js" ]; then
   NEED_BUILD="first run"
 else
-  CURRENT_COMMIT=$(git -C "$PROJ_DIR" rev-parse HEAD 2>/dev/null || echo "")
+  CURRENT_COMMIT=""
+  if git_usable; then CURRENT_COMMIT=$(git -C "$PROJ_DIR" rev-parse HEAD 2>/dev/null || echo ""); fi
   BUILD_MARKER="$PROJ_DIR/dist/.build-commit"
   BUILT_COMMIT=$(cat "$BUILD_MARKER" 2>/dev/null || echo "")
   if [ -n "$CURRENT_COMMIT" ] && [ "$CURRENT_COMMIT" != "$BUILT_COMMIT" ]; then
@@ -1677,7 +2455,7 @@ else
 fi
 if [ -n "$NEED_BUILD" ]; then
   echo "ℹ️  Compiling BotBoy ($NEED_BUILD) — takes about a minute" | tee -a "$LOG_FILE"
-  if ! npm run build >> "$LOG_FILE" 2>&1; then
+  if ! native_exec npm run build >> "$LOG_FILE" 2>&1; then
     echo "❌ Build failed — see $LOG_FILE (try: npm install && npm run build)" | tee -a "$LOG_FILE"
     exit 1
   fi
@@ -1694,7 +2472,7 @@ if [ "$FOREGROUND" = "1" ]; then
   safe_takeover || exit 1
 
   DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
-  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
+  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"
 
@@ -1748,7 +2526,7 @@ if ! server_is_ready; then
   # replacement starts, then verify this exact child through final readiness.
   safe_takeover || exit 1
   DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
-  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" nohup "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
+  PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" nohup ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!
   echo "$SERVER_PID" > "$PID_FILE"
   if ! wait_for_server "$SERVER_PID"; then

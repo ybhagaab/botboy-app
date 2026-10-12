@@ -117,6 +117,95 @@ describe('Sign in with Slack: exchange against a fake Slack', () => {
   });
 });
 
+/**
+ * The sign-in code is single use. A call that never reached Slack (a reset,
+ * a refused or unreachable connection) is sent once more; after Slack answered
+ * or the deadline passed it is not. A transport failure is named as one:
+ * before, it read "Slack refused the sign-in (request_failed)".
+ */
+describe('Sign in with Slack: transport failures', () => {
+  let fake: FakeSlackServer;
+  let pauses: number[];
+  let warnings: string[];
+  beforeEach(async () => {
+    fake = await startFakeSlack();
+    pauses = [];
+    warnings = [];
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => { warnings.push(args.map(String).join(' ')); });
+  });
+  afterEach(async () => { vi.restoreAllMocks(); await fake.close(); });
+  const run = (extra: Partial<Parameters<typeof exchangeSlackCode>[0]> = {}) => exchangeSlackCode({
+    ...CLIENT, code: 'the-code-1', redirectUri: 'https://127.0.0.1:7/api/slack/oauth/callback', slackApiUrl: fake.url,
+    sleep: async ms => { pauses.push(ms); }, ...extra,
+  });
+  const accessCalls = () => fake.requests.filter(r => r.method === 'oauth.v2.access');
+
+  it('sends the code once more after a reset before any answer, then signs in', async () => {
+    fake.dropNext = 1;
+    const result = await run();
+    expect(result.token).toBe(FAKE_SLACK_USER_TOKEN);
+    expect(accessCalls()).toHaveLength(2);
+    expect(accessCalls()[1].body.code).toBe(accessCalls()[0].body.code);
+    expect(pauses).toEqual([1500]);
+    expect(warnings.join('\n')).toContain('could not reach Slack; trying once more');
+  });
+
+  it('stops after that one retry and says Slack could not be reached, with nothing saved', async () => {
+    fake.dropNext = 2;
+    const failure = await run().catch(error => error);
+    expect(failure).toBeInstanceOf(SlackOAuthError);
+    expect(failure.code).toBe('network_error');
+    expect(failure.message).toBe("Couldn't reach Slack to finish the sign-in (network error). Nothing was saved. Choose Sign in with Slack again.");
+    expect(accessCalls()).toHaveLength(2);
+    expect(failure.message).not.toContain('refused');
+  });
+
+  it('names a refused connection as unreachable, after its one retry', async () => {
+    const closed = await startFakeSlack();
+    const deadAddress = closed.url;
+    await closed.close();
+    const failure = await run({ slackApiUrl: deadAddress }).catch(error => error);
+    expect(failure.code).toBe('network_error');
+    expect(failure.message).toMatch(/^Couldn't reach Slack to finish the sign-in \(network error\)\. Nothing was saved\./);
+    expect(pauses).toEqual([1500]);
+  });
+
+  it('never sends the code again after Slack answered, even with a refusal', async () => {
+    fake.access = { ok: false, error: 'invalid_code' };
+    const failure = await run().catch(error => error);
+    expect(failure.code).toBe('exchange_failed');
+    expect(failure.message).toBe('Slack refused the sign-in (invalid_code).');
+    expect(accessCalls()).toHaveLength(1);
+    expect(pauses).toEqual([]);
+  });
+
+  it('never sends the code again after the deadline, and says Slack did not answer', async () => {
+    fake.hang = true;
+    const failure = await run({ timeoutMs: 150 }).catch(error => error);
+    expect(failure.code).toBe('network_error');
+    expect(failure.message).toMatch(/^Couldn't reach Slack to finish the sign-in \(Slack didn't answer within \d+ seconds\)\. Nothing was saved\./);
+    expect(accessCalls()).toHaveLength(1);
+    expect(pauses).toEqual([]);
+  });
+
+  it('retries the token check once (it only reads) and names a transport failure there too', async () => {
+    const good = { ok: true, authed_user: { id: 'U1', access_token: FAKE_SLACK_USER_TOKEN, token_type: 'user' }, team: { id: 'T1', name: 'Team' } };
+    // The sign-in succeeds; the next request, the token check, meets a reset.
+    Object.defineProperty(fake, 'access', { configurable: true, get() { fake.dropNext = 1; return good; } });
+    expect((await run()).identity).toEqual({ user: 'owner', team: 'Acme' });
+    expect(accessCalls()).toHaveLength(1);
+    expect(fake.requests.filter(r => r.method === 'auth.test')).toHaveLength(2);
+
+    // Two resets: the token is not saved, and the words say Slack could not be reached.
+    fake.requests.length = 0;
+    Object.defineProperty(fake, 'access', { configurable: true, get() { fake.dropNext = 2; return good; } });
+    const failure = await run().catch(error => error);
+    expect(failure.code).toBe('network_error');
+    expect(failure.message).toBe("Couldn't reach Slack to check the new token (network error). Nothing was saved. Choose Sign in with Slack again.");
+    expect(accessCalls()).toHaveLength(1);
+  });
+});
+
 describe('Slack app client storage', () => {
   let root: string;
   beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-cred-')); });
