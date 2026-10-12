@@ -21,8 +21,36 @@ import {
 } from '../../core/slack-config.js';
 import { getSetting } from '../../core/storage.js';
 import { readLocalEnvValue, upsertLocalEnvValue } from '../../core/local-env.js';
-import { loadEnv } from '../../monitors/slack-monitor.js';
 import type { RouterDeps } from './deps.js';
+import { requireLocalOwnerUiRequest } from './local-owner.js';
+import type { SlackCaptureMode } from '../../monitors/slack-monitor.js';
+import {
+  SLACK_USER_SCOPES,
+  SlackOAuthError,
+  buildSlackAuthorizeUrl,
+  exchangeSlackCode,
+  parseFinishPaste,
+} from '../../core/slack-oauth.js';
+import { SlackCredentialInputError, isSlackRedirectMode, validateSlackClient } from '../../core/slack-credentials.js';
+
+/** Sign in with Slack's redirect path (mounted under /api). */
+export const SLACK_OAUTH_CALLBACK_PATH = '/slack/oauth/callback';
+
+type ReloadingMonitor = { reloadUserToken(token: string): Promise<{ captureMode: SlackCaptureMode }> };
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]!));
+}
+
+function resultPage(title: string, detail: string, ok: boolean): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>`
+    + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    + '<style>body{font:15px -apple-system,system-ui,sans-serif;max-width:520px;margin:15vh auto;padding:0 20px;color:#1d1d1f}a{color:#0a66c2}</style>'
+    + `</head><body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(detail)}</p>`
+    + `<p><a href="/#/connections/slack">Back to Connections → Slack</a></p></main>`
+    + (ok ? '<script>setTimeout(function(){location.href="/#/connections/slack"},2500)</script>' : '')
+    + '</body></html>';
+}
 
 function isLoopbackAddress(address: string | undefined): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -125,25 +153,43 @@ export function createSlackRouter(deps: RouterDeps): Router {
       return res.status(503).json({ error: 'Slack capture is not running' });
     }
     try {
-      res.json({ conversations: await fetchJoinedConversations(deps.slackWebClient) });
+      res.json({ conversations: await fetchJoinedConversations(deps.getSlackWebClient?.() ?? deps.slackWebClient) });
     } catch (err: any) {
       res.status(502).json({ error: `Slack API error: ${err?.data?.error || err.message}` });
     }
   });
 
   // ── Slack user token (dashboard onboarding) ──
-  // The token the RUNNING monitor booted with; a differing saved value means
-  // a restart is needed before the new token takes effect.
-  const bootToken = process.env.SLACK_USER_TOKEN || loadEnv().SLACK_USER_TOKEN || '';
+  // A saved token reaches the running monitor at once (reloadUserToken), so
+  // no restart is pending. `restartPending` stays as constant false for one
+  // release because older dashboards still read it.
+
+  /** Swaps the monitor's token; a throw means the token is saved but needs a restart. */
+  async function applyToken(token: string): Promise<string | null> {
+    deps.slackOAuth?.onTokenSaved?.(token);
+    conversationsCache = null;
+    const monitor = deps.slackMonitor as unknown as Partial<ReloadingMonitor> | undefined;
+    if (!monitor?.reloadUserToken) return null;
+    try {
+      await monitor.reloadUserToken(token);
+      return null;
+    } catch (err: any) {
+      console.warn(`[Slack] token saved but reload failed: ${String(err?.message ?? err).slice(0, 200)}`);
+      return 'Saved; restart BotBoy to use it.';
+    }
+  }
 
   router.get('/slack/token/status', (req: Request, res: Response) => {
     if (!acceptsLocalSecretRequest(req, res)) return;
     const saved = readLocalEnvValue('SLACK_USER_TOKEN') || process.env.SLACK_USER_TOKEN || '';
+    const view = deps.slackOAuth?.credentials.publicView();
     res.json({
       configured: saved.length > 0,
       tokenMasked: maskToken(saved),
       captureMode: deps.slackMonitor?.getCaptureMode?.() ?? 'disabled',
-      restartPending: saved.length > 0 && saved !== bootToken,
+      restartPending: false,
+      connectedVia: saved.length > 0 ? view?.connectedVia ?? 'token' : null,
+      identity: saved.length > 0 ? view?.identity ?? null : null,
     });
   });
 
@@ -163,7 +209,7 @@ export function createSlackRouter(deps: RouterDeps): Router {
     // identity this token carries. Nothing is written when verification fails.
     let identity: { user: string; team: string };
     try {
-      const auth = await new WebClient(token).auth.test();
+      const auth = await new WebClient(token, deps.slackOAuth?.slackApiUrl ? { slackApiUrl: deps.slackOAuth.slackApiUrl, retryConfig: { retries: 0 } } : undefined).auth.test();
       identity = { user: String(auth.user ?? ''), team: String(auth.team ?? '') };
     } catch (err: any) {
       return res.status(400).json({ error: `Slack rejected the token: ${err?.data?.error || err.message}` });
@@ -173,12 +219,140 @@ export function createSlackRouter(deps: RouterDeps): Router {
     } catch (err: any) {
       return res.status(500).json({ error: `Could not save the token: ${err?.message ?? err}` });
     }
+    try { deps.slackOAuth?.credentials.recordConnection('token', identity); } catch { /* status falls back to token */ }
+    const reloadError = await applyToken(token);
     res.json({
       saved: true,
       identity,
       tokenMasked: maskToken(token),
-      restartRequired: token !== bootToken,
+      ...(reloadError ? { reloadError } : {}),
     });
+  });
+
+  // ── Sign in with Slack (OAuth v2, user token; D6) ──
+
+  function clientView() {
+    const oauth = deps.slackOAuth!;
+    const view = oauth.credentials.publicView();
+    return {
+      ...view,
+      redirectUri: oauth.redirectUri(view.redirectMode),
+      redirectUris: { http_loopback: oauth.redirectUri('http_loopback'), https_paste: oauth.redirectUri('https_paste') },
+      userScopes: [...SLACK_USER_SCOPES],
+      pendingSignIn: oauth.states.size() > 0,
+    };
+  }
+
+  router.get('/slack/oauth/client', (req: Request, res: Response) => {
+    if (!acceptsLocalSecretRequest(req, res)) return;
+    if (!deps.slackOAuth) return res.status(503).json({ error: 'Sign in with Slack is not available' });
+    res.json(clientView());
+  });
+
+  const SIGN_IN_NEXT = 'Use Sign in with Slack on Connections → Slack.';
+  router.put('/slack/oauth/client', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Saving the Slack app client', SIGN_IN_NEXT)) return;
+    const oauth = deps.slackOAuth;
+    if (!oauth) return res.status(503).json({ error: 'Sign in with Slack is not available' });
+    const body = req.body ?? {};
+    try {
+      if (body.redirectMode !== undefined) {
+        if (!isSlackRedirectMode(body.redirectMode)) {
+          return res.status(400).json({ error: 'redirectMode must be http_loopback or https_paste', field: 'redirectMode' });
+        }
+        oauth.credentials.setRedirectMode(body.redirectMode);
+      }
+      if (body.clientId !== undefined || body.clientSecret !== undefined) {
+        oauth.credentials.saveClient(validateSlackClient(body));
+      }
+    } catch (err: any) {
+      if (err instanceof SlackCredentialInputError) return res.status(400).json({ error: err.message, field: err.field });
+      return res.status(500).json({ error: 'Could not save the Slack app client.' });
+    }
+    res.json(clientView());
+  });
+
+  router.post('/slack/oauth/start', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Starting Sign in with Slack', SIGN_IN_NEXT)) return;
+    const oauth = deps.slackOAuth;
+    if (!oauth) return res.status(503).json({ error: 'Sign in with Slack is not available' });
+    const stored = oauth.credentials.read();
+    if (!stored.client) {
+      return res.status(409).json({ error: 'Save your Slack app’s Client ID and Client Secret first.', code: 'slack_client_missing' });
+    }
+    const redirectUri = oauth.redirectUri(stored.redirectMode);
+    const state = oauth.states.issue(redirectUri);
+    res.json({ authorizeUrl: buildSlackAuthorizeUrl({ clientId: stored.client.clientId, redirectUri, state }), redirectMode: stored.redirectMode });
+  });
+
+  /** Exchange → save → reload. Returns identity or throws SlackOAuthError. */
+  async function completeSignIn(code: string, redirectUri: string) {
+    const oauth = deps.slackOAuth!;
+    const client = oauth.credentials.read().client;
+    if (!client) throw new SlackOAuthError('slack_client_missing', 'Save your Slack app’s Client ID and Client Secret first.');
+    const result = await exchangeSlackCode({ ...client, code, redirectUri, slackApiUrl: oauth.slackApiUrl });
+    upsertLocalEnvValue('SLACK_USER_TOKEN', result.token);
+    oauth.credentials.recordConnection('oauth', result.identity);
+    const reloadError = await applyToken(result.token);
+    return { identity: result.identity, tokenMasked: maskToken(result.token), reloadError };
+  }
+
+  router.get(SLACK_OAUTH_CALLBACK_PATH, async (req: Request, res: Response) => {
+    const oauth = deps.slackOAuth;
+    res.setHeader('Cache-Control', 'no-store');
+    if (!oauth) return res.status(503).send(resultPage('Sign in with Slack is not available', 'Open BotBoy and try again.', false));
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const pending = state ? oauth.states.take(state) : null;
+    if (!pending) {
+      console.warn('[Slack] sign-in callback with an unknown or expired state');
+      return res.status(400).send(resultPage('Sign-in expired', 'Start again from Connections → Slack.', false));
+    }
+    if (req.query.error === 'access_denied') {
+      console.log('[Slack] sign-in cancelled by the owner');
+      return res.send(resultPage('Sign-in cancelled', 'Nothing was saved.', false));
+    }
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    if (!code) return res.status(400).send(resultPage('Sign-in failed', 'Slack sent no code. Start again.', false));
+    try {
+      const done = await completeSignIn(code, pending.redirectUri);
+      return res.send(resultPage(
+        `Connected as ${done.identity.user} in ${done.identity.team}`,
+        done.reloadError ?? 'Slack capture uses this sign-in now.',
+        true,
+      ));
+    } catch (err: any) {
+      if (err instanceof SlackOAuthError) {
+        console.warn(`[Slack] sign-in failed: ${err.code}`);
+        return res.status(400).send(resultPage('Sign-in failed', err.message, false));
+      }
+      console.error('[Slack] sign-in could not be saved');
+      return res.status(500).send(resultPage('Sign-in could not be saved', 'BotBoy could not write its settings file.', false));
+    }
+  });
+
+  router.post('/slack/oauth/finish', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Finishing Sign in with Slack', SIGN_IN_NEXT)) return;
+    const oauth = deps.slackOAuth;
+    if (!oauth) return res.status(503).json({ error: 'Sign in with Slack is not available' });
+    let parsed: { code: string; state: string };
+    try {
+      parsed = parseFinishPaste(req.body?.pasted, oauth.states);
+    } catch (err: any) {
+      console.warn(`[Slack] finish sign-in refused: ${err?.code ?? 'invalid_paste'}`);
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
+    const pending = oauth.states.take(parsed.state);
+    if (!pending) {
+      console.warn('[Slack] finish sign-in refused: state_mismatch');
+      return res.status(400).json({ error: 'This sign-in does not match the one BotBoy started. Start again.', code: 'state_mismatch' });
+    }
+    try {
+      const done = await completeSignIn(parsed.code, pending.redirectUri);
+      res.json({ saved: true, identity: done.identity, tokenMasked: done.tokenMasked, ...(done.reloadError ? { reloadError: done.reloadError } : {}) });
+    } catch (err: any) {
+      if (err instanceof SlackOAuthError) return res.status(400).json({ error: err.message, code: err.code });
+      res.status(500).json({ error: 'Could not save the sign-in.' });
+    }
   });
 
   router.get('/slack/config', (_req: Request, res: Response) => {

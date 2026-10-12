@@ -4,6 +4,7 @@
  * `connected`, `canCompose`, or `needsReconnect` between calls.
  */
 import type { GmailClient } from './gmail-api.js';
+import type { StoredDriveSettings } from './gmail-credentials.js';
 import type { GmailAccountConnection, GmailAccountSummary, GmailConnection } from './gmail-connection.js';
 
 export interface FakeGmailAccount {
@@ -13,6 +14,9 @@ export interface FakeGmailAccount {
   connected?: boolean;
   canCompose?: boolean;
   needsReconnect?: boolean;
+  canReadDrive?: boolean;
+  canPublishDrive?: boolean;
+  drive?: StoredDriveSettings | null;
   client: GmailClient;
 }
 
@@ -28,6 +32,9 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     grantedScopes: [],
     canCompose: account.canCompose !== false,
     needsComposeGrant: account.canCompose === false,
+    canReadDrive: account.canReadDrive === true,
+    canPublishDrive: account.canPublishDrive === true,
+    drive: account.drive ?? null,
   });
   const view = (account: FakeGmailAccount): GmailAccountConnection => ({
     id: account.id,
@@ -36,6 +43,9 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     isConnected: () => account.connected !== false,
     accountEmail: () => (account.connected !== false ? account.email : null),
     canCompose: () => account.canCompose !== false,
+    canReadDrive: () => account.canReadDrive === true,
+    canPublishDrive: () => account.canPublishDrive === true,
+    drive: () => account.drive ?? null,
     accessToken: async () => 'token',
     invalidateAccessToken: () => {},
     client: () => account.client,
@@ -68,6 +78,11 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     },
     slot: (accountId: string) => view(accounts.find(account => account.id === accountId) ?? primary()),
     setLabel: () => { throw new Error('not in the fake'); },
+    setDriveSettings: (accountId: string, drive: StoredDriveSettings) => {
+      const found = accounts.find(account => account.id === accountId);
+      if (found) found.drive = drive;
+      return {} as any;
+    },
     saveClient: () => { throw new Error('not in the fake'); },
     removeClient: async () => { throw new Error('not in the fake'); },
     retireStagedTeamClient: () => false,

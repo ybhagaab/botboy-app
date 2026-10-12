@@ -193,7 +193,8 @@ guided setup.
 - **Gmail** — for a Google account (personal Gmail or Google Workspace)
   instead of Amazon mail. You create a Google OAuth client once in your own
   Google Cloud project and choose its JSON file; see **Gmail** below.
-- **Slack** — choose and configure the channels you want BotBoy to capture.
+- **Slack** — choose **Sign in with Slack** (your own Slack app; see **Slack**
+  below) or paste a user token, then pick the channels you want BotBoy to capture.
 - **SharePoint** (Amazon Employee only) — install and authenticate from its connection card when you
   want document synchronization.
 - **Other MCP servers** — ask BotBoy in chat; see **Add an MCP server** below.
@@ -305,6 +306,50 @@ kept, including mail BotBoy sends for you. The client and your sign-in token sta
 `~/.personal-productivity-tracker/gmail.json`, which only your user account can
 read; the BotBoy owner never sees your token or your mail. **Disconnect**
 revokes the access at Google; mail that BotBoy already captured stays.
+
+#### Google Drive
+
+Drive rides on a connected Gmail account. On **Connections → Gmail**, choose
+**Connect Google Drive** on the account card and allow both Drive boxes on
+Google's screen. First enable the **Google Drive API** in the same Google Cloud
+project as your Gmail client (Cloud Console → APIs & Services → Enable APIs);
+without it Drive capture warns "Enable the Google Drive API in your Cloud
+project". BotBoy asks for `drive.readonly` (read the files you choose) and
+`drive.file` (create files and update only files it created); never full Drive
+access. A Cloud project left in **Testing** ends the sign-in after 7 days (as
+for Gmail); publish the app for personal use.
+
+Then pick what BotBoy captures: **Files I own**, **Shared with me**, and
+folders (paste a folder link). The first run reads the last 30 days; after that
+BotBoy follows Drive's change feed every minute. Docs, Sheets, Slides, PDFs,
+and Office files become text; credential-named files and text with a secret
+are withheld; files of 25 MB or more are listed, not downloaded.
+
+A BotBoy document can be published to Drive from its **Publish** panel: choose
+the Drive destination (My Drive › BotBoy by default), approve, then **Sync**.
+Word files are checked byte for byte ("exact file verified"); a Google Doc is
+checked by its text ("text verified"). If an upload's outcome is unknown,
+BotBoy never sends it again on its own: choose **Check Drive**.
+
+#### Slack
+
+Without Amazon's Slack connection, BotBoy reads Slack with your own Slack
+app (BotBoy ships none):
+
+1. At api.slack.com/apps, choose **Create New App → From scratch** in your
+   workspace.
+2. Under **OAuth & Permissions**, add the **Redirect URL** and the **User Token
+   Scopes** shown on BotBoy's Slack page (copy buttons). Add no bot scopes.
+   Leave **token rotation** off.
+3. Under **Basic Information**, copy the **Client ID** and **Client Secret**
+   into BotBoy's Slack page and choose **Save app**.
+4. Choose **Sign in with Slack** and allow. Capture starts with no restart.
+
+If Slack refuses the `http://127.0.0.1` address, tick **My Slack app uses the
+https address**, register the https address shown instead, sign in, and paste
+the address of the error page your browser shows into **Finish sign-in**. You
+can still paste a user token (`xoxp-…`) instead of signing in. When Slack ends
+the sign-in, the capture warning says to sign in with Slack again.
 
 #### Add an MCP server
 

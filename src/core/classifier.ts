@@ -33,6 +33,7 @@ export function createClassifier(
       : item.source === 'slack' ? '[Slack message]'
       : item.source === 'clipboard' ? '[Clipboard capture]'
       : item.source === 'app' ? '[App activity]'
+      : item.source === 'gdrive' ? '[SOURCE: Google Drive]'
       : `[${item.source}]`;
     const parts = [sourceLabel, item.title, item.summary, item.url, item.parsedText, item.visualContext]
       .filter(Boolean);

@@ -1,4 +1,6 @@
 import { requireAmazonEmployee } from './workplace.js';
+import { GDRIVE_BOTBOY_FOLDER, GDRIVE_DEFAULT_STORED_AS } from '../../product-manager/publication-destination-gdrive.js';
+import { resolveDriveDestinationCandidates } from '../../product-manager/publication-destination-default.js';
 import { Router, type Request, type Response } from 'express';
 import {
   DocumentExportError,
@@ -430,34 +432,54 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     if (!deps.productDocumentService?.getArtifact(artifactId)) {
       return res.status(404).json({ error: 'Product-document artifact not found.' });
     }
+    const amazon = deps.workplace?.amazonEmployee() !== false;
+    const destinations = deps.db && deps.gmailConnection
+      ? resolveDriveDestinationCandidates(deps.db, deps.gmailConnection.accounts(), String(deps.productDocumentService?.getArtifact(artifactId)?.projectId ?? ''))
+      : [];
+    const driveExtra = destinations.length ? { destinations } : {};
+    // Toggle OFF: Drive candidates only (SharePoint stays Amazon-only).
+    if (!amazon) {
+      return res.json({
+        publicationDestinationDefault: unavailablePublicationDestinationDefault('SharePoint publishing needs Settings → Workplace → Amazon Employee.'),
+        destinations,
+      });
+    }
     const local = publicationDestinationDefault();
-    if (local.status !== 'unresolved') return res.json({ publicationDestinationDefault: local });
+    if (local.status !== 'unresolved') return res.json({ publicationDestinationDefault: local, ...driveExtra });
     if (!deps.mcpManager) {
-      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault('SharePoint connection is unavailable.') });
+      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault('SharePoint connection is unavailable.'), ...driveExtra });
     }
     try {
       const profile = await deps.mcpManager.getProfile('sharepoint');
       if (!profile?.enabled || profile.state !== 'running' || profile.compatibilityState !== 'compatible') {
-        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(`SharePoint connection is ${profile?.state || 'unavailable'}.`) });
+        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(`SharePoint connection is ${profile?.state || 'unavailable'}.`), ...driveExtra });
       }
       const result = await deps.mcpManager.callTool('sharepoint', 'sharepoint_list_files', {
         libraryName: 'Documents', top: 50, includeWebUrls: true,
       }, { source: 'api', timeoutMs: 120_000 });
       if (result.isError) {
-        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(result.text.slice(0, 300) || 'SharePoint listing failed.') });
+        return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(result.text.slice(0, 300) || 'SharePoint listing failed.'), ...driveExtra });
       }
       const payload = JSON.parse(sharePointToolPayload(result.text)) as { files?: Array<Record<string, unknown>> };
       const resolved = resolvePublicationDestinationCandidates(
         (payload.files ?? []).map(file => file.Path), 'sharepoint_list_files',
       );
-      return res.json({ publicationDestinationDefault: resolved });
+      return res.json({ publicationDestinationDefault: resolved, ...driveExtra });
     } catch (error) {
-      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(error instanceof Error ? error.message : String(error)) });
+      return res.json({ publicationDestinationDefault: unavailablePublicationDestinationDefault(error instanceof Error ? error.message : String(error)), ...driveExtra });
     }
   });
 
   router.post('/product-documents/:artifactId/publications', (req: Request, res: Response) => {
-    if (!requireAmazonEmployee(deps, res)) return;
+    // A Drive destination works for everyone with Drive connected; SharePoint stays Amazon-only.
+    const driveDestination = isRecord(req.body) && isRecord(req.body.destination) && req.body.destination.provider === 'gdrive'
+      ? req.body.destination
+      : null;
+    if (driveDestination) {
+      const accountId = typeof driveDestination.accountId === 'string' ? driveDestination.accountId : '';
+      const canPublish = Boolean(accountId && deps.gmailConnection?.slot(accountId).isConnected() && deps.gmailConnection.slot(accountId).canPublishDrive());
+      if (!canPublish) return res.status(409).json({ error: 'Connect Google Drive on that Google account (Connections → Gmail) to publish there.', code: 'drive_not_connected' });
+    } else if (!requireAmazonEmployee(deps, res)) return;
     const service = deps.productDocumentService;
     const publications = deps.productDocumentPublications;
     if (!service || !publications) {
@@ -516,10 +538,25 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
         const targetFolder = typeof req.body.targetFolder === 'string' ? req.body.targetFolder.trim() : '';
         const serverRelativeUrl = typeof req.body.serverRelativeUrl === 'string' ? req.body.serverRelativeUrl.trim() : '';
         const siteUrl = typeof req.body.siteUrl === 'string' ? req.body.siteUrl.trim() : '';
-        if (Boolean(targetFolder) === Boolean(serverRelativeUrl)) {
+        if (driveDestination) {
+          if (targetFolder || serverRelativeUrl || siteUrl) return res.status(400).json({ error: 'A Drive destination takes accountId and folderId, not SharePoint fields.' });
+          staged = publications.stage({
+            artifactId,
+            projectId: artifact.projectId,
+            action,
+            format: 'docx',
+            title: artifact.title,
+            destination: {
+              provider: 'gdrive',
+              accountId: String(driveDestination.accountId),
+              folderId: typeof driveDestination.folderId === 'string' && driveDestination.folderId.trim() ? driveDestination.folderId.trim() : GDRIVE_BOTBOY_FOLDER,
+              storedAs: driveDestination.storedAs === 'google_doc' ? 'google_doc' : GDRIVE_DEFAULT_STORED_AS,
+            },
+            purpose: 'Prepared directly from the generated-document reader.',
+          });
+        } else if (Boolean(targetFolder) === Boolean(serverRelativeUrl)) {
           return res.status(400).json({ error: 'Provide exactly one of targetFolder or serverRelativeUrl.' });
-        }
-        staged = publications.stage({
+        } else staged = publications.stage({
           artifactId,
           projectId: artifact.projectId,
           action,

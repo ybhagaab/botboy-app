@@ -204,6 +204,16 @@ export function withProductDocumentChatTools(
             ...(typeof args.purpose === 'string' && args.purpose.trim()
               ? { purpose: args.purpose.trim().slice(0, 200) }
               : {}),
+            ...(args.destination && typeof args.destination === 'object' && (args.destination as any).provider === 'gdrive'
+              ? {
+                destination: {
+                  provider: 'gdrive' as const,
+                  accountId: typeof (args.destination as any).account === 'string' ? (args.destination as any).account.trim() : 'default',
+                  folderId: typeof (args.destination as any).folderId === 'string' && (args.destination as any).folderId.trim() ? (args.destination as any).folderId.trim() : 'botboy',
+                  storedAs: (args.destination as any).storedAs === 'google_doc' ? 'google_doc' as const : 'docx' as const,
+                },
+              }
+              : {}),
           });
           return result(call, {
             ok: true,

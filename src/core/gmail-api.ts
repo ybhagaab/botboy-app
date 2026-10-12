@@ -147,12 +147,16 @@ export function buildAuthorizationUrl(endpoints: GoogleEndpoints, input: {
   loginHint?: string;
   /** Adding another account: Google shows its account chooser first. */
   selectAccount?: boolean;
+  /** Scopes to request (default: Gmail's); Drive opt-in adds its two. */
+  scopes?: readonly string[];
+  /** Incremental authorization: keep the scopes already granted. */
+  includeGrantedScopes?: boolean;
 }): string {
   const url = new URL(endpoints.authUrl);
   url.searchParams.set('client_id', input.clientId);
   url.searchParams.set('redirect_uri', input.redirectUri);
   url.searchParams.set('response_type', 'code');
-  url.searchParams.set('scope', GMAIL_REQUESTED_SCOPES.join(' '));
+  url.searchParams.set('scope', (input.scopes ?? GMAIL_REQUESTED_SCOPES).join(' '));
   // Offline access + forced consent: Google returns a refresh token on every
   // grant, so reconnecting always replaces a dead one.
   url.searchParams.set('access_type', 'offline');
@@ -161,6 +165,7 @@ export function buildAuthorizationUrl(endpoints: GoogleEndpoints, input: {
   url.searchParams.set('code_challenge', input.codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
   if (input.loginHint) url.searchParams.set('login_hint', input.loginHint);
+  if (input.includeGrantedScopes) url.searchParams.set('include_granted_scopes', 'true');
   return url.toString();
 }
 

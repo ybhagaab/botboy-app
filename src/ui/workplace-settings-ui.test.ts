@@ -106,8 +106,10 @@ describe('UI gated by Amazon Employee', () => {
   });
 
   it('hides document publication controls and analytics sharing while off, keeping publication history', () => {
-    expect(dashboard).toContain('const publishButton = editing || !publicationView || !amazonEmployeeOn()');
-    expect(dashboard).toContain('const publicationPanel = !editing && publicationView && amazonEmployeeOn()');
+    // Off: publication stays hidden unless Google Drive is connected (A7); SharePoint is never offered off.
+    expect(dashboard).toContain('const publishButton = editing || !publicationView || !(amazonEmployeeOn() || drivePublishAvailable())');
+    expect(dashboard).toContain('const publicationPanel = !editing && publicationView && (amazonEmployeeOn() || drivePublishAvailable())');
+    expect(dashboard).toContain("${amazonEmployeeOn() ? `<option value=\"sharepoint\"");
     expect(dashboard).toContain("${amazonEmployeeOn() ? `${publishedAction}${shareAction}` : ''}");
     expect(dashboard).toContain('${publicationFact ?');
   });

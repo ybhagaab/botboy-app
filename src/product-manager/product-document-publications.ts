@@ -84,6 +84,30 @@ export interface ProductDocumentPublication {
   verifiedAt: string | null;
   capturedAt: string | null;
   updatedAt: string;
+  /** Where the publication lands: SharePoint (default, every legacy row) or Google Drive. */
+  destinationProvider: PublicationProviderId;
+  /** gdrive: the Google account id (duplicated for queries); sharepoint: null. */
+  destinationContainer: string | null;
+  /** gdrive: 'docx' (exact bytes) or 'google_doc' (converted); sharepoint: 'native'. */
+  destinationStoredAs: PublicationStoredAs;
+  /** gdrive: persisted before the first network call and reused on every retry; sharepoint: null. */
+  idempotencyKey: string | null;
+  exportTokenCount: number | null;
+  exportTokensSha256: string | null;
+  exportMd5: string | null;
+  /** How the remote copy was proven: exact bytes (sha256 / md5) or normalized text tokens. */
+  verificationKind: string | null;
+}
+
+export type PublicationProviderId = 'sharepoint' | 'gdrive';
+export type PublicationStoredAs = 'native' | 'google_doc' | 'docx';
+
+/** A Google Drive destination chosen at stage time (A7). `folderId: 'botboy'` = My Drive › BotBoy, created on first sync. */
+export interface GdriveStageDestination {
+  provider: 'gdrive';
+  accountId: string;
+  folderId: string;
+  storedAs: 'docx' | 'google_doc';
 }
 
 export interface StageProductDocumentPublicationInput {
@@ -97,6 +121,8 @@ export interface StageProductDocumentPublicationInput {
   targetFolder?: string;
   siteUrl?: string;
   purpose?: string;
+  /** Google Drive instead of SharePoint (A7). */
+  destination?: GdriveStageDestination;
 }
 
 export interface RecordLegacyPublicationRepairInput {
@@ -131,6 +157,17 @@ export interface ProductDocumentPublicationService {
   recordVerified(publicationId: string, receipt: { remoteSha256: string; remoteItemId?: string; webUrl?: string }, at?: string): ProductDocumentPublication;
   recordCaptureQueued(publicationId: string, at?: string): ProductDocumentPublication;
   recordCapture(publicationId: string, workItemId: string, docKey: string, at?: string): ProductDocumentPublication;
+  /** gdrive: the row's idempotency key, generated and persisted once (before any network call). */
+  ensureIdempotencyKey(publicationId: string): string;
+  /** gdrive: hashes pinned beside the export receipt (md5 for the checksum fallback, tokens for Google Doc text checks). */
+  recordDestinationPins(publicationId: string, pins: { md5: string; tokenCount: number; tokensSha256: string }): ProductDocumentPublication;
+  recordVerificationKind(publicationId: string, kind: string): void;
+  /**
+   * Check Drive after an unknown effect: a found earlier write is adopted
+   * (upload_failed → uploaded_unverified); none found clears the unknown mark
+   * so Sync may run again. Drive rows only.
+   */
+  recordDriveCheck(publicationId: string, found: { remoteItemId: string; webUrl?: string } | null, at?: string): ProductDocumentPublication;
   recordFailure(publicationId: string, status: Extract<ProductDocumentPublicationStatus,
     'target_conflict' | 'upload_failed' | 'verification_failed' | 'capture_failed' | 'identity_mismatch'>, error: string, at?: string): ProductDocumentPublication;
 }
@@ -178,6 +215,14 @@ interface PublicationRow {
   verified_at: string | null;
   captured_at: string | null;
   updated_at: string;
+  destination_provider?: PublicationProviderId | null;
+  destination_container?: string | null;
+  destination_stored_as?: PublicationStoredAs | null;
+  idempotency_key?: string | null;
+  export_token_count?: number | null;
+  export_tokens_sha256?: string | null;
+  export_md5?: string | null;
+  verification_kind?: string | null;
 }
 
 const ACTIVE_STATUSES = new Set<ProductDocumentPublicationStatus>([
@@ -245,6 +290,14 @@ function rowToPublication(row: PublicationRow): ProductDocumentPublication {
     verifiedAt: row.verified_at,
     capturedAt: row.captured_at,
     updatedAt: row.updated_at,
+    destinationProvider: row.destination_provider ?? 'sharepoint',
+    destinationContainer: row.destination_container ?? null,
+    destinationStoredAs: row.destination_stored_as ?? 'native',
+    idempotencyKey: row.idempotency_key ?? null,
+    exportTokenCount: row.export_token_count ?? null,
+    exportTokensSha256: row.export_tokens_sha256 ?? null,
+    exportMd5: row.export_md5 ?? null,
+    verificationKind: row.verification_kind ?? null,
   };
 }
 
@@ -394,6 +447,15 @@ export function createProductDocumentPublicationService(
     ['remote_observed_at', 'remote_observed_at TEXT'],
     ['superseded_at', 'superseded_at TEXT'],
     ['supersession_reason', 'supersession_reason TEXT'],
+    // A7 destination seam (additive; every existing row reads as SharePoint).
+    ['destination_provider', "destination_provider TEXT NOT NULL DEFAULT 'sharepoint' CHECK(destination_provider IN ('sharepoint','gdrive'))"],
+    ['destination_container', 'destination_container TEXT'],
+    ['destination_stored_as', "destination_stored_as TEXT NOT NULL DEFAULT 'native' CHECK(destination_stored_as IN ('native','google_doc','docx'))"],
+    ['idempotency_key', 'idempotency_key TEXT'],
+    ['export_token_count', 'export_token_count INTEGER'],
+    ['export_tokens_sha256', 'export_tokens_sha256 TEXT'],
+    ['export_md5', 'export_md5 TEXT'],
+    ['verification_kind', 'verification_kind TEXT'],
   ];
   for (const [name, ddl] of additivePublicationColumns) {
     if (!publicationColumns.has(name)) {
@@ -580,7 +642,27 @@ export function createProductDocumentPublicationService(
       let basePublication: ProductDocumentPublication | null = null;
       let siteUrl = input.siteUrl?.trim() || '';
       let serverRelativeUrl = input.serverRelativeUrl?.trim() || '';
-      if (input.action === 'update_existing') {
+      let drive: { accountId: string; storedAs: 'docx' | 'google_doc' } | null = null;
+      let driveDocKey = '';
+      if (input.destination && input.action === 'create') {
+        const destination = input.destination;
+        if (destination.provider !== 'gdrive') throw new Error('Unknown publication destination provider.');
+        if (!/^(?:default|ga_[a-f0-9]{10})$/.test(destination.accountId)) throw new Error('Choose a connected Google account for the Drive destination.');
+        if (destination.folderId !== 'botboy' && !/^[A-Za-z0-9_-]{10,128}$/.test(destination.folderId)) throw new Error('The Drive folder id is invalid.');
+        if (destination.storedAs !== 'docx' && destination.storedAs !== 'google_doc') throw new Error('storedAs must be docx or google_doc.');
+        if (input.format !== 'docx') throw new Error('Google Drive publications upload the DOCX export; use format docx.');
+        if (input.serverRelativeUrl?.trim() || input.targetFolder?.trim() || input.siteUrl?.trim()) {
+          throw new Error('A Drive destination takes accountId and folderId, not SharePoint fields.');
+        }
+        if (input.basePublicationId?.trim()) throw new Error('basePublicationId is only valid for update_existing.');
+        const filename = `${safeFileTitle(input.title.trim() || artifact.title)}.docx`;
+        drive = { accountId: destination.accountId, storedAs: destination.storedAs };
+        serverRelativeUrl = `${destination.folderId}/${filename}`;
+        driveDocKey = `gdrive://${destination.accountId}/folder/${destination.folderId}/${encodeURIComponent(filename)}`;
+      }
+      if (drive) {
+        // Drive create: addressing decided above; no SharePoint mapping applies.
+      } else if (input.action === 'update_existing') {
         if (input.serverRelativeUrl?.trim() || input.targetFolder?.trim() || input.siteUrl?.trim()) {
           throw new Error('update_existing inherits the exact prior SharePoint target; do not provide destination fields.');
         }
@@ -606,8 +688,12 @@ export function createProductDocumentPublicationService(
         if (basePublication.artifactId === artifact.artifactId) {
           throw new Error('This exact artifact version is already published at the selected location.');
         }
+        const baseIsDrive = basePublication.destinationProvider === 'gdrive';
         const latestAtTarget = chainPublications.find(candidate =>
-          candidate.docKey === basePublication!.docKey && candidate.status === 'complete');
+          (baseIsDrive
+            ? candidate.destinationProvider === 'gdrive' && candidate.remoteItemId === basePublication!.remoteItemId
+            : candidate.docKey === basePublication!.docKey)
+          && candidate.status === 'complete');
         if (latestAtTarget?.publicationId !== basePublication.publicationId) {
           throw new Error(`A newer completed publication already owns this target; use basePublicationId '${latestAtTarget?.publicationId}'.`);
         }
@@ -616,6 +702,19 @@ export function createProductDocumentPublicationService(
         }
         siteUrl = basePublication.siteUrl ?? '';
         serverRelativeUrl = basePublication.serverRelativeUrl;
+        if (baseIsDrive) {
+          if (basePublication.destinationStoredAs === 'google_doc') {
+            // Until a live check proves media updates convert in place (spike S3), a Google Doc is updated as a new copy.
+            throw new Error('A Google Doc publication is updated as a new copy: publish a new copy instead.');
+          }
+          if (!basePublication.remoteItemId || !basePublication.destinationContainer) {
+            throw new Error('The base Drive publication has no file id to update.');
+          }
+          const filename = basePublication.serverRelativeUrl.split('/').pop() || 'document.docx';
+          drive = { accountId: basePublication.destinationContainer, storedAs: 'docx' };
+          serverRelativeUrl = `file/${basePublication.remoteItemId}/${filename}`;
+          driveDocKey = `gdrive://${basePublication.destinationContainer}/file/${basePublication.remoteItemId}`;
+        }
       } else {
         if (input.basePublicationId?.trim()) throw new Error('basePublicationId is only valid for update_existing.');
         const title = input.title.trim() || artifact.title;
@@ -628,10 +727,12 @@ export function createProductDocumentPublicationService(
       if (!serverRelativeUrl.toLowerCase().endsWith(`.${input.format}`)) {
         throw new Error(`The target path must end in .${input.format}.`);
       }
-      const mapped = mapSharePointWriteTarget(serverRelativeUrl, siteUrl || undefined);
-      if (typeof mapped === 'string') throw new Error(mapped.replace(/^Error:\s*/i, ''));
-      const docKey = docKeyForPath(db, serverRelativeUrl, siteUrl || undefined);
-      if (basePublication && docKey !== basePublication.docKey) {
+      if (!drive) {
+        const mapped = mapSharePointWriteTarget(serverRelativeUrl, siteUrl || undefined);
+        if (typeof mapped === 'string') throw new Error(mapped.replace(/^Error:\s*/i, ''));
+      }
+      const docKey = drive ? driveDocKey : docKeyForPath(db, serverRelativeUrl, siteUrl || undefined);
+      if (basePublication && !drive && docKey !== basePublication.docKey) {
         throw new Error('The inherited SharePoint target no longer resolves to the base publication identity.');
       }
       const intentKey = productDocumentPublicationIntentKey({
@@ -709,9 +810,10 @@ export function createProductDocumentPublicationService(
             lastError: null,
           }, createdAt);
         }
+        const place = drive ? 'Google Drive' : 'SharePoint';
         const actionLabel = input.action === 'update_existing'
-          ? `update existing SharePoint version from publication ${basePublication!.publicationId}`
-          : 'create new SharePoint copy';
+          ? `update existing ${place} version from publication ${basePublication!.publicationId}`
+          : `create new ${place} copy`;
         const pendingEdit = createPendingEdit(db, {
           docKey,
           serverRelativeUrl,
@@ -738,6 +840,10 @@ export function createProductDocumentPublicationService(
           createdAt,
           createdAt,
         );
+        if (drive) {
+          db.prepare("UPDATE product_document_publications SET destination_provider='gdrive', destination_container=?, destination_stored_as=? WHERE publication_id=?")
+            .run(drive.accountId, drive.storedAs, publicationId);
+        }
         return {
           publication: get(publicationId)!,
           pendingEdit,
@@ -954,6 +1060,42 @@ export function createProductDocumentPublicationService(
     },
     recordFailure(publicationId, status, error, at = now().toISOString()) {
       return transition(publicationId, status, { lastError: error.slice(0, 1_000) }, at);
+    },
+    ensureIdempotencyKey(publicationId) {
+      return db.transaction(() => {
+        const current = get(publicationId);
+        if (!current) throw new Error(`Unknown product-document publication '${publicationId}'.`);
+        if (current.destinationProvider !== 'gdrive') throw new Error('Only Drive publications carry an idempotency key.');
+        if (current.idempotencyKey) return current.idempotencyKey;
+        const key = randomUUID();
+        db.prepare('UPDATE product_document_publications SET idempotency_key=?, updated_at=? WHERE publication_id=? AND idempotency_key IS NULL')
+          .run(key, now().toISOString(), publicationId);
+        return key;
+      })();
+    },
+    recordDestinationPins(publicationId, pins) {
+      if (!/^[a-f0-9]{32}$/i.test(pins.md5) || !/^[a-f0-9]{64}$/i.test(pins.tokensSha256) || !Number.isInteger(pins.tokenCount) || pins.tokenCount < 0) {
+        throw new Error('Destination export pins are invalid.');
+      }
+      db.prepare('UPDATE product_document_publications SET export_md5=?, export_token_count=?, export_tokens_sha256=? WHERE publication_id=?')
+        .run(pins.md5.toLowerCase(), pins.tokenCount, pins.tokensSha256.toLowerCase(), publicationId);
+      return get(publicationId)!;
+    },
+    recordDriveCheck(publicationId, found, at = now().toISOString()) {
+      const current = get(publicationId);
+      if (!current || current.destinationProvider !== 'gdrive' || current.status !== 'upload_failed') {
+        throw new Error('Check Drive applies only to a Drive publication whose upload failed.');
+      }
+      const result = found
+        ? db.prepare("UPDATE product_document_publications SET status='uploaded_unverified', uploaded_at=?, remote_item_id=?, web_url=?, last_error=NULL, updated_at=? WHERE publication_id=? AND status='upload_failed'")
+          .run(at, found.remoteItemId.slice(0, 300), found.webUrl?.slice(0, 1_000) ?? null, at, publicationId)
+        : db.prepare("UPDATE product_document_publications SET last_error=?, updated_at=? WHERE publication_id=? AND status='upload_failed'")
+          .run('Check Drive found no earlier upload; Sync may run again.', at, publicationId);
+      if (result.changes !== 1) throw new Error(`Publication ${publicationId} changed during Check Drive.`);
+      return get(publicationId)!;
+    },
+    recordVerificationKind(publicationId, kind) {
+      db.prepare('UPDATE product_document_publications SET verification_kind=? WHERE publication_id=?').run(kind.slice(0, 40), publicationId);
     },
   };
 }

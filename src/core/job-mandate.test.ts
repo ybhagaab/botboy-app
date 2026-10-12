@@ -76,14 +76,14 @@ describe('job mandate gate', () => {
   // base executor, so the mandate gate must wrap them all.
   it('is the outermost wrapper of the chat executor (index.ts)', () => {
     const index = readFileSync(path.join(process.cwd(), 'src/index.ts'), 'utf8');
-    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withWhatsAppChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
   });
 
   it('offers a continuation only the job-scope tools', () => {
     const tools = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'open_terminal'].map(name => ({ type: 'function', function: { name } }));
     expect(filterToolsForContinuation(tools).map(tool => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query']);
     for (const name of JOB_SCOPE_TOOLS) {
-      expect(name).not.toMatch(/^(gmail_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom)/);
+      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom)/);
     }
     expect(isJobScopeTool('mcp_etl_submit_run')).toBe(false);
   });

@@ -59,12 +59,42 @@ export interface StoredGmailConnection {
   connectedAt: string;
 }
 
+/** Google Drive capture settings of one account (the grant's Drive scopes live in `connection.scope`). */
+export interface StoredDriveSettings {
+  enabled: boolean;
+  sources: { ownedByMe: boolean; sharedWithMe: boolean; folderIds: string[] };
+}
+
+export const MAX_DRIVE_FOLDERS = 50;
+const DRIVE_FOLDER_ID_PATTERN = /^[A-Za-z0-9_-]{10,128}$/;
+
+/** Strict: booleans only when true, folder ids by pattern, deduped, first 50. Unknown shapes read as absent. */
+export function parseDriveSettings(entry: any): StoredDriveSettings | undefined {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+  const sources = entry.sources && typeof entry.sources === 'object' ? entry.sources : {};
+  const folderIds: string[] = [];
+  for (const id of Array.isArray(sources.folderIds) ? sources.folderIds : []) {
+    if (typeof id === 'string' && DRIVE_FOLDER_ID_PATTERN.test(id) && !folderIds.includes(id)) folderIds.push(id);
+    if (folderIds.length >= MAX_DRIVE_FOLDERS) break;
+  }
+  return {
+    enabled: entry.enabled === true,
+    sources: { ownedByMe: sources.ownedByMe === true, sharedWithMe: sources.sharedWithMe === true, folderIds },
+  };
+}
+
+export function isDriveFolderId(value: unknown): value is string {
+  return typeof value === 'string' && DRIVE_FOLDER_ID_PATTERN.test(value);
+}
+
 export interface StoredGmailAccount {
   /** `default` or `ga_<10 hex>`: names its settings keys and capture URLs. */
   id: string;
   /** The owner's name for the account ("Work", "Personal"); '' when unset. */
   label: string;
   connection: StoredGmailConnection;
+  /** Google Drive capture choices (absent until the owner connects Drive). */
+  drive?: StoredDriveSettings;
 }
 
 export interface StoredGmailCredentials {
@@ -184,7 +214,8 @@ function readStored(file: string, builtIn: BuiltInGmailClient | null): StoredGma
     if (!connection || !isGmailAccountId(entry?.id) || seenIds.has(entry.id) || seenEmails.has(connection.accountEmail)) continue;
     seenIds.add(entry.id);
     seenEmails.add(connection.accountEmail);
-    out.accounts.push({ id: entry.id, label: cleanAccountLabel(entry.label), connection });
+    const drive = parseDriveSettings(entry.drive);
+    out.accounts.push({ id: entry.id, label: cleanAccountLabel(entry.label), connection, ...(drive ? { drive } : {}) });
   }
   return out;
 }
@@ -232,6 +263,8 @@ export interface GmailCredentialStore {
   /** Removes one account. */
   clearConnection(accountId: string): StoredGmailCredentials;
   setLabel(accountId: string, label: string): StoredGmailCredentials;
+  /** Saves one account's Drive capture choices (parsed strictly). */
+  setDrive(accountId: string, drive: StoredDriveSettings): StoredGmailCredentials;
   clearAll(): void;
   readonly file: string;
   readonly privateRoot: string;
@@ -284,6 +317,7 @@ export function createGmailCredentialStore(deps: { privateRoot?: string; builtIn
         id: accountId,
         label: existing?.label ?? '',
         connection: { ...connection, accountEmail: email, connectedAt: now.toISOString() },
+        ...(existing?.drive ? { drive: existing.drive } : {}),
       };
       // One account per address: another id holding this address gives way.
       const others = previous.accounts.filter(account => account.id !== accountId && account.connection.accountEmail !== email);
@@ -301,6 +335,14 @@ export function createGmailCredentialStore(deps: { privateRoot?: string; builtIn
       return persist({
         ...previous,
         accounts: previous.accounts.map(account => (account.id === accountId ? { ...account, label: cleanAccountLabel(label) } : account)),
+      });
+    },
+    setDrive(accountId, drive) {
+      const previous = current();
+      const parsed = parseDriveSettings(drive);
+      return persist({
+        ...previous,
+        accounts: previous.accounts.map(account => (account.id === accountId && parsed ? { ...account, drive: parsed } : account)),
       });
     },
     clearAll() {

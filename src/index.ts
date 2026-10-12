@@ -69,7 +69,7 @@ import { createCaptureHealth } from './core/capture-health.js';
 import { createBrowserMonitor } from './monitors/browser-monitor.js';
 import { createAppMonitor } from './monitors/app-monitor.js';
 import { createClipboardMonitor } from './monitors/clipboard-monitor.js';
-import { createSlackMonitor } from './monitors/slack-monitor.js';
+import { createSlackMonitor, type ReloadableSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createWorkplace } from './core/workplace.js';
 import { withWorkplaceChatTools } from './core/workplace-chat-tools.js';
@@ -78,6 +78,11 @@ import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
 import { createGmailSyncs, createGmailBrowserCaptureGate, isGmailWebEmailItem, readGmailSendAs } from './monitors/gmail-sync.js';
 import { createGmailConnection } from './core/gmail-connection.js';
+import { createGdriveSyncs, type GdriveSyncs } from './monitors/gdrive-sync.js';
+import { withGdriveChatTools } from './core/gdrive-chat-tools.js';
+import { createPublicationDestinations } from './product-manager/publication-destination.js';
+import { createSharePointDestination } from './product-manager/publication-destination-sharepoint.js';
+import { createGoogleDriveDestination } from './product-manager/publication-destination-gdrive.js';
 import { createGmailCompose } from './core/gmail-compose.js';
 import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
 import { withGmailChatTools } from './core/gmail-chat-tools.js';
@@ -85,6 +90,10 @@ import { cdpWhatsAppPage, createWhatsAppSender, withWhatsAppChatTools } from './
 import { createWhatsAppChatBridge } from './core/whatsapp-chat.js';
 import { createWhatsAppConnection } from './core/whatsapp-connection.js';
 import { GMAIL_OAUTH_CALLBACK_PATH } from './api/routers/gmail-sync.js';
+import { SLACK_OAUTH_CALLBACK_PATH } from './api/routers/slack.js';
+import type { SlackOAuthService } from './api/routers/deps.js';
+import { createSlackCredentialStore } from './core/slack-credentials.js';
+import { createSlackOAuthStateStore, slackRedirectUri } from './core/slack-oauth.js';
 import { createSharePointSync } from './monitors/sharepoint-sync.js';
 import { createRouter } from './api/routes.js';
 import { createProfileRegistry } from './product-manager/profile-registry.js';
@@ -699,8 +708,10 @@ async function main() {
   const whatsAppConnection = createWhatsAppConnection({ db, page: cdpWhatsAppPage() });
   // withWorkplaceChatTools sits directly inside the mandate: Amazon-only
   // tools are refused while Amazon Employee is off, and export_footer lives there.
+  // The Drive sync is built later (with the Gmail sync); chat reaches it through this reference.
+  let gdriveSyncRef: GdriveSyncs | null = null;
   const toolExecutor = withJobMandate(
-    withWorkplaceChatTools(withWhatsAppChatTools(withGmailChatTools(
+    withWorkplaceChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
@@ -708,7 +719,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
@@ -866,11 +877,19 @@ async function main() {
   // reports every run; a lasting failure streak becomes an owner warning
   // with its cause and next action. Slack's Midway 401s also reach the
   // sentinel through it.
-  const slackTokenConfigured = () => Boolean((inferenceEnv.SLACK_USER_TOKEN ?? '').trim());
+  // Slack's live token is the monitor's (Sign in with Slack and token saves
+  // swap it without a restart); before the monitor exists, the boot env copy.
+  let liveSlackMonitor: ReloadableSlackMonitor | null = null;
+  const slackTokenConfigured = () => (liveSlackMonitor
+    ? liveSlackMonitor.hasUserToken()
+    : Boolean((inferenceEnv.SLACK_USER_TOKEN ?? '').trim()));
+  // Sign in with Slack (D6): the owner's own Slack app client in slack.json.
+  const slackCredentials = createSlackCredentialStore();
   const captureHealth = createCaptureHealth({
     db,
     amazonEmployee: () => workplace.amazonEmployee(),
     slackTokenConfigured,
+    slackConnectedVia: () => (slackTokenConfigured() ? slackCredentials.read().connectedVia ?? 'token' : null),
   });
   const midwaySentinel = createMidwaySentinel(
     { db, mcpManager, chatTerminal, agent, captureHealth },
@@ -961,7 +980,7 @@ async function main() {
 
   // ── Pipeline: event bus → dedup → classify → store ──
   eventBus.on(async (item: RawWorkItem) => {
-    const awaitedPublicationCapture = item.source === 'sharepoint'
+    const awaitedPublicationCapture = (item.source === 'sharepoint' || item.source === 'gdrive')
       && item.type === 'document_capture'
       && Boolean(String(item.metadata?.publicationId ?? '').trim());
     // Local-folder captures are awaited by the monitor: a store failure must
@@ -1353,6 +1372,13 @@ async function main() {
   }
 
   const slackMonitor = createSlackMonitor({ db, mcpManager, captureHealth, mcpAllowed: () => workplace.amazonEmployee() });
+  liveSlackMonitor = slackMonitor;
+  const slackOAuth: SlackOAuthService = {
+    credentials: slackCredentials,
+    states: createSlackOAuthStateStore(),
+    redirectUri: mode => slackRedirectUri(PORT, mode, SLACK_OAUTH_CALLBACK_PATH),
+    onTokenSaved: token => { inferenceEnv.SLACK_USER_TOKEN = token; },
+  };
   slackMonitor.onWorkItem(item => eventBus.emit(item));
   // The first poll walks all watched conversations through rate-limited Slack
   // APIs (~48s measured) — by far the largest boot cost, and pure background
@@ -1420,6 +1446,16 @@ async function main() {
       return outlook.includes('@') ? [outlook] : [];
     },
   });
+  // ── Google Drive capture (NON_AMAZON_PATHS_PLAN.md A6) ──
+  // One sync per Gmail account whose grant includes drive.readonly and whose
+  // owner turned Drive on; read-only, ordinary fire-and-forget capture.
+  const gdriveSync = createGdriveSyncs({
+    db, connection: gmailConnection, emit: item => eventBus.emit(item), captureHealth, parser: documentParser,
+    // A published file's completion capture is awaited, like SharePoint's.
+    emitAndWait: item => eventBus.emitAndWait(item),
+  });
+  gdriveSyncRef = gdriveSync;
+  startInBackground('Google Drive capture', async () => gdriveSync.start(), '✅ Google Drive capture online');
   // The non-secret account directory (address + label) for owner identity and prompts.
   const writeGmailDirectory = () => {
     try {
@@ -1483,6 +1519,7 @@ async function main() {
       stop('app-monitor', () => appMonitor.stop());
       stop('clipboard-monitor', () => clipboardMonitor.stop());
       stop('slack-monitor', () => slackMonitor.stop());
+      stop('gdrive-sync', () => gdriveSync.stop());
       stop('context-sync', () => contextManager?.stopAutoSync());
       stop('midway-sentinel', () => midwaySentinel.stop());
       stop('chat-terminal', () => chatTerminal.shutdown());
@@ -1602,6 +1639,9 @@ async function main() {
     backgroundProcessor,
     slackMonitor,
     slackWebClient,
+    getSlackWebClient: () => slackMonitor.getUserWebClient(),
+    gdriveSync,
+    slackOAuth,
     filesystemMonitor,
     db,
     llmClient,
@@ -1636,6 +1676,15 @@ async function main() {
     dashboardPublisher,
     productDocumentService,
     productDocumentPublications,
+    // A7 destination seam: SharePoint only with Amazon Employee ON; Drive only on an account with drive.file.
+    publicationDestinations: createPublicationDestinations({
+      sharepoint: createSharePointDestination({ amazonEmployee: () => workplace.amazonEmployee(), connectionReady: () => Boolean(mcpManager) }),
+      gdrive: createGoogleDriveDestination({
+        clientFor: accountId => gdriveSync.clientFor(accountId),
+        canPublish: accountId => gmailConnection.slot(accountId).isConnected() && gmailConnection.slot(accountId).canPublishDrive(),
+        accounts: () => gmailConnection.accounts().map(account => account.id),
+      }),
+    }),
     writingConfigStore,
     chatTerminal,
     etlOnboarding,

@@ -20,7 +20,7 @@ import type Database from 'better-sqlite3';
 import { getSetting, setSetting } from './storage.js';
 import { redactSensitiveText } from './prompt-redaction.js';
 
-export type CaptureSourceId = 'slack' | 'sharepoint' | 'grasp' | 'gmail';
+export type CaptureSourceId = 'slack' | 'sharepoint' | 'grasp' | 'gmail' | 'gdrive';
 
 export type CaptureFailureKind =
   | 'midway_auth'
@@ -81,7 +81,7 @@ export interface CaptureHealth {
 }
 
 const SETTING_KEY = 'capture_health.v1';
-const SOURCES: readonly CaptureSourceId[] = ['slack', 'sharepoint', 'grasp', 'gmail'];
+const SOURCES: readonly CaptureSourceId[] = ['slack', 'sharepoint', 'grasp', 'gmail', 'gdrive'];
 /** Sources that exist only on BotBoy's Amazon internal paths; no issues while Amazon Employee is off. */
 export const AMAZON_ONLY_CAPTURE_SOURCES: readonly CaptureSourceId[] = ['grasp', 'sharepoint'];
 
@@ -90,6 +90,7 @@ const SOURCE_NAMES: Record<CaptureSourceId, string> = {
   sharepoint: 'SharePoint documents',
   grasp: 'Outlook mail & calendar',
   gmail: 'Gmail',
+  gdrive: 'Google Drive',
 };
 
 const SOURCE_HREFS: Record<CaptureSourceId, string> = {
@@ -97,6 +98,7 @@ const SOURCE_HREFS: Record<CaptureSourceId, string> = {
   sharepoint: '#/connections/document-sync',
   grasp: '#/connections/mail-calendar-sync',
   gmail: '#/connections/gmail-sync',
+  gdrive: '#/connections/gmail-sync',
 };
 
 /**
@@ -108,6 +110,7 @@ const WARN_AFTER: Record<CaptureSourceId, { failures: number; ms: number }> = {
   slack: { failures: 2, ms: 5 * 60_000 },
   grasp: { failures: 2, ms: 10 * 60_000 },
   gmail: { failures: 2, ms: 10 * 60_000 },
+  gdrive: { failures: 2, ms: 10 * 60_000 },
   sharepoint: { failures: 2, ms: 25 * 60_000 },
 };
 
@@ -124,7 +127,28 @@ const CAUSES: Record<CaptureFailureKind, string> = {
   unknown: 'Capture keeps failing',
 };
 
-function nextActionFor(source: CaptureSourceId, kind: CaptureFailureKind, amazon = true): string {
+/** How the Slack user token was saved: Sign in with Slack, a pasted token, or none. */
+export type SlackConnectedVia = 'oauth' | 'token' | null;
+
+export const SLACK_SIGN_IN_AGAIN = 'Open Connections → Slack and sign in with Slack again.';
+export const GDRIVE_RECONNECT = 'Reconnect Google (Connections → Gmail). Google ended BotBoy’s access; captured files are kept.';
+export const GDRIVE_CONNECT = 'Open Connections → Gmail and choose Connect Google Drive on the account.';
+export const GDRIVE_ENABLE_API = 'Enable the Google Drive API in your Cloud project, then wait a minute.';
+
+function nextActionFor(
+  source: CaptureSourceId,
+  kind: CaptureFailureKind,
+  amazon = true,
+  slackConnectedVia: SlackConnectedVia = null,
+  reason = '',
+): string {
+  // Sign in with Slack saved the token: the fix is to sign in again, never mwinit.
+  if (source === 'slack' && kind === 'service_auth' && slackConnectedVia === 'oauth') return SLACK_SIGN_IN_AGAIN;
+  if (source === 'gdrive') {
+    if (/accessNotConfigured|SERVICE_DISABLED|has not been used|is disabled/i.test(reason)) return GDRIVE_ENABLE_API;
+    if (/insufficient|scope|drive_not_granted/i.test(reason)) return GDRIVE_CONNECT;
+    if (kind === 'service_auth') return GDRIVE_RECONNECT;
+  }
   if (!amazon) {
     // Neutral copy: no mwinit, Midway, or Amazon connection while Amazon Employee is off.
     if (source === 'slack' && kind === 'service_auth') {
@@ -177,7 +201,7 @@ export function classifyCaptureFailure(message: string): CaptureFailureKind {
     return 'midway_auth';
   }
   if (/ratelimited|rate[ -]?limit|\b429\b|too many requests|throttl/i.test(text)) return 'rate_limited';
-  if (/invalid_auth|not_authed|token_expired|token_revoked|account_inactive|invalid_grant|invalid_client|unauthorized_client|invalid_token|AADSTS\d+|silent authorize|\b401\b|unauthori[sz]ed|unauthenticated|authentication failed|session has expired|no valid tokens|\b403\b|forbidden/i.test(text)) {
+  if (/invalid_auth|not_authed|missing_scope|token_expired|token_revoked|account_inactive|invalid_grant|invalid_client|unauthorized_client|invalid_token|AADSTS\d+|silent authorize|\b401\b|unauthori[sz]ed|unauthenticated|authentication failed|session has expired|no valid tokens|\b403\b|forbidden/i.test(text)) {
     return 'service_auth';
   }
   if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|socket hang up|fetch failed|network error|network is unreachable|status(?: code)? 5\d\d\b|\b50[234]\b|timed? ?out|timeout/i.test(text)) {
@@ -249,6 +273,8 @@ export function createCaptureHealth(deps: {
   amazonEmployee?: () => boolean;
   /** Whether a Slack user token is configured; while OFF without one, Slack shows no issue. */
   slackTokenConfigured?: () => boolean;
+  /** How the Slack token was saved (slack.json › connectedVia); picks the sign-in copy. */
+  slackConnectedVia?: () => SlackConnectedVia;
 }): CaptureHealth {
   const { db } = deps;
   const now = deps.now ?? Date.now;
@@ -301,7 +327,7 @@ export function createCaptureHealth(deps: {
         name: SOURCE_NAMES[source],
         kind,
         cause: CAUSES[kind],
-        nextAction: nextActionFor(source, kind, amazon),
+        nextAction: nextActionFor(source, kind, amazon, source === 'slack' ? deps.slackConnectedVia?.() ?? null : null, entry.reason ?? ''),
         since: entry.failingSince,
         lastSuccessAt: entry.lastSuccessAt,
         failures: entry.consecutiveFailures,

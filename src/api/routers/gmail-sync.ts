@@ -200,6 +200,21 @@ export function createGmailSyncRouter(deps: RouterDeps): Router {
     }
   });
 
+  // Connect Google Drive: an incremental grant on top of this account's Gmail scopes.
+  router.post('/gmail-sync/accounts/:accountId/drive/connect', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Connecting Google Drive', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.gmailConnection) return unavailable(res);
+    res.set('Cache-Control', 'no-store');
+    const accountId = accountIdOf(req.params.accountId);
+    if (!accountId) return res.status(400).json({ error: 'Name a connected account.', code: 'invalid_request' });
+    try {
+      return res.json(deps.gmailConnection.beginConnect({ accountId, purpose: 'drive' }));
+    } catch (error) {
+      if (error instanceof GmailAuthError) return res.status(409).json({ error: error.message, code: error.code });
+      return res.status(500).json({ error: 'BotBoy could not start the Google sign-in.', code: 'internal_error' });
+    }
+  });
+
   router.put('/gmail-sync/config', (req: Request, res: Response) => {
     if (!requireLocalOwnerUiRequest(req, res, 'Changing Gmail sync settings', OWNER_UI_NEXT_ACTION)) return;
     if (!deps.gmailSync) return unavailable(res);

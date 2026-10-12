@@ -22,6 +22,7 @@ import { createSlackRouter } from './routers/slack.js';
 import { createLocalFoldersRouter } from './routers/local-folders.js';
 import { createGraspSyncRouter } from './routers/grasp-sync.js';
 import { createGmailSyncRouter } from './routers/gmail-sync.js';
+import { createGdriveRouter } from './routers/gdrive.js';
 import { createWhatsAppRouter } from './routers/whatsapp.js';
 import { createSharePointSyncRouter } from './routers/sharepoint-sync.js';
 import { createMcpRouter } from './routers/mcp.js';
@@ -74,6 +75,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createLocalFoldersRouter(deps));
   router.use(createGraspSyncRouter(deps));
   router.use(createGmailSyncRouter(deps));
+  router.use(createGdriveRouter(deps));
   router.use(createWhatsAppRouter(deps));
   router.use(createSharePointSyncRouter(deps));
   router.use(createMcpRouter(deps));

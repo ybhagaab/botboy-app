@@ -18,7 +18,10 @@
 
 import { Router, type Request, type Response } from 'express';
 import type { RouterDeps } from './deps.js';
-import { requireLocalOwnerRequest } from './local-owner.js';
+import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
+import { PublicationTargetConflict, type PublicationTarget } from '../../product-manager/publication-destination.js';
+import { DRIVE_EFFECT_UNKNOWN, sourceTokensFromMarkdown, tokensSha256 } from '../../product-manager/publication-destination-gdrive.js';
+import type { ProductDocumentPublication } from '../../product-manager/product-document-publications.js';
 import {
   createPendingEdit,
   listPendingEdits,
@@ -75,6 +78,20 @@ function persistPublicationExport(publicationId: string, sha256: string, filenam
   const temp = `${file}.part-${randomUUID()}`;
   fs.writeFileSync(temp, data);
   fs.renameSync(temp, file);
+}
+
+function isDriveDocKey(docKey: string): boolean {
+  return docKey.startsWith('gdrive://');
+}
+
+/** The seam's target for a Drive ledger row. */
+function driveTargetOf(publication: ProductDocumentPublication): PublicationTarget {
+  return {
+    provider: 'gdrive',
+    container: publication.destinationContainer,
+    address: publication.serverRelativeUrl,
+    storedAs: publication.destinationStoredAs,
+  };
 }
 
 export function createDocumentsRouter(deps: RouterDeps): Router {
@@ -367,8 +384,21 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     const pendingEditId = String(req.params.id ?? '');
     try {
       const currentPublication = deps.productDocumentPublications?.findByPendingEdit(pendingEditId) ?? null;
+      // A Drive publication is decided only in the rendered owner UI.
+      if (currentPublication?.destinationProvider === 'gdrive'
+        && !requireLocalOwnerUiRequest(req, res, 'Deciding a Google Drive publication', 'Approve or reject it on the publication card.')) return;
       let snapshot: PublicationRemoteSnapshot | undefined;
-      if (decision === 'approve' && currentPublication?.action === 'update_existing') {
+      if (decision === 'approve' && currentPublication?.action === 'update_existing' && currentPublication.destinationProvider === 'gdrive') {
+        const plug = deps.publicationDestinations?.get('gdrive');
+        if (!plug) return res.status(503).json({ error: 'Google Drive publishing is unavailable.' });
+        const basePublication = currentPublication.basePublicationId
+          ? deps.productDocumentPublications?.get(currentPublication.basePublicationId) ?? null
+          : null;
+        const observed = await plug.observe(driveTargetOf(currentPublication), { expectedItemId: basePublication?.remoteItemId ?? null });
+        if (observed === 'absent') throw new Error('The Drive file to update could not be found.');
+        const { verification: _verification, ...remote } = observed;
+        snapshot = remote;
+      } else if (decision === 'approve' && currentPublication?.action === 'update_existing') {
         if (!deps.mcpManager) return res.status(503).json({ error: 'managed MCP runtime unavailable' });
         const basePublication = currentPublication.basePublicationId
           ? deps.productDocumentPublications?.get(currentPublication.basePublicationId) ?? null
@@ -692,7 +722,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     | { status: 'nothing-approved' }
     | { status: 'failed'; error: string }
   > {
-    if (!deps.db || !deps.mcpManager) return { status: 'failed', error: 'runtime unavailable' };
+    if (!deps.db || (!deps.mcpManager && !isDriveDocKey(docKey))) return { status: 'failed', error: 'runtime unavailable' };
     const approved = listPendingEdits(deps.db, docKey).filter(edit => edit.status === 'approved');
     if (approved.length === 0) return { status: 'nothing-approved' };
 
@@ -700,7 +730,14 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     // corpus-absence), so the first approved createDocument routes the
     // whole sync to the publish path.
     const creation = approved.find(edit => edit.operation === 'createDocument');
-    if (creation) return runDocumentCreate(creation);
+    if (creation) {
+      // Destination seam (A7): a Drive row runs the Drive plug; every other row is SharePoint.
+      const publication = deps.productDocumentPublications?.findByPendingEdit(creation.id) ?? null;
+      if (publication?.destinationProvider === 'gdrive') return runDriveCreate(creation, publication);
+      if (!deps.mcpManager) return { status: 'failed', error: 'runtime unavailable' };
+      return runDocumentCreate(creation);
+    }
+    if (!deps.mcpManager) return { status: 'failed', error: 'runtime unavailable' };
     const target = { serverRelativeUrl: approved[0].serverRelativeUrl, siteUrl: approved[0].siteUrl };
 
     const bodyEdits = approved.filter(edit => edit.operation !== 'createDocument');
@@ -1117,6 +1154,192 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     }
   }
 
+  // ── Google Drive publications (A7; publication-destination-gdrive.ts) ──
+
+  type CreateOutcome = Awaited<ReturnType<typeof runDocumentCreate>>;
+
+  function driveConflict(creationId: string, publicationId: string, reason: string): CreateOutcome {
+    // Conflicts are found before the export, so the row is still approved; a retry row keeps its failure state.
+    try { deps.productDocumentPublications?.recordFailure(publicationId, 'target_conflict', reason); } catch { /* status already terminal for this attempt */ }
+    markEditConflicted(deps.db!, creationId, reason);
+    return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creationId, applied: false, reason }] };
+  }
+
+  /** The pinned DOCX export (cached bytes, else exported once) plus the Drive pins beside it. Local only. */
+  async function driveExport(publication: ProductDocumentPublication, artifact: { title: string; content: string }): Promise<{ data: Buffer; filename: string }> {
+    const publications = deps.productDocumentPublications!;
+    const current = publications.get(publication.publicationId) ?? publication;
+    const cached = loadPublicationExport(current);
+    const exported = cached && current.exportFilename
+      ? { data: cached, filename: current.exportFilename }
+      : await (deps.publicationExporter ?? exportDocument)({ title: artifact.title, content: artifact.content, format: 'docx', footerText: deps.exportFooter?.effective() ?? '' });
+    const sha256 = sha256Buffer(exported.data);
+    if (!cached) persistPublicationExport(publication.publicationId, sha256, exported.filename, exported.data);
+    if (current.status === 'approved' || current.status === 'upload_failed' || current.status === 'exported') {
+      publications.recordExport(publication.publicationId, { sha256, bytes: exported.data.length, filename: exported.filename }, undefined, { noRemoteEffectProven: true });
+    }
+    const tokens = sourceTokensFromMarkdown(artifact.content);
+    publications.recordDestinationPins(publication.publicationId, {
+      md5: createHash('md5').update(exported.data).digest('hex'),
+      tokenCount: tokens.length,
+      tokensSha256: tokensSha256(tokens),
+    });
+    return exported;
+  }
+
+  /** After a write landed (or was adopted): verify, then capture the file as the publication's completion. */
+  async function finishDriveWrite(creationId: string, publicationId: string, target: PublicationTarget, remoteItemId: string): Promise<CreateOutcome> {
+    const publications = deps.productDocumentPublications!;
+    const plug = deps.publicationDestinations!.get('gdrive')!;
+    const current = publications.get(publicationId)!;
+    const check = await plug.verify(target, remoteItemId, {
+      bytesSha256: current.exportSha256 ?? '',
+      md5: current.exportMd5,
+      tokensSha256: current.exportTokensSha256,
+      tokenCount: current.exportTokenCount,
+    });
+    if (!check.ok) {
+      const reason = `upload returned success but ${check.reason ?? 'the Drive copy did not verify'}${check.detail ? ` ${JSON.stringify(check.detail)}` : ''}`;
+      publications.recordFailure(publicationId, 'verification_failed', reason);
+      markEditConflicted(deps.db!, creationId, reason);
+      return { status: 'done', uploaded: true, verifiedOnReadBack: false, results: [{ id: creationId, applied: false, reason }] };
+    }
+    publications.recordVerificationKind(publicationId, check.kind);
+    // The ledger's completion rule compares the verified hash with the export receipt; the
+    // proof itself (exact bytes or normalized text) is recorded in verification_kind.
+    publications.recordVerified(publicationId, {
+      remoteSha256: current.exportSha256!,
+      remoteItemId,
+      ...(check.webUrl ? { webUrl: check.webUrl } : {}),
+    });
+    markEditSynced(deps.db!, creationId);
+    try {
+      if (!deps.gdriveSync) throw new Error('Google Drive capture is unavailable.');
+      publications.recordCaptureQueued(publicationId);
+      const verified = publications.get(publicationId)!;
+      await deps.gdriveSync.captureFile(target.container!, remoteItemId, {
+        publicationId,
+        sourceArtifactId: verified.artifactId,
+        publicationProjectId: verified.projectId,
+        exportSha256: verified.exportSha256 ?? '',
+        docKey: verified.docKey,
+      });
+    } catch (error) {
+      const status = publications.get(publicationId)?.status;
+      if (status === 'capture_queued' || status === 'verified') {
+        publications.recordFailure(publicationId, 'capture_failed', error instanceof Error ? error.message : String(error));
+      }
+    }
+    console.log(`[Documents] Drive publication ${publicationId} ${check.kind === 'normalized_text' ? 'text verified' : 'exact file verified'}`);
+    return { status: 'done', uploaded: true, verifiedOnReadBack: true, results: [{ id: creationId, applied: true }] };
+  }
+
+  async function runDriveCreate(
+    creation: import('../../core/pending-edits.js').PendingEdit,
+    publication: ProductDocumentPublication,
+  ): Promise<CreateOutcome> {
+    const db = deps.db!;
+    const publications = deps.productDocumentPublications!;
+    const plug = deps.publicationDestinations?.get('gdrive');
+    if (!plug) return { status: 'failed', error: 'Google Drive publishing is unavailable.' };
+    const availability = plug.available();
+    if (!availability.ok) return { status: 'failed', error: availability.reason };
+    if (publication.status === 'upload_failed' && publication.lastError?.startsWith(DRIVE_EFFECT_UNKNOWN)) {
+      return { status: 'failed', error: 'The last Drive upload has an unknown effect. Use Check Drive; BotBoy never resends it blindly.' };
+    }
+    const owningProject = db.prepare('SELECT title, status FROM projects WHERE id = ?').get(publication.projectId) as { title: string; status: string } | undefined;
+    if (!owningProject || (owningProject.status !== 'active' && owningProject.status !== 'paused')) {
+      return { status: 'failed', error: owningProject ? `Owning project '${owningProject.title}' is ${owningProject.status}; Drive publication was not started.` : 'The owning project no longer exists; Drive publication was not started.' };
+    }
+    const artifact = deps.productDocumentService?.getArtifact(publication.artifactId) ?? null;
+    if (!artifact) {
+      publications.recordFailure(publication.publicationId, 'identity_mismatch', 'The staged source artifact no longer exists.');
+      markEditConflicted(db, creation.id, 'the staged source artifact no longer exists');
+      return { status: 'done', uploaded: false, verifiedOnReadBack: false, results: [{ id: creation.id, applied: false, reason: 'source artifact missing' }] };
+    }
+    const target = driveTargetOf(publication);
+    // The key exists before any network call and is reused by every retry.
+    const idempotencyKey = publications.ensureIdempotencyKey(publication.publicationId);
+    try {
+      let remoteItemId: string | null = null;
+      if (publication.action === 'update_existing') {
+        const observed = await plug.observe(target, { expectedItemId: publication.expectedRemoteItemId });
+        if (observed === 'absent'
+          || observed.sha256 !== publication.expectedRemoteSha256
+          || observed.itemId !== publication.expectedRemoteItemId
+          || Boolean(publication.expectedRemoteVersion && observed.version !== publication.expectedRemoteVersion)
+          || Boolean(publication.expectedRemoteModified && observed.modified !== publication.expectedRemoteModified)) {
+          return driveConflict(creation.id, publication.publicationId, 'The Drive file changed after owner approval; update stopped without overwriting that newer version.');
+        }
+      } else {
+        // An earlier attempt that landed is adopted, never created again.
+        const prior = await plug.findPriorWrite(target, idempotencyKey);
+        if (prior) remoteItemId = prior.remoteItemId;
+        else {
+          const observed = await plug.observe(target, { idempotencyKey });
+          if (observed !== 'absent') remoteItemId = observed.itemId;
+        }
+      }
+      // The canonical export is local and pinned once; it happens after the target checks.
+      let exported: { data: Buffer; filename: string };
+      try {
+        exported = await driveExport(publication, artifact);
+      } catch (error) {
+        const message = `Canonical export failed: ${error instanceof Error ? error.message : String(error)}`;
+        try { publications.recordFailure(publication.publicationId, 'upload_failed', message); } catch { /* keep the first failure */ }
+        return { status: 'failed', error: message };
+      }
+      let webUrl: string | undefined;
+      if (!remoteItemId) {
+        const outcome = await plug.write({ target, bytes: exported.data, filename: exported.filename, idempotencyKey, publicationId: publication.publicationId });
+        if (outcome.kind === 'not_written') {
+          publications.recordFailure(publication.publicationId, 'upload_failed', `Not written: ${outcome.reason}`);
+          return { status: 'failed', error: `Google Drive did not take the upload (safe to Sync again): ${outcome.reason}` };
+        }
+        if (outcome.kind === 'unknown') {
+          publications.recordFailure(publication.publicationId, 'upload_failed', `${DRIVE_EFFECT_UNKNOWN}: ${outcome.reason}`);
+          return { status: 'failed', error: `${DRIVE_EFFECT_UNKNOWN}. Use Check Drive before anything else; BotBoy never resends it blindly.` };
+        }
+        remoteItemId = outcome.remoteItemId;
+        webUrl = outcome.webUrl;
+      }
+      publications.recordUploaded(publication.publicationId, { remoteItemId, ...(webUrl ? { webUrl } : {}) });
+      return await finishDriveWrite(creation.id, publication.publicationId, target, remoteItemId);
+    } catch (error) {
+      if (error instanceof PublicationTargetConflict) return driveConflict(creation.id, publication.publicationId, error.message);
+      const message = error instanceof Error ? error.message : String(error);
+      const status = publications.get(publication.publicationId)?.status;
+      try {
+        if (status === 'exported' || status === 'approved') publications.recordFailure(publication.publicationId, 'upload_failed', message);
+        else if (status === 'uploaded_unverified') publications.recordFailure(publication.publicationId, 'verification_failed', message);
+      } catch { /* keep the first failure */ }
+      return { status: 'failed', error: message };
+    }
+  }
+
+  // Check Drive: the only action after an unknown effect. Owner UI only.
+  router.post('/documents/publications/:publicationId/check-drive', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Check Drive', 'Use Check Drive on the publication card.')) return;
+    const publications = deps.productDocumentPublications;
+    const plug = deps.publicationDestinations?.get('gdrive');
+    if (!deps.db || !publications || !plug) return res.status(503).json({ error: 'Google Drive publishing is unavailable.' });
+    const publication = publications.get(String(req.params.publicationId ?? ''));
+    if (!publication || publication.destinationProvider !== 'gdrive') return res.status(404).json({ error: 'Drive publication not found.' });
+    if (publication.status !== 'upload_failed' || !publication.idempotencyKey) {
+      return res.status(409).json({ error: 'Check Drive applies to a Drive upload whose effect is unknown.' });
+    }
+    try {
+      const target = driveTargetOf(publication);
+      const prior = await plug.findPriorWrite(target, publication.idempotencyKey);
+      publications.recordDriveCheck(publication.publicationId, prior);
+      if (!prior) return res.json({ found: false, publication: publications.get(publication.publicationId) });
+      const outcome = await finishDriveWrite(publication.pendingEditId, publication.publicationId, target, prior.remoteItemId);
+      return res.json({ found: true, outcome, publication: publications.get(publication.publicationId) });
+    } catch (error) {
+      return res.status(502).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   /**
    * Owner-approved legacy publication repair. This is intentionally NOT a
    * model tool: it adopts a pre-ledger physical file only when the caller
@@ -1333,10 +1556,12 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
 
   router.post('/documents/sync', async (req: Request, res: Response) => {
     if (!deps.db) return res.status(503).json({ error: 'database unavailable' });
-    if (!deps.mcpManager) return res.status(503).json({ error: 'managed MCP runtime unavailable' });
     const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
     const docKey = String(body.docKey ?? '').trim();
+    if (!deps.mcpManager && !isDriveDocKey(docKey)) return res.status(503).json({ error: 'managed MCP runtime unavailable' });
     if (!docKey) return res.status(400).json({ error: 'docKey required' });
+    // The final Drive write is the owner's explicit Sync in the rendered UI.
+    if (isDriveDocKey(docKey) && !requireLocalOwnerUiRequest(req, res, 'Syncing to Google Drive', 'Use Sync on the publication card.')) return;
 
     const outcome = await runDocumentSync(docKey);
     if (outcome.status === 'nothing-approved') return res.status(400).json({ error: 'no approved edits to sync' });

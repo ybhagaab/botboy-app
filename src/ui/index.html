@@ -87,8 +87,34 @@
     <section class="integration-panel" id="slack-sources" aria-labelledby="slack-sources-heading">
       <div class="panel-toolbar"><button class="button" type="button" data-action="close-integration">Back</button><div id="slack-sources-status" class="banner success" role="status" hidden></div><div id="slack-sources-error" class="banner error" role="alert" hidden></div><span class="toolbar-spacer"></span><button id="slack-sources-save" class="button primary" type="button">Save channels</button></div>
       <header class="panel-heading"><p class="eyebrow">Connection settings</p><h1 id="slack-sources-heading">Slack capture</h1><p>Choose which channels and conversations BotBoy saves. New channels can be backfilled from their available history. The list is loaded live from Slack and shows only conversations you are a member of — to add a missing channel, join it in Slack and reopen this panel.</p></header>
+      <div id="slack-connect-cards" style="display:flex;flex-direction:column">
+      <section class="card pad" id="slack-signin-card" style="margin:0 0 16px">
+        <h3 class="card-title" style="margin-top:0">Sign in with Slack</h3>
+        <p class="page-subtitle" id="slack-signin-status">Checking your Slack app…</p>
+        <p class="page-subtitle">Use your own Slack app (BotBoy ships none). In the app's <strong>OAuth &amp; Permissions</strong> page, add this redirect URL and these <strong>User Token Scopes</strong>, and leave token rotation off.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+          <code id="slack-signin-redirect" style="flex:1;min-width:260px;overflow-wrap:anywhere"></code>
+          <button id="slack-signin-copy-redirect" class="button small" type="button">Copy URL</button>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+          <code id="slack-signin-scopes" style="flex:1;min-width:260px;overflow-wrap:anywhere"></code>
+          <button id="slack-signin-copy-scopes" class="button small" type="button">Copy scopes</button>
+        </div>
+        <label class="page-subtitle" style="display:flex;gap:8px;align-items:center;margin-top:8px"><input id="slack-signin-https" type="checkbox"> My Slack app uses the https address</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
+          <input id="slack-signin-client-id" type="text" placeholder="Client ID (1234567890.1234567890)" autocomplete="off" spellcheck="false" style="flex:1;min-width:200px" aria-label="Slack app Client ID">
+          <input id="slack-signin-client-secret" type="password" placeholder="Client Secret" autocomplete="off" spellcheck="false" style="flex:1;min-width:200px" aria-label="Slack app Client Secret">
+          <button id="slack-signin-save-client" class="button" type="button">Save app</button>
+        </div>
+        <div style="margin-top:10px"><button id="slack-signin-start" class="button primary" type="button">Sign in with Slack</button></div>
+        <div id="slack-signin-finish" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px" hidden>
+          <input id="slack-signin-paste" type="text" placeholder="Paste the https://127.0.0.1… address from the browser bar" autocomplete="off" spellcheck="false" style="flex:1;min-width:260px" aria-label="Address Slack sent you to">
+          <button id="slack-signin-finish-btn" class="button" type="button">Finish sign-in</button>
+        </div>
+        <p class="page-subtitle" id="slack-signin-result" style="margin-top:8px" role="status" hidden></p>
+      </section>
       <section class="card pad" id="slack-token-card" style="margin:0 0 16px">
-        <h3 class="card-title" style="margin-top:0">Connection token</h3>
+        <h3 class="card-title" style="margin-top:0">Or paste a user token</h3>
         <p class="page-subtitle" id="slack-token-status-line">Checking token status…</p>
         <p class="page-subtitle">Paste your <strong>User OAuth Token (xoxp-…)</strong> from the Slack app's OAuth &amp; Permissions page — the token above the Bot User token. It is verified with Slack, then saved to BotBoy's local settings file. It only ever grants access to conversations you can already see.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -97,6 +123,7 @@
         </div>
         <p class="page-subtitle" id="slack-token-result" style="margin-top:8px" hidden></p>
       </section>
+      </div>
       <div style="margin:0 0 12px"><input id="slack-sources-filter" type="search" placeholder="Filter by name… (e.g. amxp)" autocomplete="off" style="width:100%;max-width:420px" aria-label="Filter Slack conversations by name"></div>
       <div id="slack-sources-list" class="settings-list"></div>
     </section>

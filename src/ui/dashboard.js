@@ -2735,6 +2735,28 @@ function renderGmailImportCard(status, busy, accountId = '') {
     </section>`;
 }
 
+/** Google Drive on one Gmail account: Connect Google Drive, then the sources BotBoy captures. */
+function renderGdriveSection(account, busy) {
+  const conn = account.connection || {};
+  const disabled = busy ? 'disabled' : '';
+  const id = esc(account.id);
+  if (!conn.canReadDrive || !conn.canPublishDrive) {
+    return `<section class="card pad" style="margin-top:8px"><h3 class="card-title">Google Drive</h3>
+      <p class="page-subtitle">${conn.canReadDrive || conn.canPublishDrive ? 'Drive is only partly allowed. Connect again and tick both Drive boxes.' : 'Capture the Drive files you choose and publish BotBoy documents to Drive. Google asks you to allow Drive for this account.'}</p>
+      <button class="button" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled}>${icon('link', 14)} ${busy === `drive:${account.id}` ? 'Opening Google…' : 'Connect Google Drive'}</button></section>`;
+  }
+  const sources = conn.drive?.sources || { ownedByMe: false, sharedWithMe: false, folderIds: [] };
+  const enabled = conn.drive?.enabled !== false;
+  return `<section class="card pad" style="margin-top:8px" data-gdrive-account="${id}"><h3 class="card-title">Google Drive</h3>
+    <p class="page-subtitle">BotBoy reads only what you choose here. It never changes Drive files it did not publish.</p>
+    <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-enabled ${enabled ? 'checked' : ''}> Capture from Drive</label>
+    <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-owned ${sources.ownedByMe ? 'checked' : ''}> Files I own</label>
+    <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-shared ${sources.sharedWithMe ? 'checked' : ''}> Shared with me</label>
+    <label class="page-subtitle" for="gdrive-folders-${id}" style="display:block;margin-top:6px">Folders (one Drive folder link or id per line)</label>
+    <textarea id="gdrive-folders-${id}" data-gdrive-folders rows="3" style="width:100%">${esc((sources.folderIds || []).join('\n'))}</textarea>
+    <div style="margin-top:6px"><button class="button small" type="button" data-action="gdrive-save-sources" data-account="${id}" ${disabled}>${busy === `drive-sources:${account.id}` ? 'Saving…' : 'Save Drive sources'}</button></div></section>`;
+}
+
 /** One connected account: label, access, totals, last sync, import, Reconnect, Disconnect. */
 function renderGmailAccountCard(account, busy) {
   const disabled = busy ? 'disabled' : '';
@@ -2763,6 +2785,7 @@ function renderGmailAccountCard(account, busy) {
       </div>
       <p class="page-subtitle">${esc(runLine)}</p>
       ${renderGmailImportCard(account, busy, account.id)}
+      ${renderGdriveSection(account, busy)}
       <div class="head-actions" style="justify-content:flex-start; margin-top:8px">
         <button class="button" type="button" data-action="gmail-sync-run" data-account="${esc(account.id)}" ${disabled}>${icon('refresh', 14)} ${busy === `run:${account.id}` ? 'Syncing…' : 'Sync now'}</button>
         <button class="button" type="button" data-action="gmail-sync-connect" data-account="${esc(account.id)}" ${disabled}>${busy === 'connect' ? 'Opening Google…' : 'Reconnect'}</button>
@@ -4422,6 +4445,21 @@ const WORKPLACE_SIGNAL_LABELS = {
   amazon_owner_email: 'Amazon mail address',
   team_gateway_credentials: 'team gateway credentials found',
 };
+/**
+ * Some Gmail account has Google Drive connected for publishing (drive.file).
+ * The Gmail status loads once on demand; until it answers, Drive is not offered.
+ */
+let driveStatusRequested = false;
+function drivePublishAvailable() {
+  const accounts = state.gmailSync?.status?.accounts;
+  if (!accounts && !driveStatusRequested) {
+    driveStatusRequested = true;
+    request('/gmail-sync/status').then(payload => {
+      if (payload?.status) { state.gmailSync.status = payload.status; renderRoute({ preserveScroll: true }); }
+    }).catch(() => {});
+  }
+  return Array.isArray(accounts) && accounts.some(account => account.connection?.canPublishDrive === true);
+}
 function amazonEmployeeOn() {
   return state.workplace?.amazonEmployee !== false;
 }
@@ -6767,6 +6805,8 @@ async function resolvePublicationDestinationDefault(artifactId) {
     const destinationDefault = payload?.publicationDestinationDefault;
     if (!destinationDefault || documents.details.get(artifactId) !== artifact) return;
     artifact.publicationDestinationDefault = destinationDefault;
+    // Provider-tagged Google Drive candidates (only accounts with Drive connected).
+    artifact.publicationDestinations = Array.isArray(payload?.destinations) ? payload.destinations : [];
     const draft = documents.publicationDraft;
     if (!documents.publicationDraftTouched && draft?.mode === 'create'
       && !draft.targetFolder && !draft.serverRelativeUrl && !draft.siteUrl
@@ -6838,7 +6878,10 @@ async function stageDocumentPublication(artifactId, { basePublicationId = '' } =
     ...(state.documents.publicationDraft || defaultPublicationDraft(view, artifact?.publicationDestinationDefault)),
     ...(basePublicationId ? { mode: 'update_existing', basePublicationId } : {}),
   };
-  const requestShape = publicationStageRequest(view, draft);
+  const driveChoices = Array.isArray(artifact.publicationDestinations) ? artifact.publicationDestinations : [];
+  // Amazon Employee off: Drive is the only destination, so it is the default.
+  if (!draft.provider && !amazonEmployeeOn() && driveChoices.length) draft.provider = 'gdrive';
+  const requestShape = publicationStageRequest(view, draft, driveChoices);
   if (!requestShape.ok) {
     state.documents.publicationError = requestShape.error;
     state.documents.publicationOpen = true;
@@ -7059,7 +7102,7 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
   const toneClass = presentation.tone ? ` ${presentation.tone}` : '';
   const pathLine = value => `<code class="document-publication-path">${esc(value || 'Unknown target')}</code>`;
   const locationRows = locations.length
-    ? `<div class="document-publication-locations">${locations.map(location => `<div class="document-publication-location"><span class="document-publication-location-icon">${icon(location.containsSelectedArtifact ? 'check' : 'link', 14)}</span><span><strong>${location.containsSelectedArtifact ? 'Current version' : 'Older version'}</strong>${pathLine(location.serverRelativeUrl)}<small>${String(location.format || '').toUpperCase()}${location.remoteItemId ? ` · item ${esc(location.remoteItemId)}` : ''}</small></span>${location.webUrl ? `<a class="button small ghost" href="${attr(location.webUrl)}" target="_blank" rel="noopener">Open</a>` : ''}</div>`).join('')}</div>`
+    ? `<div class="document-publication-locations">${locations.map(location => `<div class="document-publication-location"><span class="document-publication-location-icon">${icon(location.containsSelectedArtifact ? 'check' : 'link', 14)}</span><span><strong>${location.containsSelectedArtifact ? 'Current version' : 'Older version'}</strong>${pathLine(location.serverRelativeUrl)}<small>${location.destination ? `Google Drive · ${esc(location.destination.receipt || 'verified')}` : String(location.format || '').toUpperCase()}${location.remoteItemId ? ` · item ${esc(location.remoteItemId)}` : ''}</small></span>${location.webUrl ? `<a class="button small ghost" href="${attr(location.webUrl)}" target="_blank" rel="noopener">Open</a>` : ''}</div>`).join('')}</div>`
     : '';
 
   let body = '';
@@ -7082,6 +7125,8 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
       actions = '';
     } else if (view.phase === 'pending') {
       actions = `<button class="button primary" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="approve" ${busy ? 'disabled' : ''}>${busy ? 'Checking SharePoint…' : 'Approve'}</button><button class="button ghost" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="reject" ${busy ? 'disabled' : ''}>Reject</button>`;
+    } else if (attempt.destination?.effectUnknown) {
+      actions = `<button class="button primary" type="button" data-action="documents-publication-check-drive" data-publication="${attr(attempt.publicationId)}" ${busy ? 'disabled' : ''}>${busy ? 'Checking Drive…' : 'Check Drive'}</button>`;
     } else if (publicationAttemptCanApply(view)) {
       actions = `<button class="button primary" type="button" data-action="documents-publication-sync" data-dockey="${attr(attempt.docKey)}" ${busy ? 'disabled' : ''}>${busy ? 'Writing and verifying…' : esc(publicationEffectLabel(attempt.action, { final: true }))}</button>`;
     } else if (view.phase === 'conflicted') {
@@ -7089,7 +7134,7 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     } else {
       actions = `<button class="button ghost" type="button" data-action="documents-publication-refresh" ${busy ? 'disabled' : ''}>Refresh status</button>`;
     }
-    body = `<div class="document-publication-attempt"><div class="document-publication-effect"><span class="pill${toneClass}">${esc(statusCopy)}</span><strong>${isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy'}</strong>${pathLine(attempt.serverRelativeUrl)}<small>Official artifact ${esc(String(attempt.artifactId).slice(0, 12))}… · ${String(attempt.format || '').toUpperCase()}</small></div>${snapshot}${error ? `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}<p class="document-publication-certainty">${esc(effectNote)}</p><div class="document-publication-actions">${actions}</div></div>`;
+    body = `<div class="document-publication-attempt"><div class="document-publication-effect"><span class="pill${toneClass}">${esc(statusCopy)}</span><strong>${attempt.destination ? (isUpdate ? 'Update Google Drive file' : 'Create Google Drive copy') : isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy'}</strong>${pathLine(attempt.serverRelativeUrl)}<small>Official artifact ${esc(String(attempt.artifactId).slice(0, 12))}… · ${String(attempt.format || '').toUpperCase()}</small></div>${snapshot}${error ? `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}<p class="document-publication-certainty">${esc(effectNote)}</p><div class="document-publication-actions">${actions}</div></div>`;
   } else if (view.phase === 'blocked_unassigned') {
     body = `<div class="document-publication-empty">${icon('folder', 20)}<div><strong>Publication unavailable</strong><p>${esc(view.blockReason || 'Assign this document chain to an active or paused project before publishing it.')}</p></div></div>`;
   } else {
@@ -7098,7 +7143,14 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
       ? `<div class="document-publication-mode" role="group" aria-label="Publication type"><button class="button small ${updateMode ? 'active' : ''}" type="button" data-action="documents-publication-mode" data-mode="update_existing" aria-pressed="${updateMode ? 'true' : 'false'}">Update existing</button><button class="button small ${updateMode ? '' : 'active'}" type="button" data-action="documents-publication-mode" data-mode="create" aria-pressed="${updateMode ? 'false' : 'true'}">Create another copy</button></div>`
       : '';
     const updateForm = `<fieldset class="document-publication-fieldset"><legend>Choose the SharePoint file to update</legend>${updateBases.map((location, index) => `<label class="document-publication-choice"><input type="radio" name="document-publication-base" value="${attr(location.publicationId)}" data-publication-base ${draft.basePublicationId === location.publicationId || (!draft.basePublicationId && updateBases.length === 1 && index === 0) ? 'checked' : ''}><span><strong>${esc(location.serverRelativeUrl.split('/').pop() || 'SharePoint document')}</strong>${pathLine(location.serverRelativeUrl)}<small>${String(location.format || '').toUpperCase()} · contains an older artifact</small></span></label>`).join('')}</fieldset><div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage update for review'}</button></div>`;
-    const createForm = `<div class="document-publication-form"><div class="document-publication-section-title"><strong>${locations.length ? 'Create another physical copy' : 'Create a SharePoint copy'}</strong><small>${locations.length ? 'This is a separate file and does not replace the verified location above.' : 'Choose the exact destination before staging it for review.'}</small></div><div class="document-publication-form-grid"><label><span>Format</span><select data-publication-format><option value="docx" ${draft.format === 'docx' ? 'selected' : ''}>Word (.docx)</option><option value="md" ${draft.format === 'md' ? 'selected' : ''}>Markdown (.md)</option></select></label><label><span>Destination kind</span><select data-publication-destination-mode><option value="folder" ${draft.destinationMode !== 'path' ? 'selected' : ''}>Folder (use document title)</option><option value="path" ${draft.destinationMode === 'path' ? 'selected' : ''}>Complete file path</option></select></label><label class="wide"><span>${draft.destinationMode === 'path' ? 'Complete server-relative file path' : 'SharePoint folder path'}</span><input type="text" data-publication-destination value="${attr(draft.destinationMode === 'path' ? draft.serverRelativeUrl : draft.targetFolder)}" placeholder="${draft.destinationMode === 'path' ? '/personal/you/Documents/Strategy.docx' : '/personal/you/Documents'}" autocomplete="off"><small>${draft.destinationMode === 'path' ? `Must end in .${draft.format === 'md' ? 'md' : 'docx'}.` : 'BotBoy uses this immutable document title as the filename.'}</small></label><label class="wide"><span>Team site URL <em>optional</em></span><input type="url" data-publication-site value="${attr(draft.siteUrl || '')}" placeholder="https://amazon.sharepoint.com/sites/team" autocomplete="off"><small>Leave blank for your OneDrive.</small></label></div><div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage new copy for review'}</button></div></div>`;
+    // Where it lands: SharePoint only with Amazon Employee ON; Drive only when connected.
+    const driveChoices = Array.isArray(artifact?.publicationDestinations) ? artifact.publicationDestinations : [];
+    const useDrive = draft.provider === 'gdrive' || (!amazonEmployeeOn() && driveChoices.length > 0);
+    const destinationPicker = driveChoices.length
+      ? `<div class="document-publication-form-grid"><label class="wide"><span>Publish to</span><select data-publication-provider>${amazonEmployeeOn() ? `<option value="sharepoint" ${useDrive ? '' : 'selected'}>SharePoint</option>` : ''}${driveChoices.map((choice, index) => `<option value="gdrive:${index}" ${useDrive && Number(draft.driveChoice || 0) === index ? 'selected' : ''}>${esc(choice.label)}</option>`).join('')}</select></label>${useDrive ? `<label class="wide"><span>Stored as</span><select data-publication-stored-as><option value="docx" ${draft.storedAs !== 'google_doc' ? 'selected' : ''}>Word file (.docx) · exact file verified</option><option value="google_doc" ${draft.storedAs === 'google_doc' ? 'selected' : ''}>Google Doc (text checked loosely)</option></select></label>` : ''}</div>`
+      : '';
+    const driveForm = `<div class="document-publication-form"><div class="document-publication-section-title"><strong>Create a Google Drive copy</strong><small>BotBoy uploads the Word export. Nothing changes in Drive until you approve and choose Sync.</small></div>${destinationPicker}<div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage new copy for review'}</button></div></div>`;
+    const createForm = useDrive ? driveForm : `<div class="document-publication-form">${destinationPicker}<div class="document-publication-section-title"><strong>${locations.length ? 'Create another physical copy' : 'Create a SharePoint copy'}</strong><small>${locations.length ? 'This is a separate file and does not replace the verified location above.' : 'Choose the exact destination before staging it for review.'}</small></div><div class="document-publication-form-grid"><label><span>Format</span><select data-publication-format><option value="docx" ${draft.format === 'docx' ? 'selected' : ''}>Word (.docx)</option><option value="md" ${draft.format === 'md' ? 'selected' : ''}>Markdown (.md)</option></select></label><label><span>Destination kind</span><select data-publication-destination-mode><option value="folder" ${draft.destinationMode !== 'path' ? 'selected' : ''}>Folder (use document title)</option><option value="path" ${draft.destinationMode === 'path' ? 'selected' : ''}>Complete file path</option></select></label><label class="wide"><span>${draft.destinationMode === 'path' ? 'Complete server-relative file path' : 'SharePoint folder path'}</span><input type="text" data-publication-destination value="${attr(draft.destinationMode === 'path' ? draft.serverRelativeUrl : draft.targetFolder)}" placeholder="${draft.destinationMode === 'path' ? '/personal/you/Documents/Strategy.docx' : '/personal/you/Documents'}" autocomplete="off"><small>${draft.destinationMode === 'path' ? `Must end in .${draft.format === 'md' ? 'md' : 'docx'}.` : 'BotBoy uses this immutable document title as the filename.'}</small></label><label class="wide"><span>Team site URL <em>optional</em></span><input type="url" data-publication-site value="${attr(draft.siteUrl || '')}" placeholder="https://amazon.sharepoint.com/sites/team" autocomplete="off"><small>Leave blank for your OneDrive.</small></label></div><div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage new copy for review'}</button></div></div>`;
     body = `${locationRows}${modeChoice}${updateMode ? updateForm : createForm}${documents.publicationError ? `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span>${esc(documents.publicationError)}</span></div>` : ''}`;
   }
 
@@ -7167,7 +7219,7 @@ function renderDocumentDetailPane(artifactId) {
     : null;
   const publicationCopy = publicationPresentation(publicationView);
   // SharePoint publication is an Amazon internal path (publicationFact keeps history).
-  const publishButton = editing || !publicationView || !amazonEmployeeOn()
+  const publishButton = editing || !publicationView || !(amazonEmployeeOn() || drivePublishAvailable())
     ? ''
     : `<button class="button small document-publication-toggle ${documents.publicationOpen ? 'active' : ''} ${documents.publicationOpen && documents.publicationTrigger === 'toolbar' ? 'is-publication-origin' : ''}" type="button" data-action="documents-publication-toggle" data-publication-trigger="toolbar" aria-haspopup="dialog" aria-expanded="${documents.publicationOpen ? 'true' : 'false'}" aria-controls="document-publication-dialog">${icon('link', 13)} ${esc(publicationCopy.button)}</button>`;
   const reviewAvailable = Boolean(reviewModel.totalCount || reviewModel.statusLabel || reviewModel.reviewSummary);
@@ -7210,7 +7262,7 @@ function renderDocumentDetailPane(artifactId) {
   const detailsPanel = `<details class="document-technical-details" data-document-details ${documents.detailsOpen ? 'open' : ''}><summary>Details ${icon('chevron-down', 11)}</summary><div><span><strong>Artifact ID</strong><code>${esc(artifact.artifactId)}</code></span><span><strong>Profile</strong>${esc(artifact.profileId || 'Unknown')}${profileVersion ? ` · ${esc(profileVersion)}` : ''}</span><span><strong>Created</strong>${esc(exactCreatedAt)}</span>${artifact.model ? `<span><strong>Model</strong>${esc(artifact.model)}</span>` : ''}${artifact.checkerVersion ? `<span><strong>Checker</strong>${esc(artifact.checkerVersion)}</span>` : ''}${parentLine}${projectAssignmentControl}</div></details>`;
 
   const libraryTitleButton = `<button class="icon-button document-title-library-toggle" type="button" data-action="documents-toggle-library" aria-expanded="${documents.libraryOpen ? 'true' : 'false'}" aria-controls="document-library-content" aria-label="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}" title="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}">${icon(documents.libraryOpen ? 'panel-collapse' : 'panel-expand', 18)}</button>`;
-  const publicationPanel = !editing && publicationView && amazonEmployeeOn()
+  const publicationPanel = !editing && publicationView && (amazonEmployeeOn() || drivePublishAvailable())
     ? renderDocumentPublicationPanel(artifact, publicationView, documents)
     : '';
   return `<article class="card document-detail-pane"><header class="document-detail-header"><div class="document-title-block"><div class="document-title-row">${libraryTitleButton}<h2 id="document-detail-title">${esc(artifact.title)}</h2><span class="pill ${stateTone}"><span class="visually-hidden">Document status: </span>${esc(documentStateLabel(artifact.state))}</span></div><div class="document-primary-facts"><span>${projectFact}</span>${publicationFact ? `<span>${publicationFact}</span>` : ''}<span>${esc(profileFact)}</span><span>${esc(revisionLabel)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span><span>${number(content.length)} characters</span>${detailsPanel}</div></div></header><div class="document-detail-toolbar">${back}${modeButtons}${editButton}<div class="document-toolbar-spacer"></div><div class="document-toolbar-actions">${reviewButton}${publishButton}${downloadMenu}${focusButton}${overflowMenu}</div></div>${publicationPanel}${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
@@ -8717,6 +8769,20 @@ function bindEvents() {
         isConflict: artifact?.publicationState?.phase === 'conflicted',
       });
     }
+    if (action === 'documents-publication-check-drive') {
+      const publicationId = target.dataset.publication || '';
+      const artifactId = state.route.artifactId || '';
+      void (async () => {
+        try {
+          const payload = await request(`/documents/publications/${encodeURIComponent(publicationId)}/check-drive`, { method: 'POST', body: {} });
+          toast(payload.found ? 'Found the earlier upload in Drive; BotBoy verified and linked it' : 'No earlier upload in Drive; Sync may run again');
+        } catch (error) {
+          toast(`Check Drive: ${error.message}`, 'bad');
+        }
+        state.documents.details.delete(artifactId);
+        renderRoute({ preserveScroll: true, userAction: true });
+      })();
+    }
     if (action === 'documents-publication-sync') {
       const artifactId = state.route.artifactId || '';
       const artifact = state.documents.details.get(artifactId);
@@ -8822,6 +8888,29 @@ function bindEvents() {
         const payload = await request(`/gmail-sync/accounts/${encodeURIComponent(accountId)}/label`, { method: 'PUT', body: { label } });
         state.gmailSync.status = payload.status;
         toast(label.trim() ? `Account labelled “${label.trim()}”` : 'Label cleared');
+      });
+    }
+    if (action === 'gdrive-connect') {
+      const accountId = target.dataset.account || '';
+      void gmailSyncAction(`drive:${accountId}`, async () => {
+        const payload = await request(`/gmail-sync/accounts/${encodeURIComponent(accountId)}/drive/connect`, { method: 'POST', body: {} });
+        if (payload.authUrl) window.location.assign(payload.authUrl);
+      });
+    }
+    if (action === 'gdrive-save-sources') {
+      const accountId = target.dataset.account || '';
+      // Read the fields before the busy repaint recreates them.
+      const card = target.closest('[data-gdrive-account]');
+      const body = {
+        enabled: Boolean(card?.querySelector('[data-gdrive-enabled]')?.checked),
+        ownedByMe: Boolean(card?.querySelector('[data-gdrive-owned]')?.checked),
+        sharedWithMe: Boolean(card?.querySelector('[data-gdrive-shared]')?.checked),
+        folders: String(card?.querySelector('[data-gdrive-folders]')?.value || '').split(/\n+/).map(line => line.trim()).filter(Boolean),
+      };
+      void gmailSyncAction(`drive-sources:${accountId}`, async () => {
+        await request(`/gdrive/accounts/${encodeURIComponent(accountId)}/sources`, { method: 'PUT', body });
+        await refreshGmailSyncStatus();
+        toast('Drive sources saved; BotBoy starts capturing them now');
       });
     }
     if (action === 'gmail-sync-connect') {
@@ -9367,6 +9456,20 @@ function bindEvents() {
     if (event.target?.matches?.('[data-control-input]')) {
       updateAnalyticsControlDraft(event.target);
       return;
+    }
+    if (event.target?.matches?.('[data-publication-provider], [data-publication-stored-as]')) {
+      const artifact = state.documents.details.get(state.route.artifactId || '');
+      const draft = { ...(state.documents.publicationDraft || defaultPublicationDraft(artifact?.publicationState, artifact?.publicationDestinationDefault)) };
+      if (event.target.matches('[data-publication-provider]')) {
+        const [provider, index] = String(event.target.value).split(':');
+        draft.provider = provider === 'gdrive' ? 'gdrive' : 'sharepoint';
+        draft.driveChoice = Number(index || 0);
+      } else {
+        draft.storedAs = event.target.value === 'google_doc' ? 'google_doc' : 'docx';
+      }
+      state.documents.publicationDraft = draft;
+      state.documents.publicationDraftTouched = true;
+      renderRoute({ preserveScroll: true, userAction: true });
     }
     if (event.target?.matches?.('[data-publication-format], [data-publication-destination-mode], [data-publication-base]')) {
       const artifact = state.documents.details.get(state.route.artifactId || '');

@@ -37,6 +37,7 @@ import {
   type GoogleEndpoints,
 } from './gmail-api.js';
 import { randomBytes } from 'node:crypto';
+import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE, GDRIVE_REQUESTED_SCOPES } from './gdrive-api.js';
 import {
   GMAIL_DEFAULT_ACCOUNT_ID,
   activeGmailClient,
@@ -47,6 +48,7 @@ import {
   validateGmailClient,
   type GmailClientSource,
   type GmailCredentialStore,
+  type StoredDriveSettings,
   type StoredGmailAccount,
   type StoredGmailCredentials,
 } from './gmail-credentials.js';
@@ -84,6 +86,10 @@ export interface GmailConnectionStatus {
   canCompose: boolean;
   /** Connected with read access only: Reconnect to allow drafting and sending. */
   needsComposeGrant: boolean;
+  /** The focused account's grant covers drive.readonly / drive.file, and its Drive choices. */
+  canReadDrive: boolean;
+  canPublishDrive: boolean;
+  drive: StoredDriveSettings | null;
 }
 
 /** Thrown when there is no usable grant; the message names the next action. */
@@ -106,6 +112,12 @@ export interface GmailAccountSummary {
   grantedScopes: string[];
   canCompose: boolean;
   needsComposeGrant: boolean;
+  /** The grant covers drive.readonly (capture, search, read). */
+  canReadDrive: boolean;
+  /** The grant covers drive.file (publishing BotBoy documents). */
+  canPublishDrive: boolean;
+  /** Drive capture choices; null until the owner connects Drive. */
+  drive: StoredDriveSettings | null;
 }
 
 /** "Work (me@x.com)" or the address alone. */
@@ -122,6 +134,12 @@ export interface GmailAccountConnection {
   accountEmail(): string | null;
   /** The stored grant includes gmail.compose (drafts and sending). */
   canCompose(): boolean;
+  /** The stored grant includes drive.readonly. */
+  canReadDrive(): boolean;
+  /** The stored grant includes drive.file. */
+  canPublishDrive(): boolean;
+  /** Drive capture choices (null until Drive is connected). */
+  drive(): StoredDriveSettings | null;
   accessToken(): Promise<string>;
   invalidateAccessToken(): void;
   /** A Gmail REST client bound to this account's tokens. */
@@ -153,7 +171,14 @@ export interface GmailConnection extends GmailAccountConnection {
    */
   retireStagedTeamClient(): boolean;
   /** Reconnect `accountId`, add another account (`addAccount`), or connect the first one. */
-  beginConnect(options?: { accountId?: string; addAccount?: boolean }): { authUrl: string };
+  /**
+   * Reconnect `accountId`, add another account (`addAccount`), or connect the
+   * first one. `purpose: 'drive'` asks for Drive on top of the account's Gmail
+   * scopes (incremental grant, Connect Google Drive).
+   */
+  beginConnect(options?: { accountId?: string; addAccount?: boolean; purpose?: 'gmail' | 'drive' }): { authUrl: string };
+  /** Saves one account's Drive capture choices. */
+  setDriveSettings(accountId: string, drive: StoredDriveSettings): GmailConnectionStatus;
   completeConnect(query: { code?: unknown; state?: unknown; error?: unknown }): Promise<
     { ok: true; accountEmail: string; accountId: string } | { ok: false; error: string }
   >;
@@ -190,7 +215,7 @@ export function createGmailConnection(deps: {
   const now = deps.now ?? Date.now;
   const newAccountId = deps.newAccountId ?? (() => `ga_${randomBytes(5).toString('hex')}`);
   /** A sign-in in progress and what it is for: reconnect one account, or add one. */
-  const pending = new Map<string, { verifier: string; createdAt: number; accountId?: string }>();
+  const pending = new Map<string, { verifier: string; createdAt: number; accountId?: string; purpose?: 'drive' }>();
   const listeners = new Set<() => void>();
 
   /** Per-account runtime state (memory only). */
@@ -249,6 +274,9 @@ export function createGmailConnection(deps: {
       grantedScopes: granted,
       canCompose,
       needsComposeGrant: !canCompose,
+      canReadDrive: granted.includes(GDRIVE_READONLY_SCOPE),
+      canPublishDrive: granted.includes(GDRIVE_FILE_SCOPE),
+      drive: account.drive ?? null,
     };
   }
 
@@ -277,6 +305,9 @@ export function createGmailConnection(deps: {
       grantedScopes: granted,
       canCompose,
       needsComposeGrant: Boolean(account) && !canCompose,
+      canReadDrive: granted.includes(GDRIVE_READONLY_SCOPE),
+      canPublishDrive: granted.includes(GDRIVE_FILE_SCOPE),
+      drive: account?.drive ?? null,
     };
   }
 
@@ -347,6 +378,9 @@ export function createGmailConnection(deps: {
       isConnected: () => Boolean(storedAccount(accountId)),
       accountEmail: () => storedAccount(accountId)?.connection.accountEmail ?? null,
       canCompose: () => scopesOf(storedAccount(accountId)).includes(GMAIL_COMPOSE_SCOPE),
+      canReadDrive: () => scopesOf(storedAccount(accountId)).includes(GDRIVE_READONLY_SCOPE),
+      canPublishDrive: () => scopesOf(storedAccount(accountId)).includes(GDRIVE_FILE_SCOPE),
+      drive: () => storedAccount(accountId)?.drive ?? null,
       async accessToken() {
         const state = runtime(accountId);
         if (state.access && state.access.expiresAt - ACCESS_TOKEN_SKEW_MS > now()) return state.access.token;
@@ -394,6 +428,9 @@ export function createGmailConnection(deps: {
     isConnected: () => Boolean(firstAccount()),
     accountEmail: () => firstAccount()?.connection.accountEmail ?? null,
     canCompose: () => scopesOf(firstAccount()).includes(GMAIL_COMPOSE_SCOPE),
+    canReadDrive: () => scopesOf(firstAccount()).includes(GDRIVE_READONLY_SCOPE),
+    canPublishDrive: () => scopesOf(firstAccount()).includes(GDRIVE_FILE_SCOPE),
+    drive: () => firstAccount()?.drive ?? null,
     accessToken: () => accountView(primaryId()).accessToken(),
     invalidateAccessToken: () => accountView(primaryId()).invalidateAccessToken(),
     client: () => accountView(primaryId()).client(),
@@ -409,6 +446,13 @@ export function createGmailConnection(deps: {
     setLabel(accountId, label) {
       if (!storedAccount(accountId)) throw new GmailAuthError('That Gmail account is not connected.', 'not_connected');
       store.setLabel(accountId, cleanAccountLabel(label));
+      changed();
+      return status();
+    },
+
+    setDriveSettings(accountId, drive) {
+      if (!storedAccount(accountId)) throw new GmailAuthError('That Gmail account is not connected.', 'not_connected');
+      store.setDrive(accountId, drive);
       changed();
       return status();
     },
@@ -452,6 +496,13 @@ export function createGmailConnection(deps: {
       if (options.accountId && !options.addAccount && !target) {
         throw new GmailAuthError('That Gmail account is not connected.', 'not_connected');
       }
+      const forDrive = options.purpose === 'drive';
+      if (forDrive && !target) throw new GmailAuthError('Connect the Gmail account first, then connect Google Drive.', 'not_connected');
+      // A reconnect of an account that already has Drive asks for Drive again,
+      // so a fresh consent never silently drops it.
+      const targetScopes = scopesOf(target);
+      const keepDrive = targetScopes.includes(GDRIVE_READONLY_SCOPE) || targetScopes.includes(GDRIVE_FILE_SCOPE);
+      const scopes = forDrive || keepDrive ? [...GMAIL_REQUESTED_SCOPES, ...GDRIVE_REQUESTED_SCOPES] : GMAIL_REQUESTED_SCOPES;
       prunePending();
       while (pending.size >= MAX_PENDING_STATES) {
         const oldest = pending.keys().next().value;
@@ -460,7 +511,7 @@ export function createGmailConnection(deps: {
       }
       const state = createOAuthState();
       const pkce = createPkcePair();
-      pending.set(state, { verifier: pkce.verifier, createdAt: now(), ...(target ? { accountId: target.id } : {}) });
+      pending.set(state, { verifier: pkce.verifier, createdAt: now(), ...(target ? { accountId: target.id } : {}), ...(forDrive ? { purpose: 'drive' as const } : {}) });
       return {
         authUrl: buildAuthorizationUrl(endpoints, {
           clientId: active.client.clientId,
@@ -469,6 +520,7 @@ export function createGmailConnection(deps: {
           codeChallenge: pkce.challenge,
           loginHint: target?.connection.accountEmail,
           selectAccount: Boolean(options.addAccount),
+          ...(scopes !== GMAIL_REQUESTED_SCOPES ? { scopes, includeGrantedScopes: true } : {}),
         }),
       };
     },
@@ -528,10 +580,18 @@ export function createGmailConnection(deps: {
         const existing = accounts.find(account => account.connection.accountEmail === email);
         const accountId = existing?.id ?? (accounts.length ? newAccountId() : GMAIL_DEFAULT_ACCOUNT_ID);
         store.saveConnection(accountId, { refreshToken: tokens.refreshToken, accountEmail: email, scope: granted.join(' ') });
+        const driveGranted = granted.includes(GDRIVE_READONLY_SCOPE) && granted.includes(GDRIVE_FILE_SCOPE);
+        if (entry.purpose === 'drive' && driveGranted && !store.read().accounts.find(account => account.id === accountId)?.drive) {
+          // Drive is on; nothing is captured until the owner picks sources.
+          store.setDrive(accountId, { enabled: true, sources: { ownedByMe: false, sharedWithMe: false, folderIds: [] } });
+        }
         const fresh = runtime(accountId);
         fresh.access = { token: tokens.accessToken, expiresAt: now() + tokens.expiresInSeconds * 1000 };
         fresh.needsReconnect = false;
-        fresh.lastError = null;
+        // A partial grant keeps Gmail working and says what is missing.
+        fresh.lastError = entry.purpose === 'drive' && !driveGranted
+          ? 'Drive not granted — choose Connect Google Drive again and tick both Drive boxes.'
+          : null;
         signInError = null;
         changed();
         console.log(`[Gmail] ${existing ? 'Reconnected' : 'Connected'} ${email} as account ${accountId} (${active.source} client ${clientIdSuffix(active.client.clientId)}; ${granted.includes(GMAIL_COMPOSE_SCOPE) ? 'read + compose' : 'read only'})`);

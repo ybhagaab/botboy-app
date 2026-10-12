@@ -19,7 +19,7 @@ export type WorkItemType =
   | 'clipboard_capture'
   | 'generic_browser';
 
-export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp' | 'gmail' | 'sharepoint';
+export type WorkItemSource = 'browser' | 'app' | 'manual' | 'clipboard' | 'slack' | 'filesystem' | 'grasp' | 'gmail' | 'sharepoint' | 'gdrive';
 
 // ── Raw Work Item (emitted by monitors before storage) ──
 

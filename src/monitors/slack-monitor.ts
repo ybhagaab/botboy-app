@@ -140,7 +140,7 @@ function describeSlackError(error: unknown): string {
   return String((error as Error)?.message ?? error);
 }
 
-export function createSlackMonitor(deps: {
+type SlackMonitorDeps = {
   db: Database.Database;
   mcpManager?: McpManager;
   /** Outcome of every poll cycle, for owner-facing capture warnings. */
@@ -151,10 +151,53 @@ export function createSlackMonitor(deps: {
    * token returns quietly instead of reporting connector_down.
    */
   mcpAllowed?: () => boolean;
-}): SlackMonitor {
+};
+
+/** A Slack monitor whose user token can be swapped without a restart (Sign in with Slack). */
+export interface ReloadableSlackMonitor extends SlackMonitor {
+  /** Stops, rebuilds the token clients, re-elects the transport, and starts again. Cursors live in settings, so nothing is lost. */
+  reloadUserToken(token: string): Promise<{ captureMode: SlackCaptureMode }>;
+  /** Whether the current monitor holds a user token (live, not the boot copy). */
+  hasUserToken(): boolean;
+  /** The current token WebClient, or undefined without a token. */
+  getUserWebClient(): WebClient | undefined;
+}
+
+export function createSlackMonitor(deps: SlackMonitorDeps): ReloadableSlackMonitor {
+  const env = loadEnv();
+  let token = process.env.SLACK_USER_TOKEN || env.SLACK_USER_TOKEN || '';
+  let inner = buildSlackMonitor(deps, token);
+  let webClient = token ? new WebClient(token) : undefined;
+  const handlers: ((item: RawWorkItem) => void)[] = [];
+  let started = false;
+  return {
+    async start() { started = true; await inner.start(); },
+    stop() { started = false; inner.stop(); },
+    isConnected: () => inner.isConnected(),
+    onWorkItem(handler) { handlers.push(handler); inner.onWorkItem(handler); },
+    setWatchedChannels(ids) { inner.setWatchedChannels(ids); },
+    getWatchedChannels: () => inner.getWatchedChannels(),
+    backfillChannel: (channelId, opts) => inner.backfillChannel!(channelId, opts),
+    backfillStatus: () => inner.backfillStatus!(),
+    getCaptureMode: () => inner.getCaptureMode!(),
+    async reloadUserToken(next) {
+      const wasStarted = started;
+      if (wasStarted) inner.stop();
+      token = next.trim();
+      inner = buildSlackMonitor(deps, token);
+      webClient = token ? new WebClient(token) : undefined;
+      for (const handler of handlers) inner.onWorkItem(handler);
+      if (wasStarted) { started = true; await inner.start(); }
+      return { captureMode: inner.getCaptureMode!() };
+    },
+    hasUserToken: () => token.length > 0,
+    getUserWebClient: () => webClient,
+  };
+}
+
+function buildSlackMonitor(deps: SlackMonitorDeps, userToken: string): SlackMonitor {
   const env = loadEnv();
   const appToken = process.env.SLACK_APP_TOKEN || env.SLACK_APP_TOKEN || '';
-  const userToken = process.env.SLACK_USER_TOKEN || env.SLACK_USER_TOKEN || '';
   const tokenMode = resolveSlackCaptureMode(
     appToken,
     userToken,

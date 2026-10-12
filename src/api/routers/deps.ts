@@ -57,8 +57,22 @@ import type { CaptureHealth } from '../../core/capture-health.js';
 import type { ChatJobStore } from '../../core/chat-jobs.js';
 import type { ContinuationBridge } from '../../core/chat-continuations.js';
 import type { Workplace } from '../../core/workplace.js';
+import type { PublicationDestinations } from '../../product-manager/publication-destination.js';
+import type { GdriveSyncs } from '../../monitors/gdrive-sync.js';
+import type { SlackCredentialStore, SlackRedirectMode } from '../../core/slack-credentials.js';
+import type { SlackOAuthStateStore } from '../../core/slack-oauth.js';
 import type { ExportFooterSettings } from '../../product-manager/export-footer.js';
 
+export interface SlackOAuthService {
+  credentials: SlackCredentialStore;
+  states: SlackOAuthStateStore;
+  /** Redirect URL for the stored mode, built from the server port. */
+  redirectUri(mode: SlackRedirectMode): string;
+  /** Tests point the exchange at a fake Slack server. */
+  slackApiUrl?: string;
+  /** Called after a token is saved (keeps the in-process env copy current). */
+  onTokenSaved?(token: string): void;
+}
 export interface RouterDeps {
   nodeManager: NodeManager;
   chatInterface?: ChatInterface;
@@ -67,6 +81,10 @@ export interface RouterDeps {
   backgroundProcessor?: BackgroundProcessor;
   slackMonitor?: SlackMonitor;
   slackWebClient?: WebClient;
+  /** The live token WebClient (swapped by Sign in with Slack / token save); wins over slackWebClient. */
+  getSlackWebClient?: () => WebClient | undefined;
+  /** Sign in with Slack: the owner's own Slack app client and in-memory sign-in states. */
+  slackOAuth?: SlackOAuthService;
   filesystemMonitor?: FilesystemMonitor;
   db?: Database.Database;
   failures?: FailureRecorder;
@@ -92,6 +110,8 @@ export interface RouterDeps {
   graspSync?: GraspSync;
   /** Gmail API mail sync and its OAuth connection (non-Amazon accounts). */
   gmailSync?: GmailSyncs;
+  /** Google Drive capture, one sync per account with Drive (gdrive-sync.ts). */
+  gdriveSync?: GdriveSyncs;
   /** Connections → WhatsApp (whatsapp-connection.ts). */
   whatsApp?: import('../../core/whatsapp-connection.js').WhatsAppConnection;
   gmailConnection?: GmailConnection;
@@ -115,6 +135,10 @@ export interface RouterDeps {
   dashboardPublisher?: DashboardPublisherService;
   productDocumentService?: ProductDocumentService;
   productDocumentPublications?: ProductDocumentPublicationService;
+  /** Publication destination seam: SharePoint (Amazon Employee ON) and Google Drive plugs. */
+  publicationDestinations?: PublicationDestinations;
+  /** Test seam: the canonical DOCX exporter for Drive publications (default document-exporter.ts › exportDocument). */
+  publicationExporter?: (input: { title: string; content: string; format: 'docx'; footerText: string }) => Promise<{ data: Buffer; filename: string }>;
   writingConfigStore?: WritingConfigStore;
   chatTerminal?: ChatTerminalService;
   /** Evidence content reads (document workbench reader). */

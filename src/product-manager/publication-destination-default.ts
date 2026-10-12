@@ -89,3 +89,55 @@ export function resolveLocalPublicationDestinationDefault(db: Database.Database)
 export function unavailablePublicationDestinationDefault(reason: string): PublicationDestinationDefault {
   return unresolved(reason, 'unavailable');
 }
+
+/** A provider-tagged Google Drive destination candidate (A7). */
+export interface DriveDestinationCandidate {
+  provider: 'gdrive';
+  accountId: string;
+  accountEmail: string;
+  /** A Drive folder id, or 'botboy' for My Drive › BotBoy (created on first sync). */
+  folderId: string;
+  label: string;
+  source: 'botboy_folder' | 'project_last_used';
+  storedAs: 'docx' | 'google_doc';
+}
+
+/**
+ * Drive candidates only for accounts whose grant has drive.file: the
+ * project's last-used Drive folder first, then My Drive › BotBoy per account.
+ */
+export function resolveDriveDestinationCandidates(
+  db: Database.Database,
+  accounts: ReadonlyArray<{ id: string; email: string; canPublishDrive?: boolean }>,
+  projectId: string,
+): DriveDestinationCandidate[] {
+  const publishable = accounts.filter(account => account.canPublishDrive === true);
+  if (!publishable.length) return [];
+  const out: DriveDestinationCandidate[] = [];
+  let lastUsed: { container: string; path: string } | undefined;
+  try {
+    lastUsed = projectId ? db.prepare(`
+      SELECT destination_container AS container, server_relative_url AS path
+      FROM product_document_publications
+      WHERE destination_provider='gdrive' AND publication_action='create' AND status='complete' AND project_id=?
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(projectId) as { container: string; path: string } | undefined : undefined;
+  } catch { lastUsed = undefined; }
+  const lastAccount = lastUsed ? publishable.find(account => account.id === lastUsed!.container) : undefined;
+  const lastFolder = lastUsed?.path.split('/')[0];
+  if (lastAccount && lastFolder) {
+    out.push({
+      provider: 'gdrive', accountId: lastAccount.id, accountEmail: lastAccount.email, folderId: lastFolder,
+      label: lastFolder === 'botboy' ? `My Drive › BotBoy (${lastAccount.email})` : `Last used folder (${lastAccount.email})`,
+      source: 'project_last_used', storedAs: 'docx',
+    });
+  }
+  for (const account of publishable) {
+    if (out.some(entry => entry.accountId === account.id && entry.folderId === 'botboy')) continue;
+    out.push({
+      provider: 'gdrive', accountId: account.id, accountEmail: account.email, folderId: 'botboy',
+      label: `My Drive › BotBoy (${account.email})`, source: 'botboy_folder', storedAs: 'docx',
+    });
+  }
+  return out;
+}

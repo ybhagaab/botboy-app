@@ -1373,6 +1373,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           mcpServers,
           ...(jobBlock ? { jobBlock } : {}),
           ...(gmailAccountsBlock ? { gmailAccountsBlock } : {}),
+          driveConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canReadDrive && !account.needsReconnect),
           amazonEmployee: turnAmazonEmployee,
         };
         const systemPrompt = promptManager

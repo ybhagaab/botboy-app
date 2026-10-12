@@ -94,8 +94,22 @@ export function defaultPublicationDraft(view, destinationDefault) {
   };
 }
 
-export function publicationStageRequest(view, draft = {}) {
+export function publicationStageRequest(view, draft = {}, driveChoices = []) {
   const mode = draft.mode === 'update_existing' ? 'update_existing' : 'create';
+  // Google Drive destination (A7): account + folder from the chosen candidate.
+  if (mode === 'create' && draft.provider === 'gdrive') {
+    const choice = driveChoices[Number(draft.driveChoice || 0)];
+    if (!choice) return { ok: false, error: 'Choose a Google Drive destination.' };
+    return {
+      ok: true,
+      body: {
+        ownerRequested: true,
+        action: 'create',
+        format: 'docx',
+        destination: { provider: 'gdrive', accountId: choice.accountId, folderId: choice.folderId, storedAs: draft.storedAs === 'google_doc' ? 'google_doc' : 'docx' },
+      },
+    };
+  }
   if (mode === 'update_existing') {
     const basePublicationId = String(draft.basePublicationId || '').trim();
     const candidate = (view?.updateBases || []).find(entry => entry.publicationId === basePublicationId);

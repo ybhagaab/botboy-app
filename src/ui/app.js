@@ -2938,8 +2938,6 @@ async function refreshSlackTokenStatus() {
     const status = await res.json();
     if (!status.configured) {
       line.textContent = 'No token saved yet — Slack capture is disabled until one is added.';
-    } else if (status.restartPending) {
-      line.textContent = `Token ${status.tokenMasked} saved. Restart BotBoy to start capturing with it.`;
     } else {
       const mode = status.captureMode === 'socket' ? 'live socket capture' : status.captureMode === 'poll' ? 'polling capture (checks every ~90s)' : 'capture disabled';
       line.textContent = `Token ${status.tokenMasked} active — ${mode}.`;
@@ -2972,7 +2970,7 @@ function bindSlackTokenCard() {
       input.value = '';
       if (result) {
         result.hidden = false;
-        result.textContent = `Verified as ${body.identity?.user || 'unknown user'} in ${body.identity?.team || 'workspace'} and saved (${body.tokenMasked}).${body.restartRequired ? ' Restart BotBoy to apply — quit and reopen BotBoy.app, or rerun ./start.sh.' : ''}`;
+        result.textContent = `Verified as ${body.identity?.user || 'unknown user'} in ${body.identity?.team || 'workspace'} and saved (${body.tokenMasked}).${body.reloadError ? ` ${body.reloadError}` : ' Capture uses it now.'}`;
       }
       await refreshSlackTokenStatus();
     } catch (e) {
@@ -2987,10 +2985,122 @@ function bindSlackTokenCard() {
   });
 }
 
+// ── Sign in with Slack (the owner's own Slack app; OAuth v2 user token) ──
+
+let slackSignInBound = false;
+let slackSignInView = null;
+
+function slackSignInMessage(text) {
+  const result = document.getElementById('slack-signin-result');
+  if (!result) return;
+  result.hidden = !text;
+  result.textContent = text || '';
+}
+
+async function refreshSlackSignIn() {
+  const line = document.getElementById('slack-signin-status');
+  if (!line) return;
+  // Amazon Employee ON keeps the Slack MCP path first (Connections); the
+  // paste-token card then leads here. OFF: Sign in with Slack leads.
+  try {
+    const workplace = await fetch('/api/settings/workplace').then(r => (r.ok ? r.json() : null)).catch(() => null);
+    const amazon = workplace ? workplace.amazonEmployee !== false : true;
+    const signin = document.getElementById('slack-signin-card');
+    const token = document.getElementById('slack-token-card');
+    if (signin) signin.style.order = amazon ? '2' : '1';
+    if (token) token.style.order = amazon ? '1' : '2';
+  } catch { /* order is cosmetic */ }
+  try {
+    const [client, status] = await Promise.all([
+      fetch('/api/slack/oauth/client').then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))),
+      fetch('/api/slack/token/status').then(r => (r.ok ? r.json() : {})).catch(() => ({})),
+    ]);
+    slackSignInView = client;
+    const redirect = document.getElementById('slack-signin-redirect');
+    const scopes = document.getElementById('slack-signin-scopes');
+    const https = document.getElementById('slack-signin-https');
+    const finish = document.getElementById('slack-signin-finish');
+    if (redirect) redirect.textContent = client.redirectUri || '';
+    if (scopes) scopes.textContent = (client.userScopes || []).join(',');
+    if (https) https.checked = client.redirectMode === 'https_paste';
+    if (finish) finish.hidden = client.redirectMode !== 'https_paste';
+    if (status.configured && status.connectedVia === 'oauth' && status.identity) {
+      line.textContent = `Signed in as ${status.identity.user || 'unknown user'} in ${status.identity.team || 'workspace'}.`;
+    } else if (client.configured) {
+      line.textContent = `Slack app ${client.clientIdSuffix} saved. Sign in to connect.`;
+    } else {
+      line.textContent = 'Save your Slack app’s Client ID and Client Secret, then sign in.';
+    }
+  } catch (e) {
+    line.textContent = `Could not read the Slack app: ${e.message || 'error'}`;
+  }
+}
+
+async function slackSignInRequest(path, method, body) {
+  const res = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+  return payload;
+}
+
+function bindSlackSignInCard() {
+  if (slackSignInBound) return;
+  const start = document.getElementById('slack-signin-start');
+  if (!start) return;
+  slackSignInBound = true;
+  const copy = (id) => {
+    const text = document.getElementById(id)?.textContent || '';
+    if (text) navigator.clipboard?.writeText(text).then(() => slackSignInMessage('Copied.')).catch(() => slackSignInMessage('Copy failed; select the text instead.'));
+  };
+  document.getElementById('slack-signin-copy-redirect')?.addEventListener('click', () => copy('slack-signin-redirect'));
+  document.getElementById('slack-signin-copy-scopes')?.addEventListener('click', () => copy('slack-signin-scopes'));
+  document.getElementById('slack-signin-https')?.addEventListener('change', async (event) => {
+    try {
+      await slackSignInRequest('/api/slack/oauth/client', 'PUT', { redirectMode: event.target.checked ? 'https_paste' : 'http_loopback' });
+      slackSignInMessage('Redirect address updated. Register the address shown above in your Slack app.');
+    } catch (e) { slackSignInMessage(`Not saved: ${e.message}`); }
+    await refreshSlackSignIn();
+  });
+  document.getElementById('slack-signin-save-client')?.addEventListener('click', async () => {
+    const idInput = document.getElementById('slack-signin-client-id');
+    const secretInput = document.getElementById('slack-signin-client-secret');
+    try {
+      await slackSignInRequest('/api/slack/oauth/client', 'PUT', { clientId: idInput?.value || '', clientSecret: secretInput?.value || '' });
+      if (secretInput) secretInput.value = '';
+      if (idInput) idInput.value = '';
+      slackSignInMessage('Slack app saved.');
+    } catch (e) { slackSignInMessage(`Not saved: ${e.message}`); }
+    await refreshSlackSignIn();
+  });
+  start.addEventListener('click', async () => {
+    try {
+      const { authorizeUrl, redirectMode } = await slackSignInRequest('/api/slack/oauth/start', 'POST');
+      window.open(authorizeUrl, '_blank', 'noopener');
+      slackSignInMessage(redirectMode === 'https_paste'
+        ? 'Approve in Slack. The browser then shows an error page; copy its whole address and paste it below.'
+        : 'Approve in Slack; this page updates when you come back.');
+      const finish = document.getElementById('slack-signin-finish');
+      if (finish) finish.hidden = redirectMode !== 'https_paste';
+    } catch (e) { slackSignInMessage(e.message); }
+  });
+  document.getElementById('slack-signin-finish-btn')?.addEventListener('click', async () => {
+    const input = document.getElementById('slack-signin-paste');
+    try {
+      const body = await slackSignInRequest('/api/slack/oauth/finish', 'POST', { pasted: input?.value || '' });
+      if (input) input.value = '';
+      slackSignInMessage(`Connected as ${body.identity?.user || 'unknown user'} in ${body.identity?.team || 'workspace'}.${body.reloadError ? ` ${body.reloadError}` : ''}`);
+      await refreshSlackTokenStatus();
+    } catch (e) { slackSignInMessage(`Not connected: ${e.message}`); }
+    await refreshSlackSignIn();
+  });
+}
+
 async function loadSlackSources() {
   bindSlackSourcesFilter();
   bindSlackTokenCard();
+  bindSlackSignInCard();
   void refreshSlackTokenStatus();
+  void refreshSlackSignIn();
   // Clear banners before a fresh load.
   const status = document.getElementById('slack-sources-status');
   const err = document.getElementById('slack-sources-error');

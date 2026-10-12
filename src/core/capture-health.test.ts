@@ -241,4 +241,55 @@ describe('capture health while Amazon Employee is off (Settings → Workplace)',
     amazon = true;
     expect(health.issues().map(issue => issue.source)).toEqual(['slack']);
   });
+
+  it('Sign in with Slack: a revoked OAuth token names sign-in again, never mwinit; a pasted token keeps its copy', () => {
+    amazon = false;
+    // OFF install, no token yet: the OAuth callback then saves one (no restart).
+    token = false;
+    let via: 'oauth' | 'token' | null = null;
+    const health = createCaptureHealth({
+      db: storage.getDb(), now: () => clock.value, amazonEmployee: () => amazon,
+      slackTokenConfigured: () => token, slackConnectedVia: () => via,
+    });
+    expect(health.issues()).toEqual([]);
+    token = true;
+    via = 'oauth';
+    const kind = classifyCaptureFailure('An API error occurred: token_revoked');
+    expect(kind).toBe('service_auth');
+    health.reportFailure('slack', { kind, reason: 'token_revoked' });
+    clock.value += minutes(6);
+    health.reportFailure('slack', { kind, reason: 'token_revoked' });
+    const [issue] = health.issues();
+    expect(issue).toMatchObject({ source: 'slack', nextAction: 'Open Connections → Slack and sign in with Slack again.' });
+    expect(`${issue.cause} ${issue.nextAction}`).not.toMatch(/mwinit|Midway/i);
+    amazon = true;
+    expect(health.issues()[0].nextAction).toBe('Open Connections → Slack and sign in with Slack again.');
+    amazon = false;
+    via = 'token';
+    expect(health.issues()[0].nextAction).toBe('Open Connections → Slack → Manage and save a new Slack user token.');
+    expect(classifyCaptureFailure('missing_scope')).toBe('service_auth');
+  });
+
+  it('Google Drive is its own source with Reconnect, Connect Drive, and enable-API actions', () => {
+    amazon = false;
+    const health = make();
+    const cases: Array<[string, RegExp]> = [
+      ['invalid_grant: Token has been expired or revoked.', /Reconnect Google/],
+      ['403 insufficientPermissions: Request had insufficient authentication scopes.', /Connect Google Drive/],
+      ['403 accessNotConfigured: Google Drive API has not been used in project 1 before or it is disabled.', /Enable the Google Drive API/],
+    ];
+    for (const [reason, action] of cases) {
+      health.reportSuccess('gdrive');
+      health.reportFailure('gdrive', { kind: classifyCaptureFailure(reason), reason });
+      clock.value += minutes(11);
+      health.reportFailure('gdrive', { kind: classifyCaptureFailure(reason), reason });
+      const issue = health.issues().find(entry => entry.source === 'gdrive');
+      expect(issue, reason).toBeDefined();
+      expect(issue!.nextAction).toMatch(action);
+      expect(issue!.name).toBe('Google Drive');
+    }
+    health.reportFailure('gdrive', { kind: classifyCaptureFailure('403 rateLimitExceeded'), reason: 'rateLimitExceeded' });
+    expect(health.sources().find(entry => entry.source === 'gdrive')!.kind).toBe('rate_limited');
+  });
 });
+

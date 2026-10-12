@@ -30,6 +30,35 @@ export interface ProductDocumentPublicationLocationView {
   capturedWorkItemId: string;
   completedAt: string;
   containsSelectedArtifact: boolean;
+  /** Present only for Google Drive locations (SharePoint views are unchanged). */
+  destination?: DriveDestinationView;
+}
+
+/** Drive-only receipt fields: where it lives and how it was proven. */
+export interface DriveDestinationView {
+  provider: 'gdrive';
+  accountId: string | null;
+  storedAs: 'docx' | 'google_doc' | 'native';
+  verificationKind: string | null;
+  /** "exact file verified" (bytes) or "text verified" (converted Google Doc). */
+  receipt: string | null;
+  /** True after an unknown upload effect: only Check Drive may continue. */
+  effectUnknown: boolean;
+}
+
+function driveDestination(publication: ProductDocumentPublication): { destination?: DriveDestinationView } {
+  if (publication.destinationProvider !== 'gdrive') return {};
+  const kind = publication.verificationKind;
+  return {
+    destination: {
+      provider: 'gdrive',
+      accountId: publication.destinationContainer,
+      storedAs: publication.destinationStoredAs,
+      verificationKind: kind,
+      receipt: kind ? (kind === 'normalized_text' ? 'text verified' : 'exact file verified') : null,
+      effectUnknown: publication.status === 'upload_failed' && Boolean(publication.lastError?.startsWith('Drive effect unknown')),
+    },
+  };
 }
 
 export interface ProductDocumentPublicationAttemptView {
@@ -57,6 +86,7 @@ export interface ProductDocumentPublicationAttemptView {
   createdAt: string;
   updatedAt: string;
   effectCertainty: 'none' | 'possible_remote_effect' | 'verified_remote_effect';
+  destination?: DriveDestinationView;
 }
 
 export interface ProductDocumentPublicationView {
@@ -125,6 +155,7 @@ function attemptView(publication: ProductDocumentPublication, pending: PendingEd
     createdAt: publication.createdAt,
     updatedAt: publication.updatedAt,
     effectCertainty: effectCertainty(publication),
+    ...driveDestination(publication),
   };
 }
 
@@ -182,6 +213,7 @@ export function buildProductDocumentPublicationView(
       capturedWorkItemId: publication.capturedWorkItemId,
       completedAt: publication.capturedAt ?? publication.updatedAt,
       containsSelectedArtifact: publication.artifactId === artifact.artifactId,
+      ...driveDestination(publication),
     });
   }
   const completedLocations = [...locationByDocKey.values()];
