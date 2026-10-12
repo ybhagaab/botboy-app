@@ -250,7 +250,12 @@ export interface McpManager {
   stop(): Promise<void>;
   listServers(): Promise<McpServerSnapshot[]>;
   getServer(serverId: string): Promise<McpServerSnapshot | null>;
-  listProfiles(): Promise<McpProfileSnapshot[]>;
+  /** Visible profiles; `includeHidden` adds the ones hidden by the Amazon Employee toggle (Settings → Workplace only). */
+  listProfiles(options?: { includeHidden?: boolean }): Promise<McpProfileSnapshot[]>;
+  /** True when the Amazon Employee toggle hides this server (built-in Amazon profile or AIM install). */
+  isHiddenByWorkplace(serverId: string): boolean;
+  /** Apply an Amazon Employee change: OFF stops hidden servers (data kept), ON starts configured ones. */
+  applyWorkplaceChange(): Promise<void>;
   getProfile(profileId: string): Promise<McpProfileSnapshot | null>;
   checkProfile(profileId: string): Promise<McpProfileSnapshot>;
   runSetupAction(profileId: string, action: McpSetupAction): Promise<McpSetupActionResult>;

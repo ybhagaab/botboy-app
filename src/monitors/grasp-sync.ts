@@ -204,6 +204,8 @@ export function createGraspSync(deps: {
   config?: GraspSyncConfig;
   /** Outcome of every sync run, for owner-facing capture warnings. */
   captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
+  /** Settings → Workplace: false while Amazon Employee is off; a run then skips before any MCP call. */
+  enabled?: () => boolean;
 }): GraspSync {
   const { db, mcpManager, emit } = deps;
   const intervalMs = deps.config?.intervalMs ?? 30 * 60 * 1000;
@@ -503,6 +505,13 @@ export function createGraspSync(deps: {
       durationMs: 0,
     };
 
+    // Amazon Employee off: no MCP call, no last_run overwrite, no capture-health report.
+    if (deps.enabled?.() === false) {
+      result.status = 'skipped';
+      result.reason = 'amazon_employee_off';
+      result.durationMs = Date.now() - startedAt;
+      return result;
+    }
     if (getSetting<boolean>(db, KEYS.enabled) === false) {
       result.status = 'skipped';
       result.reason = 'grasp_sync.enabled is false';
@@ -672,10 +681,13 @@ export function isBrowserEmailItem(item: RawWorkItem): boolean {
  * hot capture path. Disabling the sync (grasp_sync.enabled=false) restores
  * browser email capture automatically.
  */
-export function createBrowserEmailCaptureGate(db: Database.Database): () => boolean {
+export function createBrowserEmailCaptureGate(db: Database.Database, active?: () => boolean): () => boolean {
   let cached = false;
   let checkedAt = 0;
   return () => {
+    // Amazon Employee off: GRASP is inactive, so browser Outlook pages are captured again.
+    // Checked before the 60 s cache so a toggle applies on the next page.
+    if (active?.() === false) return false;
     const now = Date.now();
     if (now - checkedAt > 60_000) {
       cached = getSetting<boolean>(db, KEYS.enabled) !== false

@@ -89,7 +89,7 @@ export interface AnalyticsSchemaBriefing {
 }
 
 export interface AnalyticsSchemaBriefingLoader {
-  load(message?: string, options?: { localOnly?: boolean }): Promise<AnalyticsSchemaBriefing>;
+  load(message?: string, options?: { localOnly?: boolean; amazonEmployee?: boolean }): Promise<AnalyticsSchemaBriefing>;
 }
 
 export interface AnalyticsSchemaBriefingLoaderOptions {
@@ -372,6 +372,11 @@ function buildCompleteBriefing(
   };
 }
 
+/** The chat preflight fallback when the briefing loader itself failed (chat.ts). */
+export function analyticsBriefingUnavailableText(amazonEmployee: boolean): string {
+  return `BotBoy could not load business/schema knowledge from any source. Check the managed SQL connector (#/connections/sql-context) and the analytics knowledge directory ${amazonEmployee ? '(a2-analytics connection card)' : '(shown on the same SQL connection page)'} before building a dashboard.`;
+}
+
 export function createAnalyticsSchemaBriefingLoader(
   mcpManager?: McpManager,
   options: AnalyticsSchemaBriefingLoaderOptions = {},
@@ -379,7 +384,7 @@ export function createAnalyticsSchemaBriefingLoader(
   const cache = new Map<string, { expiresAt: number; value: AnalyticsSchemaBriefing }>();
 
   return {
-    async load(message = '', runtimeOptions: { localOnly?: boolean } = {}): Promise<AnalyticsSchemaBriefing> {
+    async load(message = '', runtimeOptions: { localOnly?: boolean; amazonEmployee?: boolean } = {}): Promise<AnalyticsSchemaBriefing> {
       // ── Source 1: managed SQL connector schema presets ──
       // Connector trouble degrades to the knowledge-dir source with an
       // honest note instead of failing the whole briefing (teammates run
@@ -452,7 +457,9 @@ export function createAnalyticsSchemaBriefingLoader(
       const catalog = [...sqlCatalog, ...knowledgeCatalog];
       if (!catalog.length) {
         return unavailable(
-          `${sqlStatusLine} No business/schema knowledge is available from any source. Configure a schema knowledge source at #/connections/sql-context, or add knowledge files to the analytics knowledge directory (a2-analytics connection card — ETL onboarding can generate business presets).`,
+          `${sqlStatusLine} No business/schema knowledge is available from any source. Configure a schema knowledge source at #/connections/sql-context, or add knowledge files to the analytics knowledge directory ${runtimeOptions.amazonEmployee === false
+            ? 'shown on the SQL connection page (#/connections/sql-context).'
+            : '(a2-analytics connection card — ETL onboarding can generate business presets).'}`,
         );
       }
 

@@ -8,6 +8,7 @@ import type { McpSecretStore } from './mcp-secret-store.js';
 import { createMcpSecretStore } from './mcp-secret-store.js';
 import {
   customServerIdentity,
+  isAimInstall,
   isRemoteTransport,
   missingRequiredValues,
   normalizeCustomServerInput,
@@ -40,6 +41,7 @@ import {
   getBuiltInMcpProfile,
   getSetupActionDefinition,
   getTerminalCommandDefinition,
+  isAmazonInternalProfileId,
   isBuiltInMcpProfileId,
   pathValueWithFallbackDirectories,
   resolveCommandExecutable,
@@ -53,6 +55,7 @@ import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-
 import { createMcpTerminalEngine } from './mcp-terminal.js';
 import { modelProcessSandboxInvocation, protectedLocalPortPolicy } from './protected-local-resources.js';
 import { createSqlContextPackageResolver, type SqlContextPackageResolver } from './sql-context-package.js';
+import { AmazonEmployeeOffError } from './workplace.js';
 import type {
   BuiltInMcpProfileId,
   CustomMcpProfileFacts,
@@ -332,6 +335,14 @@ export function sqlEnvironment(config: SqlContextMcpConfig, password: string | n
   return { ...env, ...values, SQL_EXPORT_DIR: sqlContextExportDir() };
 }
 
+/** A call or action on a server hidden by the Amazon Employee toggle. The message keeps a stable code token. */
+export class McpHiddenByWorkplaceError extends AmazonEmployeeOffError {
+  constructor(displayName: string) {
+    super(`${displayName} is part of BotBoy's Amazon internal paths, which are off on this install (Settings → Workplace → Amazon Employee). Nothing was called. (code: amazon_employee_off)`);
+    this.name = 'McpHiddenByWorkplaceError';
+  }
+}
+
 export function createMcpManager(options: {
   db: Database.Database;
   secretStore?: McpSecretStore;
@@ -346,6 +357,12 @@ export function createMcpManager(options: {
   remoteMaxResponseBytes?: number;
   /** Tests only: the first reconnect delay of an unreachable remote server (30 s). */
   remoteBackoffBaseMs?: number;
+  /**
+   * Settings → Workplace (workplace.ts). While it returns false, the Amazon
+   * built-in profiles and AIM installs are hidden and inactive; their rows,
+   * secrets, and data are kept. Absent = nothing hidden (today's behavior).
+   */
+  amazonEmployee?: () => boolean;
 }): McpManager {
   const db = options.db;
   const secretStore = options.secretStore ?? createMcpSecretStore();
@@ -372,6 +389,28 @@ export function createMcpManager(options: {
 
   function row(serverId: string): McpServerRow | null {
     return (selectServer.get(serverId) as McpServerRow | undefined) ?? null;
+  }
+
+  /** The four Amazon built-in profiles, or a user-added AIM install. */
+  function isAmazonAudienceServer(serverId: string): boolean {
+    if (isAmazonInternalProfileId(serverId)) return true;
+    const server = row(serverId);
+    return server?.kind === CUSTOM_MCP_KIND && isAimInstall(parseCustomConfig(server.config_json));
+  }
+
+  /** Reads the toggle first, so while ON it never touches a row. */
+  function hiddenByWorkplace(serverId: string): boolean {
+    return options.amazonEmployee?.() === false && isAmazonAudienceServer(serverId);
+  }
+
+  function launchable(serverId: string): boolean {
+    return row(serverId)?.enabled === 1 && !hiddenByWorkplace(serverId);
+  }
+
+  function refuseHidden(serverId: string): void {
+    if (!hiddenByWorkplace(serverId)) return;
+    const server = row(serverId);
+    throw new McpHiddenByWorkplaceError(server?.display_name ?? definitionFor(serverId)?.displayName ?? serverId);
   }
 
   /**
@@ -579,7 +618,7 @@ export function createMcpManager(options: {
   function scheduleRestart(serverId: string, reason: string): void {
     if (!active || restartTimers.has(serverId)) return;
     const server = row(serverId);
-    if (!server || server.enabled !== 1) return;
+    if (!server || server.enabled !== 1 || hiddenByWorkplace(serverId)) return;
     const failures = (consecutiveFailures.get(serverId) ?? 0) + 1;
     consecutiveFailures.set(serverId, failures);
     // A remote server that is unreachable or erroring reconnects slowly and
@@ -621,12 +660,12 @@ export function createMcpManager(options: {
     if (missing.length) throw new Error(pauseForOwner(serverId, missingValuesMessage(missing)));
     const headerValues = await readCustomValues(serverId, 'header', config.headers);
 
-    if (!active || row(serverId)?.enabled !== 1) {
+    if (!active || !launchable(serverId)) {
       updateState(serverId, 'stopped', { error: null, pid: null });
       return;
     }
     await closeRuntime(serverId);
-    if (!active || stopping || row(serverId)?.enabled !== 1) {
+    if (!active || stopping || !launchable(serverId)) {
       updateState(serverId, 'stopped', { error: null, pid: null });
       return;
     }
@@ -688,7 +727,7 @@ export function createMcpManager(options: {
           inputSchema: tool.inputSchema as Record<string, unknown>,
           risk: classifyMcpTool(profile.kind, tool.name),
         }));
-        if (!active || row(serverId)?.enabled !== 1 || runtimes.get(serverId) !== runtime) {
+        if (!active || !launchable(serverId) || runtimes.get(serverId) !== runtime) {
           runtime.expectedClose = true;
           if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
           await endRemoteSession(transport);
@@ -713,7 +752,7 @@ export function createMcpManager(options: {
         consecutiveFailures.set(serverId, 0);
         return;
       } catch (error) {
-        const interrupted = !active || row(serverId)?.enabled !== 1 || runtime.expectedClose;
+        const interrupted = !active || !launchable(serverId) || runtime.expectedClose;
         runtime.expectedClose = true;
         if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
         try { await client.close(); } catch {}
@@ -744,7 +783,7 @@ export function createMcpManager(options: {
       if (!server) throw new Error(`Unknown MCP server: ${serverId}`);
       const profile = definitionFor(serverId);
       if (!profile) throw new Error(`Unknown MCP profile: ${serverId}`);
-      if (server.enabled !== 1) {
+      if (!launchable(serverId)) {
         updateState(serverId, 'stopped', { error: null, pid: null });
         return;
       }
@@ -826,13 +865,13 @@ export function createMcpManager(options: {
         });
       }
 
-      if (!active || row(serverId)?.enabled !== 1) {
+      if (!active || !launchable(serverId)) {
         updateState(serverId, 'stopped', { error: null, pid: null });
         return;
       }
 
       await closeRuntime(serverId);
-      if (!active || stopping || row(serverId)?.enabled !== 1) {
+      if (!active || stopping || !launchable(serverId)) {
         updateState(serverId, 'stopped', { error: null, pid: null });
         return;
       }
@@ -891,7 +930,7 @@ export function createMcpManager(options: {
           inputSchema: tool.inputSchema as Record<string, unknown>,
           risk: classifyMcpTool(profile.kind, tool.name),
         }));
-        if (!active || row(serverId)?.enabled !== 1 || runtimes.get(serverId) !== runtime) {
+        if (!active || !launchable(serverId) || runtimes.get(serverId) !== runtime) {
           runtime.expectedClose = true;
           if (runtimes.get(serverId) === runtime) runtimes.delete(serverId);
           try { await client.close(); } catch {}
@@ -907,7 +946,7 @@ export function createMcpManager(options: {
         });
         consecutiveFailures.set(serverId, 0);
       } catch (error) {
-        const interrupted = !active || row(serverId)?.enabled !== 1 || runtime.expectedClose;
+        const interrupted = !active || !launchable(serverId) || runtime.expectedClose;
         runtime.expectedClose = true;
         runtimes.delete(serverId);
         try { await client.close(); } catch {}
@@ -927,6 +966,7 @@ export function createMcpManager(options: {
   async function ensureReady(serverId: string): Promise<RuntimeState> {
     const server = row(serverId);
     if (!server) throw new Error(`Unknown MCP server: ${serverId}`);
+    refuseHidden(serverId);
     if (server.enabled !== 1) throw new Error(`${server.display_name} is disabled`);
     let runtime = runtimes.get(serverId);
     if (!runtime) {
@@ -1029,6 +1069,7 @@ export function createMcpManager(options: {
     const inputHash = sha256(JSON.stringify(args));
 
     try {
+      refuseHidden(serverId);
       const validatedArgs = validateMcpToolCall(profile.kind, toolName, args, {
         ownerApproved: options.ownerApproved === true,
         guidedFlow: options.guidedFlow === true,
@@ -1103,16 +1144,23 @@ export function createMcpManager(options: {
       };
     } catch (error) {
       if (error instanceof RuntimeBusyError) throw error;
-      const durationMs = Date.now() - started;
+      const recordFailedCall = (status: 'blocked' | 'failed', message: string): void => {
+        db.prepare(`
+          INSERT INTO mcp_tool_calls
+            (id, server_id, tool_name, risk, source, arguments_sha256, status, duration_ms, error, completed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          ON CONFLICT(id) DO UPDATE SET status = excluded.status, duration_ms = excluded.duration_ms,
+            error = excluded.error, completed_at = excluded.completed_at
+        `).run(callId, serverId, toolName, risk, options.source ?? 'api', inputHash, status, Date.now() - started, message);
+      };
+      if (error instanceof McpHiddenByWorkplaceError) {
+        // Audited as blocked; the original object keeps its class and code.
+        recordFailedCall('blocked', error.message);
+        throw error;
+      }
       const message = truncateError(error);
       const status = /blocked|not approved|read-only|not allowed|explicit owner request/i.test(message) ? 'blocked' : 'failed';
-      db.prepare(`
-        INSERT INTO mcp_tool_calls
-          (id, server_id, tool_name, risk, source, arguments_sha256, status, duration_ms, error, completed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(id) DO UPDATE SET status = excluded.status, duration_ms = excluded.duration_ms,
-          error = excluded.error, completed_at = excluded.completed_at
-      `).run(callId, serverId, toolName, risk, options.source ?? 'api', inputHash, status, durationMs, message);
+      recordFailedCall(status, message);
       throw new Error(message);
     }
   }
@@ -1167,6 +1215,7 @@ export function createMcpManager(options: {
         // the timer, so an unreachable remote server was retried on every
         // tick instead of backing off to 10 minutes (live 2026-10-07).
         if (restartTimers.has(server.id) || startLocks.has(server.id)) continue;
+        if (hiddenByWorkplace(server.id)) continue;
         let checkedRuntime: RuntimeState | undefined;
         try {
           const runtime = await ensureReady(server.id);
@@ -1235,6 +1284,7 @@ export function createMcpManager(options: {
 
   async function checkProfileInternal(profileId: string): Promise<McpProfileSnapshot> {
     const server = requireProfileRow(profileId);
+    refuseHidden(profileId);
     const profile = definitionFor(profileId);
     if (profile && (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script')) {
       const executable = await resolveDefinitionExecutable(profile);
@@ -1256,6 +1306,7 @@ export function createMcpManager(options: {
   ): Promise<McpSetupActionResult> {
     const profile = definitionFor(profileId);
     const server = requireProfileRow(profileId);
+    refuseHidden(profileId);
     const definition = profile ? getSetupActionDefinition(profile, action) : null;
     if (!profile || !definition || profile.launch.type !== 'local-executable') {
       throw new Error(`Setup action '${action}' is not available for ${profileId}`);
@@ -1297,6 +1348,7 @@ export function createMcpManager(options: {
 
   async function startProfileInternal(profileId: string): Promise<McpProfileSnapshot> {
     requireProfileRow(profileId);
+    refuseHidden(profileId);
     const profile = definitionFor(profileId);
     if (!profile) throw new Error(`Unknown MCP profile: ${profileId}`);
     if (setupLocks.has(profileId)) throw new Error(`A ${profile.shortName} setup action is already running.`);
@@ -1362,6 +1414,7 @@ export function createMcpManager(options: {
   async function testProfileInternal(profileId: string): Promise<McpProfileTestResult> {
     const profile = definitionFor(profileId);
     if (!profile) throw new Error(`Unknown MCP profile: ${profileId}`);
+    refuseHidden(profileId);
     let runtime = await ensureReady(profileId);
     const probe = (current: RuntimeState) => queueRuntimeCall(profileId, current, async () => {
       await current.client.ping({ timeout: 10_000 });
@@ -1454,6 +1507,7 @@ export function createMcpManager(options: {
     origin: 'user' | 'assistant',
   ): Promise<McpProfileSnapshot> {
     const normalized = normalizeCustomServerInput(input, { origin });
+    if (options.amazonEmployee?.() === false && isAimInstall(normalized)) throw new McpHiddenByWorkplaceError(normalized.name);
     const serverId = customServerId(normalized.name);
     const config: CustomServerConfig = {
       version: 2,
@@ -1496,6 +1550,9 @@ export function createMcpManager(options: {
     assertCustomServerIdle(server);
     const previous = parseCustomConfig(server.config_json);
     const normalized = normalizeCustomServerInput(input, { origin, previous, previousName: server.display_name });
+    if (options.amazonEmployee?.() === false && (isAimInstall(previous) || isAimInstall(normalized))) {
+      throw new McpHiddenByWorkplaceError(normalized.name);
+    }
     const sameIdentity = customServerIdentity(previous) === customServerIdentity(normalized);
     const keptLegacy = Object.fromEntries(Object.entries(previous.legacyEnv ?? {})
       .filter(([name]) => normalized.env.some(entry => entry.name === name) && !normalized.values.has(valueKey('env', name))));
@@ -1702,6 +1759,7 @@ export function createMcpManager(options: {
   async function startTerminalSessionInternal(profileId: string, commandId: string) {
     const profile = definitionFor(profileId);
     const server = requireProfileRow(profileId);
+    refuseHidden(profileId);
     const command = profile ? getTerminalCommandDefinition(profile, commandId) : null;
     if (!profile || !command) throw new Error(`Terminal command '${commandId}' is not available for ${profileId}`);
     if (stopping || !active) throw new Error('The managed MCP runtime is shutting down.');
@@ -1730,6 +1788,49 @@ export function createMcpManager(options: {
     const session = terminalEngine.get(sessionId);
     if (!session || session.profileId !== profileId) throw new Error('Unknown terminal session');
     return session;
+  }
+
+  /** Start one configured server; failures go to the restart backoff. Shared by start() and applyWorkplaceChange. */
+  async function launchConfigured(serverId: string): Promise<void> {
+    try {
+      await startServer(serverId);
+      const runtime = runtimes.get(serverId);
+      if (runtime && serverId === SQL_SERVER_ID) void checkConnectionIfIdle(serverId, runtime).catch((error) => {
+        updateState(serverId, 'degraded', { error: truncateError(error) });
+      });
+    } catch (error) {
+      scheduleRestart(serverId, describeProfileError(definitionFor(serverId), error));
+    }
+  }
+
+  /**
+   * The Amazon Employee toggle changed. OFF: hidden servers stop (enabled
+   * stays 1, data kept). ON: configured Amazon-audience servers start in the
+   * background. No-op while the manager is not running.
+   */
+  async function applyWorkplaceChange(): Promise<void> {
+    if (!active || stopping) return;
+    const servers = (db.prepare('SELECT * FROM mcp_servers').all() as McpServerRow[])
+      .filter(server => isAmazonAudienceServer(server.id));
+    if (options.amazonEmployee?.() === false) {
+      for (const server of servers) {
+        const timer = restartTimers.get(server.id);
+        if (timer) { clearTimeout(timer); restartTimers.delete(server.id); }
+        consecutiveFailures.delete(server.id);
+        const session = terminalEngine.sessionFor(server.id);
+        if (session?.status === 'running') terminalEngine.stop(session.id);
+        const pendingStart = startLocks.get(server.id);
+        await closeRuntime(server.id);
+        if (pendingStart) await pendingStart.catch(() => {});
+        await closeRuntime(server.id);
+        if (server.enabled === 1) updateState(server.id, 'stopped', { error: null, pid: null });
+      }
+      return;
+    }
+    for (const server of servers) {
+      if (server.enabled !== 1 || runtimes.has(server.id)) continue;
+      void launchConfigured(server.id);
+    }
   }
 
   async function stopManager(): Promise<void> {
@@ -1777,18 +1878,9 @@ export function createMcpManager(options: {
       active = true;
       if (launchPreparation.signal.aborted) launchPreparation = new AbortController();
       await migrateLegacyCustomValues();
-      const enabled = db.prepare('SELECT id FROM mcp_servers WHERE enabled = 1').all() as { id: string }[];
-      const launch = async (serverId: string): Promise<void> => {
-        try {
-          await startServer(serverId);
-          const runtime = runtimes.get(serverId);
-          if (runtime && serverId === SQL_SERVER_ID) void checkConnectionIfIdle(serverId, runtime).catch((error) => {
-            updateState(serverId, 'degraded', { error: truncateError(error) });
-          });
-        } catch (error) {
-          scheduleRestart(serverId, describeProfileError(definitionFor(serverId), error));
-        }
-      };
+      const enabled = (db.prepare('SELECT id FROM mcp_servers WHERE enabled = 1').all() as { id: string }[])
+        .filter(server => !hiddenByWorkplace(server.id));
+      const launch = launchConfigured;
       // sql-context may first install a connector update from npm; the other
       // servers start in order without waiting for that download.
       const sqlLaunch = enabled.some(server => server.id === SQL_SERVER_ID) ? launch(SQL_SERVER_ID) : null;
@@ -1806,30 +1898,35 @@ export function createMcpManager(options: {
     stop: stopManager,
 
     async listServers(): Promise<McpServerSnapshot[]> {
-      const servers = db.prepare('SELECT * FROM mcp_servers ORDER BY display_name').all() as McpServerRow[];
+      const servers = (db.prepare('SELECT * FROM mcp_servers ORDER BY display_name').all() as McpServerRow[])
+        .filter(server => !hiddenByWorkplace(server.id));
       return Promise.all(servers.map(server => snapshot(server)));
     },
 
     async getServer(serverId: string): Promise<McpServerSnapshot | null> {
       const server = row(serverId);
-      return server ? snapshot(server) : null;
+      return server && !hiddenByWorkplace(serverId) ? snapshot(server) : null;
     },
 
-    async listProfiles(): Promise<McpProfileSnapshot[]> {
+    async listProfiles(listOptions?: { includeHidden?: boolean }): Promise<McpProfileSnapshot[]> {
       // Registry profiles first, then user-added servers alphabetically.
       const servers = db.prepare(`
         SELECT * FROM mcp_servers
         ORDER BY CASE WHEN kind = '${CUSTOM_MCP_KIND}' THEN 1 ELSE 0 END, display_name
       `).all() as McpServerRow[];
-      const known = servers.filter(server => definitionFor(server.id) !== null);
+      const known = servers.filter(server => definitionFor(server.id) !== null
+        && (listOptions?.includeHidden === true || !hiddenByWorkplace(server.id)));
       return Promise.all(known.map(server => profileSnapshot(server)));
     },
 
     async getProfile(profileId: string): Promise<McpProfileSnapshot | null> {
       const profile = definitionFor(profileId);
       const server = row(profileId);
-      return profile && server ? profileSnapshot(server) : null;
+      return profile && server && !hiddenByWorkplace(profileId) ? profileSnapshot(server) : null;
     },
+
+    isHiddenByWorkplace: (serverId: string) => hiddenByWorkplace(serverId),
+    applyWorkplaceChange,
 
     checkProfile: (profileId) => withProfileLock(profileId, () => checkProfileInternal(profileId)),
     runSetupAction: (profileId, action) => withProfileLock(
@@ -1916,6 +2013,7 @@ export function createMcpManager(options: {
       }
       const server = row(serverId);
       if (!server) throw new Error(`Unknown MCP server: ${serverId}`);
+      refuseHidden(serverId);
       if (server.enabled !== 1) throw new Error(`${server.display_name} is disabled`);
       await closeRuntime(serverId);
       await startServer(serverId);

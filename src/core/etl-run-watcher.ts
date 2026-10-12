@@ -40,6 +40,8 @@ export interface EtlRunWatcherOptions {
   onRunsFinished: (jobId: string) => void;
   intervalMs?: number;
   log?: (message: string) => void;
+  /** Settings → Workplace: false while Amazon Employee is off; pending watches then wait, unread. */
+  enabled?: () => boolean;
 }
 
 export interface EtlRunWatcher {
@@ -78,6 +80,7 @@ export function createEtlRunWatcher(options: EtlRunWatcherOptions): EtlRunWatche
 
   async function tick(): Promise<void> {
     if (ticking || stopped) return;
+    if (options.enabled?.() === false) return;
     ticking = true;
     try {
       for (const jobId of options.jobs.expireIdle()) log(`[EtlWatch] job ${jobId} expired after 24 h idle`);

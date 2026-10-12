@@ -155,8 +155,22 @@ async function refreshChatModelCatalog() {
   const requestId = ++chatModelCatalogRequest;
 
   try {
-    const catalog = parseChatModelCatalog(await api('/chat/models'));
+    const raw = await api('/chat/models');
+    // Stale guard first, for both branches: a slow empty answer never overwrites a newer one.
     if (requestId !== chatModelCatalogRequest) return;
+    if (raw?.configured === false && Array.isArray(raw.models) && raw.models.length === 0) {
+      // Nothing is set up (Settings → Workplace hides team models): one disabled
+      // hint, never the GPT-5.6 fallback names below.
+      chatModelChoices = [];
+      chatDefaultModelKey = 'default';
+      chatModelGroupLabels = new Map();
+      chatModelGroupOf = new Map();
+      select.replaceChildren(new Option('Model · Add a model in Settings → AI model', ''));
+      select.disabled = true;
+      updateChatModelTitle(select);
+      return;
+    }
+    const catalog = parseChatModelCatalog(raw);
     if (!catalog) throw new Error('model catalog response was invalid');
     chatModelChoices = catalog.models.map(model => model.key);
     chatDefaultModelKey = catalog.defaultKey;

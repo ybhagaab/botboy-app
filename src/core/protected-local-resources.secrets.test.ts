@@ -136,16 +136,17 @@ describe('model-run processes and BotBoy credentials', () => {
   );
 });
 
-describe('Data Room rows and an external model provider', () => {
+describe('Data Room rows and an external model provider (owner decision D4: any connected provider)', () => {
   const runtime = (providerLocality: 'device_local' | 'amazon_managed_remote' | 'external_remote') => ({
     providerLocality,
     endpointSha256: 'a'.repeat(64),
   });
 
-  it('never places rows in an external model context, even for legacy versions without a policy', () => {
+  it('places rows in any provider context, including legacy pinned and allowModelContext:false versions', () => {
     const legacy = { classification: 'internal', allowModelContext: true } as any;
     expect(analyticsHandlingAllowsModelContext(legacy, runtime('amazon_managed_remote'))).toBe(true);
-    expect(analyticsHandlingAllowsModelContext(legacy, runtime('external_remote'))).toBe(false);
+    expect(analyticsHandlingAllowsModelContext(legacy, runtime('external_remote'))).toBe(true);
+    expect(analyticsHandlingAllowsModelContext({ classification: 'internal', allowModelContext: false } as any, runtime('external_remote'))).toBe(true);
 
     const pinned = {
       classification: 'internal',
@@ -153,10 +154,11 @@ describe('Data Room rows and an external model provider', () => {
       modelContextPolicy: { allowedProviderLocalities: ['amazon_managed_remote'], disclosurePolicyVersion: 'botboy-data-room-v1' },
     } as any;
     expect(analyticsHandlingAllowsModelContext(pinned, runtime('amazon_managed_remote'))).toBe(true);
-    expect(analyticsHandlingAllowsModelContext(pinned, runtime('external_remote'))).toBe(false);
+    expect(analyticsHandlingAllowsModelContext(pinned, runtime('external_remote'))).toBe(true);
+    expect(analyticsHandlingAllowsModelContext({ ...pinned, modelContextPolicy: { ...pinned.modelContextPolicy, endpointSha256: 'c'.repeat(64) } }, runtime('amazon_managed_remote'))).toBe(true);
   });
 
-  it('withholds dashboard widget rows from every caller once the live provider is external', async () => {
+  it('returns dashboard widget rows to every caller whatever the live provider', async () => {
     const storage = createStorage(':memory:');
     storage.initialize();
     try {
@@ -188,16 +190,14 @@ describe('Data Room rows and an external model provider', () => {
 
       live.providerLocality = 'external_remote';
       for (const callerKind of ['interactive', 'background'] as const) {
-        const withheld = await read(callerKind);
-        expect(withheld).toMatchObject({ columns: [], rows: [], displayedRowCount: 0, truncated: true });
-        expect(JSON.stringify(withheld)).not.toContain('2026-09');
+        expect((await read(callerKind)).rows).toEqual([['2026-09', 5]]);
       }
     } finally {
       storage.close();
     }
   });
 
-  it('tells the model why a query was refused on the owner’s own API key and what to say instead', async () => {
+  it('a policy_denied query (allowedUses) gets the same handling-policy next action on every provider', async () => {
     const storage = createStorage(':memory:');
     storage.initialize();
     try {
@@ -213,8 +213,7 @@ describe('Data Room rows and an external model provider', () => {
 
       const external = await query();
       expect(external).toMatchObject({ code: 'policy_denied', effect: expect.anything() });
-      expect(external.nextAction).toMatch(/own OpenAI or DeepSeek key/);
-      expect(external.nextAction).toMatch(/Data Room page or a local dashboard/);
+      expect(external.nextAction).toMatch(/^Do not bypass the handling policy/);
 
       live.providerLocality = 'amazon_managed_remote';
       expect((await query()).nextAction).toMatch(/^Do not bypass the handling policy/);

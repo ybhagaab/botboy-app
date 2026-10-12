@@ -149,6 +149,7 @@ export function withProductDocumentChatTools(
   base: ToolExecutor,
   service: ProductDocumentService,
   publications?: ProductDocumentPublicationService,
+  options: { footerText?: () => string } = {},
 ): ToolExecutor {
   return {
     async executeTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
@@ -249,6 +250,7 @@ export function withProductDocumentChatTools(
             title: artifact.title,
             content: artifact.content,
             format: args.format,
+            footerText: options.footerText?.() ?? '',
           });
           const materialized = await materializeCanonicalExport(
             artifact.artifactId,

@@ -9,7 +9,7 @@ disagree, the code is the bug or this file is — reconcile, never ignore.
 ## 1. Evidence (`work_items`)
 Definition: everything captured from the user's environment — Slack messages,
 browser visits, app window captures, clipboard, filesystem documents, GRASP-
-synced owner-addressed email and calendar events, Gmail-synced owner-addressed
+synced owner-addressed email and calendar events (Amazon Employee only), Gmail-synced owner-addressed
 and sent email (source `gmail`, for non-Amazon accounts; same `email_read` /
 `email_sent` types and metadata as Outlook mail, with the Gmail thread as the
 conversation; mail BotBoy sends with `gmail_send` arrives the same way on the
@@ -137,7 +137,7 @@ Guards: pinned projects, manually edited brains, (class a) open tasks/blockers.
 Archival is reversible; a title-echo clipboard capture of the project's own
 title never shields a project.
 
-## 8. SharePoint & OneDrive documents (`#/connections/document-sync`)
+## 8. SharePoint & OneDrive documents (`#/connections/document-sync`) (Amazon Employee only)
 Definition: a background sync (managed MCP profile `sharepoint`) turns the
 owner's document world into evidence. Sources are user-selected: shared-with-
 me, personal OneDrive, team libraries — each with a baseline depth (90 days /
@@ -212,7 +212,7 @@ MCP-level issues and their built-in fixes (do not fight these):
   restarts the profile (once per 10 min). After a BotBoy restart with stale
   jars the FIRST discovery fails and heals; the next succeeds. Only escalate
   if it persists past two cycles (then: `mwinit` freshness).
-- Midway expiry pauses everything losslessly (queue and cursors freeze);
+- Midway expiry (Amazon Employee only) pauses everything losslessly (queue and cursors freeze);
   the sentinel nudges the owner; nothing is lost or retried destructively.
 - Long downloads serialize the shared server: chat reads queue behind them
   (picker routes use skipIfBusy and return "busy" instead of hanging).

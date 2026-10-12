@@ -33,7 +33,7 @@ function load(state: Record<string, unknown>): Helpers {
     topLevel('captureIssueFor'), topLevel('captureIssueDetail'),
     topLevel('gmailAccountName'), topLevel('gmailMultiCardModel'),
     topLevel('gmailImportActive'), topLevel('gmailImportDate'), topLevel('renderGmailImportCard'),
-    topLevel('renderGmailAccountCard'), topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
+    topLevel('amazonEmployeeOn'), topLevel('renderGmailAccountCard'), topLevel('gmailSyncCardModel'), topLevel('renderGmailSyncSettings'),
     'return { gmailSyncCardModel, renderGmailSyncSettings };',
   ].join('\n');
   // eslint-disable-next-line no-new-func

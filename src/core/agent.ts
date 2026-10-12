@@ -59,6 +59,8 @@ export function createAgentOrchestrator(
   toolExecutor?: ToolExecutor,
   promptManager?: PromptManager,
   mcpManager?: McpManager,
+  /** Settings → Workplace (Amazon Employee); read once per executeAction. Absent = ON. */
+  amazonEmployee?: () => boolean,
 ): AgentOrchestrator {
   let status: ProcessingStatus = { active: false, progress: { done: 0, total: 0 } };
 
@@ -189,7 +191,7 @@ export function createAgentOrchestrator(
             return undefined;
           })
         : undefined;
-      const promptContext = { nodes, mcpServers };
+      const promptContext = { nodes, mcpServers, amazonEmployee: amazonEmployee?.() ?? true };
       const systemPrompt = promptManager
         ? promptManager.getSystemPrompt('chat', promptContext)
         : `You are BotBoy, an autonomous productivity assistant managing a personal knowledge tracker.

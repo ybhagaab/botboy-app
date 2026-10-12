@@ -1,7 +1,6 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import {
-  analyticsHandlingAllowsModelContext,
   analyticsRequestSha256,
   analyticsSha256,
   chooseAnalyticsSource,
@@ -476,10 +475,9 @@ export function createAnalyticsAnswerService(input: {
     return now().toISOString();
   }
 
+  /** D4: model context is provenance only, so the stored handling is shown as is. */
   function handlingForRuntime(handling: AnalyticsDataRoomCandidate['contract']['handling']) {
-    return analyticsHandlingAllowsModelContext(handling, input.modelContextRuntime)
-      ? handling
-      : { ...handling, allowModelContext: false };
+    return handling;
   }
 
   function projections(request: AnalyticsRequest, execution: AnalyticsAnswerExecutionCounts): AnalyticsCatalogCandidateProjection[] {

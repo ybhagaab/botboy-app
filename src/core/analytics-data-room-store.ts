@@ -615,8 +615,8 @@ function assertHandling(handling: AnalyticsDatasetContract['handling'], use: Ana
   // Publishing is the owner's decision alone (owner directive 2026-10-10):
   // a dataset never blocks what the owner chooses to publish.
   if (use === 'publication') return;
-  const allowed = handling.allowedUses.includes(use)
-    && (use !== 'local_answer' || handling.allowModelContext);
+  // D4: model context is provenance only; allowedUses is the use gate.
+  const allowed = handling.allowedUses.includes(use);
   if (!allowed) fail('policy_denied', `Version handling policy does not permit ${use}.`);
 }
 
@@ -2447,8 +2447,6 @@ export function createAnalyticsDataRoomStore(input: {
     ]);
     let requiredClassificationRank = 0;
     let allowedUses = new Set<AnalyticsDataRoomUse>(['local_answer', 'dashboard', 'publication']);
-    let allowModelContext = true;
-    const inputModelContextPolicies: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>[] = [];
     let allowPublication = true;
     let commonPartitions: Set<string> | null = null;
     let minimumWatermark: string | null = null;
@@ -2475,8 +2473,6 @@ export function createAnalyticsDataRoomStore(input: {
       if (rank === undefined) fail('policy_denied', `Input ${pin.alias} has an unknown handling classification.`);
       requiredClassificationRank = Math.max(requiredClassificationRank, rank);
       allowedUses = new Set([...allowedUses].filter(use => version.handling.allowedUses.includes(use)));
-      allowModelContext &&= version.handling.allowModelContext;
-      if (version.handling.modelContextPolicy) inputModelContextPolicies.push(version.handling.modelContextPolicy);
       allowPublication &&= version.handling.allowPublication;
       const partitions = new Set<string>(version.coverage.completePartitions);
       const priorPartitions = commonPartitions as Set<string> | null;
@@ -2490,16 +2486,10 @@ export function createAnalyticsDataRoomStore(input: {
     }
     if (lineage.inputs.length !== dependencies.size) fail('integrity_failed', 'Derived lineage does not pin every dependency exactly once.');
     const outputRank = classificationRank.get(dataset.contract.handling.classification.toLowerCase());
-    const outputModelPolicy = dataset.contract.handling.modelContextPolicy;
-    const widensModelPolicy = dataset.contract.handling.allowModelContext && inputModelContextPolicies.some(policy =>
-      !outputModelPolicy
-      || outputModelPolicy.allowedProviderLocalities.some(locality => !policy.allowedProviderLocalities.includes(locality))
-      || (policy.endpointSha256 !== undefined && outputModelPolicy.endpointSha256 !== policy.endpointSha256)
-      || outputModelPolicy.disclosurePolicyVersion !== policy.disclosurePolicyVersion);
+    // D4: input model-context pins are provenance only, so a derived output
+    // over a legacy pinned input is not a widening.
     if (outputRank === undefined || outputRank < requiredClassificationRank
       || dataset.contract.handling.allowedUses.some(use => !allowedUses.has(use))
-      || (dataset.contract.handling.allowModelContext && !allowModelContext)
-      || widensModelPolicy
       || (dataset.contract.handling.allowPublication && !allowPublication)) {
       fail('policy_denied', 'Derived handling contract widens an input policy.');
     }

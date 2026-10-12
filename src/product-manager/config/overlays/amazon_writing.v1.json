@@ -1,7 +1,7 @@
 {
   "schema_version": "writing-overlay.v1",
   "overlay_id": "amazon_writing.v1",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "overlay_type": "writing",
   "purpose": "Apply the Amazon writing register — sentence-level style, Global English, and reader voice — plus audience-first narrative, evidence, editing, review, and formatting guidance, while allowing the selected document profile and current organization template to control structure.",
   "rules": [
@@ -22,7 +22,7 @@
     "Speak to the reader in the second person and from the customer's point of view: \"With X, you can…\" or \"Use X to…\", never \"X allows/enables/lets you…\". Enable and disable apply to features and settings, never to people.",
     "Put the goal before the task in instructions: \"To connect to your gateway, first get the IP address\", not \"Get the IP address as the first step in connecting\".",
     "Prefer narrative prose over bullet lists; carry short enumerations inline as (a) …, (b) …, (c) … within the sentence, the way most Amazon documents do. Reserve a vertical numbered list for procedures where sequence or priority genuinely matters, and keep every item a complete sentence.",
-    "State the document's date near the title and use the required confidentiality handling; exports add the Amazon Confidential footer and page numbers automatically, so never hand-write page furniture in the body.",
+    "State the document's date near the title and use the required confidentiality handling; exports add the configured footer and page numbers automatically, so never hand-write page furniture in the body.",
     "Lead with the decision, takeaway, recommendation, request, or purpose.",
     "Build an outline and evidence plan before drafting prose.",
     "Review authoritative prior documents before creating a new narrative.",

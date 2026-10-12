@@ -229,7 +229,17 @@ function listRules(title: string, rules: string[]): string {
   return `## ${title}\n${rules.map((rule, index) => `${index + 1}. ${rule}`).join('\n')}`;
 }
 
-export function createProfileRegistry(options: { configDir?: string } = {}): ProfileRegistry {
+/**
+ * Overlays replaced while Amazon Employee is off (Settings → Workplace). The
+ * neutral overlay keeps the same register and mechanics without Amazon
+ * sources. STE100 stays for everyone.
+ */
+export const WORKPLACE_OVERLAY_SUBSTITUTIONS: Readonly<Record<string, string>> = {
+  'amazon_writing.v1': 'plain_business_writing.v1',
+};
+
+export function createProfileRegistry(options: { configDir?: string; amazonEmployee?: () => boolean } = {}): ProfileRegistry {
+  const amazonEmployee = options.amazonEmployee ?? (() => true);
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
   const configDir = options.configDir ?? path.join(moduleDir, 'config');
   const profiles = new Map<string, DocumentProfile>();
@@ -271,6 +281,11 @@ export function createProfileRegistry(options: { configDir?: string } = {}): Pro
       incompatibleCoreProfiles.length ? `Version mismatch: ${incompatibleCoreProfiles.join(', ')}.` : '',
     ].filter(Boolean).join(' '));
   }
+  for (const [from, to] of Object.entries(WORKPLACE_OVERLAY_SUBSTITUTIONS)) {
+    if (overlays.has(from) && !overlays.has(to)) {
+      throw new Error(`[product-manager] Workplace overlay substitution ${from} → ${to} references missing overlay ${to}`);
+    }
+  }
   for (const profile of profiles.values()) {
     for (const overlayId of profile.overlays) {
       if (!overlays.has(overlayId)) throw new Error(`[product-manager] Profile ${profile.profile_id} references missing overlay ${overlayId}`);
@@ -299,7 +314,14 @@ export function createProfileRegistry(options: { configDir?: string } = {}): Pro
     return rubric;
   }
 
+  /** The overlays actually applied for a profile now (substituted while Amazon Employee is off). */
+  function effectiveOverlayIds(profileId: string): string[] {
+    const ids = getProfile(profileId).overlays;
+    if (amazonEmployee() !== false) return [...ids];
+    return ids.map((id) => WORKPLACE_OVERLAY_SUBSTITUTIONS[id] ?? id);
+  }
   return {
+    effectiveOverlayIds,
     listProfiles: () => [...profiles.values()]
       .sort((a, b) => a.profile_id.localeCompare(b.profile_id))
       .map((profile) => ({
@@ -328,7 +350,7 @@ export function createProfileRegistry(options: { configDir?: string } = {}): Pro
       authoringPlan?: DocumentAuthoringPlan,
     ): string {
       const profile = getProfile(profileId);
-      const selectedOverlays = profile.overlays.map(getOverlay);
+      const selectedOverlays = effectiveOverlayIds(profile.profile_id).map(getOverlay);
       const selectedModules = profile.conditional_modules
         .filter((id) => id.endsWith('.v1') && overlays.has(id))
         .map(getOverlay);

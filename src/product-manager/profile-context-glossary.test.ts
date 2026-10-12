@@ -34,12 +34,38 @@ const parser: DocumentParser = {
 };
 
 describe('product-manager profile, context, and glossary foundation', () => {
+  it('substitutes the neutral writing overlay while Amazon Employee is off (Settings → Workplace)', () => {
+    let amazon = false;
+    const registry = createProfileRegistry({ amazonEmployee: () => amazon });
+    const off = registry.buildWritingInstructions('op_roadmap_vision.v1', 'advisory');
+    expect(off).toContain('plain_business_writing.v1');
+    expect(off).not.toContain('amazon_writing.v1');
+    expect(registry.effectiveOverlayIds('op_roadmap_vision.v1')).toContain('plain_business_writing.v1');
+    expect(registry.effectiveOverlayIds('op_roadmap_vision.v1')).toContain('asd_ste100_issue9.v1');
+    amazon = true;
+    const on = registry.buildWritingInstructions('op_roadmap_vision.v1', 'advisory');
+    expect(on).toContain('amazon_writing.v1');
+    expect(on).not.toContain('plain_business_writing.v1');
+    expect(on).toBe(createProfileRegistry().buildWritingInstructions('op_roadmap_vision.v1', 'advisory'));
+    const plain = registry.getOverlay('plain_business_writing.v1');
+    expect(JSON.stringify(plain.rules)).not.toMatch(/Amazon/);
+  });
+
+  it('fails fast when a workplace substitution target is missing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pm-config-'));
+    fs.cpSync(path.join(process.cwd(), 'src/product-manager/config'), dir, { recursive: true });
+    fs.rmSync(path.join(dir, 'overlays', 'plain_business_writing.v1.json'));
+    expect(() => createProfileRegistry({ configDir: dir })).toThrow(/plain_business_writing\.v1/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('loads all versioned profiles, overlays, and exact rubric totals', () => {
     const registry = createProfileRegistry();
     expect(registry.listProfiles()).toHaveLength(9);
     expect(registry.listOverlays().map((entry) => entry.overlayId)).toEqual([
       'amazon_writing.v1',
       'asd_ste100_issue9.v1',
+      'plain_business_writing.v1',
       'tenets.v1',
     ]);
     expect(registry.getProfile('communication/email.v1').family).toBe('communication');

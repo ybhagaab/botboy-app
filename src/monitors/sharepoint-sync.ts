@@ -278,6 +278,9 @@ function isStaleAuthJarError(message: string): boolean {
   return /silent authorize did not return a code/i.test(message);
 }
 
+/** connectionReady reason while Amazon Employee is off; never reported to capture health. */
+export const SHAREPOINT_SKIP_AMAZON_OFF = 'amazon employee off';
+
 export function createSharePointSync(deps: {
   db: Database.Database;
   mcpManager: McpManager;
@@ -289,6 +292,8 @@ export function createSharePointSync(deps: {
   config?: SharePointSyncConfig;
   /** Outcome of every discovery, for owner-facing capture warnings. */
   captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
+  /** Settings → Workplace: false while Amazon Employee is off; discovery and drain then skip quietly. */
+  enabled?: () => boolean;
 }): SharePointSync {
   const { db, mcpManager, emit } = deps;
   const parser = deps.documentParser;
@@ -403,6 +408,8 @@ export function createSharePointSync(deps: {
 
   // ── Profile readiness ─────────────────────────────────────────────────────
   async function connectionReady(): Promise<{ ok: boolean; reason?: string }> {
+    // First: while off the manager hides the profile, which would otherwise read as 'profile missing'.
+    if (deps.enabled?.() === false) return { ok: false, reason: SHAREPOINT_SKIP_AMAZON_OFF };
     if (getSetting<boolean>(db, KEYS.enabled) !== true) return { ok: false, reason: 'sync disabled' };
     const profile = await mcpManager.getProfile(PROFILE_ID);
     if (!profile) return { ok: false, reason: 'profile missing' };
@@ -565,7 +572,7 @@ export function createSharePointSync(deps: {
       result.durationMs = now() - startedAt;
       // Sync is on but its connection cannot serve it: that is an outage the
       // owner should see. A server still starting, or sync turned off, is not.
-      if (ready.reason && ready.reason !== 'sync disabled' && ready.reason !== 'profile starting') {
+      if (ready.reason && !['sync disabled', 'profile starting', SHAREPOINT_SKIP_AMAZON_OFF].includes(ready.reason)) {
         deps.captureHealth?.reportFailure('sharepoint', {
           kind: classifyCaptureFailure(ready.reason),
           reason: `SharePoint connection: ${ready.reason}`,

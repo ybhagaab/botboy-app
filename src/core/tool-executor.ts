@@ -32,7 +32,7 @@ import {
 import type { AnalyticsDatasetPreparationPlanV1 } from './analytics-job-types.js';
 import type { AnalyticsDataRoomCatalogReader } from './analytics-data-room-service.js';
 import type { AnalyticsDataRoomReadService } from './analytics-data-room-read.js';
-import { analyticsHandlingAllowsModelContext, stableAnalyticsJson, type AnalyticsModelContextRuntime } from './analytics-data-room-policy.js';
+import { stableAnalyticsJson, type AnalyticsModelContextRuntime } from './analytics-data-room-policy.js';
 import type { ChatTerminalService } from './chat-terminal.js';
 import type { ToolCall } from './llm-client.js';
 import { writeFileMaxChars } from './limits.js';
@@ -64,6 +64,7 @@ import type { VisualAssetRegistry } from './visual-assets.js';
 import type { VisualInspector } from './visual-inspector.js';
 import type { ProjectArtifactService } from './project-artifacts.js';
 import type { ToolImageEvidence } from './vision-payload.js';
+import { amazonEmployeeOffToolResult, isAmazonEmployeeOffError } from './workplace.js';
 import {
   createDataRoomToolFailure,
   dataRoomAuthorization,
@@ -854,46 +855,6 @@ export function createToolExecutor(
   const API_BASE = `http://localhost:${process.env.PPT_PORT || 7778}/api`;
   const normalizeTaskText = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ');
 
-  function dashboardForModel<T>(dashboard: T, context?: ToolExecutionContext): T {
-    if (!dashboard || typeof dashboard !== 'object') return dashboard;
-    const value = dashboard as any;
-    return {
-      ...value,
-      widgets: (value.widgets || []).map((widget: any) => {
-        const source = widget.result?.source;
-        if ((source?.provider !== 'data-room' && source?.provider !== 'data-room-query') || !source.versionId) return widget;
-        let allowed = false;
-        try {
-          const version = analyticsDataRoom?.getDatasetVersion(String(source.versionId));
-          // Background callers are pinned-policy-conservative (no runtime),
-          // but an external active provider withholds rows from every caller:
-          // the background agent runs on that same provider.
-          const externalProvider = modelContextRuntime?.providerLocality === 'external_remote';
-          allowed = Boolean(version && !externalProvider && analyticsHandlingAllowsModelContext(
-            version.handling,
-            context?.callerKind === 'background' ? undefined : modelContextRuntime,
-          ));
-        } catch {
-          allowed = false;
-        }
-        if (allowed) return widget;
-        return {
-          ...widget,
-          result: {
-            ...widget.result,
-            columns: [],
-            rows: [],
-            displayedRowCount: 0,
-            truncated: true,
-            limitations: [
-              'Rows withheld: this Data Room version is pinned to a different model provider locality or endpoint.',
-            ],
-          },
-        };
-      }),
-    } as T;
-  }
-
   /** Wake the scheduler and observe one run until it is terminal or the wait ends. */
   async function waitForAnalyticsRun(run: AnalyticsRun, waitMs: number, signal?: AbortSignal): Promise<AnalyticsRun> {
     const deadline = Date.now() + waitMs;
@@ -1338,6 +1299,9 @@ export function createToolExecutor(
   // mapSharePointWriteTarget lives in docx-body-editor.ts (shared with the
   // reader's Sync path since the pending-edits lane landed).
 
+  // One structured refusal for tools on servers hidden by Amazon Employee (workplace.ts).
+  const workplaceOff = (name: string): ToolHandlerOutput => ({ content: JSON.stringify(amazonEmployeeOffToolResult(name)), isError: true });
+
   const handlers: Record<string, (args: any, context?: ToolExecutionContext) => Promise<ToolHandlerOutput> | ToolHandlerOutput> = {
     // ── Guarded canonical workspace control plane ──
     manage_area: async (args) => {
@@ -1614,6 +1578,7 @@ export function createToolExecutor(
             : await mcpManager.stopProfile(profileId);
         return JSON.stringify({ action, profile: summarize(profile) }, null, 1);
       } catch (error: any) {
+        if (isAmazonEmployeeOffError(error)) return workplaceOff('mcp_profile_action');
         const profile = await mcpManager.getProfile(profileId).catch(() => null);
         const custom = profile?.kind === 'custom';
         return JSON.stringify({
@@ -1660,6 +1625,7 @@ export function createToolExecutor(
         const profile = await mcpManager.createCustomServer(input, { origin: 'assistant' });
         return await customServerReceipt('created', profile);
       } catch (error: any) {
+        if (isAmazonEmployeeOffError(error)) return workplaceOff('mcp_add_custom_server');
         return `Error: ${error?.message ?? String(error)}`;
       }
     },
@@ -1674,6 +1640,7 @@ export function createToolExecutor(
       }
       const serverId = String(args.serverId ?? '').trim();
       if (!serverId) return 'Error: serverId is required';
+      if (mcpManager.isHiddenByWorkplace?.(serverId)) return workplaceOff('mcp_update_custom_server');
       const before = await mcpManager.getProfile(serverId).catch(() => null);
       if (!before || before.kind !== 'custom') {
         return `Error: unknown custom MCP server '${serverId}'. Built-in connections are not edited this way; list servers with mcp_status.`;
@@ -1690,6 +1657,7 @@ export function createToolExecutor(
       } catch (error: any) {
         // Nothing changed: bring the server back as it was.
         if (wasActive) await mcpManager.startProfile(serverId).catch(() => null);
+        if (isAmazonEmployeeOffError(error)) return workplaceOff('mcp_update_custom_server');
         return `Error: ${error?.message ?? String(error)}${wasActive ? ' Nothing changed, and the server was started again as it was.' : ' Nothing changed.'}`;
       }
       let current = updated;
@@ -1712,6 +1680,7 @@ export function createToolExecutor(
       if (!mcpManager) return 'Error: managed MCP runtime unavailable';
       const serverId = String(args.serverId ?? '').trim();
       if (!serverId) return 'Error: serverId is required';
+      if (mcpManager.isHiddenByWorkplace?.(serverId)) return workplaceOff('mcp_get_custom_server_config');
       const config = await mcpManager.getCustomServerConfig(serverId);
       if (!config) return `Error: unknown custom MCP server '${serverId}'`;
       const profile = await mcpManager.getProfile(serverId).catch(() => null);
@@ -1775,6 +1744,7 @@ export function createToolExecutor(
       const serverId = String(args.serverId ?? '').trim();
       const toolName = String(args.toolName ?? '').trim();
       if (!serverId || !toolName) return 'Error: serverId and toolName are required';
+      if (mcpManager.isHiddenByWorkplace?.(serverId)) return workplaceOff('mcp_describe_tool');
       const server = await mcpManager.getServer(serverId);
       if (!server) return `Error: unknown MCP server '${serverId}'`;
       const tool = server.tools.find(candidate => candidate.name === toolName);
@@ -3066,9 +3036,7 @@ export function createToolExecutor(
           tool,
           error,
           nextAction: code === 'policy_denied'
-            ? (modelContextRuntime?.providerLocality === 'external_remote'
-              ? 'Data Room rows never go to an external model: this chat is running on the owner’s own OpenAI or DeepSeek key (Settings → AI model). Tell the owner the rows stay on this Mac and can be read in the Data Room page or a local dashboard, or by choosing a team gateway model in the chat model picker when one is set up. Do not try other tools to read them.'
-              : 'Do not bypass the handling policy. Use an allowed local/dashboard consumer or ask the owner for a policy-compliant outcome.')
+            ? 'Do not bypass the handling policy. Use an allowed local/dashboard consumer or ask the owner for a policy-compliant outcome.'
             : 'Correct every listed issue; refresh list_data_room_datasets first when state changed; then retry once.',
           effect: dataRoomNoEffect(),
           authorization: policyAuthorization,
@@ -3805,7 +3773,7 @@ export function createToolExecutor(
       if (!dashboard) return `Error: dashboard ${dashboardId} not found`;
       // Warnings & issues the owner sees on the page (data checks + view checks).
       const issues = dashboardIssues(dashboard, viewIssueReports.get(dashboard.id));
-      return JSON.stringify({ ...dashboardForModel(dashboard, context), issues }, null, 1);
+      return JSON.stringify({ ...dashboard, issues }, null, 1);
     },
 
     create_analytics_dashboard: async (args, context) => {
@@ -3874,7 +3842,7 @@ export function createToolExecutor(
         ok: true,
         refresh,
         message: `Refresh ${refresh.id} is ${refresh.status}; widget queries will run in the background.`,
-        dashboard: dashboardForModel(analyticsService.getDashboard(dashboardId), context),
+        dashboard: analyticsService.getDashboard(dashboardId),
         localUrl: `#/dashboards/${dashboardId}`,
       }, null, 1);
     },
@@ -4567,6 +4535,9 @@ export function createToolExecutor(
           ...(normalized.imageEvidence?.length ? { imageEvidence: normalized.imageEvidence } : {}),
         };
       } catch (e: any) {
+        if (isAmazonEmployeeOffError(e)) {
+          return { toolCallId: call.id, content: JSON.stringify(amazonEmployeeOffToolResult(name)), isError: true };
+        }
         const dataRoomTool = (['list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source'] as const)
           .find(tool => tool === name);
         if (dataRoomTool) {

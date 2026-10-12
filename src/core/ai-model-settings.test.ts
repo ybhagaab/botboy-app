@@ -439,4 +439,55 @@ describe('Settings → AI model connections', () => {
     expect(settings.chatModels.catalog()?.defaultKey).toBe('deepseek.deepseek-flash');
     expect(offline.close).toHaveBeenCalled();
   });
+
+  it('hides team models when Amazon Employee is off and nothing is set up (Settings → Workplace)', async () => {
+    const offline = {
+      healthCheck: async () => false, isAvailable: () => false, getDefaultModel: () => 'openai.gpt-5.6-terra',
+      getMaxCompletionTokens: () => 16_384, getProviderIssue: () => undefined, getAvailableModels: () => undefined, close: vi.fn(),
+    } as unknown as LlmClient;
+    let visible = false;
+    const settings = await createAiModelSettingsService({
+      envProvider: { id: 'bedrock', endpoint: 'https://bedrock.test/v1', model: 'openai.gpt-5.6-terra', apiMode: 'responses', maxContextTokens: 1_000_000, localFallbackEnabled: false, createClient: () => offline },
+      privateRoot,
+      env: { BOTBOY_INFERENCE_HEALTH_INTERVAL_MS: '0' },
+      environmentCredentialsPresent: false,
+      openAiEndpoint: fakes.openai,
+      deepSeekEndpoint: fakes.deepseek,
+      teamVisibleWithoutCredentials: () => visible,
+    });
+    closers.push(settings);
+    const status = settings.status();
+    expect(status.connections).toEqual([]);
+    expect(status.models).toEqual([]);
+    expect(status.backgroundModel).toBe('Not set up');
+    for (const role of ['processing', 'documents'] as const) {
+      expect(status.roles[role]).toMatchObject({ modelKey: '', label: 'Not set up', connectionLabel: '', chosen: false });
+    }
+    expect(settings.chatModels.catalog()).toEqual({ defaultKey: '', groups: [], models: [], configured: false });
+    expect(JSON.stringify(status)).not.toMatch(/GPT-5\.6|Terra/);
+    const events: string[] = [];
+    settings.chatModels.onChange(event => events.push(event.connectionId));
+    const before = settings.version();
+    settings.refreshVisibility();
+    expect(settings.version()).toBe(before + 1);
+    expect(events).toEqual([]);
+    visible = true;
+    expect(settings.status().connections.map(connection => connection.id)).toEqual(['team']);
+  });
+
+  it('keeps team models for an OFF owner who holds team credentials', async () => {
+    const settings = await createAiModelSettingsService({
+      envProvider,
+      usageService: createLlmUsageService(storage.getDb(), { primaryProvider: envProvider.id }),
+      env: { BOTBOY_INFERENCE_HEALTH_INTERVAL_MS: '0', BOTBOY_INFERENCE_GPT6_ROLLOUT: 'off' },
+      privateRoot,
+      environmentCredentialsPresent: true,
+      openAiEndpoint: fakes.openai,
+      deepSeekEndpoint: fakes.deepseek,
+      teamVisibleWithoutCredentials: () => false,
+    });
+    closers.push(settings);
+    expect(settings.status().connections.map(connection => connection.id)).toEqual(['team']);
+    expect(settings.chatModels.catalog()?.defaultKey).toBe('team.terra');
+  });
 });

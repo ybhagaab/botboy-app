@@ -888,6 +888,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
             title: sourceArtifact.title,
             content: sourceArtifact.content,
             format: publication.format === 'md' ? 'markdown' : 'docx',
+            footerText: deps.exportFooter?.effective() ?? '',
           });
           const exportSha256 = sha256Buffer(canonicalExport.data);
           persistPublicationExport(publication.publicationId, exportSha256, canonicalExport.filename, canonicalExport.data);

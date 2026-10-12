@@ -166,6 +166,8 @@ export interface AiModelSettingsService {
   /** Cheap, non-throwing readiness for the dashboard version poll. */
   state(): AiModelState;
   version(): number;
+  /** The Amazon Employee toggle changed: bump the version so open tabs repaint (no connection change). */
+  refreshVisibility(): void;
   saveApiKey(provider: AiModelKeyProvider, apiKey: unknown): Promise<AiModelStatus>;
   removeApiKey(provider: AiModelKeyProvider): Promise<AiModelStatus>;
   /** modelKey: a catalog key, or null to return to the default chain. */
@@ -217,6 +219,12 @@ interface AiModelSettingsDeps {
   /** Called after the organizing model changes (kick the information pipeline, log). */
   onActivated?: (identity: LlmRuntimeIdentity) => void;
   now?: () => Date;
+  /**
+   * Settings → Workplace: whether the team gateway catalog shows when no
+   * connection is configured. False while Amazon Employee is off, so a
+   * non-Amazon owner never sees team model names. Absent = shown.
+   */
+  teamVisibleWithoutCredentials?: () => boolean;
 }
 
 const PROVIDER_TEXT: Record<AiModelKeyProvider, {
@@ -590,6 +598,22 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       .filter((connection): connection is LlmConnection => Boolean(connection));
   }
 
+  const teamVisibleWithoutCredentials = deps.teamVisibleWithoutCredentials ?? (() => true);
+  /** Team is hidden (Amazon Employee off) unless it really is configured. */
+  function teamHidden(): boolean {
+    return !teamVisibleWithoutCredentials() && !teamConfigured();
+  }
+  /** What the owner sees: configured connections, else every one (team only when it may show). */
+  function displayConnections(): LlmConnection[] {
+    const configured = configuredConnections();
+    if (configured.length) return configured;
+    return teamVisibleWithoutCredentials() ? ordered() : ordered().filter(connection => connection.id !== 'team');
+  }
+  /** Nothing is set up and team may not show: no model name reaches the browser. */
+  function nothingSetUp(): boolean {
+    return teamHidden() && configuredConnections().length === 0;
+  }
+
   function findEntry(key: string): { connection: LlmConnection; entry: LlmModelEntry } | null {
     for (const connection of ordered()) {
       const entry = connection.models.find(model => model.key === key);
@@ -906,6 +930,16 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   function roleStatus(role: AiModelRole): AiModelRoleStatus {
+    if (nothingSetUp()) {
+      return {
+        modelKey: '',
+        label: 'Not set up',
+        connectionId: 'team',
+        connectionLabel: '',
+        thinking: stored.roles[role]?.thinking ?? 'off',
+        chosen: false,
+      };
+    }
     const resolved = boundRole(role);
     return {
       modelKey: resolved.entry.key,
@@ -924,8 +958,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   function status(): AiModelStatus {
-    const visible = configuredConnections();
-    const shown = visible.length ? visible : ordered();
+    const shown = displayConnections();
     const organizing = boundRole('processing');
     const issue = issueFor(organizing.connection.client.getProviderIssue?.(), organizing.connection);
     const openai = keySummary(stored.keys.openai);
@@ -939,7 +972,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       provider: organizing.connection.provider.id,
       providerLabel: legacyProviderLabel(organizing.connection.provider.id),
       // Owner-facing label ("GPT-5.6 Terra"), never a gateway target path.
-      backgroundModel: organizing.entry.label,
+      backgroundModel: nothingSetUp() ? 'Not set up' : organizing.entry.label,
       healthy: organizing.connection.client.isAvailable(),
       models: shown.flatMap(connection => connection.models.map(entry => ({ key: entry.key, label: entry.label }))),
       ...(openai ? { openai } : {}),
@@ -952,10 +985,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   const chatModels = createConnectionChatModelSource({
-    connections: () => {
-      const configured = configuredConnections();
-      return configured.length ? configured : ordered();
-    },
+    connections: displayConnections,
     // D4: the team default when configured, otherwise the organizing model.
     defaultKey: () => (teamConfigured()
       ? connectionDefaultEntry(connections.get('team')!)?.key
@@ -993,6 +1023,9 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       try { return currentState(); } catch { return 'unavailable'; }
     },
     version: () => settingsVersion,
+    refreshVisibility() {
+      settingsVersion += 1;
+    },
     saveApiKey(provider, apiKey) {
       try {
         const id = validProvider(provider);

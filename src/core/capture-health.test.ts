@@ -176,3 +176,69 @@ describe('capture health streaks', () => {
     expect(issue.lastSuccessAt).toBe('2026-10-02T08:00:00.000Z');
   });
 });
+
+describe('capture health while Amazon Employee is off (Settings → Workplace)', () => {
+  let storage: StorageLayer;
+  let clock: { value: number };
+  let amazon: boolean;
+  let token: boolean;
+  const minutes = (count: number) => count * 60_000;
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    clock = { value: Date.parse('2026-10-02T08:00:00Z') };
+    amazon = true;
+    token = true;
+  });
+  afterEach(() => storage.close());
+  const make = () => createCaptureHealth({
+    db: storage.getDb(), now: () => clock.value, amazonEmployee: () => amazon, slackTokenConfigured: () => token,
+  });
+  const streak = (health: ReturnType<typeof make>, source: 'slack' | 'grasp' | 'sharepoint' | 'gmail', kind: any) => {
+    health.reportFailure(source, { kind, reason: 'x' });
+    clock.value += minutes(40);
+    health.reportFailure(source, { kind, reason: 'x' });
+  };
+
+  it('drops Outlook and SharePoint issues and maps Midway to the service sign-in copy', () => {
+    const health = make();
+    streak(health, 'grasp', 'midway_auth');
+    streak(health, 'sharepoint', 'network');
+    streak(health, 'slack', 'midway_auth');
+    expect(health.issues().map(issue => issue.source).sort()).toEqual(['grasp', 'sharepoint', 'slack']);
+    amazon = false;
+    const issues = health.issues();
+    expect(issues.map(issue => issue.source)).toEqual(['slack']);
+    expect(issues[0]).toMatchObject({ kind: 'service_auth', nextAction: 'Open Connections → Slack → Manage and save a new Slack user token.' });
+    expect(health.sources().find(entry => entry.source === 'grasp')!.consecutiveFailures).toBe(2);
+  });
+
+  it('never names mwinit or Midway for any source or kind while off', () => {
+    amazon = false;
+    const kinds = ['midway_auth', 'service_auth', 'rate_limited', 'network', 'connector_down', 'unexpected_response', 'unknown'] as const;
+    for (const kind of kinds) {
+      storage.close();
+      storage = createStorage(':memory:');
+      storage.initialize();
+      const health = make();
+      for (const source of ['slack', 'sharepoint', 'grasp', 'gmail'] as const) streak(health, source, kind);
+      for (const issue of health.issues()) {
+        expect(`${issue.cause} ${issue.nextAction}`, `${issue.source}/${kind}`).not.toMatch(/mwinit|Midway/i);
+      }
+    }
+  });
+
+  it('hides a stale Slack streak while off without a token, and shows it again with one or when on', () => {
+    const health = make();
+    streak(health, 'slack', 'connector_down');
+    amazon = false;
+    token = false;
+    expect(health.issues()).toEqual([]);
+    expect(health.sources().find(entry => entry.source === 'slack')!.consecutiveFailures).toBe(2);
+    token = true;
+    expect(health.issues()[0]).toMatchObject({ source: 'slack', nextAction: 'Open Connections → Slack → Manage and check the Slack user token.' });
+    token = false;
+    amazon = true;
+    expect(health.issues().map(issue => issue.source)).toEqual(['slack']);
+  });
+});

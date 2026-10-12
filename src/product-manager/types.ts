@@ -125,6 +125,8 @@ export interface ProfileRegistry {
   listOverlays(): Array<{ overlayId: string; version: string; type: OverlayType; purpose: string }>;
   getProfile(profileId: string): DocumentProfile;
   getOverlay(overlayId: string): WritingOverlay;
+  /** Overlay IDs applied to a profile now: amazon_writing.v1 becomes plain_business_writing.v1 while Amazon Employee is off. */
+  effectiveOverlayIds(profileId: string): string[];
   getRubric(rubricId: string): DocumentRubric;
   buildWritingInstructions(
     profileId: string,

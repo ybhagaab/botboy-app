@@ -56,6 +56,8 @@ import type { StorageUsageService } from '../../core/storage-usage.js';
 import type { CaptureHealth } from '../../core/capture-health.js';
 import type { ChatJobStore } from '../../core/chat-jobs.js';
 import type { ContinuationBridge } from '../../core/chat-continuations.js';
+import type { Workplace } from '../../core/workplace.js';
+import type { ExportFooterSettings } from '../../product-manager/export-footer.js';
 
 export interface RouterDeps {
   nodeManager: NodeManager;
@@ -78,6 +80,10 @@ export interface RouterDeps {
   llmClient?: LlmClient;
   /** Settings → AI model: model connections, background role choices, chat model catalog, live status. */
   aiModelSettings?: AiModelSettingsService;
+  /** Settings → Workplace: the owner-attested Amazon Employee toggle (workplace.ts). */
+  workplace?: Workplace;
+  /** Document export footer text (export-footer.ts). */
+  exportFooter?: ExportFooterSettings;
   llmUsageService?: LlmUsageService;
   toolExecutor?: ToolExecutor;
   promptManager?: PromptManager;

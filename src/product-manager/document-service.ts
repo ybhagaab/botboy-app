@@ -421,7 +421,9 @@ function validateRequest(request: GenerateDocumentRequest): {
 function overlayVersions(dependencies: ProductDocumentServiceDependencies, profileId: string): Record<string, string> {
   const profile = dependencies.registry.getProfile(profileId);
   const versions: Record<string, string> = {};
-  for (const overlayId of [...profile.overlays, ...profile.conditional_modules.filter((id) => id.endsWith('.v1'))]) {
+  // Provenance: the overlays actually applied (Settings → Workplace substitution included).
+  const applied = dependencies.registry.effectiveOverlayIds?.(profileId) ?? [...profile.overlays];
+  for (const overlayId of [...applied, ...profile.conditional_modules.filter((id) => id.endsWith('.v1'))]) {
     try {
       const overlay = dependencies.registry.getOverlay(overlayId);
       versions[overlay.overlay_id] = overlay.version;

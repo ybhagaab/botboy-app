@@ -26,6 +26,7 @@
  * `QueryRunner` is the A4 seam: dashboards later select SqlMcpRunner ⇄
  * EtlQueryRunner by availability. Only the interface ships now (A4 parked).
  */
+import { isAmazonEmployeeOffError } from './workplace.js';
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
@@ -70,6 +71,8 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
         if (prime.ok) result = await call();
       }
     } catch (error: any) {
+      // Amazon Employee off: a structured failure (keeps the code token), never data.
+      if (isAmazonEmployeeOffError(error)) return { isError: true, text: 'Error: ' + String(error?.message ?? error) };
       const message = String(error?.message ?? error);
       if (!isSentryAuthShapedError(message)) {
         // Structured-errors invariant: no raw transport error may leave the

@@ -1,3 +1,5 @@
+import { isAmazonEmployeeOffError } from '../../core/workplace.js';
+import { requireAmazonEmployee } from './workplace.js';
 import { Router, Request, Response } from 'express';
 import type { McpProfileSnapshot, McpServerSnapshot } from '../../core/mcp-types.js';
 import {
@@ -234,10 +236,18 @@ function acceptsLoopbackRequest(req: Request, res: Response): boolean {
   return false;
 }
 
+const HIDDEN_BY_WORKPLACE_BODY = {
+  error: 'amazon_employee_off',
+  code: 'amazon_employee_off',
+  message: "This connection is part of BotBoy's Amazon internal paths, which are off.",
+  nextAction: 'Turn on Amazon Employee in Settings → Workplace.',
+} as const;
+
 function safeProfileRouteError(
   policy: { shortName: string; redactErrors: boolean },
   error: unknown,
-): { status: number; message: string } {
+): { status: number; message: string; code?: string } {
+  if (isAmazonEmployeeOffError(error)) return { status: 409, message: HIDDEN_BY_WORKPLACE_BODY.message, code: 'amazon_employee_off' };
   const message = error instanceof Error ? error.message : String(error ?? '');
   if (!policy.redactErrors) {
     // Owner-fixable states (a value to type, a review to give) are conflicts
@@ -293,6 +303,19 @@ export function createMcpRouter(deps: RouterDeps): Router {
   // unknown ids resolve to 404 through the manager.
   router.use('/mcp/profiles/:profileId', (req: Request, res: Response, next) => {
     if (!acceptsLoopbackRequest(req, res)) return;
+    // Hidden by the Amazon Employee toggle: a conflict with a next action, not 404.
+    if (deps.mcpManager?.isHiddenByWorkplace(paramStr(req.params.profileId))) {
+      return res.status(409).json(HIDDEN_BY_WORKPLACE_BODY);
+    }
+    next();
+  });
+
+  // Custom-server config, secrets, restart, and tool routes for a hidden
+  // server answer 409; DELETE stays allowed (the owner may remove it).
+  router.use('/mcp/servers/:id', (req: Request, res: Response, next) => {
+    if (req.method !== 'DELETE' && deps.mcpManager?.isHiddenByWorkplace(paramStr(req.params.id))) {
+      return res.status(409).json(HIDDEN_BY_WORKPLACE_BODY);
+    }
     next();
   });
 
@@ -357,7 +380,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
       return res.status(status).json({ result, profile: publicProfile(profile) });
     } catch (error) {
       const safe = safeProfileRouteError(policy, error);
-      res.status(safe.status).json({ error: safe.message });
+      res.status(safe.status).json({ error: safe.message, ...(safe.code ? { code: safe.code, nextAction: HIDDEN_BY_WORKPLACE_BODY.nextAction } : {}) });
     }
   });
 
@@ -470,6 +493,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
       const profile = await deps.mcpManager.createCustomServer(req.body);
       res.status(201).json({ profile: publicProfile(profile) });
     } catch (error: any) {
+      if (isAmazonEmployeeOffError(error)) return res.status(409).json(HIDDEN_BY_WORKPLACE_BODY);
       res.status(400).json({ error: error?.message ?? String(error) });
     }
   });
@@ -498,6 +522,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
       const profile = await deps.mcpManager.updateCustomServer(serverId, req.body);
       res.json({ profile: publicProfile(profile) });
     } catch (error: any) {
+      if (isAmazonEmployeeOffError(error)) return res.status(409).json(HIDDEN_BY_WORKPLACE_BODY);
       const message = error?.message ?? String(error);
       const status = /unknown custom/i.test(message) ? 404 : /stop the/i.test(message) ? 409 : 400;
       res.status(status).json({ error: message });
@@ -686,6 +711,7 @@ export function createMcpRouter(deps: RouterDeps): Router {
   // that run's progress rather than erroring.
   router.post('/mcp/analytics-context/generate', (req: Request, res: Response) => {
     if (!acceptsOwnerUi(req, res, 'Analytics knowledge change')) return;
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     if (!deps.etlOnboarding) return res.status(503).json({ error: 'ETL onboarding service unavailable' });
     const group = String(req.body?.group ?? '').trim();

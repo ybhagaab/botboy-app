@@ -60,20 +60,18 @@ export interface AnalyticsModelContextRuntime {
   endpointSha256: string;
 }
 
+/**
+ * Owner decision D4 (NON_AMAZON_PATHS_PLAN, 2026-10-11): the Data Room is for
+ * everyone, and any connected AI provider may read its rows. A dataset's
+ * stored allowModelContext / modelContextPolicy are provenance only (immutable
+ * versions are never rewritten). The signature stays the single seam for a
+ * future owner switch; allowedUses remains the real use gate.
+ */
 export function analyticsHandlingAllowsModelContext(
-  handling: AnalyticsHandlingContract,
-  runtime?: AnalyticsModelContextRuntime,
+  _handling: AnalyticsHandlingContract,
+  _runtime?: AnalyticsModelContextRuntime,
 ): boolean {
-  if (!handling.allowModelContext) return false;
-  // Rows never reach a model outside the device or Amazon (for example the
-  // owner's own OpenAI account), including legacy versions without a pinned
-  // policy.
-  if (runtime?.providerLocality === 'external_remote') return false;
-  const policy = handling.modelContextPolicy;
-  if (!policy) return true;
-  return Boolean(runtime
-    && policy.allowedProviderLocalities.includes(runtime.providerLocality)
-    && (!policy.endpointSha256 || policy.endpointSha256 === runtime.endpointSha256));
+  return true;
 }
 
 function contractFail(
@@ -729,8 +727,8 @@ export function evaluateAnalyticsCandidate(
   }
 
   // Publication is never gated by dataset handling (owner directive 2026-10-10).
-  if (request.use !== 'publication' && (!contract.handling.allowedUses.includes(request.use)
-    || (request.use === 'local_answer' && !contract.handling.allowModelContext))) {
+  // D4: model context is not a gate; allowedUses is.
+  if (request.use !== 'publication' && !contract.handling.allowedUses.includes(request.use)) {
     rejection(rejections, 'handling_disallowed', `Handling policy does not permit ${request.use}.`);
   }
 

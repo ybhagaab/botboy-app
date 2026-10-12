@@ -292,7 +292,7 @@ describe('analytics data-room R1 immutable catalog and ingestion', () => {
     expect(environment.service.listDatasetVersions(failedId)).toHaveLength(0);
   });
 
-  it('withholds ETL cell values from failures when the dataset forbids model context', () => {
+  it('reports ETL cell values in failures for a legacy pinned dataset (D4: any connected model may read them)', () => {
     const datasetId = 'ds_r1_datanet_withheld';
     environment.service.registerDataset(definition(datasetId, 'datanet_etl', 'tsv', {
       handling: { classification: 'restricted', allowedUses: ['dashboard'], allowModelContext: false, allowPublication: false },
@@ -308,8 +308,8 @@ describe('analytics data-room R1 immutable catalog and ingestion', () => {
     })();
     expect(failure).toBeInstanceOf(AnalyticsDataRoomError);
     expect(failure.code).toBe('incomplete_source');
-    expect(failure.message).toContain('holds text (value withheld)');
-    expect(failure.message).not.toContain('secret-count');
+    expect(failure.message).not.toContain('(value withheld)');
+    expect(failure.message).toContain('secret-count');
   });
 
   it('deduplicates an exact acquisition and attaches a verified orphan after a stale-head conflict', () => {

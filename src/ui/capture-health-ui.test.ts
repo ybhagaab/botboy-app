@@ -39,7 +39,7 @@ function load(state: Record<string, unknown>): Helpers {
     constLine('icon'), constLine('esc'), constLine('attr'), constLine('number'),
     topLevel('relativeTime'), topLevel('whenPhrase'),
     topLevel('captureIssueFor'), topLevel('captureSourceHealth'), topLevel('captureIssueDetail'),
-    topLevel('slackCardModel'), topLevel('sharepointSyncCardModel'), topLevel('graspSyncCardModel'),
+    topLevel('amazonEmployeeOn'), topLevel('slackCardModel'), topLevel('sharepointSyncCardModel'), topLevel('graspSyncCardModel'),
     topLevel('updateGlobalHealth'),
     dashboard.match(/\nconst CAPTURE_SOURCE_BY_PROFILE = .*\n/)![0],
     topLevel('profileCaptureIssueAlert'),

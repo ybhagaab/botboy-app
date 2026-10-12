@@ -126,6 +126,16 @@ describe('chat on a switchable AI model', () => {
     expect(JSON.stringify(after.body)).not.toContain('bedrock-mantle');
   });
 
+  it('answers 200 with an empty catalog (never 503) when no model is set up and team models are hidden', async () => {
+    const empty = { defaultKey: '', groups: [], models: [], configured: false };
+    const llmSwitch = createLlmClientSwitch(gatewayClient(), identity('gateway'));
+    const app = buildApp(makeDeps(db, llmSwitch, {
+      aiModelSettings: { chatModels: { catalog: () => empty, resolve: () => null, onChange: () => () => {} }, state: () => 'not_configured', version: () => 1 },
+    }));
+    const response = await request(app).get('/api/chat/models');
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual(empty);
+  });
   it('sends an OpenAI-provider turn its plain model id with no gateway headers', async () => {
     const seen: any[] = [];
     const stream = vi.fn((input: any) => {

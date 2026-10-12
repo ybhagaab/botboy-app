@@ -76,6 +76,8 @@ export interface MidwaySentinelOptions {
   pollIntervalMs?: number;
   /** Clock override for tests. */
   now?: () => number;
+  /** Settings → Workplace: false while Amazon Employee is off; the tick then does nothing. */
+  active?: () => boolean;
 }
 
 /** Built-in profiles that ride the Midway session. */
@@ -371,6 +373,7 @@ export function createMidwaySentinel(
   };
 
   const tick = async () => {
+    if (options.active?.() === false) return;
     if (ticking || stopped) return;
     ticking = true;
     try {

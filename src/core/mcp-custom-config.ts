@@ -469,6 +469,16 @@ function parseEntries(value: unknown, kind: CustomValueKind): CustomValueEntry[]
  * local servers whose values wait in `legacyEnv` for the Keychain move.
  * Rows written before review tracking count as user-authored and reviewed.
  */
+/**
+ * An AIM install (Amazon-internal, NON_AMAZON_PATHS_PLAN D1): the stored
+ * command's basename is `aim`, or its about.source carries the `aim:` prefix
+ * that mcp-registry-lookup.ts › aimCandidate writes. Accepts a stored config
+ * or the normalized input create/update hold before any row is written.
+ */
+export function isAimInstall(config: Pick<CustomServerConfig, 'command' | 'about'>): boolean {
+  return path.basename(config.command || '') === 'aim' || (config.about?.source ?? '').startsWith('aim:');
+}
+
 export function parseCustomConfig(raw: string | null | undefined): CustomServerConfig {
   let parsed: unknown = {};
   try { parsed = JSON.parse(raw || '{}'); } catch { /* defaults below */ }

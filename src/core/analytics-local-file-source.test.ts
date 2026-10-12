@@ -6,7 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createStorage, type StorageLayer } from './storage.js';
-import { createAnalyticsDataRoomStore } from './analytics-data-room-store.js';
+import { analyticsDatasetContractSha256, createAnalyticsDataRoomStore } from './analytics-data-room-store.js';
+import { stableAnalyticsJson } from './analytics-data-room-policy.js';
 import { createAnalyticsDataRoomBackupService } from './analytics-data-room-backup.js';
 import { createAnalyticsDataRoomService } from './analytics-data-room-service.js';
 import { createAnalyticsDerivationService } from './analytics-data-room-derivation.js';
@@ -290,7 +291,7 @@ describe('local-file Data Room lifecycle', () => {
         sidecar.close();
       }
     };
-    return { store, service, counts, rows };
+    return { store, service, counts, rows, db };
   }
 
   const metric = { id: 'ingress_total', version: '1', unit: 'count', definition: 'Daily ingress total for one metric name, as reported.' };
@@ -455,20 +456,28 @@ describe('local-file Data Room lifecycle', () => {
     expect(env.counts()).toEqual({ jobs: 0, datasets: 0, versions: 0 });
   });
 
-  it('withholds cell values from profiles and failures when the chat provider may not see rows', async () => {
+  it('reports cell values to any provider and creates datasets with no provider pin (D4)', async () => {
     const home = tempDir('local-file-home-');
     const env = environment(home, { providerLocality: 'external_remote', endpointSha256: 'b'.repeat(64) });
     const file = write(path.join(home, 'secret-values.csv'), 'date,metrics_name,total\n2026-09-01,confidential_metric,N/A\n');
     const profile = await env.service.inspectLocalFile({ path: file });
-    expect(profile.samplesWithheld).toBe(true);
-    expect(profile.columns.every(column => column.samples.length === 0 && column.minimum === undefined)).toBe(true);
-    expect(profile.columns.map(column => column.name)).toEqual(['date', 'metrics_name', 'total']);
+    expect(profile.samplesWithheld).toBe(false);
+    expect(profile.columns.some(column => column.samples.length > 0)).toBe(true);
     const failure = await env.service.prepareOrJoinAndWait(owner('withheld'), plan(
       { kind: 'local_file', alias: 'report', path: file, target: target('2026-09-01', '2026-09-01') },
       request('2026-09-01', '2026-09-01'),
     )).catch(error => error);
-    expect(failure.issues[0].message).toContain('holds text (value withheld)');
-    expect(JSON.stringify(failure.issues)).not.toContain('N/A');
+    expect(JSON.stringify(failure.issues)).toContain('N/A');
+    expect(JSON.stringify(failure.issues)).not.toContain('value withheld');
+    const good = write(path.join(home, 'good.csv'), 'date,metrics_name,total\n2026-09-01,app_open,5\n');
+    const created = await env.service.prepareOrJoinAndWait(owner('external-ok'), plan(
+      { kind: 'local_file', alias: 'report', path: good, target: target('2026-09-01', '2026-09-01') },
+      request('2026-09-01', '2026-09-01'),
+    ));
+    expect(created.status).toBe('completed');
+    const handling = env.store.getDataset(created.result!.primary.datasetId)!.contract.handling;
+    expect(handling.allowModelContext).toBe(true);
+    expect(handling.modelContextPolicy).toBeUndefined();
   });
 
   const etlTarget = (start: string, end: string) => ({
@@ -591,6 +600,55 @@ describe('local-file Data Room lifecycle', () => {
     } finally {
       sidecar.close();
     }
+  });
+
+  /**
+   * D4 inherited handling (design §12.1–12.2, invariant 9a): a dataset written
+   * before D4 keeps its stored model-context bytes, so refreshing it by id (or
+   * resuming its job) never conflicts; the real gates still conflict.
+   */
+  function pinLegacy(env: ReturnType<typeof environment>, datasetId: string, handling: Record<string, unknown>) {
+    const row = env.db.prepare('SELECT contract_json FROM analytics_datasets WHERE id = ?').get(datasetId) as { contract_json: string };
+    const contract = JSON.parse(row.contract_json);
+    contract.handling = { ...contract.handling, ...handling };
+    if (!('modelContextPolicy' in handling)) delete contract.handling.modelContextPolicy;
+    contract.contractSha256 = '';
+    contract.contractSha256 = analyticsDatasetContractSha256(contract);
+    env.db.prepare('UPDATE analytics_datasets SET contract_json = ?, contract_sha256 = ? WHERE id = ?')
+      .run(stableAnalyticsJson(contract), contract.contractSha256, datasetId);
+    return contract.contractSha256 as string;
+  }
+  // A pin from an earlier endpoint: recomputing it from today's runtime would differ.
+  const legacyPolicy = { allowedProviderLocalities: ['amazon_managed_remote'], endpointSha256: 'c'.repeat(64), disclosurePolicyVersion: 'botboy-data-room-v1' };
+
+  it('refreshes a pinned pre-D4 SQL dataset by id without a conflict, keeping its stored handling', async () => {
+    const home = tempDir('local-file-home-');
+    const csv = 'metrics_name,date,total,hours\napp_open,2026-09-01,5,1.5\n';
+    const env = environment(home, undefined, undefined, fakeSql(csv, ['metrics_name', 'date', 'total', 'hours']).runner);
+    const source = { kind: 'sql_query', alias: 'report', sql: 'SELECT metrics_name, date, total, hours FROM fixture', target: { ...etlTarget('2026-09-01', '2026-09-01'), datasetId: 'ds_legacy_sql' } };
+    expect((await env.service.prepareOrJoinAndWait(owner('legacy-sql-1'), plan(source, request('2026-09-01', '2026-09-01')))).status).toBe('completed');
+    const pinned = pinLegacy(env, 'ds_legacy_sql', { allowModelContext: true, modelContextPolicy: legacyPolicy });
+    const again = await env.service.prepareOrJoinAndWait(owner('legacy-sql-2'), plan(source, request('2026-09-01', '2026-09-01')));
+    expect(again.status, JSON.stringify(again).slice(0, 1500)).toBe('completed');
+    const stored = env.db.prepare("SELECT contract_sha256 FROM analytics_datasets WHERE id = 'ds_legacy_sql'").get() as { contract_sha256: string };
+    expect(stored.contract_sha256).toBe(pinned);
+    expect(env.store.getDataset('ds_legacy_sql')!.contract.handling.modelContextPolicy).toEqual(legacyPolicy);
+  });
+
+  it('refreshes a legacy allowModelContext:false local-file dataset by id; a real gate change still conflicts', async () => {
+    const home = tempDir('local-file-home-');
+    // Team gateway runtime: the pre-D4 rule would recompute allowModelContext:true + a pin.
+    const env = environment(home);
+    const file = write(path.join(home, 'legacy.csv'), 'date,metrics_name,total\n2026-09-01,app_open,5\n');
+    const source = (extra: Record<string, unknown> = {}) => ({ kind: 'local_file', alias: 'report', path: file, target: { ...target('2026-09-01', '2026-09-01'), datasetId: 'ds_legacy_file', ...extra } });
+    expect((await env.service.prepareOrJoinAndWait(owner('legacy-file-1'), plan(source(), request('2026-09-01', '2026-09-01')))).status).toBe('completed');
+    pinLegacy(env, 'ds_legacy_file', { allowModelContext: false });
+    const again = await env.service.prepareOrJoinAndWait(owner('legacy-file-2'), plan(source(), request('2026-09-01', '2026-09-01')));
+    expect(again.status).toBe('completed');
+    expect(env.store.getDataset('ds_legacy_file')!.contract.handling.allowModelContext).toBe(false);
+    const changed = await env.service.prepareOrJoinAndWait(owner('legacy-file-3'), plan(source({ classification: 'restricted' }), request('2026-09-01', '2026-09-01')))
+      .catch(error => error);
+    expect(JSON.stringify(changed.issues ?? changed.message ?? changed)).toMatch(/different definition|conflict/);
   });
 
   it('publishes nothing when a SQL result misfits its target, and says re-running the query is safe', async () => {

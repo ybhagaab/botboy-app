@@ -49,7 +49,7 @@ describe('model operation context', () => {
     expect(analyticsImportProviderReceipt(TEAM).providerLocality).toBe('amazon_managed_remote');
   });
 
-  it('judges Data Room rows by the operation that will receive them', () => {
+  it('lets every provider read Data Room rows while receipts keep each operation’s locality (D4)', () => {
     // Mirrors index.ts › answerProviderReceipt: operation first, else the organizing model.
     const organizing = () => TEAM;
     const runtime: AnalyticsModelContextRuntime = {
@@ -67,7 +67,8 @@ describe('model operation context', () => {
     } as any;
     expect(analyticsHandlingAllowsModelContext(handling, runtime)).toBe(true);
     expect(runInLlmModelOperation(operation('team', TEAM), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
-    expect(runInLlmModelOperation(operation('deepseek', DEEPSEEK), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(false);
-    expect(runInLlmModelOperation(operation('openai', OPENAI), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(false);
+    expect(runInLlmModelOperation(operation('deepseek', DEEPSEEK), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
+    expect(runInLlmModelOperation(operation('openai', OPENAI), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
+    expect(runInLlmModelOperation(operation('openai', OPENAI), () => runtime.providerLocality)).toBe('external_remote');
   });
 });

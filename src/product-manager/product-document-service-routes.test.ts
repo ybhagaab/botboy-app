@@ -254,7 +254,7 @@ describe('native product-manager generation service', () => {
       emailSendApprovalRequired: false,
     });
     expect(artifact.context.status).toBe('prompt_only');
-    expect(artifact.overlayVersions).toHaveProperty('amazon_writing.v1', '1.1.0');
+    expect(artifact.overlayVersions).toHaveProperty('amazon_writing.v1', '1.1.1');
     expect(artifact.validation.ste.findings.some((finding) => finding.code === 'STE_BUNDLE_LIMITED')).toBe(true);
   });
 
@@ -352,7 +352,7 @@ describe('product-document HTTP API', () => {
     const app = buildApp(fixture.service, fixture.configStore);
     const discovery = await request(app).get('/api/product-documents/profiles').expect(200);
     expect(discovery.body.profiles).toHaveLength(9);
-    expect(discovery.body.overlays).toHaveLength(3);
+    expect(discovery.body.overlays).toHaveLength(4);
     expect(discovery.body.ste.dictionary).toBeUndefined();
     expect(discovery.body.controls).toEqual({ emailDraftOnly: true, emailSendEndpointAvailable: false });
 

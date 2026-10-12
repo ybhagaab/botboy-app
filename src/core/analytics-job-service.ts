@@ -1792,31 +1792,12 @@ function intersectHandling(versions: AnalyticsDatasetVersionDetail[]): Analytics
   const useOrder: AnalyticsDataRoomUse[] = ['local_answer', 'dashboard', 'publication'];
   const allowedUses = useOrder.filter(use => versions.every(version => version.handling.allowedUses.includes(use)));
   const allowPublication = versions.every(version => version.handling.allowPublication);
-  let allowModelContext = versions.every(version => version.handling.allowModelContext);
-  const policies = versions.map(version => version.handling.modelContextPolicy).filter((value): value is NonNullable<typeof value> => !!value);
-  let modelContextPolicy: AnalyticsHandlingContract['modelContextPolicy'];
-  if (allowModelContext && policies.length) {
-    const allowedProviderLocalities = (
-      ['device_local', 'amazon_managed_remote'] as const
-    ).filter(locality => policies.every(policy => policy.allowedProviderLocalities.includes(locality)));
-    const disclosures = new Set(policies.map(policy => policy.disclosurePolicyVersion));
-    const endpoints = new Set(policies.map(policy => policy.endpointSha256).filter((value): value is string => !!value));
-    if (!allowedProviderLocalities.length || disclosures.size !== 1 || endpoints.size > 1) {
-      allowModelContext = false;
-    } else {
-      modelContextPolicy = {
-        allowedProviderLocalities,
-        disclosurePolicyVersion: [...disclosures][0],
-        ...(endpoints.size ? { endpointSha256: [...endpoints][0] } : {}),
-      };
-    }
-  }
+  // D4: model context is provenance only; a new derived dataset carries no provider pin.
   return {
     classification: highest,
     allowedUses,
-    allowModelContext,
+    allowModelContext: true,
     allowPublication,
-    ...(allowModelContext && modelContextPolicy ? { modelContextPolicy } : {}),
   };
 }
 
@@ -1838,6 +1819,8 @@ function buildContract(
   datasetId: string,
   template: AnalyticsJobFragmentContractV1,
   versions: AnalyticsDatasetVersionDetail[],
+  /** The stored handling of an existing dataset with this id (a resumed job). */
+  existingHandling?: AnalyticsHandlingContract,
 ): AnalyticsDatasetContract {
   if (versions.some(version => version.contract.domainKey !== template.domainKey)) {
     fail('policy_denied', 'R6.2b cannot invent cross-domain composition semantics; use inputs with the declared output domain.');
@@ -1859,7 +1842,16 @@ function buildContract(
     datasetKind: 'derived' as const,
     scope: 'workspace' as const,
     coverage: commonCoverage(versions),
-    handling: intersectHandling(versions),
+    // D4: provenance only. An existing dataset keeps its stored model-context
+    // bytes so registerDataset's exact-definition check passes; the real
+    // gates (classification, allowedUses, allowPublication) are recomputed.
+    handling: existingHandling
+      ? {
+        ...intersectHandling(versions),
+        allowModelContext: existingHandling.allowModelContext,
+        ...(existingHandling.modelContextPolicy ? { modelContextPolicy: existingHandling.modelContextPolicy } : {}),
+      }
+      : intersectHandling(versions),
   } as AnalyticsDatasetContract;
   contract.contractSha256 = analyticsDatasetContractSha256(contract);
   validateAnalyticsRelationalContract(contract);
@@ -1871,7 +1863,9 @@ function preparationSourceDefinition(input: {
   alias: string;
   sourceKind: 'sql_context' | 'datanet_etl' | 'import';
   target: AnalyticsDatasetPreparationTargetV1;
+  /** Kept for receipts; no longer shapes handling (D4). */
   modelContextRuntime?: AnalyticsModelContextRuntime;
+  store: Pick<AnalyticsDataRoomStore, 'getDataset'>;
 }): { definition: AnalyticsDatasetDefinitionInput; expectedHeadRevision: number; quality: AnalyticsDatasetPreparationTargetV1['quality'] } {
   const { target } = input;
   const datasetId = target.datasetId
@@ -1880,20 +1874,16 @@ function preparationSourceDefinition(input: {
   const semanticIdentities = derivePreparationSemanticIdentities(target.metric, target.regime);
   const metric = semanticIdentities.metric;
   const regime = semanticIdentities.regime;
-  const runtime = input.modelContextRuntime;
-  const allowModelContext = Boolean(runtime && runtime.providerLocality !== 'external_remote');
+  // D4: provenance only. An existing dataset keeps its stored bytes so
+  // registerDataset's exact-definition check passes; a new one is open to
+  // every connected model with no provider pin.
+  const existingHandling = input.store.getDataset(datasetId)?.contract.handling;
   const handling: AnalyticsHandlingContract = {
     classification: target.classification ?? 'internal',
     allowedUses: ['local_answer', 'dashboard', ...(target.allowPublication ? ['publication' as const] : [])],
-    allowModelContext,
+    allowModelContext: existingHandling ? existingHandling.allowModelContext : true,
     allowPublication: target.allowPublication === true,
-    ...(allowModelContext && runtime ? {
-      modelContextPolicy: {
-        allowedProviderLocalities: [runtime.providerLocality as 'device_local' | 'amazon_managed_remote'],
-        endpointSha256: runtime.endpointSha256,
-        disclosurePolicyVersion: 'botboy-data-room-v1',
-      },
-    } : {}),
+    ...(existingHandling?.modelContextPolicy ? { modelContextPolicy: existingHandling.modelContextPolicy } : {}),
   };
   const contract = {
     contractVersion: 'analytics-dataset-contract-v1',
@@ -2098,11 +2088,6 @@ export function createAnalyticsJobService(input: {
   const now = input.now ?? (() => new Date());
   const waitMs = Math.max(100, Math.min(ANALYTICS_JOB_MAX_FOREGROUND_WAIT_MS, input.waitMs ?? DEFAULT_WAIT_MS));
   const localFilePolicy = input.localFilePolicy ?? defaultAnalyticsLocalFilePolicy();
-  // Same model-context rule as newly prepared datasets: without a local or
-  // managed provider, file facts reach the model as structure only. Read per
-  // use: the active provider can change at runtime (Settings → AI model).
-  const withholdFileValues = (): boolean =>
-    !input.modelContextRuntime || input.modelContextRuntime.providerLocality === 'external_remote';
   let active: Promise<number> | null = null;
   let activeController: AbortController | null = null;
   let activeJobId: string | null = null;
@@ -2376,7 +2361,7 @@ export function createAnalyticsJobService(input: {
         source: label,
         schema: source.target ? `${label}.target.schema` : `${label}.into.datasetId`,
         ...(dataset ? { fixedDatasetId: dataset.id } : {}),
-      }, { withholdValues: withholdFileValues() });
+      }, { withholdValues: false });
     } catch (error) {
       return localFileFailure(error);
     }
@@ -2534,7 +2519,8 @@ export function createAnalyticsJobService(input: {
         tempRoot: localFilePolicy.tempRoot,
       }, 'file');
       const profile = profileAnalyticsLocalTable(table, locator.nullToken);
-      const samplesWithheld = withholdFileValues();
+      // D4: every connected model may read file values.
+      const samplesWithheld = false;
       return {
         file: { name: table.fileName, format: table.format, bytes: table.size, sha256: table.sha256 },
         ...(table.sheets ? { sheets: table.sheets } : {}),
@@ -2643,6 +2629,7 @@ export function createAnalyticsJobService(input: {
         sourceKind: 'import',
         target: source.target,
         modelContextRuntime: input.modelContextRuntime,
+        store: input.store,
       });
       const existing = input.store.getDataset(definition.definition.id);
       const expectedHeadRevision = source.target.expectedHeadRevision ?? existing?.head?.headRevision ?? definition.expectedHeadRevision;
@@ -2825,6 +2812,7 @@ export function createAnalyticsJobService(input: {
       sourceKind: source.kind === 'sql_query' ? 'sql_context' : 'datanet_etl',
       target: source.target,
       modelContextRuntime: input.modelContextRuntime,
+      store: input.store,
     });
     const existing = input.store.getDataset(prepared.definition.id);
     const expectedHeadRevision = source.target.expectedHeadRevision
@@ -3024,7 +3012,7 @@ export function createAnalyticsJobService(input: {
     });
     const job = observation.job;
     const datasetId = `ds_job_${analyticsSha256({ jobId: job.id, planSha256: job.planSha256, fragmentId: fragment.id }).slice(0, 24)}`;
-    const contract = buildContract(datasetId, fragment.contract, versions);
+    const contract = buildContract(datasetId, fragment.contract, versions, input.store.getDataset(datasetId)?.contract.handling);
     const terminal = spec.terminal === true;
     const request = normalizeAnalyticsRequest(spec.request as unknown as AnalyticsRequest);
     validateFragmentAnswer(fragment, contract, request, terminal);

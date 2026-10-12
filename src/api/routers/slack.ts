@@ -109,7 +109,9 @@ export function createSlackRouter(deps: RouterDeps): Router {
         } else if (web) {
           for await (const c of listJoinedConversations(web)) out.push(c);
         } else {
-          throw new Error('Slack is not connected: start the Slack MCP connection or configure a user token');
+          throw new Error(deps.workplace && !deps.workplace.amazonEmployee()
+            ? 'Slack is not connected: add your Slack user token on Connections → Slack.'
+            : 'Slack is not connected: start the Slack MCP connection or configure a user token');
         }
         conversationsCache = { at: Date.now(), data: out };
         return out;

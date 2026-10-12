@@ -283,6 +283,8 @@ export interface McpServerDefinition {
 
 export interface BuiltInMcpProfile extends McpServerDefinition {
   id: BuiltInMcpProfileId;
+  /** 'amazon' profiles are hidden and inactive while Amazon Employee is off (workplace.ts). */
+  audience: 'everyone' | 'amazon';
   kind: BuiltInMcpProfileId;
   launch:
     | { type: 'sql-context-package' }
@@ -302,6 +304,7 @@ const GRASP_AUTHORIZE_COMMAND = 'grasp-mcp login';
 const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Object.freeze({
   'sql-context': Object.freeze({
     id: SQL_CONTEXT_PROFILE_ID,
+    audience: 'everyone',
     kind: SQL_CONTEXT_PROFILE_ID,
     displayName: 'SQL / Redshift',
     shortName: 'SQL MCP',
@@ -349,6 +352,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
   }),
   'grasp-m365': Object.freeze({
     id: GRASP_PROFILE_ID,
+    audience: 'amazon',
     kind: GRASP_PROFILE_ID,
     displayName: 'Amazon Microsoft 365 through GRASP',
     shortName: 'GRASP MCP',
@@ -504,6 +508,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
   }),
   slack: Object.freeze({
     id: SLACK_MCP_PROFILE_ID,
+    audience: 'amazon',
     kind: SLACK_MCP_PROFILE_ID,
     displayName: 'Amazon Slack through AI Community MCP',
     shortName: 'Slack MCP',
@@ -617,6 +622,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
   }),
   sharepoint: Object.freeze({
     id: SHAREPOINT_MCP_PROFILE_ID,
+    audience: 'amazon',
     kind: SHAREPOINT_MCP_PROFILE_ID,
     displayName: 'Amazon SharePoint & OneDrive',
     shortName: 'SharePoint MCP',
@@ -729,6 +735,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
   }),
   'a2-analytics': Object.freeze({
     id: A2_ANALYTICS_PROFILE_ID,
+    audience: 'amazon',
     kind: A2_ANALYTICS_PROFILE_ID,
     displayName: 'Datanet ETL through A2 Analytics',
     shortName: 'ETL MCP',
@@ -887,6 +894,13 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
 
 export function isBuiltInMcpProfileId(value: string): value is BuiltInMcpProfileId {
   return Object.prototype.hasOwnProperty.call(PROFILES, value);
+}
+
+/** Built-in profiles that belong to BotBoy's Amazon internal paths (design §3). */
+export const AMAZON_INTERNAL_PROFILE_IDS: readonly string[] = [GRASP_PROFILE_ID, SLACK_MCP_PROFILE_ID, SHAREPOINT_MCP_PROFILE_ID, A2_ANALYTICS_PROFILE_ID];
+
+export function isAmazonInternalProfileId(id: string): boolean {
+  return AMAZON_INTERNAL_PROFILE_IDS.includes(id);
 }
 
 export function getBuiltInMcpProfile(value: string): BuiltInMcpProfile | null {

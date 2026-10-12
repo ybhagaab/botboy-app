@@ -168,7 +168,7 @@ export function createAnalyticsDataRoomService(input: {
       typed = typeAnalyticsLocalTable(table, dataset.contract.schema, nullToken, {
         source: 'etl_query',
         schema: 'target.schema',
-      }, { withholdValues: !dataset.contract.handling.allowModelContext });
+      }, { withholdValues: false }); // D4: any connected model may read values
     } catch (error) {
       if (!(error instanceof AnalyticsLocalFileError)) throw error;
       return incomplete(error.issues.map(issue => issue.message).join(' ') || error.message);
@@ -299,7 +299,7 @@ export function createAnalyticsDataRoomService(input: {
       typed = typeAnalyticsLocalTable(table, dataset.contract.schema, '', {
         source: 'sql_query',
         schema: 'target.schema',
-      }, { withholdValues: !dataset.contract.handling.allowModelContext, origin: 'query' });
+      }, { withholdValues: false, origin: 'query' }); // D4
     } catch (error) {
       if (!(error instanceof AnalyticsLocalFileError)) throw error;
       return incomplete(error.issues.map(issue => issue.message).join(' ') || error.message);

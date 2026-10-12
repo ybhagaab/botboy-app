@@ -50,6 +50,8 @@ export interface ChatModelCatalogPayload {
   readonly defaultKey: string;
   readonly groups?: readonly ChatModelCatalogGroup[];
   readonly models: readonly ChatModelCatalogEntry[];
+  /** false only for the empty catalog shown when no model connection is set up. */
+  readonly configured?: false;
 }
 
 export interface ChatModelBinding {
@@ -151,8 +153,10 @@ export function createConnectionChatModelSource(input: {
   return {
     catalog() {
       const connections = ordered();
+      // No connection is shown (nothing set up, team hidden): an explicit empty catalog, never a 503.
+      if (!connections.length) return { defaultKey: '', groups: [], models: [], configured: false };
       const fallback = effectiveDefault();
-      if (!connections.length || !fallback) return null;
+      if (!fallback) return null;
       const defaultKey = fallback.entry.key;
       return {
         defaultKey,

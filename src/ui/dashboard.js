@@ -76,6 +76,8 @@ const state = {
   // Settings → AI model. The key itself never lives in state: it is read
   // from the form once, sent, and the field is cleared by the next repaint.
   aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null },
+  // Settings → Workplace. Until known, the UI behaves as ON (no change for existing users).
+  workplace: { amazonEmployee: true, known: false, status: null, saving: false, footerSaving: false, notice: null, footerError: null, pendingFocus: '' },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
   inbox: { count: null, items: [], limit: 100, offset: 0 },
   inboxError: '',
@@ -229,6 +231,7 @@ const state = {
   lastAiModelVersion: null,
   lastAiModelState: null,
   lastCaptureHealthVersion: null,
+  lastWorkplaceVersion: null,
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -316,6 +319,7 @@ function parseRoute() {
   if (parts[0] === 'settings' && parts[1] === 'dashboard-sharing') return { view: 'publisher-settings' };
   if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
   if (parts[0] === 'settings' && parts[1] === 'ai-model') return { view: 'ai-model-settings' };
+  if (parts[0] === 'settings' && parts[1] === 'workplace') return { view: 'workplace-settings' };
   if (parts[0] === 'data-room') {
     let id = parts[2] || parts[1] || '';
     try { id = decodeURIComponent(id); } catch { id = ''; }
@@ -929,7 +933,7 @@ function renderSidebar() {
         || (view === 'connections' && ['mcp-settings', 'profile-settings', 'mcp-add', 'mcp-edit'].includes(route.view))
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
         || (view === 'data-room' && ['data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'].includes(route.view))
-        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings'].includes(route.view));
+        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings', 'workplace-settings'].includes(route.view));
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
     <section class="nav-section"><div class="nav-label"><span>Areas & projects</span></div><div class="area-tree">
@@ -2835,7 +2839,7 @@ function renderGmailSyncSettings() {
   const composeBanner = connection.connected && connection.needsComposeGrant && !connection.needsReconnect
     ? `<div class="mcp-alert">${icon('alert', 14)}<span>BotBoy can read and search this mailbox but cannot draft or send yet. Choose Reconnect and allow “Manage drafts and send emails”.</span></div>`
     : '';
-  return `${pageHead('Connection settings', 'Gmail', 'BotBoy captures the mail you receive and send in Gmail and folds it into project synthesis, like Outlook mail. For Google accounts; Amazon mail uses Outlook mail & calendar.', connection.connected ? `<button class="button" type="button" data-action="gmail-sync-run" ${disabled}>${icon('refresh', 14)} ${busy === 'run' ? 'Syncing…' : 'Sync now'}</button>` : '')}
+  return `${pageHead('Connection settings', 'Gmail', amazonEmployeeOn() ? 'BotBoy captures the mail you receive and send in Gmail and folds it into project synthesis, like Outlook mail. For Google accounts; Amazon mail uses Outlook mail & calendar.' : 'Captures Gmail mail and folds it into project synthesis.', connection.connected ? `<button class="button" type="button" data-action="gmail-sync-run" ${disabled}>${icon('refresh', 14)} ${busy === 'run' ? 'Syncing…' : 'Sync now'}</button>` : '')}
     <section class="card pad">
       <div class="connection-head"><span class="source-icon">${icon('mail', 19)}</span><span class="pill ${card.tone}"><span class="status-dot ${card.tone}"></span>${esc(card.status)}</span></div>
       <p>${esc(card.detail)}</p>
@@ -3019,6 +3023,10 @@ function slackCardModel(configuredCount) {
   const issue = captureIssueFor('slack');
   if (issue) return { status: 'Not syncing', tone: 'warn', detail: captureIssueDetail(issue) };
   const health = captureSourceHealth('slack');
+  // Amazon Employee off: Slack is the user-token path only.
+  if (!amazonEmployeeOn() && !health?.lastSuccessAt && configuredCount === 0) {
+    return { status: 'Not set up', tone: '', detail: 'Add your Slack user token to start capture' };
+  }
   const checked = health?.lastSuccessAt ? ` · checked ${whenPhrase(health.lastSuccessAt)}` : '';
   return { status: 'Connected', tone: 'good', detail: `${number(configuredCount)} conversations configured${checked}` };
 }
@@ -3236,7 +3244,7 @@ function renderConnections() {
     ['message', 'WhatsApp', whatsAppCard.status, whatsAppCard.tone, whatsAppCard.detail, 'whatsapp'],
     ['file', 'SharePoint documents', sharepointSyncCard.status, sharepointSyncCard.tone, sharepointSyncCard.detail, 'sharepoint-sync'],
     ['globe', 'Browser capture', 'Available', 'good', total == null ? 'Captured evidence is stored locally' : `${number(total)} total evidence items in the local store`, 'browser'],
-  ];
+  ].filter(([, , , , , action]) => amazonEmployeeOn() || !AMAZON_ONLY_CAPTURE_CARDS.includes(action));
   const captureIssueSources = { slack: 'slack', 'grasp-sync': 'grasp', 'gmail-sync': 'gmail', 'sharepoint-sync': 'sharepoint' };
   const lifecycleFor = action => (captureIssueFor(captureIssueSources[action])
     ? 'Not syncing'
@@ -3424,22 +3432,28 @@ function renderProfileSettings(profileId) {
     </section>`;
 }
 
-/** Analytics knowledge directory card — a2-analytics connection page only.
+/** Analytics knowledge directory card: the a2-analytics connection page, and
+ * the SQL connection page while Amazon Employee is off (a2 is hidden then).
  * BotBoy loads .md/.txt files from this local directory on demand to ground
  * data questions (generated presets under presets/, user notes at the root). */
 function renderAnalyticsContextCard(profileId) {
-  if (profileId !== 'a2-analytics') return '';
+  const onA2 = profileId === 'a2-analytics';
+  const onSqlOff = profileId === 'sql-context' && !amazonEmployeeOn();
+  if (!onA2 && !onSqlOff) return '';
   const ctx = state.mcp.analyticsContext;
   if (!ctx && !state.mcp.analyticsContextPending) void loadAnalyticsContextConfig();
-  return `<article class="card pad"><div class="eyebrow">${icon('file', 14)} Analytics knowledge</div>
+  return `<article class="card pad">${renderAnalyticsKnowledgeDirSection(ctx)}${ctx && onA2 ? renderEtlOnboardingSection(ctx.onboarding) : ''}
+  </article>`;
+}
+/** The knowledge-directory part of the card (shared by both pages). */
+function renderAnalyticsKnowledgeDirSection(ctx) {
+  return `<div class="eyebrow">${icon('file', 14)} Analytics knowledge</div>
     <h3 class="card-title">${ctx ? `${number(ctx.fileCount)} knowledge file${ctx.fileCount === 1 ? '' : 's'}` : 'Loading…'}</h3>
     <p class="page-subtitle">BotBoy grounds data questions in local .md/.txt files from this directory — drop your schema or methodology notes at the root; generated business presets land under presets/. Loaded on demand, one file per task.</p>
     ${ctx ? `<div class="mcp-fact"><span>Directory</span><strong style="word-break:break-all">${esc(ctx.dir)}</strong></div>
     <label class="page-subtitle" for="analytics-context-dir" style="display:block;margin-top:8px">Use a different directory (leave empty for the default)</label>
     <input id="analytics-context-dir" type="text" value="${attr(ctx.configured || '')}" placeholder="${attr(ctx.dir)}" style="width:100%"/>
-    <div style="margin-top:8px"><button class="button small" type="button" data-action="analytics-context-save">Save directory</button></div>
-    ${renderEtlOnboardingSection(ctx.onboarding)}` : ''}
-  </article>`;
+    <div style="margin-top:8px"><button class="button small" type="button" data-action="analytics-context-save">Save directory</button></div>` : ''}`;
 }
 
 /** ETL preset generation (etl-analytics A3) — status line + manual trigger.
@@ -3485,7 +3499,7 @@ async function loadAnalyticsContextConfig() {
     state.mcp.analyticsContext = { dir: '', configured: '', fileCount: 0, error: String(error?.message || error) };
   }
   state.mcp.analyticsContextPending = false;
-  if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+  if (['profile-settings', 'mcp-settings'].includes(state.route.view)) renderRoute({ preserveScroll: true });
   scheduleAnalyticsOnboardingPoll();
 }
 
@@ -4037,6 +4051,7 @@ function renderMcpSettings() {
         <div class="mcp-form-actions"><span>${config.passwordConfigured ? `${icon('shield', 14)} Password protected by Keychain` : `${icon('shield', 14)} No password stored in BotBoy`}</span><button class="button primary" type="submit" ${state.mcp.saving ? 'disabled' : ''}>${state.mcp.saving ? 'Saving…' : 'Save connection'}</button></div>
       </form>
       <aside class="mcp-side">
+        ${renderAnalyticsContextCard('sql-context')}
         <article class="card pad"><div class="eyebrow">${icon('shield', 14)} Query policy</div><h3 class="card-title">Read-only by construction</h3><p class="page-subtitle">BotBoy accepts SELECT, WITH, EXPLAIN, and SHOW. It rejects writes, DDL, grants, transactions, multi-statements, and unsafe database functions before calling the MCP.</p></article>
         <article class="card pad"><div class="eyebrow">${icon('activity', 14)} Managed availability</div><h3 class="card-title">Lifecycle stays inside BotBoy</h3><p class="page-subtitle">Health checks, reconnects, process restarts, and discovered tools are maintained automatically. You configure the data source—not the server runtime.</p>${server?.lastHealthyAt ? `<div class="mcp-fact"><span>Last healthy</span><strong>${esc(relativeTime(server.lastHealthyAt))}</strong></div>` : ''}${server?.restartCount ? `<div class="mcp-fact"><span>Automatic restarts</span><strong>${number(server.restartCount)}</strong></div>` : ''}</article>
         <article class="card pad"><div class="eyebrow">${icon('database', 14)} Least privilege</div><h3 class="card-title">Use a dedicated read-only role</h3><p class="page-subtitle">Application policy is defense in depth. The Redshift user or IAM role should only have SELECT and the minimum schema/context permissions it needs.</p></article>
@@ -4301,7 +4316,7 @@ function aiModelKeyCard(status, provider) {
     required: true,
     help: `Create one at ${provider.keysUrl}. BotBoy checks it with ${provider.label}, keeps it private on this Mac, and offers its models right away.`,
   });
-  return `<form class="card mcp-form ai-model-key-form" data-provider="${provider.id}"><div class="card-header"><div><h2 class="card-title">${esc(provider.label)}</h2><div class="card-meta">${meta}</div></div>${pill}</div>${saveError}${issue}<div class="mcp-form-body">${savedRows}${field}<p class="card-meta">When one of this key's models does the work, what it reads (captured messages, documents, your chats, and query results) is sent to ${esc(provider.label)} under your account. Data Room table values stay on this Mac.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${savingThis ? 'Checking key…' : saved ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
+  return `<form class="card mcp-form ai-model-key-form" data-provider="${provider.id}"><div class="card-header"><div><h2 class="card-title">${esc(provider.label)}</h2><div class="card-meta">${meta}</div></div>${pill}</div>${saveError}${issue}<div class="mcp-form-body">${savedRows}${field}<p class="card-meta">When one of this key's models does the work, what it reads (captured messages, documents, your chats, and query results) is sent to ${esc(provider.label)} under your account. Data Room tables BotBoy reads for you are sent too.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${savingThis ? 'Checking key…' : saved ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
 }
 
 function renderAiModelSettings() {
@@ -4393,6 +4408,141 @@ async function removeAiModelKey(providerId) {
 }
 
 /** Saving re-renders the page; keep keyboard focus on the control the owner used. */
+// ── Settings → Workplace (Amazon Employee + export footer) ──
+const WORKPLACE_ICON = 'settings';
+/** Built-in connections that belong to BotBoy's Amazon internal paths (mcp-profiles.ts). */
+const AMAZON_INTERNAL_PROFILE_IDS = ['grasp-m365', 'slack', 'sharepoint', 'a2-analytics'];
+/** Capture cards shown only while Amazon Employee is on. */
+const AMAZON_ONLY_CAPTURE_CARDS = ['grasp-sync', 'sharepoint-sync'];
+const WORKPLACE_SIGNAL_LABELS = {
+  midway_cookie: 'Midway sign-in found',
+  amazon_toolbox: 'Amazon Toolbox found',
+  amazon_connection_used: 'Amazon connections used',
+  amazon_capture_used: 'Amazon capture used',
+  amazon_owner_email: 'Amazon mail address',
+  team_gateway_credentials: 'team gateway credentials found',
+};
+function amazonEmployeeOn() {
+  return state.workplace?.amazonEmployee !== false;
+}
+async function loadWorkplace({ render = false } = {}) {
+  try {
+    const status = await request('/settings/workplace');
+    state.workplace.status = status;
+    state.workplace.amazonEmployee = status?.amazonEmployee !== false;
+    state.workplace.known = true;
+  } catch {
+    // Unknown stays ON: nothing is hidden on an older server or a failed read.
+  }
+  if (render && ['workplace-settings', 'connections', 'settings'].includes(state.route.view)) renderRoute({ preserveScroll: true });
+}
+async function applyWorkplaceVersionChange() {
+  await loadWorkplace();
+  try {
+    const profiles = await request('/mcp/profiles');
+    state.mcp.servers = Array.isArray(profiles?.profiles) ? profiles.profiles : [];
+  } catch {
+    state.mcp.servers = null;
+  }
+  await refreshCaptureHealth();
+  if (['connections', 'workplace-settings', 'documents', 'analytics-dashboard', 'settings', 'gmail-sync-settings', 'ai-model-settings',
+    'mcp-settings', 'profile-settings', 'grasp-sync-settings', 'sharepoint-sync-settings', 'publisher-settings'].includes(state.route.view)) {
+    renderRoute({ preserveScroll: true });
+  }
+}
+/** Shown in place of an Amazon-only page while Amazon Employee is off. */
+function amazonOnlyView(title) {
+  return `${pageHead('Settings', title, '')}
+    <article class="card pad"><p class="page-subtitle">Part of BotBoy's Amazon internal paths. Turn on Amazon Employee in Settings → Workplace to use it.</p>
+    <a class="button small" href="#/settings/workplace">Open Settings → Workplace ${icon('chevron-right', 12)}</a></article>`;
+}
+function workplaceSourceLine(status) {
+  if (!status) return '';
+  if (status.source === 'owner') {
+    const when = status.updatedAt ? new Date(status.updatedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+    return `Set by you${when ? ` on ${when}` : ''}`;
+  }
+  const signals = (status.signals || []).map(signal => WORKPLACE_SIGNAL_LABELS[signal] || signal);
+  return signals.length ? `Detected on this Mac (${signals.join(', ')})` : 'Detected on this Mac (no Amazon sign-in or tools found)';
+}
+function workplaceFooterLine(footer) {
+  if (!footer) return '';
+  if (footer.source === 'kept') return `Now: '${footer.text}' (kept from before this update)`;
+  if (footer.source === 'owner' && footer.text) return `Now: '${footer.text}' (set by you)`;
+  return 'Now: no footer text';
+}
+function renderWorkplaceSettings() {
+  const wp = state.workplace;
+  const status = wp.status;
+  const on = amazonEmployeeOn();
+  const hidden = (status?.hiddenConnections || []).filter(connection => connection.setUp).map(connection => connection.displayName);
+  const footer = status?.exportFooter || null;
+  const footerHint = 'Printed in the center of every page footer in PDF and Word exports, and in HTML exports when printed. Leave empty for no footer text. You can also ask BotBoy in chat.';
+  const footerError = wp.footerError ? `<p class="card-meta" id="workplace-footer-error" role="alert">${esc(wp.footerError)}</p>` : '';
+  return `${pageHead('Settings', 'Workplace', 'Which of BotBoy’s paths apply to you, and what your document exports print.')}
+    <section class="grid settings-layout"><nav class="card settings-nav"><a class="button ghost" href="#/settings">${icon('settings')} General</a><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace" aria-current="page">${icon(WORKPLACE_ICON)} Workplace</a></nav>
+    <div style="display:grid; gap:14px; align-content:start; min-width:0">
+      <article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">Amazon Employee</h2><div class="card-meta">${esc(workplaceSourceLine(status))}</div></div></div>
+        <div class="setting-row"><span class="setting-copy"><strong id="workplace-amazon-label">Amazon Employee</strong><span id="workplace-amazon-help">Turn on if you work at Amazon. BotBoy then offers Amazon's internal connections (Slack through AI Community MCP, Outlook through GRASP, SharePoint, Datanet ETL), Amazon writing style, and Harmony dashboard sharing. Turn off to hide them; their setup and captured data are kept. Applies right away, no restart.</span></span>
+        <button class="toggle ${on ? 'on' : ''}" style="flex:none" type="button" role="switch" aria-checked="${on ? 'true' : 'false'}" aria-labelledby="workplace-amazon-label" aria-describedby="workplace-amazon-help" data-action="workplace-toggle" ${wp.saving || !wp.known ? 'disabled' : ''}></button></div>
+        ${!on && hidden.length ? `<p class="card-meta">Hidden while off: ${esc(hidden.join(', '))}. They resume when you turn this on.</p>` : ''}
+        <p class="card-meta" role="status">${wp.notice ? esc(wp.notice) : ''}</p>
+      </article>
+      <form class="card settings-panel" data-workplace-footer-form><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">Document export footer</h2><div class="card-meta">${esc(workplaceFooterLine(footer))}</div></div></div>
+        <label class="page-subtitle" for="workplace-footer" style="display:block;margin-top:8px">Footer text</label>
+        <input id="workplace-footer" type="text" maxlength="120" style="width:100%" value="${attr(footer?.text || '')}" aria-describedby="workplace-footer-hint${wp.footerError ? ' workplace-footer-error' : ''}" ${wp.footerSaving ? 'disabled' : ''}/>
+        <p class="card-meta" id="workplace-footer-hint">${esc(footerHint)}</p>
+        ${footerError}
+        <div class="mcp-form-actions"><span></span><button class="button primary" type="submit" ${wp.footerSaving || !footer ? 'disabled' : ''}>${wp.footerSaving ? 'Saving…' : 'Save'}</button></div>
+      </form>
+    </div></section>`;
+}
+function restoreWorkplaceFocus() {
+  const pending = state.workplace.pendingFocus;
+  if (!pending || state.workplace.saving || state.workplace.footerSaving) return;
+  state.workplace.pendingFocus = '';
+  const target = pending === 'toggle' ? document.querySelector('[data-action="workplace-toggle"]') : document.getElementById('workplace-footer');
+  target?.focus({ preventScroll: true });
+}
+async function saveWorkplaceToggle() {
+  const wp = state.workplace;
+  if (wp.saving || !wp.known) return;
+  const next = !amazonEmployeeOn();
+  wp.saving = true;
+  wp.notice = 'Saving…';
+  wp.pendingFocus = 'toggle';
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const status = await request('/settings/workplace', { method: 'PUT', body: { amazonEmployee: next } });
+    wp.status = status;
+    wp.amazonEmployee = status?.amazonEmployee !== false;
+    wp.notice = wp.amazonEmployee ? 'Amazon Employee is on. Amazon connections are back.' : 'Amazon Employee is off. Amazon connections are hidden; their data is kept.';
+    state.lastWorkplaceVersion = status?.version ?? state.lastWorkplaceVersion;
+    try { window.dispatchEvent(new CustomEvent('botboy:ai-model-changed')); } catch {}
+  } catch (error) {
+    wp.notice = `Could not save: ${error?.message || error}`;
+  }
+  wp.saving = false;
+  await applyWorkplaceVersionChange();
+  renderRoute({ preserveScroll: true, userAction: true });
+}
+async function saveExportFooter(form) {
+  const wp = state.workplace;
+  if (wp.footerSaving) return;
+  const text = form.querySelector('#workplace-footer')?.value ?? '';
+  wp.footerSaving = true;
+  wp.footerError = null;
+  wp.pendingFocus = 'footer';
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const result = await request('/settings/workplace/export-footer', { method: 'PUT', body: { text } });
+    if (wp.status) wp.status = { ...wp.status, exportFooter: result?.exportFooter };
+  } catch (error) {
+    wp.footerError = error?.payload?.error || String(error?.message || error);
+  }
+  wp.footerSaving = false;
+  renderRoute({ preserveScroll: true, userAction: true });
+}
 function restoreAiModelRoleFocus() {
   const pending = state.aiModel.pendingFocus;
   if (!pending || state.aiModel.roleBusy) return;
@@ -5152,14 +5302,14 @@ function renderDataRoomImportSemanticReview(item) {
     const choiceMode = choices.length > 0 && field.allowText !== true && new Set(choices.map(choice => choice.id)).size === choices.length;
     const textMode = choices.length === 0 && field.allowText === true;
     const control = choiceMode
-      ? `<select data-data-room-import-answer data-proposal="${attr(review.proposalId)}" data-field="${attr(field.field)}" ${busy ? 'disabled' : ''}><option value="">Choose one…</option>${choices.map(choice => `<option value="${attr(choice.id)}" ${value === choice.id ? 'selected' : ''}>${esc(choice.label)}</option>`).join('')}</select>`
+      ? `<select data-data-room-import-answer data-proposal="${attr(review.proposalId)}" data-field="${attr(field.field)}" ${busy ? 'disabled' : ''}><option value="">Choose one…</option>${choices.map(choice => `<option value="${attr(choice.id)}" ${value === choice.id ? 'selected' : ''}>${esc(choice.id === 'retry_after_provider_change' ? 'Retry' : choice.label)}</option>`).join('')}</select>`
       : textMode
         ? `<input type="text" data-data-room-import-answer data-proposal="${attr(review.proposalId)}" data-field="${attr(field.field)}" value="${attr(value)}" placeholder="Answer only this ambiguity" ${busy ? 'disabled' : ''}>`
         : '<div class="data-room-import-error" role="alert">This ambiguity has no valid answer mode. Retry semantic processing.</div>';
     return `<label class="data-room-import-unresolved"><span>${esc(field.field)}</span><small>${esc(field.reason)}</small>${control}</label>`;
   }).join('');
   const evidence = (review.evidence || []).map(entry => `<li><strong>${esc(entry.field)}</strong><span><b>${esc(entry.proposedValue)}</b> · ${Math.round(Number(entry.confidence || 0) * 100)}% · ${esc(entry.explanation)}${entry.contextTerms?.length ? `<small>Context: ${entry.contextTerms.map(esc).join(' · ')}</small>` : ''}${entry.profileCells?.length ? `<small>Cells: ${entry.profileCells.map(esc).join(', ')}</small>` : ''}</span></li>`).join('');
-  const details = proposal ? `<div class="data-room-import-proposal"><div><small>Dataset</small><strong>${esc(proposal.name)}</strong><span>${esc(proposal.description)}</span></div><div class="data-room-import-proposal-grid"><span><small>Domain</small><strong>${esc(proposal.domainKey)}</strong></span><span><small>Layout</small><strong>${esc(proposal.layout.replaceAll('_', ' '))}</strong></span><span><small>Metric</small><strong>${esc(proposal.metric.id)} · ${esc(proposal.metric.unit)}</strong></span><span><small>Regime</small><strong>${esc(proposal.regime.id)}</strong></span><span><small>Grain</small><strong>${esc(proposal.grain)}</strong></span><span><small>Counting key</small><strong>${esc(proposal.countingKey)}</strong></span><span><small>Time</small><strong>${esc(proposal.timeField)} · ${esc(proposal.timeZone)}</strong></span><span><small>Coverage</small><strong>${esc(proposal.coverage.first)} → ${esc(proposal.coverage.last)} · ${number(proposal.coverage.completePartitions)} complete/${number(proposal.coverage.observedPartitions)} observed</strong></span><span><small>Rows after transform</small><strong>${number(proposal.rowCount)}</strong></span><span><small>Handling</small><strong>${esc(proposal.classification)}</strong></span></div><div class="data-room-import-definitions"><div><small>Metric definition</small><p>${esc(proposal.metric.definition)}</p></div><div><small>Regime definition</small><p>${esc(proposal.regime.definition)}</p></div><div><small>Exact row dimensions</small><p>${(proposal.dimensions || []).map(value => `<code>${esc(value)}</code>`).join(' ') || 'None'}</p></div><div><small>Coverage, handling &amp; retention</small><p>${esc(proposal.coverage.basis)} Allowed uses: ${(proposal.handling?.allowedUses || []).map(esc).join(', ')}. Model rows pinned to ${(proposal.handling?.modelContextPolicy?.allowedProviderLocalities || []).map(value => esc(String(value).replaceAll('_', ' '))).join(', ')} / endpoint ${esc(shortSha(proposal.handling?.modelContextPolicy?.endpointSha256))}. Publication ${proposal.handling?.allowPublication ? 'allowed' : 'blocked'}; automatic expiry ${proposal.retention?.automaticExpiry ? 'enabled' : 'disabled'}.</p></div></div>${proposal.transform ? `<div class="data-room-import-transform"><strong>Transform receipt</strong><span>Source non-empty rows ${number(proposal.transform.sourceNonEmptyRows)} · admitted rows ${number(proposal.transform.admittedSourceRows)} · structural rows ${number(proposal.transform.structuralRows)} · missing observations ${number(proposal.transform.missingObservations)}</span><span>Approved data range ${number(proposal.transform.dataStartRow)}–${number(proposal.transform.dataEndRow)} (header ${number(proposal.transform.headerRow)})</span><span>Excluded source rows: ${proposal.transform.excludedSourceRows?.length ? proposal.transform.excludedSourceRows.map(number).join(', ') : 'none'} · omitted populated columns: ${proposal.transform.omittedSourceColumns?.length ? proposal.transform.omittedSourceColumns.map(esc).join(', ') : 'none'}</span><span>Heading roles: ${proposal.transform.headingRoles?.length ? proposal.transform.headingRoles.map(value => `${number(value.row)} ${esc(value.role)} “${esc(value.label)}”`).join(' · ') : 'not applicable'}</span></div>` : ''}${proposal.limitations?.length ? `<ul class="data-room-import-limitations">${proposal.limitations.map(value => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}</div>` : '';
+  const details = proposal ? `<div class="data-room-import-proposal"><div><small>Dataset</small><strong>${esc(proposal.name)}</strong><span>${esc(proposal.description)}</span></div><div class="data-room-import-proposal-grid"><span><small>Domain</small><strong>${esc(proposal.domainKey)}</strong></span><span><small>Layout</small><strong>${esc(proposal.layout.replaceAll('_', ' '))}</strong></span><span><small>Metric</small><strong>${esc(proposal.metric.id)} · ${esc(proposal.metric.unit)}</strong></span><span><small>Regime</small><strong>${esc(proposal.regime.id)}</strong></span><span><small>Grain</small><strong>${esc(proposal.grain)}</strong></span><span><small>Counting key</small><strong>${esc(proposal.countingKey)}</strong></span><span><small>Time</small><strong>${esc(proposal.timeField)} · ${esc(proposal.timeZone)}</strong></span><span><small>Coverage</small><strong>${esc(proposal.coverage.first)} → ${esc(proposal.coverage.last)} · ${number(proposal.coverage.completePartitions)} complete/${number(proposal.coverage.observedPartitions)} observed</strong></span><span><small>Rows after transform</small><strong>${number(proposal.rowCount)}</strong></span><span><small>Handling</small><strong>${esc(proposal.classification)}</strong></span></div><div class="data-room-import-definitions"><div><small>Metric definition</small><p>${esc(proposal.metric.definition)}</p></div><div><small>Regime definition</small><p>${esc(proposal.regime.definition)}</p></div><div><small>Exact row dimensions</small><p>${(proposal.dimensions || []).map(value => `<code>${esc(value)}</code>`).join(' ') || 'None'}</p></div><div><small>Coverage, handling &amp; retention</small><p>${esc(proposal.coverage.basis)} Allowed uses: ${(proposal.handling?.allowedUses || []).map(esc).join(', ')}. Model context: any connected AI model can read these rows. Publication ${proposal.handling?.allowPublication ? 'allowed' : 'blocked'}; automatic expiry ${proposal.retention?.automaticExpiry ? 'enabled' : 'disabled'}.</p></div></div>${proposal.transform ? `<div class="data-room-import-transform"><strong>Transform receipt</strong><span>Source non-empty rows ${number(proposal.transform.sourceNonEmptyRows)} · admitted rows ${number(proposal.transform.admittedSourceRows)} · structural rows ${number(proposal.transform.structuralRows)} · missing observations ${number(proposal.transform.missingObservations)}</span><span>Approved data range ${number(proposal.transform.dataStartRow)}–${number(proposal.transform.dataEndRow)} (header ${number(proposal.transform.headerRow)})</span><span>Excluded source rows: ${proposal.transform.excludedSourceRows?.length ? proposal.transform.excludedSourceRows.map(number).join(', ') : 'none'} · omitted populated columns: ${proposal.transform.omittedSourceColumns?.length ? proposal.transform.omittedSourceColumns.map(esc).join(', ') : 'none'}</span><span>Heading roles: ${proposal.transform.headingRoles?.length ? proposal.transform.headingRoles.map(value => `${number(value.row)} ${esc(value.role)} “${esc(value.label)}”`).join(' · ') : 'not applicable'}</span></div>` : ''}${proposal.limitations?.length ? `<ul class="data-room-import-limitations">${proposal.limitations.map(value => `<li>${esc(value)}</li>`).join('')}</ul>` : ''}</div>` : '';
   let message = '';
   if (review.state === 'processing') message = '<p>BotBoy is reading the complete worksheet, selecting one analytics context family, and validating a structured semantic proposal. The workbook is not yet a dataset.</p>';
   if (review.state === 'needs_input') message = review.error?.code === 'integrity_failed'
@@ -6032,7 +6182,8 @@ function renderAnalyticsDashboard(id) {
   const stopAction = activeRun
     ? `<button class="button" type="button" data-action="analytics-cancel-refresh" data-dashboard="${attr(id)}" ${stopping ? 'disabled' : ''} title="${attr(activeRun.status === 'running' ? 'Stops the refresh — queries already running finish, no new ones start; an in-flight warehouse query cannot be aborted' : 'Cancels the queued refresh before it starts')}">${icon('x', 14)} ${stopping ? 'Stopping…' : 'Stop refresh'}</button>`
     : '';
-  const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${publishedAction}${shareAction}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
+  // Harmony sharing is an Amazon internal path: hidden while Amazon Employee is off.
+  const actions = `<a class="button" href="#/dashboards">${icon('chevron-right')} All dashboards</a>${amazonEmployeeOn() ? `${publishedAction}${shareAction}` : ''}${stopAction}<button class="button primary" type="button" data-action="analytics-refresh" data-dashboard="${attr(id)}" ${refreshing ? 'disabled' : ''}>${icon('refresh')} ${refreshLabel}</button>`;
   const schedule = dashboard.schedule;
   return `<header class="analytics-dashboard-head"><div class="analytics-dashboard-utility"><div class="breadcrumb"><a href="#/dashboards">Dashboards</a>${icon('chevron-right', 11)}<span>${esc(dashboard.title)}</span></div><div class="head-actions">${actions}</div></div><div class="analytics-dashboard-heading"><div class="eyebrow"><span class="eyebrow-dot"></span>Analytical dashboard</div><h1 class="page-title">${esc(dashboard.title)}</h1>${dashboard.description ? `<p class="page-subtitle">${esc(dashboard.description)}</p>` : ''}</div></header><div class="analytics-dashboard-meta"><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(dashboard.status)}</span><span>${icon('clock', 13)} ${dashboard.lastRefreshedAt ? `Refreshed ${esc(relativeTime(dashboard.lastRefreshedAt))}` : 'Not refreshed yet'}</span><span>${icon('database', 13)} Managed SQL · read only</span>${schedule ? `<span>${icon('refresh', 13)} ${schedule.enabled ? `Daily at ${esc(schedule.localTime)} ${esc(schedule.timezone)}` : 'Schedule paused'}</span>` : ''}${successfulPublication ? `<span>${icon('globe', 13)} Snapshot published ${esc(relativeTime(successfulPublication.publishedAt))}</span>` : ''}</div>${renderAnalyticsProgress(dashboard, activeRun)}${dashboard.lastError ? `<div class="analytics-dashboard-alert">${icon('alert', 15)}<span>${esc(dashboard.lastError)}</span></div>` : ''}${renderShareConfirmation(dashboard)}${renderLatestDashboardPublication(dashboard)}${renderAnalyticsIssues(dashboard)}${renderAnalyticsWidgetGrid(dashboard, activeRun, chatSelection)}<section class="analytics-detail-grid">${renderAnalyticsRuns(dashboard)}${renderAnalyticsSchedule(dashboard)}${renderAnalyticsManagement(dashboard)}<article class="card pad analytics-governance"><div class="eyebrow">${icon('shield', 14)} Guardrails</div><h2 class="card-title">Local definition, governed refresh</h2><p>Queries are validated when saved and immediately before every run. Results are external untrusted data, escaped before rendering, and never authorize project or task changes.</p><div class="mcp-fact"><span>Canonical copy</span><strong>BotBoy SQLite</strong></div><div class="mcp-fact"><span>Database access</span><strong>Read only</strong></div><div class="mcp-fact"><span>Shared copies</span><strong>Explicit confirmation only</strong></div></article></section>`;
 }
@@ -7015,7 +7166,8 @@ function renderDocumentDetailPane(artifactId) {
     ? artifact.publicationState
     : null;
   const publicationCopy = publicationPresentation(publicationView);
-  const publishButton = editing || !publicationView
+  // SharePoint publication is an Amazon internal path (publicationFact keeps history).
+  const publishButton = editing || !publicationView || !amazonEmployeeOn()
     ? ''
     : `<button class="button small document-publication-toggle ${documents.publicationOpen ? 'active' : ''} ${documents.publicationOpen && documents.publicationTrigger === 'toolbar' ? 'is-publication-origin' : ''}" type="button" data-action="documents-publication-toggle" data-publication-trigger="toolbar" aria-haspopup="dialog" aria-expanded="${documents.publicationOpen ? 'true' : 'false'}" aria-controls="document-publication-dialog">${icon('link', 13)} ${esc(publicationCopy.button)}</button>`;
   const reviewAvailable = Boolean(reviewModel.totalCount || reviewModel.statusLabel || reviewModel.reviewSummary);
@@ -7058,7 +7210,7 @@ function renderDocumentDetailPane(artifactId) {
   const detailsPanel = `<details class="document-technical-details" data-document-details ${documents.detailsOpen ? 'open' : ''}><summary>Details ${icon('chevron-down', 11)}</summary><div><span><strong>Artifact ID</strong><code>${esc(artifact.artifactId)}</code></span><span><strong>Profile</strong>${esc(artifact.profileId || 'Unknown')}${profileVersion ? ` · ${esc(profileVersion)}` : ''}</span><span><strong>Created</strong>${esc(exactCreatedAt)}</span>${artifact.model ? `<span><strong>Model</strong>${esc(artifact.model)}</span>` : ''}${artifact.checkerVersion ? `<span><strong>Checker</strong>${esc(artifact.checkerVersion)}</span>` : ''}${parentLine}${projectAssignmentControl}</div></details>`;
 
   const libraryTitleButton = `<button class="icon-button document-title-library-toggle" type="button" data-action="documents-toggle-library" aria-expanded="${documents.libraryOpen ? 'true' : 'false'}" aria-controls="document-library-content" aria-label="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}" title="${documents.libraryOpen ? 'Hide generated documents' : 'Show generated documents'}">${icon(documents.libraryOpen ? 'panel-collapse' : 'panel-expand', 18)}</button>`;
-  const publicationPanel = !editing && publicationView
+  const publicationPanel = !editing && publicationView && amazonEmployeeOn()
     ? renderDocumentPublicationPanel(artifact, publicationView, documents)
     : '';
   return `<article class="card document-detail-pane"><header class="document-detail-header"><div class="document-title-block"><div class="document-title-row">${libraryTitleButton}<h2 id="document-detail-title">${esc(artifact.title)}</h2><span class="pill ${stateTone}"><span class="visually-hidden">Document status: </span>${esc(documentStateLabel(artifact.state))}</span></div><div class="document-primary-facts"><span>${projectFact}</span>${publicationFact ? `<span>${publicationFact}</span>` : ''}<span>${esc(profileFact)}</span><span>${esc(revisionLabel)}</span><span>Created ${esc(relativeTime(artifact.createdAt))}</span><span>${number(content.length)} characters</span>${detailsPanel}</div></div></header><div class="document-detail-toolbar">${back}${modeButtons}${editButton}<div class="document-toolbar-spacer"></div><div class="document-toolbar-actions">${reviewButton}${publishButton}${downloadMenu}${focusButton}${overflowMenu}</div></div>${publicationPanel}${detailError ? `<div class="document-inline-error" role="status">${icon('alert', 14)}<span>Latest refresh failed: ${esc(detailError)}</span></div>` : ''}${documents.actionError ? `<div class="document-inline-error" role="alert">${icon('alert', 14)}<span>${esc(documents.actionError)}</span></div>` : ''}${documents.pandocPrompt ? renderPandocInstallCard(documents.pandocPrompt) : ''}<div class="document-preview-shell" data-scroll-key="documents:preview:${attr(artifactId)}">${questionsBlock}${truncated && !editing ? `<div class="document-truncation-notice" role="status">${icon('alert', 14)}<span>Preview truncated: showing the first ${number(DOCUMENT_PREVIEW_LIMIT)} of ${number(content.length)} characters.</span></div>` : ''}${content || editing ? '' : `<div class="document-content-empty ${questionsBlock ? 'inline' : ''}">This document has no preview content.</div>`}${previewBody}</div><footer class="document-detail-footer"><span>${footerNote}</span><span>${editing ? `${number((documents.editDraft ?? content).length)} characters in editor` : `${number(Math.min(content.length, DOCUMENT_PREVIEW_LIMIT))} characters displayed`}</span></footer></article>`;
@@ -7591,7 +7743,7 @@ function renderLlmUsageSettings() {
 function renderSettings() {
   const dark = document.documentElement.dataset.theme !== 'light';
   return `${pageHead('Workspace', 'Settings', 'Appearance, diagnostics, and compatibility tools for the local dashboard.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a><a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
+    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace">${icon(WORKPLACE_ICON)} Workplace</a>${amazonEmployeeOn() ? `<a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a>` : ''}<a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
 // Repaints rebuild #app-view from scratch, which destroys any text the
@@ -7714,6 +7866,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   }
   if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
   if (routeChanged && state.route.view === 'ai-model-settings') void loadAiModelStatus();
+  if (routeChanged && state.route.view === 'workplace-settings') void loadWorkplace({ render: true });
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
   // hard-reload restore, even if the owner later returns to the same hash.
@@ -7776,14 +7929,24 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'channels') html = renderChannels();
   if (state.route.view === 'connections') html = renderConnections();
   if (state.route.view === 'mcp-settings') html = renderMcpSettings();
-  if (state.route.view === 'grasp-sync-settings') html = renderGraspSyncSettings();
+  if (state.route.view === 'grasp-sync-settings') html = amazonEmployeeOn() ? renderGraspSyncSettings() : amazonOnlyView('Outlook mail & calendar');
   if (state.route.view === 'gmail-sync-settings') html = renderGmailSyncSettings();
   if (state.route.view === 'whatsapp-settings') html = renderWhatsAppSettings();
-  if (state.route.view === 'sharepoint-sync-settings') html = renderSharePointSyncSettings();
+  if (state.route.view === 'sharepoint-sync-settings') html = amazonEmployeeOn() ? renderSharePointSyncSettings() : amazonOnlyView('SharePoint documents');
   if (state.route.view === 'doc-reader') html = renderDocReader();
   if (state.route.view === 'mcp-add') html = renderMcpServerForm();
   if (state.route.view === 'mcp-edit') html = renderMcpServerForm({ editing: true, profileId: state.route.profileId });
-  if (state.route.view === 'profile-settings') html = renderProfileSettings(state.route.profileId);
+  if (state.route.view === 'profile-settings') {
+    // Amazon Employee off: the Slack recovery link opens the token panel, and
+    // other Amazon-only connection pages explain how to turn them on.
+    if (!amazonEmployeeOn() && state.route.profileId === 'slack') {
+      showIntegration('slack');
+      return;
+    }
+    html = !amazonEmployeeOn() && AMAZON_INTERNAL_PROFILE_IDS.includes(state.route.profileId)
+      ? amazonOnlyView('Connection settings')
+      : renderProfileSettings(state.route.profileId);
+  }
   if (state.route.view === 'dashboards') html = renderAnalyticsList();
   if (state.route.view === 'analytics-dashboard') html = renderAnalyticsDashboard(state.route.dashboardId);
   if (state.route.view === 'data-room') html = renderDataRoomList();
@@ -7794,9 +7957,10 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'documents') html = renderDocuments();
   if (state.route.view === 'pipeline') html = renderPipeline();
   if (state.route.view === 'settings') html = renderSettings();
-  if (state.route.view === 'publisher-settings') html = renderPublisherSettings();
+  if (state.route.view === 'publisher-settings') html = amazonEmployeeOn() ? renderPublisherSettings() : amazonOnlyView('Dashboard sharing');
   if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
   if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();
+  if (state.route.view === 'workplace-settings') html = renderWorkplaceSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   window.BotBoyHtmlViews?.park();
   view.innerHTML = html;
@@ -7821,6 +7985,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   }
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
   if (state.route.view === 'ai-model-settings') restoreAiModelRoleFocus();
+  if (state.route.view === 'workplace-settings') restoreWorkplaceFocus();
   // Scroll ownership: only USER-INITIATED renders may reset to top (real
   // navigation). Background renders — polls, loader completions, SSE — always
   // restore the previous position, whether or not preserveScroll was threaded
@@ -8150,6 +8315,7 @@ function bindEvents() {
     if (action === 'toggle-assistant') toggleAssistant();
     if (action === 'close-assistant') toggleAssistant(false);
     if (action === 'toggle-theme') toggleTheme();
+    if (action === 'workplace-toggle') void saveWorkplaceToggle();
     if (action === 'open-command') openCommand();
     if (action === 'close-command') document.getElementById('command-dialog').close();
     if (action === 'plan-day') planDay();
@@ -8772,7 +8938,7 @@ function bindEvents() {
         } catch (error) {
           toast(error?.message || 'Could not save the analytics knowledge directory', 'bad');
         }
-        if (state.route.view === 'profile-settings') renderRoute({ preserveScroll: true });
+        if (['profile-settings', 'mcp-settings'].includes(state.route.view)) renderRoute({ preserveScroll: true });
       })();
     }
     if (action === 'analytics-context-generate' || action === 'analytics-context-regenerate') {
@@ -9026,6 +9192,11 @@ function bindEvents() {
   });
 
   document.addEventListener('submit', event => {
+    if (event.target?.matches?.('[data-workplace-footer-form]')) {
+      event.preventDefault();
+      void saveExportFooter(event.target);
+      return;
+    }
     if (event.target?.matches('.analytics-control-form')) {
       event.preventDefault();
       void applyAnalyticsControls(event.target);
@@ -9345,6 +9516,8 @@ async function pollVersion() {
     state.lastAiModelState = payload.aiModelState ?? null;
     const previousCaptureHealthVersion = state.lastCaptureHealthVersion;
     state.lastCaptureHealthVersion = payload.captureHealthVersion ?? null;
+    const previousWorkplaceVersion = state.lastWorkplaceVersion;
+    state.lastWorkplaceVersion = payload.workplaceVersion ?? null;
 
     // Reload the tab when the code it runs is stale. Two triggers:
     //  - bootId change: the server restarted (possibly with new UI code).
@@ -9402,6 +9575,13 @@ async function pollVersion() {
       }
     }
 
+    // Amazon Employee changed (this or another tab): reload the setting, the
+    // server-filtered connection list, and capture health, then repaint the
+    // views it gates. The chat model picker follows the AI model version.
+    if (previousWorkplaceVersion !== null && state.lastWorkplaceVersion !== null
+      && state.lastWorkplaceVersion !== previousWorkplaceVersion) {
+      await applyWorkplaceVersionChange();
+    }
     // An older-mail import advances without new captures (most old mail is
     // filtered), so the open Gmail page refreshes its status on this poll
     // while one runs. It never repaints over a field the owner is editing.
@@ -9627,6 +9807,7 @@ function initialize() {
     }
   }
   void loadCore();
+  void loadWorkplace({ render: true });
   setInterval(() => { if (!document.hidden) void pollVersion(); }, 5000);
 }
 

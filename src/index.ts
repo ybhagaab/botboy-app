@@ -71,6 +71,9 @@ import { createAppMonitor } from './monitors/app-monitor.js';
 import { createClipboardMonitor } from './monitors/clipboard-monitor.js';
 import { createSlackMonitor } from './monitors/slack-monitor.js';
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
+import { createWorkplace } from './core/workplace.js';
+import { withWorkplaceChatTools } from './core/workplace-chat-tools.js';
+import { createExportFooterSettings } from './product-manager/export-footer.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
 import { createGmailSyncs, createGmailBrowserCaptureGate, isGmailWebEmailItem, readGmailSendAs } from './monitors/gmail-sync.js';
@@ -335,8 +338,19 @@ async function main() {
     );
   };
 
+  // Shell settings override the documented local dotenv-style file. Built
+  // here (before the MCP manager) because Workplace detection reads the
+  // team gateway credential, which usually lives only in that file.
+  const localEnvFile = loadSlackEnv();
+  const inferenceEnv = { ...localEnvFile, ...process.env };
+  // Settings → Workplace: the owner-attested Amazon Employee toggle. Every
+  // Amazon-internal chokepoint reads this one in-memory getter.
+  const workplace = createWorkplace({ db, env: inferenceEnv });
+  const exportFooter = createExportFooterSettings({ db, amazonEmployee: () => workplace.amazonEmployee() });
+  exportFooter.seedLegacyFooterOnce();
+
   // macOS Keychain through McpManager's secret store.
-  const mcpManager = createMcpManager({ db });
+  const mcpManager = createMcpManager({ db, amazonEmployee: () => workplace.amazonEmployee() });
   startInBackground('Managed MCP runtime', () => mcpManager.start(), '✅ Managed MCP runtime initialized');
 
   // R0–R4 analytics data room: one private immutable store, bounded local
@@ -386,6 +400,7 @@ async function main() {
   const analyticsService = createAnalyticsDashboardService({
     db,
     mcpManager,
+    amazonEmployee: () => workplace.amazonEmployee(),
     etlRunner: createDashboardEtlRunner({ db, mcpManager }),
     dataRoom: analyticsDashboardDataRoom,
     dataRoomRead: analyticsDashboardDataRoomRead,
@@ -407,7 +422,7 @@ async function main() {
       verifyStaticArtifact: context => verifyHarmonyArtifactContent(createCdpProvisionTransport(), context),
     },
   });
-  const analyticsScheduler = createAnalyticsScheduler({ db, analyticsService });
+  const analyticsScheduler = createAnalyticsScheduler({ db, analyticsService, etlActive: () => workplace.amazonEmployee() });
 
   // ── Agent workspace setup (symlinks, config sync) ──
   ensureAgentWorkspace();
@@ -427,9 +442,7 @@ async function main() {
   // project routing, brain synthesis, reconciliation, organization, and the
   // optional legacy generative paths. Direct Bedrock is the current provider;
   // the future OIDC/JWT gateway plugs in here without changing consumers.
-  // Shell settings override the documented local dotenv-style file.
-  const localEnvFile = loadSlackEnv();
-  const inferenceEnv = { ...localEnvFile, ...process.env };
+  // inferenceEnv (shell over the local dotenv file) is built above, before the MCP manager.
   // Launcher/.env configuration: the team connection. OpenAI and DeepSeek
   // keys saved in Settings → AI model add their own connections alongside it.
   const environmentProvider = createInferenceProviderFromEnv(inferenceEnv);
@@ -449,6 +462,7 @@ async function main() {
     environmentCredentialsPresent: environmentProvider.id !== 'bedrock'
       || Boolean((inferenceEnv.BOTBOY_INFERENCE_API_KEY || inferenceEnv.AWS_BEARER_TOKEN_BEDROCK || '').trim()),
     onActivated: () => kickInformationPipeline(),
+    teamVisibleWithoutCredentials: () => workplace.amazonEmployee(),
   });
   const llmClient = aiModelSettings.client;
   {
@@ -544,7 +558,7 @@ async function main() {
   const promptManager = createPromptManager();
 
   // ── Native product-manager writing system ──
-  const profileRegistry = createProfileRegistry();
+  const profileRegistry = createProfileRegistry({ amazonEmployee: () => workplace.amazonEmployee() });
   const writingConfigStore = createWritingConfigStore(db);
   const writingContextResolver = createContextResolver(documentParser);
   const glossaryResolver = createGlossaryResolver();
@@ -672,7 +686,7 @@ async function main() {
     visualInspector,
     projectArtifacts,
     // mcp_find_server: the official MCP Registry plus the owner's AIM registry.
-    mcpServerFinder: createMcpServerFinder(),
+    mcpServerFinder: createMcpServerFinder({ includeAim: () => workplace.amazonEmployee() }),
   });
   // Gmail in chat (GMAIL_CHAT_TOOLS_PLAN.md): search/read live, draft/send
   // compose-only. The same compose service backs the chat draft card. Chat
@@ -683,15 +697,18 @@ async function main() {
   // WhatsApp in chat: the owner's own WhatsApp Web tab (whatsapp-send.ts).
   const whatsAppSender = createWhatsAppSender({ page: cdpWhatsAppPage() });
   const whatsAppConnection = createWhatsAppConnection({ db, page: cdpWhatsAppPage() });
+  // withWorkplaceChatTools sits directly inside the mandate: Amazon-only
+  // tools are refused while Amazon Employee is off, and export_footer lives there.
   const toolExecutor = withJobMandate(
-    withWhatsAppChatTools(withGmailChatTools(
+    withWorkplaceChatTools(withWhatsAppChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
         productDocumentPublications,
+        { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }),
+    ), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
@@ -746,6 +763,7 @@ async function main() {
   const etlWatchRunner = createEtlQueryRunner({ db, call: createEtlToolCall(mcpManager), downloadDir: etlResultsDir });
   const etlRunWatcher = createEtlRunWatcher({
     jobs: chatJobs,
+    enabled: () => workplace.amazonEmployee(),
     readRun: (runId) => etlWatchRunner.readRun!({ runId }),
     // runQuery's one queue rescue, for scratch runs handed off before it ran.
     prioritizeRun: (runId) => etlWatchRunner.prioritizeRun!({ runId }),
@@ -773,7 +791,7 @@ async function main() {
     contextManager = createContextSync(db, nodeManager, contextDir);
     const pipeline = createClassificationPipeline(classifier, acpClient, contextManager);
     const delegator = createSubagentDelegator(acpClient);
-    agent = createAgent(db, acpClient, nodeManager, contextManager, pipeline, delegator, llmClient, toolExecutor, promptManager, mcpManager);
+    agent = createAgent(db, acpClient, nodeManager, contextManager, pipeline, delegator, llmClient, toolExecutor, promptManager, mcpManager, () => workplace.amazonEmployee());
     contextManager.startAutoSync(30000);
     const itemDeduplicator = createItemDeduplicator(db, acpClient);
     const descriptionGenerator = createDescriptionGenerator(acpClient, nodeManager);
@@ -787,7 +805,7 @@ async function main() {
     console.log('✅ Legacy plane active (embedding classifier, context sync, background processor)');
   } else {
     // Chat/tool-loop agent only — no embedding classifier, no context timer.
-    agent = createAgent(db, acpClient, nodeManager, undefined, undefined, undefined, llmClient, toolExecutor, promptManager, mcpManager);
+    agent = createAgent(db, acpClient, nodeManager, undefined, undefined, undefined, llmClient, toolExecutor, promptManager, mcpManager, () => workplace.amazonEmployee());
     console.log('ℹ️  Legacy classification plane disabled (set PPT_LEGACY=1 to enable)');
   }
   const chatInterface = createChatInterface(db, agent);
@@ -848,11 +866,19 @@ async function main() {
   // reports every run; a lasting failure streak becomes an owner warning
   // with its cause and next action. Slack's Midway 401s also reach the
   // sentinel through it.
-  const captureHealth = createCaptureHealth({ db });
+  const slackTokenConfigured = () => Boolean((inferenceEnv.SLACK_USER_TOKEN ?? '').trim());
+  const captureHealth = createCaptureHealth({
+    db,
+    amazonEmployee: () => workplace.amazonEmployee(),
+    slackTokenConfigured,
+  });
   const midwaySentinel = createMidwaySentinel(
     { db, mcpManager, chatTerminal, agent, captureHealth },
     // Cookie-path override for testing the flow without touching the real jar.
-    process.env.PPT_MIDWAY_COOKIE_PATH ? { cookiePath: process.env.PPT_MIDWAY_COOKIE_PATH } : {},
+    {
+      ...(process.env.PPT_MIDWAY_COOKIE_PATH ? { cookiePath: process.env.PPT_MIDWAY_COOKIE_PATH } : {}),
+      active: () => workplace.amazonEmployee(),
+    },
   );
 
   // ── lossless-capture-brain-pipeline: evidence + interpretation planes ──
@@ -1286,7 +1312,7 @@ async function main() {
   // emit boundary (GRASP plan §17.5; user directive 2026-08-18). Every other
   // browser capture passes through untouched, and disabling the sync restores
   // browser email capture.
-  const graspMailSupersedesBrowser = createBrowserEmailCaptureGate(db);
+  const graspMailSupersedesBrowser = createBrowserEmailCaptureGate(db, () => workplace.amazonEmployee());
   // The same rule for Gmail web once the Gmail API sync is live (gmail-sync.ts).
   const gmailSupersedesBrowser = createGmailBrowserCaptureGate(db);
   browserMonitor.onWorkItem(item => {
@@ -1326,7 +1352,7 @@ async function main() {
     console.log('⚠️  Skipping Slack channel-config bootstrap (no SLACK_USER_TOKEN)');
   }
 
-  const slackMonitor = createSlackMonitor({ db, mcpManager, captureHealth });
+  const slackMonitor = createSlackMonitor({ db, mcpManager, captureHealth, mcpAllowed: () => workplace.amazonEmployee() });
   slackMonitor.onWorkItem(item => eventBus.emit(item));
   // The first poll walks all watched conversations through rate-limited Slack
   // APIs (~48s measured) — by far the largest boot cost, and pure background
@@ -1380,6 +1406,7 @@ async function main() {
     db, mcpManager, emit: item => eventBus.emit(item),
     config: { intervalMs: 5 * 60 * 1000 },
     captureHealth,
+    enabled: () => workplace.amazonEmployee(),
   });
 
   // ── Gmail API sync (non-Amazon accounts; GMAIL_API_INTEGRATION_PLAN.md) ──
@@ -1413,6 +1440,7 @@ async function main() {
   const sharePointSync = createSharePointSync({
     db, mcpManager, documentParser, contentStore, emit: item => eventBus.emitAndWait(item),
     captureHealth,
+    enabled: () => workplace.amazonEmployee(),
   });
 
   // First imports of existing files (formerly the R12.3 startup loop) run in
@@ -1621,7 +1649,13 @@ async function main() {
     chatJobs,
     chatContinuations,
     appUpdater,
+    workplace,
+    exportFooter,
   };
+  // Workplace listeners, in order (design §6.4). Each is isolated by workplace.ts.
+  workplace.onChange(() => mcpManager.applyWorkplaceChange(), 'mcpManager.applyWorkplaceChange');
+  workplace.onChange(() => aiModelSettings.refreshVisibility(), 'aiModelSettings.refreshVisibility');
+  workplace.onChange(() => {}, 'captureHealth');
   app.use('/api', createRouter(routerDeps));
 
   // Serve static UI files

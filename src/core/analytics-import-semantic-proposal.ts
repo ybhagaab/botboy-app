@@ -209,7 +209,8 @@ export interface AnalyticsImportSemanticReview {
       allowedUses: string[];
       allowModelContext: boolean;
       allowPublication: boolean;
-      modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>;
+      /** Legacy proposals carry a provider pin; new ones have none (D4). */
+      modelContextPolicy?: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>;
     };
     retention: { minimumVersions: number; automaticExpiry: boolean; reacquirable: boolean; backupRequired: boolean };
     rowCount: number;
@@ -987,7 +988,7 @@ function definitionFor(
   limitations: string[],
   layout: 'record_table' | 'wide_time_series',
   ownerId: string,
-  modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
+  modelContextPolicy?: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
 ): { proposal: ValidatedProposalPayload; definition: AnalyticsDatasetDefinitionInput; prepared: AnalyticsImportPreparedRows } {
   const timeIndex = columns.indexOf(timeField);
   const days = [...new Set(rows.map(row => typeof row[timeIndex] === 'string' ? row[timeIndex]!.slice(0, 10) : '').filter(value => /^\d{4}-\d{2}-\d{2}$/.test(value)))].sort();
@@ -1074,7 +1075,7 @@ function definitionFor(
       allowedUses: ['local_answer', 'dashboard'],
       allowModelContext: true,
       allowPublication: false,
-      modelContextPolicy,
+      ...(modelContextPolicy ? { modelContextPolicy } : {}),
     },
   };
   const contract = { ...baseContract, contractSha256: analyticsDatasetContractSha256(baseContract) };
@@ -1139,7 +1140,7 @@ function definitionFor(
         : 'Every populated row inside the approved record range has a valid time and metric value; observed file partitions are complete relative to this imported sheet.',
     },
     classification: IMPORT_CLASSIFICATION,
-    handling: { allowedUses: ['local_answer', 'dashboard'], allowModelContext: true, allowPublication: false, modelContextPolicy },
+    handling: { allowedUses: ['local_answer', 'dashboard'], allowModelContext: true, allowPublication: false, ...(modelContextPolicy ? { modelContextPolicy } : {}) },
     retention: { minimumVersions: 1, automaticExpiry: false, reacquirable: true, backupRequired: false },
     rowCount: rows.length,
     transform,
@@ -1156,7 +1157,7 @@ function buildWideProposal(
   context: SelectedContext,
   model: ModelProposal,
   ownerId: string,
-  modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
+  modelContextPolicy?: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
 ): BuiltProposal {
   if (!model.labelColumn) throw new Error('wide_time_series requires labelColumn.');
   const header = parsed.rows.find(row => row.rowNumber === model.headerRow);
@@ -1390,7 +1391,7 @@ function buildRecordProposal(
   context: SelectedContext,
   model: ModelProposal,
   ownerId: string,
-  modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
+  modelContextPolicy?: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
 ): BuiltProposal {
   if (!model.timeColumn || !model.metricValueColumn) throw new Error('record_table requires timeColumn and metricValueColumn.');
   if (model.dataStartRow <= model.headerRow) throw new Error('Record-table dataStartRow must follow headerRow.');
@@ -1611,7 +1612,7 @@ function validateAndBuild(
   model: ModelProposal,
   ownerAnswers: Record<string, string>,
   ownerId: string,
-  modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
+  modelContextPolicy?: NonNullable<AnalyticsHandlingContract['modelContextPolicy']>,
 ): { built?: BuiltProposal; unresolved: AnalyticsImportUnresolvedField[] } {
   const requiredText: Array<[string, string]> = [
     ['datasetName', model.datasetName], ['description', model.description], ['domainKey', model.domainKey],
@@ -1967,7 +1968,8 @@ export function createAnalyticsImportSemanticProposalService(input: {
       endpointSha256,
       modelTemperature: 0 as const,
       content: 'Bounded worksheet structure, semantic labels, and representative cell values plus one complete analytics context family.',
-      allowed: locality === 'device_local' || locality === 'amazon_managed_remote',
+      // D4: any connected provider may read workbook evidence; the receipt keeps provenance.
+      allowed: true,
     };
   }
 
@@ -2231,19 +2233,6 @@ export function createAnalyticsImportSemanticProposalService(input: {
       return;
     }
     const context = loadSelectedContext(db, catalog, selected.family);
-    if (locality === 'external_remote') {
-      updateNeedsInput(rowById(row.id)!, parsed.profile, [{
-        field: 'modelProvider',
-        reason: 'The configured inference endpoint is not device-local or Amazon-managed, so workbook evidence was not sent.',
-        choices: [{ id: 'retry_after_provider_change', label: 'Retry after changing the inference provider' }],
-      }], runtime, {
-        contextFamily: context.family,
-        contextSelectionSha256: context.selectionSha256,
-        contextReceiptsJson: stableAnalyticsJson(context.receipts),
-        contextBundleSha256: context.bundleSha256,
-      });
-      return;
-    }
     const userContent = modelRequestPayload(candidate, parsed, context, resolvedOwnerAnswers);
     const prompt = `${MODEL_SYSTEM}\n\n${userContent}`;
     const promptSha256 = sha256(prompt);
@@ -2267,14 +2256,10 @@ export function createAnalyticsImportSemanticProposalService(input: {
     try { model = parseModelProposal(response.content); } catch (error) {
       throw new AnalyticsImportInboxError('invalid_input', `Semantic proposal JSON failed validation: ${error instanceof Error ? error.message : String(error)}`);
     }
-    const modelContextPolicy: NonNullable<AnalyticsHandlingContract['modelContextPolicy']> = {
-      allowedProviderLocalities: [locality as 'device_local' | 'amazon_managed_remote'],
-      endpointSha256,
-      disclosurePolicyVersion: ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
-    };
+    // D4: no provider pin is written; the disclosure receipt records provenance.
     let validation: ReturnType<typeof validateAndBuild>;
     try {
-      validation = validateAndBuild(row.id, candidate, parsed, context, model, resolvedOwnerAnswers, input.ownerId, modelContextPolicy);
+      validation = validateAndBuild(row.id, candidate, parsed, context, model, resolvedOwnerAnswers, input.ownerId);
     } catch (error) {
       throw new AnalyticsImportInboxError(
         'invalid_input',

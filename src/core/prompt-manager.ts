@@ -6,6 +6,8 @@
 import type { Node, WorkItem } from './types.js';
 import type { ToolDefinition } from './llm-client.js';
 import type { McpProfileSnapshot, McpServerSnapshot } from './mcp-types.js';
+import { isAmazonOnlyChatTool } from './workplace.js';
+import { applyOffPromptEdits } from './prompt-workplace-edits.js';
 import { mcpServerCardMarker } from './mcp-custom-config.js';
 import { writeFileMaxChars } from './limits.js';
 import { dashboardLaneAvailability, etlChatLaneCallable } from './analytics-runners.js';
@@ -38,6 +40,11 @@ export interface PromptContext {
   jobBlock?: string;
   /** The owner's connected Gmail accounts with their labels (when more than one, or labelled). */
   gmailAccountsBlock?: string;
+  /**
+   * Settings → Workplace (Amazon Employee), read once per turn. false hides
+   * Amazon-only tools and guidance; undefined is treated as ON.
+   */
+  amazonEmployee?: boolean;
 }
 
 export interface PromptManager {
@@ -118,7 +125,9 @@ function createQueryDataRoomToolDefinition(): ToolDefinition {
   };
 }
 
-function createDataRoomDatasetToolDefinition(): ToolDefinition {
+function createDataRoomDatasetToolDefinition({ includeEtl = true }: { includeEtl?: boolean } = {}): ToolDefinition {
+  // Settings → Workplace: while Amazon Employee is off the ETL source is pruned, not reworded.
+  const E = (on: string, off: string) => (includeEtl ? on : off);
   return {
     type: 'function',
     function: {
@@ -129,16 +138,16 @@ function createDataRoomDatasetToolDefinition(): ToolDefinition {
         'The plan keys are exactly version, mode, request, sources, fragments, terminal. version is the JSON number 1; mode is the separate exact string dataset_preparation. Never emit semanticRequest, relationalFragments, columns, publish_dataset, sourceAlias, mode=closed, or a string version.',
         'For every fresh source, first call the same tool read-only as {action:"derive_semantic_hashes", metric:{id,version,unit,definition}, regime:{id,version,definition}}. Copy the returned metric and regime objects exactly into plan.request; retain the same complete definitions in source.target. This deterministic receipt computes identities only—it never authors or mutates a plan.',
         'REQUEST SHAPES: metric={id,version,unit,definitionSha256}; regime={id,version,definitionSha256} (metric/regime version is a STRING such as "1"; only plan.version and answer.version are the number 1); dimensions and filters are arrays, [] when the request has none (omitted means []); freshness={mode:"historical_as_of"|"allow_stale"} or {mode:"fresh_by",maxAgeMs}; use="local_answer". Coverage completeRanges may be [] when no partition is proven complete. FRESH TARGET SHAPES: schema entries use {name,logicalType,nullable}; metric/regime use the definition objects above; countingKey/timeField/dimensions name exact schema fields; answer={version:1,metricId,metricValueColumn,rowDimensions,filterableFields,stableOrder}. countingKey is ONE field name (never an array); request.domainKey/countingKey/requiredGrain/timeZone equal target.domainKey/countingKey/grain/timeZone; coverage.watermark is a full ISO timestamp with timezone such as "2026-09-25T23:59:59+05:30".',
-        'BotBoy authors every field required by the complete schema: exact semantic request; 1–8 exact existing-version, Import Inbox, local-file, complete SQL, or checkpointed ETL sources; full fresh-source target contracts; optional schema-defined relational fragments; and one terminal. No server-side plan author fills missing fields.',
-        'LOCAL FILE IMPORT (any readable CSV/TSV/XLSX: owner files, downloads, mail/Slack/chat attachments, ETL result .tsv, write_file output): first call read-only {action:"inspect_local_file", file:{path, sheet?, headerRow?, nullToken?}} for the exact header, compatibleTypes, empties, and date ranges. NEW dataset source: {kind:"local_file", alias, path, sheet?, headerRow?, nullToken?, target:{complete target}}; schema names equal the header (any order), types from compatibleTypes, nullable where empty>0. EXISTING dataset source: {kind:"local_file", alias, path, ..., into:{datasetId, mode:"merge_partitions"|"replace", coverage:{coverage of the file rows}}} with plan.request copied from that dataset card (metric/regime/grain/countingKey/timeZone) and terminal = this source. merge_partitions adds or replaces only the file’s days/months; replace makes the file the complete new version. nullToken defaults to "" (empty cells are null), which is also how Datanet ETL downloads write null. BotBoy reads, types, and coverage-checks the file and pins its exact bytes before any job exists, so a mismatch has zero effects. Never re-run SQL or ETL to import a file you already have, never convert it through shell/OpenPyXL, and never ask the owner for the file again.',
-        'ETL SOURCE FORM: {kind:"etl_query", alias, sql:"complete warehouse query", datasetDate?:"YYYY-MM-DD", nullToken?, target:{complete target}} submits one NEW run; there is no runId field. BotBoy reads the complete result like a local TSV: target.schema names equal the query output columns (any order; warehouse names are usually lowercase), and empty cells or omitted trailing fields are null, so declare nullable:true wherever the query can return NULL. If the finished result does not fit the target, the job fails without resubmitting; follow its nextAction. For monthly data, target.coverage should normally use partitionKind:"month" with compact observedRanges/completeRanges using YYYY-MM-01 endpoints; request.dateRange must be fully observed while completeRanges may honestly exclude partial or uncertified months.',
-        'SQL SOURCE FORM: {kind:"sql_query", alias, sql:"complete read-only query", target:{complete target}} runs on the SQL connection and exports the COMPLETE result (at most 50,000 rows, 500,000 cells, 32 MiB), never a chat-sized page. BotBoy reads it like a local CSV: target.schema names equal the query output columns (any order), NULL is null, dates must be YYYY-MM-DD and timestamps ISO 8601 with a zone—format them in SQL or declare string. Prefer it over ETL for results within that limit; aggregate in SQL or use etl_query for larger data. A result that does not fit the target publishes nothing; follow its nextAction.',
+        'BotBoy authors every field required by the complete schema: exact semantic request; 1–8 exact existing-version, Import Inbox, local-file, ' + E('complete SQL, or checkpointed ETL sources', 'or complete SQL sources') + '; full fresh-source target contracts; optional schema-defined relational fragments; and one terminal. No server-side plan author fills missing fields.',
+        'LOCAL FILE IMPORT (any readable CSV/TSV/XLSX: owner files, downloads, mail/Slack/chat attachments, ' + E('ETL result .tsv, ', '') + 'write_file output): first call read-only {action:"inspect_local_file", file:{path, sheet?, headerRow?, nullToken?}} for the exact header, compatibleTypes, empties, and date ranges. NEW dataset source: {kind:"local_file", alias, path, sheet?, headerRow?, nullToken?, target:{complete target}}; schema names equal the header (any order), types from compatibleTypes, nullable where empty>0. EXISTING dataset source: {kind:"local_file", alias, path, ..., into:{datasetId, mode:"merge_partitions"|"replace", coverage:{coverage of the file rows}}} with plan.request copied from that dataset card (metric/regime/grain/countingKey/timeZone) and terminal = this source. merge_partitions adds or replaces only the file’s days/months; replace makes the file the complete new version. nullToken defaults to "" (empty cells are null)' + E(', which is also how Datanet ETL downloads write null', '') + '. BotBoy reads, types, and coverage-checks the file and pins its exact bytes before any job exists, so a mismatch has zero effects. Never re-run SQL' + E(' or ETL', '') + ' to import a file you already have, never convert it through shell/OpenPyXL, and never ask the owner for the file again.',
+        ...(includeEtl ? ['ETL SOURCE FORM: {kind:"etl_query", alias, sql:"complete warehouse query", datasetDate?:"YYYY-MM-DD", nullToken?, target:{complete target}} submits one NEW run; there is no runId field. BotBoy reads the complete result like a local TSV: target.schema names equal the query output columns (any order; warehouse names are usually lowercase), and empty cells or omitted trailing fields are null, so declare nullable:true wherever the query can return NULL. If the finished result does not fit the target, the job fails without resubmitting; follow its nextAction. For monthly data, target.coverage should normally use partitionKind:"month" with compact observedRanges/completeRanges using YYYY-MM-01 endpoints; request.dateRange must be fully observed while completeRanges may honestly exclude partial or uncertified months.'] : []),
+        'SQL SOURCE FORM: {kind:"sql_query", alias, sql:"complete read-only query", target:{complete target}} runs on the SQL connection and exports the COMPLETE result (at most 50,000 rows, 500,000 cells, 32 MiB), never a chat-sized page. BotBoy reads it like a local CSV: target.schema names equal the query output columns (any order), NULL is null, dates must be YYYY-MM-DD and timestamps ISO 8601 with a zone—format them in SQL or declare string. ' + E('Prefer it over ETL for results within that limit; aggregate in SQL or use etl_query for larger data.', 'Aggregate in SQL for larger data.') + ' A result that does not fit the target publishes nothing; follow its nextAction.',
         'action=create requires explicit current-owner intent and ownerRequested=true. action=status takes only the returned jobId and never resubmits a source. A bounded call may return in_progress, waiting_external, or needs_approval; protected Import Inbox approval remains owner-UI-only.',
         'A no-effect correct_arguments failure may expose another prerequisite validation layer. Correct every listed issues[].path in one materially changed call and continue in the same turn while new actionable issues remain: validation failures write nothing, and only the same failure coming back three times means stop and report. Never repeat canonically identical arguments. Several independent imports (different sources) may each be created in one turn. Once a source has a jobId, observe it with status; after a committed/unknown effect without a jobId, stop creating until it is observed.',
         'Do not use shell, generic file inspection, or implementation source to calculate semantic hashes or profile files; use derive_semantic_hashes, inspect_local_file, and exact prior receipts. Refer to files by name in owner-facing prose; do not echo BotBoy-internal paths.',
         'Completion is one verified immutable catalog dataset/version, never an answer or analysis menu. The full schema below is authoritative.',
       ].join(' '),
-      parameters: createDataRoomDatasetParametersSchema(),
+      parameters: createDataRoomDatasetParametersSchema({ includeEtl }),
     },
   };
 }
@@ -460,6 +469,23 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
           ownerRequested: { type: 'boolean', description: 'Set true only when the owner asked for a document in this conversation.' },
         },
         required: ['title', 'content', 'ownerRequested'],
+      },
+    },
+  },
+  export_footer: {
+    type: 'function',
+    function: {
+      name: 'export_footer',
+      description: 'Read or set the text printed in the center of every page footer of PDF and Word document exports, and of HTML exports when printed (the date and page numbers always stay). action=get reports it. action=set only when the owner’s current message asks for a footer: pass their exact text (empty string = no footer text) and ownerRequested=true. Changes future exports only.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          action: { type: 'string', enum: ['get', 'set'] },
+          text: { type: 'string', maxLength: 120, description: 'set only: the exact footer text, one line; empty string = no footer text.' },
+          ownerRequested: { type: 'boolean', description: 'set only: true when the owner asked for this footer in the current message.' },
+        },
+        required: ['action'],
       },
     },
   },
@@ -917,7 +943,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
 
 const ROLE_TOOLS: Record<AgentRole, string[]> = {
   orchestrator: ['query_db', 'list_nodes', 'get_node_items', 'assign_item', 'create_node', 'search_items', 'send_chat_message', 'enrich_item', 'run_command', 'create_item', 'update_item', 'write_file', 'read_file'],
-  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'assign_project_artifact', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source', 'edit_analytics_dashboard', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_find_server', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'wait_for_etl_run', 'job_update', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'gmail_search', 'gmail_read', 'gmail_draft', 'gmail_send', 'whatsapp_find_contact', 'whatsapp_send', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
+  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'assign_project_artifact', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source', 'edit_analytics_dashboard', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_find_server', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'wait_for_etl_run', 'job_update', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'gmail_search', 'gmail_read', 'gmail_draft', 'gmail_send', 'whatsapp_find_contact', 'whatsapp_send', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'export_footer', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
   classifier: [], // no tools — just returns JSON
   enricher: ['enrich_item', 'query_db'],
   organizer: ['list_nodes', 'get_node_items', 'create_node', 'assign_item'],
@@ -1073,11 +1099,17 @@ function etlCoreRules(): string {
   ].join('\n');
 }
 
-function formatDataLaneNotice(servers?: McpServerSnapshot[]): string {
+function formatDataLaneNotice(servers?: McpServerSnapshot[], amazon = true): string {
   if (!servers) return '';
   const ETL_CORE_RULES = etlCoreRules();
   const sql = servers.find(server => server.id === 'sql-context');
   const availability = dashboardLaneAvailability(servers);
+  if (!amazon) {
+    // Amazon Employee off: a2-analytics is hidden, so the SQL connection is the only lane.
+    return availability.sqlUsable
+      ? '\n## DATA LANE NOTICE\nThe SQL warehouse lane is data-ready for this turn (required query tools + recent warehouse-health receipt). Use governed mcp_sql_* reads for warehouse analysis and dashboard query validation.\n'
+      : '\n## DATA LANE NOTICE\nThe SQL warehouse lane is not data-ready for this turn. Do not call SQL query tools and do not create or refresh a warehouse-backed dashboard that cannot run. Do not start, restart, or reconfigure the connection unless the owner explicitly asks for repair. State that the SQL connection on Connections needs attention and stop.\n';
+  }
   if (availability.sqlUsable) {
     return `\n## DATA LANE NOTICE\nThe SQL warehouse lane is data-ready for this turn (required query tools + recent warehouse-health receipt). Use governed mcp_sql_* reads for warehouse analysis and dashboard query validation. Datanet ETL tools remain primary for DataCentral jobs, runs, profiles, schedules, and existing ETL outputs. ETL runs are async: BotBoy watches the runs you submit (mcp_etl_run_query) and continues the job when they finish; use wait_for_etl_run to use a result in this turn, and never resubmit a running run or ask the owner to check back. Already-submitted dashboard ETL handoffs are reconciled from their exact remote run receipts when results arrive; never queue a full refresh solely to import a late output.\n`;
   }
@@ -1303,7 +1335,7 @@ When the user asks about emails, meetings, files, messages, documents, or data, 
 - Sharing is an external write. Canonical analytics dashboards use get_dashboard_sharing_status plus the dashboard Share confirmation card. Existing HTML/prototype files use publish_static_artifact_to_harmony directly: for an explicit publish request make ONE live call (validation is built in), use app-level configuration automatically, and claim success only from published=true with contentVerified=true and visibilityConverged=true. dryRun is preview/diagnosis only. A partial post-deploy receipt is resumable without redeploying; follow its nextAction. browser_hands MAY repair the named Bindles permission when deterministic convergence exhausts, then resume the attempt for a final receipt. Never disable S3/CloudFront or Harmony safety controls.
 
 ${formatMcpInventory(ctx?.mcpServers)}
-${formatDataLaneNotice(ctx?.mcpServers)}
+${formatDataLaneNotice(ctx?.mcpServers, ctx?.amazonEmployee !== false)}
 ${DATA_JOB_GUIDANCE}
 
 ## Identity — who you are (and are not)
@@ -1518,6 +1550,49 @@ Noise = bare app names (Electron, Chrome), system events, empty titles.
 Duplicates = same URL, same content, near-identical titles.`,
 };
 
+/**
+ * Exact-substring replacements applied to shared chat tools while Amazon
+ * Employee is off (design §8.2). `field` is 'description' or a property path
+ * under the function. A drift-guard test asserts each `from` occurs once.
+ */
+export const OFF_TOOL_DESCRIPTION_OVERRIDES: ReadonlyArray<{ tool: string; field: string; from: string; to: string }> = [
+  { tool: 'mcp_profile_action', field: 'description', from: 'Authentication steps (Toolbox install, mwinit, grasp-mcp login) CANNOT run', to: 'Authentication steps (installers, CLI logins) CANNOT run' },
+  { tool: 'mcp_profile_action', field: 'parameters.properties.profileId.description', from: 'for example grasp-m365 or sql-context', to: 'for example sql-context' },
+  { tool: 'open_terminal', field: 'parameters.properties.title.description', from: 'e.g. "Midway sign-in"', to: 'e.g. "Sign-in"' },
+  { tool: 'refresh_analytics_dashboard', field: 'description', from: ' Never call this merely to import a late Datanet output: already-submitted timeout handoffs are reconciled automatically into their exact eligible widgets without rerunning queries.', to: '' },
+  { tool: 'mcp_find_server', field: 'description', from: 'Searches the official MCP Registry and, when aim is installed, the AIM registry.', to: 'Searches the official MCP Registry.' },
+  { tool: 'mcp_add_custom_server', field: 'parameters.properties.command.description', from: '(npx, uvx, aim, docker, a binary)', to: '(npx, uvx, docker, a binary)' },
+  { tool: 'mcp_update_custom_server', field: 'parameters.properties.command.description', from: '(npx, uvx, aim, docker, a binary)', to: '(npx, uvx, docker, a binary)' },
+  { tool: 'assign_project_artifact', field: 'parameters.properties.filePath.description', from: 'returned by write_file or Harmony publish.', to: 'returned by write_file.' },
+];
+
+/** Clone only along the replaced path; TOOL_DEFS is never mutated. */
+function withOffOverrides(def: ToolDefinition): ToolDefinition {
+  const entries = OFF_TOOL_DESCRIPTION_OVERRIDES.filter(entry => entry.tool === def.function.name);
+  if (!entries.length) return def;
+  let fn: any = { ...def.function };
+  for (const entry of entries) {
+    const keys = entry.field.split('.');
+    const write = (node: any, index: number): any => {
+      const copy = { ...node };
+      const key = keys[index];
+      copy[key] = index === keys.length - 1
+        ? String(node[key]).replace(entry.from, entry.to)
+        : write(node[key], index + 1);
+      return copy;
+    };
+    fn = write(fn, 0);
+  }
+  return { ...def, function: fn };
+}
+
+/** Exported for tests: the shared registry of chat tool definitions (read-only use). */
+export function chatToolDefinitionNames(): string[] {
+  return Object.keys(TOOL_DEFS);
+}
+
+export { createDataRoomDatasetToolDefinition };
+
 export function createPromptManager(): PromptManager {
   return {
     getSystemPrompt(role: AgentRole, context?: PromptContext): string {
@@ -1530,6 +1605,8 @@ export function createPromptManager(): PromptManager {
         // sending unsupported cache-control fields.
         prompt = `${analyticsDashboardPrompt(context)}\n\n${prompt}`;
       }
+      // Settings → Workplace: Amazon internal guidance is left out while Amazon Employee is off.
+      if (role === 'chat' && context?.amazonEmployee === false) prompt = applyOffPromptEdits(prompt);
 
       if (context?.customInstructions) prompt += `\n\n${context.customInstructions}`;
       if (role === 'chat' && context?.gmailAccountsBlock) prompt += `\n\n${context.gmailAccountsBlock}`;
@@ -1544,9 +1621,18 @@ export function createPromptManager(): PromptManager {
       // Analytical discipline lives in the analytics system prompt, not in
       // tool removal; write tools keep their own ownerRequested/policy gates.
       const names = ROLE_TOOLS[role] || [];
+      // Settings → Workplace: while Amazon Employee is off, Amazon-only tools
+      // are not offered and shared tools lose their Amazon examples.
+      const amazon = context?.amazonEmployee !== false;
       return names
-        .map(name => name === 'write_file' ? createWriteFileToolDefinition() : TOOL_DEFS[name])
-        .filter(Boolean);
+        .filter(name => amazon || !isAmazonOnlyChatTool(name))
+        .map(name => name === 'write_file'
+          ? createWriteFileToolDefinition()
+          : name === 'create_data_room_dataset' && !amazon
+            ? createDataRoomDatasetToolDefinition({ includeEtl: false })
+            : TOOL_DEFS[name])
+        .filter(Boolean)
+        .map(def => (amazon ? def : withOffOverrides(def)));
     },
   };
 }

@@ -1,3 +1,4 @@
+import { requireAmazonEmployee } from './workplace.js';
 import { requireLocalOwnerUiRequest } from './local-owner.js';
 import { dashboardIssues, viewIssueReports } from '../../core/analytics-dashboard-issues.js';
 import { Router, Request, Response } from 'express';
@@ -66,6 +67,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
   });
 
   router.put('/analytics/publisher', (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     try {
       res.json({ publisher: deps.dashboardPublisher.updateConfig(req.body) });
@@ -76,6 +78,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
 
   // Harmony setup stepper: which step is the owner on? (CLI missing is the expected first state.)
   router.get('/analytics/publisher/harmony/probe', async (_req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     try {
       res.json({ probe: await deps.dashboardPublisher.probeHarmonySetup() });
@@ -86,6 +89,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
 
   // One-click CLI install (`toolbox install harmonycli`). Long-running; the UI shows progress.
   router.post('/analytics/publisher/harmony/install-cli', async (_req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     try {
       const result = await deps.dashboardPublisher.installHarmonyCli();
@@ -100,6 +104,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
   // terminals: command FIXED server-side, loopback-only, user types PIN +
   // touches the security key in the PTY — never through the model or API.
   router.post('/analytics/publisher/harmony/mwinit', (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     const chatTerminal = deps.chatTerminal;
     if (!chatTerminal) return res.status(503).json({ error: 'Terminal sessions are unavailable.' });
     const isLoopback = (address: string | undefined) =>
@@ -126,6 +131,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
 
   // What automated provisioning WOULD create — content of the confirm card.
   router.get('/analytics/publisher/harmony/provision-plan', (_req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     try {
       res.json({ plan: deps.dashboardPublisher.planHarmonyProvisioning() });
@@ -136,6 +142,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
 
   // Create team + bindle (idempotent; writes to shared Amazon systems) — explicit confirm required.
   router.post('/analytics/publisher/harmony/provision', async (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     if (req.body?.confirmed !== true) {
       return res.status(400).json({ error: 'confirmed must be true after the user reviews exactly what will be created' });
@@ -321,6 +328,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
   });
 
   router.post('/analytics/dashboards/:id/share-request', (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     res.set('Cache-Control', 'no-store');
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     if (!requireLocalOwnerMutation(req, res)) return;
@@ -333,6 +341,7 @@ export function createAnalyticsRouter(deps: RouterDeps, dashboardState?: Dashboa
   });
 
   router.post('/analytics/dashboards/:id/publish', async (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     res.set('Cache-Control', 'no-store');
     if (!deps.dashboardPublisher) return res.status(503).json({ error: 'Dashboard publishing is unavailable' });
     if (!requireLocalOwnerMutation(req, res)) return;

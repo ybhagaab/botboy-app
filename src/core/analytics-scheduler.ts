@@ -12,6 +12,8 @@ export function createAnalyticsScheduler(options: {
   db: Database.Database;
   analyticsService: AnalyticsDashboardService;
   pollIntervalMs?: number;
+  /** Settings → Workplace: false while Amazon Employee is off; the late-ETL result pass then skips. */
+  etlActive?: () => boolean;
   /** Whole-dashboard concurrency. Two prevents head-of-line blocking while
    * keeping aggregate warehouse/ETL pressure bounded. */
   runConcurrency?: number;
@@ -103,6 +105,8 @@ export function createAnalyticsScheduler(options: {
 
   function launchLateResultPass(): void {
     if (lateResultOperation) return;
+    // Amazon Employee off: Datanet is hidden; pending late handoffs stay journaled, unclaimed.
+    if (options.etlActive?.() === false) return;
     lateResultOperation = analyticsService.processLateEtlResults(6)
       .catch(error => {
         console.error('[Analytics scheduler] late ETL reconciliation failed:', error);

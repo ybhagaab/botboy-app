@@ -1,3 +1,4 @@
+import { requireAmazonEmployee } from './workplace.js';
 import { Router, type Request, type Response } from 'express';
 import {
   DocumentExportError,
@@ -346,7 +347,7 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     try {
       const artifact = service.getArtifact(artifactId);
       if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
-      const exported = await exportDocument({ title: artifact.title, content: artifact.content, format });
+      const exported = await exportDocument({ title: artifact.title, content: artifact.content, format, footerText: deps.exportFooter?.effective() ?? '' });
       res.set('Content-Type', exported.mediaType);
       res.set('Content-Disposition', `attachment; filename="${exported.filename}"`);
       return res.send(exported.data);
@@ -456,6 +457,7 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
   });
 
   router.post('/product-documents/:artifactId/publications', (req: Request, res: Response) => {
+    if (!requireAmazonEmployee(deps, res)) return;
     const service = deps.productDocumentService;
     const publications = deps.productDocumentPublications;
     if (!service || !publications) {

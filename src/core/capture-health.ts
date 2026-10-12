@@ -82,6 +82,8 @@ export interface CaptureHealth {
 
 const SETTING_KEY = 'capture_health.v1';
 const SOURCES: readonly CaptureSourceId[] = ['slack', 'sharepoint', 'grasp', 'gmail'];
+/** Sources that exist only on BotBoy's Amazon internal paths; no issues while Amazon Employee is off. */
+export const AMAZON_ONLY_CAPTURE_SOURCES: readonly CaptureSourceId[] = ['grasp', 'sharepoint'];
 
 const SOURCE_NAMES: Record<CaptureSourceId, string> = {
   slack: 'Slack',
@@ -122,7 +124,17 @@ const CAUSES: Record<CaptureFailureKind, string> = {
   unknown: 'Capture keeps failing',
 };
 
-function nextActionFor(source: CaptureSourceId, kind: CaptureFailureKind): string {
+function nextActionFor(source: CaptureSourceId, kind: CaptureFailureKind, amazon = true): string {
+  if (!amazon) {
+    // Neutral copy: no mwinit, Midway, or Amazon connection while Amazon Employee is off.
+    if (source === 'slack' && kind === 'service_auth') {
+      return 'Open Connections → Slack → Manage and save a new Slack user token.';
+    }
+    if (source === 'slack' && kind !== 'rate_limited' && kind !== 'network') {
+      return 'Open Connections → Slack → Manage and check the Slack user token.';
+    }
+    if (kind === 'service_auth' && source !== 'gmail') return `Restart the ${SOURCE_NAMES[source]} connection.`;
+  }
   switch (kind) {
     case 'midway_auth':
       return 'Run mwinit. BotBoy opens a terminal for it in chat; capture catches up on its own afterwards.';
@@ -230,7 +242,14 @@ function loadPersisted(db: Database.Database): Map<CaptureSourceId, CaptureSourc
   return entries;
 }
 
-export function createCaptureHealth(deps: { db: Database.Database; now?: () => number }): CaptureHealth {
+export function createCaptureHealth(deps: {
+  db: Database.Database;
+  now?: () => number;
+  /** Settings → Workplace; absent = ON (today's behavior). */
+  amazonEmployee?: () => boolean;
+  /** Whether a Slack user token is configured; while OFF without one, Slack shows no issue. */
+  slackTokenConfigured?: () => boolean;
+}): CaptureHealth {
   const { db } = deps;
   const now = deps.now ?? Date.now;
   const entries = loadPersisted(db);
@@ -257,10 +276,10 @@ export function createCaptureHealth(deps: { db: Database.Database; now?: () => n
     return entry;
   }
 
-  function isIssue(entry: CaptureSourceHealth, at: number): boolean {
-    if (!entry.failingSince || entry.consecutiveFailures <= 0 || !entry.kind) return false;
+  function isIssue(entry: CaptureSourceHealth, at: number, kind: CaptureFailureKind | null = entry.kind): boolean {
+    if (!entry.failingSince || entry.consecutiveFailures <= 0 || !kind) return false;
     // Midway says exactly what to do; there is nothing to wait for.
-    if (entry.kind === 'midway_auth') return true;
+    if (kind === 'midway_auth') return true;
     const threshold = WARN_AFTER[entry.source];
     const age = at - Date.parse(entry.failingSince);
     return entry.consecutiveFailures >= threshold.failures && Number.isFinite(age) && age >= threshold.ms;
@@ -268,16 +287,21 @@ export function createCaptureHealth(deps: { db: Database.Database; now?: () => n
 
   function issues(): CaptureHealthIssue[] {
     const at = now();
+    const amazon = deps.amazonEmployee?.() !== false;
     const out: CaptureHealthIssue[] = [];
     for (const source of SOURCES) {
+      // Raw state stays untouched; only what is shown changes while off.
+      if (!amazon && AMAZON_ONLY_CAPTURE_SOURCES.includes(source)) continue;
+      if (!amazon && source === 'slack' && deps.slackTokenConfigured?.() === false) continue;
       const entry = entryFor(source);
-      if (!isIssue(entry, at) || !entry.kind || !entry.failingSince) continue;
+      const kind = !amazon && entry.kind === 'midway_auth' ? 'service_auth' : entry.kind;
+      if (!isIssue(entry, at, kind) || !kind || !entry.failingSince) continue;
       out.push({
         source,
         name: SOURCE_NAMES[source],
-        kind: entry.kind,
-        cause: CAUSES[entry.kind],
-        nextAction: nextActionFor(source, entry.kind),
+        kind,
+        cause: CAUSES[kind],
+        nextAction: nextActionFor(source, kind, amazon),
         since: entry.failingSince,
         lastSuccessAt: entry.lastSuccessAt,
         failures: entry.consecutiveFailures,

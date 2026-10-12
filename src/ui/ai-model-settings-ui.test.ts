@@ -22,7 +22,7 @@ function between(source: string, start: string, end: string): string {
 describe('Settings → AI model SPA seams', () => {
   it('routes, links, loads, and renders the page inside the existing Settings shell', () => {
     expect(dashboard).toContain("if (parts[0] === 'settings' && parts[1] === 'ai-model') return { view: 'ai-model-settings' };");
-    expect(dashboard).toContain("['publisher-settings', 'llm-usage-settings', 'ai-model-settings'].includes(route.view)");
+    expect(dashboard).toContain("['publisher-settings', 'llm-usage-settings', 'ai-model-settings', 'workplace-settings'].includes(route.view)");
     expect(dashboard).toContain('<a class="button ghost" href="#/settings/ai-model">');
     expect(dashboard).toContain("if (routeChanged && state.route.view === 'ai-model-settings') void loadAiModelStatus();");
     expect(dashboard).toContain("if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();");

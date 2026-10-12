@@ -145,6 +145,12 @@ export function createSlackMonitor(deps: {
   mcpManager?: McpManager;
   /** Outcome of every poll cycle, for owner-facing capture warnings. */
   captureHealth?: Pick<CaptureHealth, 'reportSuccess' | 'reportFailure'>;
+  /**
+   * Settings → Workplace: false while Amazon Employee is off. The Slack MCP
+   * is then hidden (the manager returns no server), and a cycle with no
+   * token returns quietly instead of reporting connector_down.
+   */
+  mcpAllowed?: () => boolean;
 }): SlackMonitor {
   const env = loadEnv();
   const appToken = process.env.SLACK_APP_TOKEN || env.SLACK_APP_TOKEN || '';
@@ -863,6 +869,7 @@ export function createSlackMonitor(deps: {
     }
   }
 
+  let loggedNotConnected = false;
   async function pollCycle(): Promise<void> {
     if (polling) return;
     if (Date.now() < nextPollAt) return;
@@ -873,6 +880,13 @@ export function createSlackMonitor(deps: {
       // server is running, else the token WebClient, else defer losslessly
       // (cursors only advance after successful processing).
       mcpTransportActive = Boolean(mcpClient && await mcpClient.isAvailable());
+      if (!mcpTransportActive && !webClient && deps.mcpAllowed?.() === false) {
+        if (!loggedNotConnected) {
+          loggedNotConnected = true;
+          console.log('[Slack] not connected: add a user token on Connections → Slack');
+        }
+        return;
+      }
       if (!mcpTransportActive && !webClient) {
         throw new Error('no active transport — start the Slack MCP connection (or configure a user token)');
       }

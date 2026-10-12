@@ -75,6 +75,8 @@ export function createDashboardRouter(
   aiModel?: () => { version: number; state: string },
   /** Capture-health issue counter; open tabs refetch /capture-health on change. */
   captureHealth?: () => { version: number; issues: number },
+  /** Settings → Workplace (Amazon Employee) change counter; open tabs repaint gated views on change. */
+  workplace?: () => { version: number; amazonEmployee: boolean },
 ): Router {
   const router = Router();
 
@@ -193,6 +195,15 @@ export function createDashboardRouter(
         try {
           const summary = captureHealth?.();
           return summary ? { captureHealthVersion: summary.version, captureIssues: summary.issues } : {};
+        } catch {
+          return {};
+        }
+      })(),
+      // In-memory: changes when the owner flips Amazon Employee.
+      ...(() => {
+        try {
+          const summary = workplace?.();
+          return summary ? { workplaceVersion: summary.version, amazonEmployee: summary.amazonEmployee } : {};
         } catch {
           return {};
         }

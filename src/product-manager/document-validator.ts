@@ -355,6 +355,11 @@ function validateWorkbook(content: string): DocumentFinding[] {
   return findings;
 }
 
+/**
+ * Opening directness, meta-instruction leakage, placeholders, and subjective
+ * language. Workplace-neutral integrity and style checks: they run for every
+ * owner whatever Settings → Workplace says (design §11, by decision).
+ */
 function validateAmazonWriting(profile: DocumentProfile, content: string): DocumentFinding[] {
   const findings: DocumentFinding[] = [];
   const prose = content.replace(/^\s*#{1,6}\s+.*$/gm, '').trim();

@@ -125,10 +125,8 @@ the team gateway. Any mix works at the same time:
 - **Remove key** stops chats on that provider's models; background work moves
   to another connected model.
 - When one of your key's models does the work, what it reads (captured
-  messages, documents, your chats, and query results) is sent to that
-  provider under your account. Data Room table values are not: they stay on
-  your Mac, so chat on an OpenAI or DeepSeek model cannot analyze Data Room
-  datasets.
+  messages, documents, your chats, query results, and Data Room tables) is
+  sent to that provider under your account.
 - New provider accounts have low rate limits. BotBoy waits and retries when
   the provider asks it to; limits rise as the account is used.
 
@@ -172,18 +170,31 @@ Use `./start.sh --update` for every later release.
 
 </details>
 
+### Amazon Employee setting
+
+**Settings → Workplace → Amazon Employee** decides whether BotBoy offers its
+Amazon internal paths: Slack through AI Community MCP, Outlook through GRASP,
+SharePoint, Datanet ETL, AIM servers, Amazon writing style, and Harmony
+dashboard sharing. BotBoy turns it on by itself when it finds Amazon sign-in
+or tools on your Mac (for example a Midway sign-in or Toolbox). Turn it off if
+you do not work at Amazon: those connections are hidden, their setup and
+captured data are kept, and the change applies right away with no restart.
+Slack then works with your own Slack user token. The same page sets the text
+printed in the center of every page footer of exported documents (blank by
+default; you can also ask BotBoy in chat).
+
 ### Connect optional data sources
 
 Open **Connections** in BotBoy. Each connection is opt-in and provides its own
 guided setup.
 
-- **Amazon Microsoft 365 through GRASP** — Outlook/calendar synchronization
+- **Amazon Microsoft 365 through GRASP** (Amazon Employee only) — Outlook/calendar synchronization
   uses your own Amazon browser session. BotBoy stores no GRASP password.
 - **Gmail** — for a Google account (personal Gmail or Google Workspace)
   instead of Amazon mail. You create a Google OAuth client once in your own
   Google Cloud project and choose its JSON file; see **Gmail** below.
 - **Slack** — choose and configure the channels you want BotBoy to capture.
-- **SharePoint** — install and authenticate from its connection card when you
+- **SharePoint** (Amazon Employee only) — install and authenticate from its connection card when you
   want document synchronization.
 - **Other MCP servers** — ask BotBoy in chat; see **Add an MCP server** below.
 - **Local folders** — BotBoy watches Downloads, Desktop, and Documents by
@@ -204,7 +215,7 @@ guided setup.
 
 #### Datanet ETL
 
-For Datanet/DataCentral work, open **Connections → Datanet ETL** and follow the
+Amazon Employee only. For Datanet/DataCentral work, open **Connections → Datanet ETL** and follow the
 steps shown there:
 
 1. Install Toolbox + AIM if needed.

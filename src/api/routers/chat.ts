@@ -9,6 +9,7 @@
  * was moved verbatim from routes.ts during the July 2026 router split.
  */
 
+import { exportFooterSetConfirmed } from '../../core/workplace-chat-tools.js';
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { estimateTokens, paramStr, type RouterDeps } from './deps.js';
@@ -19,6 +20,7 @@ import { currentLlmModelOperation, runInLlmModelOperation } from '../../core/llm
 import { createLlmUsageOperationId } from '../../core/llm-usage.js';
 import { normalizeAnalyticsSearchText } from '../../core/analytics-search-normalization.js';
 import {
+  analyticsBriefingUnavailableText,
   createAnalyticsSchemaBriefingLoader,
   resolveConversationMode,
   detectAnalyticsCreateIntent,
@@ -1063,6 +1065,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // Tool executions in this turn send their results to this model, so data
     // checks (Data Room rows, file values) judge this connection's locality.
     const turnModelOperation = chatBinding?.operation;
+    // Settings → Workplace (Amazon Employee), read once per turn for prompt, tools, and briefing.
+    const turnAmazonEmployee = deps.workplace ? deps.workplace.amazonEmployee() : true;
     // modeHint is ambient page context (an analytics route being open). It is
     // advisory — the message must corroborate — unlike mode, which commands.
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
@@ -1254,13 +1258,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 }
               : await runInLlmModelOperation(turnModelOperation, () => analyticsSchemaLoader.load(message, {
                   localOnly: analyticsIntent !== 'create' && Boolean(deps.analyticsDataRoom),
+                  amazonEmployee: turnAmazonEmployee,
                 }));
           } catch (error: any) {
             console.error(`[Chat] Analytics schema preflight failed: ${error?.message ?? error}`);
             analyticsBriefing = {
               ready: false,
               complete: false,
-              text: 'BotBoy could not load business/schema knowledge from any source. Check the managed SQL connector (#/connections/sql-context) and the analytics knowledge directory (a2-analytics connection card) before building a dashboard.',
+              text: analyticsBriefingUnavailableText(turnAmazonEmployee),
               groundingTerms: [],
               presets: [],
               files: [],
@@ -1368,6 +1373,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           mcpServers,
           ...(jobBlock ? { jobBlock } : {}),
           ...(gmailAccountsBlock ? { gmailAccountsBlock } : {}),
+          amazonEmployee: turnAmazonEmployee,
         };
         const systemPrompt = promptManager
           ? promptManager.getSystemPrompt('chat', promptContext)
@@ -1543,7 +1549,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const WRITE_TOOLS = new Set([
           'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
           'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
-          'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony',
+          'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
           ...GMAIL_WRITE_TOOLS,
           ...WHATSAPP_WRITE_TOOLS,
         ]);
@@ -2302,7 +2308,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                     ? gmailWriteConfirmed(tc.function.name, result?.content)
                     : WHATSAPP_WRITE_TOOLS.has(tc.function.name)
                       ? whatsAppSendConfirmed(tc.function.name, result?.content)
-                      : true;
+                      // The footer counts only for a confirmed set (get and refusals never do).
+                      : tc.function.name === 'export_footer'
+                        ? exportFooterSetConfirmed(String(result?.content ?? ''))
+                        : true;
               }
               const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
               if (savedDraftId) gmailDraftIds.add(savedDraftId);

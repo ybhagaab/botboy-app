@@ -64,7 +64,7 @@ export interface McpServerCandidate {
 }
 
 export interface McpSourceStatus {
-  status: 'ok' | 'not_installed' | 'loading' | 'unavailable';
+  status: 'ok' | 'not_installed' | 'loading' | 'unavailable' | 'skipped';
   matches?: number;
   message?: string;
 }
@@ -105,6 +105,8 @@ export interface McpServerFinderDeps {
   /** How long one search waits for a first AIM listing before reporting `loading`. */
   aimWaitMs?: number;
   now?: () => number;
+  /** Settings → Workplace: false skips the AIM registry (an Amazon internal path). Absent = searched. */
+  includeAim?: () => boolean;
 }
 
 const REGISTRY_CACHE_MS = 10 * 60_000;
@@ -526,6 +528,9 @@ export function createMcpServerFinder(deps: McpServerFinderDeps = {}): McpServer
       })();
 
       const aimTask = (async (): Promise<{ candidates: McpServerCandidate[]; status: McpSourceStatus }> => {
+        if (deps.includeAim?.() === false) {
+          return { candidates: [], status: { status: 'skipped', message: 'Only the official MCP Registry was searched.' } };
+        }
         const { catalog, status } = await aimBundles();
         if (!catalog) return { candidates: [], status };
         const ranked = catalog.bundles

@@ -350,11 +350,19 @@ function qualitySchema(): JsonSchema {
   };
 }
 
-function sourceTargetSchema(): JsonSchema {
+/** Settings → Workplace: includeEtl=false builds the schema without the Datanet ETL source (Amazon Employee off). */
+export interface DatasetToolSchemaOptions {
+  includeEtl?: boolean;
+}
+
+function sourceTargetSchema(opts: DatasetToolSchemaOptions = {}): JsonSchema {
+  const etl = opts.includeEtl !== false;
   return {
     type: 'object',
     additionalProperties: false,
-    description: 'Complete target contract for a NEW dataset from a fresh SQL, ETL, or local-file source. SQL/ETL columns must match acquired order and types; local-file schema names must equal the file header set (any order) and every cell must satisfy its declared type.',
+    description: etl
+      ? 'Complete target contract for a NEW dataset from a fresh SQL, ETL, or local-file source. SQL/ETL columns must match acquired order and types; local-file schema names must equal the file header set (any order) and every cell must satisfy its declared type.'
+      : 'Complete target contract for a NEW dataset from a fresh SQL or local-file source. SQL columns must match acquired order and types; local-file schema names must equal the file header set (any order) and every cell must satisfy its declared type.',
     properties: {
       datasetId: { type: 'string', pattern: '^ds_[A-Za-z0-9_-]{1,96}$', description: 'Optional exact target dataset ID. Omit to create one deterministically.' },
       expectedHeadRevision: { type: 'integer', minimum: 0, description: 'Optional exact CAS revision when updating a known dataset.' },
@@ -562,16 +570,17 @@ function fragmentSchema(): JsonSchema {
 }
 
 /** Shared by the local_file source and the read-only inspect_local_file action. */
-function localFileLocatorProperties(): Record<string, JsonSchema> {
+function localFileLocatorProperties(opts: DatasetToolSchemaOptions = {}): Record<string, JsonSchema> {
+  const etl = opts.includeEtl !== false;
   return {
     path: {
       type: 'string', minLength: 1, maxLength: 4096,
-      description: 'Any readable local file: an absolute path, a ~/ path, or a path relative to BotBoy’s files workspace (a write_file filename). Use exactly the path a download, attachment, or ETL tool returned. BotBoy’s own private state (database, secrets, Data Room internals) is not importable; its artifact folders (files, etl-results, chat-attachments, slack-attachments, sharepoint-cache) are.',
+      description: 'Any readable local file: an absolute path, a ~/ path, or a path relative to BotBoy’s files workspace (a write_file filename). Use exactly the path a download' + (etl ? ', attachment, or ETL tool' : ' or attachment') + ' returned. BotBoy’s own private state (database, secrets, Data Room internals) is not importable; its artifact folders (files, etl-results, chat-attachments, slack-attachments, sharepoint-cache) are.',
     },
     format: { type: 'string', enum: ['csv', 'tsv', 'xlsx'], description: 'Optional; inferred from .csv, .tsv/.tab, .xlsx/.xlsm. Required only for other extensions.' },
     sheet: { type: 'string', minLength: 1, maxLength: 255, description: 'XLSX only: exact worksheet name; optional when the workbook has exactly one sheet.' },
     headerRow: { type: 'integer', minimum: 1, maximum: 50000, description: 'XLSX only: 1-based row holding the column names (default 1). Rows above it are ignored; every populated cell below it must sit under a named column. Blank rows are skipped.' },
-    nullToken: { type: 'string', maxLength: 32, description: 'Optional exact cell text meaning null. Default "" = empty CSV/TSV cells (including Datanet ETL downloads) and blank XLSX cells are null. Set it only when the file writes another marker, such as "\\N" or "NULL".' },
+    nullToken: { type: 'string', maxLength: 32, description: 'Optional exact cell text meaning null. Default "" = empty CSV/TSV cells' + (etl ? ' (including Datanet ETL downloads)' : '') + ' and blank XLSX cells are null. Set it only when the file writes another marker, such as "\\N" or "NULL".' },
   };
 }
 
@@ -592,7 +601,8 @@ function localFileIntoSchema(): JsonSchema {
   };
 }
 
-function sourceSchema(): JsonSchema {
+function sourceSchema(opts: DatasetToolSchemaOptions = {}): JsonSchema {
+  const etl = opts.includeEtl !== false;
   const alias = { type: 'string', pattern: SOURCE_ALIAS_PATTERN, maxLength: 32 };
   const requiredColumns = {
     type: 'array', maxItems: 100, uniqueItems: true,
@@ -625,8 +635,8 @@ function sourceSchema(): JsonSchema {
         description: 'Local-file source mini-shapes. NEW dataset: {kind:"local_file", alias:"source_alias", path:"~/path/file.xlsx", sheet:"Exact sheet", target:{complete target}}. EXISTING dataset: {kind:"local_file", alias, path, into:{datasetId:"ds_…", mode:"merge_partitions", coverage:{coverage of the file rows}}}. Exactly one of target or into. CSV/TSV/XLSX; the file is read, typed against the contract, and coverage-checked before any job exists, and its exact bytes are pinned by BotBoy. First call action=inspect_local_file for exact columns, compatibleTypes, and time ranges.',
         properties: {
           kind: { type: 'string', enum: ['local_file'] }, alias,
-          ...localFileLocatorProperties(),
-          target: sourceTargetSchema(),
+          ...localFileLocatorProperties(opts),
+          target: sourceTargetSchema(opts),
           into: localFileIntoSchema(),
         },
         required: ['kind', 'alias', 'path'],
@@ -637,15 +647,15 @@ function sourceSchema(): JsonSchema {
       },
       {
         type: 'object', additionalProperties: false,
-        description: 'SQL source mini-shape: {kind:"sql_query", alias:"source_alias", sql:"complete read-only query", target:{complete target}}. BotBoy exports the complete result through the SQL connection (at most 50,000 rows, 500,000 cells, and 32 MiB) and reads it like a local CSV: target.schema names equal the query output columns (any order; warehouse names are usually lowercase), NULL is null, dates must be YYYY-MM-DD and timestamps ISO 8601 with a zone (format them in SQL, or declare string). Aggregate larger data in SQL, or use etl_query.',
+        description: 'SQL source mini-shape: {kind:"sql_query", alias:"source_alias", sql:"complete read-only query", target:{complete target}}. BotBoy exports the complete result through the SQL connection (at most 50,000 rows, 500,000 cells, and 32 MiB) and reads it like a local CSV: target.schema names equal the query output columns (any order; warehouse names are usually lowercase), NULL is null, dates must be YYYY-MM-DD and timestamps ISO 8601 with a zone (format them in SQL, or declare string). Aggregate larger data in SQL' + (etl ? ', or use etl_query.' : '.'),
         properties: {
           kind: { type: 'string', enum: ['sql_query'] }, alias,
           sql: { type: 'string', minLength: 1, maxLength: 100000, description: 'One complete read-only SELECT/WITH query.' },
-          target: sourceTargetSchema(),
+          target: sourceTargetSchema(opts),
         },
         required: ['kind', 'alias', 'sql', 'target'],
       },
-      {
+      ...(etl ? [{
         type: 'object', additionalProperties: false,
         description: 'ETL source mini-shape: {kind:"etl_query", alias:"source_alias", sql:"complete warehouse query", datasetDate:"YYYY-MM-DD" (optional), target:{complete target}}. It submits one NEW checkpointed Datanet run; there is no runId field. The complete result reads like a local TSV: target.schema names match the query columns (any order), and empty cells or omitted trailing fields are null. To import the result of a run that already succeeded, use local_file with the downloaded .tsv path instead of re-running SQL.',
         properties: {
@@ -653,15 +663,15 @@ function sourceSchema(): JsonSchema {
           sql: { type: 'string', minLength: 1, maxLength: 100000, description: 'Complete warehouse query submitted through checkpointed Datanet ETL.' },
           datasetDate: { type: 'string', pattern: ISO_DAY_PATTERN },
           nullToken: { type: 'string', maxLength: 32, description: 'Optional exact result-cell text meaning null. Default "" (Datanet writes null as an empty cell); set it only if the query itself emits a marker such as "\\N".' },
-          target: sourceTargetSchema(),
+          target: sourceTargetSchema(opts),
         },
         required: ['kind', 'alias', 'sql', 'target'],
-      },
+      }] : []),
     ],
   };
 }
 
-export function createDatasetPreparationPlanSchema(): JsonSchema {
+export function createDatasetPreparationPlanSchema(opts: DatasetToolSchemaOptions = {}): JsonSchema {
   return {
     type: 'object',
     additionalProperties: false,
@@ -680,7 +690,7 @@ export function createDatasetPreparationPlanSchema(): JsonSchema {
         description: 'Complete request object from this schema. It is never a prose string and the field name is exactly request.',
       },
       sources: {
-        type: 'array', minItems: 1, maxItems: 8, items: sourceSchema(),
+        type: 'array', minItems: 1, maxItems: 8, items: sourceSchema(opts),
         description: 'One to eight complete source objects. The field name is exactly sources.',
       },
       fragments: {
@@ -710,7 +720,7 @@ export function createDatasetPreparationPlanSchema(): JsonSchema {
   };
 }
 
-export function createDataRoomDatasetParametersSchema(): JsonSchema {
+export function createDataRoomDatasetParametersSchema(opts: DatasetToolSchemaOptions = {}): JsonSchema {
   return {
     type: 'object',
     additionalProperties: false,
@@ -724,13 +734,13 @@ export function createDataRoomDatasetParametersSchema(): JsonSchema {
       file: {
         type: 'object', additionalProperties: false,
         description: 'inspect_local_file only: the same locator the local_file source will use. Returns sheets, exact header, per-column compatibleTypes/empties/distinct counts, and day/month ranges of date columns, read by the exact create-time parser.',
-        properties: localFileLocatorProperties(),
+        properties: localFileLocatorProperties(opts),
         required: ['path'],
       },
       metric: metricDefinitionSchema(),
       regime: regimeDefinitionSchema(),
       jobId: { type: 'string', pattern: '^aj_[a-f0-9]{32}$', description: 'Required only for status; exact durable ID returned by create.' },
-      plan: createDatasetPreparationPlanSchema(),
+      plan: createDatasetPreparationPlanSchema(opts),
       ownerRequested: { type: 'boolean', enum: [true], description: 'Required only for create and only for an explicit current owner request. This is a temporary attestation in addition to server-confirmed owner context.' },
     },
     required: ['action'],

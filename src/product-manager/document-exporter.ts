@@ -118,20 +118,29 @@ function resolveChrome(): Promise<string | null> {
 }
 
 /**
+ * A CSS string literal for owner text: wrapped in double quotes, with \, ",
+ * <, >, and & written as CSS hex escapes so footer text can never close the
+ * string or break out of the <style> element in header.html.
+ */
+export function cssString(text: string): string {
+  const escapes: Record<string, string> = { '\\': '\\5C ', '"': '\\22 ', '<': '\\3C ', '>': '\\3E ', '&': '\\26 ' };
+  return '"' + text.replace(/[\\"<>&]/g, char => escapes[char]) + '"';
+}
+
+/**
  * Print styling shared by the HTML download and the Chrome-printed PDF.
- * Amazon-standard document geometry (owner request 2026-08-20): thin 0.5in
- * page margins, an 11pt body, and printed-page footers carrying the date,
- * "Amazon Confidential", and page numbers (Amazon Writing Guidelines
- * mechanics). The @page margin boxes render in Chrome 131+ print; older
+ * House-style document geometry (owner request 2026-08-20): thin 0.5in page
+ * margins, an 11pt body, and printed-page footers carrying the date, the
+ * owner's export footer text (Settings → Workplace; omitted when blank), and
+ * page numbers. The @page margin boxes render in Chrome 131+ print; older
  * engines ignore them without side effects, and they never affect on-screen
  * HTML viewing.
  */
-const buildExportStyle = (dateText: string) => `
+export const buildExportStyle = (dateText: string, footerText = '') => `
   @page {
     margin: 12.7mm;
     @bottom-left { content: "${dateText}"; font: 8pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #555b64; }
-    @bottom-center { content: "Amazon Confidential"; font: 8pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #555b64; }
-    @bottom-right { content: "Page " counter(page) " of " counter(pages); font: 8pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #555b64; }
+${footerText ? `    @bottom-center { content: ${cssString(footerText)}; font: 8pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #555b64; }\n` : ''}    @bottom-right { content: "Page " counter(page) " of " counter(pages); font: 8pt Calibri, "Segoe UI", Helvetica, Arial, sans-serif; color: #555b64; }
   }
   html { font-size: 11pt; }
   body { max-width: 780px; margin: 0 auto; padding: 24px;
@@ -256,8 +265,8 @@ function escapeXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-/** Word footer part: date, "Amazon Confidential", and Page X of Y at 9pt. */
-function buildDocxFooterXml(dateText: string): string {
+/** Word footer part: date, the owner's footer text (blank keeps the tab), and Page X of Y at 9pt. */
+export function buildDocxFooterXml(dateText: string, footerText = ''): string {
   const run = (inner: string) => `<w:r><w:rPr><w:sz w:val="18" /><w:szCs w:val="18" /><w:color w:val="555B64" /></w:rPr>${inner}</w:r>`;
   const field = (instr: string) => `<w:fldSimple w:instr=" ${instr} ">${run('<w:t>1</w:t>')}</w:fldSimple>`;
   return [
@@ -267,7 +276,7 @@ function buildDocxFooterXml(dateText: string): string {
     '<w:tabs><w:tab w:val="center" w:pos="5400" /><w:tab w:val="right" w:pos="10800" /></w:tabs>',
     '<w:rPr><w:sz w:val="18" /><w:szCs w:val="18" /></w:rPr></w:pPr>',
     run(`<w:t xml:space="preserve">${escapeXml(dateText)}</w:t>`),
-    run('<w:tab /><w:t>Amazon Confidential</w:t>'),
+    run(footerText ? `<w:tab /><w:t xml:space="preserve">${escapeXml(footerText)}</w:t>` : '<w:tab />'),
     run('<w:tab /><w:t xml:space="preserve">Page </w:t>'),
     field('PAGE'),
     run('<w:t xml:space="preserve"> of </w:t>'),
@@ -277,14 +286,14 @@ function buildDocxFooterXml(dateText: string): string {
 }
 
 /**
- * Post-process pandoc's DOCX to Amazon-standard document conventions:
+ * Post-process pandoc's DOCX to BotBoy's house-style document conventions:
  *   - 0.5in page margins (720 twips); pandoc's sectPr has NO pgMar, so Word
  *     falls back to its 1in default — margins must be injected, not replaced
  *   - 11pt default body (22 half-points; pandoc emits 12pt)
  *   - fully boxed tables: pandoc's default "Table" style draws only a header
  *     rule, so a full single-line grid (all edges + inside lines) is injected
  *     into that style, which every table in the document references
- *   - a footer part (date, Amazon Confidential, Page X of Y), which needs
+ *   - a footer part (date, the export footer text, Page X of Y), which needs
  *     four coordinated edits: the footer1.xml part, a content-type override,
  *     a document.xml.rels relationship, and a sectPr footerReference
  * OOXML sectPr child order matters: footerReference leads, pgMar follows
@@ -293,7 +302,7 @@ function buildDocxFooterXml(dateText: string): string {
  * matching this module's local-tools design. Best-effort: any failure leaves
  * the original pandoc output intact.
  */
-async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: string): Promise<void> {
+async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: string, footerText = ''): Promise<void> {
   const extractDir = path.join(workDir, 'docx-geometry');
   try {
     await execFileAsync('/usr/bin/unzip', ['-q', docxPath, '-d', extractDir], { timeout: 20_000 });
@@ -374,9 +383,9 @@ async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: 
 
     // Footer wiring: part + content type + relationship + section reference.
     // Skipped safely if the r namespace is missing or a footer already exists.
-    const footerRelId = 'rIdAmznFooter';
+    const footerRelId = 'rIdBotboyFooter';
     if (documentXml.includes('xmlns:r=') && !documentXml.includes('<w:footerReference')) {
-      await fs.writeFile(path.join(extractDir, 'word', 'footer1.xml'), buildDocxFooterXml(dateText), 'utf8');
+      await fs.writeFile(path.join(extractDir, 'word', 'footer1.xml'), buildDocxFooterXml(dateText, footerText), 'utf8');
 
       let contentTypes = await fs.readFile(contentTypesPath, 'utf8');
       if (!contentTypes.includes('/word/footer1.xml')) {
@@ -495,8 +504,11 @@ export async function exportDocument(input: {
   title: string;
   content: string;
   format: DocumentExportFormat;
+  /** Center page-footer text (export-footer.ts). Default '' = no footer text (D2). */
+  footerText?: string;
 }): Promise<DocumentExportResult> {
   const { title, content, format } = input;
+  const footerText = input.footerText ?? '';
   const filename = exportFilename(title, format);
   const mediaType = DOCUMENT_EXPORT_FORMATS[format].mediaType;
 
@@ -518,7 +530,7 @@ export async function exportDocument(input: {
     const inputPath = path.join(workDir, 'input.md');
     const headerPath = path.join(workDir, 'header.html');
     await fs.writeFile(inputPath, content, 'utf8');
-    await fs.writeFile(headerPath, `<style>${buildExportStyle(dateText)}</style>`, 'utf8');
+    await fs.writeFile(headerPath, `<style>${buildExportStyle(dateText, footerText)}</style>`, 'utf8');
     // No `--metadata=title`: pandoc renders that as a visible title block in
     // standalone HTML and a Title paragraph in DOCX, duplicating the H1 the
     // document content already opens with (owner report 2026-08-28 — markdown
@@ -552,7 +564,7 @@ export async function exportDocument(input: {
     if (format === 'docx') {
       const outputPath = path.join(workDir, 'output.docx');
       await runPandoc([...baseArgs, '--to=docx', '--output', outputPath, inputPath]);
-      await applyDocxHouseStyle(outputPath, workDir, dateText);
+      await applyDocxHouseStyle(outputPath, workDir, dateText, footerText);
       return { data: await fs.readFile(outputPath), filename, mediaType };
     }
 

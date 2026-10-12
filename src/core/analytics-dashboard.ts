@@ -627,6 +627,8 @@ export function createAnalyticsDashboardService(options: {
   db: Database.Database;
   mcpManager: McpManager;
   queryTimeoutMs?: number;
+  /** Settings → Workplace: copy only (the no-lane text drops Datanet while Amazon Employee is off). */
+  amazonEmployee?: () => boolean;
   /** Fallback data lane (etl-analytics A4): the Datanet ETL composite. When
    * present AND sql-context is not running at run start, widget queries run
    * through the scratch-pair pool — widgets may execute in parallel, each
@@ -3661,6 +3663,11 @@ export function createAnalyticsDashboardService(options: {
   async function pickRunLane(): Promise<DashboardLaneId> {
     if (await liveLaneUsable('sql-mcp')) return 'sql-mcp';
     if (await liveLaneUsable('etl')) return 'etl';
+    if (options.amazonEmployee?.() === false) {
+      throw new DataLaneUnavailableError(
+        'No analytics data lane is ready yet: the SQL connection failed its live warehouse check. Waiting for a connection before retrying.',
+      );
+    }
     throw new DataLaneUnavailableError(
       'No analytics data lane is ready yet: sql-context failed its live warehouse check and '
       + 'the Datanet ETL composite is not running with its required tools. Waiting for a connection before retrying.',
