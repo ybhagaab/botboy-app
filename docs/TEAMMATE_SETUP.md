@@ -419,6 +419,27 @@ npm run bootstrap
 
 Files recorded as unread are read the next time they change.
 
+The native reader never delays BotBoy. `./start.sh` builds it in the background
+after the BotBoy window is open, and gives the build two minutes at most
+(`BOTBOY_OCR_BUILD_TIMEOUT_SECONDS` changes that). If the build fails, BotBoy
+prints one note (in Terminal, or only in `/tmp/ppt.log` when you open BotBoy from
+its app icon) and carries on without it: text PDFs are still read,
+and only text inside images and scanned PDFs is unavailable. A failure is usually
+the Command Line Tools being out of step with macOS (for example after a macOS
+update, or when the tools were only half installed). BotBoy remembers the failure
+and does not try again at every start; it tries again by itself when macOS, the
+Command Line Tools, or the reader's source change. To fix it yourself, open
+**System Settings > General > Software Update**, install the macOS and Command
+Line Tools updates it offers, then run:
+
+```bash
+cd ~/botboy-app
+./start.sh --rebuild-ocr
+```
+
+`./start.sh --doctor` shows the result on its `xcode-clt` row (the date, how long
+the build took, and the first error) and on its `pdf readers` row.
+
 ### Troubleshooting
 
 BotBoy's runtime log is `/tmp/ppt.log`.
@@ -450,6 +471,7 @@ credential attachment before producing the report.
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
 | `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Run `npm install` in `~/botboy-app`, read the errors at its end, fix what they name, then `./start.sh`. On Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
+| BotBoy took a long time to open, `/tmp/ppt.log` is full of Swift messages, or the doctor says `OCR helper build failed` | The optional reader for images and scanned PDFs could not be built on your Mac, usually because the Command Line Tools and macOS do not match. After `./start.sh --update`, BotBoy builds it only after its window is open and gives up after two minutes, so it no longer holds up opening. Install the updates in **System Settings > General > Software Update**, then run `./start.sh --rebuild-ocr`. BotBoy works without the reader; only text inside images and scanned PDFs is missing. |
 | `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app`. `./start.sh --update` updates BotBoy but never reinstalls packages, so older ones stay until you do. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |

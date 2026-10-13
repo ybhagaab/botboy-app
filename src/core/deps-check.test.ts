@@ -18,7 +18,9 @@ describe('deps-check', () => {
   it('surfaces an actionable message when something is missing (never silent)', () => {
     const report = checkDependencies();
     if (!report.ok) {
-      expect(report.message).toContain('missing');
+      // Either the list of missing tools, or (when the OCR helper's build
+      // already failed on this Mac) the one-line explanation of that.
+      expect(report.message).toMatch(/missing|could not be built/);
     } else {
       expect(report.message).toBe('');
     }

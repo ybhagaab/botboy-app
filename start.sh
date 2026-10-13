@@ -30,6 +30,16 @@ fi
 #                            persists while running and quitting it shuts the
 #                            server down gracefully.
 #                            Regenerate that bundle with: npm run app:bundle
+#   ./start.sh --rebuild-ocr retry building the optional OCR helper (it reads text
+#                            inside images and scanned PDFs) now, even when an
+#                            earlier build failed on this Mac; wait for the
+#                            result and exit without starting anything. A normal
+#                            start never waits for that helper: it builds in the
+#                            background once the dashboard window is open, with
+#                            a hard time limit (BOTBOY_OCR_BUILD_TIMEOUT_SECONDS,
+#                            default 120), and a failure is remembered per
+#                            machine until the source, Swift compiler, or macOS
+#                            build changes.
 
 FOREGROUND=0
 OPEN_WINDOW_ONLY=0
@@ -37,6 +47,7 @@ STOP_ONLY=0
 DOCTOR=0
 RECOVER_SHUTDOWN=0
 UPDATE_ONLY=0
+REBUILD_OCR=0
 [ "$1" = "--foreground" ] && FOREGROUND=1
 # --open-window: just focus/open the dashboard window (used when BotBoy.app's
 # dock icon is clicked while the tracker is already running).
@@ -45,6 +56,7 @@ UPDATE_ONLY=0
 [ "$1" = "--doctor" ] && DOCTOR=1
 [ "$1" = "--recover-shutdown" ] && RECOVER_SHUTDOWN=1
 [ "$1" = "--update" ] && UPDATE_ONLY=1
+[ "$1" = "--rebuild-ocr" ] && REBUILD_OCR=1
 
 # Resolve the project dir from THIS script's location — never hardcode, or the
 # launcher silently breaks the moment the repo moves.
@@ -505,7 +517,7 @@ arch_print_warnings() {
 }
 
 arch_prepare
-if [ "$DOCTOR$STOP_ONLY$RECOVER_SHUTDOWN$OPEN_WINDOW_ONLY" = "0000" ]; then
+if [ "$DOCTOR$STOP_ONLY$RECOVER_SHUTDOWN$OPEN_WINDOW_ONLY$REBUILD_OCR" = "00000" ]; then
   arch_print_warnings
 fi
 
@@ -548,7 +560,9 @@ heal_missing_npm_dependencies() {
   missing="$(missing_npm_dependencies)"
   [ -n "$missing" ] || return 0
   echo "ℹ️  Installing dependencies ($missing) — npm install" | tee -a "$LOG_FILE"
-  if (cd "$PROJ_DIR" && native_exec "$NPM_BIN" install --no-audit --no-fund >> "$LOG_FILE" 2>&1); then
+  # BOTBOY_DEFER_OCR_BUILD: npm's postinstall must not compile the optional OCR
+  # helper here, before the window; the background job builds it afterwards.
+  if (cd "$PROJ_DIR" && export BOTBOY_DEFER_OCR_BUILD=1 && native_exec "$NPM_BIN" install --no-audit --no-fund >> "$LOG_FILE" 2>&1); then
     echo "✅ Dependencies installed" | tee -a "$LOG_FILE"
     DEPS_INSTALLED=1
     return 0
@@ -561,61 +575,154 @@ heal_missing_npm_dependencies() {
   fi
 }
 
-# The OCR helper is compiled locally from native/vision-ocr/main.swift. An
-# update that changes the source must rebuild it, or the old helper keeps
-# running (npm install is the only other trigger). Needs Xcode CLT. Without
-# it the helper is simply absent: one calm note, no "rebuild failed" warning,
-# and no compiler shim is ever run. A failure keeps the existing helper.
+# The OCR helper is an optional extra: BotBoy reads PDF text with pdf.js
+# without it, and it only adds text from images and scanned PDFs. It is
+# compiled locally from native/vision-ocr/main.swift, and that compile can be
+# slow, can fail on a Mac whose Command Line Tools and macOS do not match, and
+# can hang. It must never hold up a start (Maria's Mac, 2026-10-13: every start
+# retried a failing compile before the server and window, so opening BotBoy
+# "took ages"). So:
+#   - Nothing here runs before the dashboard window is open. start_ocr_helper_job
+#     runs after it, as a detached background job, and a start that finds the
+#     helper built and current starts nothing.
+#   - scripts/bootstrap-deps.mjs --ocr-helper does the work. It owns the hard
+#     time limit (BOTBOY_OCR_BUILD_TIMEOUT_SECONDS, default 120), keeps the
+#     compiler output to its first 20 and last 5 lines, and remembers a failure
+#     per machine (~/.personal-productivity-tracker/ocr-helper-build.json) so an
+#     unchanged source, Swift compiler, and macOS build are not retried. One calm
+#     note is printed per failure; a start that skips the build prints nothing.
+#   - ./start.sh --rebuild-ocr retries on request. A failure keeps the existing
+#     helper. Without Xcode CLT the helper is simply absent: one calm note, and
+#     no compiler shim is ever run.
 OCR_SRC="$PROJ_DIR/native/vision-ocr/main.swift"
 OCR_BIN="$PROJ_DIR/native/vision-ocr/bin/vision-ocr"
+
+# The helper is built and not older than its source (file tests only).
+ocr_helper_current() {
+  [ -x "$OCR_BIN" ] && ! [ "$OCR_SRC" -nt "$OCR_BIN" ]
+}
+
+# One synchronous attempt to bring the OCR helper up to date. $1 = "force" when
+# the owner asked (./start.sh --rebuild-ocr): a remembered failure is ignored
+# and every line is shown. Otherwise (the background job) only the calm note
+# reaches the terminal, and the compiler detail goes to the log.
 rebuild_ocr_helper_if_needed() {
+  local mode="${1:-background}"
   [ -f "$OCR_SRC" ] || return 0
-  if [ -x "$OCR_BIN" ] && ! [ "$OCR_SRC" -nt "$OCR_BIN" ]; then
+  if [ "$mode" != "force" ] && ocr_helper_current; then
     return 0
   fi
-  if ! clt_toolchain_ok; then
+  if ! clt_installed; then
     [ -x "$OCR_BIN" ] || print_ocr_note
     return 0
   fi
-  echo "ℹ  Rebuilding the OCR helper" | tee -a "$LOG_FILE"
-  if ! (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs >> "$LOG_FILE" 2>&1) || [ ! -x "$OCR_BIN" ]; then
-    echo "⚠  OCR helper rebuild failed — see $LOG_FILE" | tee -a "$LOG_FILE"
+  if [ ! -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ]; then
+    [ "$mode" != "force" ] || echo "ℹ  scripts/bootstrap-deps.mjs is missing from this BotBoy folder; run ./start.sh --update to restore it" | tee -a "$LOG_FILE"
+    return 0
   fi
+  if [ "$mode" = "force" ]; then
+    echo "ℹ  Rebuilding the OCR helper; this can take a minute or two" | tee -a "$LOG_FILE"
+    (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs --ocr-helper --force-ocr 2>&1) | tee -a "$LOG_FILE"
+  else
+    (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs --ocr-helper 2>> "$LOG_FILE") | tee -a "$LOG_FILE"
+  fi
+  return 0
+}
+
+# Start the OCR helper work as a detached background job and return at once.
+# Call it only after the dashboard window is open. The job is a subshell: it has
+# no input, ignores a closed Terminal (HUP), is never waited for, and holds
+# nothing of this launcher (a subshell does not run the EXIT trap that releases
+# the start lock, and it signals no server, so --stop and shutdown receipts are
+# unaffected; its process, `node scripts/bootstrap-deps.mjs`, never matches the
+# server match `node dist/index.js`). Its output goes to a terminal only: a pipe
+# or file a caller waits on would otherwise stay open until the job ends. The
+# BotBoy.app launcher waits for this script, not for the job.
+start_ocr_helper_job() {
+  [ -f "$OCR_SRC" ] || return 0
+  ocr_helper_current && return 0
+  (
+    trap '' HUP
+    exec </dev/null 2>>"$LOG_FILE"
+    [ -t 1 ] || exec >/dev/null
+    rebuild_ocr_helper_if_needed background
+  ) &
+  return 0
+}
+
+# The remembered failure of the last OCR helper build as one sentence for the
+# doctor, or nothing. bootstrap-deps.mjs owns the marker format and the wording.
+ocr_marker_doctor_text() {
+  [ -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ] || return 0
+  native_exec "$NODE" "$PROJ_DIR/scripts/bootstrap-deps.mjs" --ocr-marker 2>/dev/null | head -n 1
 }
 
 # Doctor rows for the Swift toolchain and the readers that depend on it.
 # Says "installed (swiftc found)", not "works": it proves the compiler is
-# reachable, nothing more.
+# reachable, nothing more. After a failed OCR helper build the xcode-clt row
+# says so, with the date, how long the attempt took, and the first error line.
 doctor_toolchain_rows() {
-  local helper
+  local helper failure=""
   if clt_toolchain_ok; then
-    echo "xcode-clt: installed (swiftc found)"
+    failure="$(ocr_marker_doctor_text)"
+    if [ -n "$failure" ]; then
+      echo "xcode-clt: installed (swiftc found); $failure"
+    else
+      echo "xcode-clt: installed (swiftc found)"
+    fi
   else
     echo "xcode-clt: MISSING — run: xcode-select --install; without it BotBoy cannot read text inside images or scanned PDFs (text PDFs still work)"
   fi
   if [ -x "$OCR_BIN" ]; then
     helper="vision-ocr helper built"
   elif clt_toolchain_ok; then
-    helper="vision-ocr helper not built (tools present; run ./start.sh)"
+    if [ -n "$failure" ]; then
+      helper="vision-ocr helper not built (last build failed, see xcode-clt row; BotBoy works without it)"
+    else
+      helper="vision-ocr helper not built (tools present; run ./start.sh)"
+    fi
   else
     helper="vision-ocr helper not built (Xcode Command Line Tools missing: images and scanned PDFs unavailable)"
   fi
   echo "pdf readers: $helper; pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
 }
 
-# Executable test hooks for the three functions above. They change nothing
-# beyond what the function itself does.
+# Executable test hooks for the functions above. They change nothing beyond
+# what the function itself does. BOTBOY_TEST_OCR_REBUILD runs the synchronous
+# worker (BOTBOY_TEST_OCR_MODE=force for --rebuild-ocr's mode);
+# BOTBOY_TEST_OCR_JOB runs only the detached kickoff and returns.
 if [ "${BOTBOY_TEST_HEAL_DEPS:-0}" = "1" ]; then
   heal_missing_npm_dependencies
   exit 0
 fi
 if [ "${BOTBOY_TEST_OCR_REBUILD:-0}" = "1" ]; then
-  rebuild_ocr_helper_if_needed
+  rebuild_ocr_helper_if_needed "${BOTBOY_TEST_OCR_MODE:-background}"
+  exit 0
+fi
+if [ "${BOTBOY_TEST_OCR_JOB:-0}" = "1" ]; then
+  start_ocr_helper_job
+  echo "ocr-job-kicked-off"
   exit 0
 fi
 if [ "${BOTBOY_TEST_DOCTOR_TOOLCHAIN:-0}" = "1" ]; then
   doctor_toolchain_rows
   exit 0
+fi
+
+# ── --rebuild-ocr: retry the optional OCR helper build now, then exit ──
+# Placed before the Chrome and credential steps below, which it does not need.
+# It starts and stops no server and takes no start lock.
+if [ "$REBUILD_OCR" = "1" ]; then
+  if [ ! -f "$OCR_SRC" ]; then
+    echo "ℹ  This BotBoy has no OCR helper source (native/vision-ocr/main.swift); there is nothing to build"
+    exit 0
+  fi
+  rebuild_ocr_helper_if_needed force
+  if ocr_helper_current; then
+    echo "✅ OCR helper is built: BotBoy can read text inside images and scanned PDFs" | tee -a "$LOG_FILE"
+    exit 0
+  fi
+  exit 1
 fi
 
 # Doctor rows for this machine. They never fail the doctor, and every warning
@@ -2408,7 +2515,8 @@ trap release_start_lock EXIT
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
 heal_missing_npm_dependencies
-rebuild_ocr_helper_if_needed
+# (The optional OCR helper is NOT built here: start_ocr_helper_job runs it in
+# the background after the dashboard window is open.)
 # An unresolved shutdown guard blocks every replacement start. Report it now,
 # with its next step, instead of after the build.
 startup_safety_allows_takeover || exit 1
@@ -2422,7 +2530,7 @@ startup_safety_allows_takeover || exit 1
 if ! NATIVE_STATUS="$(native_modules_status repair)"; then
   echo "ℹ️  Reinstalling native modules for Node $("$NODE" --version 2>/dev/null) — npm install" | tee -a "$LOG_FILE"
   printf '%s\n' "$NATIVE_STATUS" | grep -v '|ok$' | sed 's/|/: /; s/^/    /' | tee -a "$LOG_FILE"
-  (cd "$PROJ_DIR" && rm -rf node_modules/better-sqlite3 node_modules/node-pty \
+  (cd "$PROJ_DIR" && export BOTBOY_DEFER_OCR_BUILD=1 && rm -rf node_modules/better-sqlite3 node_modules/node-pty \
     && native_exec npm install --no-audit --no-fund >> "$LOG_FILE" 2>&1) || true
   if ! NATIVE_STATUS="$(native_modules_status repair)"; then
     print_native_modules_failure "$NATIVE_STATUS" | tee -a "$LOG_FILE"
@@ -2497,6 +2605,7 @@ if [ "$FOREGROUND" = "1" ]; then
   release_start_lock
   warn_if_no_llm_credentials
   install_app_bundle_if_missing
+  start_ocr_helper_job
 
   # Block for the server's lifetime. `wait` returns early when a trapped signal
   # arrives, so the loop keeps the app alive until the server is really gone.
@@ -2542,3 +2651,4 @@ fi
 [ -z "${DB_OPEN_MARKER:-}" ] || rm -f "$DB_OPEN_MARKER"
 warn_if_no_llm_credentials
 install_app_bundle_if_missing
+start_ocr_helper_job

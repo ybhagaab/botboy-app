@@ -9,7 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Each case starts the launcher a few times; a loaded Mac needs more than the 5 s default.
+vi.setConfig({ testTimeout: 60_000 });
 
 const launcherPath = fileURLToPath(new URL('../../start.sh', import.meta.url));
 const roots: string[] = [];
@@ -31,6 +34,10 @@ function box(deps: Record<string, string> = {}) {
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x', dependencies: deps }));
   const marks = path.join(root, 'marks');
   fs.mkdirSync(marks);
+  // A private HOME: the OCR helper's remembered-failure marker lives under it
+  // and must never land in the real home folder.
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home);
   const stub = (name: string, body: string) => {
     const file = path.join(stubs, name);
     fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
@@ -43,6 +50,7 @@ function box(deps: Record<string, string> = {}) {
       cwd: dir,
       env: {
         ...process.env,
+        HOME: home,
         BOTBOY_NO_ARCH_REEXEC: '1',
         PPT_LOG_FILE: path.join(root, 'launcher.log'),
         [hook]: '1',
@@ -119,16 +127,20 @@ describe('start.sh › rebuild_ocr_helper_if_needed', () => {
     expect(result.stdout).toBe('');
   });
 
-  it('warns "rebuild failed" only when the toolchain was ok and the helper is still absent', () => {
+  it('never prints a "rebuild failed" warning, even when the toolchain is ok but the build cannot run', () => {
+    // Before 2026-10-13 this printed "OCR helper rebuild failed" at every start.
+    // Now a failed or impossible build says nothing here: scripts/bootstrap-deps.mjs
+    // remembers a real failure and prints one calm note (launcher-ocr-job.test.ts).
     const b = box();
     b.addOcrSource();
     const xcodeSelect = b.stub('xcode-select', 'echo /stub/clt');
     const xcrun = b.stub('xcrun', 'echo /stub/swiftc');
-    // No scripts/bootstrap-deps.mjs in the copied checkout: the rebuild fails.
+    // No scripts/bootstrap-deps.mjs in the copied checkout: there is nothing to run.
     const result = b.run('BOTBOY_TEST_OCR_REBUILD', { BOTBOY_TEST_XCODE_SELECT_BIN: xcodeSelect, BOTBOY_TEST_XCRUN_BIN: xcrun });
-    expect(result.stdout).toContain('Rebuilding the OCR helper');
-    expect(result.stdout).toContain('OCR helper rebuild failed');
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('rebuild failed');
     expect(result.stdout).not.toContain(OCR_NOTE);
+    expect(result.stdout).toBe('');
   });
 });
 

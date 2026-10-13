@@ -3,10 +3,21 @@
  * bootstrap-deps — build/verify/install local tool dependencies.
  *
  * Modes:
- *   node scripts/bootstrap-deps.mjs                  verify + build helper (no installs)
+ *   node scripts/bootstrap-deps.mjs                  verify + build helper (no installs); run by hand
+ *                                                    (npm run bootstrap / setup) it retries a failed OCR
+ *                                                    build, run by npm's postinstall it does not
  *   node scripts/bootstrap-deps.mjs --install        also install missing core tools via Homebrew
  *   node scripts/bootstrap-deps.mjs --install --with-optional
  *                                                    also install the optional set (ffmpeg, whisper, ollama)
+ *   node scripts/bootstrap-deps.mjs --ocr-helper     only the OCR helper: what start.sh runs in the
+ *                                                    background once the dashboard window is open.
+ *                                                    Progress and compiler detail go to stderr, the one
+ *                                                    note meant for the owner goes to stdout
+ *   node scripts/bootstrap-deps.mjs --ocr-helper --force-ocr
+ *                                                    the same, ignoring a remembered failure
+ *                                                    (./start.sh --rebuild-ocr)
+ *   node scripts/bootstrap-deps.mjs --ocr-marker     print the remembered failure as one sentence for
+ *                                                    ./start.sh --doctor (nothing when there is none)
  *
  * Idempotent and safely re-runnable:
  *   - Makes node-pty's prebuilt macOS spawn-helper executable (its npm
@@ -19,9 +30,47 @@
  *
  * Safe to run on non-macOS (it no-ops the OCR build with a clear notice) so it
  * can sit in a guarded `postinstall` without breaking CI installs.
+ *
+ * The OCR helper is optional (BotBoy reads PDF text with pdf.js and works
+ * without it), so it must never hold anything up:
+ *   - The compile has a hard timeout, BOTBOY_OCR_BUILD_TIMEOUT_SECONDS
+ *     (default 120), so it cannot hang `npm install` or the background job.
+ *     A timed-out compile is killed with its children, and the compiler output
+ *     is cut to its first 20 and last 5 lines plus one summary line.
+ *   - The helper is compiled in a staging folder and moved into place, so a
+ *     killed or failed build never leaves a half-written helper behind.
+ *   - A failed or timed-out build is REMEMBERED per machine, so the same
+ *     failure is not retried at every start (Maria's Mac, 2026-10-13: a Command
+ *     Line Tools / SDK mismatch made every start compile and fail again).
+ *     start.sh sets BOTBOY_DEFER_OCR_BUILD=1 for its own `npm install`, which
+ *     then skips the compile; the background job builds the helper instead.
+ *
+ * OCR helper marker — ONE format, written only by this script:
+ *   File:  ~/.personal-productivity-tracker/ocr-helper-build.json (0600; the
+ *          folder is created 0700 when missing). Lock: ocr-helper-build.lock/
+ *          beside it (a folder; one build at a time).
+ *   {
+ *     "schema": 1,
+ *     "kind": "failed" | "timeout",
+ *     "failedAt": "<ISO-8601 UTC>",
+ *     "durationMs": <integer, wall time of the failed attempt>,
+ *     "reason": "<one line: the first compiler error line, or why it timed out>",
+ *     "signature": {
+ *       "source": "<sha256 of native/vision-ocr/main.swift>",
+ *       "swiftc": "<first line of swiftc --version>",
+ *       "osBuild": "<sw_vers -buildVersion>"
+ *     }
+ *   }
+ *   While the signature is unchanged the build is skipped silently. It is tried
+ *   again when any part changes (a release updates main.swift, the compiler or
+ *   macOS is updated) or when the owner asks (./start.sh --rebuild-ocr,
+ *   npm run bootstrap). A successful build deletes the marker. Readers: this
+ *   script (the skip, --ocr-marker for start.sh --doctor) and the server
+ *   (src/core/ocr-helper-marker.ts, read-only and fail-open).
  */
 
-import { chmodSync, existsSync, mkdirSync, realpathSync, statSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, writeFileSync } from 'fs';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import os from 'os';
 import path from 'path';
@@ -41,6 +90,15 @@ const WITH_OPTIONAL = process.argv.includes('--with-optional');
 // BOTBOY_TEST_* overrides exist for tests; production never sets them.
 const XCODE_SELECT_BIN = process.env.BOTBOY_TEST_XCODE_SELECT_BIN || '/usr/bin/xcode-select';
 const XCRUN_BIN = process.env.BOTBOY_TEST_XCRUN_BIN || '/usr/bin/xcrun';
+const SW_VERS_BIN = process.env.BOTBOY_TEST_SW_VERS_BIN || '/usr/bin/sw_vers';
+
+// Every probe is short (milliseconds on a healthy Mac); a stuck one must not
+// hold the background job or `npm install`.
+const PROBE_TIMEOUT_MS = 15_000;
+const DEFAULT_OCR_BUILD_TIMEOUT_SECONDS = 120;
+const OCR_HEAD_LINES = 20;
+const OCR_TAIL_LINES = 5;
+const OCR_MARKER_SCHEMA = 1;
 
 // Keep aligned with TOOL_REGISTRY in src/core/toolchain.ts.
 // Core is EMPTY by design: BotBoy's own pdf.js reader (scripts/pdf-text.mjs,
@@ -55,8 +113,17 @@ const OPTIONAL_FORMULAS = [
   { bins: ['ollama'], formula: 'ollama', why: 'local LLM fallback' },
 ];
 
+// `log` carries progress and diagnostics: stdout normally, stderr in
+// --ocr-helper mode (start.sh sends that to the log). `say` is the one place
+// text meant for the owner is printed, always on stdout.
+let writeDiagnostic = (line) => console.log(line);
+
 function log(msg) {
-  console.log(`[bootstrap-deps] ${msg}`);
+  writeDiagnostic(`[bootstrap-deps] ${msg}`);
+}
+
+function say(line) {
+  console.log(line);
 }
 
 function hasBin(b) {
@@ -94,12 +161,12 @@ function findBrew() {
  */
 export function detectSwiftToolchain({ run = execFileSync } = {}) {
   try {
-    run(XCODE_SELECT_BIN, ['-p'], { stdio: 'pipe' });
+    run(XCODE_SELECT_BIN, ['-p'], { stdio: 'pipe', timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' });
   } catch {
     return { ok: false, reason: 'no-clt' };
   }
   try {
-    const swiftc = String(run(XCRUN_BIN, ['--find', 'swiftc'], { stdio: 'pipe', encoding: 'utf8' })).trim();
+    const swiftc = String(run(XCRUN_BIN, ['--find', 'swiftc'], { stdio: 'pipe', encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })).trim();
     if (swiftc) return { ok: true, swiftc };
   } catch {
     // fall through
@@ -115,7 +182,7 @@ export function detectSwiftToolchain({ run = execFileSync } = {}) {
  */
 export function swiftSdkArgs({ run = execFileSync } = {}) {
   try {
-    const sdk = String(run(XCRUN_BIN, ['--show-sdk-path'], { stdio: 'pipe', encoding: 'utf8' })).trim();
+    const sdk = String(run(XCRUN_BIN, ['--show-sdk-path'], { stdio: 'pipe', encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' })).trim();
     return sdk ? ['-sdk', sdk] : [];
   } catch {
     return [];
@@ -126,8 +193,24 @@ export function ocrNotBuiltNote() {
   return 'OCR helper not built: install Xcode Command Line Tools with `xcode-select --install`; BotBoy works without it except text from images and scanned PDFs';
 }
 
-export function ocrBuildFailedNote(firstLine) {
-  return `OCR helper build failed (${firstLine || 'unknown error'}); BotBoy works without it except text from images and scanned PDFs`;
+/** Seconds as people read them: 4.2 below ten, whole seconds from ten up. */
+export function formatSeconds(ms) {
+  const seconds = Math.max(0, Number(ms) || 0) / 1000;
+  return seconds < 10 ? seconds.toFixed(1) : String(Math.round(seconds));
+}
+
+/** The summary line of a failed build (the log keeps this and the cut-down compiler output). */
+export function ocrBuildFailedNote(firstLine, { durationMs } = {}) {
+  const after = typeof durationMs === 'number' ? ` after ${formatSeconds(durationMs)} s` : '';
+  return `OCR helper build failed${after} (${firstLine || 'unknown error'}); BotBoy works without it except text from images and scanned PDFs`;
+}
+
+/**
+ * The one calm note printed (terminal and log) when a build fails or times
+ * out. At most once per signature, because a remembered failure is not retried.
+ */
+export function ocrOffNote() {
+  return "Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy's helper (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > Software Update, then run ./start.sh --rebuild-ocr.";
 }
 
 /** True when this file is the script node was started with, also through symlinks (os.tmpdir() is one on macOS). */
@@ -140,8 +223,299 @@ export function isMainModule(metaUrl, argv1) {
   }
 }
 
-/** Returns 'ok', 'no-toolchain' (expected, exit 0), or 'failed' (compile error). */
-function buildVisionHelper() {
+// ── OCR helper: remembered failures ──────────────────────────────────────────
+
+function privateRoot(home = os.homedir()) {
+  return path.join(home, '.personal-productivity-tracker');
+}
+
+export function ocrMarkerPath(home) {
+  return path.join(privateRoot(home), 'ocr-helper-build.json');
+}
+
+function ocrLockPath(home) {
+  return path.join(privateRoot(home), 'ocr-helper-build.lock');
+}
+
+/** The hard limit for one compile, from BOTBOY_OCR_BUILD_TIMEOUT_SECONDS (default 120; 0.25 to 3600 accepted). */
+export function ocrBuildTimeoutMs(env = process.env) {
+  const asked = Number(String(env.BOTBOY_OCR_BUILD_TIMEOUT_SECONDS ?? '').trim());
+  const seconds = Number.isFinite(asked) && asked >= 0.25 && asked <= 3600 ? asked : DEFAULT_OCR_BUILD_TIMEOUT_SECONDS;
+  return Math.round(seconds * 1000);
+}
+
+function oneLine(text, max = 240) {
+  const clean = String(text ?? '')
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function firstLine(text, max = 200) {
+  const line = String(text ?? '').split('\n').map((entry) => oneLine(entry, max)).find(Boolean);
+  return line || '';
+}
+
+function sha256OfFile(file) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex');
+  } catch {
+    return '';
+  }
+}
+
+function probeLine(run, file, args) {
+  try {
+    return firstLine(run(file, args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' }));
+  } catch {
+    return '';
+  }
+}
+
+/** What a failure depends on: the helper source, the Swift compiler, and the macOS build. */
+export function computeOcrSignature(swiftc, { run = execFileSync, source = swiftSrc } = {}) {
+  return {
+    source: sha256OfFile(source),
+    swiftc: swiftc ? probeLine(run, swiftc, ['--version']) : '',
+    osBuild: probeLine(run, SW_VERS_BIN, ['-buildVersion']),
+  };
+}
+
+export function sameOcrSignature(a, b) {
+  return Boolean(a && b)
+    && a.source !== ''
+    && a.source === b.source
+    && a.swiftc === b.swiftc
+    && a.osBuild === b.osBuild;
+}
+
+/**
+ * The remembered failure, or null. Fail-open: a missing, unreadable, oversized,
+ * or malformed file reads as "no failure remembered", so the build is tried.
+ */
+export function readOcrMarker({ file = ocrMarkerPath() } = {}) {
+  try {
+    const text = readFileSync(file, 'utf8');
+    if (text.length > 16 * 1024) return null;
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || value.schema !== OCR_MARKER_SCHEMA) return null;
+    if (value.kind !== 'failed' && value.kind !== 'timeout') return null;
+    if (typeof value.failedAt !== 'string' || !Number.isFinite(Date.parse(value.failedAt))) return null;
+    if (typeof value.reason !== 'string') return null;
+    const signature = value.signature;
+    if (!signature || typeof signature.source !== 'string' || typeof signature.swiftc !== 'string' || typeof signature.osBuild !== 'string') return null;
+    return {
+      schema: OCR_MARKER_SCHEMA,
+      kind: value.kind,
+      failedAt: value.failedAt,
+      durationMs: Number.isFinite(value.durationMs) && value.durationMs >= 0 ? Math.round(value.durationMs) : null,
+      reason: value.reason,
+      signature: { source: signature.source, swiftc: signature.swiftc, osBuild: signature.osBuild },
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Write the marker atomically and privately. Never throws; false when it could not be written. */
+export function writeOcrMarker(marker, { file = ocrMarkerPath() } = {}) {
+  const staged = `${file}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(staged, `${JSON.stringify({ schema: OCR_MARKER_SCHEMA, ...marker }, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(staged, 0o600);
+    renameSync(staged, file);
+    return true;
+  } catch {
+    try {
+      rmSync(staged, { force: true });
+    } catch {
+      // nothing more to do
+    }
+    return false;
+  }
+}
+
+export function clearOcrMarker({ file = ocrMarkerPath() } = {}) {
+  try {
+    rmSync(file, { force: true });
+  } catch {
+    // a marker that cannot be removed only costs one more silent skip
+  }
+}
+
+function localDate(iso) {
+  const date = new Date(iso);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** The sentence ./start.sh --doctor appends to its xcode-clt row. */
+export function ocrMarkerDoctorText(marker) {
+  const after = marker.durationMs == null ? '' : ` after ${formatSeconds(marker.durationMs)} s`;
+  return `OCR helper build failed on ${localDate(marker.failedAt)}${after}: ${oneLine(marker.reason, 240) || 'no reason recorded'}`;
+}
+
+/**
+ * One build at a time: a folder made with an atomic mkdir. A lock older than
+ * maxAgeMs belongs to a killed run and is taken over. If the lock cannot be
+ * made for any reason other than "already there", the build goes ahead.
+ */
+export function acquireOcrBuildLock({ dir = ocrLockPath(), maxAgeMs, now = Date.now } = {}) {
+  try {
+    mkdirSync(path.dirname(dir), { recursive: true, mode: 0o700 });
+  } catch {
+    return { ok: true, release() {} };
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(dir);
+      return {
+        ok: true,
+        release() {
+          try {
+            rmdirSync(dir);
+          } catch {
+            // already gone
+          }
+        },
+      };
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return { ok: true, release() {} };
+      let ageMs = Infinity;
+      try {
+        ageMs = now() - statSync(dir).mtimeMs;
+      } catch {
+        // vanished between the two calls: try to take it
+      }
+      // A lock dated well in the future (the clock was set back) cannot be a live one for
+      // long; a few seconds ahead is only timestamp rounding.
+      if (ageMs >= -5000 && ageMs <= maxAgeMs) return { ok: false, ageMs };
+      try {
+        rmdirSync(dir);
+      } catch {
+        // someone else took it over first
+      }
+    }
+  }
+  return { ok: false, ageMs: 0 };
+}
+
+// ── OCR helper: compiler output ──────────────────────────────────────────────
+
+function outputLines(text) {
+  return String(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ').trimEnd())
+    .filter((line) => line.trim() !== '')
+    .map((line) => (line.length > 400 ? `${line.slice(0, 399)}…` : line));
+}
+
+/** The first `head` and last `tail` lines of the compiler output (all of it when short). */
+export function excerptCompilerOutput(text, head = OCR_HEAD_LINES, tail = OCR_TAIL_LINES) {
+  const lines = outputLines(text);
+  const total = lines.length;
+  if (total <= head + tail) return { lines, total, omitted: 0 };
+  return { lines: [...lines.slice(0, head), ...lines.slice(total - tail)], total, omitted: total - head - tail };
+}
+
+function plainPaths(text) {
+  const home = os.homedir();
+  let result = String(text).split(`${root}${path.sep}`).join('');
+  if (home && home.length > 1) result = result.split(home).join('~');
+  return result;
+}
+
+/** The first line that reports an error (else the first line). A display choice, never a classification. */
+export function firstErrorLine(text) {
+  const lines = outputLines(text);
+  const hit = lines.find((line) => /\berror:/i.test(line)) ?? lines[0] ?? '';
+  return oneLine(plainPaths(hit), 240);
+}
+
+function failureReason(result) {
+  if (result.timedOut) return 'the compiler did not finish in time';
+  const fromOutput = firstErrorLine(result.output);
+  if (fromOutput) return fromOutput;
+  if (typeof result.status === 'number') return `the Swift compiler exited with status ${result.status}`;
+  if (result.spawnError) return `could not run the Swift compiler (${result.spawnError})`;
+  if (result.signal) return `the Swift compiler was stopped by ${result.signal}`;
+  return 'the Swift compiler failed';
+}
+
+/**
+ * Compile the helper into a staging folder and move it into place. The
+ * compiler runs with a hard timeout (SIGKILL), in its own process group so a
+ * timed-out compile is stopped together with its children. A killed or failed
+ * build leaves any existing helper untouched.
+ */
+function compileOcrHelper(swiftc, timeoutMs) {
+  mkdirSync(binDir, { recursive: true });
+  // Staging folders left by a killed run (this run holds the lock, so none is in use).
+  try {
+    for (const name of readdirSync(binDir)) {
+      if (name.startsWith('.build-')) rmSync(path.join(binDir, name), { recursive: true, force: true });
+    }
+  } catch {
+    // best effort
+  }
+  const stage = mkdtempSync(path.join(binDir, '.build-'));
+  const staged = path.join(stage, 'vision-ocr');
+  const started = Date.now();
+  try {
+    execFileSync(swiftc, [...swiftSdkArgs(), '-O', swiftSrc, '-o', staged], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: 32 * 1024 * 1024,
+      detached: true,
+    });
+    if (!existsSync(staged)) {
+      return { ok: false, durationMs: Date.now() - started, output: 'the Swift compiler finished but wrote no helper' };
+    }
+    chmodSync(staged, 0o755);
+    renameSync(staged, bin);
+    return { ok: true, durationMs: Date.now() - started };
+  } catch (error) {
+    const timedOut = error?.code === 'ETIMEDOUT';
+    // The group id is the compiler's own pid. Only a real pid is signalled: a negative
+    // pid of 0 or 1 would mean this process's group or every process.
+    if (timedOut && Number.isInteger(error.pid) && error.pid > 1) {
+      try {
+        process.kill(-error.pid, 'SIGKILL');
+      } catch {
+        // the group is already gone
+      }
+    }
+    return {
+      ok: false,
+      timedOut,
+      durationMs: Date.now() - started,
+      status: typeof error?.status === 'number' ? error.status : undefined,
+      signal: error?.signal || undefined,
+      spawnError: typeof error?.code === 'string' && error.code !== 'ETIMEDOUT' ? error.code : undefined,
+      output: `${error?.stderr ?? ''}\n${error?.stdout ?? ''}`,
+    };
+  } finally {
+    try {
+      rmSync(stage, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+  }
+}
+
+/**
+ * Returns 'ok' (built, current, or nothing to do here), 'no-toolchain'
+ * (expected, exit 0), 'remembered' (failed before, nothing changed: silent),
+ * 'busy' (another build is running), or 'failed' (compile error or timeout).
+ * `force` ignores a remembered failure.
+ */
+function buildVisionHelper({ force = false } = {}) {
   if (process.platform !== 'darwin') {
     log('skip: Apple Vision OCR helper only builds on macOS (non-darwin platform).');
     return 'ok';
@@ -158,20 +532,45 @@ function buildVisionHelper() {
   }
   const toolchain = detectSwiftToolchain();
   if (!toolchain.ok) {
-    log(ocrNotBuiltNote());
+    say(`ℹ  ${ocrNotBuiltNote()}`);
     return 'no-toolchain';
   }
-  mkdirSync(binDir, { recursive: true });
-  log('building vision-ocr helper...');
-  try {
-    execFileSync(toolchain.swiftc, [...swiftSdkArgs(), '-O', swiftSrc, '-o', bin], { stdio: 'inherit' });
-  } catch (error) {
-    const firstLine = String(error?.message || error).split('\n')[0].trim();
-    log(`WARNING: ${ocrBuildFailedNote(firstLine)}`);
-    return 'failed';
+  const signature = computeOcrSignature(toolchain.swiftc);
+  if (!force) {
+    const remembered = readOcrMarker();
+    if (remembered && sameOcrSignature(remembered.signature, signature)) return 'remembered';
   }
-  log(`built ${bin}`);
-  return 'ok';
+  const timeoutMs = ocrBuildTimeoutMs();
+  const lock = acquireOcrBuildLock({ maxAgeMs: timeoutMs + 60_000 });
+  if (!lock.ok) {
+    if (force) say('ℹ  Another OCR helper build is already running; give it a minute, then run ./start.sh --doctor.');
+    return 'busy';
+  }
+  try {
+    log('building vision-ocr helper...');
+    const result = compileOcrHelper(toolchain.swiftc, timeoutMs);
+    if (result.ok) {
+      clearOcrMarker();
+      log(`built ${bin}`);
+      return 'ok';
+    }
+    const reason = failureReason(result);
+    const excerpt = excerptCompilerOutput(result.output);
+    for (const line of excerpt.lines) console.error(`  ${plainPaths(line)}`);
+    const cut = excerpt.omitted > 0 ? ` [compiler output: ${excerpt.total} lines, showing the first ${OCR_HEAD_LINES} and the last ${OCR_TAIL_LINES}]` : '';
+    log(`WARNING: ${ocrBuildFailedNote(reason, { durationMs: result.durationMs })}${cut}`);
+    writeOcrMarker({
+      kind: result.timedOut ? 'timeout' : 'failed',
+      failedAt: new Date().toISOString(),
+      durationMs: result.durationMs,
+      reason,
+      signature,
+    });
+    say(`ℹ  ${ocrOffNote()}`);
+    return 'failed';
+  } finally {
+    lock.release();
+  }
 }
 
 /**
@@ -273,14 +672,33 @@ function verifyAndInstallTools() {
  * Returns the exit status. A missing toolchain is expected (exit 0). A compile
  * error or unexpected throw exits 0 only inside `npm install` (postinstall must
  * never fail the install) and 2 otherwise.
+ *
+ * Who retries a remembered OCR failure: a run by hand (`npm run bootstrap`,
+ * `npm run setup`) and `--force-ocr` do, because the owner asked; npm's
+ * postinstall and the background job (`--ocr-helper`) do not.
  */
-export function main() {
-  const lenient = process.env.npm_lifecycle_event === 'postinstall';
+export function main({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const ocrOnly = argv.includes('--ocr-helper');
+  writeDiagnostic = ocrOnly ? (line) => console.error(line) : (line) => console.log(line);
+  if (argv.includes('--ocr-marker')) {
+    const remembered = readOcrMarker();
+    if (remembered) say(ocrMarkerDoctorText(remembered));
+    return 0;
+  }
+  const lenient = env.npm_lifecycle_event === 'postinstall';
+  const force = argv.includes('--force-ocr') || (!ocrOnly && !lenient);
   try {
-    makePtySpawnHelperExecutable();
-    const built = buildVisionHelper();
-    verifyAndInstallTools();
-    log('done.');
+    if (!ocrOnly) makePtySpawnHelperExecutable();
+    let built = 'ok';
+    if (lenient && env.BOTBOY_DEFER_OCR_BUILD === '1') {
+      log('OCR helper build deferred: start.sh builds it in the background once the dashboard window is open.');
+    } else {
+      built = buildVisionHelper({ force });
+    }
+    if (!ocrOnly) {
+      verifyAndInstallTools();
+      log('done.');
+    }
     return built === 'failed' && !lenient ? 2 : 0;
   } catch (error) {
     log(`WARNING: unexpected failure: ${error?.message || error}`);
@@ -289,5 +707,8 @@ export function main() {
 }
 
 if (isMainModule(import.meta.url, process.argv[1])) {
+  // A closed pipe (the terminal or tee went away) must not crash the run.
+  process.stdout.on('error', () => {});
+  process.stderr.on('error', () => {});
   process.exitCode = main();
 }

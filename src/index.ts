@@ -145,7 +145,7 @@ import { adaptSendPrompt } from './core/pipeline-llm.js';
 import { createEvidenceGister } from './core/evidence-gist.js';
 import { createBackfiller } from './core/backfill.js';
 import { checkDependencies } from './core/deps-check.js';
-import { initToolchain } from './core/toolchain.js';
+import { formatMissingRequiredWarning, initToolchain } from './core/toolchain.js';
 import { createChatTerminalService } from './core/chat-terminal.js';
 import { createShutdownCoordinator } from './core/shutdown-coordinator.js';
 import { getSetting, setSetting } from './core/storage.js';
@@ -306,18 +306,14 @@ async function main() {
   try {
     const toolchain = await initToolchain(db);
     const found = toolchain.tools.filter((t) => t.path).length;
-    const missingRequired = toolchain.tools.filter((t) => !t.path && t.requirement === 'required');
     console.log(
       `✅ Toolchain: ${found}/${toolchain.tools.length} tools resolved` +
         (toolchain.pathAdditions.length ? `, PATH += ${toolchain.pathAdditions.length} dir(s)` : ''),
     );
-    if (missingRequired.length > 0) {
-      console.warn(
-        `⚠️  Missing required tools: ${missingRequired
-          .map((t) => `${t.name} (${t.brewFormula ? `brew install ${t.brewFormula}` : t.installHint || 'see README'})`)
-          .join(', ')} — run "npm run setup"`,
-      );
-    }
+    // An OCR helper whose build already failed on this Mac is reported once, on
+    // one line, by the dependency check below, not sent back to "npm run setup".
+    const missingRequiredWarning = formatMissingRequiredWarning(toolchain.tools);
+    if (missingRequiredWarning) console.warn(missingRequiredWarning);
   } catch (e: any) {
     console.error(`⚠️  Toolchain discovery failed: ${e?.message ?? e}`);
   }

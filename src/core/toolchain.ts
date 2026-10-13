@@ -24,6 +24,7 @@ import path from 'path';
 import type Database from 'better-sqlite3';
 import { getSetting, setSetting } from './storage.js';
 import { visionHelperPath } from './deps-check.js';
+import { ocrHelperUnavailableLine, readOcrBuildFailure, type OcrBuildFailure } from './ocr-helper-marker.js';
 
 export const TOOLCHAIN_SETTING_KEY = 'toolchain.map';
 
@@ -171,6 +172,33 @@ async function probeVersion(binPath: string, args: string[]): Promise<string | n
   }
 }
 
+/**
+ * What to tell the owner about a missing OCR helper. When its build already
+ * failed on this Mac (`ocr-helper-marker.ts`), building it again is not the
+ * answer, so the hint says what is true instead.
+ */
+export function visionHelperInstallHint(failure: OcrBuildFailure | null): string {
+  return failure ? ocrHelperUnavailableLine() : 'run "npm run bootstrap" to build it';
+}
+
+/**
+ * The boot warning for required tools that are missing, or null when there is
+ * nothing to say. The OCR helper whose build already failed on this Mac is left
+ * out: "npm run setup" would only repeat that build, and the dependency check
+ * (`checkDependencies`) already says what is true, once, on one line.
+ */
+export function formatMissingRequiredWarning(
+  tools: readonly ResolvedTool[],
+  options: { ocrFailure?: OcrBuildFailure | null } = {},
+): string | null {
+  const ocrFailure = options.ocrFailure !== undefined ? options.ocrFailure : readOcrBuildFailure();
+  const missing = tools.filter((t) => !t.path && t.requirement === 'required' && !(ocrFailure && t.name === 'vision-ocr'));
+  if (missing.length === 0) return null;
+  return `⚠️  Missing required tools: ${missing
+    .map((t) => `${t.name} (${t.brewFormula ? `brew install ${t.brewFormula}` : t.installHint || 'see README'})`)
+    .join(', ')} — run "npm run setup"`;
+}
+
 /** Discover every registry tool. Pure read — no PATH mutation, no persistence. */
 export async function discoverToolchain(
   env: NodeJS.ProcessEnv = process.env,
@@ -199,13 +227,14 @@ export async function discoverToolchain(
   // The Apple Vision OCR helper is a built artifact with a fixed path, not a
   // PATH tool — include it so diagnostics and setup see one complete picture.
   const helper = visionHelperPath();
+  const helperPath = existsSync(helper) ? helper : null;
   tools.push({
     name: 'vision-ocr',
     purpose: 'Apple Vision OCR helper (built by npm run bootstrap)',
     requirement: 'required',
-    path: existsSync(helper) ? helper : null,
+    path: helperPath,
     version: null,
-    installHint: 'run "npm run bootstrap" to build it',
+    installHint: visionHelperInstallHint(helperPath ? null : readOcrBuildFailure()),
     internalOnly: true,
   });
 

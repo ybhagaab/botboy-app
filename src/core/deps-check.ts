@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { ocrHelperUnavailableLine, readOcrBuildFailure, type OcrBuildFailure } from './ocr-helper-marker.js';
 
 export interface DepStatus {
   name: string;
@@ -54,12 +55,20 @@ export function pdfJsInstalled(): boolean {
     && existsSync(pdfTextScriptPath());
 }
 
-export function checkDependencies(): DepsReport {
+/**
+ * `ocrFailure` is read from the remembered-failure marker unless a caller (a
+ * test) supplies it. When the OCR helper is missing because its build already
+ * failed on this Mac, the report says that once, on one line, instead of
+ * sending the owner back to the build that failed (`ocr-helper-marker.ts`).
+ */
+export function checkDependencies(options: { ocrFailure?: OcrBuildFailure | null } = {}): DepsReport {
   const deps: DepStatus[] = [];
 
   // OCR — macOS Vision helper (built by the bootstrap step).
   const helper = visionHelperPath();
   const ocrOk = process.platform === 'darwin' && existsSync(helper);
+  const buildFailed = !ocrOk && process.platform === 'darwin'
+    && (options.ocrFailure !== undefined ? options.ocrFailure : readOcrBuildFailure()) !== null;
   deps.push({
     name: 'ocr (apple-vision helper)',
     ok: ocrOk,
@@ -67,7 +76,9 @@ export function checkDependencies(): DepsReport {
       ? `found at ${helper}`
       : process.platform !== 'darwin'
         ? 'Apple Vision OCR requires macOS'
-        : `missing; run "npm run bootstrap" to build the vision-ocr helper (${helper})`,
+        : buildFailed
+          ? ocrHelperUnavailableLine()
+          : `missing; run "npm run bootstrap" to build the vision-ocr helper (${helper})`,
   });
 
   // Document parsing — the native vision-ocr helper reads the PDF text layer
@@ -90,16 +101,27 @@ export function checkDependencies(): DepsReport {
   deps.push({
     name: 'scanned-pdf rasterize (vision-ocr pdf-rasterize|pdftoppm)',
     ok: ocrOk || pdftoppm,
-    detail: ocrOk ? 'available (native CoreGraphics)' : pdftoppm ? 'available (pdftoppm)' : 'missing; run "npm run bootstrap" to build the native helper',
+    detail: ocrOk
+      ? 'available (native CoreGraphics)'
+      : pdftoppm
+        ? 'available (pdftoppm)'
+        : buildFailed
+          ? ocrHelperUnavailableLine()
+          : 'missing; run "npm run bootstrap" to build the native helper',
   });
 
   const required = deps.filter((d) => d.name.startsWith('ocr') || d.name.startsWith('pdf'));
   const ok = required.every((d) => d.ok);
   const missing = deps.filter((d) => !d.ok);
-  const message = ok
-    ? ''
-    : 'Some local extraction dependencies are missing:\n' +
-      missing.map((d) => `  - ${d.name}: ${d.detail}`).join('\n');
+  // One cause behind both OCR rows when the build failed: say it once, on one
+  // line, and keep the bulleted list for anything else that is missing.
+  const others = buildFailed ? missing.filter((d) => !d.detail.startsWith(ocrHelperUnavailableLine())) : missing;
+  const lines: string[] = [];
+  if (others.length > 0) {
+    lines.push('Some local extraction dependencies are missing:\n' + others.map((d) => `  - ${d.name}: ${d.detail}`).join('\n'));
+  }
+  if (buildFailed && others.length < missing.length) lines.push(ocrHelperUnavailableLine());
+  const message = ok ? '' : lines.join('\n');
 
   return { ok, deps, message };
 }

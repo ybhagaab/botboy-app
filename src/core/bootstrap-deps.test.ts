@@ -9,7 +9,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Each case starts node a few times; a loaded Mac needs more than the 5 s default.
+vi.setConfig({ testTimeout: 60_000 });
 
 const bootstrapPath = fileURLToPath(new URL('../../scripts/bootstrap-deps.mjs', import.meta.url));
 const bootstrapUrl = pathToFileURL(bootstrapPath).href;
@@ -89,6 +92,10 @@ describe('notes and entry guard', () => {
 function checkout() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-bootstrap-clt-'));
   roots.push(root);
+  // A private HOME: a failed build writes its remembered-failure marker there,
+  // and it must never land in the real home folder.
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home);
   const real = path.join(root, 'real');
   fs.mkdirSync(path.join(real, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(real, 'native', 'vision-ocr'), { recursive: true });
@@ -109,11 +116,12 @@ function checkout() {
   const run = (env: Record<string, string>) =>
     spawnSync(process.execPath, [path.join(linked, 'scripts', 'bootstrap-deps.mjs')], {
       cwd: linked,
-      env: { ...process.env, npm_lifecycle_event: '', PATH: `${stubs}:/usr/bin:/bin`, ...env },
+      env: { ...process.env, HOME: home, npm_lifecycle_event: '', PATH: `${stubs}:/usr/bin:/bin`, ...env },
       encoding: 'utf8',
       timeout: 20_000,
     });
-  return { stub, swiftc, marker, run };
+  const failureMarker = path.join(home, '.personal-productivity-tracker', 'ocr-helper-build.json');
+  return { stub, swiftc, marker, run, home, failureMarker };
 }
 
 describe('scripts/bootstrap-deps.mjs without Command Line Tools', () => {
@@ -141,7 +149,12 @@ describe('scripts/bootstrap-deps.mjs without Command Line Tools', () => {
     expect(fs.existsSync(box.marker)).toBe(true);
     expect(plain.stdout).toContain('OCR helper build failed');
 
+    // The failed build is now remembered; forget it so postinstall compiles
+    // (and fails) again. Remembered failures are covered in bootstrap-deps.ocr.test.ts.
+    fs.rmSync(box.failureMarker);
+    fs.rmSync(box.marker);
     const postinstall = box.run({ ...env, npm_lifecycle_event: 'postinstall' });
+    expect(fs.existsSync(box.marker)).toBe(true);
     expect(postinstall.status).toBe(0);
     expect(postinstall.stdout).toContain('OCR helper build failed');
   });
