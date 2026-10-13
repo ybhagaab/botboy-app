@@ -287,7 +287,7 @@ export interface AnalyticsImportSemanticProposalService {
     model: string;
     providerLocality: ProviderLocality;
     endpointSha256: string;
-    modelTemperature: 0;
+    modelTemperature: 0 | null;
     content: string;
     allowed: boolean;
   };
@@ -413,9 +413,9 @@ function words(value: string): string[] {
 }
 
 function providerLocality(endpoint: string, providerId: string): ProviderLocality {
-  // The owner's own OpenAI or DeepSeek account is a third-party remote by
-  // definition, whatever endpoint it is reached through.
-  if (providerId === 'openai' || providerId === 'deepseek') return 'external_remote';
+  // The owner's own OpenAI, DeepSeek or Anthropic account is a third-party
+  // remote by definition, whatever endpoint it is reached through.
+  if (providerId === 'openai' || providerId === 'deepseek' || providerId === 'anthropic') return 'external_remote';
   try {
     const host = new URL(endpoint).hostname.toLowerCase();
     if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return 'device_local';
@@ -430,6 +430,14 @@ function providerLocality(endpoint: string, providerId: string): ProviderLocalit
   return 'external_remote';
 }
 
+/**
+ * The sampling temperature the receipt records. BotBoy asks for 0 and every provider but Anthropic receives it;
+ * Anthropic never gets a `temperature` (several current models reject it with a 400), so the receipt records NULL there:
+ * repeatability rests on the strict schema, the local validators and owner approval, not on temperature 0.
+ */
+export function importModelTemperature(providerId: string): 0 | null {
+  return providerId === 'anthropic' ? null : 0;
+}
 export interface ImportProviderDescriptor {
   id: string;
   endpoint: string;
@@ -621,7 +629,8 @@ const MODEL_PROPOSAL_KEYS = [
   'grain', 'timeZone', 'classification', 'evidence', 'unresolved',
 ] as const;
 
-const ANALYTICS_IMPORT_PROPOSAL_RESPONSE_FORMAT: LlmResponseFormat = {
+/** Exported for the Anthropic schema adapter tests (provider-neutral contract; unchanged). */
+export const ANALYTICS_IMPORT_PROPOSAL_RESPONSE_FORMAT: LlmResponseFormat = {
   type: 'json_schema',
   name: 'analytics_import_semantic_proposal',
   strict: true,
@@ -735,7 +744,8 @@ function modelRequestPayload(
   });
 }
 
-function parseEvidence(value: unknown): ModelEvidence[] {
+/** Exported for the Anthropic probe (P6) and tests; the proposal pipeline is its only production caller. */
+export function parseEvidence(value: unknown): ModelEvidence[] {
   if (!Array.isArray(value) || value.length !== MODEL_EVIDENCE_FIELDS.length) {
     throw new Error(`evidence must contain exactly ${MODEL_EVIDENCE_FIELDS.length} ordered entries.`);
   }
@@ -1966,7 +1976,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
       model: provider.model,
       providerLocality: locality,
       endpointSha256,
-      modelTemperature: 0 as const,
+      modelTemperature: importModelTemperature(provider.id),
       content: 'Bounded worksheet structure, semantic labels, and representative cell values plus one complete analytics context family.',
       // D4: any connected provider may read workbook evidence; the receipt keeps provenance.
       allowed: true,
@@ -2186,7 +2196,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         profile.parseSha256, profile.profileSha256, profile.rowsetSha256, profile.schemaSha256,
         extra.contextFamily ?? null, extra.contextSelectionSha256 ?? null, extra.contextReceiptsJson ?? null, extra.contextBundleSha256 ?? null,
         extra.llmOperationId ?? null, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION, extra.promptSha256 ?? null,
-        runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, runtime.endpointSha256, runtime.locality, 0, ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
+        runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, runtime.endpointSha256, runtime.locality, importModelTemperature(runtime.provider.id), ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
         extra.responseSha256 ?? null, extra.finishReason ?? null,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, extra.evidenceJson ?? null, stableAnalyticsJson(canonicalUnresolved), at, row.id, row.state_revision,
         ANALYTICS_IMPORT_TRANSFORM_VERSION,
@@ -2312,7 +2322,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         parsed.profile.parseSha256, parsed.profile.profileSha256, parsed.profile.rowsetSha256, parsed.profile.schemaSha256,
         preparedReceipt.relativePath, preparedReceipt.sha256, preparedReceipt.bytes, context.family, context.selectionSha256,
         stableAnalyticsJson(context.receipts), context.bundleSha256, operationId, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION,
-        promptSha256, runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, endpointSha256, locality, 0,
+        promptSha256, runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, endpointSha256, locality, importModelTemperature(runtime.provider.id),
         ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION, responseSha256, response.finishReason,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, proposalJson, sha256(proposalJson), definitionJson, contractJson,
         built.definition.contract.contractSha256, stableAnalyticsJson(built.evidence), at, at, row.id, current.state_revision,

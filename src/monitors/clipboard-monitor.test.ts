@@ -6,6 +6,10 @@ import { createClipboardMonitor, looksLikeCopiedPassword, privateCopyReasonFromT
 // token-shaped literal lives in the repository.
 const GITHUB_TOKEN = `${['gh', 'p_'].join('')}A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8`;
 const SLACK_TOKEN = `${['xo', 'xp-'].join('')}123456789012-123456789012-AbCdEfGh1234`;
+// Anthropic regular and Admin keys, assembled the same way.
+const ANTHROPIC_BODY = 'Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv'.repeat(3);
+const ANTHROPIC_KEY = `${['sk', '-ant-', 'api03-'].join('')}${ANTHROPIC_BODY}`;
+const ANTHROPIC_ADMIN_KEY = `${['sk', '-ant-', 'admin01-'].join('')}${ANTHROPIC_BODY}`;
 
 describe('privateCopyReasonFromText', () => {
   it('holds high-confidence secret formats by kind', () => {
@@ -13,6 +17,11 @@ describe('privateCopyReasonFromText', () => {
     expect(privateCopyReasonFromText(`export SLACK_USER_TOKEN=${SLACK_TOKEN}`)).toMatch(/Slack token/);
   });
 
+  it('holds Anthropic regular and Admin keys by kind', () => {
+    expect(privateCopyReasonFromText(ANTHROPIC_KEY)).toBe('Contains what looks like an Anthropic API key');
+    expect(privateCopyReasonFromText(`export ANTHROPIC_API_KEY=${ANTHROPIC_ADMIN_KEY}`)).toBe('Contains what looks like an Anthropic API key');
+    expect(privateCopyReasonFromText(`Anthropic keys start with ${['sk', '-ant-'].join('')} and are long`)).toBeNull();
+  });
   it('holds a lone generated-password token and lets ordinary copies through', () => {
     expect(looksLikeCopiedPassword('Xk9$mP2!qLw7')).toBe(true);
     expect(privateCopyReasonFromText('Xk9$mP2!qLw7')).toBe('Looks like a copied password');

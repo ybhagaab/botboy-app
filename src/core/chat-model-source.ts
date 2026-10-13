@@ -17,7 +17,7 @@ import {
 } from './inference-provider.js';
 import type { LlmClient, LlmRequestRoute } from './llm-client.js';
 import { isLlmClientSwitch, pinLlmClient } from './llm-client-switch.js';
-import type { LlmModelOperation } from './llm-model-operation.js';
+import type { LlmModelOperation, LlmThinkingOffMode } from './llm-model-operation.js';
 import {
   LLM_CONNECTION_ORDER,
   LLM_MODEL_KEY_PATTERN,
@@ -43,6 +43,11 @@ export interface ChatModelCatalogEntry {
   readonly group?: string;
   /** Whether the model reads images; omitted when unknown. */
   readonly images?: boolean;
+  /**
+   * How Thinking "Off" behaves on this model (Claude only; omitted for the other providers). The chat panel reads it
+   * to word the Thinking control's tooltip; it carries no route, endpoint or credential.
+   */
+  readonly thinkingOff?: LlmThinkingOffMode;
 }
 
 /** Browser-safe catalog: labels and stable keys only, never routes or credentials. */
@@ -114,7 +119,10 @@ export function createSingleClientChatModelSource(client: LlmClient | undefined)
 /** Every configured connection's models, grouped by provider. */
 export function createConnectionChatModelSource(input: {
   connections: () => readonly LlmConnection[];
-  /** D4: the team default when configured, otherwise the organizing model. */
+  /**
+   * D8: the team default when configured; otherwise an explicit Organizing choice, or the Organizing connection's own
+   * default model when Organizing is Automatic (a role default never leaks into chat).
+   */
   defaultKey: () => string | undefined;
   onChange: (listener: (event: { connectionId: string }) => void) => () => void;
 }): ChatModelSource {
@@ -169,6 +177,7 @@ export function createConnectionChatModelSource(input: {
           preview: entry.preview,
           group: connection.id,
           ...(entry.capabilities.images !== undefined ? { images: entry.capabilities.images } : {}),
+          ...(entry.capabilities.thinkingOff !== undefined ? { thinkingOff: entry.capabilities.thinkingOff } : {}),
         }))),
       };
     },

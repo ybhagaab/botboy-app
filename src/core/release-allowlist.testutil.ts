@@ -34,6 +34,8 @@ export function releaseFiles(): string[] {
     }
     if (/\.(test|fake)\.ts$|\.testutil\.ts$/.test(rel)) return;
     if (/\.(png|jpe?g|gif|webp|ico|icns|node|dylib|wasm|ttf|woff2?)$/i.test(rel)) return;
+    // Prebuilt native helpers are extensionless Mach-O files; the credential scans must not read them as text.
+    if (/^native\/[^/]+\/prebuilt\//.test(rel)) return;
     out.push(rel);
   };
   for (const entry of releaseAllowlist()) walk(entry);

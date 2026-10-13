@@ -18,11 +18,18 @@
  *                                                    (./start.sh --rebuild-ocr)
  *   node scripts/bootstrap-deps.mjs --ocr-marker     print the remembered failure as one sentence for
  *                                                    ./start.sh --doctor (nothing when there is none)
+ *   node scripts/bootstrap-deps.mjs --ocr-status     print the `ocr helper:` doctor row (which helper this
+ *                                                    Mac uses and why) and exit 0 when one is usable, 1
+ *                                                    when none is. Read-only: it clears and writes nothing
  *
  * Idempotent and safely re-runnable:
  *   - Makes node-pty's prebuilt macOS spawn-helper executable (its npm
  *     tarball drops the execute bit).
- *   - Builds the macOS `vision-ocr` Swift helper if it is missing or stale.
+ *   - Decides which OCR helper this Mac uses (scripts/native-prebuilt.mjs): the
+ *     PREBUILT universal helper that ships in native/vision-ocr/prebuilt, or a
+ *     local build. A current helper means nothing is compiled and no toolchain
+ *     is probed. Only when there is none (or a stale one) and a Swift toolchain
+ *     exists is `vision-ocr` compiled locally, as a background last resort.
  *   - Verifies every external CLI tool BotBoy shells out to (the canonical
  *     registry lives in src/core/toolchain.ts — keep the lists aligned).
  *   - With --install, installs missing Homebrew formulas non-interactively.
@@ -51,21 +58,29 @@
  *          beside it (a folder; one build at a time).
  *   {
  *     "schema": 1,
- *     "kind": "failed" | "timeout",
+ *     "kind": "failed" | "timeout" | "unavailable",
  *     "failedAt": "<ISO-8601 UTC>",
- *     "durationMs": <integer, wall time of the failed attempt>,
- *     "reason": "<one line: the first compiler error line, or why it timed out>",
+ *     "durationMs": <integer, wall time of the failed attempt; null for unavailable>,
+ *     "reason": "<one line: the first compiler error line, why it timed out, or for
+ *                 unavailable the sentence the owner was shown>",
+ *     "reasonCode": "<unavailable only: manifest_missing | manifest_invalid | prebuilt_missing |
+ *                     prebuilt_corrupt | prebuilt_not_executable | os_too_old | quarantined |
+ *                     smoke_failed | resolver_error>",
  *     "signature": {
  *       "source": "<sha256 of native/vision-ocr/main.swift>",
- *       "swiftc": "<first line of swiftc --version>",
- *       "osBuild": "<sw_vers -buildVersion>"
+ *       "swiftc": "<first line of swiftc --version; empty when there is no toolchain>",
+ *       "osBuild": "<sw_vers -buildVersion>",
+ *       "prebuilt": "<sha256 of the manifest's binary; the key is absent when there is no manifest>"
  *     }
  *   }
- *   While the signature is unchanged the build is skipped silently. It is tried
- *   again when any part changes (a release updates main.swift, the compiler or
- *   macOS is updated) or when the owner asks (./start.sh --rebuild-ocr,
- *   npm run bootstrap). A successful build deletes the marker. Readers: this
- *   script (the skip, --ocr-marker for start.sh --doctor) and the server
+ *   `unavailable` means no helper is usable and NOTHING WAS ATTEMPTED (no toolchain
+ *   to compile with); it must never be worded as a failed build. While the
+ *   signature (and reasonCode) is unchanged the note is not printed again. It is
+ *   tried again when any part changes (a release updates main.swift or the
+ *   prebuilt, the compiler or macOS is updated, a toolchain appears) or when the
+ *   owner asks (./start.sh --rebuild-ocr, npm run bootstrap). A usable current
+ *   helper or a successful build deletes the marker. Readers: this script (the
+ *   skip, --ocr-marker for start.sh --doctor) and the server
  *   (src/core/ocr-helper-marker.ts, read-only and fail-open).
  */
 
@@ -80,6 +95,19 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const swiftSrc = path.join(root, 'native', 'vision-ocr', 'main.swift');
 const binDir = path.join(root, 'native', 'vision-ocr', 'bin');
 const bin = path.join(binDir, 'vision-ocr');
+// Written beside a local build: the SHA-256 of the main.swift it was built from.
+const builtFromFile = path.join(binDir, 'vision-ocr.built-from');
+
+// scripts/native-prebuilt.mjs holds the manifest and the resolver. A damaged
+// checkout may lack it (or it may fail to load): then this script behaves as it
+// did before prebuilt helpers existed (the compile path), so `npm install`
+// still cannot fail on OCR.
+let prebuilt = null;
+try {
+  prebuilt = await import('./native-prebuilt.mjs');
+} catch {
+  prebuilt = null;
+}
 
 const INSTALL = process.argv.includes('--install');
 const WITH_OPTIONAL = process.argv.includes('--with-optional');
@@ -99,6 +127,7 @@ const DEFAULT_OCR_BUILD_TIMEOUT_SECONDS = 120;
 const OCR_HEAD_LINES = 20;
 const OCR_TAIL_LINES = 5;
 const OCR_MARKER_SCHEMA = 1;
+const OCR_MARKER_KINDS = ['failed', 'timeout', 'unavailable'];
 
 // Keep aligned with TOOL_REGISTRY in src/core/toolchain.ts.
 // Core is EMPTY by design: BotBoy's own pdf.js reader (scripts/pdf-text.mjs,
@@ -117,6 +146,9 @@ const OPTIONAL_FORMULAS = [
 // --ocr-helper mode (start.sh sends that to the log). `say` is the one place
 // text meant for the owner is printed, always on stdout.
 let writeDiagnostic = (line) => console.log(line);
+// The background job (--ocr-helper) runs at every start and must stay silent when
+// nothing is wrong; npm's postinstall and a run by hand say which helper they found.
+let quietWhenCurrent = false;
 
 function log(msg) {
   writeDiagnostic(`[bootstrap-deps] ${msg}`);
@@ -210,7 +242,16 @@ export function ocrBuildFailedNote(firstLine, { durationMs } = {}) {
  * out. At most once per signature, because a remembered failure is not retried.
  */
 export function ocrOffNote() {
-  return "Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy's helper (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > Software Update, then run ./start.sh --rebuild-ocr.";
+  return "Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy's helper (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > General > Software Update, then run ./start.sh --rebuild-ocr.";
+}
+
+/**
+ * The variant when a rebuild failed but a working helper (the prebuilt one, or
+ * an older local build) is still in use: nothing is off, an update did not happen.
+ */
+export function ocrKeptNote(reason) {
+  const why = reason ? ` (${reason})` : '';
+  return `Could not update BotBoy's reader for images and scanned PDFs${why}; the previous reader stays and keeps working. To retry, update macOS and the Command Line Tools in System Settings > General > Software Update, then run ./start.sh --rebuild-ocr.`;
 }
 
 /** True when this file is the script node was started with, also through symlinks (os.tmpdir() is one on macOS). */
@@ -274,13 +315,30 @@ function probeLine(run, file, args) {
   }
 }
 
-/** What a failure depends on: the helper source, the Swift compiler, and the macOS build. */
-export function computeOcrSignature(swiftc, { run = execFileSync, source = swiftSrc } = {}) {
-  return {
+/** The SHA-256 of the manifest's prebuilt OCR binary, or '' when there is no usable manifest. */
+function prebuiltBinarySha() {
+  try {
+    const read = prebuilt?.readManifest({ root });
+    return read?.ok ? read.manifest.artifacts.visionOcr?.binary?.sha256 ?? '' : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * What a remembered outcome depends on: the helper source, the Swift compiler
+ * (empty when there is none), the macOS build, and the prebuilt binary the
+ * manifest names. `prebuilt` is left out when empty, so a signature made
+ * without a manifest keeps its original three-part shape.
+ */
+export function computeOcrSignature(swiftc, { run = execFileSync, source = swiftSrc, prebuiltSha = prebuiltBinarySha() } = {}) {
+  const signature = {
     source: sha256OfFile(source),
     swiftc: swiftc ? probeLine(run, swiftc, ['--version']) : '',
     osBuild: probeLine(run, SW_VERS_BIN, ['-buildVersion']),
   };
+  if (prebuiltSha) signature.prebuilt = prebuiltSha;
+  return signature;
 }
 
 export function sameOcrSignature(a, b) {
@@ -288,7 +346,8 @@ export function sameOcrSignature(a, b) {
     && a.source !== ''
     && a.source === b.source
     && a.swiftc === b.swiftc
-    && a.osBuild === b.osBuild;
+    && a.osBuild === b.osBuild
+    && (a.prebuilt ?? '') === (b.prebuilt ?? '');
 }
 
 /**
@@ -301,12 +360,13 @@ export function readOcrMarker({ file = ocrMarkerPath() } = {}) {
     if (text.length > 16 * 1024) return null;
     const value = JSON.parse(text);
     if (!value || typeof value !== 'object' || value.schema !== OCR_MARKER_SCHEMA) return null;
-    if (value.kind !== 'failed' && value.kind !== 'timeout') return null;
+    if (!OCR_MARKER_KINDS.includes(value.kind)) return null;
     if (typeof value.failedAt !== 'string' || !Number.isFinite(Date.parse(value.failedAt))) return null;
     if (typeof value.reason !== 'string') return null;
+    if (value.kind === 'unavailable' && (typeof value.reasonCode !== 'string' || value.reasonCode === '')) return null;
     const signature = value.signature;
     if (!signature || typeof signature.source !== 'string' || typeof signature.swiftc !== 'string' || typeof signature.osBuild !== 'string') return null;
-    return {
+    const marker = {
       schema: OCR_MARKER_SCHEMA,
       kind: value.kind,
       failedAt: value.failedAt,
@@ -314,6 +374,9 @@ export function readOcrMarker({ file = ocrMarkerPath() } = {}) {
       reason: value.reason,
       signature: { source: signature.source, swiftc: signature.swiftc, osBuild: signature.osBuild },
     };
+    if (typeof signature.prebuilt === 'string' && signature.prebuilt !== '') marker.signature.prebuilt = signature.prebuilt;
+    if (value.kind === 'unavailable') marker.reasonCode = value.reasonCode;
+    return marker;
   } catch {
     return null;
   }
@@ -352,8 +415,13 @@ function localDate(iso) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-/** The sentence ./start.sh --doctor appends to its xcode-clt row. */
+/**
+ * The sentence ./start.sh --doctor appends to its xcode-clt row: a BUILD failure
+ * only. An `unavailable` marker means nothing was attempted, so it never
+ * reads as a failed build (its words are on the `ocr helper:` row).
+ */
 export function ocrMarkerDoctorText(marker) {
+  if (marker.kind !== 'failed' && marker.kind !== 'timeout') return '';
   const after = marker.durationMs == null ? '' : ` after ${formatSeconds(marker.durationMs)} s`;
   return `OCR helper build failed on ${localDate(marker.failedAt)}${after}: ${oneLine(marker.reason, 240) || 'no reason recorded'}`;
 }
@@ -465,6 +533,8 @@ function compileOcrHelper(swiftc, timeoutMs) {
   const stage = mkdtempSync(path.join(binDir, '.build-'));
   const staged = path.join(stage, 'vision-ocr');
   const started = Date.now();
+  // The source this build is made from, noted before the compile starts.
+  const sourceSha = sha256OfFile(swiftSrc);
   try {
     execFileSync(swiftc, [...swiftSdkArgs(), '-O', swiftSrc, '-o', staged], {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -479,6 +549,13 @@ function compileOcrHelper(swiftc, timeoutMs) {
     }
     chmodSync(staged, 0o755);
     renameSync(staged, bin);
+    // Remember which source this build came from, so the resolver can tell a current local build from an outdated
+    // one. Without the note it falls back to file times.
+    try {
+      writeFileSync(builtFromFile, `${sourceSha}\n`);
+    } catch {
+      // not fatal
+    }
     return { ok: true, durationMs: Date.now() - started };
   } catch (error) {
     const timedOut = error?.code === 'ETIMEDOUT';
@@ -509,36 +586,93 @@ function compileOcrHelper(swiftc, timeoutMs) {
   }
 }
 
+/** The resolver's verdict for this folder, or null when the resolver itself is unavailable (damaged checkout). */
+function resolveOcrHelper({ repair = true } = {}) {
+  if (!prebuilt) return null;
+  try {
+    return prebuilt.resolveVisionHelper({ root, repair });
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Returns 'ok' (built, current, or nothing to do here), 'no-toolchain'
- * (expected, exit 0), 'remembered' (failed before, nothing changed: silent),
- * 'busy' (another build is running), or 'failed' (compile error or timeout).
- * `force` ignores a remembered failure.
+ * No helper is usable and nothing can be compiled here (no toolchain, or no
+ * source to compile). Say so ONCE per signature in the reason table's words,
+ * which always name the next action, and remember it as `unavailable`: this is
+ * not a failed build and must never read as one.
  */
-function buildVisionHelper({ force = false } = {}) {
+function noteHelperUnavailable(verdict, { force }) {
+  const signature = computeOcrSignature('');
+  if (!force) {
+    const remembered = readOcrMarker();
+    if (remembered && remembered.kind === 'unavailable' && remembered.reasonCode === verdict.reason && sameOcrSignature(remembered.signature, signature)) return 'remembered';
+  }
+  const line = prebuilt.ocrReasonLine(verdict.reason, { osVersion: verdict.osVersion, minMacos: verdict.minMacos, detail: verdict.detail, root });
+  writeOcrMarker({
+    kind: 'unavailable',
+    reasonCode: verdict.reason,
+    failedAt: new Date().toISOString(),
+    durationMs: null,
+    reason: oneLine(line, 400),
+    signature,
+  });
+  say(`ℹ  ${line}`);
+  return 'no-toolchain';
+}
+
+/**
+ * Returns 'ok' (a current helper, a built one, or nothing to do here),
+ * 'no-toolchain' (expected, exit 0), 'remembered' (nothing changed since the
+ * last note: silent), 'busy' (another build is running), or 'failed' (compile
+ * error or timeout). `force` ignores a remembered outcome; `defer` (npm's
+ * postinstall under start.sh) skips the compile.
+ *
+ * Order, and the reason for it: the resolver runs FIRST. A current helper (the
+ * shipped prebuilt one, or a current local build) means no toolchain probe and
+ * no compile on any Mac. A helper that works but is older than main.swift stays
+ * in use while a newer one is built. Only then is a toolchain looked for.
+ */
+function buildVisionHelper({ force = false, defer = false } = {}) {
   if (process.platform !== 'darwin') {
     log('skip: Apple Vision OCR helper only builds on macOS (non-darwin platform).');
     return 'ok';
   }
-  if (!existsSync(swiftSrc)) {
-    log(`skip: helper source not found at ${swiftSrc}`);
+  const verdict = resolveOcrHelper();
+  if (verdict?.current) {
+    if (!quietWhenCurrent) log(`OCR helper: using the ${verdict.provenance === 'prebuilt' ? 'prebuilt' : 'local'} helper (nothing to build).`);
+    clearOcrMarker();
     return 'ok';
   }
-  // Idempotent: rebuild only if binary is missing or older than the source.
-  const needsBuild = !existsSync(bin) || statSync(bin).mtimeMs < statSync(swiftSrc).mtimeMs;
-  if (!needsBuild) {
-    log('vision-ocr helper is up to date.');
+  if (!verdict) {
+    // Legacy rule (no resolver): build when the binary is missing or older than its source.
+    if (!existsSync(swiftSrc)) {
+      log(`skip: helper source not found at ${swiftSrc}`);
+      return 'ok';
+    }
+    if (existsSync(bin) && statSync(bin).mtimeMs >= statSync(swiftSrc).mtimeMs) {
+      log('vision-ocr helper is up to date.');
+      return 'ok';
+    }
+  }
+  if (defer) {
+    log('OCR helper build deferred: start.sh builds it in the background once the dashboard window is open.');
     return 'ok';
   }
-  const toolchain = detectSwiftToolchain();
+  const usable = Boolean(verdict) && verdict.provenance !== 'none';
+  const toolchain = existsSync(swiftSrc) ? detectSwiftToolchain() : { ok: false, reason: 'no-source' };
   if (!toolchain.ok) {
-    say(`ℹ  ${ocrNotBuiltNote()}`);
-    return 'no-toolchain';
+    if (usable) return 'ok'; // the helper in use works; it just cannot be updated on this Mac
+    if (!verdict) {
+      say(`ℹ  ${ocrNotBuiltNote()}`);
+      return 'no-toolchain';
+    }
+    return noteHelperUnavailable(verdict, { force });
   }
   const signature = computeOcrSignature(toolchain.swiftc);
   if (!force) {
     const remembered = readOcrMarker();
-    if (remembered && sameOcrSignature(remembered.signature, signature)) return 'remembered';
+    if (remembered && remembered.kind !== 'unavailable' && sameOcrSignature(remembered.signature, signature)) return 'remembered';
   }
   const timeoutMs = ocrBuildTimeoutMs();
   const lock = acquireOcrBuildLock({ maxAgeMs: timeoutMs + 60_000 });
@@ -566,7 +700,7 @@ function buildVisionHelper({ force = false } = {}) {
       reason,
       signature,
     });
-    say(`ℹ  ${ocrOffNote()}`);
+    say(`ℹ  ${usable ? ocrKeptNote(reason) : ocrOffNote()}`);
     return 'failed';
   } finally {
     lock.release();
@@ -669,6 +803,26 @@ function verifyAndInstallTools() {
 }
 
 /**
+ * The `ocr helper:` doctor row. Read-only: nothing is cleared, repaired or
+ * written (a flagged file is reported, never executed). Exit 0 when a helper is
+ * usable (current or not), 1 when none is. A missing resolver prints `unknown`.
+ */
+function printOcrStatus() {
+  if (!prebuilt) {
+    say('ocr helper: unknown (scripts/native-prebuilt.mjs is missing from this folder; run ./start.sh --update)');
+    return 1;
+  }
+  try {
+    const verdict = prebuilt.resolveVisionHelper({ root, repair: false, smokeTimeoutMs: 10_000 });
+    say(prebuilt.ocrDoctorLine(verdict, { root }));
+    return verdict.provenance === 'none' ? 1 : 0;
+  } catch {
+    say('ocr helper: unknown (the check itself failed; run ./start.sh --update)');
+    return 1;
+  }
+}
+
+/**
  * Returns the exit status. A missing toolchain is expected (exit 0). A compile
  * error or unexpected throw exits 0 only inside `npm install` (postinstall must
  * never fail the install) and 2 otherwise.
@@ -680,21 +834,21 @@ function verifyAndInstallTools() {
 export function main({ argv = process.argv.slice(2), env = process.env } = {}) {
   const ocrOnly = argv.includes('--ocr-helper');
   writeDiagnostic = ocrOnly ? (line) => console.error(line) : (line) => console.log(line);
+  quietWhenCurrent = ocrOnly;
   if (argv.includes('--ocr-marker')) {
     const remembered = readOcrMarker();
-    if (remembered) say(ocrMarkerDoctorText(remembered));
+    const sentence = remembered ? ocrMarkerDoctorText(remembered) : '';
+    if (sentence) say(sentence);
     return 0;
+  }
+  if (argv.includes('--ocr-status')) {
+    return printOcrStatus();
   }
   const lenient = env.npm_lifecycle_event === 'postinstall';
   const force = argv.includes('--force-ocr') || (!ocrOnly && !lenient);
   try {
     if (!ocrOnly) makePtySpawnHelperExecutable();
-    let built = 'ok';
-    if (lenient && env.BOTBOY_DEFER_OCR_BUILD === '1') {
-      log('OCR helper build deferred: start.sh builds it in the background once the dashboard window is open.');
-    } else {
-      built = buildVisionHelper({ force });
-    }
+    const built = buildVisionHelper({ force, defer: lenient && env.BOTBOY_DEFER_OCR_BUILD === '1' });
     if (!ocrOnly) {
       verifyAndInstallTools();
       log('done.');

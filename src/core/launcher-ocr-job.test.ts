@@ -22,6 +22,7 @@ vi.setConfig({ testTimeout: 60_000 });
 
 const launcherPath = fileURLToPath(new URL('../../start.sh', import.meta.url));
 const bootstrapPath = fileURLToPath(new URL('../../scripts/bootstrap-deps.mjs', import.meta.url));
+const nativePrebuiltPath = fileURLToPath(new URL('../../scripts/native-prebuilt.mjs', import.meta.url));
 const launcherText = fs.readFileSync(launcherPath, 'utf8');
 const roots: string[] = [];
 afterEach(() => {
@@ -29,7 +30,7 @@ afterEach(() => {
 });
 
 const OFF_NOTE_START = 'Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy\'s helper';
-const OFF_NOTE = `${OFF_NOTE_START} (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > Software Update, then run ./start.sh --rebuild-ocr.`;
+const OFF_NOTE = `${OFF_NOTE_START} (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > General > Software Update, then run ./start.sh --rebuild-ocr.`;
 // The build itself (scripts/bootstrap-deps.mjs) only runs on macOS; the text checks run anywhere.
 const onMac = describe.runIf(process.platform === 'darwin');
 const sleepMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -45,6 +46,9 @@ function box() {
   for (const d of [path.join(dir, 'scripts'), path.join(dir, 'native', 'vision-ocr'), stubs, home]) fs.mkdirSync(d, { recursive: true });
   fs.copyFileSync(launcherPath, path.join(dir, 'start.sh'));
   fs.copyFileSync(bootstrapPath, path.join(dir, 'scripts', 'bootstrap-deps.mjs'));
+  // The resolver bootstrap-deps.mjs runs first. This harness has no manifest, so it answers "no prebuilt" and the
+  // compile path below is what is under test (prebuilt cases: launcher-prebuilt-ocr.test.ts).
+  fs.copyFileSync(nativePrebuiltPath, path.join(dir, 'scripts', 'native-prebuilt.mjs'));
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'x' }));
   const source = path.join(dir, 'native', 'vision-ocr', 'main.swift');
   fs.writeFileSync(source, '// stub\n');
@@ -213,7 +217,7 @@ onMac('start.sh › OCR helper job: a failing swiftc', () => {
     const forced = b.run(null, {}, ['--rebuild-ocr']);
     expect(b.compiles()).toBe(2);
     expect(forced.status).toBe(1);
-    expect(forced.stdout).toContain('Rebuilding the OCR helper');
+    expect(forced.stdout).toContain('Checking the OCR helper');
     expect(forced.stdout).toContain('module.modulemap'); // the owner asked, so the (cut-down) detail is shown
     expect(forced.stdout.split(OFF_NOTE).length - 1).toBe(1);
   });
@@ -226,7 +230,7 @@ onMac('start.sh › OCR helper job: a failing swiftc', () => {
     b.swiftc(SUCCEEDS);
     const forced = b.run(null, {}, ['--rebuild-ocr']);
     expect(forced.status).toBe(0);
-    expect(forced.stdout).toContain('OCR helper is built');
+    expect(forced.stdout).toContain('✅ OCR helper ready (local build, current (compiled on this Mac))');
     expect(fs.existsSync(b.marker)).toBe(false);
     expect(fs.statSync(b.helper).mode & 0o111).not.toBe(0);
     const compilesBefore = b.compiles();
@@ -294,7 +298,7 @@ onMac('start.sh › startup does not wait for the OCR helper', () => {
     expect(b.logText()).toContain('error: boom');
   });
 
-  it('starts nothing when the helper is already built and current', () => {
+  it('does nothing visible when the helper is already built and current (the job still checks, silently)', () => {
     const b = box();
     b.swiftc(FAILING_FLOOD);
     b.buildHelper();
@@ -306,14 +310,18 @@ onMac('start.sh › startup does not wait for the OCR helper', () => {
     expect(b.logText()).toBe('');
   });
 
-  it('a Mac without Command Line Tools gets the existing one-line note and no compiler', () => {
+  it('a Mac without Command Line Tools and without a usable helper gets ONE reason line (it names the next action), no compiler, and silence afterwards', () => {
+    // This harness has no prebuilt manifest (a damaged or very old checkout), so the reason is the missing reader.
+    // With a valid prebuilt there is nothing to say at all: launcher-prebuilt-ocr.test.ts.
     const b = box();
     b.swiftc(FAILING_FLOOD);
     const noClt = b.write('xcode-select', 'exit 2');
     const result = b.run('BOTBOY_TEST_OCR_REBUILD', { BOTBOY_TEST_XCODE_SELECT_BIN: noClt });
-    expect(result.stdout).toContain('OCR helper not built: install Xcode Command Line Tools with `xcode-select --install`');
+    expect(result.stdout.trim()).toBe("ℹ  OCR is off: BotBoy's prebuilt reader is missing from this folder. Run ./start.sh --update to restore it.");
+    expect(result.stdout).not.toContain('Command Line Tools with `xcode-select --install`');
     expect(b.compiles()).toBe(0);
-    expect(fs.existsSync(b.marker)).toBe(false);
+    expect(b.readMarker()).toMatchObject({ kind: 'unavailable', reasonCode: 'manifest_missing' });
+    expect(b.run('BOTBOY_TEST_OCR_REBUILD', { BOTBOY_TEST_XCODE_SELECT_BIN: noClt }).stdout).toBe('');
   });
 
   it('the job holds no pipe open for a caller that waits for end of output', () => {
@@ -375,7 +383,7 @@ describe('start.sh › OCR helper job: structure', () => {
 
   it('the job touches no lock, PID file, safety block, receipt, or signal of the launcher', () => {
     const worker = launcherText
-      .slice(launcherText.indexOf('rebuild_ocr_helper_if_needed() {'), launcherText.indexOf('# The remembered failure of the last OCR helper build'))
+      .slice(launcherText.indexOf('rebuild_ocr_helper_if_needed() {'), launcherText.indexOf('# The remembered BUILD failure of the last OCR helper build'))
       .split('\n').filter((line) => !line.trim().startsWith('#')).join('\n'); // code only: the comments explain these very things
     expect(worker.length).toBeGreaterThan(500);
     expect(worker).not.toMatch(/PID_FILE|STARTUP_SAFETY_BLOCK|LOCK_DIR|SHUTDOWN_RECEIPT_DIR|stop_existing_server|safe_takeover|stop_startup_child|release_start_lock|kill |\bwait\b|pkill|pgrep/);
@@ -404,17 +412,18 @@ onMac('start.sh › --rebuild-ocr', () => {
     b.buildHelper();
     const result = b.run(null, {}, ['--rebuild-ocr']);
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('up to date');
-    expect(result.stdout).toContain('OCR helper is built');
+    expect(result.stdout).toContain('✅ OCR helper ready (local build, current (compiled on this Mac))');
     expect(b.compiles()).toBe(0);
   });
 
-  it('on a Mac without Command Line Tools prints the install note and exits 1', () => {
+  it('on a Mac without Command Line Tools and without a usable helper names the reason and the next action, and exits 1', () => {
     const b = box();
     const noClt = b.write('xcode-select', 'exit 2');
     const result = b.run(null, { BOTBOY_TEST_XCODE_SELECT_BIN: noClt }, ['--rebuild-ocr']);
     expect(result.status).toBe(1);
-    expect(result.stdout).toContain('OCR helper not built: install Xcode Command Line Tools');
+    expect(result.stdout).toContain("BotBoy's prebuilt reader is missing from this folder. Run ./start.sh --update");
+    expect(result.stdout).toContain('ocr helper: OFF');
+    expect(b.compiles()).toBe(0);
   });
 
   it('names the problem when scripts/bootstrap-deps.mjs is missing, and exits 1', () => {
@@ -427,12 +436,14 @@ onMac('start.sh › --rebuild-ocr', () => {
     expect(b.run('BOTBOY_TEST_OCR_REBUILD').stdout).toBe('');
   });
 
-  it('with no helper source in the checkout, has nothing to build', () => {
+  it('with no helper source and no prebuilt in the checkout, cannot build anything and says how to restore it', () => {
     const b = box();
+    b.swiftc(SUCCEEDS);
     fs.rmSync(b.source);
     const result = b.run(null, {}, ['--rebuild-ocr']);
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain('nothing to build');
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("BotBoy's prebuilt reader is missing from this folder. Run ./start.sh --update");
+    expect(b.compiles()).toBe(0);
   });
 });
 
@@ -449,8 +460,9 @@ onMac('start.sh › doctor rows after a failed OCR build', () => {
     expect(out).toContain(
       "xcode-clt: installed (swiftc found); OCR helper build failed on 2026-10-12 after 4.2 s: error: failed to build module 'Swift'; this SDK is not supported by the compiler",
     );
-    expect(out).toContain('pdf readers: vision-ocr helper not built (last build failed, see xcode-clt row; BotBoy works without it);');
-    expect(out).not.toContain('run ./start.sh');
+    expect(out).toContain('ocr helper: OFF, ');
+    expect(out).toContain('pdf readers: vision-ocr helper off (images and scanned PDFs unavailable; see the ocr helper row);');
+    expect(out).not.toContain('tools present; run ./start.sh');
   });
 
   it('rounds long attempts to whole seconds', () => {
@@ -466,21 +478,37 @@ onMac('start.sh › doctor rows after a failed OCR build', () => {
   it('keeps today\'s rows when no failure is remembered, or the file is corrupt', () => {
     const b = box();
     expect(rows(b)).toContain('xcode-clt: installed (swiftc found)\n');
-    expect(rows(b)).toContain('vision-ocr helper not built (tools present; run ./start.sh)');
+    expect(rows(b)).toContain('pdf readers: vision-ocr helper off (images and scanned PDFs unavailable; see the ocr helper row);');
     fs.mkdirSync(path.dirname(b.marker), { recursive: true });
     fs.writeFileSync(b.marker, '{ this is not json');
     expect(rows(b)).toContain('xcode-clt: installed (swiftc found)\n');
-    expect(rows(b)).toContain('vision-ocr helper not built (tools present; run ./start.sh)');
+    expect(rows(b)).toContain('pdf readers: vision-ocr helper off (images and scanned PDFs unavailable; see the ocr helper row);');
   });
 
-  it('still says the helper is built when an older helper exists beside a failed rebuild', () => {
+  it('keeps an older helper in use beside a failed rebuild: it still works, and the failure is still shown', () => {
+    const b = box();
+    b.swiftc(FAILING_FLOOD);
+    b.run('BOTBOY_TEST_OCR_REBUILD');
+    // A local build made before main.swift last changed: usable, not current.
+    fs.mkdirSync(path.dirname(b.helper), { recursive: true });
+    fs.writeFileSync(b.helper, '#!/bin/sh\necho helper\n', { mode: 0o755 });
+    const past = new Date(Date.now() - 3_600_000);
+    fs.utimesSync(b.helper, past, past);
+    const out = rows(b);
+    expect(out).toContain('ocr helper: local build, older than main.swift in this folder; it still works');
+    expect(out).toContain('pdf readers: vision-ocr helper (local build);');
+    expect(out).toContain('xcode-clt: installed (swiftc found); OCR helper build failed on');
+  });
+
+  it('does not repeat an old failure while a current helper is in use', () => {
     const b = box();
     b.swiftc(FAILING_FLOOD);
     b.run('BOTBOY_TEST_OCR_REBUILD');
     b.buildHelper();
     const out = rows(b);
-    expect(out).toContain('pdf readers: vision-ocr helper built;');
-    expect(out).toContain('xcode-clt: installed (swiftc found); OCR helper build failed on');
+    expect(out).toContain('ocr helper: local build, current (compiled on this Mac)');
+    expect(out).toContain('xcode-clt: installed (swiftc found)\n');
+    expect(out).not.toContain('build failed');
   });
 
   it('leaves the missing-tools rows alone', () => {
@@ -489,8 +517,10 @@ onMac('start.sh › doctor rows after a failed OCR build', () => {
     b.run('BOTBOY_TEST_OCR_REBUILD');
     const noClt = b.write('xcode-select', 'exit 2');
     const out = b.run('BOTBOY_TEST_DOCTOR_TOOLCHAIN', { BOTBOY_TEST_XCODE_SELECT_BIN: noClt }).stdout;
-    expect(out).toContain('xcode-clt: MISSING — run: xcode-select --install');
-    expect(out).toContain('vision-ocr helper not built (Xcode Command Line Tools missing: images and scanned PDFs unavailable)');
+    // F-E: the tools are optional now; the row no longer claims OCR needs them.
+    expect(out).toContain("xcode-clt: not installed (optional: BotBoy's helpers ship prebuilt; the tools are needed only for Node 20's database module, for git, and to build a helper from source)");
+    expect(out).not.toContain('cannot read text inside images');
+    expect(out).toContain('pdf readers: vision-ocr helper off (images and scanned PDFs unavailable; see the ocr helper row);');
   });
 });
 

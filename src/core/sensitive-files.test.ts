@@ -37,6 +37,9 @@ const fake = {
   openai: join('sk', '-proj-', chars(48, `${ALNUM}_-`, 5)),
   deepseek: join('sk', '-', chars(32, '0123456789abcdef', 6)),
   google: join('AI', 'za', chars(35, `${ALNUM}_-`, 7)),
+  // Anthropic regular and Admin keys (Claude provider): the prefix is split so no key-shaped literal sits in the file.
+  anthropic: join('sk', '-ant-', 'api03-', chars(93, `${ALNUM}_-`, 14)),
+  anthropicAdmin: join('sk', '-ant-', 'admin01-', chars(93, `${ALNUM}_-`, 15)),
   awsId: join('AK', 'IA', chars(16, UPPER + DIGITS, 8)),
   awsSecret: join('aB3', chars(37, `${ALNUM}/+`, 9)),
   privateKey: [
@@ -116,6 +119,20 @@ describe('secret formats in text', () => {
     expect(kinds).toEqual(['private_key', 'aws_access_key', 'github_token', 'slack_token', 'openai_key', 'api_key', 'google_api_key']);
     expect(describeSecretKinds(['private_key'])).toBe('Contains what looks like a private key');
     expect(describeSecretKinds(['aws_access_key', 'github_token'])).toBe('Contains what looks like an AWS access key and a GitHub token');
+  });
+
+  it('finds Anthropic regular and Admin keys, names them, and redacts them from text', () => {
+    for (const key of [fake.anthropic, fake.anthropicAdmin]) {
+      expect(detectSecrets(`ANTHROPIC_API_KEY=${key}`)).toEqual(['anthropic_key']);
+      expect(detectSecrets(`{"apiKey": "${key}"}`)).toEqual(['anthropic_key']);
+      const redacted = redactSecrets(`please use ${key} for the Claude card`);
+      expect(redacted).not.toContain(key);
+      expect(redacted).toContain('please use');
+    }
+    expect(describeSecretKinds(['anthropic_key'])).toBe('Contains what looks like an Anthropic API key');
+    // Placeholders and prose about the format are not keys.
+    expect(detectSecrets(join('sk', '-ant-', 'api03-', 'YOUR_KEY_HERE_', 'x'.repeat(70)))).toEqual([]);
+    expect(detectSecrets(`Anthropic keys start with ${join('sk', '-ant-')} and are long.`)).toEqual([]);
   });
 
   it('finds a service-account key inside JSON', () => {
@@ -204,6 +221,18 @@ describe('prompt redaction', () => {
     expect(redacted).toContain('postgres://svc:[REDACTED]@db.internal:5432/app');
     expect(redacted).toContain('[REDACTED_PRIVATE_KEY]');
     expect(redacted).toContain('Ship the catalog API on Friday.');
+  });
+
+  it('redacts an Anthropic key from a prompt and keeps the surrounding evidence', () => {
+    const redacted = redactSensitiveText([
+      `ANTHROPIC_API_KEY=${fake.anthropic}`,
+      `admin: ${fake.anthropicAdmin}`,
+      'Ship the Claude card on Friday.',
+    ].join('\n'));
+    for (const key of [fake.anthropic, fake.anthropicAdmin]) expect(redacted).not.toContain(key);
+    expect(redacted).toContain('ANTHROPIC_API_KEY=[REDACTED_SECRET]');
+    expect(redacted).toContain('admin: [REDACTED_SECRET]');
+    expect(redacted).toContain('Ship the Claude card on Friday.');
   });
 
   it('keeps placeholders and prose after a header without a body', () => {

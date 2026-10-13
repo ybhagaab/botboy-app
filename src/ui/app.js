@@ -98,6 +98,28 @@ function chatModelChoice() {
   return chatModelChoices.includes(legacy) ? legacy : chatDefaultModelKey;
 }
 
+// Thinking "Off" is not always off on a Claude model (design D5): an always-on model thinks a little at Off, and a
+// switchable one thinks a little in chat when tools are on. The server names the behavior per model (`thinkingOff`);
+// the Thinking control's tooltip says so for the selected model. No option is relabeled.
+const CHAT_THINKING_OFF_MODES = ['native', 'native_without_tools', 'lowest_effort', 'unavailable'];
+const CHAT_THINKING_OFF_NOTE = 'With tools on, Claude may still think briefly at Off.';
+let chatModelThinkingOff = new Map();
+
+function chatEffortTitle(baseTitle, thinkingOff) {
+  return thinkingOff === 'lowest_effort' || thinkingOff === 'native_without_tools'
+    ? `${baseTitle} ${CHAT_THINKING_OFF_NOTE}`
+    : baseTitle;
+}
+
+function updateChatEffortTitle() {
+  const effort = document.getElementById('chat-effort');
+  if (!effort) return;
+  // The markup holds the base text; remember it once so the note can be added and removed.
+  if (!effort.dataset.baseTitle) effort.dataset.baseTitle = effort.title;
+  const model = document.getElementById('chat-model');
+  effort.title = chatEffortTitle(effort.dataset.baseTitle, model ? chatModelThinkingOff.get(model.value) : undefined);
+}
+
 function parseChatModelCatalog(value) {
   if (!value || typeof value !== 'object' || !Array.isArray(value.models)) return null;
   const groups = Array.isArray(value.groups)
@@ -120,6 +142,7 @@ function parseChatModelCatalog(value) {
     isDefault: model.isDefault === true,
     preview: model.preview === true,
     group: typeof model.group === 'string' && groupIds.has(model.group) ? model.group : '',
+    thinkingOff: CHAT_THINKING_OFF_MODES.includes(model.thinkingOff) ? model.thinkingOff : '',
   }));
   if (!models.length) return null;
   const defaultKey = typeof value.defaultKey === 'string' && seen.has(value.defaultKey)
@@ -165,9 +188,11 @@ async function refreshChatModelCatalog() {
       chatDefaultModelKey = 'default';
       chatModelGroupLabels = new Map();
       chatModelGroupOf = new Map();
+      chatModelThinkingOff = new Map();
       select.replaceChildren(new Option('Model · Add a model in Settings → AI model', ''));
       select.disabled = true;
       updateChatModelTitle(select);
+      updateChatEffortTitle();
       return;
     }
     const catalog = parseChatModelCatalog(raw);
@@ -176,6 +201,7 @@ async function refreshChatModelCatalog() {
     chatDefaultModelKey = catalog.defaultKey;
     chatModelGroupLabels = new Map(catalog.groups.map(group => [group.id, group.label]));
     chatModelGroupOf = new Map(catalog.models.map(model => [model.key, model.group]));
+    chatModelThinkingOff = new Map(catalog.models.map(model => [model.key, model.thinkingOff]));
     if (catalog.groups.length > 1) {
       // Several providers: one tree, provider headings over plain model titles.
       select.replaceChildren(...catalog.groups.map(group => {
@@ -194,6 +220,7 @@ async function refreshChatModelCatalog() {
     chatDefaultModelKey = 'default';
     chatModelGroupLabels = new Map();
     chatModelGroupOf = new Map();
+    chatModelThinkingOff = new Map();
     select.replaceChildren(
       new Option('Model · GPT-5.6 Terra (default)', 'default'),
       new Option('Model · GPT-5.6 Luna', 'luna'),
@@ -202,6 +229,7 @@ async function refreshChatModelCatalog() {
   }
   select.value = chatModelChoice();
   updateChatModelTitle(select);
+  updateChatEffortTitle();
   select.disabled = lastAiModelState === 'not_configured';
 }
 
@@ -212,6 +240,7 @@ function initChatModelControl() {
     const value = chatModelChoices.includes(select.value) ? select.value : chatDefaultModelKey;
     try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
     updateChatModelTitle(select);
+    updateChatEffortTitle();
   });
   void refreshChatModelCatalog();
 }

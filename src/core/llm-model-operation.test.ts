@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { analyticsHandlingAllowsModelContext, type AnalyticsModelContextRuntime } from './analytics-data-room-policy.js';
-import { analyticsImportProviderReceipt } from './analytics-import-semantic-proposal.js';
+import { analyticsImportProviderReceipt, importModelTemperature } from './analytics-import-semantic-proposal.js';
 import { currentLlmModelOperation, runInLlmModelOperation, type LlmModelOperation, type LlmProviderDescriptor } from './llm-model-operation.js';
 
 /**
@@ -27,6 +27,7 @@ const TEAM: LlmProviderDescriptor = {
 };
 const DEEPSEEK: LlmProviderDescriptor = { id: 'deepseek', endpoint: 'https://api.deepseek.com', model: 'deepseek-flash', apiMode: 'responses' };
 const OPENAI: LlmProviderDescriptor = { id: 'openai', endpoint: 'https://api.openai.com/v1', model: 'gpt-5.6-terra', apiMode: 'responses' };
+const ANTHROPIC: LlmProviderDescriptor = { id: 'anthropic', endpoint: 'https://api.anthropic.com', model: 'claude-sonnet-5-5', apiMode: 'messages' };
 
 describe('model operation context', () => {
   it('follows awaits and timers, nests, and is absent outside', async () => {
@@ -46,7 +47,21 @@ describe('model operation context', () => {
   it('classifies the owner-key APIs as external and the team gateway as Amazon-managed', () => {
     expect(analyticsImportProviderReceipt(DEEPSEEK).providerLocality).toBe('external_remote');
     expect(analyticsImportProviderReceipt(OPENAI).providerLocality).toBe('external_remote');
+    expect(analyticsImportProviderReceipt(ANTHROPIC).providerLocality).toBe('external_remote');
     expect(analyticsImportProviderReceipt(TEAM).providerLocality).toBe('amazon_managed_remote');
+  });
+
+  it('names Anthropic external whatever endpoint it is reached through, even a loopback one (a test double or a proxy)', () => {
+    for (const endpoint of ['http://127.0.0.1:4010', 'http://localhost:4010', 'https://llm.corp.amazon.com', 'https://api.anthropic.com']) {
+      expect(analyticsImportProviderReceipt({ ...ANTHROPIC, endpoint }).providerLocality, endpoint).toBe('external_remote');
+    }
+    // The shape of the rule: only an explicit owner-key provider id takes that shortcut; a bare loopback endpoint stays device-local.
+    expect(analyticsImportProviderReceipt({ id: 'openai-compatible', endpoint: 'http://127.0.0.1:8000/v1', model: 'm', apiMode: 'chat_completions' }).providerLocality).toBe('device_local');
+  });
+
+  it('records no temperature for Anthropic and 0 for every other provider (design v3: never send temperature)', () => {
+    expect(importModelTemperature('anthropic')).toBeNull();
+    for (const id of ['gateway', 'openai', 'deepseek', 'bedrock', 'openai-compatible', 'ollama']) expect(importModelTemperature(id), id).toBe(0);
   });
 
   it('lets every provider read Data Room rows while receipts keep each operation’s locality (D4)', () => {
@@ -69,6 +84,8 @@ describe('model operation context', () => {
     expect(runInLlmModelOperation(operation('team', TEAM), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
     expect(runInLlmModelOperation(operation('deepseek', DEEPSEEK), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
     expect(runInLlmModelOperation(operation('openai', OPENAI), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
+    expect(runInLlmModelOperation(operation('anthropic', ANTHROPIC), () => analyticsHandlingAllowsModelContext(handling, runtime))).toBe(true);
     expect(runInLlmModelOperation(operation('openai', OPENAI), () => runtime.providerLocality)).toBe('external_remote');
+    expect(runInLlmModelOperation(operation('anthropic', ANTHROPIC), () => runtime.providerLocality)).toBe('external_remote');
   });
 });

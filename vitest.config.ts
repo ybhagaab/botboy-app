@@ -10,7 +10,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    setupFiles: ['./vitest.setup.ts'],
+    // One stub folder per run (created and removed in the main process), so a straggler still hits a stub.
+    globalSetup: ['./vitest.no-ui-tools.global.ts'],
+    setupFiles: ['./vitest.setup.ts', './vitest.no-ui-tools.setup.ts'],
     include: ['src/**/*.test.ts'],
     coverage: {
       provider: 'v8',

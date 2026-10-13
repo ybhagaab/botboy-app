@@ -30,16 +30,20 @@ fi
 #                            persists while running and quitting it shuts the
 #                            server down gracefully.
 #                            Regenerate that bundle with: npm run app:bundle
-#   ./start.sh --rebuild-ocr retry building the optional OCR helper (it reads text
-#                            inside images and scanned PDFs) now, even when an
-#                            earlier build failed on this Mac; wait for the
-#                            result and exit without starting anything. A normal
-#                            start never waits for that helper: it builds in the
-#                            background once the dashboard window is open, with
-#                            a hard time limit (BOTBOY_OCR_BUILD_TIMEOUT_SECONDS,
-#                            default 120), and a failure is remembered per
-#                            machine until the source, Swift compiler, or macOS
-#                            build changes.
+#   ./start.sh --rebuild-ocr re-check the OCR helper (it reads text inside images
+#                            and scanned PDFs) now and, only when none is usable
+#                            and a Swift toolchain exists, build one; ignores an
+#                            earlier remembered outcome; wait for the result and
+#                            exit without starting anything. BotBoy ships the
+#                            helper PREBUILT, so nothing is compiled on a normal
+#                            Mac. A normal start never waits for the helper
+#                            either: its check (and a last-resort local build,
+#                            with a hard time limit, BOTBOY_OCR_BUILD_TIMEOUT_SECONDS,
+#                            default 120) runs in the background once the
+#                            dashboard window is open, and an outcome is
+#                            remembered per machine until the source, the
+#                            prebuilt helper, the Swift compiler, or macOS
+#                            changes.
 
 FOREGROUND=0
 OPEN_WINDOW_ONLY=0
@@ -72,6 +76,7 @@ GIT_SHIM="${BOTBOY_TEST_GIT_SHIM:-/usr/bin/git}"
 ARCH_BIN="${BOTBOY_TEST_ARCH_BIN:-/usr/bin/arch}"
 SYSCTL_BIN="${BOTBOY_TEST_SYSCTL_BIN:-/usr/sbin/sysctl}"
 FILE_BIN="${BOTBOY_TEST_FILE_BIN:-/usr/bin/file}"
+XATTR_BIN="${BOTBOY_TEST_XATTR_BIN:-/usr/bin/xattr}"
 
 # ── Native architecture on Apple Silicon ─────────────────────────────────────
 # A shell that runs under Rosetta hands that translation to everything it
@@ -447,7 +452,7 @@ if [ -z "$NODE" ]; then
   done
 fi
 if [ -z "$NODE" ]; then
-  echo "❌ node not found — install Node 20.16+ (e.g. brew install node), then re-run ./start.sh" | tee -a "$LOG_FILE"
+  echo "❌ node not found — install Node 22 or newer from nodejs.org (the installer needs no other tools), then re-run ./start.sh" | tee -a "$LOG_FILE"
   exit 1
 fi
 
@@ -544,8 +549,47 @@ missing_npm_dependencies() {
   ' "$PROJ_DIR" 2>/dev/null || true
 }
 
-print_ocr_note() {
-  echo "ℹ  OCR helper not built: install Xcode Command Line Tools with \`xcode-select --install\`; BotBoy works without it except text from images and scanned PDFs" | tee -a "$LOG_FILE"
+# The prebuilt native helpers arrive through git, which sets no download flag
+# (com.apple.quarantine). A ZIP downloaded in a browser flags every file, and
+# macOS then kills the first run of a flagged helper (about 6 s later, measured)
+# or raises a Gatekeeper dialog whose default button is Move to Trash. So the
+# flag is cleared on native/ before anything can run a helper, and a file whose
+# flag cannot be cleared is never executed (the resolver in
+# scripts/native-prebuilt.mjs refuses it). Best effort, never fatal; `xattr` is a
+# real OS tool, not an Xcode shim. Cost when nothing is flagged: two xattr calls.
+native_download_mark_present() {
+  [ -f "$1" ] && "$XATTR_BIN" -p com.apple.quarantine "$1" >/dev/null 2>&1
+}
+strip_native_download_mark() {
+  [ -d "$PROJ_DIR/native" ] || return 0
+  native_download_mark_present "$PROJ_DIR/native/vision-ocr/prebuilt/vision-ocr" \
+    || native_download_mark_present "$PROJ_DIR/native/botboy-launcher/prebuilt/botboy-launcher" \
+    || return 0
+  "$XATTR_BIN" -r -d com.apple.quarantine "$PROJ_DIR/native" >/dev/null 2>&1 || true
+  if native_download_mark_present "$PROJ_DIR/native/vision-ocr/prebuilt/vision-ocr" \
+    || native_download_mark_present "$PROJ_DIR/native/botboy-launcher/prebuilt/botboy-launcher"; then
+    echo "Could not clear the download mark on BotBoy's helpers; OCR stays off until it is cleared: xattr -r -d com.apple.quarantine \"$PROJ_DIR/native\"" >> "$LOG_FILE"
+  else
+    echo "Cleared the download mark on BotBoy's helpers" >> "$LOG_FILE"
+  fi
+  return 0
+}
+
+# Node 20 compiles BotBoy's database module from source on `npm install`, which needs the Xcode
+# Command Line Tools; Node 22 and newer download a prebuilt copy. One calm line before an install on a
+# Mac that has the first and not the second. It never blocks the install, and an ordinary start (nothing to
+# install) never gets here. (An npm "preinstall" script cannot say this early: npm runs a dependency's install
+# script before the root package's, measured on npm 10.8.2.)
+warn_if_node_needs_tools_to_install() {
+  local version major
+  version="$("$NODE" --version 2>/dev/null)"
+  major="${version#v}"
+  major="${major%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] || return 0
+  [ "$major" -lt 22 ] || return 0
+  clt_installed && return 0
+  echo "ℹ  This Mac has Node ${version} and no Command Line Tools. Installing BotBoy's database module has to compile it. Install Node 22 or newer from nodejs.org (no extra tools needed), or run xcode-select --install first." | tee -a "$LOG_FILE"
+  return 0
 }
 
 # Dependency self-heal. `--update` fast-forwards package.json but never ran
@@ -559,6 +603,7 @@ heal_missing_npm_dependencies() {
   local missing still
   missing="$(missing_npm_dependencies)"
   [ -n "$missing" ] || return 0
+  warn_if_node_needs_tools_to_install
   echo "ℹ️  Installing dependencies ($missing) — npm install" | tee -a "$LOG_FILE"
   # BOTBOY_DEFER_OCR_BUILD: npm's postinstall must not compile the optional OCR
   # helper here, before the window; the background job builds it afterwards.
@@ -576,52 +621,43 @@ heal_missing_npm_dependencies() {
 }
 
 # The OCR helper is an optional extra: BotBoy reads PDF text with pdf.js
-# without it, and it only adds text from images and scanned PDFs. It is
-# compiled locally from native/vision-ocr/main.swift, and that compile can be
-# slow, can fail on a Mac whose Command Line Tools and macOS do not match, and
-# can hang. It must never hold up a start (Maria's Mac, 2026-10-13: every start
-# retried a failing compile before the server and window, so opening BotBoy
-# "took ages"). So:
+# without it, and it only adds text from images and scanned PDFs. It ships
+# PREBUILT (native/vision-ocr/prebuilt, one universal ad-hoc signed file beside
+# native/prebuilt-manifest.json) so nothing is compiled on a teammate's Mac.
+# The decision is ONE function, scripts/native-prebuilt.mjs › resolveVisionHelper
+# (prebuilt, local build, or none and why); this file only runs it. A local
+# compile is the last resort, only when no usable helper exists and a Swift
+# toolchain does, and it used to be slow, fail on a Mac whose Command Line Tools
+# and macOS do not match, and hang (Maria's Mac, 2026-10-13: every start retried
+# a failing compile before the server and window, so opening BotBoy "took
+# ages"). So:
 #   - Nothing here runs before the dashboard window is open. start_ocr_helper_job
-#     runs after it, as a detached background job, and a start that finds the
-#     helper built and current starts nothing.
-#   - scripts/bootstrap-deps.mjs --ocr-helper does the work. It owns the hard
-#     time limit (BOTBOY_OCR_BUILD_TIMEOUT_SECONDS, default 120), keeps the
-#     compiler output to its first 20 and last 5 lines, and remembers a failure
-#     per machine (~/.personal-productivity-tracker/ocr-helper-build.json) so an
-#     unchanged source, Swift compiler, and macOS build are not retried. One calm
-#     note is printed per failure; a start that skips the build prints nothing.
-#   - ./start.sh --rebuild-ocr retries on request. A failure keeps the existing
-#     helper. Without Xcode CLT the helper is simply absent: one calm note, and
-#     no compiler shim is ever run.
-OCR_SRC="$PROJ_DIR/native/vision-ocr/main.swift"
-OCR_BIN="$PROJ_DIR/native/vision-ocr/bin/vision-ocr"
-
-# The helper is built and not older than its source (file tests only).
-ocr_helper_current() {
-  [ -x "$OCR_BIN" ] && ! [ "$OCR_SRC" -nt "$OCR_BIN" ]
-}
+#     runs after it, as a detached background job (about 100 ms of Node, because
+#     the check no longer depends on file times), and a start never waits for it.
+#   - scripts/bootstrap-deps.mjs --ocr-helper does the work. A current helper
+#     ends it at once, silently, without touching any compiler or Xcode shim.
+#     Otherwise it owns the hard time limit (BOTBOY_OCR_BUILD_TIMEOUT_SECONDS,
+#     default 120), keeps the compiler output to its first 20 and last 5 lines,
+#     and remembers the outcome per machine
+#     (~/.personal-productivity-tracker/ocr-helper-build.json) so an unchanged
+#     source, prebuilt helper, Swift compiler, and macOS build are not retried.
+#     One calm note is printed per outcome; a start that skips the work prints
+#     nothing.
+#   - ./start.sh --rebuild-ocr re-checks on request. A failure keeps the helper
+#     in use. Without Xcode CLT nothing is compiled and no shim is ever run.
 
 # One synchronous attempt to bring the OCR helper up to date. $1 = "force" when
-# the owner asked (./start.sh --rebuild-ocr): a remembered failure is ignored
+# the owner asked (./start.sh --rebuild-ocr): a remembered outcome is ignored
 # and every line is shown. Otherwise (the background job) only the calm note
 # reaches the terminal, and the compiler detail goes to the log.
 rebuild_ocr_helper_if_needed() {
   local mode="${1:-background}"
-  [ -f "$OCR_SRC" ] || return 0
-  if [ "$mode" != "force" ] && ocr_helper_current; then
-    return 0
-  fi
-  if ! clt_installed; then
-    [ -x "$OCR_BIN" ] || print_ocr_note
-    return 0
-  fi
   if [ ! -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ]; then
     [ "$mode" != "force" ] || echo "ℹ  scripts/bootstrap-deps.mjs is missing from this BotBoy folder; run ./start.sh --update to restore it" | tee -a "$LOG_FILE"
     return 0
   fi
   if [ "$mode" = "force" ]; then
-    echo "ℹ  Rebuilding the OCR helper; this can take a minute or two" | tee -a "$LOG_FILE"
+    echo "ℹ  Checking the OCR helper; building one locally (only when none is usable) can take a minute or two" | tee -a "$LOG_FILE"
     (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs --ocr-helper --force-ocr 2>&1) | tee -a "$LOG_FILE"
   else
     (cd "$PROJ_DIR" && native_exec "$NODE" scripts/bootstrap-deps.mjs --ocr-helper 2>> "$LOG_FILE") | tee -a "$LOG_FILE"
@@ -639,8 +675,7 @@ rebuild_ocr_helper_if_needed() {
 # or file a caller waits on would otherwise stay open until the job ends. The
 # BotBoy.app launcher waits for this script, not for the job.
 start_ocr_helper_job() {
-  [ -f "$OCR_SRC" ] || return 0
-  ocr_helper_current && return 0
+  [ -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ] || return 0
   (
     trap '' HUP
     exec </dev/null 2>>"$LOG_FILE"
@@ -650,47 +685,74 @@ start_ocr_helper_job() {
   return 0
 }
 
-# The remembered failure of the last OCR helper build as one sentence for the
-# doctor, or nothing. bootstrap-deps.mjs owns the marker format and the wording.
+# The remembered BUILD failure of the last OCR helper build as one sentence for
+# the doctor, or nothing (an "unavailable" outcome is not a failed build and has
+# its words on the `ocr helper:` row). bootstrap-deps.mjs owns the marker format.
 ocr_marker_doctor_text() {
   [ -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ] || return 0
   native_exec "$NODE" "$PROJ_DIR/scripts/bootstrap-deps.mjs" --ocr-marker 2>/dev/null | head -n 1
 }
 
-# Doctor rows for the Swift toolchain and the readers that depend on it.
-# Says "installed (swiftc found)", not "works": it proves the compiler is
-# reachable, nothing more. After a failed OCR helper build the xcode-clt row
-# says so, with the date, how long the attempt took, and the first error line.
+# The `ocr helper:` doctor row, from the same resolver the server and the job
+# use. Read-only (a flagged file is reported, never cleared or run). Prints one
+# line and returns 0 when a helper is usable; when Node or the module cannot
+# answer, an `unknown` row and 1. Nothing here touches Xcode.
+ocr_helper_status_row() {
+  local line
+  if [ -f "$PROJ_DIR/scripts/bootstrap-deps.mjs" ]; then
+    line="$(native_exec "$NODE" "$PROJ_DIR/scripts/bootstrap-deps.mjs" --ocr-status 2>/dev/null | head -n 1)"
+  fi
+  if [ -n "$line" ]; then
+    echo "$line"
+    case "$line" in "ocr helper: OFF"*|"ocr helper: unknown"*) return 1 ;; esac
+    return 0
+  fi
+  echo "ocr helper: unknown (the check could not run; run ./start.sh --update)"
+  return 1
+}
+
+# Doctor rows for the Swift toolchain and the readers. The Command Line Tools
+# are OPTIONAL now: the helpers ship prebuilt. The xcode-clt row says whether
+# the compiler is reachable ("installed (swiftc found)" proves that, nothing
+# more) and, only while OCR is not in order, repeats a remembered BUILD failure
+# with its date, how long the attempt took, and the first error line.
 doctor_toolchain_rows() {
-  local helper failure=""
+  local ocr_row failure="" helper
+  ocr_row="$(ocr_helper_status_row)"
   if clt_toolchain_ok; then
-    failure="$(ocr_marker_doctor_text)"
+    case "$ocr_row" in
+      *", current"*) ;;
+      *) failure="$(ocr_marker_doctor_text)" ;;
+    esac
     if [ -n "$failure" ]; then
       echo "xcode-clt: installed (swiftc found); $failure"
     else
       echo "xcode-clt: installed (swiftc found)"
     fi
   else
-    echo "xcode-clt: MISSING — run: xcode-select --install; without it BotBoy cannot read text inside images or scanned PDFs (text PDFs still work)"
+    echo "xcode-clt: not installed (optional: BotBoy's helpers ship prebuilt; the tools are needed only for Node 20's database module, for git, and to build a helper from source)"
   fi
-  if [ -x "$OCR_BIN" ]; then
-    helper="vision-ocr helper built"
-  elif clt_toolchain_ok; then
-    if [ -n "$failure" ]; then
-      helper="vision-ocr helper not built (last build failed, see xcode-clt row; BotBoy works without it)"
-    else
-      helper="vision-ocr helper not built (tools present; run ./start.sh)"
-    fi
-  else
-    helper="vision-ocr helper not built (Xcode Command Line Tools missing: images and scanned PDFs unavailable)"
-  fi
+  echo "$ocr_row"
+  case "$ocr_row" in
+    "ocr helper: prebuilt"*) helper="vision-ocr helper (prebuilt)" ;;
+    "ocr helper: local build"*) helper="vision-ocr helper (local build)" ;;
+    "ocr helper: OFF"*) helper="vision-ocr helper off (images and scanned PDFs unavailable; see the ocr helper row)" ;;
+    *) helper="vision-ocr helper unknown (see the ocr helper row)" ;;
+  esac
   echo "pdf readers: $helper; pdftotext $(command -v pdftotext >/dev/null 2>&1 && echo installed || echo absent); pdf.js $([ -f "$PROJ_DIR/node_modules/pdfjs-dist/legacy/build/pdf.mjs" ] && echo installed || echo 'MISSING — run: npm install')"
 }
 
 # Executable test hooks for the functions above. They change nothing beyond
 # what the function itself does. BOTBOY_TEST_OCR_REBUILD runs the synchronous
 # worker (BOTBOY_TEST_OCR_MODE=force for --rebuild-ocr's mode);
-# BOTBOY_TEST_OCR_JOB runs only the detached kickoff and returns.
+# BOTBOY_TEST_OCR_JOB runs only the detached kickoff and returns;
+# BOTBOY_TEST_NATIVE_STRIP runs only the download-mark clearing (with
+# BOTBOY_TEST_XATTR_BIN standing in for xattr).
+if [ "${BOTBOY_TEST_NATIVE_STRIP:-0}" = "1" ]; then
+  strip_native_download_mark
+  echo "native-strip-done"
+  exit 0
+fi
 if [ "${BOTBOY_TEST_HEAL_DEPS:-0}" = "1" ]; then
   heal_missing_npm_dependencies
   exit 0
@@ -713,21 +775,33 @@ fi
 # Placed before the Chrome and credential steps below, which it does not need.
 # It starts and stops no server and takes no start lock.
 if [ "$REBUILD_OCR" = "1" ]; then
-  if [ ! -f "$OCR_SRC" ]; then
-    echo "ℹ  This BotBoy has no OCR helper source (native/vision-ocr/main.swift); there is nothing to build"
-    exit 0
-  fi
   rebuild_ocr_helper_if_needed force
-  if ocr_helper_current; then
-    echo "✅ OCR helper is built: BotBoy can read text inside images and scanned PDFs" | tee -a "$LOG_FILE"
+  # One result line, from the same resolver: a usable helper means success, and
+  # anything else names its reason and next action.
+  OCR_RESULT_ROW="$(ocr_helper_status_row)" && OCR_RESULT_OK=1 || OCR_RESULT_OK=0
+  if [ "$OCR_RESULT_OK" = "1" ]; then
+    echo "✅ OCR helper ready (${OCR_RESULT_ROW#ocr helper: }): BotBoy can read text inside images and scanned PDFs" | tee -a "$LOG_FILE"
     exit 0
   fi
+  echo "ℹ  $OCR_RESULT_ROW" | tee -a "$LOG_FILE"
   exit 1
 fi
 
 # Doctor rows for this machine. They never fail the doctor, and every warning
 # says what to do.
 DF_BIN="${BOTBOY_TEST_DF_BIN:-df}"
+# Advice about the Node BotBoy runs on. The `node:` line at the top of the doctor already names the path
+# and version, so this row exists only for a Node below 22: Node 20 reached end-of-life on 2026-04-30 and
+# compiles BotBoy's database module on install, which needs the Command Line Tools (design 5.9, F-F).
+doctor_node_row() {
+  local version major
+  version="$("$NODE" --version 2>/dev/null)"
+  major="${version#v}"
+  major="${major%%.*}"
+  [[ "$major" =~ ^[0-9]+$ ]] || return 0
+  [ "$major" -lt 22 ] || return 0
+  echo "node advice: Node ${major} is end-of-life and compiles BotBoy's database module on install, which needs the Command Line Tools. Install Node 22 or newer from nodejs.org; its installer needs no other tools."
+}
 doctor_machine_rows() {
   local ram_bytes ram_gb free_kb free_gb pressure level swap_text swap_gb swap_high chrome_state node_text
   if [ "$HW_ARM64" = "1" ]; then
@@ -835,20 +909,74 @@ doctor_machine_rows() {
 # slice, under Rosetta unless Info.plist prefers arm64 (measured 2026-10-12:
 # a plain script app ran with proc_translated=1 and passed it to every
 # child; the same bundle with LSArchitecturePriority [arm64, x86_64] ran
-# native). The plan below is a pure function of facts, so the table is
-# testable. It never deletes a bundle and never replaces a working native
-# launcher with the shell fallback.
+# native).
+#
+# GENERIC LAUNCHER. The app has no folder path built in. It reads the folder it
+# opens from ~/.personal-productivity-tracker/app-checkout.v1 (`checkout=<physical
+# folder>`), so ONE prebuilt universal launcher serves every checkout, nothing is
+# compiled on a teammate's Mac, and a folder that moves is followed: running
+# ./start.sh from the new location re-points the file (the `claim` action). A
+# generic launcher is recognized by BotBoyLauncherVersion in Info.plist (at least
+# scripts/native-prebuilt.mjs › LAUNCHER_VERSION) AND no path embedded in its
+# executable; anything else is an older per-Mac launcher.
+#
+# The plan below is a pure function of facts (so the table is testable). It never
+# deletes a bundle and never replaces a working native launcher with the shell
+# fallback. Facts: the file kind and slices (`file -b`, Apple Silicon only; an
+# Intel Mac reads nothing from the executable: kind=unread), the Info.plist keys,
+# the ownership grep, and one Node call (scripts/native-prebuilt.mjs
+# launcher-facts) for the manifest and prebuilt state, the recorded folder and any
+# embedded path. A second call adds the execution smoke, only when the plan could
+# reach "migrate". If Node or the module cannot answer, the plan is `none` (except
+# `create`): a bundle that cannot be judged is left alone.
+#
+# Bundle action, first matching row wins:
+#   1  no bundle, or no executable                                 create
+#   2  kind unknown                                                none
+#   3  not owned by this folder                                    none
+#        owned: an older launcher with this folder's start.sh embedded (logical or
+#        physical path) or whose embedded folder is gone; a generic one that
+#        records this folder, nothing, or a folder whose start.sh is gone
+#   4  owned, generic, native executable                           patch_plist when the
+#        architecture key is wrong on Apple Silicon, else none
+#   5  owned, an older launcher or the script fallback, and --foreground: no swap
+#        (the app that is running may be this very launcher): row 8
+#   6  ... a recorded failure matches the launcher, builder and manifest
+#        signatures                                                warn_harmless
+#   7  ... a native launcher is obtainable (the prebuilt one runs here, or a
+#        Swift toolchain exists)                                   migrate
+#   8  otherwise the earlier rules, Apple Silicon only: an Intel-only compiled
+#        launcher warn_harmless, a wrong architecture key patch_plist, else none
+# Recorded-folder action (generic launchers only, independent of the row):
+#   claim when nothing is recorded or the recorded start.sh is gone; never while
+#   another folder's start.sh exists (the app belongs to that checkout).
 APP_BUNDLE="${BOTBOY_TEST_APP_BUNDLE:-/Applications/BotBoy.app}"
 PLISTBUDDY_BIN="${BOTBOY_TEST_PLISTBUDDY_BIN:-/usr/libexec/PlistBuddy}"
 LSREGISTER_BIN="${BOTBOY_TEST_LSREGISTER_BIN:-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister}"
+NATIVE_PREBUILT_JS="$PROJ_DIR/scripts/native-prebuilt.mjs"
 APP_EXISTS=0
 APP_KIND=none
 APP_ARCHS=""
 APP_PRIORITY0=""
+APP_VERSION=""
+APP_FACTS_OK=0
+APP_WANT_VERSION=""
+APP_PREBUILT=unchecked
+APP_PREBUILT_REASON=""
+APP_PREBUILT_DETAIL=""
+APP_MATCHES_PREBUILT=0
+APP_INSTALLED_SMOKE=unchecked
+APP_RECORDED=""
+APP_RECORDED_LIVE=0
+APP_BAKED=""
+APP_BAKED_LIVE=0
+APP_LEGACY=0
+APP_GENERIC=0
 APP_OWNED=0
 APP_TOOLCHAIN=0
 APP_MARKER_BLOCKS=0
 APP_PLAN=none
+APP_CHECKOUT_ACTION=none
 APP_PLIST_CHANGED=0
 
 app_launcher_marker_file() {
@@ -860,22 +988,30 @@ app_file_signature() {
   stat -f '%z:%m' "$1" 2>/dev/null || true
 }
 
-# A failed rebuild is recorded with the launcher and builder it saw, so a
-# start never retries the same failure: it waits for the launcher or the
-# builder script to change.
+# A failed upgrade is recorded with the launcher, builder script and prebuilt
+# manifest it saw, so a start never retries the same failure: it waits for one of
+# the three to change.
 app_launcher_marker_blocks() {
-  local marker launcher_sig builder_sig recorded_launcher recorded_builder recorded_result
+  local marker launcher_sig builder_sig manifest_sig recorded_launcher recorded_builder recorded_manifest recorded_result
   marker="$(app_launcher_marker_file)"
   [ -f "$marker" ] || return 1
   launcher_sig="$(app_file_signature "$APP_BUNDLE/Contents/MacOS/BotBoy")"
   builder_sig="$(app_file_signature "$PROJ_DIR/scripts/make-app-bundle.mjs")"
+  manifest_sig="$(app_file_signature "$PROJ_DIR/native/prebuilt-manifest.json")"
   recorded_launcher="$(sed -n 's/^launcher=//p' "$marker" | head -n 1)"
   recorded_builder="$(sed -n 's/^builder=//p' "$marker" | head -n 1)"
+  recorded_manifest="$(sed -n 's/^manifest=//p' "$marker" | head -n 1)"
   recorded_result="$(sed -n 's/^result=//p' "$marker" | head -n 1)"
   [ "$recorded_result" = "failed" ] || return 1
-  [ -n "$launcher_sig" ] && [ "$recorded_launcher" = "$launcher_sig" ] && [ "$recorded_builder" = "$builder_sig" ]
+  [ -n "$launcher_sig" ] && [ "$recorded_launcher" = "$launcher_sig" ] && [ "$recorded_builder" = "$builder_sig" ] && [ "$recorded_manifest" = "$manifest_sig" ]
 }
 
+# The reason code the last failed upgrade recorded (empty when none).
+app_launcher_marker_reason() {
+  sed -n 's/^reason=//p' "$(app_launcher_marker_file)" 2>/dev/null | head -n 1
+}
+
+# $1 = ok | failed, $2 = the builder's reason code (failed only).
 app_launcher_marker_write() {
   local marker
   marker="$(app_launcher_marker_file)"
@@ -883,62 +1019,195 @@ app_launcher_marker_write() {
   {
     echo "launcher=$(app_file_signature "$APP_BUNDLE/Contents/MacOS/BotBoy")"
     echo "builder=$(app_file_signature "$PROJ_DIR/scripts/make-app-bundle.mjs")"
+    echo "manifest=$(app_file_signature "$PROJ_DIR/native/prebuilt-manifest.json")"
     echo "result=$1"
+    [ -z "${2:-}" ] || echo "reason=$2"
     echo "date=$(date '+%Y-%m-%dT%H:%M:%S')"
   } > "$marker" 2>/dev/null || true
 }
 
-# Gather the facts. On Intel nothing beyond "does the bundle exist" is read.
+# What a builder reason code means for the owner, in one clause.
+app_launcher_reason_words() {
+  case "$1" in
+    os_too_old) echo "this Mac's macOS is older than the prebuilt launcher needs (macOS 13)" ;;
+    launcher_smoke_failed|launcher_codesign_failed|launcher_quarantined) echo "macOS would not run the new launcher on this Mac" ;;
+    launcher_corrupt|launcher_missing|manifest_missing|manifest_invalid|native_prebuilt_module_missing) echo "the prebuilt launcher in this folder is missing or damaged; run ./start.sh --update" ;;
+    no_toolchain) echo "no prebuilt launcher runs here and there are no developer tools to build one" ;;
+    app_not_writable) echo "macOS did not allow changes inside $APP_BUNDLE; remove it and run ./start.sh again" ;;
+    checkout_file_failed|backup_failed) echo "BotBoy could not write to ~/.personal-productivity-tracker" ;;
+    readback_failed|swap_failed) echo "the new launcher did not check out once it was in place, so the previous one was put back" ;;
+    restore_failed) echo "the new launcher did not check out and the previous one could not be put back automatically; its copies are in ~/.personal-productivity-tracker/app-launcher-backup" ;;
+    start_script_missing) echo "start.sh is missing or not executable in this folder" ;;
+    "") echo "see $LOG_FILE" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Read `launcher-facts` into the APP_* variables (never eval; a key we do not
+# know is ignored). $1 = --smoke to include the execution smoke. Returns 1 when
+# Node or the module cannot answer; facts already read are kept.
+app_read_node_facts() {
+  local output key value
+  [ -f "$NATIVE_PREBUILT_JS" ] || return 1
+  output="$(native_exec "$NODE" "$NATIVE_PREBUILT_JS" launcher-facts --app "$APP_BUNDLE" --checkout "$PROJ_DIR" $1 2>/dev/null)" || return 1
+  [ -n "$output" ] || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      prebuilt_usable) APP_PREBUILT="$value" ;;
+      prebuilt_reason) APP_PREBUILT_REASON="$value" ;;
+      prebuilt_detail) APP_PREBUILT_DETAIL="$value" ;;
+      want_version) APP_WANT_VERSION="$value" ;;
+      installed_matches_prebuilt) APP_MATCHES_PREBUILT="$value" ;;
+      installed_smoke) APP_INSTALLED_SMOKE="$value" ;;
+      recorded_checkout) APP_RECORDED="$value" ;;
+      recorded_live) APP_RECORDED_LIVE="$value" ;;
+      legacy_baked_path) APP_BAKED="$value" ;;
+      legacy_baked_live) APP_BAKED_LIVE="$value" ;;
+    esac
+  done <<EOF
+$output
+EOF
+  case "$APP_WANT_VERSION" in ''|*[!0-9]*) return 1 ;; esac
+  APP_FACTS_OK=1
+  return 0
+}
+
+# Older launcher or script fallback: something a migration could replace.
+app_upgradable() {
+  [ "$APP_LEGACY" = "1" ] && return 0
+  [ "$APP_GENERIC" = "1" ] && [ "$APP_KIND" = "script" ] && return 0
+  return 1
+}
+
+# Derive generic/older and ownership from the facts (pure; needs APP_FACTS_OK=1).
+app_classify() {
+  local exe="$APP_BUNDLE/Contents/MacOS/BotBoy" physical
+  APP_LEGACY=0
+  APP_GENERIC=0
+  APP_OWNED=0
+  [ "$APP_FACTS_OK" = "1" ] || return 0
+  physical="$(cd "$PROJ_DIR" 2>/dev/null && pwd -P)"
+  # A path embedded in the executable, or a marker below the wanted version, is an older launcher
+  # (a new Info.plist beside an old executable, left by an interrupted swap, counts as older too).
+  if [ -n "$APP_BAKED" ] || [ -z "$APP_VERSION" ] || [ "$APP_VERSION" -lt "$APP_WANT_VERSION" ]; then
+    APP_LEGACY=1
+  else
+    APP_GENERIC=1
+  fi
+  if [ -n "$APP_BAKED" ]; then
+    # grep reads a Mach-O and a script alike; the embedded folder being gone makes it claimable.
+    if grep -aqF "$PROJ_DIR/start.sh" "$exe" 2>/dev/null || { [ -n "$physical" ] && grep -aqF "$physical/start.sh" "$exe" 2>/dev/null; }; then
+      APP_OWNED=1
+    elif [ "$APP_BAKED_LIVE" != "1" ]; then
+      APP_OWNED=1
+    fi
+  else
+    # Opens the recorded folder: ours when it is this folder, empty, or its start.sh is gone.
+    if [ -z "$APP_RECORDED" ] || [ "$APP_RECORDED_LIVE" != "1" ] || [ "$APP_RECORDED" = "$physical" ] || [ "$APP_RECORDED" = "$PROJ_DIR" ]; then
+      APP_OWNED=1
+    fi
+  fi
+  return 0
+}
+
+# Gather the facts. On Intel nothing is read from the executable (kind=unread).
 app_launcher_facts() {
-  local exe description
+  local exe plist description
   APP_EXISTS=0
   APP_KIND=none
   APP_ARCHS=""
   APP_PRIORITY0=""
+  APP_VERSION=""
+  APP_FACTS_OK=0
+  APP_WANT_VERSION=""
+  APP_PREBUILT=unchecked
+  APP_PREBUILT_REASON=""
+  APP_PREBUILT_DETAIL=""
+  APP_MATCHES_PREBUILT=0
+  APP_INSTALLED_SMOKE=unchecked
+  APP_RECORDED=""
+  APP_RECORDED_LIVE=0
+  APP_BAKED=""
+  APP_BAKED_LIVE=0
+  APP_LEGACY=0
+  APP_GENERIC=0
   APP_OWNED=0
   APP_TOOLCHAIN=0
   APP_MARKER_BLOCKS=0
   [ -d "$APP_BUNDLE" ] || return 0
   APP_EXISTS=1
   exe="$APP_BUNDLE/Contents/MacOS/BotBoy"
+  plist="$APP_BUNDLE/Contents/Info.plist"
   if [ ! -f "$exe" ]; then
     APP_KIND=missing
     return 0
   fi
-  [ "$HW_ARM64" = "1" ] || return 0
-  description="$("$FILE_BIN" -b "$exe" 2>/dev/null)"
-  case "$description" in
-    Mach-O*) APP_KIND=macho; APP_ARCHS="$(file_description_archs "$description")" ;;
-    *script*|*text*) APP_KIND=script ;;
-    *) APP_KIND=unknown ;;
-  esac
-  APP_PRIORITY0="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
-  if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
-    grep -aqF "$PROJ_DIR/start.sh" "$exe" 2>/dev/null && APP_OWNED=1
-    clt_toolchain_ok && APP_TOOLCHAIN=1
-    app_launcher_marker_blocks && APP_MARKER_BLOCKS=1
+  if [ "$HW_ARM64" = "1" ]; then
+    description="$("$FILE_BIN" -b "$exe" 2>/dev/null)"
+    case "$description" in
+      Mach-O*) APP_KIND=macho; APP_ARCHS="$(file_description_archs "$description")" ;;
+      *script*|*text*) APP_KIND=script ;;
+      *) APP_KIND=unknown ;;
+    esac
+    APP_PRIORITY0="$("$PLISTBUDDY_BIN" -c 'Print :LSArchitecturePriority:0' "$plist" 2>/dev/null || true)"
+  else
+    APP_KIND=unread
+  fi
+  [ "$APP_KIND" != "unknown" ] || return 0
+  APP_VERSION="$("$PLISTBUDDY_BIN" -c 'Print :BotBoyLauncherVersion' "$plist" 2>/dev/null || true)"
+  case "$APP_VERSION" in *[!0-9]*) APP_VERSION="" ;; esac
+  app_read_node_facts || return 0
+  app_classify
+  app_launcher_marker_blocks && APP_MARKER_BLOCKS=1
+  # Whether a native launcher can be had is asked only when the plan could reach it: the execution
+  # smoke of the prebuilt launcher costs about a second.
+  if [ "$APP_OWNED" = "1" ] && [ "$FOREGROUND" != "1" ] && [ "$APP_MARKER_BLOCKS" != "1" ] && app_upgradable; then
+    if [ "$APP_PREBUILT" = "unchecked" ]; then
+      app_read_node_facts --smoke || true
+    fi
+    if [ "$APP_PREBUILT" != "1" ] && clt_toolchain_ok; then
+      APP_TOOLCHAIN=1
+    fi
   fi
   return 0
 }
 
-# Pure: APP_PLAN is create | patch_plist | rebuild | warn_harmless | none.
+# Pure: APP_PLAN is create | patch_plist | migrate | warn_harmless | none, and
+# APP_CHECKOUT_ACTION is none | claim (see the table above).
 app_launcher_plan() {
   APP_PLAN=none
+  APP_CHECKOUT_ACTION=none
   if [ "$APP_EXISTS" != "1" ] || [ "$APP_KIND" = "missing" ]; then
     APP_PLAN=create
     return 0
   fi
-  [ "$HW_ARM64" = "1" ] || return 0
-  if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
-    # An Intel-only launcher: only a rebuild can make the app itself native.
-    if [ "$APP_TOOLCHAIN" = "1" ] && [ "$APP_OWNED" = "1" ] && [ "$FOREGROUND" != "1" ] && [ "$APP_MARKER_BLOCKS" != "1" ]; then
-      APP_PLAN=rebuild
-    else
-      APP_PLAN=warn_harmless
-    fi
+  [ "$APP_FACTS_OK" = "1" ] || return 0
+  [ "$APP_KIND" != "unknown" ] || return 0
+  [ "$APP_OWNED" = "1" ] || return 0
+  if [ "$APP_GENERIC" = "1" ] && { [ -z "$APP_RECORDED" ] || [ "$APP_RECORDED_LIVE" != "1" ]; }; then
+    APP_CHECKOUT_ACTION=claim
+  fi
+  if [ "$APP_GENERIC" = "1" ] && [ "$APP_KIND" != "script" ]; then
+    [ "$HW_ARM64" = "1" ] && [ "$APP_PRIORITY0" != "arm64" ] && APP_PLAN=patch_plist
     return 0
   fi
-  [ "$APP_PRIORITY0" = "arm64" ] || APP_PLAN=patch_plist
+  if [ "$FOREGROUND" != "1" ]; then
+    if [ "$APP_MARKER_BLOCKS" = "1" ]; then
+      APP_PLAN=warn_harmless
+      return 0
+    fi
+    if [ "$APP_PREBUILT" = "1" ] || [ "$APP_TOOLCHAIN" = "1" ]; then
+      APP_PLAN=migrate
+      return 0
+    fi
+  fi
+  # Row 8, the earlier rules for a launcher that stays as it is (Apple Silicon only).
+  [ "$HW_ARM64" = "1" ] || return 0
+  if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
+    APP_PLAN=warn_harmless
+  elif [ "$APP_PRIORITY0" != "arm64" ]; then
+    APP_PLAN=patch_plist
+  fi
   return 0
 }
 
@@ -980,8 +1249,38 @@ patch_app_plist_arch() {
   return 0
 }
 
+# Record this folder (its physical path) as the one BotBoy.app opens: a temporary
+# file, then a rename, mode 0600 in the data folder (created 0700 when missing).
+# The format is the one scripts/native-prebuilt.mjs › writeCheckoutFile writes and the
+# launcher reads. Returns 1 when it cannot be written; nothing is left behind.
+write_app_checkout_file() {
+  local physical dir file temp
+  physical="$(cd "$PROJ_DIR" 2>/dev/null && pwd -P)"
+  case "$physical" in /*) ;; *) return 1 ;; esac
+  [ "${#physical}" -lt 4096 ] || return 1
+  case "$physical" in *[[:cntrl:]]*) return 1 ;; esac
+  dir="$HOME/.personal-productivity-tracker"
+  file="$dir/app-checkout.v1"
+  temp="$file.$$.tmp"
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null || return 1
+  ( umask 077; printf 'checkout=%s\nwritten=%s\n' "$physical" "$(date '+%Y-%m-%dT%H:%M:%S')" > "$temp" ) 2>/dev/null || { rm -f "$temp"; return 1; }
+  if ! mv -f "$temp" "$file" 2>/dev/null; then
+    rm -f "$temp"
+    return 1
+  fi
+  return 0
+}
+
 apply_app_launcher_plan() {
-  local builder="$PROJ_DIR/scripts/make-app-bundle.mjs"
+  local builder="$PROJ_DIR/scripts/make-app-bundle.mjs" output status reason
+  # The recorded folder lives outside the bundle, so it is written in every mode (--foreground too).
+  if [ "$APP_CHECKOUT_ACTION" = "claim" ]; then
+    if write_app_checkout_file; then
+      echo "ℹ️  BotBoy.app now opens this folder ($PROJ_DIR)" | tee -a "$LOG_FILE"
+    else
+      echo "ℹ️  Could not record this folder for BotBoy.app (is ~/.personal-productivity-tracker writable?); the app keeps what it had" | tee -a "$LOG_FILE"
+    fi
+  fi
   case "$APP_PLAN" in
     create)
       echo "ℹ️  Installing BotBoy.app into $(dirname "$APP_BUNDLE") (first run)"
@@ -998,67 +1297,133 @@ apply_app_launcher_plan() {
         echo "ℹ️  Could not update BotBoy.app's architecture setting (harmless: start.sh still runs BotBoy natively)" | tee -a "$LOG_FILE"
       fi
       ;;
-    rebuild)
-      echo "ℹ️  Rebuilding BotBoy.app's launcher for Apple Silicon (the installed one is the Intel build)" | tee -a "$LOG_FILE"
-      if native_exec "$NODE" "$builder" --launcher-only --dest "$APP_BUNDLE" >> "$LOG_FILE" 2>&1; then
-        app_launcher_marker_write ok
-        patch_app_plist_arch || true
-        echo "✅ BotBoy.app launcher rebuilt; this takes effect at the next app launch: quit and reopen BotBoy" | tee -a "$LOG_FILE"
+    migrate)
+      if [ "$APP_PREBUILT" = "1" ]; then
+        echo "ℹ️  Upgrading BotBoy.app's launcher so it follows this folder (prebuilt, no developer tools needed)" | tee -a "$LOG_FILE"
       else
-        app_launcher_marker_write failed
-        echo "ℹ️  BotBoy.app's launcher is the Intel build and starts translated; harmless, because start.sh re-launches BotBoy natively (rebuild failed, see $LOG_FILE)" | tee -a "$LOG_FILE"
+        echo "ℹ️  Upgrading BotBoy.app's launcher so it follows this folder (building it on this Mac)" | tee -a "$LOG_FILE"
+      fi
+      output="$(native_exec "$NODE" "$builder" --launcher-only --dest "$APP_BUNDLE" 2>&1)"
+      status=$?
+      printf '%s\n' "$output" >> "$LOG_FILE"
+      if [ "$status" = "0" ]; then
+        app_launcher_marker_write ok
+        # The builder wrote the architecture key where it belongs (Apple Silicon only); this only confirms it.
+        [ "$HW_ARM64" != "1" ] || patch_app_plist_arch || true
+        echo "✅ BotBoy.app upgraded; this takes effect at the next app launch: quit and reopen BotBoy" | tee -a "$LOG_FILE"
+      else
+        reason="$(printf '%s\n' "$output" | sed -n 's/^reason=//p' | tail -n 1)"
+        app_launcher_marker_write failed "$reason"
+        if [ "$reason" = "restore_failed" ]; then
+          echo "ℹ️  BotBoy.app's launcher could not be upgraded ($(app_launcher_reason_words "$reason")). Next: remove $APP_BUNDLE and run ./start.sh to build it again" | tee -a "$LOG_FILE"
+        else
+          echo "ℹ️  BotBoy.app's launcher could not be upgraded ($(app_launcher_reason_words "$reason")); the current one keeps working. Next: ./start.sh --doctor" | tee -a "$LOG_FILE"
+        fi
       fi
       ;;
     warn_harmless)
-      echo "ℹ️  BotBoy.app's launcher is the Intel build and starts translated; harmless, because start.sh re-launches BotBoy natively" | tee -a "$LOG_FILE"
+      if [ "$APP_KIND" = "macho" ] && [ -n "$APP_ARCHS" ] && ! archs_include_arm64 "$APP_ARCHS"; then
+        echo "ℹ️  BotBoy.app's launcher is the Intel build and starts translated; harmless, because start.sh re-launches BotBoy natively" | tee -a "$LOG_FILE"
+      else
+        echo "ℹ️  BotBoy.app's launcher is the older per-Mac build and the last upgrade did not work here ($(app_launcher_reason_words "$(app_launcher_marker_reason)")); it keeps working. Next: ./start.sh --doctor" | tee -a "$LOG_FILE"
+      fi
       ;;
   esac
   return 0
 }
 
+# The architecture-priority words of the doctor row.
+app_priority_words() {
+  if [ "$APP_PRIORITY0" = "arm64" ]; then
+    echo "arm64 first"
+  elif [ "$APP_KIND" = "macho" ] && archs_include_arm64 "$APP_ARCHS"; then
+    echo "missing (harmless for a compiled launcher with an arm64 slice; start.sh adds the key on its next start)"
+  else
+    echo "missing (the app itself starts translated; BotBoy's own processes are still native because start.sh re-launches natively; start.sh adds the key on its next start)"
+  fi
+}
+
 doctor_app_launcher_row() {
-  local kind priority
+  local what opens arch_words="" line
   app_launcher_facts
   if [ "$APP_EXISTS" != "1" ] || [ "$APP_KIND" = "missing" ]; then
     echo "app launcher: not installed (./start.sh installs it on its first successful start)"
     return 0
   fi
-  if [ "$HW_ARM64" != "1" ]; then
-    echo "app launcher: installed (Intel Mac: nothing to check)"
+  if [ "$APP_KIND" = "unknown" ]; then
+    echo "app launcher: unknown; architecture priority: $(app_priority_words)"
     return 0
   fi
-  case "$APP_KIND" in
-    macho)
-      if [ -z "$APP_ARCHS" ]; then
-        kind="compiled"
-      elif archs_include_arm64 "$APP_ARCHS"; then
-        case " $APP_ARCHS " in
-          *" x86_64 "*) kind="compiled universal" ;;
-          *) kind="compiled arm64" ;;
-        esac
-      else
-        kind="compiled x86_64 only"
-      fi
-      ;;
-    script) kind="shell script" ;;
-    *) kind="unknown" ;;
-  esac
-  if [ "$APP_PRIORITY0" = "arm64" ]; then
-    priority="arm64 first"
-  elif [ "$APP_KIND" = "macho" ] && archs_include_arm64 "$APP_ARCHS"; then
-    priority="missing (harmless for a compiled launcher with an arm64 slice; start.sh adds the key on its next start)"
-  else
-    priority="missing (the app itself starts translated; BotBoy's own processes are still native because start.sh re-launches natively; start.sh adds the key on its next start)"
+  if [ "$APP_FACTS_OK" != "1" ]; then
+    echo "app launcher: unknown (the check could not run; run ./start.sh --update)"
+    return 0
   fi
-  echo "app launcher: $kind; architecture priority: $priority"
+  # The installed file is run (print-target mode) only when it is byte-identical to the prebuilt launcher:
+  # an older launcher has no such mode and would start the app.
+  if [ "$APP_MATCHES_PREBUILT" = "1" ]; then
+    app_read_node_facts --smoke || true
+  fi
+  if [ "$APP_KIND" = "macho" ]; then
+    if [ -z "$APP_ARCHS" ]; then
+      arch_words=""
+    elif archs_include_arm64 "$APP_ARCHS"; then
+      case " $APP_ARCHS " in
+        *" x86_64 "*) arch_words="universal" ;;
+        *) arch_words="arm64" ;;
+      esac
+    else
+      arch_words="x86_64 only"
+    fi
+  fi
+  if [ "$APP_GENERIC" = "1" ]; then
+    if [ "$APP_MATCHES_PREBUILT" = "1" ]; then
+      what="prebuilt universal (v$APP_VERSION)"
+    elif [ "$APP_KIND" = "script" ]; then
+      what="shell script (v$APP_VERSION)"
+    elif [ "$APP_KIND" = "macho" ]; then
+      what="compiled on this Mac (v$APP_VERSION${arch_words:+, $arch_words})"
+    else
+      what="launcher (v$APP_VERSION)"
+    fi
+    if [ -z "$APP_RECORDED" ]; then
+      opens="no folder is recorded yet (run ./start.sh in the BotBoy folder to record it)"
+    elif [ "$APP_RECORDED_LIVE" != "1" ]; then
+      opens="its folder is gone ($APP_RECORDED): run ./start.sh here to reconnect it"
+    elif [ "$APP_OWNED" = "1" ]; then
+      opens="opens $APP_RECORDED"
+    else
+      opens="opens another folder ($APP_RECORDED): run ./start.sh there, or remove $APP_BUNDLE and run ./start.sh here"
+    fi
+  else
+    case "$APP_KIND" in
+      script) what="older script launcher" ;;
+      macho) what="older compiled launcher${arch_words:+ ($arch_words)}" ;;
+      *) what="older launcher" ;;
+    esac
+    if [ "$APP_OWNED" != "1" ]; then
+      opens="belongs to another folder${APP_BAKED:+ ($APP_BAKED)}"
+    elif [ "$APP_MARKER_BLOCKS" = "1" ]; then
+      opens="the last upgrade did not work here ($(app_launcher_reason_words "$(app_launcher_marker_reason)")); it keeps working"
+    else
+      opens="upgrades at the next ./start.sh"
+    fi
+  fi
+  line="app launcher: $what; $opens"
+  [ "$HW_ARM64" != "1" ] || line="$line; architecture priority: $(app_priority_words)"
+  case "$APP_INSTALLED_SMOKE" in
+    ok) line="$line; smoke ok" ;;
+    failed*) line="$line; smoke FAILED (${APP_INSTALLED_SMOKE#failed: }): run ./start.sh --update, or remove $APP_BUNDLE and run ./start.sh" ;;
+  esac
+  echo "$line"
 }
 
 # Self-heal the Dock/Applications launcher: build /Applications/BotBoy.app on
-# the first start after a clone (or after someone deletes the app), and on
+# the first start after a clone (or after someone deletes the app), upgrade an
+# older launcher to the generic prebuilt one, keep the recorded folder current, and on
 # Apple Silicon keep an existing one starting natively (app_launcher_plan).
 # Runs after the dashboard is already open so it never delays startup, and a
 # failure never breaks the tracker: the app is cosmetic + lifecycle
-# convenience, not a runtime dependency. It never rebuilds in --foreground
+# convenience, not a runtime dependency. It never swaps a launcher in --foreground
 # (the app that is running may be this very launcher).
 install_app_bundle_if_missing() {
   [ -f "$PROJ_DIR/scripts/make-app-bundle.mjs" ] || return 0
@@ -1069,6 +1434,10 @@ install_app_bundle_if_missing() {
 
 # Executable test hooks. They read the facts and print them; the apply hook
 # runs the real flow against BOTBOY_TEST_APP_BUNDLE only.
+if [ "${BOTBOY_TEST_DOCTOR_NODE:-0}" = "1" ]; then
+  doctor_node_row
+  exit 0
+fi
 if [ "${BOTBOY_TEST_DOCTOR_MACHINE:-0}" = "1" ]; then
   doctor_machine_rows
   exit 0
@@ -1077,7 +1446,8 @@ if [ "${BOTBOY_TEST_APP_LAUNCHER_PLAN:-0}" = "1" ]; then
   app_launcher_facts
   app_launcher_plan
   echo "plan=$APP_PLAN"
-  echo "kind=$APP_KIND archs=$APP_ARCHS priority=$APP_PRIORITY0 owned=$APP_OWNED toolchain=$APP_TOOLCHAIN marker_blocks=$APP_MARKER_BLOCKS"
+  echo "checkout_action=$APP_CHECKOUT_ACTION"
+  echo "kind=$APP_KIND archs=$APP_ARCHS priority=$APP_PRIORITY0 version=$APP_VERSION facts_ok=$APP_FACTS_OK legacy=$APP_LEGACY generic=$APP_GENERIC owned=$APP_OWNED prebuilt=$APP_PREBUILT toolchain=$APP_TOOLCHAIN marker_blocks=$APP_MARKER_BLOCKS"
   exit 0
 fi
 if [ "${BOTBOY_TEST_APP_PLIST_PATCH:-0}" = "1" ]; then
@@ -2239,6 +2609,7 @@ if [ "$DOCTOR" = "1" ]; then
   else
     echo "shutdown recovery: no active safety guard"
   fi
+  doctor_node_row
   doctor_machine_rows
   doctor_app_launcher_row
   doctor_toolchain_rows
@@ -2514,6 +2885,9 @@ trap release_start_lock EXIT
 #   2. dist/.build-commit differs from git HEAD — stale build after git pull.
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
+# Clear the browser-download flag on the prebuilt helpers first: npm's
+# postinstall (inside the self-heal) and the server both may run them.
+strip_native_download_mark
 heal_missing_npm_dependencies
 # (The optional OCR helper is NOT built here: start_ocr_helper_job runs it in
 # the background after the dashboard window is open.)
@@ -2528,6 +2902,7 @@ startup_safety_allows_takeover || exit 1
 # starts, so no guard can be left behind (teammate on Node 26 + npm 12,
 # 2026-10-07).
 if ! NATIVE_STATUS="$(native_modules_status repair)"; then
+  warn_if_node_needs_tools_to_install
   echo "ℹ️  Reinstalling native modules for Node $("$NODE" --version 2>/dev/null) — npm install" | tee -a "$LOG_FILE"
   printf '%s\n' "$NATIVE_STATUS" | grep -v '|ok$' | sed 's/|/: /; s/^/    /' | tee -a "$LOG_FILE"
   (cd "$PROJ_DIR" && export BOTBOY_DEFER_OCR_BUILD=1 && rm -rf node_modules/better-sqlite3 node_modules/node-pty \

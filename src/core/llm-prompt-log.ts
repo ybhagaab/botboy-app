@@ -125,7 +125,8 @@ function renderTurn(item: Record<string, unknown>, index: number): string {
   return lines.join('\n\n');
 }
 
-function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): string {
+/** Exported for tests. */
+export function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): string {
   const req = (entry.request ?? {}) as Record<string, unknown>;
   const parts: string[] = [];
 
@@ -142,9 +143,13 @@ function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): 
   );
 
   // System prompt: Responses API carries it in `instructions`; chat-completions
-  // as a system-role message (rendered with the turns below).
+  // as a system-role message (rendered with the turns below); the Anthropic
+  // Messages API as a top-level `system` string.
   if (typeof req.instructions === 'string') {
     parts.push('## Instructions (system prompt)\n\n' + req.instructions);
+  }
+  if (typeof req.system === 'string') {
+    parts.push('## System prompt\n\n' + req.system);
   }
 
   const turns = (Array.isArray(req.input) ? req.input : Array.isArray(req.messages) ? req.messages : []) as unknown[];
@@ -169,7 +174,7 @@ function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): 
 
   const rest: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(req)) {
-    if (!['instructions', 'input', 'messages', 'tools'].includes(k)) rest[k] = v;
+    if (!['instructions', 'system', 'input', 'messages', 'tools'].includes(k)) rest[k] = v;
   }
   if (Object.keys(rest).length > 0) {
     parts.push('## Other params\n\n```json\n' + JSON.stringify(rest, null, 2) + '\n```');
@@ -183,6 +188,9 @@ function renderMarkdown(ts: Date, entry: LlmPromptLogEntry, bodyChars: number): 
 // Serialized writer chain: keeps directory creation + prune + writes ordered.
 let writeChain: Promise<void> = Promise.resolve();
 
+/** An Anthropic image block's source, as JSON.stringify writes it (key order is the builder's). */
+const ANTHROPIC_IMAGE_MARKER = '"source":{"type":"base64","media_type":"image/';
+
 /**
  * Image data URLs (chat attachments) would bloat log files by megabytes per
  * request — elide the base64 payload, keep the shape and size visible.
@@ -190,11 +198,17 @@ let writeChain: Promise<void> = Promise.resolve();
 export function elideImageDataUrls<T>(request: T): T {
   try {
     const json = JSON.stringify(request);
-    if (!json.includes('data:image/')) return request;
-    return JSON.parse(json.replace(
-      /data:image\/[a-z]+;base64,([A-Za-z0-9+/=]{64})[A-Za-z0-9+/=]*/g,
-      (match, head) => `data:image-elided (${match.length} chars, starts ${head.slice(0, 24)}…)`,
-    ));
+    if (!json.includes('data:image/') && !json.includes(ANTHROPIC_IMAGE_MARKER)) return request;
+    return JSON.parse(json
+      .replace(
+        /data:image\/[a-z]+;base64,([A-Za-z0-9+/=]{64})[A-Za-z0-9+/=]*/g,
+        (match, head) => `data:image-elided (${match.length} chars, starts ${head.slice(0, 24)}…)`,
+      )
+      // Anthropic image blocks carry raw base64 in `source.data`, not a data URL.
+      .replace(
+        /("source":\{"type":"base64","media_type":"image\/[a-z+.-]+","data":")([A-Za-z0-9+/=]{64})[A-Za-z0-9+/=]*(")/g,
+        (match, open, head, close) => `${open}image-elided (${match.length - open.length - close.length} chars, starts ${head.slice(0, 24)}…)${close}`,
+      ));
   } catch {
     return request;
   }

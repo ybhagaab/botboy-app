@@ -10,7 +10,7 @@
  *
  * Development checkouts never offer an update (same rule as start.sh).
  */
-import { execFile, spawn, type SpawnOptions } from 'node:child_process';
+import { execFile, spawn, spawnSync, type SpawnOptions } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,6 +42,45 @@ const defaultGit: GitRunner = (args, cwd) => new Promise((resolve, reject) => {
 
 const defaultSpawn: Spawner = (cmd, args, opts) => spawn(cmd, args, opts);
 
+/**
+ * Same rule as start.sh › git_usable. On a Mac without the Xcode Command Line
+ * Tools, /usr/bin/git is a shim that raises the macOS "install developer tools"
+ * dialog when run, so the first git found on PATH counts only when it is not
+ * that shim, or when `xcode-select -p` answers. A ZIP checkout (it carries the
+ * release marker but has no `.git`, and often no git at all) is therefore
+ * quietly "not supported" and the Update button stays hidden, instead of the
+ * dialog appearing every ten minutes. `BOTBOY_TEST_XCODE_SELECT_BIN` replaces
+ * the tool in tests.
+ */
+export function gitUsable(projDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!fs.existsSync(path.join(projDir, '.git'))) return false;
+  let found: string | null = null;
+  for (const dir of String(env.PATH ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, 'git');
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) {
+        found = candidate;
+        break;
+      }
+    } catch {
+      // not here
+    }
+  }
+  // Same default places start.sh adds to PATH, for a server started from the app.
+  if (!found) found = ['/usr/bin/git'].find((candidate) => fs.existsSync(candidate)) ?? null;
+  if (!found) return false;
+  if (found !== '/usr/bin/git') return true;
+  const override = env.BOTBOY_TEST_XCODE_SELECT_BIN;
+  const bin = override && path.isAbsolute(override) ? override : '/usr/bin/xcode-select';
+  try {
+    return spawnSync(bin, ['-p'], { stdio: 'ignore', timeout: 15_000, killSignal: 'SIGKILL' }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Same detection as start.sh: release marker or a botboy-app origin. */
 export async function isReleaseCheckout(projDir: string, git: GitRunner = defaultGit): Promise<boolean> {
   if (fs.existsSync(path.join(projDir, '.botboy-distribution'))) return true;
@@ -68,6 +107,8 @@ export interface AppUpdaterOptions {
   spawner?: Spawner;
   intervalMs?: number;
   onChange?: () => void;
+  /** Whether git may be run here (tests); default: this file's gitUsable. */
+  canUseGit?: (projDir: string) => boolean;
 }
 
 export class AppUpdater {
@@ -77,6 +118,7 @@ export class AppUpdater {
   private readonly spawner: Spawner;
   private readonly intervalMs: number;
   private readonly onChange?: () => void;
+  private readonly canUseGit: (projDir: string) => boolean;
   private supported: boolean | null = null;
   private timer: NodeJS.Timeout | null = null;
   private checking: Promise<AppUpdateStatus> | null = null;
@@ -92,6 +134,7 @@ export class AppUpdater {
     this.spawner = opts.spawner ?? defaultSpawn;
     this.intervalMs = opts.intervalMs ?? 10 * 60_000;
     this.onChange = opts.onChange;
+    this.canUseGit = opts.canUseGit ?? ((dir) => gitUsable(dir));
   }
 
   status(): AppUpdateStatus { return { ...this.state }; }
@@ -114,6 +157,11 @@ export class AppUpdater {
   }
 
   private async doCheck(): Promise<AppUpdateStatus> {
+    // No git here (a ZIP checkout, or a Mac without the developer tools): quietly unsupported, and git is never run.
+    if (!this.canUseGit(this.projDir)) {
+      this.state = { ...this.state, supported: false, available: false };
+      return this.status();
+    }
     if (this.supported === null) this.supported = await isReleaseCheckout(this.projDir, this.git);
     if (!this.supported) { this.state = { ...this.state, supported: false, available: false }; return this.status(); }
     const wasAvailable = this.state.available;

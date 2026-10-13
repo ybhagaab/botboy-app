@@ -6,14 +6,19 @@
  *   - team: the launcher/.env provider (team gateway, Bedrock, self-hosted),
  *     present when its credentials exist or when nothing else is configured;
  *   - openai: the owner's OpenAI API key (every chat model the key lists);
- *   - deepseek: the owner's DeepSeek API key (every model the key lists).
+ *   - deepseek: the owner's DeepSeek API key (every model the key lists);
+ *   - anthropic: the owner's Anthropic (Claude) API key (every Claude model
+ *     the key lists, through the native Messages API).
  *
  * Model choices:
  *   - chat picks per message (chat panel), from every connection;
  *   - organizing (the information pipeline, planners, visual inspection,
  *     background agent loops) and document writing each have one owner choice
  *     with its own Thinking level. Until the owner picks, each uses the
- *     default chain: team default → OpenAI → DeepSeek.
+ *     default chain: team default → OpenAI → DeepSeek → Anthropic. Chat
+ *     follows the same chain through each connection's default model, so a
+ *     role default (Claude's Haiku-line Organizing model) never becomes the
+ *     chat default.
  *
  * Boundaries this module owns:
  *   - Keys live only in ~/.personal-productivity-tracker/ai-model.json (0600,
@@ -34,10 +39,27 @@ import {
   DEEPSEEK_PLATFORM_ENDPOINT,
   OPENAI_PLATFORM_ENDPOINT,
   OPENAI_PLATFORM_MODEL_IDS,
+  createAnthropicInferenceProvider,
   createDeepSeekInferenceProvider,
   createOpenAiPlatformInferenceProvider,
   type InferenceProvider,
 } from './inference-provider.js';
+import {
+  ANTHROPIC_API_ENDPOINT,
+  deriveProfile,
+  isAnthropicAdminKey,
+  isAnthropicApiKey,
+  listAnthropicModels,
+  logProfileDisagreementsOnce,
+  looksLikeAnthropicKey,
+  parseStoredAnthropicModels,
+  pickAnthropicDefaultModel,
+  pickAnthropicProcessingModel,
+  selectOfferedModels,
+  verifyKey as verifyAnthropicKey,
+  type AnthropicModelProfile,
+} from './anthropic-models.js';
+import { ANTHROPIC_BILLING_URL, ANTHROPIC_KEYS_URL, isAnthropicApiError } from './anthropic-errors.js';
 import {
   isLlmProviderLimitError,
   redactProviderSecrets,
@@ -48,8 +70,10 @@ import { createLlmClientSwitch, type LlmClientSwitch, type LlmRuntimeIdentity } 
 import {
   LLM_CONNECTION_ORDER,
   LLM_MODEL_KEY_PATTERN,
+  anthropicModelEntries,
   bindLlmModel,
   connectionDefaultEntry,
+  connectionRoleDefaultEntry,
   deepSeekModelCapabilities,
   deepSeekModelEntries,
   isLlmThinkingLevel,
@@ -59,6 +83,7 @@ import {
   parseDeepSeekModelList,
   pickDeepSeekDefaultModel,
   pickOpenAiDefaultModel,
+  qualifiedModelKey,
   teamConnectionLabel,
   teamModelEntries,
   type DeepSeekModelProfile,
@@ -68,6 +93,7 @@ import {
   type LlmThinkingLevel,
 } from './llm-model-catalog.js';
 import { createConnectionChatModelSource, type ChatModelSource } from './chat-model-source.js';
+import type { LlmThinkingOffMode } from './llm-model-operation.js';
 import type { LlmUsageService } from './llm-usage.js';
 
 export const AI_MODEL_SETTINGS_FILE = 'ai-model.json';
@@ -77,9 +103,12 @@ const MODEL_LIST_TIMEOUT_MS = 15_000;
 // Boot refreshes saved model lists in parallel but must not hold startup on a
 // slow or blocked provider; the saved list stays usable when this expires.
 const BOOT_MODEL_LIST_TIMEOUT_MS = 5_000;
+// A Claude answer that says the model list is stale (a 404 on a model, a thinking-type 400) asks for a re-list;
+// at most one starts per interval, so a failing model cannot turn into a polling loop.
+const ANTHROPIC_STALE_REFRESH_INTERVAL_MS = 10 * 60_000;
 
 export type AiModelState = 'ready' | 'unavailable' | 'not_configured';
-export type AiModelKeyProvider = 'openai' | 'deepseek';
+export type AiModelKeyProvider = 'openai' | 'deepseek' | 'anthropic';
 export type AiModelRole = 'processing' | 'documents';
 export const AI_MODEL_ROLES: readonly AiModelRole[] = Object.freeze(['processing', 'documents']);
 
@@ -103,6 +132,8 @@ export interface AiModelConnectionStatus {
     readonly label: string;
     readonly images?: boolean;
     readonly contextWindow: number;
+    /** How Thinking "Off" behaves on this model (Claude only; absent for the other providers). */
+    readonly thinkingOff?: LlmThinkingOffMode;
   }[];
   readonly issue?: AiModelIssue;
 }
@@ -119,6 +150,8 @@ export interface AiModelRoleStatus {
   /** The owner's stored choice when it is not offered right now. */
   readonly unavailableChoice?: string;
   readonly images?: boolean;
+  /** How Thinking "Off" behaves on the model serving this role (Claude only). */
+  readonly thinkingOff?: LlmThinkingOffMode;
 }
 
 export interface AiModelStatus {
@@ -137,6 +170,8 @@ export interface AiModelStatus {
   readonly models: readonly { key: string; label: string }[];
   readonly openai?: { readonly keySuffix: string; readonly savedAt: string; readonly verifiedAt: string };
   readonly deepseek?: { readonly keySuffix: string; readonly savedAt: string; readonly verifiedAt: string };
+  /** The saved Anthropic key (suffix and times only). */
+  readonly anthropic?: { readonly keySuffix: string; readonly savedAt: string; readonly verifiedAt: string };
   /** Present when launcher credentials exist alongside saved keys. */
   readonly environmentProviderLabel?: string;
   readonly issue?: AiModelIssue;
@@ -193,15 +228,34 @@ interface StoredDeepSeekKey extends StoredKey {
   models: DeepSeekModelProfile[];
 }
 
+interface StoredAnthropicKey extends StoredKey {
+  /** The models the key offers (lifecycle-filtered, at most 100), with the capabilities that drive request shaping. */
+  models: AnthropicModelProfile[];
+}
+
 interface StoredRole {
   modelKey?: string;
   thinking?: LlmThinkingLevel;
+  /** Role fields this build does not know, written back unchanged. */
+  extra?: Record<string, unknown>;
+}
+
+/**
+ * Fields this build does not know, kept so a rewrite never loses a newer
+ * build's data (a provider's key, a role's extra fields): D11. They are read
+ * from the file and written back unchanged; nothing here interprets them.
+ */
+interface StoredPassthrough {
+  top: Record<string, unknown>;
+  keys: Record<string, unknown>;
+  roles: Record<string, unknown>;
 }
 
 interface StoredAiModelSettings {
   schemaVersion: 2;
-  keys: { openai?: StoredOpenAiKey; deepseek?: StoredDeepSeekKey };
+  keys: { openai?: StoredOpenAiKey; deepseek?: StoredDeepSeekKey; anthropic?: StoredAnthropicKey };
   roles: { processing?: StoredRole; documents?: StoredRole };
+  passthrough: StoredPassthrough;
 }
 
 interface AiModelSettingsDeps {
@@ -215,6 +269,9 @@ interface AiModelSettingsDeps {
   /** Test seams: hosted endpoints and HTTP client for model lists. */
   openAiEndpoint?: string;
   deepSeekEndpoint?: string;
+  anthropicEndpoint?: string;
+  /** Test seam: the deadline of the boot model-list refresh (default 5 s; Claude's listing shares it across pages). */
+  bootModelListTimeoutMs?: number;
   fetchImpl?: typeof fetch;
   /** Called after the organizing model changes (kick the information pipeline, log). */
   onActivated?: (identity: LlmRuntimeIdentity) => void;
@@ -245,6 +302,12 @@ const PROVIDER_TEXT: Record<AiModelKeyProvider, {
     keysUrl: 'platform.deepseek.com/api_keys',
     billing: 'platform.deepseek.com → Top up',
   },
+  anthropic: {
+    label: 'Anthropic',
+    host: 'api.anthropic.com',
+    keysUrl: ANTHROPIC_KEYS_URL,
+    billing: ANTHROPIC_BILLING_URL,
+  },
 };
 
 const ROLE_TEXT: Record<AiModelRole, string> = {
@@ -255,6 +318,7 @@ const ROLE_TEXT: Record<AiModelRole, string> = {
 function legacyProviderLabel(providerId: string): string {
   if (providerId === 'openai') return 'OpenAI (your API key)';
   if (providerId === 'deepseek') return 'DeepSeek (your API key)';
+  if (providerId === 'anthropic') return 'Anthropic (your API key)';
   if (providerId === 'gateway') return 'Team gateway (Amazon Bedrock)';
   if (providerId === 'bedrock') return 'Amazon Bedrock';
   if (providerId === 'openai-compatible') return 'Self-hosted model endpoint';
@@ -265,9 +329,10 @@ function keySuffix(apiKey: string): string {
   return `…${apiKey.slice(-4)}`;
 }
 
-function issueFor(issue: LlmProviderIssue | undefined, connection: LlmConnection): AiModelIssue | undefined {
+/** Owner-facing text for a provider issue on one keyed connection (undefined for the launcher provider). */
+export function aiModelIssueText(issue: LlmProviderIssue | undefined, providerId: string): AiModelIssue | undefined {
   if (!issue) return undefined;
-  const provider = connection.id === 'openai' || connection.id === 'deepseek' ? PROVIDER_TEXT[connection.id] : undefined;
+  const provider = providerId === 'openai' || providerId === 'deepseek' || providerId === 'anthropic' ? PROVIDER_TEXT[providerId] : undefined;
   if (!provider) return undefined;
   if (issue.code === 'auth_rejected') {
     return {
@@ -285,6 +350,14 @@ function issueFor(issue: LlmProviderIssue | undefined, connection: LlmConnection
       at: issue.at,
     };
   }
+  if (issue.code === 'overloaded') {
+    return {
+      code: issue.code,
+      message: `${provider.label} is busy right now.`,
+      nextAction: 'BotBoy retries on its own; nothing to change.',
+      at: issue.at,
+    };
+  }
   return {
     code: issue.code,
     message: `${provider.label} is rate-limiting this key.`,
@@ -293,9 +366,23 @@ function issueFor(issue: LlmProviderIssue | undefined, connection: LlmConnection
   };
 }
 
-function modelSettingsError(error: unknown, provider: AiModelKeyProvider): AiModelSettingsError {
+function issueFor(issue: LlmProviderIssue | undefined, connection: LlmConnection): AiModelIssue | undefined {
+  return aiModelIssueText(issue, connection.id);
+}
+
+/** Exported for tests. */
+export function modelSettingsError(error: unknown, provider: AiModelKeyProvider): AiModelSettingsError {
   if (error instanceof AiModelSettingsError) return error;
+  // Anthropic answers are classified once, in anthropic-errors.ts (D10); Save shows that text and code.
+  if (provider === 'anthropic' && isAnthropicApiError(error)) {
+    const c = error.classification;
+    return new AiModelSettingsError(c.saveCode, c.message, c.nextAction, c.saveStatus);
+  }
   const text = PROVIDER_TEXT[provider];
+  // A provider at capacity is not this key's rate limit: the key is fine and the wait is short.
+  if ((error as { code?: unknown } | null)?.code === 'LLM_PROVIDER_OVERLOADED') {
+    return new AiModelSettingsError('provider_overloaded', `${text.label} is temporarily overloaded.`, `${text.label} is busy. Save the key again in a minute.`, 503);
+  }
   if (isLlmProviderLimitError(error)) {
     return (error as any).code === 'LLM_QUOTA_EXHAUSTED'
       ? new AiModelSettingsError('no_credit', `Your ${text.label} account has no available credit.`, `Add credit at ${text.billing}, then save the key again.`)
@@ -371,8 +458,27 @@ async function listDeepSeekModels(endpoint: string, apiKey: string, fetchImpl: t
   }
 }
 
+function noPassthrough(): StoredPassthrough {
+  return { top: {}, keys: {}, roles: {} };
+}
+
 function emptySettings(): StoredAiModelSettings {
-  return { schemaVersion: SCHEMA_VERSION, keys: {}, roles: {} };
+  return { schemaVersion: SCHEMA_VERSION, keys: {}, roles: {}, passthrough: noPassthrough() };
+}
+
+/** The entries of a parsed JSON object whose names this build does not know (own keys only; `__proto__` stays plain data). */
+function unknownEntries(source: unknown, known: ReadonlySet<string>): Record<string, unknown> {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return {};
+  return Object.fromEntries(Object.entries(source).filter(([name]) => !known.has(name)));
+}
+
+const KNOWN_TOP_FIELDS: ReadonlySet<string> = new Set(['schemaVersion', 'keys', 'roles']);
+const KNOWN_KEY_PROVIDERS: ReadonlySet<string> = new Set(['openai', 'deepseek', 'anthropic']);
+const KNOWN_ROLE_NAMES: ReadonlySet<string> = new Set(AI_MODEL_ROLES);
+const KNOWN_ROLE_FIELDS: ReadonlySet<string> = new Set(['modelKey', 'thinking']);
+
+function hasPassthrough(passthrough: StoredPassthrough): boolean {
+  return Object.keys(passthrough.top).length + Object.keys(passthrough.keys).length + Object.keys(passthrough.roles).length > 0;
 }
 
 function storedKeyBase(value: any): StoredKey | undefined {
@@ -396,11 +502,40 @@ function storedDeepSeek(value: any): StoredDeepSeekKey | undefined {
   return models.length ? { ...base, models } : undefined;
 }
 
+function storedAnthropic(value: any): StoredAnthropicKey | undefined {
+  if (typeof value?.apiKey !== 'string' || !isAnthropicApiKey(value.apiKey)) return undefined;
+  return {
+    apiKey: value.apiKey,
+    savedAt: String(value.savedAt ?? ''),
+    verifiedAt: String(value.verifiedAt ?? ''),
+    models: parseStoredAnthropicModels(value.models),
+  };
+}
+
 function storedRole(value: any): StoredRole | undefined {
-  if (!value || typeof value !== 'object') return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const modelKey = typeof value.modelKey === 'string' && LLM_MODEL_KEY_PATTERN.test(value.modelKey) ? value.modelKey : undefined;
   const thinking = isLlmThinkingLevel(value.thinking) ? value.thinking : undefined;
-  return modelKey || thinking ? { ...(modelKey ? { modelKey } : {}), ...(thinking ? { thinking } : {}) } : undefined;
+  const extra = unknownEntries(value, KNOWN_ROLE_FIELDS);
+  const hasExtra = Object.keys(extra).length > 0;
+  return modelKey || thinking || hasExtra
+    ? { ...(modelKey ? { modelKey } : {}), ...(thinking ? { thinking } : {}), ...(hasExtra ? { extra } : {}) }
+    : undefined;
+}
+
+function serializeRole(role: StoredRole): Record<string, unknown> {
+  return { ...(role.extra ?? {}), ...(role.modelKey ? { modelKey: role.modelKey } : {}), ...(role.thinking ? { thinking: role.thinking } : {}) };
+}
+
+/** The JSON written to disk: known fields, then everything this build did not recognize, unchanged. */
+function serializeStored(value: StoredAiModelSettings): Record<string, unknown> {
+  const roles = Object.fromEntries(AI_MODEL_ROLES.flatMap(role => (value.roles[role] ? [[role, serializeRole(value.roles[role]!)]] : [])));
+  return {
+    ...value.passthrough.top,
+    schemaVersion: SCHEMA_VERSION,
+    keys: { ...value.passthrough.keys, ...value.keys },
+    roles: { ...value.passthrough.roles, ...roles },
+  };
 }
 
 /** Read schema 1 (one OpenAI key) or 2; undefined when absent or unreadable. */
@@ -429,19 +564,26 @@ function readStored(file: string): { settings: StoredAiModelSettings; schemaVers
     if (value.provider !== 'openai') return unreadable();
     const openai = storedOpenAi(value);
     return openai
-      ? { settings: { schemaVersion: SCHEMA_VERSION, keys: { openai }, roles: {} }, schemaVersion: 1 }
+      ? { settings: { schemaVersion: SCHEMA_VERSION, keys: { openai }, roles: {}, passthrough: noPassthrough() }, schemaVersion: 1 }
       : unreadable();
   }
   if (value?.schemaVersion !== SCHEMA_VERSION || !value.keys || typeof value.keys !== 'object') return unreadable();
   const openai = value.keys.openai ? storedOpenAi(value.keys.openai) : undefined;
   const deepseek = value.keys.deepseek ? storedDeepSeek(value.keys.deepseek) : undefined;
+  const anthropic = value.keys.anthropic ? storedAnthropic(value.keys.anthropic) : undefined;
   const processing = storedRole(value.roles?.processing);
   const documents = storedRole(value.roles?.documents);
   return {
     settings: {
       schemaVersion: SCHEMA_VERSION,
-      keys: { ...(openai ? { openai } : {}), ...(deepseek ? { deepseek } : {}) },
+      keys: { ...(openai ? { openai } : {}), ...(deepseek ? { deepseek } : {}), ...(anthropic ? { anthropic } : {}) },
       roles: { ...(processing ? { processing } : {}), ...(documents ? { documents } : {}) },
+      // A newer build's provider keys and role fields survive this build's writes (D11).
+      passthrough: {
+        top: unknownEntries(value, KNOWN_TOP_FIELDS),
+        keys: unknownEntries(value.keys, KNOWN_KEY_PROVIDERS),
+        roles: unknownEntries(value.roles, KNOWN_ROLE_NAMES),
+      },
     },
     schemaVersion: SCHEMA_VERSION,
   };
@@ -454,7 +596,7 @@ function writeStored(file: string, value: StoredAiModelSettings): void {
     // 'wx': create new only, never through a pre-existing file or link.
     const fd = fs.openSync(temporary, 'wx', 0o600);
     try {
-      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
+      fs.writeFileSync(fd, `${JSON.stringify(serializeStored(value), null, 2)}\n`);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -485,7 +627,9 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   const file = path.join(privateRoot, AI_MODEL_SETTINGS_FILE);
   const openAiEndpoint = deps.openAiEndpoint ?? OPENAI_PLATFORM_ENDPOINT;
   const deepSeekEndpoint = deps.deepSeekEndpoint ?? DEEPSEEK_PLATFORM_ENDPOINT;
+  const anthropicEndpoint = deps.anthropicEndpoint ?? ANTHROPIC_API_ENDPOINT;
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const bootListTimeoutMs = deps.bootModelListTimeoutMs ?? BOOT_MODEL_LIST_TIMEOUT_MS;
   const now = deps.now ?? (() => new Date());
   const credentialsPresent = Boolean(deps.environmentCredentialsPresent);
 
@@ -494,6 +638,8 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   let connectionCounter = 0;
   let settingsVersion = 1;
   let saving: Promise<unknown> | null = null;
+  let anthropicRefreshing = false;
+  let anthropicRefreshedAt = Number.NEGATIVE_INFINITY;
 
   const loaded = readStored(file);
   let stored: StoredAiModelSettings = loaded?.settings ?? emptySettings();
@@ -501,7 +647,8 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   let persistedSchema = loaded?.schemaVersion ?? 0;
 
   function persist(next: StoredAiModelSettings): void {
-    const empty = !next.keys.openai && !next.keys.deepseek && !next.roles.processing && !next.roles.documents;
+    const empty = !next.keys.openai && !next.keys.deepseek && !next.keys.anthropic
+      && !next.roles.processing && !next.roles.documents && !hasPassthrough(next.passthrough);
     if (empty) fs.rmSync(file, { force: true });
     else writeStored(file, next);
     stored = next;
@@ -575,8 +722,90 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     };
   }
 
+  /**
+   * The Claude connection for a saved key: every model the key lists, the Sonnet-line pick as its default (chat,
+   * Document writing, key verification) and the Haiku-line pick as its Organizing default, because background work
+   * runs on every captured item (design D8). undefined when the list yields no model to build on (a hand-edited
+   * file; Save refuses an empty list), in which case the key stays saved and nothing is registered.
+   */
+  function buildAnthropicConnection(key: StoredAnthropicKey): LlmConnection | undefined {
+    const defaultModel = pickAnthropicDefaultModel(key.models) ?? key.models[0]?.id;
+    if (!defaultModel) return undefined;
+    const processingModel = pickAnthropicProcessingModel(key.models);
+    const provider = createAnthropicInferenceProvider({
+      apiKey: key.apiKey,
+      models: key.models,
+      defaultModel,
+      endpoint: anthropicEndpoint,
+      env,
+      onModelsStale: refreshAnthropicModelsSoon,
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    });
+    return {
+      id: 'anthropic',
+      label: 'Anthropic (Claude)',
+      source: 'settings',
+      client: provider.createClient({ usageService: deps.usageService }),
+      provider: descriptor(provider),
+      models: anthropicModelEntries(key.models, defaultModel),
+      ...(processingModel ? { roleDefaultModels: { processing: qualifiedModelKey('anthropic', processingModel) } } : {}),
+      version: ++connectionCounter,
+    };
+  }
+
+  /**
+   * The Claude client saw an answer that says its model list is stale: list again, at most once per interval and one
+   * at a time. A changed list is stored and replaces the connection (which stops chat turns pinned to it, the same
+   * as any other replacement); an unchanged, empty or failed answer keeps the saved list. Nothing is applied when
+   * the key was saved, replaced or removed meanwhile.
+   */
+  function refreshAnthropicModelsSoon(): void {
+    const key = stored.keys.anthropic;
+    const at = now().getTime();
+    if (!key || anthropicRefreshing || at - anthropicRefreshedAt < ANTHROPIC_STALE_REFRESH_INTERVAL_MS) return;
+    anthropicRefreshing = true;
+    anthropicRefreshedAt = at;
+    void (async () => {
+      try {
+        const listed = await listAnthropicModels({
+          endpoint: anthropicEndpoint, apiKey: key.apiKey, fetchImpl, timeoutMs: MODEL_LIST_TIMEOUT_MS, overallTimeoutMs: MODEL_LIST_TIMEOUT_MS,
+        });
+        const models = selectOfferedModels(listed.models, anthropicKeepIds());
+        const current = stored.keys.anthropic;
+        if (!models.length || saving || !current || current.apiKey !== key.apiKey) return;
+        if (JSON.stringify(models) === JSON.stringify(current.models)) return;
+        const next: StoredAnthropicKey = { ...current, models };
+        persist({ ...stored, keys: { ...stored.keys, anthropic: next } });
+        const connection = buildAnthropicConnection(next);
+        if (connection) replaceConnection('anthropic', connection);
+        for (const model of models) logProfileDisagreementsOnce(deriveProfile(model));
+        console.log(`[AI model] The Claude model list changed; ${models.length} model(s) are offered now.`);
+      } catch {
+        // A failed re-list keeps the saved list; the next stale answer tries again after the interval.
+      } finally {
+        anthropicRefreshing = false;
+      }
+    })();
+  }
+
+  /**
+   * Keyed connections that are REGISTERED. It decides when the never-set-up
+   * launcher connection is retired, so it counts connections, not saved keys:
+   * a Claude key whose list yields no model has no connection and does not
+   * retire the launcher one.
+   */
   function keyedConnectionCount(): number {
-    return (connections.has('openai') ? 1 : 0) + (connections.has('deepseek') ? 1 : 0);
+    return (['openai', 'deepseek', 'anthropic'] as const).filter(id => connections.has(id)).length;
+  }
+
+  /** Models an Anthropic listing must keep offering even when deprecated: the key's previous list and role choices. */
+  function anthropicKeepIds(): Set<string> {
+    const ids = new Set((stored.keys.anthropic?.models ?? []).map(model => model.id));
+    for (const choice of Object.values(stored.roles)) {
+      const match = /^anthropic\.(.+)$/.exec(choice?.modelKey ?? '');
+      if (match) ids.add(match[1]);
+    }
+    return ids;
   }
 
   /** Team counts as configured with launcher credentials or a healthy client. */
@@ -622,11 +851,14 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     return null;
   }
 
-  /** Default chain: team default when configured, then OpenAI, then DeepSeek. */
-  function defaultChain(): { connection: LlmConnection; entry: LlmModelEntry } {
+  /**
+   * Default chain: team default when configured, then OpenAI, then DeepSeek, then Claude. On the chosen connection a
+   * role gets its role default when it has one (Claude's Haiku-line Organizing model), else the connection default.
+   */
+  function defaultChain(role: AiModelRole): { connection: LlmConnection; entry: LlmModelEntry } {
     const candidates = configuredConnections();
     for (const connection of candidates.length ? candidates : ordered()) {
-      const entry = connectionDefaultEntry(connection);
+      const entry = connectionRoleDefaultEntry(connection, role);
       if (entry) return { connection, entry };
     }
     throw new Error('No AI model connection exists.');
@@ -644,7 +876,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     const picked = choice?.modelKey ? findEntry(choice.modelKey) : null;
     if (picked) return { ...picked, thinking, chosen: true };
     return {
-      ...defaultChain(),
+      ...defaultChain(role),
       thinking,
       chosen: false,
       ...(choice?.modelKey ? { unavailableChoice: choice.modelKey } : {}),
@@ -661,12 +893,17 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   // Refresh each saved key's model list (best effort: offline keeps the
   // saved list). Persisted only for schema-2 files.
   const refreshed = { ...stored.keys };
-  const [openAiListed, deepSeekListed] = await Promise.all([
+  const [openAiListed, deepSeekListed, anthropicListed] = await Promise.all([
     stored.keys.openai
-      ? listOpenAiModels(openAiEndpoint, stored.keys.openai.apiKey, fetchImpl, BOOT_MODEL_LIST_TIMEOUT_MS).catch(() => null)
+      ? listOpenAiModels(openAiEndpoint, stored.keys.openai.apiKey, fetchImpl, bootListTimeoutMs).catch(() => null)
       : null,
     stored.keys.deepseek
-      ? listDeepSeekModels(deepSeekEndpoint, stored.keys.deepseek.apiKey, fetchImpl, BOOT_MODEL_LIST_TIMEOUT_MS).catch(() => null)
+      ? listDeepSeekModels(deepSeekEndpoint, stored.keys.deepseek.apiKey, fetchImpl, bootListTimeoutMs).catch(() => null)
+      : null,
+    stored.keys.anthropic
+      ? listAnthropicModels({ endpoint: anthropicEndpoint, apiKey: stored.keys.anthropic.apiKey, fetchImpl, timeoutMs: bootListTimeoutMs, overallTimeoutMs: bootListTimeoutMs })
+          .then(result => selectOfferedModels(result.models, anthropicKeepIds()))
+          .catch(() => null)
       : null,
   ]);
   let listsChanged = false;
@@ -679,6 +916,12 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     refreshed.deepseek = { ...refreshed.deepseek, models: deepSeekListed };
     listsChanged = true;
   }
+  if (refreshed.anthropic && anthropicListed?.length
+    && JSON.stringify(anthropicListed) !== JSON.stringify(refreshed.anthropic.models)) {
+    refreshed.anthropic = { ...refreshed.anthropic, models: anthropicListed };
+    listsChanged = true;
+  }
+  for (const model of anthropicListed ?? []) logProfileDisagreementsOnce(deriveProfile(model));
   if (listsChanged) {
     const next = { ...stored, keys: refreshed };
     if (persistedSchema === SCHEMA_VERSION) {
@@ -689,6 +932,10 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
   if (stored.keys.openai) connections.set('openai', buildOpenAiConnection(stored.keys.openai));
   if (stored.keys.deepseek) connections.set('deepseek', buildDeepSeekConnection(stored.keys.deepseek));
+  if (stored.keys.anthropic) {
+    const claude = buildAnthropicConnection(stored.keys.anthropic);
+    if (claude) connections.set('anthropic', claude);
+  }
   // The launcher provider stays available whenever its credentials exist, and
   // is the only (possibly not set up) connection when nothing else is.
   if (credentialsPresent || keyedConnectionCount() === 0) {
@@ -815,7 +1062,52 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     }
   }
 
+  /**
+   * Anthropic (Claude): verify the key (model list, then one minimal 16-token
+   * message), store it with its model list, then register the connection that
+   * offers every listed Claude model in chat and the role selects. A failed
+   * check leaves every connection and the stored file untouched.
+   */
+  async function saveAnthropicKey(apiKey: string): Promise<AiModelStatus> {
+    const at = now().toISOString();
+    let verification: Awaited<ReturnType<typeof verifyAnthropicKey>>;
+    try {
+      verification = await verifyAnthropicKey({ endpoint: anthropicEndpoint, apiKey, fetchImpl, keep: anthropicKeepIds() });
+    } catch (error) {
+      throw modelSettingsError(error, 'anthropic');
+    }
+    if (!verification.models.length || !verification.verifiedModel) {
+      throw new AiModelSettingsError(
+        'no_chat_models',
+        'This Anthropic key lists no Claude models BotBoy can use.',
+        `Check the key's model access at ${PROVIDER_TEXT.anthropic.keysUrl.split('/')[0]}, then try again.`,
+      );
+    }
+    const key: StoredAnthropicKey = { apiKey, savedAt: at, verifiedAt: at, models: [...verification.models] };
+    const candidate = buildAnthropicConnection(key);
+    if (!candidate) {
+      throw new AiModelSettingsError(
+        'no_chat_models',
+        'This Anthropic key lists no Claude models BotBoy can use.',
+        `Check the key's model access at ${PROVIDER_TEXT.anthropic.keysUrl.split('/')[0]}, then try again.`,
+      );
+    }
+    // The free model-list probe marks the new client healthy; a failure here only leaves it "needs attention".
+    await candidate.client.healthCheck().catch(() => false);
+    try {
+      persist({ ...stored, keys: { ...stored.keys, anthropic: key } });
+    } catch {
+      candidate.client.close();
+      throw storageFailed('save the verified key privately');
+    }
+    replaceConnection('anthropic', candidate);
+    for (const model of key.models) logProfileDisagreementsOnce(deriveProfile(model));
+    console.log(`[AI model] ${PROVIDER_TEXT.anthropic.label} key ${keySuffix(apiKey)} verified; ${key.models.length} Claude model(s) listed.`);
+    return status();
+  }
+
   async function saveKey(provider: AiModelKeyProvider, apiKey: string): Promise<AiModelStatus> {
+    if (provider === 'anthropic') return saveAnthropicKey(apiKey);
     const at = now().toISOString();
     let candidate: LlmConnection;
     let nextKeys: StoredAiModelSettings['keys'];
@@ -859,9 +1151,10 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       replaceConnection(provider, undefined);
       console.log(`[AI model] ${PROVIDER_TEXT[provider].label} key removed.`);
     } else {
-      // The file changed even without a live connection; open pages refresh.
+      // The file changed even without a live connection (a Claude key whose list yielded no model); open pages refresh.
       settingsVersion += 1;
       rebindRoles();
+      if (provider === 'anthropic') console.log(`[AI model] ${PROVIDER_TEXT[provider].label} key removed.`);
     }
     return status();
   }
@@ -885,10 +1178,10 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       }
       thinking = choice.thinking === 'off' ? undefined : choice.thinking;
     }
-    const nextRole: StoredRole = { ...(modelKey ? { modelKey } : {}), ...(thinking ? { thinking } : {}) };
+    const nextRole: StoredRole = { ...(modelKey ? { modelKey } : {}), ...(thinking ? { thinking } : {}), ...(current.extra ? { extra: current.extra } : {}) };
     const { [role]: _previous, ...otherRoles } = stored.roles;
     try {
-      persist({ ...stored, roles: { ...otherRoles, ...(modelKey || thinking ? { [role]: nextRole } : {}) } });
+      persist({ ...stored, roles: { ...otherRoles, ...(modelKey || thinking || current.extra ? { [role]: nextRole } : {}) } });
     } catch {
       throw storageFailed('save the model choice');
     }
@@ -899,7 +1192,8 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
 
   function connectionReady(connection: LlmConnection): boolean {
     const issueCode = connection.client.getProviderIssue?.()?.code;
-    return connection.client.isAvailable() && (!issueCode || issueCode === 'rate_limited');
+    // Rate limiting and provider overload (a 529) clear on their own and do not make a connection unusable.
+    return connection.client.isAvailable() && (!issueCode || issueCode === 'rate_limited' || issueCode === 'overloaded');
   }
 
   /** Cheap, non-throwing state for the version poll. */
@@ -910,7 +1204,10 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   function connectionStatus(connection: LlmConnection): AiModelConnectionStatus {
-    const key = connection.id === 'openai' ? stored.keys.openai : connection.id === 'deepseek' ? stored.keys.deepseek : undefined;
+    const key = connection.id === 'openai' ? stored.keys.openai
+      : connection.id === 'deepseek' ? stored.keys.deepseek
+        : connection.id === 'anthropic' ? stored.keys.anthropic
+          : undefined;
     const issue = issueFor(connection.client.getProviderIssue?.(), connection);
     return {
       id: connection.id,
@@ -924,6 +1221,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
         label: entry.label,
         ...(entry.capabilities.images !== undefined ? { images: entry.capabilities.images } : {}),
         contextWindow: entry.capabilities.contextWindow,
+        ...(entry.capabilities.thinkingOff !== undefined ? { thinkingOff: entry.capabilities.thinkingOff } : {}),
       })),
       ...(issue ? { issue } : {}),
     };
@@ -950,6 +1248,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       chosen: resolved.chosen,
       ...(resolved.unavailableChoice ? { unavailableChoice: resolved.unavailableChoice } : {}),
       ...(resolved.entry.capabilities.images !== undefined ? { images: resolved.entry.capabilities.images } : {}),
+      ...(resolved.entry.capabilities.thinkingOff !== undefined ? { thinkingOff: resolved.entry.capabilities.thinkingOff } : {}),
     };
   }
 
@@ -963,6 +1262,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     const issue = issueFor(organizing.connection.client.getProviderIssue?.(), organizing.connection);
     const openai = keySummary(stored.keys.openai);
     const deepseek = keySummary(stored.keys.deepseek);
+    const anthropic = keySummary(stored.keys.anthropic);
     return {
       state: currentState(),
       configVersion: settingsVersion,
@@ -977,6 +1277,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       models: shown.flatMap(connection => connection.models.map(entry => ({ key: entry.key, label: entry.label }))),
       ...(openai ? { openai } : {}),
       ...(deepseek ? { deepseek } : {}),
+      ...(anthropic ? { anthropic } : {}),
       ...(credentialsPresent && keyedConnectionCount() > 0
         ? { environmentProviderLabel: legacyProviderLabel(deps.envProvider.id) }
         : {}),
@@ -986,10 +1287,14 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
 
   const chatModels = createConnectionChatModelSource({
     connections: displayConnections,
-    // D4: the team default when configured, otherwise the organizing model.
-    defaultKey: () => (teamConfigured()
-      ? connectionDefaultEntry(connections.get('team')!)?.key
-      : boundRole('processing').entry.key),
+    // D8: the team default when configured. Otherwise an explicit Organizing choice keeps today's rule (the model
+    // the owner picked is the chat default); Automatic resolves through the Organizing connection's own default
+    // model, so a role default (Claude's Haiku-line Organizing model) never becomes the chat default.
+    defaultKey: () => {
+      if (teamConfigured()) return connectionDefaultEntry(connections.get('team')!)?.key;
+      const organizing = boundRole('processing');
+      return organizing.chosen ? organizing.entry.key : connectionDefaultEntry(organizing.connection)?.key;
+    },
     onChange: listener => {
       connectionListeners.add(listener);
       return () => { connectionListeners.delete(listener); };
@@ -998,6 +1303,32 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
 
   function validKey(provider: AiModelKeyProvider, apiKey: unknown): string {
     const key = typeof apiKey === 'string' ? apiKey.trim() : '';
+    if (provider === 'anthropic') {
+      // Admin keys serve the Admin API only; a regular key is `sk-ant-api…`. The one place a key enters, before any header exists (D10).
+      if (isAnthropicAdminKey(key)) {
+        throw new AiModelSettingsError(
+          'invalid_format',
+          'That is an Anthropic Admin key, which cannot call models.',
+          `Create a regular API key at ${ANTHROPIC_KEYS_URL}. It starts with "sk-ant-api".`,
+        );
+      }
+      if (!isAnthropicApiKey(key)) {
+        throw new AiModelSettingsError(
+          'invalid_format',
+          'That does not look like an Anthropic API key.',
+          `Paste the full key from ${ANTHROPIC_KEYS_URL}. It starts with "sk-ant-".`,
+        );
+      }
+      return key;
+    }
+    // An Anthropic key also passes the shared sk- pattern; send it to its own card instead of failing later.
+    if (looksLikeAnthropicKey(key)) {
+      throw new AiModelSettingsError(
+        'invalid_format',
+        `That is an Anthropic key, not ${provider === 'openai' ? 'an OpenAI' : 'a DeepSeek'} key.`,
+        'Paste it into the Anthropic (Claude) card instead.',
+      );
+    }
     if (!API_KEY_PATTERN.test(key)) {
       throw new AiModelSettingsError(
         'invalid_format',
@@ -1009,8 +1340,8 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   function validProvider(provider: unknown): AiModelKeyProvider {
-    if (provider === 'openai' || provider === 'deepseek') return provider;
-    throw new AiModelSettingsError('invalid_provider', 'Unknown AI model provider.', 'Use OpenAI or DeepSeek in Settings → AI model.');
+    if (provider === 'openai' || provider === 'deepseek' || provider === 'anthropic') return provider;
+    throw new AiModelSettingsError('invalid_provider', 'Unknown AI model provider.', 'Use OpenAI, DeepSeek or Anthropic (Claude) in Settings → AI model.');
   }
 
   const service: AiModelSettingsService = {

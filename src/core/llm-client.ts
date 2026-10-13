@@ -239,6 +239,20 @@ function validateStrictJsonSchema(schema: Record<string, unknown>): void {
   visit(schema, '$', 0);
 }
 
+/**
+ * A strict JSON-Schema response format after BotBoy's closed-schema checks (name, `strict: true`, plain object schema,
+ * `validateStrictJsonSchema`); null for any other format. Shared by every transport, so the contract is checked once.
+ */
+export function validateStrictResponseFormat(format: LlmResponseFormat): LlmJsonSchemaResponseFormat | null {
+  if (format.type !== 'json_schema') return null;
+  if (format.strict !== true || !/^[A-Za-z0-9_-]{1,64}$/.test(format.name)
+    || !plainSchemaObject(format.schema)) {
+    throw new Error('Structured output requires strict mode, a provider-safe name, and an object JSON Schema.');
+  }
+  validateStrictJsonSchema(format.schema);
+  return format;
+}
+
 export interface LlmRequestRoute {
   /** Exact provider-qualified model selected by the server-owned catalog. */
   readonly model: string;
@@ -331,8 +345,11 @@ export interface LlmMessage {
 /** Which model-family conventions the remote endpoint uses. */
 export type LlmDialect = 'qwen' | 'kimi' | 'openai';
 
-/** Remote OpenAI-compatible wire protocol. */
-export type LlmApiMode = 'chat-completions' | 'responses';
+/**
+ * Remote wire protocol. `chat-completions` and `responses` are OpenAI-compatible and served by `createLlmClient`;
+ * `messages` is Anthropic's Messages API, served by `anthropic-client.ts` (the generic client never sees it).
+ */
+export type LlmApiMode = 'chat-completions' | 'responses' | 'messages';
 
 /** Thinking-effort levels exposed through BotBoy's provider-neutral contract. */
 export type ReasoningEffort = 'low' | 'high' | 'max';
@@ -418,8 +435,10 @@ export function isLlmPayloadTooLargeError(error: unknown): error is LlmPayloadTo
   return error instanceof LlmPayloadTooLargeError || (error as any)?.code === 'LLM_PAYLOAD_TOO_LARGE';
 }
 
-/** Hosted model APIs reached with the owner's own key (Settings → AI model). */
+/** Hosted model APIs reached with the owner's own key (Settings → AI model) on the OpenAI-compatible transport. */
 export type LlmHostedPlatform = 'openai' | 'deepseek';
+/** Platforms with a typed exhausted-credit error: the hosted OpenAI-compatible APIs and Anthropic (its own transport). */
+export type LlmQuotaPlatform = LlmHostedPlatform | 'anthropic';
 
 /**
  * The provider is throttling this credential. Request-specific, never endpoint
@@ -438,27 +457,50 @@ export class LlmRateLimitedError extends Error {
 export class LlmQuotaExhaustedError extends Error {
   readonly code = 'LLM_QUOTA_EXHAUSTED';
   readonly nextAction: string;
-  constructor(readonly platform: LlmHostedPlatform = 'openai') {
-    super(platform === 'deepseek'
+  /**
+   * `copy` carries wording the caller already classified (Anthropic distinguishes billing, a spend limit the owner
+   * set, and the tier's monthly cap); without it each platform keeps its own fixed text.
+   */
+  constructor(readonly platform: LlmQuotaPlatform = 'openai', copy?: { message: string; nextAction: string }) {
+    super(copy?.message ?? (platform === 'deepseek'
       ? 'The DeepSeek account behind this API key has no balance left.'
-      : 'The OpenAI account behind this API key has no available credit.');
+      : platform === 'anthropic'
+        ? 'The Anthropic account behind this API key has no available credit.'
+        : 'The OpenAI account behind this API key has no available credit.'));
     this.name = 'LlmQuotaExhaustedError';
-    this.nextAction = platform === 'deepseek'
+    this.nextAction = copy?.nextAction ?? (platform === 'deepseek'
       ? 'Top up this DeepSeek account (platform.deepseek.com → Top up), then try again.'
-      : 'Add credit or raise the spending limit for this OpenAI account (platform.openai.com → Billing), then try again.';
+      : platform === 'anthropic'
+        ? 'Add credit at platform.claude.com/settings/billing, then try again.'
+        : 'Add credit or raise the spending limit for this OpenAI account (platform.openai.com → Billing), then try again.');
   }
 }
 
-/** Account/credential limits are not endpoint failures and never authorize fallback. */
-export function isLlmProviderLimitError(error: unknown): error is LlmRateLimitedError | LlmQuotaExhaustedError {
+/**
+ * The provider is temporarily at capacity (Anthropic 529). BotBoy already retried within its bounds; the credential is
+ * fine, so this is request-specific, never endpoint health, and never authorizes fallback.
+ */
+export class LlmProviderOverloadedError extends Error {
+  readonly code = 'LLM_PROVIDER_OVERLOADED';
+  readonly nextAction: string;
+  constructor(readonly retryAfterMs?: number, provider = 'Anthropic') {
+    super(`${provider} is temporarily overloaded.`);
+    this.name = 'LlmProviderOverloadedError';
+    this.nextAction = `${provider} is busy. BotBoy already retried; try again in a minute.`;
+  }
+}
+
+/** Account/credential limits and provider capacity are not endpoint failures and never authorize fallback. */
+export function isLlmProviderLimitError(error: unknown): error is LlmRateLimitedError | LlmQuotaExhaustedError | LlmProviderOverloadedError {
   const code = (error as any)?.code;
-  return error instanceof LlmRateLimitedError || error instanceof LlmQuotaExhaustedError
-    || code === 'LLM_RATE_LIMITED' || code === 'LLM_QUOTA_EXHAUSTED';
+  return error instanceof LlmRateLimitedError || error instanceof LlmQuotaExhaustedError || error instanceof LlmProviderOverloadedError
+    || code === 'LLM_RATE_LIMITED' || code === 'LLM_QUOTA_EXHAUSTED' || code === 'LLM_PROVIDER_OVERLOADED';
 }
 
 /** Most recent credential/account problem the provider reported, for owner status. */
 export interface LlmProviderIssue {
-  readonly code: 'auth_rejected' | 'quota_exhausted' | 'rate_limited';
+  /** `overloaded`: the provider is temporarily at capacity (Anthropic 529). It retries on its own and leaves the connection ready. */
+  readonly code: 'auth_rejected' | 'quota_exhausted' | 'rate_limited' | 'overloaded';
   readonly httpStatus: number;
   readonly at: string;
 }
@@ -514,7 +556,8 @@ export function retryAfterMs(headers: Pick<Headers, 'get'>): number | undefined 
   return resets.length ? Math.max(...resets) : undefined;
 }
 
-function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+/** Wait `ms`, rejecting with the signal's reason if it aborts first. */
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'));
     const timer = setTimeout(() => {
@@ -604,13 +647,18 @@ function assertProviderRequestConstraint(size: ProviderRequestSize, constraint?:
   }
 }
 
+/**
+ * Serialize once and gate the exact string. `measure` replaces how image bytes are counted for a wire format that
+ * does not carry `data:image/` URLs (Anthropic's base64 image blocks); without it `requireImageFree` would pass vacuously.
+ */
 export function serializeProviderRequest(
   body: unknown,
   maximumBytes?: number,
   constraint?: ProviderRequestConstraint,
+  measure: (bodyStr: string) => ProviderRequestSize = providerRequestSize,
 ): { bodyStr: string; size: ProviderRequestSize } {
   const bodyStr = JSON.stringify(body);
-  const size = assertProviderRequestSize(bodyStr, maximumBytes);
+  const size = assertProviderRequestSize(bodyStr, maximumBytes, measure);
   assertProviderRequestConstraint(size, constraint);
   return { bodyStr, size };
 }
@@ -618,8 +666,9 @@ export function serializeProviderRequest(
 export function assertProviderRequestSize(
   bodyStr: string,
   maximumBytes = Number(process.env.BOTBOY_LLM_MAX_REQUEST_BYTES || 5_500_000),
+  measure: (bodyStr: string) => ProviderRequestSize = providerRequestSize,
 ): ProviderRequestSize {
-  const size = providerRequestSize(bodyStr);
+  const size = measure(bodyStr);
   const boundedMaximum = Number.isFinite(maximumBytes) && maximumBytes > 0 ? Math.floor(maximumBytes) : 5_500_000;
   if (size.bodyBytes > boundedMaximum) throw new LlmPayloadTooLargeError(size, boundedMaximum);
   return size;
@@ -1328,13 +1377,7 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
   }
 
   function strictJsonSchemaFormat(format: LlmResponseFormat): LlmJsonSchemaResponseFormat | null {
-    if (format.type !== 'json_schema') return null;
-    if (format.strict !== true || !/^[A-Za-z0-9_-]{1,64}$/.test(format.name)
-      || !plainSchemaObject(format.schema)) {
-      throw new Error('Structured output requires strict mode, a provider-safe name, and an object JSON Schema.');
-    }
-    validateStrictJsonSchema(format.schema);
-    return format;
+    return validateStrictResponseFormat(format);
   }
 
   function openAIResponseFormat(format: LlmResponseFormat): LlmResponseFormat | {

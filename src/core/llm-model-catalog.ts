@@ -2,7 +2,8 @@
  * Model connections and the models each one offers (Settings → AI model).
  *
  * A connection is one credential to one provider: the team gateway (launcher
- * configuration), the owner's OpenAI key, or the owner's DeepSeek key. Every
+ * configuration), the owner's OpenAI key, the owner's DeepSeek key, or the owner's
+ * Anthropic (Claude) key. Every
  * model a connection offers gets a provider-qualified key
  * (`team.terra`, `openai.gpt-5.6-terra`, `deepseek.deepseek-flash`), an exact
  * server-only route, and a capability profile.
@@ -15,6 +16,7 @@
  */
 import type { ChatCompletionRequest, LlmClient, LlmRequestRoute } from './llm-client.js';
 import type { LlmModelCapabilities, LlmModelOperation, LlmProviderDescriptor } from './llm-model-operation.js';
+import { deriveProfile, type AnthropicModelProfile } from './anthropic-models.js';
 import {
   BLESSED_CHAT_MODELS,
   OPENAI_PLATFORM_DEFAULT_MODEL,
@@ -25,9 +27,9 @@ import {
   type ChatModelCatalog,
 } from './inference-provider.js';
 
-export type LlmConnectionId = 'team' | 'openai' | 'deepseek';
-/** Picker and Settings order. */
-export const LLM_CONNECTION_ORDER: readonly LlmConnectionId[] = Object.freeze(['team', 'openai', 'deepseek']);
+export type LlmConnectionId = 'team' | 'openai' | 'deepseek' | 'anthropic';
+/** Picker and Settings order. Claude comes last, so existing Automatic behavior is unchanged. */
+export const LLM_CONNECTION_ORDER: readonly LlmConnectionId[] = Object.freeze(['team', 'openai', 'deepseek', 'anthropic']);
 
 /** Same levels as the chat Thinking control. */
 export type LlmThinkingLevel = 'off' | 'low' | 'high' | 'max';
@@ -38,7 +40,7 @@ export function isLlmThinkingLevel(value: unknown): value is LlmThinkingLevel {
 }
 
 /** `<connection>.<model id>`; model ids may contain dots and colons (fine-tunes). */
-export const LLM_MODEL_KEY_PATTERN = /^(team|openai|deepseek)\.[A-Za-z0-9._:-]{1,160}$/;
+export const LLM_MODEL_KEY_PATTERN = /^(team|openai|deepseek|anthropic)\.[A-Za-z0-9._:-]{1,160}$/;
 const MODEL_ID_PATTERN = /^[A-Za-z0-9._:-]{1,160}$/;
 
 export function qualifiedModelKey(connectionId: LlmConnectionId, modelId: string): string {
@@ -72,12 +74,27 @@ export interface LlmConnection {
   readonly client: LlmClient;
   readonly provider: LlmProviderDescriptor;
   readonly models: readonly LlmModelEntry[];
+  /**
+   * Role defaults that differ from the connection default, used only while the owner has not picked a model for
+   * that role (Automatic). `processing` (Organizing) is a model key of this connection's `models`; Claude sets it
+   * to its Haiku-line model. Document writing, key verification and the chat default stay on the connection default.
+   */
+  readonly roleDefaultModels?: { readonly processing?: string };
   /** Bumps whenever this connection is replaced; chat turns pin it. */
   readonly version: number;
 }
 
 export function connectionDefaultEntry(connection: LlmConnection): LlmModelEntry | undefined {
   return connection.models.find(entry => entry.isConnectionDefault) ?? connection.models[0];
+}
+
+/**
+ * What Automatic assigns to a background role on one connection: its role default when that model is offered,
+ * otherwise the connection default. A connection without `roleDefaultModels` always answers its default.
+ */
+export function connectionRoleDefaultEntry(connection: LlmConnection, role: 'processing' | 'documents'): LlmModelEntry | undefined {
+  const wanted = role === 'processing' ? connection.roleDefaultModels?.processing : undefined;
+  return (wanted ? connection.models.find(entry => entry.key === wanted) : undefined) ?? connectionDefaultEntry(connection);
 }
 
 // ── Team gateway (launcher configuration) ──
@@ -316,6 +333,31 @@ export function deepSeekModelEntries(profiles: readonly DeepSeekModelProfile[], 
     isConnectionDefault: profile.id === defaultModel,
     preview: false,
     capabilities: deepSeekModelCapabilities(profile),
+  }));
+}
+
+// ── Anthropic API (owner's key) ──
+
+/**
+ * The Claude models a key offers (already lifecycle-filtered by `selectOfferedModels`), one entry each. Titles come from
+ * the list's `display_name`; the route is the model id alone (the client never takes an alternate endpoint or headers);
+ * `thinkingOff` records how Off behaves on that model's thinking profile (D2).
+ */
+export function anthropicModelEntries(models: readonly AnthropicModelProfile[], defaultModel: string): LlmModelEntry[] {
+  return models.map(profile => ({
+    key: qualifiedModelKey('anthropic', profile.id),
+    connectionId: 'anthropic' as const,
+    label: profile.name,
+    model: profile.id,
+    route: { model: profile.id },
+    isConnectionDefault: profile.id === defaultModel,
+    preview: false,
+    capabilities: {
+      ...(profile.images !== undefined ? { images: profile.images } : {}),
+      contextWindow: profile.contextWindow,
+      maxOutputTokens: profile.maxOutputTokens,
+      thinkingOff: deriveProfile(profile).thinkingOff,
+    },
   }));
 }
 

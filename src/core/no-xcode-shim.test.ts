@@ -72,3 +72,45 @@ describe('no Xcode shim on the start and doctor paths', () => {
     });
   }
 });
+
+describe('the server reaches no Xcode shim on a Mac without Command Line Tools', () => {
+  const read = (file: string) => fs.readFileSync(path.join(root, 'src', 'core', file), 'utf8');
+  const index = (text: string, needle: string) => {
+    const at = text.indexOf(needle);
+    expect(at, needle).toBeGreaterThan(-1);
+    return at;
+  };
+
+  it('toolchain.ts resolves /usr/bin/git and /usr/bin/python3 to "not installed" unless xcode-select answers, before any version probe', () => {
+    const text = read('toolchain.ts');
+    expect(text).toMatch(/XCODE_SHIM_TOOLS = new Set\(\['\/usr\/bin\/git', '\/usr\/bin\/python3'\]\)/);
+    expect(text).toMatch(/function commandLineToolsPresent\(\)[\s\S]*?\['-p'\]/);
+    const gate = index(text, 'XCODE_SHIM_TOOLS.has(resolved) && !developerToolsPresent()');
+    expect(gate).toBeLessThan(index(text, 'probeVersion(resolved, spec.versionArgs)'));
+    // the tool is dropped (never run) and the hint names the fix
+    expect(text.slice(gate, gate + 300)).toContain('resolved = null');
+    expect(text).toContain('install the Command Line Tools (xcode-select --install)');
+  });
+
+  it('toolchain.ts runs the OCR helper never: the boot inventory reads the resolver\'s verdict only', () => {
+    const text = read('toolchain.ts');
+    expect(text).toContain('visionHelperStatus()');
+    expect(text).not.toMatch(/execFile\([^)]*vision-ocr|spawnSync\([^)]*vision/);
+  });
+
+  it('app-update.ts asks gitUsable before it runs git at all, and gitUsable asks xcode-select for the /usr/bin shim', () => {
+    const text = read('app-update.ts');
+    expect(text).toMatch(/export function gitUsable\(/);
+    expect(text).toMatch(/found !== '\/usr\/bin\/git'[\s\S]*?\['-p'\]/);
+    const gate = index(text, 'if (!this.canUseGit(this.projDir))');
+    expect(gate).toBeLessThan(index(text, 'isReleaseCheckout(this.projDir, this.git)'));
+    expect(gate).toBeLessThan(index(text, "this.git(['fetch'"));
+    expect(text).toMatch(/\.git'\)\)\) return false/); // a ZIP checkout has no .git
+  });
+
+  it('the native helper module spawns only the helper, xattr, and nothing from Xcode', () => {
+    const text = read('native-helpers.ts');
+    expect(text).not.toMatch(/['"`](xcrun|swiftc|lipo|otool|vtool|git|xcode-select)['"`]/);
+    expect(text).toMatch(/xattrBin\(\), \['-p', QUARANTINE_ATTRIBUTE/);
+  });
+});

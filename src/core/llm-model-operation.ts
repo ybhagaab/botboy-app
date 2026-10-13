@@ -24,12 +24,22 @@ export interface LlmProviderDescriptor {
   readonly apiMode: LlmApiMode;
 }
 
+/**
+ * How a model honors Thinking "Off" (Claude only; undefined elsewhere).
+ * `native`: Off really omits or disables thinking. `native_without_tools`: native when no tools are sent (background
+ * roles), the lowest effort with tools (chat). `lowest_effort`: the model always thinks a little; Off uses its lowest
+ * effort. `unavailable`: the model has no thinking control.
+ */
+export type LlmThinkingOffMode = 'native' | 'native_without_tools' | 'lowest_effort' | 'unavailable';
+
 /** What one model can take; read per use, never cached across models. */
 export interface LlmModelCapabilities {
   /** true/false when known; undefined when the provider does not report it. */
   readonly images?: boolean;
   readonly contextWindow: number;
   readonly maxOutputTokens: number;
+  /** How Thinking "Off" behaves on this model; set for Claude models, absent for the others. */
+  readonly thinkingOff?: LlmThinkingOffMode;
 }
 
 export interface LlmModelOperation {

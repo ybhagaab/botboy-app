@@ -5,6 +5,8 @@
  * storing raw bytes (2026-10-05).
  */
 const { present } = vi.hoisted(() => ({ present: new Set<string>() }));
+// The OCR helper is judged from the manifest and file hashes (native-helpers.ts); a fixture folder stands in for "present".
+import { cleanupFixtures, fixture } from './native-helpers.testutil.js';
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
@@ -20,7 +22,6 @@ vi.mock('child_process', async (importOriginal) => {
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   const controlled = (file: string): string | null => {
-    if (file.endsWith('vision-ocr')) return 'vision-ocr';
     if (file.endsWith('pdfjs-dist/legacy/build/pdf.mjs') || file.endsWith('scripts/pdf-text.mjs')) return 'pdf.js';
     return null;
   };
@@ -30,7 +31,13 @@ vi.mock('fs', async (importOriginal) => {
 const { checkDependencies } = await import('./deps-check.js');
 
 describe('PDF parsing dependency', () => {
-  beforeEach(() => present.clear());
+  beforeEach(() => {
+    present.clear();
+    cleanupFixtures();
+    // No helper by default: an empty package folder has no manifest.
+    process.env.BOTBOY_TEST_NATIVE_ROOT = fixture({ manifest: 'missing', withBinary: false }).root;
+  });
+  afterEach(() => cleanupFixtures());
   const pdfDep = () => checkDependencies().deps.find((dep) => dep.name.startsWith('pdf parsing'))!;
 
   it('is missing with only textutil, and says what to run', () => {
@@ -46,7 +53,7 @@ describe('PDF parsing dependency', () => {
     present.add('pdftotext');
     expect(pdfDep()).toMatchObject({ ok: true, detail: 'available (pdftotext)' });
     if (process.platform === 'darwin') {
-      present.add('vision-ocr');
+      process.env.BOTBOY_TEST_NATIVE_ROOT = fixture().root; // a valid prebuilt helper
       expect(pdfDep()).toMatchObject({ ok: true, detail: 'available (native PDFKit helper)' });
     }
   });

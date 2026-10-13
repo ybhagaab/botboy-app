@@ -132,4 +132,14 @@ describe('hosted OpenAI provider (Settings → AI model)', () => {
     // An ambient OPENAI_API_KEY alone never redirects BotBoy's data.
     expect(resolveInferenceProviderId({ OPENAI_API_KEY: 'sk-ambient-0000000000000000' })).toBe('bedrock');
   });
+
+  it('keeps Anthropic (Claude) Settings-only too: the variable throws toward Settings and an ambient key is ignored', () => {
+    expect(() => resolveInferenceProviderId({ BOTBOY_INFERENCE_PROVIDER: 'anthropic' }))
+      .toThrow(/Add your Anthropic \(Claude\) API key in BotBoy Settings → AI model/);
+    expect(() => resolveInferenceProviderId({ BOTBOY_INFERENCE_PROVIDER: ' Anthropic ' })).toThrow(/Settings → AI model/);
+    expect(() => resolveInferenceProviderId({ BOTBOY_INFERENCE_PROVIDER: 'deepseek' })).toThrow(/Add your DeepSeek API key/);
+    // The owner's own Claude Code settings never redirect BotBoy's data.
+    const ambient = ['sk', 'ant', 'api03', 'ambient'.repeat(5)].join('-');
+    expect(resolveInferenceProviderId({ ANTHROPIC_API_KEY: ambient, ANTHROPIC_AUTH_TOKEN: ambient })).toBe('bedrock');
+  });
 });

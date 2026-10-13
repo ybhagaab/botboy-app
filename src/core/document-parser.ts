@@ -17,6 +17,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pdfTextScriptPath, visionHelperPath } from './deps-check.js';
+import { noteHelperExecFailure } from './native-helpers.js';
 
 export interface ParseResult {
   success: boolean;
@@ -195,6 +196,7 @@ export function createDocumentParser(): DocumentParser {
         return pdfHelperText(run(helper, ['pdf-text', filePath], PDF_TOOL_TIMEOUT_MS));
       } catch (err) {
         if (err instanceof Error && /password/i.test(err.message)) throw err;
+        noteHelperExecFailure(err, helper);
         errors.helper = toolError(err);
       }
     }
@@ -220,6 +222,7 @@ export function createDocumentParser(): DocumentParser {
         return pdfHelperText(await runAsync(helper, ['pdf-text', filePath], PDF_TOOL_TIMEOUT_MS));
       } catch (err) {
         if (err instanceof Error && /password/i.test(err.message)) throw err;
+        noteHelperExecFailure(err, helper);
         errors.helper = toolError(err);
       }
     }
@@ -1095,6 +1098,7 @@ export function createDocumentParser(): DocumentParser {
         };
       } catch (err) {
         if (err instanceof Error && /password/i.test(err.message)) throw err;
+        noteHelperExecFailure(err, helper);
       }
     }
     // BotBoy's own pdf.js reader caps pages natively too.

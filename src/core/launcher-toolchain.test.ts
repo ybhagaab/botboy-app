@@ -20,6 +20,8 @@ afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
+// Until the prebuilt OCR helper (2026-10-13) start.sh printed this itself when xcode-select failed. The words now come from the Node job
+// (scripts/bootstrap-deps.mjs, reason table in scripts/native-prebuilt.mjs), so the shell stays silent.
 const OCR_NOTE =
   'OCR helper not built: install Xcode Command Line Tools with `xcode-select --install`; BotBoy works without it except text from images and scanned PDFs';
 
@@ -95,7 +97,7 @@ describe('start.sh › heal_missing_npm_dependencies', () => {
 });
 
 describe('start.sh › rebuild_ocr_helper_if_needed', () => {
-  it('prints the one-line note and runs no compiler when xcode-select fails', () => {
+  it('runs no compiler and prints nothing of its own when xcode-select fails (the Node job owns the words)', () => {
     const b = box();
     b.addOcrSource();
     const xcodeSelect = b.stub('xcode-select', 'exit 2');
@@ -107,9 +109,8 @@ describe('start.sh › rebuild_ocr_helper_if_needed', () => {
       PATH: `${b.stubs}:${process.env.PATH}`,
     });
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain(OCR_NOTE);
-    expect(result.stdout.split(OCR_NOTE).length - 1).toBe(1);
-    expect(result.stdout).not.toContain('rebuild failed');
+    expect(result.stdout).toBe('');
+    expect(result.stdout).not.toContain(OCR_NOTE);
     expect(b.ran('swiftc')).toBe(false);
     expect(b.ran('xcrun')).toBe(false);
   });
@@ -192,7 +193,9 @@ describe('start.sh › doctor_toolchain_rows', () => {
     const xcrun = b.stub('xcrun', 'echo /stub/swiftc');
     const result = b.run('BOTBOY_TEST_DOCTOR_TOOLCHAIN', { BOTBOY_TEST_XCODE_SELECT_BIN: xcodeSelect, BOTBOY_TEST_XCRUN_BIN: xcrun });
     expect(result.stdout).toContain('xcode-clt: installed (swiftc found)');
-    expect(result.stdout).toContain('vision-ocr helper not built (tools present; run ./start.sh)');
+    // This bare box has no scripts/bootstrap-deps.mjs, so the shell cannot ask the resolver: the row says unknown (never "run ./start.sh" to build).
+    expect(result.stdout).toContain('ocr helper: unknown');
+    expect(result.stdout).not.toContain('tools present; run ./start.sh');
   });
 
   it('shows MISSING with the consequence when the tools are absent', () => {
@@ -200,18 +203,21 @@ describe('start.sh › doctor_toolchain_rows', () => {
     const xcodeSelect = b.stub('xcode-select', 'exit 2');
     const result = b.run('BOTBOY_TEST_DOCTOR_TOOLCHAIN', { BOTBOY_TEST_XCODE_SELECT_BIN: xcodeSelect });
     expect(result.stdout).toContain(
-      'xcode-clt: MISSING — run: xcode-select --install; without it BotBoy cannot read text inside images or scanned PDFs (text PDFs still work)',
+      "xcode-clt: not installed (optional: BotBoy's helpers ship prebuilt; the tools are needed only for Node 20's database module, for git, and to build a helper from source)",
     );
-    expect(result.stdout).toContain('vision-ocr helper not built (Xcode Command Line Tools missing: images and scanned PDFs unavailable)');
+    expect(result.stdout).not.toContain('xcode-clt: MISSING');
+    expect(result.stdout).toContain('pdf readers: vision-ocr helper unknown (see the ocr helper row);');
   });
 
-  it('says built when the helper exists', () => {
+  it('says a local helper is in use when one exists', () => {
     const b = box();
     const binDir = path.join(b.dir, 'native', 'vision-ocr', 'bin');
     fs.mkdirSync(binDir, { recursive: true });
     fs.writeFileSync(path.join(binDir, 'vision-ocr'), '#!/bin/sh\n', { mode: 0o755 });
     const xcodeSelect = b.stub('xcode-select', 'exit 2');
     const result = b.run('BOTBOY_TEST_DOCTOR_TOOLCHAIN', { BOTBOY_TEST_XCODE_SELECT_BIN: xcodeSelect });
-    expect(result.stdout).toContain('pdf readers: vision-ocr helper built;');
+    // This bare box also lacks scripts/bootstrap-deps.mjs, so the shell cannot ask the resolver: the row says unknown, never "built".
+    expect(result.stdout).toContain('ocr helper: unknown');
+    expect(result.stdout).toContain('pdf readers: vision-ocr helper unknown (see the ocr helper row);');
   });
 });

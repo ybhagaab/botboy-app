@@ -23,8 +23,8 @@ afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
-type Signature = { source: string; swiftc: string; osBuild: string };
-type Marker = { schema: number; kind: string; failedAt: string; durationMs: number | null; reason: string; signature: Signature };
+type Signature = { source: string; swiftc: string; osBuild: string; prebuilt?: string };
+type Marker = { schema: number; kind: string; failedAt: string; durationMs: number | null; reason: string; signature: Signature; reasonCode?: string };
 type Mod = {
   ocrBuildTimeoutMs: (env?: Record<string, string | undefined>) => number;
   excerptCompilerOutput: (text: string, head?: number, tail?: number) => { lines: string[]; total: number; omitted: number };
@@ -32,13 +32,14 @@ type Mod = {
   formatSeconds: (ms: number) => string;
   ocrBuildFailedNote: (firstLine: string, extra?: { durationMs?: number }) => string;
   ocrOffNote: () => string;
+  ocrKeptNote: (reason?: string) => string;
   ocrMarkerPath: (home?: string) => string;
   readOcrMarker: (options?: { file?: string }) => Marker | null;
   writeOcrMarker: (marker: Omit<Marker, 'schema'>, options?: { file?: string }) => boolean;
   clearOcrMarker: (options?: { file?: string }) => void;
   ocrMarkerDoctorText: (marker: Marker) => string;
   sameOcrSignature: (a: Signature | null, b: Signature | null) => boolean;
-  computeOcrSignature: (swiftc: string, deps?: { run?: (file: string, args: string[], opts?: unknown) => unknown; source?: string }) => Signature;
+  computeOcrSignature: (swiftc: string, deps?: { run?: (file: string, args: string[], opts?: unknown) => unknown; source?: string; prebuiltSha?: string }) => Signature;
   acquireOcrBuildLock: (options?: { dir?: string; maxAgeMs: number; now?: () => number }) => { ok: boolean; release?: () => void; ageMs?: number };
 };
 const load = () => import(/* @vite-ignore */ bootstrapUrl) as Promise<Mod>;
@@ -116,8 +117,23 @@ describe('notes', () => {
   it('the calm note is exactly the agreed text', async () => {
     const { ocrOffNote } = await load();
     expect(ocrOffNote()).toBe(
-      "Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy's helper (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > Software Update, then run ./start.sh --rebuild-ocr.",
+      "Text reading from images and scanned PDFs (OCR) is off: the Swift tools on this Mac cannot build BotBoy's helper (usually the Command Line Tools and macOS versions do not match). BotBoy works fine without it. To enable it, update macOS and the Command Line Tools in System Settings > General > Software Update, then run ./start.sh --rebuild-ocr.",
     );
+  });
+  it('carry-over 1: no message anywhere names the old Software Update path', async () => {
+    const { ocrOffNote, ocrKeptNote } = await load();
+    for (const text of [ocrOffNote(), ocrKeptNote('error: boom'), fs.readFileSync(bootstrapPath, 'utf8')]) {
+      expect(text).not.toMatch(/System Settings > Software Update/);
+    }
+  });
+  it('carry-over 2: when a working helper stays after a failed rebuild, the note says the previous reader keeps working', async () => {
+    const { ocrKeptNote } = await load();
+    const note = ocrKeptNote('error: the SDK is not supported');
+    expect(note).toBe(
+      "Could not update BotBoy's reader for images and scanned PDFs (error: the SDK is not supported); the previous reader stays and keeps working. To retry, update macOS and the Command Line Tools in System Settings > General > Software Update, then run ./start.sh --rebuild-ocr.",
+    );
+    expect(note).not.toMatch(/ is off/);
+    expect(ocrKeptNote('')).toContain('images and scanned PDFs; the previous reader stays');
   });
 });
 
@@ -179,6 +195,26 @@ describe('the OCR marker file', () => {
     expect(writeOcrMarker(MARKER, { file: path.join(dir, 'a-file', 'inside', 'm.json') })).toBe(false);
   });
 
+  it('remembers an "unavailable" outcome (nothing was attempted) with its reason code, and never words it as a failed build', async () => {
+    const { writeOcrMarker, readOcrMarker, ocrMarkerDoctorText } = await load();
+    const file = path.join(tempDir(), 'm.json');
+    const unavailable = {
+      kind: 'unavailable', reasonCode: 'os_too_old', failedAt: '2026-10-12T16:26:47.000Z', durationMs: null,
+      reason: 'Text reading from images and scanned PDFs (OCR) is off: this Mac runs macOS 12.7 and BotBoy\'s reader needs macOS 13.0 or newer.',
+      signature: { ...SIGNATURE, swiftc: '', prebuilt: 'f'.repeat(64) },
+    };
+    expect(writeOcrMarker(unavailable, { file })).toBe(true);
+    const read = readOcrMarker({ file });
+    expect(read).toEqual({ schema: 1, ...unavailable });
+    expect(read?.durationMs).toBeNull();
+    expect(ocrMarkerDoctorText(read as Marker)).toBe('');
+    // An unavailable marker without its reason code is not this format.
+    fs.writeFileSync(file, JSON.stringify({ schema: 1, ...unavailable, reasonCode: undefined }));
+    expect(readOcrMarker({ file })).toBeNull();
+    fs.writeFileSync(file, JSON.stringify({ schema: 1, ...unavailable, reasonCode: '' }));
+    expect(readOcrMarker({ file })).toBeNull();
+  });
+
   it('says what the doctor shows: date, how long, and why', async () => {
     const { ocrMarkerDoctorText } = await load();
     const text = ocrMarkerDoctorText({ schema: 1, ...MARKER } as Marker);
@@ -196,6 +232,7 @@ describe('signature', () => {
     const calls: Array<[string, string[]]> = [];
     const signature = computeOcrSignature('/fake/swiftc', {
       source,
+      prebuiltSha: '',
       run: (file, args) => {
         calls.push([file, args]);
         return file === '/fake/swiftc' ? 'Apple Swift version 6.0 (swiftlang-6.0.0.9.10)\nTarget: arm64-apple-macosx15.0\n' : '24A335\n';
@@ -209,12 +246,26 @@ describe('signature', () => {
     expect(calls).toEqual([['/fake/swiftc', ['--version']], ['/usr/bin/sw_vers', ['-buildVersion']]]);
     // A different source gives a different signature.
     fs.writeFileSync(source, 'print(2)\n');
-    expect(computeOcrSignature('/fake/swiftc', { source, run: () => 'x' }).source).not.toBe(signature.source);
+    expect(computeOcrSignature('/fake/swiftc', { source, prebuiltSha: '', run: () => 'x' }).source).not.toBe(signature.source);
+  });
+
+  it('adds the prebuilt binary hash when there is one, and an empty compiler when there is no toolchain', async () => {
+    const { computeOcrSignature, sameOcrSignature } = await load();
+    const source = path.join(tempDir(), 'main.swift');
+    fs.writeFileSync(source, 'print(1)\n');
+    const withPrebuilt = computeOcrSignature('', { source, prebuiltSha: 'f'.repeat(64), run: () => '24A335\n' });
+    expect(withPrebuilt).toEqual({ source: createHash('sha256').update('print(1)\n').digest('hex'), swiftc: '', osBuild: '24A335', prebuilt: 'f'.repeat(64) });
+    expect(sameOcrSignature(withPrebuilt, { ...withPrebuilt })).toBe(true);
+    expect(sameOcrSignature(withPrebuilt, { ...withPrebuilt, prebuilt: 'e'.repeat(64) })).toBe(false);
+    const without = { ...withPrebuilt };
+    delete without.prebuilt;
+    expect(sameOcrSignature(withPrebuilt, without)).toBe(false);
+    expect(sameOcrSignature(without, { ...without })).toBe(true);
   });
 
   it('survives probes that fail or hang (they come back empty)', async () => {
     const { computeOcrSignature } = await load();
-    const signature = computeOcrSignature('/fake/swiftc', { source: '/nonexistent/main.swift', run: () => { throw new Error('boom'); } });
+    const signature = computeOcrSignature('/fake/swiftc', { source: '/nonexistent/main.swift', prebuiltSha: '', run: () => { throw new Error('boom'); } });
     expect(signature).toEqual({ source: '', swiftc: '', osBuild: '' });
   });
 
@@ -447,7 +498,9 @@ describe('scripts/bootstrap-deps.mjs: remembered failures', () => {
     expect(result.stdout).toBe('');
     expect(fs.existsSync(box.marker)).toBe(false);
     expect(fs.statSync(box.helper).mode & 0o111).not.toBe(0);
-    expect(fs.readdirSync(path.dirname(box.helper))).toEqual(['vision-ocr']);
+    // The helper and the note of which source it was built from (the resolver judges "current" by it).
+    expect(fs.readdirSync(path.dirname(box.helper)).sort()).toEqual(['vision-ocr', 'vision-ocr.built-from']);
+    expect(fs.readFileSync(path.join(path.dirname(box.helper), 'vision-ocr.built-from'), 'utf8').trim()).toBe(createHash('sha256').update('// stub\n').digest('hex'));
     expect(fs.existsSync(path.join(box.home, '.personal-productivity-tracker', 'ocr-helper-build.lock'))).toBe(false);
   });
 

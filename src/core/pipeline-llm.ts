@@ -43,6 +43,8 @@ export function adaptSendPrompt(
     /** Live provider id; follows runtime provider changes (Settings → AI model). */
     getProviderId?(): string | undefined;
     getDefaultModel?(): string;
+    /** Live API mode; `messages` is the Anthropic Messages API. */
+    getApiMode?(): string | undefined;
   },
   metadata: PipelineLlmAuditMetadata = {},
 ): PipelineLlm {
@@ -52,8 +54,11 @@ export function adaptSendPrompt(
     getContextBudgetTokens: () => client.getContextBudgetTokens?.() ?? 16_000,
     auditMetadata: () => {
       const activeEndpoint = client.getActiveEndpoint?.() ?? metadata.activeEndpoint;
+      // A client that speaks the Anthropic Messages API never sends a temperature (several current Claude models
+      // reject it), so the audit records none for it, as the Data Room import receipt does.
+      const { temperature: _configured, ...withoutTemperature } = metadata;
       return {
-        ...metadata,
+        ...(client.getApiMode?.() === 'messages' ? withoutTemperature : metadata),
         provider: activeEndpoint === 'ollama' ? 'ollama' : (client.getProviderId?.() ?? metadata.provider),
         model: client.getActiveModel?.() ?? client.getDefaultModel?.() ?? metadata.model,
         activeEndpoint,

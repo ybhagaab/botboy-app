@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "artifacts": {
+    "visionOcr": {
+      "source": {
+        "sha256": "ef0ce388889ea7aa1943d82f4b1e8b818eb4b2804e713a86bf83d6392ecaf709"
+      },
+      "binary": {
+        "sha256": "ae0a55dbab44e6c60ec352cec41bc60d4f01386ded8ac7c8842964727df10187",
+        "bytes": 207616
+      },
+      "archs": [
+        "arm64",
+        "x86_64"
+      ],
+      "minMacos": "13.0",
+      "signature": {
+        "kind": "adhoc",
+        "identifier": "com.botboy.vision-ocr"
+      },
+      "toolchain": {
+        "swift": "Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)",
+        "sdk": "macosx27.0 (26A425)",
+        "ld": "27037.1"
+      },
+      "builtAt": "2026-10-13"
+    },
+    "botboyLauncher": {
+      "source": {
+        "sha256": "0e37dbe40d2e9d70543d979f17a13b4e24d91c9792505b5cfcb6b8d5d21a08e0"
+      },
+      "binary": {
+        "sha256": "2083a68ff4ddbccf22227380b3ad4bf1bace93eaadf3850cf2de9452c99a0ee8",
+        "bytes": 209152
+      },
+      "archs": [
+        "arm64",
+        "x86_64"
+      ],
+      "minMacos": "13.0",
+      "signature": {
+        "kind": "adhoc",
+        "identifier": "com.botboy.tracker"
+      },
+      "toolchain": {
+        "swift": "Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)",
+        "sdk": "macosx27.0 (26A425)",
+        "ld": "27037.1"
+      },
+      "builtAt": "2026-10-13",
+      "launcherVersion": 2
+    }
+  }
+}

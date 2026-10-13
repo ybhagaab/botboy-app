@@ -4,7 +4,8 @@ import type { RouterDeps } from './deps.js';
 import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
 
 const OWNER_UI_NEXT_ACTION = 'Open Settings → AI model in the BotBoy window and use its controls.';
-const KEY_PROVIDERS: readonly AiModelKeyProvider[] = ['openai', 'deepseek'];
+// The body stays `{apiKey}` for every provider: no workspace id field (deferred, design D10).
+const KEY_PROVIDERS: readonly AiModelKeyProvider[] = ['openai', 'deepseek', 'anthropic'];
 
 function sendFailure(res: Response, error: unknown): void {
   if (error instanceof AiModelSettingsError) {

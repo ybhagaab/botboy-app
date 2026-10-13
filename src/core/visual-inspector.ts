@@ -678,7 +678,7 @@ export function createVisualInspector(deps: {
         throw new VisualInspectionError(
           'VISUAL_MODEL_TEXT_ONLY',
           `${reader.label}, the model BotBoy uses for organizing, cannot read images, so these images were not inspected.`,
-          'Tell the owner the images were not inspected, and that choosing an image-capable organizing model in Settings → AI model (for example DeepSeek Flash or GPT-5.6 Terra) lets BotBoy read them. Do not describe or guess their contents.',
+          'Tell the owner the images were not inspected, and that choosing an image-capable organizing model in Settings → AI model (for example DeepSeek Flash, GPT-5.6 Terra or a Claude model) lets BotBoy read them. Do not describe or guess their contents.',
         );
       }
       const assetIds = [...new Set((input.assetIds ?? []).map(String))];

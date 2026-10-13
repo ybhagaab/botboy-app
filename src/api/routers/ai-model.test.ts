@@ -87,8 +87,8 @@ describe('AI model settings router', () => {
     expect(response.body).toMatchObject({ openai: { keySuffix: '…abcd' }, roles: { processing: { modelKey: 'team.terra' } } });
   });
 
-  it('saves OpenAI and DeepSeek keys only from the same-origin owner page', async () => {
-    for (const provider of ['openai', 'deepseek']) {
+  it('saves OpenAI, DeepSeek and Anthropic keys only from the same-origin owner page', async () => {
+    for (const provider of ['openai', 'deepseek', 'anthropic']) {
       const noOrigin = await request(server).put(`/api/settings/ai-model/${provider}`).send({ apiKey: 'sk-proj-x' });
       expect(noOrigin.status).toBe(403);
       expect(noOrigin.body).toMatchObject({ code: 'owner_action_required', nextAction: expect.stringContaining('Settings → AI model') });
@@ -108,7 +108,21 @@ describe('AI model settings router', () => {
     const deepseek = await ownerPut('/api/settings/ai-model/deepseek', { apiKey: 'sk-deepseekownerkey' });
     expect(deepseek.status).toBe(200);
     expect(settings.saveApiKey).toHaveBeenCalledWith('deepseek', 'sk-deepseekownerkey');
-    expect((await ownerPut('/api/settings/ai-model/anthropic', { apiKey: 'sk-x' })).status).toBe(404);
+    // The Anthropic key is passed through untouched: validation and verification belong to the settings service.
+    const anthropicKey = ['sk', 'ant', 'api03', 'routerkey'.repeat(4)].join('-');
+    const anthropic = await ownerPut('/api/settings/ai-model/anthropic', { apiKey: anthropicKey });
+    expect(anthropic.status).toBe(200);
+    expect(anthropic.headers['cache-control']).toBe('no-store');
+    expect(settings.saveApiKey).toHaveBeenCalledWith('anthropic', anthropicKey);
+    // Only providers the service knows have routes.
+    expect((await ownerPut('/api/settings/ai-model/gemini', { apiKey: 'sk-x' })).status).toBe(404);
+  });
+
+  it('accepts no workspace id or other field on the Anthropic key route', async () => {
+    const response = await ownerPut('/api/settings/ai-model/anthropic', { apiKey: 'sk-ant-x', workspaceId: 'wrkspc_0123456789' });
+    expect(response.status).toBe(400);
+    expect(response.body.code).toBe('invalid_request');
+    expect(settings.saveApiKey).not.toHaveBeenCalled();
   });
 
   it('accepts only the key field', async () => {
@@ -147,6 +161,10 @@ describe('AI model settings router', () => {
     const removed = await owner(request(server).delete('/api/settings/ai-model/deepseek'));
     expect(removed.status).toBe(200);
     expect(settings.removeApiKey).toHaveBeenCalledWith('deepseek');
+    const claude = await owner(request(server).delete('/api/settings/ai-model/anthropic'));
+    expect(claude.status).toBe(200);
+    expect(settings.removeApiKey).toHaveBeenCalledWith('anthropic');
+    expect((await owner(request(server).delete('/api/settings/ai-model/gemini'))).status).toBe(404);
   });
 
   it('changes a background model or Thinking level only from the owner page, with only those fields', async () => {

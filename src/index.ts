@@ -310,8 +310,8 @@ async function main() {
       `✅ Toolchain: ${found}/${toolchain.tools.length} tools resolved` +
         (toolchain.pathAdditions.length ? `, PATH += ${toolchain.pathAdditions.length} dir(s)` : ''),
     );
-    // An OCR helper whose build already failed on this Mac is reported once, on
-    // one line, by the dependency check below, not sent back to "npm run setup".
+    // The OCR helper is recommended, not required; why it is off (if it is) is
+    // reported once, on one line, by the dependency check below.
     const missingRequiredWarning = formatMissingRequiredWarning(toolchain.tools);
     if (missingRequiredWarning) console.warn(missingRequiredWarning);
   } catch (e: any) {
@@ -976,8 +976,11 @@ async function main() {
 
   // Verify local extraction dependencies (never silently degrade — R13.4/R13.5).
   const deps = checkDependencies();
-  if (!deps.ok) console.warn(`⚠️  ${deps.message}`);
-  else console.log('✅ Local extraction dependencies available (parsing + OCR)');
+  if (deps.ok) console.log('✅ Local extraction dependencies available (parsing + OCR)');
+  // The OCR helper only adds images and scanned PDFs: when it is the only gap this is information, not a warning
+  // (and when a helper is in use there is no line at all).
+  else if (deps.ocrOnly) console.log(`ℹ️  ${deps.message}`);
+  else console.warn(`⚠️  ${deps.message}`);
 
   // ── Pipeline: event bus → dedup → classify → store ──
   eventBus.on(async (item: RawWorkItem) => {

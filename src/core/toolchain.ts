@@ -19,11 +19,12 @@
  */
 
 import { existsSync, statSync, accessSync, constants as fsConstants } from 'fs';
+import { spawnSync } from 'child_process';
 import os from 'os';
 import path from 'path';
 import type Database from 'better-sqlite3';
 import { getSetting, setSetting } from './storage.js';
-import { visionHelperPath } from './deps-check.js';
+import { visionHelperStatus } from './deps-check.js';
 import { ocrHelperUnavailableLine, readOcrBuildFailure, type OcrBuildFailure } from './ocr-helper-marker.js';
 
 export const TOOLCHAIN_SETTING_KEY = 'toolchain.map';
@@ -76,7 +77,7 @@ export interface ToolchainSnapshot {
  */
 export const TOOL_REGISTRY: readonly ToolSpec[] = Object.freeze([
   // Core runtime
-  { name: 'node', purpose: 'JavaScript runtime (BotBoy itself, agent scripts)', requirement: 'required', versionArgs: ['--version'], installHint: 'install Node 20+ (brew install node)' },
+  { name: 'node', purpose: 'JavaScript runtime (BotBoy itself, agent scripts)', requirement: 'required', versionArgs: ['--version'], installHint: 'install Node 22 or newer from nodejs.org (the installer needs no other tools)' },
   { name: 'curl', purpose: 'HTTP fetches (web_search, web_fetch)', requirement: 'required', versionArgs: ['--version'], macBuiltin: true },
   // Capture pipeline
   { name: 'pdftotext', purpose: 'PDF text extraction fallback (poppler; the native vision-ocr helper is primary)', requirement: 'optional', brewFormula: 'poppler', versionArgs: ['-v'] },
@@ -175,10 +176,33 @@ async function probeVersion(binPath: string, args: string[]): Promise<string | n
 /**
  * What to tell the owner about a missing OCR helper. When its build already
  * failed on this Mac (`ocr-helper-marker.ts`), building it again is not the
- * answer, so the hint says what is true instead.
+ * answer, so the hint says what is true instead; when the helper is off for a
+ * reason the resolver knows (macOS too old, a damaged file, ...), `offLine` is
+ * that reason's sentence, which always names the next action.
  */
-export function visionHelperInstallHint(failure: OcrBuildFailure | null): string {
-  return failure ? ocrHelperUnavailableLine() : 'run "npm run bootstrap" to build it';
+export function visionHelperInstallHint(failure: OcrBuildFailure | null, offLine: string | null = null): string {
+  if (failure) return ocrHelperUnavailableLine();
+  return offLine ?? 'run "npm run bootstrap" to build it';
+}
+
+/**
+ * /usr/bin/git and /usr/bin/python3 are Xcode shims: on a Mac without the
+ * Command Line Tools, running either raises the macOS "install developer
+ * tools" dialog (and the version probe would record a stderr line as a
+ * "version"). A tool that resolves to exactly that path counts as present only
+ * when `xcode-select -p` answers. `BOTBOY_TEST_XCODE_SELECT_BIN` replaces the tool in tests.
+ */
+const XCODE_SHIM_TOOLS = new Set(['/usr/bin/git', '/usr/bin/python3']);
+const XCODE_SHIM_HINT = 'install the Command Line Tools (xcode-select --install)';
+
+function commandLineToolsPresent(): boolean {
+  const override = process.env.BOTBOY_TEST_XCODE_SELECT_BIN;
+  const bin = override && path.isAbsolute(override) ? override : '/usr/bin/xcode-select';
+  try {
+    return spawnSync(bin, ['-p'], { stdio: 'ignore', timeout: 15_000, killSignal: 'SIGKILL' }).status === 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -206,9 +230,18 @@ export async function discoverToolchain(
   const extraDirs = knownToolDirectories();
   const pathValue = env.PATH ?? '';
 
+  // Asked at most once per discovery, and only if a shim path is actually found.
+  let toolsAnswer: boolean | null = null;
+  const developerToolsPresent = () => (toolsAnswer ??= commandLineToolsPresent());
+
   const tools: ResolvedTool[] = await Promise.all(
     TOOL_REGISTRY.map(async (spec) => {
-      const resolved = resolveBinary(spec.name, pathValue, extraDirs);
+      let resolved = resolveBinary(spec.name, pathValue, extraDirs);
+      let installHint = spec.installHint;
+      if (resolved && XCODE_SHIM_TOOLS.has(resolved) && !developerToolsPresent()) {
+        resolved = null; // never run the shim: it would raise the install dialog
+        installHint = XCODE_SHIM_HINT;
+      }
       const version = resolved && spec.versionArgs ? await probeVersion(resolved, spec.versionArgs) : null;
       return {
         name: spec.name,
@@ -216,25 +249,27 @@ export async function discoverToolchain(
         requirement: spec.requirement,
         path: resolved,
         version,
-        brewFormula: spec.brewFormula,
-        installHint: spec.installHint,
+        brewFormula: resolved === null && installHint === XCODE_SHIM_HINT ? undefined : spec.brewFormula,
+        installHint,
         macBuiltin: spec.macBuiltin,
         internalOnly: spec.internalOnly,
       };
     }),
   );
 
-  // The Apple Vision OCR helper is a built artifact with a fixed path, not a
+  // The Apple Vision OCR helper is a shipped artifact with a fixed path, not a
   // PATH tool — include it so diagnostics and setup see one complete picture.
-  const helper = visionHelperPath();
-  const helperPath = existsSync(helper) ? helper : null;
+  // It is RECOMMENDED, not required: BotBoy runs without it (only images and
+  // scanned PDFs are unread), so a Mac without it logs no "Missing required
+  // tools" warning. Boot-time and read-only: the resolver's verdict, no spawn.
+  const status = visionHelperStatus();
   tools.push({
     name: 'vision-ocr',
-    purpose: 'Apple Vision OCR helper (built by npm run bootstrap)',
-    requirement: 'required',
-    path: helperPath,
+    purpose: 'Apple Vision OCR helper (ships prebuilt with BotBoy)',
+    requirement: 'recommended',
+    path: status.ok ? status.path : null,
     version: null,
-    installHint: visionHelperInstallHint(helperPath ? null : readOcrBuildFailure()),
+    installHint: visionHelperInstallHint(status.ok ? null : readOcrBuildFailure(), status.ok ? null : status.offLine),
     internalOnly: true,
   });
 

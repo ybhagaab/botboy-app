@@ -17,7 +17,10 @@
     "setup": "node scripts/bootstrap-deps.mjs --install && npm run build",
     "postinstall": "node scripts/bootstrap-deps.mjs",
     "app:bundle": "node scripts/make-app-bundle.mjs",
-    "release": "bash scripts/release.sh"
+    "prebuilt:build": "node scripts/build-native-prebuilt.mjs",
+    "prebuilt:verify": "node scripts/build-native-prebuilt.mjs --verify",
+    "release": "bash scripts/release.sh",
+    "release:check": "bash scripts/release.sh --preflight"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1106.0",

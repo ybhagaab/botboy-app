@@ -1,7 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ChatCompletionRequest, LlmClient } from './llm-client.js';
+import { parseAnthropicModel, type AnthropicModelProfile } from './anthropic-models.js';
+import { FAKE_ANTHROPIC_KEY, fakeModelRow } from './anthropic-api.fake.js';
+import { createAnthropicInferenceProvider } from './inference-provider.js';
 import {
+  LLM_CONNECTION_ORDER,
+  LLM_MODEL_KEY_PATTERN,
+  anthropicModelEntries,
   bindLlmModel,
+  connectionDefaultEntry,
+  connectionRoleDefaultEntry,
   deepSeekModelEntries,
   isOpenAiChatModelId,
   openAiModelEntries,
@@ -9,6 +17,7 @@ import {
   parseDeepSeekModelList,
   pickDeepSeekDefaultModel,
   pickOpenAiDefaultModel,
+  qualifiedModelKey,
   sortOpenAiModelIds,
   teamModelEntries,
   type LlmConnection,
@@ -19,6 +28,21 @@ import {
  * models BotBoy offers, what each can take, DeepSeek's reported profiles, the
  * unchanged team catalog, and the per-request route/budget/thinking rules.
  */
+describe('connection ids and model keys', () => {
+  it('lists Claude last, so the Automatic order of team, OpenAI and DeepSeek is unchanged', () => {
+    expect(LLM_CONNECTION_ORDER).toEqual(['team', 'openai', 'deepseek', 'anthropic']);
+  });
+  it('accepts provider-qualified keys for every connection, Claude snapshot ids included', () => {
+    for (const key of ['team.terra', 'openai.gpt-5.6-terra', 'deepseek.deepseek-flash', 'anthropic.claude-sonnet-5-5', 'anthropic.claude-haiku-4-5-20251001']) {
+      expect(LLM_MODEL_KEY_PATTERN.test(key), key).toBe(true);
+    }
+    for (const key of ['gemini.pro', 'anthropic.', 'anthropic.bad id', 'Anthropic.claude', 'anthropic']) {
+      expect(LLM_MODEL_KEY_PATTERN.test(key), key).toBe(false);
+    }
+    expect(qualifiedModelKey('anthropic', 'claude-opus-5-5')).toBe('anthropic.claude-opus-5-5');
+  });
+});
+
 describe('OpenAI model list', () => {
   it('offers chat models and drops embeddings, speech, image, moderation, search, and tiny legacy models', () => {
     const listed = [
@@ -152,6 +176,118 @@ describe('team catalog', () => {
     expect(entries[0]).toMatchObject({ key: 'team.default', label: 'Provider default', isConnectionDefault: true });
     // Chat's existing completion cap is preserved; the server enforces its own limit.
     expect(entries[0].capabilities).toEqual({ contextWindow: 32_768, maxOutputTokens: 32_768 });
+  });
+});
+
+describe('Claude entries', () => {
+  const profile = (spec: Parameters<typeof fakeModelRow>[0]) => parseAnthropicModel(fakeModelRow(spec))!;
+  const SONNET = profile({ id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', variant: 'A', line: 'sonnet' });
+  const HAIKU = profile({ id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', variant: 'B', line: 'haiku' });
+  const OPUS_45 = profile({ id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', variant: 'C', line: 'opus', maxInputTokens: 200_000, maxTokens: 64_000 });
+  const LEGACY = profile({ id: 'claude-3-haiku-20240307', name: 'Claude Haiku 3', variant: 'D', line: 'haiku', maxInputTokens: 200_000, maxTokens: 4_096 });
+
+  it('builds one provider-qualified entry per listed model: the reported title, the plain id as route, the default marked', () => {
+    const entries = anthropicModelEntries([SONNET, HAIKU, OPUS_45], 'claude-haiku-5-5');
+    expect(entries.map(entry => [entry.key, entry.connectionId, entry.label, entry.model, entry.isConnectionDefault, entry.preview])).toEqual([
+      ['anthropic.claude-sonnet-5-5', 'anthropic', 'Claude Sonnet 5.5', 'claude-sonnet-5-5', false, false],
+      ['anthropic.claude-haiku-5-5', 'anthropic', 'Claude Haiku 5.5', 'claude-haiku-5-5', true, false],
+      ['anthropic.claude-opus-4-5-20251101', 'anthropic', 'Claude Opus 4.5', 'claude-opus-4-5-20251101', false, false],
+    ]);
+    // The route names only the model: an Anthropic route can never carry an endpoint, headers or a reasoning flag.
+    expect(entries.map(entry => entry.route)).toEqual([{ model: 'claude-sonnet-5-5' }, { model: 'claude-haiku-5-5' }, { model: 'claude-opus-4-5-20251101' }]);
+    for (const entry of entries) expect(LLM_MODEL_KEY_PATTERN.test(entry.key), entry.key).toBe(true);
+    expect(anthropicModelEntries([], 'claude-sonnet-5-5')).toEqual([]);
+  });
+
+  it('records each model\'s window, output limit, image input and how Thinking Off behaves (D2)', () => {
+    const [sonnet, haiku, opus, legacy] = anthropicModelEntries([SONNET, HAIKU, OPUS_45, LEGACY], 'claude-sonnet-5-5');
+    // Kind A (always-on) models think a little even at Off; kind B can switch it off but not beside tools; kind C is native; kind D has no control.
+    expect(sonnet.capabilities).toEqual({ images: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, thinkingOff: 'lowest_effort' });
+    expect(haiku.capabilities).toEqual({ images: true, contextWindow: 1_000_000, maxOutputTokens: 128_000, thinkingOff: 'native_without_tools' });
+    expect(opus.capabilities).toMatchObject({ contextWindow: 200_000, maxOutputTokens: 64_000, thinkingOff: 'native' });
+    expect(legacy.capabilities).toMatchObject({ contextWindow: 200_000, thinkingOff: 'unavailable' });
+  });
+
+  it('leaves image input unknown when the list does not say, rather than guessing', () => {
+    const silent = parseAnthropicModel({ ...fakeModelRow({ id: 'claude-future-9', variant: 'A', line: 'sonnet' }), capabilities: null })!;
+    const [entry] = anthropicModelEntries([silent], 'claude-future-9');
+    expect('images' in entry.capabilities).toBe(false);
+    expect(entry.capabilities.thinkingOff).toBeDefined();
+  });
+});
+
+describe('Role defaults on a connection (design D8)', () => {
+  const profile = (spec: Parameters<typeof fakeModelRow>[0]) => parseAnthropicModel(fakeModelRow(spec))!;
+  const SONNET = profile({ id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', variant: 'A', line: 'sonnet' });
+  const HAIKU = profile({ id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', variant: 'B', line: 'haiku' });
+  const OPUS = profile({ id: 'claude-opus-5-5', name: 'Claude Opus 5.5', variant: 'A', line: 'opus' });
+  // Only `models` and `roleDefaultModels` are read, so the client and provider are placeholders.
+  const connection = (models: LlmConnection['models'], roleDefaultModels?: LlmConnection['roleDefaultModels']): LlmConnection => ({
+    id: 'anthropic', label: 'Anthropic (Claude)', source: 'settings', client: {} as LlmClient,
+    provider: { id: 'anthropic', endpoint: 'https://example.test', model: 'claude-sonnet-5-5', apiMode: 'messages' },
+    models, ...(roleDefaultModels ? { roleDefaultModels } : {}), version: 1,
+  });
+  const entries = anthropicModelEntries([SONNET, HAIKU, OPUS], 'claude-sonnet-5-5');
+
+  it('answers the connection default for every role when the connection names no role default', () => {
+    const plain = connection(entries);
+    expect(connectionRoleDefaultEntry(plain, 'processing')?.key).toBe('anthropic.claude-sonnet-5-5');
+    expect(connectionRoleDefaultEntry(plain, 'documents')?.key).toBe('anthropic.claude-sonnet-5-5');
+    expect(connectionRoleDefaultEntry(plain, 'processing')).toBe(connectionDefaultEntry(plain));
+  });
+
+  it('answers the named model for Organizing only; Document writing stays on the connection default', () => {
+    const claude = connection(entries, { processing: 'anthropic.claude-haiku-5-5' });
+    expect(connectionRoleDefaultEntry(claude, 'processing')?.key).toBe('anthropic.claude-haiku-5-5');
+    expect(connectionRoleDefaultEntry(claude, 'documents')?.key).toBe('anthropic.claude-sonnet-5-5');
+    // The connection default itself (chat, key verification) is untouched by a role default.
+    expect(connectionDefaultEntry(claude)?.key).toBe('anthropic.claude-sonnet-5-5');
+  });
+
+  it('falls back to the connection default when the named model is not offered, and answers nothing for an empty connection', () => {
+    const stale = connection(entries, { processing: 'anthropic.claude-haiku-4-5-20251001' });
+    expect(connectionRoleDefaultEntry(stale, 'processing')?.key).toBe('anthropic.claude-sonnet-5-5');
+    expect(connectionRoleDefaultEntry(connection([], { processing: 'anthropic.claude-haiku-5-5' }), 'processing')).toBeUndefined();
+  });
+});
+
+describe('Context budget 100,000 on a bound Claude model (D7; owner decision 2026-10-13)', () => {
+  const clients: Array<{ close(): void }> = [];
+  afterEach(() => { for (const client of clients.splice(0)) client.close(); });
+
+  // The connection is built the way ai-model-settings builds it: the real provider factory with a Claude list, no budget override.
+  function claudeConnection(models: AnthropicModelProfile[], env: NodeJS.ProcessEnv = {}): LlmConnection {
+    const provider = createAnthropicInferenceProvider({
+      apiKey: FAKE_ANTHROPIC_KEY, models, defaultModel: models[0].id, env: { BOTBOY_INFERENCE_HEALTH_INTERVAL_MS: '0', ...env },
+    });
+    const client = provider.createClient();
+    clients.push(client);
+    return {
+      id: 'anthropic', label: 'Anthropic (Claude)', source: 'settings', client,
+      provider: { id: 'anthropic', endpoint: provider.endpoint, model: provider.model, apiMode: 'messages' },
+      models: anthropicModelEntries(models, models[0].id), version: 1,
+    };
+  }
+  const row = (spec: Parameters<typeof fakeModelRow>[0]) => parseAnthropicModel(fakeModelRow(spec))!;
+
+  it('4. a 1,000,000-token model, a 200,000-token model and a model whose window is unknown each report exactly 100,000', () => {
+    const million = row({ id: 'claude-sonnet-5-5', variant: 'A', line: 'sonnet', maxInputTokens: 1_000_000, maxTokens: 128_000 });
+    const twoHundredK = row({ id: 'claude-haiku-4-5-20251001', variant: 'C', line: 'haiku', maxInputTokens: 200_000, maxTokens: 64_000 });
+    const unknown = row({ id: 'claude-mystery-1', variant: 'A', line: 'sonnet', maxInputTokens: null, maxTokens: null });
+    expect(unknown.contextWindow).toBe(200_000);
+    const connection = claudeConnection([million, twoHundredK, unknown]);
+    const budgets = connection.models.map(entry => [entry.model, bindLlmModel(connection, entry).getContextBudgetTokens?.()]);
+    expect(budgets).toEqual([
+      ['claude-sonnet-5-5', 100_000],
+      ['claude-haiku-4-5-20251001', 100_000],
+      ['claude-mystery-1', 100_000],
+    ]);
+    // The budget is the same literal whether the model is routed explicitly (chat) or not (background roles).
+    expect(bindLlmModel(connection, connection.models[1], { alwaysRoute: true }).getContextBudgetTokens?.()).toBe(100_000);
+    // The window still limits the budget when it is genuinely small: a 40,000-token model cannot be given 100,000.
+    const small = row({ id: 'claude-small-1', variant: 'A', line: 'haiku', maxInputTokens: 40_000, maxTokens: 8_000 });
+    const smallConnection = claudeConnection([small]);
+    expect(bindLlmModel(smallConnection, smallConnection.models[0]).getContextBudgetTokens?.()).toBeLessThan(40_000);
   });
 });
 

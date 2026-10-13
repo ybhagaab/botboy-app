@@ -5,15 +5,29 @@
 You need:
 
 - a Mac with **Google Chrome**
-- **Node.js 20.16 or newer** (`node --version`; PDF reading needs 20.16).
-  Homebrew's current Node (`brew install node`, Node 26 with npm 12) works.
-  On Node 20, `npm install` builds BotBoy's database module from source, which
-  needs Xcode Command Line Tools (`xcode-select --install`).
-- **Git**
+- **Node.js 22 or newer** from nodejs.org (`node --version`). Its installer needs
+  no other tools. The current LTS, Node 24, needs macOS 13.5 or newer; on an older
+  macOS install Node 22. Node 20 reached end-of-life on 2026-04-30: on it,
+  `npm install` builds BotBoy's database module from source, which needs the Xcode
+  Command Line Tools (`xcode-select --install`). Homebrew is no shortcut: it
+  installs the Command Line Tools first.
+- **Git**, which comes with the Xcode Command Line Tools (a Mac without them offers
+  to install them the first time you run `git`)
 - an AI model: the private BotBoy credential attachment sent to you by the
   owner, your own OpenAI API key, your own DeepSeek API key, or any mix of them
 
 You do **not** need an AWS account or `aws login`.
+
+### What works on a Mac with only macOS, Chrome and Node
+
+- **Works without anything else** (macOS 13 or newer): capture, chat, text PDFs,
+  scanned PDFs and images (BotBoy ships its own reader), Office files, and the
+  BotBoy.app Dock icon. Nothing is compiled on your Mac.
+- **Needs the Xcode Command Line Tools:** `git` (so `./start.sh --update` and the
+  in-app Update button), Node 20's database module, and building BotBoy's readers
+  from source on macOS 12.
+- **Needs something else:** Python scripts (python.org), and optional extras such as
+  pandoc, ffmpeg, jq or LibreOffice (Homebrew).
 
 ### Install
 
@@ -384,17 +398,28 @@ one. **Connections** lists every server, with **Edit** and **Delete**.
 - **Pandoc** is optional. Markdown downloads work without it. For Word, PDF,
   or HTML document export, BotBoy offers an in-app Homebrew installation, or
   you can run `brew install pandoc`.
-- **BotBoy.app** is attempted automatically on first start. If it is missing,
-  if you moved the checkout, or if you installed Xcode Command Line Tools
-  later, run:
+- **BotBoy.app** is installed automatically on first start. It is a small
+  prebuilt launcher that ships with BotBoy: nothing is compiled on your Mac, and
+  no developer tools are needed on macOS 13 or newer (macOS 12 gets a simpler
+  launcher without the persistent Dock icon, or a built one if the Command Line
+  Tools are installed). The app has no folder built in: it opens the BotBoy
+  folder recorded in `~/.personal-productivity-tracker/app-checkout.v1`, and
+  `./start.sh` keeps that file current. If you move the BotBoy folder, open
+  Terminal, go to the folder and run `./start.sh`: it points the app at the folder
+  you ran it from. If the app is missing, run:
 
 ```bash
 cd ~/botboy-app
 npm run app:bundle
 ```
 
-With Xcode Command Line Tools, the native launcher keeps the Dock icon present
-while BotBoy runs. Without them, BotBoy still runs from Terminal.
+`./start.sh` also upgrades an older BotBoy.app to this launcher by itself the next
+time it runs from the same folder (the old one is kept in
+`~/.personal-productivity-tracker/app-launcher-backup`), and it never takes the app
+from another BotBoy folder that still exists. The new launcher is a different program
+from the old one, so the first time you open BotBoy from its icon after the upgrade,
+macOS may ask again for access to files and folders or to automation: allow it, as
+before.
 
 On a Mac with Apple silicon, BotBoy, its Node server, and its debug Chrome run
 natively, not under Rosetta. If Terminal or an older `BotBoy.app` starts
@@ -406,39 +431,34 @@ reopen BotBoy. `./start.sh --doctor` shows each of these on its `hardware`,
 
 BotBoy reads the text of PDFs on every Mac: its pdf.js reader is installed by
 `npm install`, and `./start.sh` installs it after an update if it is missing.
-Xcode Command Line Tools also build BotBoy's native reader, which is faster
-and adds OCR for scanned PDFs and images. Without them, BotBoy records scanned
-pages and images as unread rather than guessing. To add the native reader,
-run `xcode-select --install`, then:
-
-```bash
-cd ~/botboy-app
-npm run bootstrap
-./start.sh
-```
-
-Files recorded as unread are read the next time they change.
-
-The native reader never delays BotBoy. `./start.sh` builds it in the background
-after the BotBoy window is open, and gives the build two minutes at most
-(`BOTBOY_OCR_BUILD_TIMEOUT_SECONDS` changes that). If the build fails, BotBoy
-prints one note (in Terminal, or only in `/tmp/ppt.log` when you open BotBoy from
-its app icon) and carries on without it: text PDFs are still read,
-and only text inside images and scanned PDFs is unavailable. A failure is usually
-the Command Line Tools being out of step with macOS (for example after a macOS
-update, or when the tools were only half installed). BotBoy remembers the failure
-and does not try again at every start; it tries again by itself when macOS, the
-Command Line Tools, or the reader's source change. To fix it yourself, open
-**System Settings > General > Software Update**, install the macOS and Command
-Line Tools updates it offers, then run:
+The reader for text inside images and scanned PDFs (OCR) also ships prebuilt, for
+Apple silicon and Intel Macs on macOS 13 or newer: nothing is built on your Mac and
+no developer tools are needed. `./start.sh --doctor` shows it on its `ocr helper:`
+row (which reader is in use and, when it is off, why and what to do) and on its
+`pdf readers` row. Only a Mac that cannot use the prebuilt reader (macOS 12, or a
+file macOS refuses to run) builds one, in the background after the BotBoy window is
+open and only when the Command Line Tools are installed; the build gets two minutes
+at most (`BOTBOY_OCR_BUILD_TIMEOUT_SECONDS` changes that), and BotBoy remembers the
+outcome instead of trying again at every start. Without any reader BotBoy records
+scanned pages and images as unread rather than guessing, reads them the next time
+they change, and still reads text PDFs. To check again now, install the macOS
+updates under **System Settings > General > Software Update**, then run:
 
 ```bash
 cd ~/botboy-app
 ./start.sh --rebuild-ocr
 ```
 
-`./start.sh --doctor` shows the result on its `xcode-clt` row (the date, how long
-the build took, and the first error) and on its `pdf readers` row.
+If you downloaded BotBoy as a ZIP in a browser, macOS marks every file as
+downloaded. `./start.sh` clears that mark on BotBoy's `native` folder before anything
+runs, and never runs a reader or launcher whose mark it cannot clear; if the doctor
+says the mark is still there, run:
+
+```bash
+xattr -r -d com.apple.quarantine ~/botboy-app/native
+```
+
+(`git clone` and `./start.sh --update` never set that mark.)
 
 ### Troubleshooting
 
@@ -463,7 +483,7 @@ credential attachment before producing the report.
 
 | Symptom | What to do |
 |---|---|
-| `node not found` | Install Node.js 20.16 or newer and rerun `./start.sh`. |
+| `node not found` | Install Node.js 22 or newer from nodejs.org (its installer needs no other tools) and rerun `./start.sh`. |
 | Chat says it needs an AI model first | Open **Settings → AI model** and add an OpenAI or DeepSeek API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
 | Settings → AI model says OpenAI or DeepSeek rejected the key | Copy a current key from platform.openai.com/api-keys or platform.deepseek.com/api_keys and save it again. |
 | Settings → AI model says the account has no credit | Add credit in OpenAI Billing or top up the DeepSeek account. BotBoy resumes on its own once calls succeed. |
@@ -471,7 +491,9 @@ credential attachment before producing the report.
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
 | `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Run `npm install` in `~/botboy-app`, read the errors at its end, fix what they name, then `./start.sh`. On Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
-| BotBoy took a long time to open, `/tmp/ppt.log` is full of Swift messages, or the doctor says `OCR helper build failed` | The optional reader for images and scanned PDFs could not be built on your Mac, usually because the Command Line Tools and macOS do not match. After `./start.sh --update`, BotBoy builds it only after its window is open and gives up after two minutes, so it no longer holds up opening. Install the updates in **System Settings > General > Software Update**, then run `./start.sh --rebuild-ocr`. BotBoy works without the reader; only text inside images and scanned PDFs is missing. |
+| BotBoy took a long time to open, `/tmp/ppt.log` is full of Swift messages, the doctor says `OCR helper build failed`, or its `ocr helper:` row says `OFF` | Older releases built the optional reader for images and scanned PDFs on your Mac. It now ships prebuilt and BotBoy never waits for it: run `./start.sh --update`. If the `ocr helper:` row of `./start.sh --doctor` still says `OFF`, it names the reason and the next step: usually macOS older than 13 (install the updates in **System Settings > General > Software Update**), a damaged or edited `native` folder (`./start.sh --update`), or a download mark on the reader (next row). Then run `./start.sh --rebuild-ocr`. BotBoy works without the reader; only text inside images and scanned PDFs is missing. |
+| macOS says a BotBoy file was "downloaded from the internet" or "can't be opened", or the doctor's `ocr helper:` row says the download mark is still on the reader | You downloaded BotBoy as a ZIP in a browser. Run `xattr -r -d com.apple.quarantine ~/botboy-app/native`, then `./start.sh`. A `git clone` never has this problem. |
+| BotBoy.app says "BotBoy launcher is stale", or opens the wrong BotBoy folder | You moved the BotBoy folder, or you have more than one. Open Terminal, go to the folder you want and run `./start.sh`: it points the app at that folder (it never takes the app from another folder that still exists; remove `/Applications/BotBoy.app` and run `./start.sh` there if you want to switch on purpose). `./start.sh --doctor` shows the folder on its `app launcher:` row. |
 | `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app`. `./start.sh --update` updates BotBoy but never reinstalls packages, so older ones stay until you do. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |

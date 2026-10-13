@@ -76,12 +76,16 @@ dedicated read-only analytics connection.
 
 ## Install
 
-You need macOS, Google Chrome, Git, Node.js 20.16+, and an AI model: the private
-BotBoy credential attachment sent by the owner, your own OpenAI API key, your
-own DeepSeek API key, or any mix of them. No AWS account or `aws login` is
-required. Homebrew's current Node (`brew install node`, Node 26 with npm 12)
-works; on Node 20, `npm install` builds the database module from source and
-needs Xcode Command Line Tools (`xcode-select --install`).
+You need macOS, Google Chrome, Git, Node.js 22 or newer (from nodejs.org: its
+installer needs no other tools), and an AI model: the private BotBoy credential
+attachment sent by the owner, your own OpenAI API key, your own DeepSeek API key,
+or any mix of them. No AWS account or `aws login` is required. Git comes with the
+Xcode Command Line Tools (a Mac without them offers to install them the first time
+you run `git`). The current LTS, Node 24, needs macOS 13.5 or newer; on an older
+macOS install Node 22. On Node 20 (end-of-life since 2026-04-30), `npm install`
+builds the database module from source and needs the Command Line Tools too.
+BotBoy's readers (text inside images and scanned PDFs, and the Dock app) ship
+prebuilt: nothing is compiled on your Mac.
 
 If you have a credential attachment, download it to Downloads or Desktop.
 Then run:

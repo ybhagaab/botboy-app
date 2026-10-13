@@ -50,6 +50,8 @@ const RESPONSE_FORMAT: LlmResponseFormat = {
   },
 };
 
+/** Exported for the Anthropic schema adapter tests (provider-neutral contract; unchanged). */
+export const ANALYTICS_JOB_PLAN_RESPONSE_FORMAT = RESPONSE_FORMAT;
 interface CatalogCard {
   datasetId: string;
   versionId: string;

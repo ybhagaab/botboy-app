@@ -4323,8 +4323,10 @@ async function loadLlmUsage({ force = false } = {}) {
 }
 
 // ── Settings → AI model: model connections (team gateway, OpenAI key,
-// DeepSeek key) and the models for background work. Keys are verified
-// server-side and never kept in browser state; changes apply without restart.
+// DeepSeek key, Anthropic key) and the models for background work. Keys are
+// verified server-side and never kept in browser state; changes apply without
+// restart. Every provider's card reads its connection the same way: Ready or
+// Needs attention, its model list, and Remove.
 const AI_MODEL_KEY_PROVIDERS = [
   {
     id: 'openai',
@@ -4338,12 +4340,31 @@ const AI_MODEL_KEY_PROVIDERS = [
     keysUrl: 'platform.deepseek.com/api_keys',
     intro: 'Use your own DeepSeek API key. BotBoy offers every model the key lists, including image input where the model supports it.',
   },
+  {
+    id: 'anthropic',
+    label: 'Anthropic (Claude)',
+    keysUrl: 'platform.claude.com/settings/keys',
+    placeholder: 'sk-ant-…',
+    intro: 'Use your own Anthropic API key. BotBoy offers every Claude model the key can use, in chat and in Background work.',
+    help: 'Create a regular API key at platform.claude.com/settings/keys (it starts with sk-ant-). BotBoy checks it with Anthropic and keeps it private on this Mac.',
+    saveLabel: 'Check and save key',
+    savedToast: 'Anthropic (Claude) key checked and saved. Its models are ready in chat and in Background work.',
+    failedToast: 'Could not save the Anthropic (Claude) key',
+  },
 ];
 const AI_MODEL_ROLE_COPY = {
   processing: { title: 'Organizing', detail: 'Routing, project briefs, digests, planning, and reading images.' },
   documents: { title: 'Document writing', detail: 'Product documents and email drafts, plus the review of documents written in chat.' },
 };
 const AI_MODEL_THINKING_LEVELS = [['off', 'Off'], ['low', 'Low'], ['high', 'High'], ['max', 'Max']];
+// Thinking "Off" on a Claude model (design D5): not every Claude model can turn thinking off, so its row and any role
+// caption naming it carry a small badge whose tooltip (and screen-reader text) says what Off does there. A model whose
+// Off is native has no badge, and models of the other providers send no `thinkingOff` at all.
+const AI_MODEL_THINKING_OFF = {
+  lowest_effort: { badge: 'Always thinks', text: 'Always thinks a little; Off uses its lowest effort.' },
+  native_without_tools: { badge: 'Thinks in chat', text: 'Off works for background work; in chat, with tools on, it thinks a little.' },
+  unavailable: { badge: 'No thinking', text: 'No thinking control.' },
+};
 
 function aiModelErrorText(error) {
   return String(error?.payload?.error || error?.message || error || 'Unknown error');
@@ -4376,6 +4397,15 @@ function aiModelContextLabel(tokens) {
   return String(value);
 }
 
+function aiModelThinkingBadge(thinkingOff) {
+  const copy = typeof thinkingOff === 'string' && Object.prototype.hasOwnProperty.call(AI_MODEL_THINKING_OFF, thinkingOff)
+    ? AI_MODEL_THINKING_OFF[thinkingOff]
+    : null;
+  return copy
+    ? `<small class="pill ai-model-thinking" title="${attr(copy.text)}">${esc(copy.badge)}<span class="visually-hidden">. ${esc(copy.text)}</span></small>`
+    : '';
+}
+
 function aiModelIssueAlert(issue) {
   return issue
     ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(issue.message)}</strong> ${esc(issue.nextAction)}</span></div>`
@@ -4391,7 +4421,7 @@ function aiModelModelList(connection) {
       model.images === true ? 'Reads images' : model.images === false ? 'Text only' : '',
       model.contextWindow ? `${aiModelContextLabel(model.contextWindow)} context` : '',
     ].filter(Boolean).join(' · ');
-    return `<li><span>${esc(model.label)}</span>${facts ? `<small>${esc(facts)}</small>` : ''}</li>`;
+    return `<li><span>${esc(model.label)}${aiModelThinkingBadge(model.thinkingOff)}</span>${facts ? `<small>${esc(facts)}</small>` : ''}</li>`;
   }).join('');
   return `<details class="ai-model-models"><summary>${esc(String(models.length))} model${models.length === 1 ? '' : 's'} available</summary><ul>${rows}</ul></details>`;
 }
@@ -4423,7 +4453,7 @@ function aiModelRoleRow(status, roleId) {
     : '';
   const thinking = AI_MODEL_THINKING_LEVELS
     .map(([value, label]) => `<option value="${value}" ${role.thinking === value ? 'selected' : ''}>Thinking · ${label}</option>`).join('');
-  return `<div class="setting-row ai-model-role-row"><span class="setting-copy"><strong>${esc(copy.title)}</strong><span>${esc(copy.detail)}</span><span class="ai-model-role-caption">${esc(caption + imageNote)}</span></span><span class="ai-model-role-controls"><label><span class="visually-hidden">${esc(copy.title)} model</span><select data-ai-model-role="${roleId}" data-ai-model-field="modelKey" ${busy ? 'disabled' : ''}>${aiModelRoleOptions(connections, role)}</select></label><label><span class="visually-hidden">${esc(copy.title)} thinking</span><select data-ai-model-role="${roleId}" data-ai-model-field="thinking" ${busy ? 'disabled' : ''}>${thinking}</select></label></span></div>`;
+  return `<div class="setting-row ai-model-role-row"><span class="setting-copy"><strong>${esc(copy.title)}</strong><span>${esc(copy.detail)}</span><span class="ai-model-role-caption">${esc(caption + imageNote)}${aiModelThinkingBadge(role.thinkingOff)}</span></span><span class="ai-model-role-controls"><label><span class="visually-hidden">${esc(copy.title)} model</span><select data-ai-model-role="${roleId}" data-ai-model-field="modelKey" ${busy ? 'disabled' : ''}>${aiModelRoleOptions(connections, role)}</select></label><label><span class="visually-hidden">${esc(copy.title)} thinking</span><select data-ai-model-role="${roleId}" data-ai-model-field="thinking" ${busy ? 'disabled' : ''}>${thinking}</select></label></span></div>`;
 }
 
 function aiModelKeyCard(status, provider) {
@@ -4447,12 +4477,12 @@ function aiModelKeyCard(status, provider) {
   const issue = saved ? aiModelIssueAlert(connection?.issue) : '';
   const field = mcpField('apiKey', `${provider.label} API key`, '', {
     type: 'password',
-    placeholder: 'sk-…',
+    placeholder: provider.placeholder || 'sk-…',
     autocomplete: 'off',
     required: true,
-    help: `Create one at ${provider.keysUrl}. BotBoy checks it with ${provider.label}, keeps it private on this Mac, and offers its models right away.`,
+    help: provider.help || `Create one at ${provider.keysUrl}. BotBoy checks it with ${provider.label}, keeps it private on this Mac, and offers its models right away.`,
   });
-  return `<form class="card mcp-form ai-model-key-form" data-provider="${provider.id}"><div class="card-header"><div><h2 class="card-title">${esc(provider.label)}</h2><div class="card-meta">${meta}</div></div>${pill}</div>${saveError}${issue}<div class="mcp-form-body">${savedRows}${field}<p class="card-meta">When one of this key's models does the work, what it reads (captured messages, documents, your chats, and query results) is sent to ${esc(provider.label)} under your account. Data Room tables BotBoy reads for you are sent too.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${savingThis ? 'Checking key…' : saved ? 'Replace key' : 'Save and turn on'}</button></div></form>`;
+  return `<form class="card mcp-form ai-model-key-form" data-provider="${provider.id}"><div class="card-header"><div><h2 class="card-title">${esc(provider.label)}</h2><div class="card-meta">${meta}</div></div>${pill}</div>${saveError}${issue}<div class="mcp-form-body">${savedRows}${field}<p class="card-meta">When one of this key's models does the work, what it reads (captured messages, documents, your chats, and query results) is sent to ${esc(provider.label)} under your account. Data Room tables BotBoy reads for you are sent too.</p></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Stored only on this Mac. BotBoy never shows the key again.</span><button class="button primary" type="submit" ${busy ? 'disabled' : ''}>${savingThis ? 'Checking key…' : saved ? 'Replace key' : (provider.saveLabel || 'Save and turn on')}</button></div></form>`;
 }
 
 function renderAiModelSettings() {
@@ -4505,11 +4535,11 @@ async function saveAiModelKey(form) {
     state.aiModel.loading = false;
     state.aiModel.status = status;
     state.aiModel.error = '';
-    toast(`${provider.label} is on. Its models are ready in chat and in Background work.`);
+    toast(provider.savedToast || `${provider.label} is on. Its models are ready in chat and in Background work.`);
     announceAiModelChange();
   } catch (error) {
     state.aiModel.saveError = { provider: provider.id, message: aiModelErrorText(error), nextAction: String(error?.nextAction || '') };
-    toast(`Could not turn on ${provider.label}`, 'bad');
+    toast(provider.failedToast || `Could not turn on ${provider.label}`, 'bad');
   } finally {
     state.aiModel.saving = false;
     state.aiModel.savingProvider = '';
@@ -4521,7 +4551,7 @@ async function removeAiModelKey(providerId) {
   const status = state.aiModel.status;
   const provider = AI_MODEL_KEY_PROVIDERS.find(entry => entry.id === providerId);
   if (!provider || !status?.[provider.id] || state.aiModel.saving || state.aiModel.removing) return;
-  if (!window.confirm(`Remove the saved ${provider.label} key (${status[provider.id].keySuffix})?\n\nChats on its models stop, and background work moves to another connected model.`)) return;
+  if (!window.confirm(`Remove the saved ${provider.label} key (${status[provider.id].keySuffix})?\n\n${provider.removeNote || 'Chats on its models stop, and background work moves to another connected model.'}`)) return;
   state.aiModel.removing = true;
   state.aiModel.savingProvider = provider.id;
   state.aiModel.saveError = null;

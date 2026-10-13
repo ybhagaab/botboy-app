@@ -10,6 +10,8 @@ import {
 import { getBedrockBearerToken, signBedrockRequest } from './aws-sigv4.js';
 import { createOAuthClientCredentialsAuthorizer } from './oauth-authorizer.js';
 import type { LlmUsageService } from './llm-usage.js';
+import { ANTHROPIC_API_ENDPOINT, type AnthropicModelProfile } from './anthropic-models.js';
+import { ANTHROPIC_STREAM_IDLE_TIMEOUT_MS, createAnthropicLlmClient } from './anthropic-client.js';
 
 /**
  * Application-level inference provider.
@@ -25,14 +27,14 @@ import type { LlmUsageService } from './llm-usage.js';
  * gateway credentials themselves.
  */
 /**
- * 'openai' and 'deepseek' are hosted APIs configured from Settings → AI model
- * (the owner's own keys). They are never derived from environment variables,
- * so an ambient OPENAI_API_KEY or DEEPSEEK_API_KEY can never silently redirect
- * BotBoy's data.
+ * 'openai', 'deepseek' and 'anthropic' are hosted APIs configured from
+ * Settings → AI model (the owner's own keys). They are never derived from
+ * environment variables, so an ambient OPENAI_API_KEY, DEEPSEEK_API_KEY or
+ * ANTHROPIC_API_KEY can never silently redirect BotBoy's data.
  */
-export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible' | 'openai' | 'deepseek';
+export type InferenceProviderId = 'bedrock' | 'gateway' | 'openai-compatible' | 'openai' | 'deepseek' | 'anthropic';
 /** Providers the launcher/environment can select. */
-export type EnvInferenceProviderId = Exclude<InferenceProviderId, 'openai' | 'deepseek'>;
+export type EnvInferenceProviderId = Exclude<InferenceProviderId, 'openai' | 'deepseek' | 'anthropic'>;
 
 export interface InferenceProvider {
   readonly id: InferenceProviderId;
@@ -585,7 +587,7 @@ function apiModeSetting(value: string | undefined, fallback: LlmApiMode): LlmApi
  * opt-in local fallback). Shared by every provider so switching providers at
  * runtime keeps the owner's tuning.
  */
-function runtimeSettingsFromEnv(env: NodeJS.ProcessEnv) {
+function runtimeSettingsFromEnv(env: NodeJS.ProcessEnv, providerDefaults: { streamIdleTimeoutMs?: number } = {}) {
   return {
     requestTimeoutMs: nonNegativeIntSetting(
       env.BOTBOY_INFERENCE_TIMEOUT_MS ?? env.VLLM_TIMEOUT_MS,
@@ -604,9 +606,10 @@ function runtimeSettingsFromEnv(env: NodeJS.ProcessEnv) {
       env.BOTBOY_INFERENCE_HEALTH_INTERVAL_MS,
       SHARED_DEFAULTS.healthCheckIntervalMs,
     ),
+    // A set value wins for every provider alike; unset, a provider may bring its own default (Anthropic: 280 s).
     streamIdleTimeoutMs: nonNegativeIntSetting(
       env.BOTBOY_INFERENCE_STREAM_IDLE_TIMEOUT_MS ?? env.VLLM_STREAM_IDLE_TIMEOUT_MS,
-      SHARED_DEFAULTS.streamIdleTimeoutMs,
+      providerDefaults.streamIdleTimeoutMs ?? SHARED_DEFAULTS.streamIdleTimeoutMs,
     ),
     localFallback: boolSetting(
       env.BOTBOY_LOCAL_LLM_FALLBACK ?? env.LLM_FALLBACK_ENABLED,
@@ -684,6 +687,8 @@ export const DEEPSEEK_PLATFORM_ENDPOINT = 'https://api.deepseek.com';
 export const DEEPSEEK_PREFERRED_DEFAULT_MODEL = 'deepseek-flash';
 /** DeepSeek's documented V4 profile, used only when GET /models omits a value. */
 const DEEPSEEK_DEFAULT_CONTEXT_TOKENS = 1_000_000;
+/** A model whose list entry reports no window reads as 200,000 tokens (the Messages window every listed Claude model meets). */
+const ANTHROPIC_DEFAULT_CONTEXT_TOKENS = 200_000;
 
 export interface DeepSeekInferenceOptions {
   /** The owner's DeepSeek API key. Held only by the request authorizer. */
@@ -732,6 +737,78 @@ export function createDeepSeekInferenceProvider(options: DeepSeekInferenceOption
   });
 }
 
+/** Anthropic (Claude) API, native Messages. The key goes only to this endpoint, in `x-api-key`. */
+export const ANTHROPIC_PLATFORM_ENDPOINT = ANTHROPIC_API_ENDPOINT;
+
+export interface AnthropicInferenceOptions {
+  /** The owner's Anthropic API key. Held only by the client, used only to build request headers. */
+  apiKey: string;
+  /** The models the key offers, with the capabilities that drive request shaping. */
+  models: readonly AnthropicModelProfile[];
+  /** The connection's default model (route-less calls, the free probe); must be listed. */
+  defaultModel: string;
+  /** Test seam only; production always uses the hosted Anthropic API. */
+  endpoint?: string;
+  /** Runtime tuning source (timeouts, health cadence). */
+  env?: NodeJS.ProcessEnv;
+  /** Called (fire and forget) when an answer says the key's model list is stale. */
+  onModelsStale?: (reason: string) => void;
+  /** Test seam only: the HTTP client every request uses (default: the global fetch). */
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * The hosted Anthropic API with the owner's key, on its native Messages API (`anthropic-client.ts`). Everything
+ * above the client is unchanged. Runtime settings come from the same environment names as the other providers;
+ * the stream idle timeout defaults to 280 s here (a set value still wins). The context budget is NOT set here:
+ * the provider inherits the shared default (`SHARED_DEFAULTS.contextBudgetTokens`, 100,000) exactly like OpenAI,
+ * DeepSeek and the team gateway, and `BOTBOY_INFERENCE_CONTEXT_BUDGET_TOKENS` overrides it for every provider alike.
+ * `BOTBOY_ANTHROPIC_PROMPT_CACHE=off` turns prompt caching off.
+ */
+export function createAnthropicInferenceProvider(options: AnthropicInferenceOptions): InferenceProvider {
+  const apiKey = options.apiKey.trim();
+  if (!apiKey) throw new Error('An Anthropic API key is required.');
+  const defaultModel = options.defaultModel.trim();
+  if (!defaultModel) throw new Error('An Anthropic default model is required.');
+  const env = options.env ?? process.env;
+  const profiles = new Map(options.models.map(model => [model.id, model] as const));
+  const settings: SharedProviderOptions = {
+    endpoint: (options.endpoint ?? ANTHROPIC_PLATFORM_ENDPOINT).replace(/\/+$/, ''),
+    model: defaultModel,
+    apiMode: 'messages',
+    dialect: 'openai',
+    reasoningEffort: reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low',
+    maxContextTokens: profiles.get(defaultModel)?.contextWindow ?? defaultInferenceMaxContextTokens('anthropic'),
+    ...runtimeSettingsFromEnv(env, { streamIdleTimeoutMs: ANTHROPIC_STREAM_IDLE_TIMEOUT_MS }),
+  };
+  const config: LlmConfig = {
+    ...buildLlmConfig(settings, { authMode: 'apiKey' }),
+    providerId: 'anthropic',
+    availableModels: Object.freeze(options.models.map(model => model.id)),
+  };
+  const promptCaching = (env.BOTBOY_ANTHROPIC_PROMPT_CACHE ?? '').trim().toLowerCase() !== 'off';
+  return {
+    id: 'anthropic',
+    endpoint: settings.endpoint,
+    model: settings.model,
+    apiMode: settings.apiMode,
+    maxContextTokens: settings.maxContextTokens,
+    localFallbackEnabled: false,
+    createClient: (clientOptions = {}) => createAnthropicLlmClient(
+      config,
+      {
+        apiKey,
+        profiles: () => profiles,
+        promptCaching,
+        defaultEffort: reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low',
+        ...(options.onModelsStale ? { onModelsStale: options.onModelsStale } : {}),
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      },
+      clientOptions.usageService,
+    ),
+  };
+}
+
 function inferProvider(env: NodeJS.ProcessEnv): InferenceProviderId {
   const endpoint = (env.BOTBOY_INFERENCE_ENDPOINT || env.VLLM_ENDPOINT)?.trim();
   const authMode = env.VLLM_AUTH_MODE?.trim().toLowerCase();
@@ -753,8 +830,8 @@ export function resolveInferenceProviderId(
 ): EnvInferenceProviderId {
   const providerName = (env.BOTBOY_INFERENCE_PROVIDER || '').trim().toLowerCase()
     || inferProvider(env);
-  if (providerName === 'openai' || providerName === 'deepseek') {
-    const label = providerName === 'openai' ? 'OpenAI' : 'DeepSeek';
+  if (providerName === 'openai' || providerName === 'deepseek' || providerName === 'anthropic') {
+    const label = providerName === 'openai' ? 'OpenAI' : providerName === 'deepseek' ? 'DeepSeek' : 'Anthropic (Claude)';
     throw new Error(`BOTBOY_INFERENCE_PROVIDER=${providerName} is not an environment setting. Add your ${label} API key in BotBoy Settings → AI model instead, and remove this variable.`);
   }
   if (providerName !== 'bedrock' && providerName !== 'gateway' && providerName !== 'openai-compatible') {
@@ -769,6 +846,7 @@ export function defaultInferenceMaxContextTokens(id: InferenceProviderId): numbe
   if (id === 'gateway') return GATEWAY_MAX_CONTEXT_TOKENS;
   if (id === 'openai') return OPENAI_PLATFORM_MAX_CONTEXT_TOKENS;
   if (id === 'deepseek') return DEEPSEEK_DEFAULT_CONTEXT_TOKENS;
+  if (id === 'anthropic') return ANTHROPIC_DEFAULT_CONTEXT_TOKENS;
   return OPENAI_COMPATIBLE_MAX_CONTEXT_TOKENS;
 }
 

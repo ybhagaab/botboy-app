@@ -306,10 +306,60 @@ describe('visual inspection composite', () => {
     const error = await inspector.inspect({ assetIds: [asset.assetId], question: 'What is visible?', ownerRequest: 'Inspect it.', callerKind: 'interactive' }).catch(e => e);
     expect(error).toMatchObject({ code: 'VISUAL_MODEL_TEXT_ONLY', nextAction: expect.stringContaining('Settings → AI model') });
     expect(error.message).toContain('DeepSeek V4 Pro');
+    // The fix names the image-capable choices an owner may make, Claude among them (design D5/slice B).
+    expect(error.nextAction).toContain('(for example DeepSeek Flash, GPT-5.6 Terra or a Claude model)');
+    expect(error.nextAction).toContain('Do not describe or guess their contents.');
     expect(fake.client.chatCompletionPrimary).not.toHaveBeenCalled();
     expect(fake.client.preflightPrimary).not.toHaveBeenCalled();
     const runs = storage.getDb().prepare('SELECT COUNT(*) AS n FROM visual_inspection_runs').get() as any;
     expect(runs.n).toBe(0);
+  });
+
+  it('does not stop a model whose image support is unknown, nor a Claude model that reads images: only an explicit false stops', async () => {
+    for (const images of [undefined, true]) {
+      const { storage, registry } = fixture();
+      const asset = registry.registerBuffer({ buffer: makePng(8, 8, () => [5, 6, 7, 255]), ownerKind: 'chat_attachment', ownerId: `reads-${String(images)}` });
+      const fake = fakeLlm();
+      const client = {
+        ...fake.client,
+        getModelOperation: () => ({
+          connectionId: 'anthropic',
+          modelKey: 'anthropic.claude-haiku-5-5',
+          label: 'Claude Haiku 5.5',
+          provider: { id: 'anthropic', endpoint: 'https://api.anthropic.com', model: 'claude-haiku-5-5', apiMode: 'messages' as const },
+          capabilities: { ...(images === undefined ? {} : { images }), contextWindow: 1_000_000, maxOutputTokens: 128_000, thinkingOff: 'native_without_tools' as const },
+          client: fake.client,
+        }),
+      };
+      const inspector = createVisualInspector({ db: storage.getDb(), registry, llmClient: client });
+      const receipt = await inspector.inspect({ assetIds: [asset.assetId], question: 'What is visible?', ownerRequest: 'Inspect it.', callerKind: 'interactive' });
+      expect(receipt.coverage).toMatchObject({ complete: true });
+      expect(fake.client.chatCompletionPrimary).toHaveBeenCalled();
+    }
+  });
+
+  it('stops a text-only Claude Organizing model the same way, naming it, before any run, preflight or request', async () => {
+    const { storage, registry } = fixture();
+    const asset = registry.registerBuffer({ buffer: makePng(8, 8, () => [9, 8, 7, 255]), ownerKind: 'chat_attachment', ownerId: 'text-only-claude' });
+    const fake = fakeLlm();
+    const client = {
+      ...fake.client,
+      getModelOperation: () => ({
+        connectionId: 'anthropic',
+        modelKey: 'anthropic.claude-3-haiku-20240307',
+        label: 'Claude Haiku 3',
+        provider: { id: 'anthropic', endpoint: 'https://api.anthropic.com', model: 'claude-3-haiku-20240307', apiMode: 'messages' as const },
+        capabilities: { images: false, contextWindow: 200_000, maxOutputTokens: 4_096, thinkingOff: 'unavailable' as const },
+        client: fake.client,
+      }),
+    };
+    const inspector = createVisualInspector({ db: storage.getDb(), registry, llmClient: client });
+    const error = await inspector.inspect({ assetIds: [asset.assetId], question: 'What is visible?', ownerRequest: 'Inspect it.', callerKind: 'background' }).catch(e => e);
+    expect(error).toMatchObject({ code: 'VISUAL_MODEL_TEXT_ONLY', nextAction: expect.stringContaining('Claude model') });
+    expect(error.message).toBe('Claude Haiku 3, the model BotBoy uses for organizing, cannot read images, so these images were not inspected.');
+    expect(fake.client.chatCompletionPrimary).not.toHaveBeenCalled();
+    expect(fake.client.preflightPrimary).not.toHaveBeenCalled();
+    expect((storage.getDb().prepare('SELECT COUNT(*) AS n FROM visual_inspection_runs').get() as any).n).toBe(0);
   });
 });
 

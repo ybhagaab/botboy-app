@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.setConfig({ testTimeout: 60_000 });
 
 const launcherPath = fileURLToPath(new URL('../../start.sh', import.meta.url));
+const nativePrebuiltPath = fileURLToPath(new URL('../../scripts/native-prebuilt.mjs', import.meta.url));
 const roots: string[] = [];
 afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
@@ -149,7 +150,7 @@ describe('start.sh › Intel Macs run no arch or file command', () => {
       BOTBOY_TEST_FILE_BIN: file,
       BOTBOY_TEST_LSOF_BIN: b.recording('lsof'),
       BOTBOY_TEST_PS_BIN: b.recording('ps'),
-      BOTBOY_TEST_APP_BUNDLE: path.join(b.root, 'no-such.app'),
+      BOTBOY_TEST_APP_BUNDLE: path.join(b.root, 'no-such-bundle'),
     };
     // arch_prepare runs before these hooks; the doctor rows and the app plan read the facts too.
     for (const hook of ['BOTBOY_TEST_HEAL_DEPS', 'BOTBOY_TEST_DOCTOR_MACHINE', 'BOTBOY_TEST_APP_LAUNCHER_PLAN']) {
@@ -465,7 +466,10 @@ describe('start.sh › no Xcode shim without Command Line Tools', () => {
     const xcodeSelect = b.recording('xcode-select', 'exit 2');
     const xcrun = b.recording('xcrun', 'exit 1');
     const gitShim = b.recording('git', 'exit 1');
-    const bundle = path.join(b.root, 'BotBoy.app');
+    // Not named *.app: macOS assesses (and may register) anything that looks like an application bundle once something runs from it.
+    const bundle = path.join(b.root, 'bundle-under-test');
+    fs.mkdirSync(path.join(b.dir, 'scripts'), { recursive: true });
+    fs.copyFileSync(nativePrebuiltPath, path.join(b.dir, 'scripts', 'native-prebuilt.mjs'));
     fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
     fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'BotBoy'), '');
     const file = b.stub('file', `echo '${INTEL_ONLY}'`);
@@ -479,6 +483,7 @@ describe('start.sh › no Xcode shim without Command Line Tools', () => {
       BOTBOY_TEST_ARCH_PROBE_OK: '1',
       BOTBOY_TEST_FILE_BIN: file,
       BOTBOY_TEST_APP_BUNDLE: bundle,
+      BOTBOY_TEST_LSREGISTER_BIN: b.stub('lsregister', ''),
       BOTBOY_TEST_PLISTBUDDY_BIN: b.stub('plistbuddy', ''),
       BOTBOY_TEST_LSOF_BIN: b.stub('lsof', ''),
       PATH: `${b.stubs}:/usr/bin:/bin:/usr/sbin:/sbin:${path.dirname(process.execPath)}`,
