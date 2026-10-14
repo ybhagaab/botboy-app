@@ -8,8 +8,8 @@ local folders, and your browser—and turns that activity into organized
 projects, living briefs, and a chat assistant grounded in your work. Evidence,
 document copies, generated files, and credentials stay local by default;
 selected content needed for LLM requests goes through the authenticated team
-gateway, or to OpenAI or DeepSeek under your own account when you add an API
-key in Settings → AI model and choose one of its models.
+gateway, or to OpenAI, DeepSeek or Anthropic (Claude) under your own account
+when you add an API key in Settings → AI model and choose one of its models.
 
 ## Why teams use it
 
@@ -76,15 +76,32 @@ dedicated read-only analytics connection.
 
 ## Install
 
-You need macOS, Google Chrome, Git, Node.js 22 or newer (from nodejs.org: its
-installer needs no other tools), and an AI model: the private BotBoy credential
-attachment sent by the owner, your own OpenAI API key, your own DeepSeek API key,
-or any mix of them. No AWS account or `aws login` is required. Git comes with the
-Xcode Command Line Tools (a Mac without them offers to install them the first time
-you run `git`). The current LTS, Node 24, needs macOS 13.5 or newer; on an older
-macOS install Node 22. On Node 20 (end-of-life since 2026-04-30), `npm install`
-builds the database module from source and needs the Command Line Tools too.
-BotBoy's readers (text inside images and scanned PDFs, and the Dock app) ship
+You need macOS, Google Chrome, Git, and an AI model: the private
+BotBoy credential attachment sent by the owner, your own OpenAI API key, your own
+DeepSeek API key, your own Anthropic (Claude) API key, or any mix of them. No AWS
+account or `aws login` is required.
+Git comes with the Xcode Command Line Tools (a Mac without them offers to install
+them the first time you run `git`).
+You do not need to install Node.js, Homebrew or npm. `./start.sh` uses the Node your
+Mac already has when it works; when it has none (or one that cannot install BotBoy),
+`./start.sh` downloads BotBoy's own copy once: Node 24.21.0 from nodejs.org (about
+50 MB), checked against a SHA-256 kept in this repository before it is unpacked into
+`~/.personal-productivity-tracker/runtime`. Only BotBoy uses it (its chat commands, its terminal and the MCP servers
+you add use it too, so `node`, `npx` and `npm` work there), and deleting that
+folder removes it. That Node needs macOS 13.5 or newer; on an older macOS, update it
+in System Settings > General > Software Update (on macOS 13 Ventura, 13.5 or newer is
+a free update). Only if your Mac cannot update: install Node 22 from nodejs.org, run
+`sudo npm install -g npm@11` once in Terminal (it asks for your Mac password; Node 22's
+own npm 10.9 cannot do BotBoy's first install), then run `./start.sh`. Prefer your own
+Node? Install Node 24 or newer from nodejs.org (the LTS download; its installer needs
+no other tools). You do not need Python or uv either: on a Mac without a usable Python 3.10+ or
+uv, `./start.sh` sets up BotBoy's own uv 0.13.0 and CPython 3.13.16 in the background
+(about 40 MB from github.com, checked against SHA-256 values in `python-runtime.pin`
+before unpacking, into `~/.personal-productivity-tracker/runtime`). Only BotBoy uses
+them (chat's Python and the Python MCP servers you add), what they install goes to
+`~/.botboy-python`, and `sh -c 'rm -rf ~/.personal-productivity-tracker/runtime/uv-* ~/.personal-productivity-tracker/runtime/python ~/.personal-productivity-tracker/runtime/.download/uv-* ~/.personal-productivity-tracker/runtime/.download/cpython-* ~/.personal-productivity-tracker/runtime/.python.lock ~/.botboy-python'`
+removes them, with what an interrupted download left behind (run it as written: through `sh -c` it also
+works when some of these are missing, where zsh would refuse it). BotBoy's readers (text inside images and scanned PDFs, and the Dock app) ship
 prebuilt: nothing is compiled on your Mac.
 
 If you have a credential attachment, download it to Downloads or Desktop.
@@ -93,15 +110,25 @@ Then run:
 ```bash
 git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
 cd ~/botboy-app
-npm install
 ./start.sh
 ```
 
-Using your own OpenAI or DeepSeek API key? When the dashboard opens, go to
-**Settings → AI model**, paste the key into its card, and choose **Save and
-turn on**. BotBoy checks it with the provider and offers its models right away,
-with no restart. The chat panel lists every connected provider's models, and
-**Background work** chooses the models for organizing and document writing.
+Using your own OpenAI, DeepSeek or Anthropic (Claude) API key? When the
+dashboard opens, go to **Settings → AI model**, paste the key into its card, and
+choose **Save and turn on** (**Check and save key** on the Claude card). BotBoy
+checks it with the provider and offers its models right away, with no restart.
+The chat panel lists every connected provider's models, and **Background work**
+chooses the models for organizing and document writing.
+A Claude key comes from
+[platform.claude.com/settings/keys](https://platform.claude.com/settings/keys)
+and starts with `sk-ant-`. Use a regular key that belongs to one workspace:
+Admin keys (`sk-ant-admin…`) are refused, and BotBoy has no workspace ID field.
+The Claude card lists the models the key can use; with only a Claude key,
+Organizing starts on the newest Haiku-line model and Document writing and chat
+on the newest Sonnet-line model. `./start.sh --doctor` shows the key's last four
+characters and an `anthropic probe`. An older BotBoy ignores the Claude key and
+drops it the next time it saves its Settings, so paste the key again after going
+back to an older release.
 
 Allow a few minutes on first run. BotBoy imports any credential attachment
 (`.env` or owner-issued ZIP), builds itself, waits for the final dashboard to
@@ -149,10 +176,11 @@ checkout aside and clone again (see the setup guide); your data stays in
 BotBoy is single-user and local-first. Its evidence database, document copies,
 generated files, and credentials live under
 `~/.personal-productivity-tracker/`. Selected text and bounded visual inputs
-needed for LLM requests go through the authenticated team gateway, or to OpenAI
-or DeepSeek under your own account when one of your saved keys' models does the
-work (Data Room table values are never sent to them). Connections communicate only
-with services you enable; explicit writes keep their own approval boundaries.
+needed for LLM requests go through the authenticated team gateway, or to OpenAI,
+DeepSeek or Anthropic (Claude) under your own account when one of your saved
+keys' models does the work. That includes tool results, files BotBoy reads for
+you and Data Room table values. Connections communicate only with services you
+enable; explicit writes keep their own approval boundaries.
 
 ## Help
 

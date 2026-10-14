@@ -8,6 +8,7 @@ import {
   BOTBOY_CREDENTIAL_ENV_KEYS,
   modelChildEnvironment,
   modelCommandSandboxInvocation,
+  modelShellLaunch,
   resolvesIntoPrivateState,
 } from './protected-local-resources.js';
 import { createToolExecutor, readFileHandler } from './tool-executor.js';
@@ -49,7 +50,7 @@ describe('model-run processes and BotBoy credentials', () => {
       BOTBOY_INFERENCE_PROVIDER: 'gateway',
       ...Object.fromEntries(BOTBOY_CREDENTIAL_ENV_KEYS.map(key => [key, `secret-${key}`])),
     };
-    const env = modelChildEnvironment({ BOTBOY_FILES: filesDir }, base);
+    const env = modelChildEnvironment({ BOTBOY_FILES: filesDir }, base, null);
     for (const key of BOTBOY_CREDENTIAL_ENV_KEYS) expect(env).not.toHaveProperty(key);
     expect(env).toMatchObject({
       PATH: '/usr/bin',
@@ -64,13 +65,27 @@ describe('model-run processes and BotBoy credentials', () => {
     ]));
   });
 
-  it('keeps run_command and the chat terminal on the scrubbed environment', () => {
+  it('keeps run_command and the chat terminal on the scrubbed environment (both build it through modelShellLaunch)', () => {
     const executor = fs.readFileSync(new URL('./tool-executor.ts', import.meta.url), 'utf8');
     const terminal = fs.readFileSync(new URL('./chat-terminal.ts', import.meta.url), 'utf8');
-    expect(executor).toContain('env: modelChildEnvironment({ BOTBOY_FILES: invocation.filesDir })');
+    expect(executor).toContain('const invocation = modelShellLaunch(cmd);');
+    expect(executor).toContain('env: invocation.env,');
+    expect(terminal).toContain('modelShellLaunch(input.command, {');
+    expect(terminal).toContain('env: invocation.env,');
     expect(executor).not.toContain('env: { ...process.env, BOTBOY_FILES');
-    expect(terminal).toContain('env: modelChildEnvironment({');
     expect(terminal).not.toContain('...(process.env as Record<string, string>)');
+    // Neither builds the sandbox or the environment by hand: the profile, the PATH line and the environment cannot disagree.
+    for (const source of [executor, terminal]) {
+      expect(source).not.toContain('modelCommandSandboxInvocation(');
+      expect(source).not.toContain('modelChildEnvironment(');
+    }
+  });
+
+  it('modelShellLaunch removes exactly the same credentials and adds BOTBOY_FILES', () => {
+    const creds = Object.fromEntries(BOTBOY_CREDENTIAL_ENV_KEYS.map(key => [key, `secret-${key}`]));
+    const launch = modelShellLaunch('true', { privateRoot, filesDir, base: { PATH: '/usr/bin', HOME: '/Users/owner', AWS_PROFILE: 'p', ...creds }, use: null, extraEnv: { TERM: 'xterm-256color' } });
+    for (const key of BOTBOY_CREDENTIAL_ENV_KEYS) expect(launch.env).not.toHaveProperty(key);
+    expect(launch.env).toEqual({ PATH: '/usr/bin', HOME: '/Users/owner', AWS_PROFILE: 'p', BOTBOY_FILES: filesDir, TERM: 'xterm-256color' });
   });
 
   it('classifies link targets against the private-state boundary', () => {
@@ -119,7 +134,7 @@ describe('model-run processes and BotBoy credentials', () => {
       const invocation = modelCommandSandboxInvocation(`cat "${keyFile}"`, { privateRoot, filesDir, shell: '/bin/sh' });
       const result = await execFileAsync(invocation.executable, invocation.args, {
         cwd: filesDir,
-        env: modelChildEnvironment({ BOTBOY_FILES: filesDir }),
+        env: modelChildEnvironment({ BOTBOY_FILES: filesDir }, process.env, null),
       }).then(output => ({ ok: true, output: `${output.stdout}${output.stderr}` }))
         .catch((error: any) => ({ ok: false, output: `${error.stdout ?? ''}${error.stderr ?? ''}` }));
       expect(result.ok).toBe(false);

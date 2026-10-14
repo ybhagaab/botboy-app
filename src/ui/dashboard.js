@@ -57,6 +57,7 @@ import {
   shouldPreserveOuterScroll,
   startOuterScrollRestore,
 } from './shell-scroll.js';
+import { createServerLink } from './server-link.js';
 
 const API = '/api';
 const DOCUMENT_LIST_LIMIT = 100;
@@ -4504,7 +4505,7 @@ function renderAiModelSettings() {
     ? `${aiModelRoleRow(status, 'processing')}${aiModelRoleRow(status, 'documents')}<div class="setting-row"><span class="setting-copy"><strong>Chat</strong><span>Each message uses the model picked in the chat panel.</span></span></div>`
     : '';
   const intro = notSetUp
-    ? `<div class="setting-row"><span class="setting-copy"><strong>No AI model yet</strong><span>Chat and background organizing are off until you add an OpenAI or DeepSeek API key below.</span></span><span class="pill">Not set up</span></div>`
+    ? `<div class="setting-row"><span class="setting-copy"><strong>No AI model yet</strong><span>Chat and background organizing are off until you add an OpenAI, DeepSeek or Anthropic (Claude) API key below.</span></span><span class="pill">Not set up</span></div>`
     : roles;
   const teamCard = team && !notSetUp
     ? `<article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">${esc(team.label)}</h2><div class="card-meta">Set up by the BotBoy launcher configuration.</div></div><span class="pill ${team.healthy ? 'good' : 'warn'}">${team.healthy ? 'Ready' : 'Needs attention'}</span></div>${aiModelIssueAlert(team.issue)}${aiModelModelList(team)}</article>`
@@ -9752,9 +9753,14 @@ window.addEventListener('resize', () => {
 }, { passive: true });
 const USER_QUIET_MS = 12000;
 
+// Says when the server has been unreachable for about ten seconds (server-link.js).
+// Recovery is the bootId reload below: a restarted server answers with a new
+// boot id and this window reloads itself on the same route.
+const serverLink = createServerLink({ banner: document.getElementById('server-link-banner') });
+
 async function pollVersion() {
   try {
-    const payload = await request('/dashboard/version');
+    const payload = await serverLink.watch(request('/dashboard/version'));
     const previousVersion = state.lastVersion;
     const previousAnalyticsVersion = state.lastAnalyticsVersion;
     const previousDataRoomVersion = state.lastDataRoomVersion;

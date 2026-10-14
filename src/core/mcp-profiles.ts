@@ -789,7 +789,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
           '  "$p" -m pip install --user --break-system-packages \'mcp<2\' || "$p" -m pip install --user \'mcp<2\';',
           '  exit $?;',
           'done;',
-          'echo "No Python 3.10+ found — the ETL server needs one. Install it first (e.g. brew install python@3.12), then rerun this step." >&2;',
+          'echo "No Python 3.10+ found — the ETL server needs one. BotBoy sets up its own Python 3.13 when ./start.sh runs while online (./start.sh --doctor, row \'python source\'); then rerun this step." >&2;',
           'exit 1',
         ].join(' ')]),
         timeoutMs: 10 * 60_000,
@@ -834,7 +834,7 @@ const PROFILES: Readonly<Record<BuiltInMcpProfileId, BuiltInMcpProfile>> = Objec
         },
         {
           title: 'Install the Python MCP library',
-          description: "One-time, via the button above (it targets the same Python 3.10+ the server launches with and handles both pip generations). Needs a Python 3.10+ on the machine — stock Xcode python3 is 3.9 and cannot run this server; install one with: brew install python@3.12",
+          description: "One-time, via the button above (it targets the same Python 3.10+ the server launches with and handles both pip generations). Needs Python 3.10 or newer. BotBoy uses this Mac's own Python when it has one, otherwise its own Python 3.13, which ./start.sh sets up.",
           command: "use the 'Install Python MCP library' action above",
         },
         {
@@ -1024,15 +1024,27 @@ export function pathValueWithFallbackDirectories(pathValue: string | undefined):
   return entries.join(path.delimiter);
 }
 
+/**
+ * The folders an executable name is looked up in, in order: the PATH value, the code-owned fallback folders, and then
+ * `lastResort`. `lastResort` comes last on purpose, so it can add a command but never shadow one found elsewhere. The
+ * only caller that passes one is the MCP manager, for user-added commands, with `~/.npm-global/bin` while BotBoy runs on
+ * its own Node (a program installed with `npm install -g` from chat).
+ */
+export function executableSearchDirectories(pathValue: string, lastResort: readonly string[] = []): string[] {
+  return [
+    ...pathValue.split(path.delimiter),
+    ...FALLBACK_EXECUTABLE_DIRECTORIES,
+    ...lastResort,
+  ];
+}
+
 async function searchPathForExecutable(
   executableName: string,
   pathValue = process.env.PATH ?? '',
+  lastResort: readonly string[] = [],
 ): Promise<string | null> {
   const seen = new Set<string>();
-  const directories = [
-    ...pathValue.split(path.delimiter),
-    ...FALLBACK_EXECUTABLE_DIRECTORIES,
-  ];
+  const directories = executableSearchDirectories(pathValue, lastResort);
   for (const directory of directories) {
     if (!directory || !path.isAbsolute(directory) || seen.has(directory)) continue;
     seen.add(directory);
@@ -1050,13 +1062,14 @@ async function searchPathForExecutable(
 export async function resolveCommandExecutable(
   command: string,
   pathValue = process.env.PATH ?? '',
+  lastResort: readonly string[] = [],
 ): Promise<string | null> {
   if (!command) return null;
   if (command.includes(path.sep)) {
     if (!path.isAbsolute(command)) return null;
     return verifyExecutableFile(command);
   }
-  return searchPathForExecutable(command, pathValue);
+  return searchPathForExecutable(command, pathValue, lastResort);
 }
 
 /**
@@ -1100,10 +1113,13 @@ export async function resolveAimPackageScript(
 /**
  * Resolve the launch executable for any managed definition. SQL launches
  * through the pinned package entry point and does not resolve here.
+ * `lastResort` folders are searched for USER-ADDED commands only: built-in profiles run outside the sandbox and never
+ * resolve a program from a folder that sandboxed code can write (`~/.npm-global/bin`).
  */
 export async function resolveDefinitionExecutable(
   definition: McpServerDefinition,
   pathValue = process.env.PATH ?? '',
+  lastResort: readonly string[] = [],
 ): Promise<string | null> {
   if (definition.launch.type === 'local-executable') {
     return searchPathForExecutable(definition.launch.executableName, pathValue);
@@ -1112,7 +1128,7 @@ export async function resolveDefinitionExecutable(
     return resolveAimPackageScript(definition.launch.packageName, definition.launch.relativeScriptPath);
   }
   if (definition.launch.type === 'custom-command') {
-    return resolveCommandExecutable(definition.launch.command, pathValue);
+    return resolveCommandExecutable(definition.launch.command, pathValue, lastResort);
   }
   return null;
 }

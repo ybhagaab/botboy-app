@@ -194,7 +194,7 @@ describe('chat on a switchable AI model', () => {
     expect(response.status).toBe(409);
     expect(response.body).toMatchObject({
       code: 'ai_model_not_configured',
-      nextAction: expect.stringContaining('Settings → AI model'),
+      nextAction: 'Open Settings → AI model and paste an OpenAI, DeepSeek or Anthropic (Claude) API key. Chat and background organizing start right away.',
     });
     expect(stream).not.toHaveBeenCalled();
   });

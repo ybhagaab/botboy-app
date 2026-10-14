@@ -39,8 +39,7 @@ import { writeFileMaxChars } from './limits.js';
 import { getBuiltInMcpProfile } from './mcp-profiles.js';
 import {
   isProtectedLocalHttpUrl,
-  modelChildEnvironment,
-  modelCommandSandboxInvocation,
+  modelShellLaunch,
   resolvesIntoPrivateState,
 } from './protected-local-resources.js';
 
@@ -3871,7 +3870,9 @@ export function createToolExecutor(
         // and output caps are unchanged.
         const { execFile } = await import('child_process');
         const fs = await import('fs');
-        const invocation = modelCommandSandboxInvocation(cmd);
+        // One call builds the sandboxed login shell and its environment (modelShellLaunch). While BotBoy runs on its own
+        // Node that child can read it, so node, npx and npm work in chat; on a Mac with its own Node nothing is added.
+        const invocation = modelShellLaunch(cmd);
         // The files workspace stays writable (including its intentional source
         // links), while Seatbelt non-waivably denies BotBoy private state,
         // BotBoy/CDP loopback ports, and native UI automation to every child.
@@ -3882,7 +3883,7 @@ export function createToolExecutor(
             timeout: 600000,
             maxBuffer: 1024 * 1024,
             cwd: invocation.filesDir,
-            env: modelChildEnvironment({ BOTBOY_FILES: invocation.filesDir }),
+            env: invocation.env,
             // Stop, disconnect, and shutdown end the command with the turn.
             ...(context?.abortSignal ? { signal: context.abortSignal } : {}),
           }, (error, stdout, stderr) => {

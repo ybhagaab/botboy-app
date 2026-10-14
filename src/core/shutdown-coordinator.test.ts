@@ -182,6 +182,63 @@ describe('shutdown coordinator', () => {
     expect(exitCodes).toEqual([2]);
   });
 
+  // server.close() closes only the sockets that are idle at that moment. A response that ends during
+  // shutdown (a chat turn its abort ended, an SSE stream ended at admission close) leaves a keep-alive
+  // socket that Node would keep for its 5 s keep-alive timeout, past the grace: the owner's restarts
+  // all ended `forced` with http_grace_timeout.
+  it('closes a keep-alive socket as soon as its response ends during shutdown, so the HTTP stage completes inside the grace', async () => {
+    const box = sandbox();
+    const exitCodes: number[] = [];
+    const server = http.createServer();
+    let pending: http.ServerResponse | undefined;
+    const coordinator = createShutdownCoordinator({
+      server,
+      databasePath: box.databasePath,
+      receiptPath: box.receiptPath,
+      pid: 4646,
+      httpGraceMs: 1_500, // shorter than Node's 5 s keep-alive timeout
+      httpSettleMs: 200,
+      hardDeadlineMs: 5_000,
+      quiesce: () => {},
+      closeStages: [],
+      flushQueue: () => {},
+      closeDatabase: () => {},
+      exit: code => { exitCodes.push(code); },
+    });
+    server.on('request', coordinator.wrapRequestHandler((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'text/plain' });
+      response.write('working');
+      pending = response; // ends only after shutdown has begun
+    }));
+    const port = await listen(server);
+    const agent = new http.Agent({ keepAlive: true }); // like a browser
+    cleanups.push(() => agent.destroy());
+    const body = new Promise<string>((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port, path: '/api/chat/messages', agent }, response => {
+        let text = '';
+        response.setEncoding('utf8');
+        response.on('data', chunk => { text += chunk; });
+        response.on('end', () => resolve(text));
+        response.on('error', reject);
+      }).on('error', reject);
+    });
+    for (let i = 0; i < 200 && !pending; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    expect(pending).toBeDefined();
+
+    const completion = coordinator.begin('SIGINT');
+    setTimeout(() => pending!.end(' done'), 100);
+    const receipt = await completion;
+
+    expect(await body).toBe('working done');
+    expect(receipt.forcedReasons).toEqual([]);
+    expect(receipt.outcome).toBe('clean');
+    expect(receipt.http.destroyedSocketCount).toBe(0);
+    const stage = receipt.stages.find(entry => entry.name === 'http');
+    expect(stage?.status).toBe('completed');
+    expect(stage!.durationMs!).toBeLessThan(1_500);
+    expect(exitCodes).toEqual([0]);
+  });
+
   it('continues to DB-last finalization when a subsystem times out', async () => {
     const box = sandbox();
     const order: string[] = [];

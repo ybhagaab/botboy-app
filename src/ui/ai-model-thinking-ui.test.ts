@@ -264,3 +264,106 @@ describe('wiring in app.js (source seams)', () => {
     expect(app).not.toMatch(/chat-effort[^\n]*\.(textContent|innerHTML|replaceChildren)/);
   });
 });
+
+// Slice B review LOW 1: `.ai-model-models li small` (the facts beside a model title) sets --faint, and at specificity
+// (0,1,2) it outranks `.pill` (0,1,0), so the thinking badge on a connection-card row rendered at about 3.0:1. One more
+// rule gives the badge --muted again. jsdom does not compute styles, so this works out the cascade for `color` from the
+// shipped CSS text (top-level rules; at-rule blocks such as media queries are skipped) against the markup dashboard.js
+// really renders, inside the ancestors a model row has on the Settings page.
+describe('badge text colour on connection-card rows', () => {
+  const ROW_RULE = '.ai-model-models li small';
+  const BADGE_RULE = '.ai-model-models li small.ai-model-thinking';
+  type Rule = { selector: string; body: string; order: number };
+  /** Top-level rules of dashboard.css in source order (comments removed, at-rule blocks skipped). */
+  const rules = (): Rule[] => {
+    const text = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const found: Rule[] = [];
+    let at = 0;
+    while (at < text.length) {
+      const open = text.indexOf('{', at);
+      if (open < 0) break;
+      const prelude = text.slice(at, open).trim();
+      let depth = 1;
+      let end = open + 1;
+      while (end < text.length && depth > 0) {
+        if (text[end] === '{') depth += 1;
+        else if (text[end] === '}') depth -= 1;
+        end += 1;
+      }
+      if (!prelude.startsWith('@')) found.push({ selector: prelude, body: text.slice(open + 1, end - 1), order: found.length });
+      at = end;
+    }
+    return found;
+  };
+  /** The declarations of the first rule whose selector is exactly `selector`, without whitespace. */
+  const declarations = (selector: string): string | null => {
+    const rule = rules().find((entry) => entry.selector === selector);
+    return rule ? rule.body.replace(/\s+/g, '') : null;
+  };
+  /** [ids, classes + attributes + pseudo-classes, elements] of one selector. */
+  const specificity = (selector: string): [number, number, number] => {
+    const ids = (selector.match(/#[\w-]+/g) ?? []).length;
+    const classes = (selector.match(/\.[\w-]+|\[[^\]]*\]|(?<!:):(?!:)(?!not\b|is\b|where\b)[\w-]+/g) ?? []).length;
+    const elements = selector.split(/[\s>+~]+/).filter((compound) => /^[a-z]/i.test(compound)).length;
+    return [ids, classes, elements];
+  };
+  /** The `color` that wins for `element`: !important, then specificity, then source order. */
+  const cascadedColor = (element: Element): { value: string; selector: string } | null => {
+    let best: { key: number[]; value: string; selector: string } | null = null;
+    for (const rule of rules()) {
+      const declared = rule.body.match(/(?:^|;)\s*color\s*:\s*([^;!]+?)\s*(!important)?\s*(?:;|$)/);
+      if (!declared) continue;
+      for (const selector of rule.selector.split(/,(?![^(]*\))/).map((part) => part.trim())) {
+        let hit = false;
+        try { hit = element.matches(selector); } catch { hit = false; }
+        if (!hit) continue;
+        const key = [declared[2] ? 1 : 0, ...specificity(selector), rule.order];
+        const beats = !best || key.some((part, index) => part !== best!.key[index] && key.slice(0, index).every((earlier, k) => earlier === best!.key[k]) && part > best!.key[index]);
+        if (beats) best = { key, value: declared[1], selector };
+      }
+    }
+    return best ? { value: best.value, selector: best.selector } : null;
+  };
+  /** A model row as the Settings page has it: list inside a key card inside the AI model section. */
+  const rowOnPage = (thinkingOff: string) => {
+    const { list } = loadDashboard();
+    document.body.innerHTML = `<main id="workspace"><section class="ai-model-settings"><form class="card mcp-form ai-model-key-form"><div class="mcp-form-body">${list(claudeConnection([row('claude-sonnet-5-5', 'Claude Sonnet 5.5', thinkingOff)]))}</div></form></section></main>`;
+    return {
+      badge: document.querySelector('.ai-model-models li small.ai-model-thinking')!,
+      facts: document.querySelector('.ai-model-models li small:not(.ai-model-thinking)')!,
+    };
+  };
+
+  it('has a badge rule on --muted beside the row rule that colours the facts', () => {
+    expect(declarations(ROW_RULE)).toMatch(/(^|;)color:/);
+    expect(declarations(BADGE_RULE)).toBe('color:var(--muted);');
+    // --muted is the colour the pill itself defines, so the override restores the badge's own text colour.
+    expect(declarations('.pill')).toContain('color:var(--muted);');
+  });
+
+  it('the badge rule outranks the row rule', () => {
+    expect(specificity(ROW_RULE)).toEqual([0, 1, 2]);
+    expect(specificity(BADGE_RULE)).toEqual([0, 2, 2]);
+  });
+
+  it('the colour that wins for the badge on a model row is --muted, from the badge rule, and the facts beside it keep the row rule', () => {
+    const { badge, facts } = rowOnPage('lowest_effort');
+    expect(badge).not.toBeNull();
+    expect(badge.matches(BADGE_RULE)).toBe(true);
+    expect(cascadedColor(badge)).toEqual({ value: 'var(--muted)', selector: BADGE_RULE });
+    expect(facts.matches(BADGE_RULE)).toBe(false);
+    expect(cascadedColor(facts)).toMatchObject({ selector: ROW_RULE });
+  });
+
+  it('leaves the role-caption badge alone: it sits outside .ai-model-models, so it keeps the pill colour', () => {
+    const { row: roleRow } = loadDashboard();
+    document.body.innerHTML = roleRow({
+      connections: [claudeConnection([row('claude-haiku-5-5', 'Claude Haiku 5.5', 'native_without_tools')])],
+      roles: { processing: { modelKey: 'anthropic.claude-haiku-5-5', label: 'Claude Haiku 5.5', connectionId: 'anthropic', connectionLabel: 'Anthropic (Claude)', thinking: 'off', chosen: false, images: true, thinkingOff: 'native_without_tools' } },
+    }, 'processing');
+    const badge = document.querySelector('.ai-model-role-caption .ai-model-thinking')!;
+    expect(badge).not.toBeNull();
+    expect(badge.closest('.ai-model-models')).toBeNull();
+    expect(cascadedColor(badge)).toEqual({ value: 'var(--muted)', selector: '.pill' });
+  });
+});

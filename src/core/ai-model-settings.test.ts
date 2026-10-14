@@ -1189,6 +1189,35 @@ describe('Settings → AI model connections', () => {
       expect(storedFile().roles.processing).toEqual({ modelKey: 'anthropic.claude-haiku-5-5', thinking: 'low' });
     });
 
+    // Owner Gate C step 1: the picker has three groups, in this order, and Remove key / saving again moves only Claude's.
+    it('three picker groups: Team gateway, OpenAI and Anthropic (Claude), in that order; Remove key drops only the Claude group and saving it again restores it', async () => {
+      const settings = await saveWith();
+      await settings.saveApiKey('openai', OPENAI_KEY);
+      await settings.saveApiKey('anthropic', FAKE_ANTHROPIC_KEY);
+      const groups = () => settings.chatModels.catalog()!.groups;
+      const THREE = [{ id: 'team', label: 'Team gateway' }, { id: 'openai', label: 'OpenAI' }, { id: 'anthropic', label: 'Anthropic (Claude)' }];
+      expect(groups()).toEqual(THREE);
+      const catalog = settings.chatModels.catalog()!;
+      for (const group of THREE) {
+        const keys = catalog.models.filter(model => model.group === group.id).map(model => model.key);
+        expect(keys.length, group.id).toBeGreaterThan(0);
+        expect(keys.every(key => key.startsWith(`${group.id}.`)), group.id).toBe(true);
+      }
+      expect(catalog.models.every(model => THREE.some(group => group.id === model.group))).toBe(true);
+      expect(catalog.defaultKey).toBe('team.terra');
+      const events: string[] = [];
+      settings.chatModels.onChange(event => events.push(event.connectionId));
+      await settings.removeApiKey('anthropic');
+      expect(groups()).toEqual(THREE.slice(0, 2));
+      expect(settings.chatModels.resolve('anthropic.claude-sonnet-5-5')).toBeNull();
+      expect(settings.chatModels.resolve('openai.gpt-4o')).not.toBeNull();
+      // Only the Claude connection's turns stop; the other two connections are untouched.
+      expect(events).toEqual(['anthropic']);
+      await settings.saveApiKey('anthropic', FAKE_ANTHROPIC_KEY);
+      expect(groups()).toEqual(THREE);
+      expect(settings.chatModels.resolve('anthropic.claude-sonnet-5-5')).toMatchObject({ connectionId: 'anthropic' });
+    });
+
     it('keeps the chat default and Organizing exactly as the pins say, whether or not a Claude key is saved', async () => {
       const settings = await serviceWithoutTeam({ anthropicEndpoint: anthropic.url });
       await settings.saveApiKey('openai', OPENAI_KEY);

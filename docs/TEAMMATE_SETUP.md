@@ -5,51 +5,102 @@
 You need:
 
 - a Mac with **Google Chrome**
-- **Node.js 22 or newer** from nodejs.org (`node --version`). Its installer needs
-  no other tools. The current LTS, Node 24, needs macOS 13.5 or newer; on an older
-  macOS install Node 22. Node 20 reached end-of-life on 2026-04-30: on it,
-  `npm install` builds BotBoy's database module from source, which needs the Xcode
-  Command Line Tools (`xcode-select --install`). Homebrew is no shortcut: it
-  installs the Command Line Tools first.
-- **Git**, which comes with the Xcode Command Line Tools (a Mac without them offers
-  to install them the first time you run `git`)
+- **Git**, which comes with the Xcode Command Line Tools (a Mac without them offers to
+  install them the first time you run `git`)
 - an AI model: the private BotBoy credential attachment sent to you by the
-  owner, your own OpenAI API key, your own DeepSeek API key, or any mix of them
+  owner, your own OpenAI API key, your own DeepSeek API key, your own Anthropic
+  (Claude) API key, or any mix of them
 
-You do **not** need an AWS account or `aws login`.
+You do **not** need an AWS account or `aws login`, and you do **not** need to install
+Node.js, Homebrew or npm first. `./start.sh` uses the Node your Mac already has when it
+works. When it does not (none, older than 20.16, Node 20 on a Mac without the Command
+Line Tools, or a Node 22 whose npm 10.9 cannot install BotBoy), `./start.sh` sets up
+BotBoy's own copy of Node, once:
 
-### What works on a Mac with only macOS, Chrome and Node
+- it downloads Node 24.21.0 for your Mac's chip (about 50 MB) from nodejs.org, checks it
+  against a SHA-256 kept in this folder (`node-runtime.pin`) **before** unpacking it, and
+  unpacks it into `~/.personal-productivity-tracker/runtime`;
+- only BotBoy uses it: your Terminal, your PATH and your other apps are not changed, and
+  it needs no Homebrew and no Command Line Tools. BotBoy's chat commands, its terminal and the
+  servers you add use it too, so `node`, `npx` and `npm` work there without installing anything. `npm install -g` from chat installs into
+  `~/.npm-global` (BotBoy's own Node folder is read-only), and a server you add by its program name is looked
+  up there too. `corepack enable` cannot write into BotBoy's Node; use `npx pnpm` or `npx yarn`;
+- it needs about 1 GB of free disk and **macOS 13.5 or newer** (Node 24's own floor). On
+  macOS 13.0 to 13.4, or older, update macOS first (System Settings > General > Software
+  Update; on macOS 13 Ventura, 13.5 or newer is a free update); `./start.sh` says so and
+  stops. Only if your Mac cannot update: install Node 22 from nodejs.org, run
+  `sudo npm install -g npm@11` once in Terminal (it asks for your Mac password; Node 22's
+  own npm 10.9 cannot do BotBoy's first install), then run `./start.sh`;
+- every later start downloads nothing, and `./start.sh --update` fetches a newer pinned
+  Node only when a release changes the pin;
+- to remove it: `rm -rf ~/.personal-productivity-tracker/runtime`. It comes back at the next
+  start if your Mac still has no usable Node. `./start.sh --doctor` shows which Node BotBoy
+  uses (`node source:`) and whether a download would be needed (`node runtime:`);
+- prefer your own Node? Install Node 24 or newer from nodejs.org (the LTS download; its
+  installer needs no other tools). `BOTBOY_NODE_RUNTIME=system ./start.sh` never uses or
+  downloads a private copy, and `BOTBOY_NODE_RUNTIME=private ./start.sh` always does.
 
-- **Works without anything else** (macOS 13 or newer): capture, chat, text PDFs,
-  scanned PDFs and images (BotBoy ships its own reader), Office files, and the
-  BotBoy.app Dock icon. Nothing is compiled on your Mac.
-- **Needs the Xcode Command Line Tools:** `git` (so `./start.sh --update` and the
-  in-app Update button), Node 20's database module, and building BotBoy's readers
-  from source on macOS 12.
-- **Needs something else:** Python scripts (python.org), and optional extras such as
-  pandoc, ffmpeg, jq or LibreOffice (Homebrew).
+You do not need Python or uv either. `./start.sh` uses your Mac's own Python 3.10 or newer and
+uv when they work. When it has none (macOS's own `python3` is 3.9, or only the Xcode stand-in),
+`./start.sh` sets up BotBoy's own Python, once, in the background while it builds:
+
+- it downloads uv 0.13.0 and CPython 3.13.16 for your Mac's chip (about 40 MB) from github.com
+  (the astral-sh/uv and astral-sh/python-build-standalone releases), checks both against SHA-256
+  values kept in this folder (`python-runtime.pin`) **before** unpacking them, and puts them in
+  `~/.personal-productivity-tracker/runtime` (about 95 MB);
+- only BotBoy uses them: your Terminal and your PATH are not changed. Chat's `python3`, `pip`,
+  `uv` and `uvx`, and the Python MCP servers you add (`uvx …`, `uv run …`, `python3 -m …`, or a
+  program installed with `uv tool install` or `pip install`), use them. What they install goes to
+  `~/.botboy-python` (BotBoy's own Python folder is read-only): a plain `pip install` in chat
+  works, and a virtual environment works as usual;
+- on a slow or blocked network BotBoy waits for its Python at most about 3 minutes on a first
+  start (or any start that installs or builds BotBoy, other than `./start.sh --update`) and at
+  most about 20 s on later starts. After that it starts without Python, and the next
+  `./start.sh` continues the download;
+- to remove it, with what an interrupted download left behind:
+  `sh -c 'rm -rf ~/.personal-productivity-tracker/runtime/uv-* ~/.personal-productivity-tracker/runtime/python ~/.personal-productivity-tracker/runtime/.download/uv-* ~/.personal-productivity-tracker/runtime/.download/cpython-* ~/.personal-productivity-tracker/runtime/.python.lock ~/.botboy-python'`
+  (run it as written: through `sh -c` it also works when some of these are missing, where zsh would refuse it).
+  It comes back at the next start if your Mac still has no usable Python or uv. `./start.sh --doctor`
+  shows `python source:`, `uv source:`, `python runtime:` and `python files:`;
+- `BOTBOY_PYTHON_RUNTIME=system ./start.sh` never uses or downloads it, and
+  `BOTBOY_PYTHON_RUNTIME=private ./start.sh` always does.
+
+### What works on a Mac with only macOS, Chrome and Git
+
+- **Works without anything else** (macOS 13.5 or newer): capture, chat, text PDFs,
+  scanned PDFs and images (BotBoy ships its own reader), Office files, the BotBoy.app
+  Dock icon, BotBoy's own Node, and BotBoy's own Python and uv (after one start while online).
+  Nothing is compiled on your Mac.
+- **Needs the Xcode Command Line Tools:** `git` (so the first `git clone`, `./start.sh --update`
+  and the in-app Update button), Node 20's database module if you use your own Node 20,
+  and building BotBoy's readers from source on macOS 12.
+- **Needs something else:** optional extras such as pandoc, ffmpeg, jq or LibreOffice (Homebrew).
 
 ### Install
 
 1. If the owner sent you a credential attachment, download it from your 1:1
    Slack DM and leave it in **Downloads** or on your **Desktop**. BotBoy
    accepts the owner-issued `.env` file or ZIP automatically. Using only your
-   own OpenAI or DeepSeek API key? Skip this step.
+   own OpenAI, DeepSeek or Anthropic (Claude) API key? Skip this step.
 2. Open Terminal and run:
 
 ```bash
 git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
 cd ~/botboy-app
-npm install
 ./start.sh
 ```
 
+`./start.sh` installs BotBoy's packages itself (with the Node described above); you do
+not run `npm install` by hand.
+
 3. Using your own API key: when the dashboard opens, go to
    **Settings → AI model**, paste a key from
-   [platform.openai.com/api-keys](https://platform.openai.com/api-keys) or
-   [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
-   into its card, and choose **Save and turn on**. BotBoy checks the key with
-   the provider, then offers its models right away. No restart is needed.
+   [platform.openai.com/api-keys](https://platform.openai.com/api-keys),
+   [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) or
+   [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys)
+   into its card, and choose the card's save button (**Save and turn on**, or
+   **Check and save key** on the Anthropic (Claude) card). BotBoy checks the key
+   with the provider, then offers its models right away. No restart is needed.
 
 Allow a few minutes on the first run. BotBoy imports any credential
 attachment, builds itself, opens the dashboard, and attempts to install
@@ -88,14 +139,16 @@ optional connections, troubleshooting, and unusual recovery cases.
 
 ### What first start does
 
-`npm install` installs BotBoy's dependencies. `./start.sh` then:
+`./start.sh` first makes sure a working Node exists (this Mac's own, or BotBoy's
+own pinned copy, downloaded once; see **Start here**) and installs BotBoy's
+dependencies with it. Then it:
 
 1. imports the newest valid `botboy-credentials*` plaintext file or owner ZIP
    from Downloads/Desktop into
    `~/.personal-productivity-tracker/.env` with permissions limited to you;
 2. deletes the downloaded credential attachment after a successful import;
 3. connects the authenticated team gateway (GPT-5.6 Terra by default) plus
-   any OpenAI or DeepSeek key saved in **Settings → AI model**;
+   any OpenAI, DeepSeek or Anthropic (Claude) key saved in **Settings → AI model**;
 4. loads the server-approved chat model catalog: GPT-5.6 Terra, Luna, and Sol;
    GPT-6 Astra, Sol, and Luna; and GPT-6.1 Sol on the team gateway, plus each
    saved key's own models;
@@ -111,10 +164,10 @@ Approved GPT-6 and GPT-6.1 additions use the same Cognito token URL, OAuth scope
 allowlisted client identity across the approved team gateways, so existing
 teammates do not need a replacement credential attachment.
 
-### Your own OpenAI or DeepSeek API key
+### Your own OpenAI, DeepSeek or Claude API key
 
-**Settings → AI model** connects your own OpenAI and DeepSeek accounts next to
-the team gateway. Any mix works at the same time:
+**Settings → AI model** connects your own OpenAI, DeepSeek and Anthropic
+(Claude) accounts next to the team gateway. Any mix works at the same time:
 
 - BotBoy verifies each key with its provider (model list plus one tiny
   request) before using it, so a mistyped or revoked key changes nothing.
@@ -124,7 +177,8 @@ the team gateway. Any mix works at the same time:
   characters), and commands BotBoy's model runs cannot read them.
 - Each key's card lists the models it offers. An OpenAI key offers every chat
   model the key can use; a DeepSeek key offers every model DeepSeek lists for
-  it. The team gateway keeps its fixed list.
+  it; a Claude key offers every active Claude model Anthropic lists for it.
+  The team gateway keeps its fixed list.
 - The chat panel's model menu shows every connected provider's models under
   provider headings. You pick the model per message.
 - **Background work** in Settings has two choices, each with its own
@@ -132,10 +186,10 @@ the team gateway. Any mix works at the same time:
   and reading images) and **Document writing** (product documents and email
   drafts, plus the review of documents written in chat). **Automatic** uses
   the team gateway's default when it is set up, otherwise your OpenAI key,
-  otherwise your DeepSeek key.
-- Pick an image-capable organizing model (for example DeepSeek Flash or
-  GPT-5.6 Terra) if you want BotBoy to read screenshots and image
-  attachments. A text-only model says so instead of guessing.
+  otherwise your DeepSeek key, otherwise your Claude key.
+- Pick an image-capable organizing model (for example DeepSeek Flash,
+  GPT-5.6 Terra or a Claude model) if you want BotBoy to read screenshots and
+  image attachments. A text-only model says so instead of guessing.
 - **Remove key** stops chats on that provider's models; background work moves
   to another connected model.
 - When one of your key's models does the work, what it reads (captured
@@ -143,6 +197,49 @@ the team gateway. Any mix works at the same time:
   sent to that provider under your account.
 - New provider accounts have low rate limits. BotBoy waits and retries when
   the provider asks it to; limits rise as the account is used.
+
+#### Claude (an Anthropic API key)
+
+- **Where the key comes from:** create a regular API key in the Anthropic
+  Console at
+  [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys).
+  It starts with `sk-ant-`. Admin keys (they start `sk-ant-admin`) are for
+  Anthropic's Admin API: BotBoy refuses them, so create a regular key instead.
+  Use a key that belongs to one workspace: if Settings says the key is not
+  tied to one workspace, create a new key, choose a workspace when you create
+  it, and save that one (BotBoy has no field for a workspace ID).
+- **Steps:** open **Settings → AI model**, paste the key into the
+  **Anthropic (Claude)** card and choose **Check and save key**. BotBoy asks
+  Anthropic for the models the key can use and sends one tiny request (about
+  16 tokens) to prove the key works. The models then appear in the chat model
+  menu under **Anthropic (Claude)** and in the **Background work** choices. No
+  restart is needed. **Remove key** stops chats on Claude models and moves
+  Automatic background work to another connected model; saving the key again
+  brings them back.
+- **Defaults:** Claude comes last in the **Automatic** order, so adding a Claude
+  key changes nothing that was automatic unless it is your only connection.
+  Then **Organizing** starts on the newest Haiku-line model (quick and low
+  cost, because it runs on every captured item), and **Document writing** and
+  the chat default start on the newest Sonnet-line model. Choose any other
+  Claude model in the chat menu or in **Background work**.
+- **Thinking:** some Claude models always think a little. Their rows in
+  Settings carry a small badge that says what **Off** does on that model.
+- **What leaves your Mac:** when a Claude model does the work, what it reads
+  (captured messages, documents, your chats, tool results, files BotBoy reads
+  for you, and Data Room tables) and any image it inspects is sent to
+  Anthropic under your account, exactly as it is for OpenAI and DeepSeek.
+- **Credit and limits:** a new Anthropic account starts with low rate limits
+  and may have a spend limit. BotBoy waits and retries when Anthropic asks it
+  to. If Settings reports that the account has no credit, add credit at
+  [platform.claude.com/settings/billing](https://platform.claude.com/settings/billing).
+- **Check it:** `./start.sh --doctor` prints
+  `ai-model: Anthropic (Claude) key …abcd saved in Settings` (the last four
+  characters only) and `anthropic probe: HTTP 200`. `401` means Anthropic
+  rejected the key, and `000` means a network, proxy or VPN blocks
+  api.anthropic.com.
+- **Going back to an older release:** an older BotBoy does not know the Claude
+  key. It ignores it, and drops it the next time it saves its Settings file, so
+  after going back to an older release paste the Claude key again.
 
 ### Updating and customizations
 
@@ -239,9 +336,10 @@ steps shown there:
 4. Refresh Midway + Sentry with `mwinit -o -s`.
 5. Choose **Start & test**.
 
-Datanet requires Python 3.10 or newer. Stock Xcode Python can be 3.9; if BotBoy
-cannot find a supported Python, install one (for example
-`brew install python@3.12`) and repeat the guided step. Reads and result
+Datanet requires Python 3.10 or newer. BotBoy uses your Mac's own Python when it has
+one, otherwise its own Python 3.13, which `./start.sh` sets up (see Start here). If
+the guided step says no Python 3.10+ was found, run `./start.sh` while online and
+repeat the step. Reads and result
 downloads are autonomous. Submitting, restarting, prioritizing, or changing a
 production pipeline happens only after you explicitly ask.
 
@@ -406,12 +504,10 @@ one. **Connections** lists every server, with **Edit** and **Delete**.
   folder recorded in `~/.personal-productivity-tracker/app-checkout.v1`, and
   `./start.sh` keeps that file current. If you move the BotBoy folder, open
   Terminal, go to the folder and run `./start.sh`: it points the app at the folder
-  you ran it from. If the app is missing, run:
+  you ran it from. If the app is missing, run `./start.sh` (it installs the app when
+  it is missing); if you use your own Node, `npm run app:bundle` in `~/botboy-app`
+  rebuilds it by hand.
 
-```bash
-cd ~/botboy-app
-npm run app:bundle
-```
 
 `./start.sh` also upgrades an older BotBoy.app to this launcher by itself the next
 time it runs from the same folder (the old one is kept in
@@ -483,25 +579,41 @@ credential attachment before producing the report.
 
 | Symptom | What to do |
 |---|---|
-| `node not found` | Install Node.js 22 or newer from nodejs.org (its installer needs no other tools) and rerun `./start.sh`. |
-| Chat says it needs an AI model first | Open **Settings → AI model** and add an OpenAI or DeepSeek API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
-| Settings → AI model says OpenAI or DeepSeek rejected the key | Copy a current key from platform.openai.com/api-keys or platform.deepseek.com/api_keys and save it again. |
-| Settings → AI model says the account has no credit | Add credit in OpenAI Billing or top up the DeepSeek account. BotBoy resumes on its own once calls succeed. |
-| Settings → AI model cannot reach api.openai.com or api.deepseek.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` status. |
+| `node not found` | You ran `--stop`, `--doctor`, `--recover-shutdown`, `--open-window` or `--rebuild-ocr` on a Mac with no Node yet: those never download. Run `./start.sh` first; it sets up BotBoy's own Node (see **Start here**). With `BOTBOY_NODE_RUNTIME=system` set, install Node 24 or newer from nodejs.org (the LTS download; its installer needs no other tools) and rerun `./start.sh`. |
+| `Could not reach nodejs.org to download Node`, `Your network is replacing secure connections`, or `The download of Node was interrupted` | BotBoy needs one 50 MB download from nodejs.org. Check your internet connection, VPN or proxy, or try another network (a phone hotspot works), then run `./start.sh` again; it resumes an interrupted download. Or install Node 24 or newer from nodejs.org yourself (the LTS download) and run `./start.sh`. |
+| `BotBoy deleted the Node download: its checksum does not match` | The file was damaged on the way or a network altered it; nothing was unpacked or run. Try another network and run `./start.sh` again. If it repeats, tell the owner. |
+| `BotBoy's Node v… needs macOS 13.5 or newer` | BotBoy's own Node needs macOS 13.5 or newer. Update macOS in System Settings > General > Software Update (on macOS 13 Ventura, 13.5 or newer is a free update), then run `./start.sh` again. Only if your Mac cannot update: install Node 22 from nodejs.org, run `sudo npm install -g npm@11` once in Terminal (it asks for your Mac password; Node 22's own npm 10.9 cannot do BotBoy's first install), then run `./start.sh`. |
+| `Not enough free disk space to set up BotBoy's Node` | Free about 1 GB, then run `./start.sh` again. |
+| `npm install` fails with `Cannot read properties of null (reading 'edgesOut')` | A Node 22 you installed yourself comes with npm 10.9.x, which cannot do the first install of BotBoy's packages (an npm bug). Install Node 24 or newer from nodejs.org (the LTS download), or update npm with `npm install -g npm@11`. On a Mac with no Node, or whose Node cannot install BotBoy, `./start.sh` already uses its own and needs none of this. |
+| A server you added in BotBoy starts with `npx`, `npm` or a `#!/usr/bin/env node` script | Nothing to install. When BotBoy uses its own Node, the servers you add use it too: they can read BotBoy's Node folder (`~/.personal-productivity-tracker/runtime`) and nothing else in BotBoy's private folder, so `npx`, `npm` and node scripts run there. If one still fails with `Operation not permitted`, run `./start.sh --doctor` and send its `node source:` and `node runtime:` lines to the owner. |
+| In a BotBoy chat command or the chat terminal, `nvm` says it is not compatible with the `npm_config_prefix` environment variable | Expected when BotBoy uses its own Node: its chat commands set `npm_config_prefix` so that `npm install -g` lands in `~/.npm-global`, and nvm refuses to run beside it. Run nvm in your own Terminal instead, outside BotBoy; chat commands already have BotBoy's Node. |
+| A server you added in BotBoy by its program name says `Command not found` | The message says the next step. For an npm program, ask BotBoy in chat to install it (`npm install -g`; on a Mac that uses BotBoy's own Node it lands in `~/.npm-global`, which BotBoy looks in last), then press Start again. For a Python program, ask BotBoy to install it with `uv tool install` (or `pip install`): it lands in `~/.botboy-python/bin`, which BotBoy also looks in last. `Command not found: uvx` (or `uv`, `python3`) means BotBoy has not set up its own uv and Python on this Mac yet: run `./start.sh` while online (`./start.sh --doctor`, rows `uv source:` and `python source:`), or install them yourself, then press Start. |
+| A server you added in BotBoy starts with `uvx`, `uv run` or `python3` | Nothing to install. When BotBoy uses its own uv and Python, the servers you add use them too: they can read BotBoy's Python folders and nothing else in BotBoy's private folder, and what they install goes to `~/.botboy-python`. |
+| `Could not reach github.com to download BotBoy's Python`, `BotBoy's Python is still downloading`, or `The download of BotBoy's Python was interrupted` | BotBoy started without Python; nothing is lost. Run `./start.sh` again while online: it resumes the download in the background. Chat's Python and Python servers work from that start on. |
+| `Your network is replacing secure connections to github.com` | A company proxy inspects HTTPS. Try another network (for example a phone hotspot) and run `./start.sh` again, or ask IT. Once BotBoy's Python is set up, Python work behind such a proxy may need the proxy's root certificate: `UV_SYSTEM_CERTS=1` makes uv use the certificates macOS trusts (uv 0.11 or newer), and `SSL_CERT_FILE=<a PEM file with that root>` does the same for Python's own HTTPS requests (set either in chat, or in a server's environment). |
+| `BotBoy deleted a download of its Python: its checksum does not match` | The file was damaged on the way or a network altered it; nothing was unpacked or run, and BotBoy started without Python. Try another network and run `./start.sh` again. If it repeats, tell the owner. |
+| `Not enough free disk space to set up BotBoy's Python` | Free about 1 GB, then run `./start.sh` again. BotBoy runs without Python until then. |
+| `No interpreter found for Python 3.14` (or another version) in chat | BotBoy's uv uses only BotBoy's Python 3.13. For another version: `uv python install 3.14 --install-dir ~/.botboy-python/python`, then pass `--python ~/.botboy-python/bin/python3.14` (asked for by version, that Python is not found). |
+| `pip` says `externally-managed-environment` and `BotBoy keeps its own Python read-only` | That pip runs outside BotBoy's chat. Use a virtual environment: `python3 -m venv .venv && .venv/bin/pip install <package>` (or `uv venv`, then `uv pip install <package>`). In BotBoy's chat a plain `pip install` works. |
+| Chat says it needs an AI model first | Open **Settings → AI model** and add an OpenAI, DeepSeek or Anthropic (Claude) API key, or put the owner's credential attachment in Downloads and rerun `./start.sh`. |
+| Settings → AI model says OpenAI, DeepSeek or Anthropic rejected the key | Copy a current key from platform.openai.com/api-keys, platform.deepseek.com/api_keys or platform.claude.com/settings/keys and save it again. |
+| Settings → AI model says the account has no credit | Add credit in OpenAI Billing, top up the DeepSeek account, or add credit at platform.claude.com/settings/billing. BotBoy resumes on its own once calls succeed. |
+| Settings → AI model says the Claude key is an Admin key, or is not tied to one workspace | Create a regular API key in the Anthropic Console (Settings → API keys → Create key), choose a workspace when you create it, and save that key in the **Anthropic (Claude)** card. |
+| Settings → AI model cannot reach api.openai.com, api.deepseek.com or api.anthropic.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` / `anthropic probe` status. |
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
-| Build fails on a clean clone | Run `npm install`, then `./start.sh`. |
-| `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Run `npm install` in `~/botboy-app`, read the errors at its end, fix what they name, then `./start.sh`. On Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
+| Build fails on a clean clone | Run `./start.sh` again; it installs the packages itself, with the Node `./start.sh --doctor` names under `node source:`. The errors are at the end of `/tmp/ppt.log`. |
+| `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Read the errors at the end of `/tmp/ppt.log` (BotBoy ran `npm install` with the Node `./start.sh --doctor` names under `node source:`), fix what they name, then `./start.sh`. On your own Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
 | BotBoy took a long time to open, `/tmp/ppt.log` is full of Swift messages, the doctor says `OCR helper build failed`, or its `ocr helper:` row says `OFF` | Older releases built the optional reader for images and scanned PDFs on your Mac. It now ships prebuilt and BotBoy never waits for it: run `./start.sh --update`. If the `ocr helper:` row of `./start.sh --doctor` still says `OFF`, it names the reason and the next step: usually macOS older than 13 (install the updates in **System Settings > General > Software Update**), a damaged or edited `native` folder (`./start.sh --update`), or a download mark on the reader (next row). Then run `./start.sh --rebuild-ocr`. BotBoy works without the reader; only text inside images and scanned PDFs is missing. |
 | macOS says a BotBoy file was "downloaded from the internet" or "can't be opened", or the doctor's `ocr helper:` row says the download mark is still on the reader | You downloaded BotBoy as a ZIP in a browser. Run `xattr -r -d com.apple.quarantine ~/botboy-app/native`, then `./start.sh`. A `git clone` never has this problem. |
 | BotBoy.app says "BotBoy launcher is stale", or opens the wrong BotBoy folder | You moved the BotBoy folder, or you have more than one. Open Terminal, go to the folder you want and run `./start.sh`: it points the app at that folder (it never takes the app from another folder that still exists; remove `/Applications/BotBoy.app` and run `./start.sh` there if you want to switch on purpose). `./start.sh --doctor` shows the folder on its `app launcher:` row. |
-| `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app`. `./start.sh --update` updates BotBoy but never reinstalls packages, so older ones stay until you do. |
+| `npm audit` lists vulnerabilities in an existing install | Run `npm install` once in `~/botboy-app` (with your own Node; if BotBoy uses its own, `./start.sh --doctor` names the folder whose `bin/npm` to run). `./start.sh --update` updates BotBoy but only installs packages that are missing or re-pinned, so older ones stay until you do. |
 | `Incomplete OAuth config` | Download the owner's credential attachment again and rerun `./start.sh`. |
 | `invalid_client` / HTTP 400 | Ask the owner for a valid credential attachment. |
 | Chat returns HTTP 401 | Ask the owner to check gateway access. |
 | Dashboard does not open | Confirm Google Chrome is installed and inspect `/tmp/ppt.log`. |
 | Chrome shows `ERR_CONNECTION_REFUSED` | Do not keep refreshing. Run `./start.sh --update`, then `./start.sh`; if startup reports failure, run `./start.sh --doctor` and share only the reviewed relevant output. |
 | `Replacement start blocked` / `shutdown recovery: BLOCKED` | Run `./start.sh --recover-shutdown`, then `./start.sh`. Do not delete the guard yourself; deleting and re-cloning `botboy-app` does not clear it. See **Unverified shutdown recovery** below. |
-| BotBoy.app is missing | Run `npm run app:bundle`; BotBoy itself can still run from Terminal. |
+| BotBoy.app is missing | Run `./start.sh` (it installs the app when it is missing); with your own Node, `npm run app:bundle` rebuilds it by hand. BotBoy itself can still run from Terminal. |
 | Activity Monitor shows BotBoy, `node`, or Chrome as **Intel**, the Mac feels slow, or the doctor says `this shell: translated (Rosetta)`, `chrome arch: x86_64 only`, or `architecture priority: missing` | Run `./start.sh --update` in `~/botboy-app`, then quit and reopen BotBoy. Starting from `./start.sh` relaunches BotBoy and its Chrome natively and fixes the app's architecture setting by itself, but a Chrome that is already running as Intel is never restarted for you: quit it once (⌘Q), then start BotBoy again. If the doctor still reports an Intel-only Chrome (Migration Assistant can copy the Intel build), install **Chrome for Mac with Apple chip** from google.com/chrome and replace the app. An Intel-only Node needs an Apple-silicon Node (the nodejs.org installer, or Homebrew in `/opt/homebrew`). Terminal set to **Open using Rosetta** is handled, but you can clear that box in its Get Info. This was verified on macOS 26 only. |
 | BotBoy.app still starts under Rosetta after the update | Start BotBoy once from Terminal with `./start.sh` so it can patch the app, then quit and reopen BotBoy. Without developer tools you can apply the same change by hand: `/usr/libexec/PlistBuddy -c "Delete :LSArchitecturePriority" /Applications/BotBoy.app/Contents/Info.plist` (an error is fine), then `/usr/libexec/PlistBuddy -c "Add :LSArchitecturePriority array" -c "Add :LSArchitecturePriority:0 string arm64" -c "Add :LSArchitecturePriority:1 string x86_64" /Applications/BotBoy.app/Contents/Info.plist`, then `touch /Applications/BotBoy.app`. Deleting the app (`rm -rf /Applications/BotBoy.app`) and running `npm run app:bundle` only helped Macs with developer tools before this update; after it, BotBoy patches the app itself, and a regenerated app carries the setting on every Mac. |
 | BotBoy slows its browser capture, or the doctor shows `memory pressure: warn` or `swap used` | The Mac is short of memory. BotBoy polls less often until pressure drops, then returns to normal on its own. Close other apps, or choose **Pause** on **Connections → Browser capture** to stop reading your tabs until you resume. |
@@ -585,12 +697,10 @@ cd ~
 mv botboy-app "botboy-app-backup-$(date +%Y%m%d-%H%M%S)"
 git clone https://github.com/ybhagaab/botboy-app.git ~/botboy-app
 cd ~/botboy-app
-npm install
 ./start.sh
-npm run app:bundle
 ```
 
-After verifying the replacement, review the timestamped backup with the owner
+`./start.sh` installs the packages and BotBoy.app itself. After verifying the replacement, review the timestamped backup with the owner
 before deleting it. Do not delete `~/.personal-productivity-tracker/` unless
 the owner explicitly asks for a factory reset; that directory contains local
 evidence and credentials.
@@ -601,9 +711,9 @@ BotBoy is local-first. Its evidence database, document copies, generated files,
 and credentials stay under `~/.personal-productivity-tracker/` on your Mac by
 default. Content needed for an LLM request—including selected text and bounded
 visual inputs when you ask BotBoy to inspect an image—goes to the model doing
-that work: through the authenticated team gateway, or to OpenAI or DeepSeek
-under your own account when one of your saved keys' models is chosen in chat or
-in **Settings → AI model**. Connections communicate with
+that work: through the authenticated team gateway, or to OpenAI, DeepSeek or
+Anthropic (Claude) under your own account when one of your saved keys' models is
+chosen in chat or in **Settings → AI model**. Connections communicate with
 the services you enable; Gmail talks only to Google's sign-in and Gmail API
 endpoints, and mail BotBoy reads for a chat answer goes to the chat model like
 any other content. A remote MCP server you add receives the arguments of

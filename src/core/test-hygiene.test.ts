@@ -13,6 +13,7 @@
  */
 import cp, { exec, execFile, execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -60,9 +61,54 @@ describe('the net under every test file (vitest.no-ui-tools.setup.ts)', () => {
     expect(guard, 'the setup file did not run').toBeTruthy();
     expect(process.env.PATH!.split(path.delimiter)[0]).toBe(guard!.stubDir);
     expect(process.env.BOTBOY_TEST_LSREGISTER_BIN).toBe(guard!.lsregisterStub);
-    for (const name of ['osascript', 'open', 'lsregister']) {
+    for (const name of ['osascript', 'open', 'lsregister', 'install_name_tool']) {
       expect(fs.statSync(path.join(guard!.stubDir, name)).mode & 0o111, name).toBeGreaterThan(0);
     }
+    // No python3 stub: it would shadow every real python3 a test means to find (the real /usr/bin one is refused instead).
+    expect(fs.existsSync(path.join(guard!.stubDir, 'python3'))).toBe(false);
+  });
+
+  describe('the two Xcode stand-ins, /usr/bin/python3 and /usr/bin/install_name_tool (Python on demand)', () => {
+    // Both are xcselect shims: with the Command Line Tools they run Apple's tools, without them they raise the
+    // "install developer tools" dialog. No test may run either. The refusal is RECORDED as well as thrown, so a
+    // file whose code under test swallows the error still fails in the setup file's afterAll.
+    const standIns: Array<[string, string, () => unknown]> = [
+      ['python3', 'spawnSync', () => spawnSync('/usr/bin/python3', ['-V'])],
+      ['python3', 'execFileSync', () => execFileSync('/usr/bin/python3', ['-V'])],
+      ['python3', 'execFile', () => execFile('/usr/bin/python3', ['-V'], () => undefined)],
+      ['python3', 'exec (a shell line)', () => exec('echo hi; /usr/bin/python3 -V', () => undefined)],
+      ['python3', 'a bare name that PATH resolves to it', () => spawnSync('python3', ['-V'], { env: { PATH: '/usr/bin:/bin' } })],
+      ['install_name_tool', 'spawnSync', () => spawnSync('/usr/bin/install_name_tool', ['-h'])],
+      ['install_name_tool', 'execFileSync', () => execFileSync('/usr/bin/install_name_tool', ['-h'])],
+    ];
+    for (const [tool, how, attempt] of standIns) {
+      it(`refuses the real ${tool} through ${how}, before any process starts, and records it`, () => {
+        if (process.platform !== 'darwin') return;
+        expect(attempt).toThrow(new RegExp(`would run the REAL ${tool}, an Xcode stand-in`));
+        const calls = guard!.calls();
+        expect(calls).toHaveLength(1);
+        expect(calls[0]).toMatch(new RegExp(`^REFUSED the real ${tool}: `));
+      });
+    }
+
+    it('a bare install_name_tool reaches the recording stub, even with a PATH the test passes (uv looks it up by name)', () => {
+      const result = spawnSync('/bin/sh', ['-c', 'command -v install_name_tool; install_name_tool -id x y'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe(path.join(guard!.stubDir, 'install_name_tool'));
+      expect(guard!.calls()).toEqual(['install_name_tool -id x y']);
+    });
+
+    it('lets a python3 that is not the stand-in through (a tripwire of the test\'s own, first on its PATH)', () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-hygiene-py-'));
+      try {
+        fs.writeFileSync(path.join(dir, 'python3'), '#!/bin/sh\necho tripwire-python\n', { mode: 0o755 });
+        const result = spawnSync('python3', ['-V'], { env: { PATH: `${dir}:/usr/bin:/bin` }, encoding: 'utf8' });
+        expect(result.stdout.trim()).toBe('tripwire-python');
+        expect(guard!.calls()).toEqual([]);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   const refusals: Array<[string, string, () => unknown]> = [
@@ -120,6 +166,31 @@ describe('the net under every test file (vitest.no-ui-tools.setup.ts)', () => {
     expect(guard!.calls()).toEqual([]);
   });
 
+  it('closes the Node download URL: a loopback port nothing listens on, also for a child whose environment a test builds from scratch', async () => {
+    // start.sh and scripts/verify-node-runtime.mjs download BotBoy's private Node from nodejs.org. A test that
+    // forgets to start its own server must get "connection refused", never the real nodejs.org.
+    const url = new URL(process.env.BOTBOY_TEST_NODE_DIST_URL ?? '');
+    expect(url.protocol).toBe('http:');
+    expect(url.hostname).toBe('127.0.0.1');
+    const refused = await new Promise<string>((resolve) => {
+      const socket = net.connect({ host: '127.0.0.1', port: Number(url.port) });
+      socket.once('connect', () => { socket.destroy(); resolve('connected'); });
+      socket.once('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? 'error'));
+    });
+    expect(refused).toBe('ECONNREFUSED');
+    const child = spawnSync(process.execPath, ['-p', 'process.env.BOTBOY_TEST_NODE_DIST_URL'], { env: { PATH: process.env.PATH ?? '' }, encoding: 'utf8' });
+    expect(child.stdout.trim()).toBe(url.origin);
+    const own = spawnSync(process.execPath, ['-p', 'process.env.BOTBOY_TEST_NODE_DIST_URL'], { env: { PATH: process.env.PATH ?? '', BOTBOY_TEST_NODE_DIST_URL: 'http://127.0.0.1:4242' }, encoding: 'utf8' });
+    expect(own.stdout.trim()).toBe('http://127.0.0.1:4242'); // a test's own server URL is kept
+  });
+
+  it('closes the Python download URL the same way (scripts/python-runtime.sh and verify-python-runtime.mjs fetch from github.com)', () => {
+    expect(process.env.BOTBOY_TEST_PYTHON_DIST_URL).toBe(process.env.BOTBOY_TEST_NODE_DIST_URL);
+    const child = spawnSync(process.execPath, ['-p', 'process.env.BOTBOY_TEST_PYTHON_DIST_URL'], { env: { PATH: process.env.PATH ?? '' }, encoding: 'utf8' });
+    expect(child.stdout.trim()).toBe(process.env.BOTBOY_TEST_NODE_DIST_URL);
+    const own = spawnSync(process.execPath, ['-p', 'process.env.BOTBOY_TEST_PYTHON_DIST_URL'], { env: { PATH: process.env.PATH ?? '', BOTBOY_TEST_PYTHON_DIST_URL: 'http://127.0.0.1:4343' }, encoding: 'utf8' });
+    expect(own.stdout.trim()).toBe('http://127.0.0.1:4343');
+  });
   it('lets ordinary commands through untouched', () => {
     expect(spawnSync('/usr/bin/true').status).toBe(0);
     expect(execFileSync('/bin/echo', ['hi'], { encoding: 'utf8' }).trim()).toBe('hi');
@@ -246,12 +317,12 @@ describe('the tests themselves', () => {
   };
   const self = fileURLToPath(import.meta.url);
 
-  it('no test or test helper names the real osascript, open or lsregister', () => {
+  it('no test or test helper names the real osascript, open, lsregister or install_name_tool', () => {
     const offenders = testFiles()
       .filter((file) => file !== self)
       .filter((file) => {
         const text = fs.readFileSync(file, 'utf8');
-        return text.includes('/usr/bin/osascript') || text.includes("'/usr/bin/open'") || text.includes('LaunchServices.framework/Support/lsregister');
+        return text.includes('/usr/bin/osascript') || text.includes("'/usr/bin/open'") || text.includes('LaunchServices.framework/Support/lsregister') || text.includes('/usr/bin/install_name_tool');
       })
       .map((file) => path.relative(srcRoot, file));
     expect(offenders, 'stub the tool (a recording script on PATH or the BOTBOY_TEST_* hook) instead').toEqual([]);

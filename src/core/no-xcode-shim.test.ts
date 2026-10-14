@@ -73,6 +73,16 @@ describe('no Xcode shim on the start and doctor paths', () => {
   }
 });
 
+describe('BotBoy\'s own Node (scripts/node-runtime.sh) runs no Xcode shim at all', () => {
+  const library = fs.readFileSync(path.join(scriptsDir, 'node-runtime.sh'), 'utf8');
+  it('names no shim, no git, no xcrun, no python and no xcode-select: curl, shasum, tar, sw_vers, df, xattr, stat, pgrep and the Node it manages are real macOS tools', () => {
+    const offenders = codeLines(library)
+      .filter(({ line }) => SHELL_COMMAND.test(line) || SHELL_GIT.test(line) || /\b(xcrun|xcode-select|python3?|brew)\b/.test(line));
+    expect(offenders).toEqual([]);
+    // The one Command Line Tools question it asks goes through start.sh's silent probe.
+    expect(library).toMatch(/clt_installed/);
+  });
+});
 describe('the server reaches no Xcode shim on a Mac without Command Line Tools', () => {
   const read = (file: string) => fs.readFileSync(path.join(root, 'src', 'core', file), 'utf8');
   const index = (text: string, needle: string) => {

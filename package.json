@@ -19,6 +19,8 @@
     "app:bundle": "node scripts/make-app-bundle.mjs",
     "prebuilt:build": "node scripts/build-native-prebuilt.mjs",
     "prebuilt:verify": "node scripts/build-native-prebuilt.mjs --verify",
+    "node-runtime:verify": "node scripts/verify-node-runtime.mjs",
+    "python-runtime:verify": "node scripts/verify-python-runtime.mjs",
     "release": "bash scripts/release.sh",
     "release:check": "bash scripts/release.sh --preflight"
   },

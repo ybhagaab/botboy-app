@@ -9,7 +9,7 @@
  *  - a check, before each run, that the work clone's origin and the URL are absolute local paths.
  * The real botboy-app, ~/.cache/botboy-app-release and the real HOME are never named.
  */
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -68,7 +68,7 @@ export function releaseFixture(options: { artifacts?: boolean } = {}) {
     fs.mkdirSync(path.dirname(path.join(pkg, rel)), { recursive: true });
     fs.copyFileSync(path.join(packageRoot, rel), path.join(pkg, rel));
   };
-  const real = ['scripts/release.sh', 'scripts/build-native-prebuilt.mjs', 'scripts/native-prebuilt.mjs', 'scripts/bootstrap-deps.mjs'];
+  const real = ['scripts/release.sh', 'scripts/build-native-prebuilt.mjs', 'scripts/native-prebuilt.mjs', 'scripts/bootstrap-deps.mjs', 'scripts/verify-node-runtime.mjs', 'node-runtime.pin', 'scripts/verify-python-runtime.mjs', 'python-runtime.pin'];
   real.forEach(copy);
   if (options.artifacts !== false) {
     ['native/prebuilt-manifest.json', 'native/vision-ocr/main.swift', 'native/vision-ocr/prebuilt/vision-ocr', 'native/botboy-launcher/main.swift', 'native/botboy-launcher/prebuilt/botboy-launcher'].forEach(copy);
@@ -111,11 +111,16 @@ export function releaseFixture(options: { artifacts?: boolean } = {}) {
   const noClt = path.join(stubs, 'xcode-select');
   fs.writeFileSync(noClt, '#!/bin/sh\nexit 2\n', { mode: 0o755 });
 
-  const release = (args: string[] = [], extraEnv: Record<string, string> = {}, spawnOptions: { path?: string } = {}): SpawnSyncReturns<string> => {
+  /** The environment of one release.sh run, after the structural guards (shared by the sync and async runners). */
+  const releaseEnv = (extraEnv: Record<string, string> = {}, spawnOptions: { path?: string } = {}): Record<string, string> => {
     const env = baseEnv({
       BOTBOY_RELEASE_URL: origin,
       BOTBOY_RELEASE_WORKDIR: work,
       BOTBOY_TEST_XCODE_SELECT_BIN: noClt,
+      // The node-runtime.pin check compares with nodejs.org; the default here is a closed loopback port (the offline path).
+      BOTBOY_TEST_NODE_DIST_URL: process.env.BOTBOY_TEST_NODE_DIST_URL ?? 'http://127.0.0.1:9',
+      // The same for python-runtime.pin and GitHub.
+      BOTBOY_TEST_PYTHON_DIST_URL: process.env.BOTBOY_TEST_PYTHON_DIST_URL ?? 'http://127.0.0.1:9',
       ...extraEnv,
     });
     if (spawnOptions.path !== undefined) env.PATH = spawnOptions.path;
@@ -128,8 +133,19 @@ export function releaseFixture(options: { artifacts?: boolean } = {}) {
       const workOrigin = spawnSync('git', ['-C', env.BOTBOY_RELEASE_WORKDIR!, 'remote', 'get-url', 'origin'], { encoding: 'utf8', env: baseEnv() }).stdout.trim();
       if (!isLocalPath(workOrigin)) throw new Error(`refusing to run release.sh: the work clone's origin is not a local path (${workOrigin})`);
     }
-    return spawnSync('bash', [path.join(pkg, 'scripts', 'release.sh'), ...args], { cwd: pkg, env, encoding: 'utf8', timeout: 180_000 });
+    return env;
   };
+  const release = (args: string[] = [], extraEnv: Record<string, string> = {}, spawnOptions: { path?: string } = {}): SpawnSyncReturns<string> =>
+    spawnSync('bash', [path.join(pkg, 'scripts', 'release.sh'), ...args], { cwd: pkg, env: releaseEnv(extraEnv, spawnOptions), encoding: 'utf8', timeout: 180_000 });
+  /** Same run without blocking this process: for a test that serves nodejs.org's files from the same process. */
+  const releaseAsync = (args: string[] = [], extraEnv: Record<string, string> = {}) => new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+    const child = spawn('bash', [path.join(pkg, 'scripts', 'release.sh'), ...args], { cwd: pkg, env: releaseEnv(extraEnv) });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
 
   return {
     root, dev, pkg, origin, work, home, stubs,
@@ -141,6 +157,7 @@ export function releaseFixture(options: { artifacts?: boolean } = {}) {
       git(dev, 'commit', '-q', '-m', message);
     },
     release,
+    releaseAsync,
     baseEnv,
     headSha: () => git(dev, 'rev-parse', '--short', 'HEAD'),
     originHead: () => git(origin, 'rev-parse', 'main'),

@@ -118,6 +118,8 @@ describe('registry entries become add objects', () => {
       ['uvx', ['mcparmory-notion==1.0.2']],
       ['docker', ['run', '-i', '--rm', '-e', 'NOTION_TOKEN', 'ghcr.io/mcparmory/notion:1.0.2']],
     ]);
+    // BotBoy sets up its own uv on a Mac without one (Python on demand), so the label no longer says "needs uv".
+    expect(armory.options[0].label).toBe('Local: Python package mcparmory-notion, run with uvx');
     // What BotBoy cannot run yet is said, not silently dropped.
     expect(armory.skipped).toEqual([
       'https://{tenant}.mcparmory.com/mcp (its address needs values filled in)',

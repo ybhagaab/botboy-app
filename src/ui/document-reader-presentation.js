@@ -20,6 +20,8 @@ function syncFocusBoundary(documentRef, shell, focusMode) {
       const parent = child.parentElement;
       for (const sibling of parent.children) {
         if (sibling === child || sibling.hasAttribute('data-document-focus-inert')) continue;
+        // The server status line (#server-link-banner) must still show and be announced in Focus.
+        if (sibling.hasAttribute('data-document-focus-exempt')) continue;
         sibling.setAttribute('data-document-focus-inert', sibling.hasAttribute('aria-hidden') ? sibling.getAttribute('aria-hidden') ?? '' : '__absent__');
         sibling.setAttribute('aria-hidden', 'true');
         setInert(sibling, true);

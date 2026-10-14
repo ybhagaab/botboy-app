@@ -172,6 +172,34 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
 }
 
+/**
+ * Ends a long-lived response (an SSE stream that a viewer keeps open, such as GET /chat/live) the moment
+ * shutdown closes admission, so the HTTP stage never waits out its grace for it: no long-lived response
+ * survives admission close. `detach` stops every producer of the stream first (subscriptions, keep-alive
+ * timers), because a write after the end emits an unhandled 'error' that would take the server down before
+ * its DB-last receipt. A stream that registered work owns (a chat turn, a folder backfill) is not ended
+ * here: that work's abort ends it through its own code. The viewer's EventSource reconnects by itself.
+ */
+export function endResponseAtShutdown(
+  shutdown: Pick<ShutdownRuntimeContext, 'signal'> | undefined,
+  response: http.ServerResponse,
+  detach: () => void,
+): void {
+  if (!shutdown) return;
+  const end = () => {
+    try { detach(); } catch { /* best effort: the end below still happens */ }
+    if (!response.writableEnded) {
+      try { response.end(); } catch { /* the viewer already left */ }
+    }
+  };
+  if (shutdown.signal.aborted) {
+    end();
+    return;
+  }
+  shutdown.signal.addEventListener('abort', end, { once: true });
+  response.once('close', () => shutdown.signal.removeEventListener('abort', end));
+}
+
 async function within<T>(name: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   try {
@@ -211,6 +239,7 @@ export function createShutdownCoordinator(options: ShutdownCoordinatorOptions): 
   let serverClosePromise: Promise<void> | null = null;
   let resolveServerClose: (() => void) | null = null;
   let receiptWriteFailed = false;
+  let idleCloseScheduled = false;
 
   function iso(value = now()): string {
     return new Date(value).toISOString();
@@ -310,6 +339,18 @@ export function createShutdownCoordinator(options: ShutdownCoordinatorOptions): 
       if (currentReceipt) currentReceipt.http.idleConnectionsClosed = true;
     } catch {}
     return serverClosePromise;
+  }
+
+  // server.close() closes only the connections that are idle at that moment. A response that ends
+  // during shutdown leaves its keep-alive socket idle afterwards, and Node keeps such a socket until
+  // the keep-alive timeout (5 s), past the HTTP grace; close it as soon as it is idle instead.
+  function closeIdleConnectionsSoon(): void {
+    if (idleCloseScheduled) return;
+    idleCloseScheduled = true;
+    setImmediate(() => {
+      idleCloseScheduled = false;
+      try { options.server.closeIdleConnections?.(); } catch { /* the server has already closed */ }
+    });
   }
 
   function stageReceipt(name: string, timeoutMs: number): ShutdownStageReceipt {
@@ -606,6 +647,7 @@ export function createShutdownCoordinator(options: ShutdownCoordinatorOptions): 
         if (!registered) return;
         registered = false;
         requests.delete(id);
+        if (phase !== 'idle') closeIdleConnectionsSoon();
       };
       response.once('finish', unregister);
       response.once('close', unregister);

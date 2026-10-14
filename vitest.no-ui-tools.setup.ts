@@ -16,6 +16,18 @@
  *    lsregister (absolute path, or a bare name that PATH resolves to the real one) before any
  *    process starts. src/core/test-hygiene.test.ts proves this and scans the tests for the
  *    other half of the rule (a bundle test names its own HOME and lsregister stub).
+ *  - Defaults BOTBOY_TEST_NODE_DIST_URL to a CLOSED loopback port, in this process and in every child
+ *    environment a test passes. start.sh and scripts/verify-node-runtime.mjs download BotBoy's private Node
+ *    from nodejs.org; with this default a test that forgets to give them a local server gets "connection
+ *    refused" (the offline path) and never reaches nodejs.org. A test that wants a download starts its own
+ *    server on 127.0.0.1 and passes that URL (src/core/node-runtime.testutil.ts).
+ *  - The same for BOTBOY_TEST_PYTHON_DIST_URL: scripts/python-runtime.sh and scripts/verify-python-runtime.mjs
+ *    download BotBoy's uv and CPython from github.com, and a test never does.
+ *  - Never runs the two Xcode stand-ins /usr/bin/python3 and /usr/bin/install_name_tool (xcselect shims: with the
+ *    Command Line Tools they run Apple's tools, without them they raise the install dialog). The spawn functions
+ *    refuse them like the UI tools, AND the refusal is recorded, so a test whose code swallowed the error still
+ *    fails in afterAll. `install_name_tool` also has a recording stub first on PATH (uv looks it up by name);
+ *    `python3` does not, because a stub there would shadow every real python3 a test means to find.
  *
  * It cannot see inside a child process that calls /usr/bin/osascript by absolute path; the
  * only such caller is the generated shell launcher, which uses the bare name `osascript`
@@ -38,8 +50,15 @@ import { afterAll } from 'vitest';
 import { RUN_DIR_ENV } from './vitest.no-ui-tools.global';
 
 const LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
-const GUARDED_NAMES = ['osascript', 'open', 'lsregister'] as const;
+/** Tools that get a recording stub first on PATH. */
+const GUARDED_NAMES = ['osascript', 'open', 'lsregister', 'install_name_tool'] as const;
+/** The Xcode stand-ins no test may run (see the header). Their refusal is also recorded. */
+const XCODE_STAND_INS = [['/usr/bin/python3', 'python3'], ['/usr/bin/install_name_tool', 'install_name_tool']] as const;
+/** Bare command names a spawn is checked for: a name that PATH resolves to the real tool is refused. */
+const CHECKED_NAMES: readonly string[] = [...GUARDED_NAMES, 'python3'];
 const INSTALLED = Symbol.for('botboy.test.noUiTools');
+/** A loopback address nothing listens on (the TCP "discard" port), so a download attempt fails at once and offline. */
+export const CLOSED_DIST_URL = 'http://127.0.0.1:9';
 
 type Guard = {
   stubDir: string;
@@ -71,7 +90,7 @@ function createGuard(): Guard {
     fs.writeFileSync(path.join(stubDir, name), `#!/bin/sh\necho "${name} $*" >> '${logFile}'\nexit 0\n`, { mode: 0o755 });
   }
   const real = new Map<string, string>();
-  for (const [file, name] of [['/usr/bin/osascript', 'osascript'], ['/usr/bin/open', 'open'], [LSREGISTER, 'lsregister']] as const) {
+  for (const [file, name] of [['/usr/bin/osascript', 'osascript'], ['/usr/bin/open', 'open'], [LSREGISTER, 'lsregister'], ...XCODE_STAND_INS] as const) {
     real.set(file, name);
     real.set(realpath(file), name);
   }
@@ -105,7 +124,7 @@ function resolveOnPath(name: string, pathValue: string | undefined): string | nu
 function realToolOf(guard: Guard, word: string, pathValue: string | undefined): string | null {
   if (!word) return null;
   if (path.isAbsolute(word)) return guard.realTools.get(word) ?? guard.realTools.get(realpath(word)) ?? null;
-  if (!(GUARDED_NAMES as readonly string[]).includes(word)) return null;
+  if (!CHECKED_NAMES.includes(word)) return null;
   const found = resolveOnPath(word, pathValue);
   return found ? (guard.realTools.get(found) ?? guard.realTools.get(realpath(found)) ?? null) : null;
 }
@@ -124,6 +143,8 @@ function patchedEnv(guard: Guard, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const current = next.PATH ?? '';
   if (!current.split(path.delimiter).includes(guard.stubDir)) next.PATH = current ? `${guard.stubDir}${path.delimiter}${current}` : guard.stubDir;
   if (next.BOTBOY_TEST_LSREGISTER_BIN === undefined) next.BOTBOY_TEST_LSREGISTER_BIN = guard.lsregisterStub;
+  if (next.BOTBOY_TEST_NODE_DIST_URL === undefined) next.BOTBOY_TEST_NODE_DIST_URL = CLOSED_DIST_URL;
+  if (next.BOTBOY_TEST_PYTHON_DIST_URL === undefined) next.BOTBOY_TEST_PYTHON_DIST_URL = CLOSED_DIST_URL;
   return next;
 }
 
@@ -159,7 +180,20 @@ function install(first: Guard): void {
   // The wrappers outlive one test file's guard when a worker is reused (its stub folder is removed in afterAll and
   // the next file's setup creates a new one), so they always ask for the live guard.
   const live = (): Guard => globals.__botboyUiGuard ?? first;
+  const standIns = new Set<string>(XCODE_STAND_INS.map(([, name]) => name));
   const refuse = (call: string, tool: string): never => {
+    if (standIns.has(tool)) {
+      // Recorded too: code under test may catch the error below, and the file must still fail in afterAll.
+      try {
+        fs.appendFileSync(live().logFile, `REFUSED the real ${tool}: ${call}\n`);
+      } catch {
+        // the folder is gone; the throw below still stops the call
+      }
+      throw new Error(
+        `[test hygiene] ${call} would run the REAL ${tool}, an Xcode stand-in: it runs Apple's tool, or raises the "install developer tools" dialog on a Mac without them. `
+        + 'Give the code under test a stand-in path (BOTBOY_TEST_PYTHON_SHIM, BOTBOY_TEST_XCODE_SELECT_BIN, ...) or a PATH whose python3 is a tripwire of your own.',
+      );
+    }
     throw new Error(
       `[test hygiene] ${call} would run the REAL ${tool}. That shows UI on the owner's screen or registers an app with LaunchServices. `
       + 'Stub it: a recording script first on the PATH you pass, or the BOTBOY_TEST_* hook (BOTBOY_TEST_LSREGISTER_BIN, BOTBOY_TEST_XATTR_BIN, ...).',
@@ -224,6 +258,8 @@ process.env.PATH = (process.env.PATH ?? '').split(path.delimiter).includes(guard
   ? process.env.PATH
   : `${guard.stubDir}${path.delimiter}${process.env.PATH ?? ''}`;
 if (process.env.BOTBOY_TEST_LSREGISTER_BIN === undefined) process.env.BOTBOY_TEST_LSREGISTER_BIN = guard.lsregisterStub;
+if (process.env.BOTBOY_TEST_NODE_DIST_URL === undefined) process.env.BOTBOY_TEST_NODE_DIST_URL = CLOSED_DIST_URL;
+if (process.env.BOTBOY_TEST_PYTHON_DIST_URL === undefined) process.env.BOTBOY_TEST_PYTHON_DIST_URL = CLOSED_DIST_URL;
 install(guard);
 
 afterAll(() => {
@@ -236,8 +272,8 @@ afterAll(() => {
   try {
     if (calls.length) {
       throw new Error(
-        `[test hygiene] a test reached a stub of the macOS UI tools (${calls.length} call${calls.length === 1 ? '' : 's'}: ${calls.slice(0, 3).join(' | ')}). `
-        + 'osascript shows dialogs, open launches apps and lsregister registers them: give the test its own recording stub, and keep the real tool out of it.',
+        `[test hygiene] a test reached a stub of the macOS UI tools or an Xcode stand-in (${calls.length} call${calls.length === 1 ? '' : 's'}: ${calls.slice(0, 3).join(' | ')}). `
+        + 'osascript shows dialogs, open launches apps, lsregister registers them, and /usr/bin/python3 and install_name_tool are Xcode shims: give the test its own recording stub, and keep the real tool out of it.',
       );
     }
   } finally {

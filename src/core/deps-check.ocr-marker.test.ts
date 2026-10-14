@@ -72,6 +72,18 @@ function helper(kind: 'none' | 'prebuilt') {
   resetNativeHelperState();
   return f;
 }
+/**
+ * Discovery runs on a Mac WITHOUT the Command Line Tools here (an xcode-select stand-in that fails), so it drops Apple's
+ * /usr/bin/python3 and /usr/bin/git before any version probe: the probe would otherwise run the real python3 stand-in
+ * (the test-hygiene net records and fails that), because this file's child_process mock does not reach probeVersion.
+ */
+function noCommandLineTools(): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-depsmarker-xcode-'));
+  roots.push(dir);
+  const stub = path.join(dir, 'xcode-select');
+  fs.writeFileSync(stub, '#!/bin/sh\nexit 2\n', { mode: 0o755 });
+  vi.stubEnv('BOTBOY_TEST_XCODE_SELECT_BIN', stub);
+}
 const signature = { source: 'a'.repeat(64), swiftc: 'Apple Swift version 6.0', osBuild: '24A335' };
 const failedMarker = { schema: 1, ...FAILURE, signature };
 const unavailableMarker = (reasonCode: string, reason: string, prebuilt?: string) => ({
@@ -89,6 +101,7 @@ afterEach(() => {
   else process.env.HOME = savedHome;
   cleanupFixtures();
   resetNativeHelperState();
+  vi.unstubAllEnvs();
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
 });
 
@@ -232,6 +245,7 @@ describe('the toolchain registry entry for the OCR helper', () => {
 
   it.runIf(ON_MAC)('discovery: recommended (not required), the right hint per outcome, and a usable helper carries no hint', async () => {
     const { discoverToolchain } = await import('./toolchain.js');
+    noCommandLineTools();
     helper('none');
     fakeHome(failedMarker);
     const failed = (await discoverToolchain({ PATH: '/usr/bin:/bin' })).tools.find((tool) => tool.name === 'vision-ocr')!;
@@ -250,6 +264,7 @@ describe('the toolchain registry entry for the OCR helper', () => {
 
   it.runIf(ON_MAC)('a Mac without the helper logs no "Missing required tools" warning for it (F-C)', async () => {
     const { discoverToolchain } = await import('./toolchain.js');
+    noCommandLineTools();
     helper('none');
     fakeHome(null);
     const snapshot = await discoverToolchain({ PATH: '/usr/bin:/bin' });

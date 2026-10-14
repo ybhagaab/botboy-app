@@ -53,7 +53,21 @@ import {
 } from './mcp-profiles.js';
 import { hasLiveDatanetSentryCookie, primeDatanetSentrySession } from './sentry-session.js';
 import { createMcpTerminalEngine } from './mcp-terminal.js';
-import { modelProcessSandboxInvocation, protectedLocalPortPolicy } from './protected-local-resources.js';
+import {
+  loginPathLine,
+  modelProcessSandboxInvocation,
+  npmGlobalEnvironment,
+  pathWithoutPrivateRuntime,
+  privateNodeUse,
+  privatePythonUse,
+  privateRuntimeRoot,
+  protectedLocalPortPolicy,
+  pythonChildAccess,
+  pythonRuntimeUse,
+  pythonSandboxOptions,
+  pythonUserEnvironment,
+} from './protected-local-resources.js';
+import { commandLineToolsKnown } from './command-line-tools.js';
 import { createSqlContextPackageResolver, type SqlContextPackageResolver } from './sql-context-package.js';
 import { AmazonEmployeeOffError } from './workplace.js';
 import type {
@@ -343,6 +357,49 @@ export class McpHiddenByWorkplaceError extends AmazonEmployeeOffError {
   }
 }
 
+/**
+ * "Command not found" for a user-added server, with the next step in one sentence. For an npm program the step is to
+ * install it from chat (it lands in `~/.npm-global` when BotBoy runs on its own Node), then press Start again. `uv`,
+ * `uvx` and `python3`: BotBoy sets up its own uv and Python at start on a Mac that has none (scripts/python-runtime.sh),
+ * so the step names the doctor row that says how far that got and a start while online (design review finding 13).
+ */
+export function commandNotFound(command: string): string {
+  const name = path.basename(command);
+  if (name === 'uvx' || name === 'uv') {
+    return `Command not found: ${command}. BotBoy sets up its own uv at start and has not done so yet on this Mac (./start.sh --doctor, row "uv source"): run ./start.sh again while online, or install uv yourself, then press Start.`;
+  }
+  if (/^python3?(\.\d+)?$/.test(name)) {
+    return `Command not found: ${command}. BotBoy sets up its own Python at start and has not done so yet on this Mac (./start.sh --doctor, row "python source"): run ./start.sh again while online, or install Python 3.10 or newer yourself, then press Start.`;
+  }
+  return `Command not found: ${command}. If it is an npm program, ask BotBoy in chat to install it, then press Start again.`;
+}
+
+/**
+ * The live-run switch (BOTBOY_TEST_PREFER_PRIVATE_PYTHON=1, never set in production; the owner's decision: A2 Analytics
+ * stays on the owner's own Python during that run): the a2-analytics launch and its setup terminal lose BotBoy's Python
+ * bin from PATH, so its launcher picks the Python it uses today. Without the switch this returns the PATH unchanged.
+ */
+export function a2PathForLiveRun(profileId: string, pathValue: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (profileId !== A2_ANALYTICS_PROFILE_ID || env.BOTBOY_TEST_PREFER_PRIVATE_PYTHON !== '1') return pathValue;
+  return pathWithoutPrivateRuntime(pathValue, path.join(privateRuntimeRoot(), 'python'));
+}
+
+/**
+ * The arguments of a setup-terminal command (argv without the program). Design review finding 7(a): a LOGIN shell
+ * script (`bash -lc` / `zsh -lc`, such as a2's "Install Python MCP library") starts with a line that puts BotBoy's
+ * Python bin first again after the owner's profile files ran, while BotBoy's CPython is the `python3` on `pathValue`
+ * (the terminal's PATH): `/etc/profile`'s path_helper moves the system folders in front and a `~/.bash_profile` may
+ * reset PATH, and then the script would reach Apple's python3 stand-in. Byte-identical arguments otherwise, including
+ * a2 in the live run (its PATH no longer holds BotBoy's Python).
+ */
+export function setupTerminalArgs(argv: readonly string[], pathValue: string | undefined, privateRoot?: string): string[] {
+  const args = argv.slice(1);
+  const shell = path.basename(argv[0] ?? '');
+  if ((shell !== 'bash' && shell !== 'zsh') || args.length !== 2 || args[0] !== '-lc') return args;
+  const python = privatePythonUse({ pathValue: pathValue ?? '', privateRoot });
+  return python ? ['-lc', loginPathLine([python.pythonBin]) + args[1]] : args;
+}
+
 export function createMcpManager(options: {
   db: Database.Database;
   secretStore?: McpSecretStore;
@@ -365,6 +422,21 @@ export function createMcpManager(options: {
   amazonEmployee?: () => boolean;
 }): McpManager {
   const db = options.db;
+  /**
+   * The launch executable of a definition. While BotBoy runs on its own Node, a USER-ADDED command is also looked up in
+   * `~/.npm-global/bin`, LAST (after every other folder, so it adds a command and never shadows one), because chat can
+   * `npm install -g` a server there; while BotBoy's own uv or Python is in use, `~/.botboy-python/bin` comes after it
+   * (`uv tool install` and `pip install --user` from chat put commands there). Built-in and AIM launches never search
+   * either (`resolveDefinitionExecutable` ignores them for them): they run outside the sandbox, and sandboxed code can
+   * write those folders. With a Node, a Python and a uv of its own, nothing changes.
+   */
+  const lastResortFolders = (): string[] => {
+    const use = privateNodeUse();
+    const python = pythonRuntimeUse();
+    return [...(use ? [use.globalBin] : []), ...(python ? [python.userBin] : [])];
+  };
+  const resolveExecutable = (definition: McpServerDefinition): Promise<string | null> =>
+    resolveDefinitionExecutable(definition, undefined, lastResortFolders());
   const secretStore = options.secretStore ?? createMcpSecretStore();
   const remotePolicy = options.remotePolicy ?? protectedLocalPortPolicy();
   const sqlContextPackages = options.sqlContextPackages ?? createSqlContextPackageResolver();
@@ -548,7 +620,7 @@ export function createMcpManager(options: {
     if (profile.launch.type === 'custom-command' && missingRequiredValues(parseCustomConfig(server.config_json)).length > 0) {
       return false;
     }
-    return Boolean(await resolveDefinitionExecutable(profile));
+    return Boolean(await resolveExecutable(profile));
   }
 
   async function snapshot(server: McpServerRow): Promise<McpServerSnapshot> {
@@ -582,7 +654,7 @@ export function createMcpManager(options: {
     if (!profile) throw new Error(`Unknown MCP profile: ${server.id}`);
     const base = await snapshot(server);
     const installationState = profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script'
-      ? await resolveDefinitionExecutable(profile) ? 'installed' : 'not_installed'
+      ? await resolveExecutable(profile) ? 'installed' : 'not_installed'
       : 'installed';
     const toolNames = new Set(base.tools.map(tool => tool.name));
     const missingTools = profile.requiredTools.filter(name => !toolNames.has(name));
@@ -820,10 +892,10 @@ export function createMcpManager(options: {
           maxBufferSize: STDIO_MAX_MESSAGE_BYTES,
         });
       } else {
-        const executable = await resolveDefinitionExecutable(profile);
+        const executable = await resolveExecutable(profile);
         if (!executable) {
           const reason = profile.launch.type === 'custom-command'
-            ? `Command not found: ${profile.launch.command}`
+            ? commandNotFound(profile.launch.command)
             : `${profile.shortName} is not installed.`;
           db.prepare(`
             UPDATE mcp_servers SET enabled = 0, state = 'needs_configuration',
@@ -842,20 +914,39 @@ export function createMcpManager(options: {
           if (missing.length) throw new Error(pauseForOwner(serverId, missingValuesMessage(missing)));
           customEnv = await readCustomValues(serverId, 'env', config.env, config.legacyEnv);
         }
-        const childEnv = profile.launch.type === 'custom-command'
+        let childEnv = profile.launch.type === 'custom-command'
           ? { ...getDefaultEnvironment(), ...customEnv }
           : getDefaultEnvironment();
         // AIM launch wrappers exec `aim …` from the child, so the child PATH
         // must resolve the toolchain even under a minimal-PATH launch.
-        childEnv.PATH = pathValueWithFallbackDirectories(childEnv.PATH ?? process.env.PATH);
+        childEnv.PATH = a2PathForLiveRun(serverId, pathValueWithFallbackDirectories(childEnv.PATH ?? process.env.PATH));
         // aim-package-script launchers take no argv; both other branches
         // carry their registry/user-declared args. Owner-reviewed custom
         // servers remain agent-callable but run behind the same protected
-        // local-resource boundary as model-authored commands.
+        // local-resource boundary as model-authored commands. While BotBoy
+        // itself runs on its own copy of Node (a Mac with no Node of its own),
+        // or on its own uv or Python, that boundary may READ the runtime
+        // folders in use, so a server started with `npx`, `npm`, `uvx` or
+        // `python3` runs from the same runtime; on any other Mac the profile
+        // is unchanged. Built-in and AIM servers run unsandboxed and use the
+        // PATH above as it is.
         const launchArgs = profile.launch.type === 'aim-package-script' ? [] : [...profile.launch.args];
+        const nodeUse = privateNodeUse();
+        const pythonUse = profile.launch.type === 'custom-command' ? pythonRuntimeUse() : null;
         const launch = profile.launch.type === 'custom-command'
-          ? modelProcessSandboxInvocation(executable, launchArgs)
+          ? modelProcessSandboxInvocation(executable, launchArgs, { runtimeReadDir: nodeUse?.runtimeDir, ...pythonSandboxOptions(pythonUse, pythonUse ? commandLineToolsKnown() !== true : false) })
           : { executable, args: launchArgs };
+        if ('opened' in launch) {
+          // A sandboxed child keeps on PATH only the runtime folders its profile opened (one it cannot read would fall
+          // through to the next program of that name: Apple's python3 stand-in on a bare Mac; review finding 4).
+          childEnv.PATH = pathWithoutPrivateRuntime(childEnv.PATH, privateRuntimeRoot(), Object.values(launch.opened));
+          // The child that can read BotBoy's Node also gets npm's global prefix (the runtime is read-only to it), with
+          // its bin at the END of PATH; BotBoy's uv or Python adds ~/.botboy-python the same way. A value the owner
+          // declared for this server is kept. Never for an unsandboxed child, and never for this process.
+          if (nodeUse && launch.opened.node) childEnv = npmGlobalEnvironment(childEnv, nodeUse, customEnv);
+          const python = pythonChildAccess(pythonUse, launch.opened);
+          if (python) childEnv = pythonUserEnvironment(childEnv, python, customEnv);
+        }
         transport = new StdioClientTransport({
           command: launch.executable,
           args: launch.args,
@@ -1287,9 +1378,9 @@ export function createMcpManager(options: {
     refuseHidden(profileId);
     const profile = definitionFor(profileId);
     if (profile && (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script')) {
-      const executable = await resolveDefinitionExecutable(profile);
+      const executable = await resolveExecutable(profile);
       const absenceReason = profile.launch.type === 'custom-command'
-        ? `Command not found: ${profile.launch.command}`
+        ? commandNotFound(profile.launch.command)
         : `${profile.shortName} is not installed.`;
       if (!executable && !runtimes.has(profileId)) {
         updateState(profileId, 'needs_configuration', { error: absenceReason, pid: null });
@@ -1321,7 +1412,7 @@ export function createMcpManager(options: {
     const controller = new AbortController();
     setupAbortControllers.set(profileId, controller);
     const operation = (async () => {
-      const executable = await resolveDefinitionExecutable(profile);
+      const executable = await resolveExecutable(profile);
       if (stopping || controller.signal.aborted) throw new Error('The managed MCP runtime is shutting down.');
       if (!executable) {
         updateState(profileId, 'needs_configuration', { error: `${profile.shortName} is not installed.`, pid: null });
@@ -1360,11 +1451,11 @@ export function createMcpManager(options: {
       }
     }
     if (profile.launch.type === 'local-executable' || profile.launch.type === 'custom-command' || profile.launch.type === 'aim-package-script') {
-      const executable = await resolveDefinitionExecutable(profile);
+      const executable = await resolveExecutable(profile);
       if (stopping || !active) throw new Error('The managed MCP runtime is shutting down.');
       if (!executable) {
         const reason = profile.launch.type === 'custom-command'
-          ? `Command not found: ${profile.launch.command}`
+          ? commandNotFound(profile.launch.command)
           : `${profile.shortName} is not installed.`;
         db.prepare(`
           UPDATE mcp_servers SET enabled = 0, state = 'needs_configuration',
@@ -1496,10 +1587,10 @@ export function createMcpManager(options: {
 
   async function initialCustomState(definition: McpServerDefinition): Promise<{ state: McpServerState; error: string | null }> {
     if (definition.launch.type !== 'custom-command') return { state: 'stopped', error: null };
-    const executable = await resolveDefinitionExecutable(definition);
+    const executable = await resolveExecutable(definition);
     return executable
       ? { state: 'stopped', error: null }
-      : { state: 'needs_configuration', error: `Command not found: ${definition.launch.command}` };
+      : { state: 'needs_configuration', error: commandNotFound(definition.launch.command) };
   }
 
   async function createCustomServerInternal(
@@ -1742,12 +1833,12 @@ export function createMcpManager(options: {
     }
   }
 
-  /** Child environment for embedded setup-terminal commands. */
-  function terminalEnvironment(): Record<string, string> {
+  /** Child environment for embedded setup-terminal commands (a2's loses BotBoy's Python only in the live run: `a2PathForLiveRun`). */
+  function terminalEnvironment(profileId: string): Record<string, string> {
     const base = getDefaultEnvironment();
     return {
       ...base,
-      PATH: pathValueWithFallbackDirectories(base.PATH ?? process.env.PATH),
+      PATH: a2PathForLiveRun(profileId, pathValueWithFallbackDirectories(base.PATH ?? process.env.PATH)),
       TERM: 'xterm-256color',
     };
   }
@@ -1773,13 +1864,14 @@ export function createMcpManager(options: {
     if (!executable) {
       throw new Error(`Command not found: ${command.argv[0]}. Install it, then try again.`);
     }
+    const env = terminalEnvironment(profileId);
     return terminalEngine.start({
       profileId,
       commandId: command.id,
       title: command.title,
       executable,
-      args: command.argv.slice(1),
-      env: terminalEnvironment(),
+      args: setupTerminalArgs(command.argv, env.PATH),
+      env,
       timeoutMs: command.timeoutMs,
     });
   }

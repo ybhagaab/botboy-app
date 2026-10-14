@@ -4415,7 +4415,10 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
     void refreshChatJobStrip();
     const chatEl = document.getElementById('chat-messages');
     if (chatEl && chatEl.querySelector('.streaming-live')) return;
-    const msgs = await api('/chat/history');
+    // While the server is unreachable the dashboard says so itself (server-link.js);
+    // a failed poll must not also log an unhandled rejection every five seconds.
+    let msgs;
+    try { msgs = await api('/chat/history'); } catch { return; }
     const lastNew = msgs.length > 0 ? msgs[msgs.length - 1].id : null;
     const lastCur = state.chatMessages.length > 0 ? state.chatMessages[state.chatMessages.length - 1].id : null;
     if (lastNew !== lastCur) { state.chatMessages = msgs; renderChat(); }

@@ -1,0 +1,31 @@
+# BotBoy's private Node runtime: ONE exact version, never bumped by itself.
+#
+# Used only on a Mac that has no usable Node (none at all, older than 20.16, Node below 22 with no Command Line
+# Tools to build the database module, or a Node whose npm cannot install this project). A system Node that works
+# is always preferred. Read by start.sh through scripts/node-runtime.sh (bash only: no Node, plutil or Python
+# needed), by scripts/verify-node-runtime.mjs, and by the tests. Plain `key=value` lines; `#` starts a comment.
+#
+# The download is https://nodejs.org/dist/v<version>/node-v<version>-darwin-<arm64|x64>.tar.gz and is
+# checked against the sha256 below BEFORE it is unpacked. Nothing else is downloaded.
+#
+# Why line 24, not 22 (measured 2026-10-14): Node 22's bundled npm 10.9.x cannot install this project from a clean
+# checkout (npm/cli#8261: "Cannot read properties of null (reading 'edgesOut')" on vitest 4.1's peer set; it failed
+# 2 of 2 times with npm 10.9.9). Node 24 comes with npm 11, which installs it, and has prebuilt better-sqlite3 and
+# node-pty binaries. Node 24 needs macOS 13.5 or newer (min_macos below); the BotBoy helpers need 13.0.
+#
+# Bumping is a deliberate release step (also the "Node runtime pin" row of docs/maps/teammate-install-release.md):
+#   1. take version, line, end-of-life date, and each tarball's size and SHA-256 from nodejs.org
+#      (https://nodejs.org/dist/v<version>/SHASUMS256.txt; the schedule is nodejs.org/en/about/previous-releases);
+#   2. npm run node-runtime:verify   (format, end-of-life date, and online: the hashes equal nodejs.org's);
+#   3. install with that exact Node in a scratch copy of the release files (a fresh `npm install`, so its own npm
+#      is tested too), then run lint, build and the FULL test suite;
+#   4. only then release. A new Node can need new dependency versions: that is why this is never automatic.
+schema=1
+version=24.21.0
+line=24
+eol=2028-04-30
+min_macos=13.5
+darwin-arm64.sha256=bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057
+darwin-arm64.bytes=52909993
+darwin-x64.sha256=1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097
+darwin-x64.bytes=54203979

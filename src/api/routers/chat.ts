@@ -65,6 +65,7 @@ import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatT
 import { filterToolsForContinuation } from '../../core/job-mandate.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
 import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
+import { endResponseAtShutdown } from '../../core/shutdown-coordinator.js';
 
 /** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
 const GMAIL_WRITE_TOOLS = new Set(['gmail_draft', 'gmail_send']);
@@ -932,6 +933,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       'X-Accel-Buffering': 'no',
     });
     const send = (payload: unknown) => {
+      if (res.writableEnded) return;
       try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* the viewer left */ }
     };
     const current = continuations.hub.current();
@@ -948,10 +950,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       try { res.write(': keep-alive\n\n'); } catch { /* closed */ }
     }, 15_000);
     keepAlive.unref?.();
-    req.on('close', () => {
+    const stopViewing = () => {
       clearInterval(keepAlive);
       unsubscribe();
-    });
+    };
+    // Shutdown ends this stream at once, so it never holds the HTTP stage open (it is open whenever a
+    // dashboard window is); the window's EventSource reconnects to the next server by itself.
+    endResponseAtShutdown(deps.shutdown, res, stopViewing);
+    req.on('close', stopViewing);
   });
 
   router.post('/chat/messages', async (req: Request, res: Response) => {
@@ -995,7 +1001,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       return res.status(409).json({
         error: 'Chat needs an AI model first.',
         code: 'ai_model_not_configured',
-        nextAction: 'Open Settings → AI model and paste an OpenAI or DeepSeek API key. Chat and background organizing start right away.',
+        nextAction: 'Open Settings → AI model and paste an OpenAI, DeepSeek or Anthropic (Claude) API key. Chat and background organizing start right away.',
       });
     }
     if (requestedMode !== undefined && requestedMode !== 'general' && requestedMode !== 'analytics_dashboard') {
@@ -2752,10 +2758,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       );
       const keepAlive = setInterval(() => { res.write(': keep-alive\n\n'); }, 15_000);
       keepAlive.unref?.();
-      req.on('close', () => {
+      const stopStreaming = () => {
         clearInterval(keepAlive);
         unsubscribe?.();
-      });
+      };
+      // Shutdown ends the stream without waiting for the terminal's process to exit.
+      endResponseAtShutdown(deps.shutdown, res, stopStreaming);
+      req.on('close', stopStreaming);
     } catch (error: any) {
       unsubscribe?.();
       if (!res.headersSent) {

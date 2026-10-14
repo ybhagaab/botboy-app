@@ -1,0 +1,39 @@
+# BotBoy's private Python runtime: uv plus ONE CPython, exact versions, never bumped by themselves.
+#
+# Used only on a Mac without a usable Python or uv (no python3/python3.13..python3.10 of 3.10 or newer outside Apple's
+# /usr/bin shim and the Command Line Tools, or no uv 0.3.0 or newer with uvx beside it). A Python and a uv that work
+# are always preferred. Read by start.sh through scripts/python-runtime.sh (bash only), by
+# scripts/verify-python-runtime.mjs, and by the tests. Plain `key=value` lines; `#` starts a comment.
+#
+# The downloads, from GitHub releases only, each checked against the sha256 below BEFORE it is unpacked:
+#   https://github.com/astral-sh/uv/releases/download/<uv.version>/uv-<aarch64|x86_64>-apple-darwin.tar.gz
+#   https://github.com/astral-sh/python-build-standalone/releases/download/<python.build>/
+#     cpython-<python.version>%2B<python.build>-<aarch64|x86_64>-apple-darwin-install_only_stripped.tar.gz
+# BotBoy's uv then installs that CPython from the verified local file (a file:// mirror), and uv checks it again
+# against the hash built into uv. So python.build MUST be the build tag this uv version embeds for python.version:
+# `npm run python-runtime:verify` fails otherwise (it runs `uv python list --only-downloads --show-urls`).
+#
+# Why 3.13, not 3.14 (measured 2026-10-14): common older pins such as pydantic-core 2.27 and 2.33 ship macOS wheels
+# for cp39 to cp313 and none for cp314; every Python MCP server checked on PyPI declares requires-python >=3.10.
+#
+# Bumping is a deliberate release step, uv and CPython as a PAIR (also the "Python runtime pin" row of
+# docs/maps/python-runtime.md):
+#   1. take uv.version and each uv tarball's size and SHA-256 from the uv release (the .sha256 file beside each
+#      tarball); take python.build from that uv version's built-in download list, and each CPython file's size and
+#      SHA-256 from that build's SHA256SUMS; python.eol from the CPython release schedule (PEP 719 for 3.13);
+#   2. npm run python-runtime:verify   (format, end of life, and online: hashes, sizes and the uv/CPython pairing);
+#   3. run the dev live check (scripts/dev/python-runtime-mcp-live-check.mjs) and the full test suite;
+#   4. only then release.
+schema=1
+uv.version=0.13.0
+uv.darwin-arm64.sha256=a9c1b29002cf3c83f07fa9cd8a887a3be0107d90e23189721221e7257db8e3d6
+uv.darwin-arm64.bytes=14692549
+uv.darwin-x64.sha256=5f44dcbde809b632f47c36fadb241cb4d6f9af71d0c8f172b5d2026d3dde742c
+uv.darwin-x64.bytes=18138509
+python.version=3.13.16
+python.build=20261009
+python.eol=2029-10-31
+python.darwin-arm64.sha256=11785155d0f70e634178219c20925d8f20be00a3da4684fc4f5019dd15602ef7
+python.darwin-arm64.bytes=25257849
+python.darwin-x64.sha256=bd085c51e960f00ee33b630e2b13ac90fe90cdc3da25a0f0bc0719b1294920bf
+python.darwin-x64.bytes=24975282

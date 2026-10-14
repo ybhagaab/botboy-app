@@ -120,7 +120,7 @@ describe('Settings → AI model SPA seams', () => {
     expect(catalog).toContain('requestId !== chatModelCatalogRequest');
 
     expect(html).toMatch(/<div id="chat-ai-model-notice"[^>]*role="status"[^>]*hidden>/);
-    expect(html).toContain('Add an OpenAI or DeepSeek API key in Settings');
+    expect(html).toContain('Add an OpenAI, DeepSeek or Anthropic (Claude) API key in Settings');
     expect(html).toContain('href="#/settings/ai-model"');
     // Display rules must not override the hidden attribute.
     expect(css).toContain('.chat-ai-model-notice:not([hidden])');

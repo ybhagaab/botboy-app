@@ -34,7 +34,7 @@ import {
   type McpTerminalEngine,
   type McpTerminalSessionSnapshot,
 } from './mcp-terminal.js';
-import { modelChildEnvironment, modelCommandSandboxInvocation } from './protected-local-resources.js';
+import { modelShellLaunch } from './protected-local-resources.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 // Source builds are real on machines whose Homebrew prefix disables bottles
@@ -130,21 +130,23 @@ export function createChatTerminalService(): ChatTerminalService {
       const problem = validateChatTerminalCommand(input.command);
       if (problem) throw new Error(problem);
       const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000), MAX_TIMEOUT_MS);
-      const invocation = modelCommandSandboxInvocation(input.command, { shell: '/bin/zsh' });
+      // Same sandboxed login shell and environment as run_command (modelShellLaunch): BotBoy's own inference credentials
+      // never reach a model-run terminal, and BotBoy's own Node is usable when BotBoy runs on it.
+      const invocation = modelShellLaunch(input.command, {
+        shell: '/bin/zsh',
+        extraEnv: {
+          TERM: 'xterm-256color',
+          // Non-interactive-friendly defaults; prompts still work via PTY.
+          HOMEBREW_NO_AUTO_UPDATE: '1',
+        },
+      });
       const snapshot = engine.start({
         profileId: 'chat',
         commandId: 'chat-command',
         title: input.title || input.command.slice(0, 60),
         executable: invocation.executable,
         args: invocation.args,
-        // Same environment as run_command: BotBoy's own inference credentials
-        // never reach a model-run terminal.
-        env: modelChildEnvironment({
-          TERM: 'xterm-256color',
-          BOTBOY_FILES: invocation.filesDir,
-          // Non-interactive-friendly defaults; prompts still work via PTY.
-          HOMEBREW_NO_AUTO_UPDATE: '1',
-        }),
+        env: invocation.env,
         timeoutMs,
       });
       latestSessionId = snapshot.id;

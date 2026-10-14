@@ -9,6 +9,7 @@ import {
 import { paramStr, type RouterDeps } from './deps.js';
 import { requireLocalOwnerUiRequest } from './local-owner.js';
 import { sqlToolTimeoutMs } from '../../core/tool-executor.js';
+import { endResponseAtShutdown } from '../../core/shutdown-coordinator.js';
 import { getSetting } from '../../core/storage.js';
 import {
   ANALYTICS_CONTEXT_DIR_KEY,
@@ -123,7 +124,7 @@ function customServerGuide(profile: McpProfileSnapshot): Record<string, unknown>
     steps: [],
     nextActions: {
       default: 'Start the server. Then test the MCP protocol connection.',
-      notInstalled: 'The command was not found. Edit the configuration or install the command. Then select Check installation.',
+      notInstalled: 'The command was not found. Edit the configuration or install the command (for an npm program, ask BotBoy in chat to install it). Then select Check installation.',
       starting: 'Wait for the local MCP server to start.',
       failed: 'Stop the server. Review the command, arguments, and environment. Then start the server again.',
       runningUnchecked: 'Test the connection. The test uses MCP protocol operations only.',
@@ -438,10 +439,13 @@ export function createMcpRouter(deps: RouterDeps): Router {
       );
       const keepAlive = setInterval(() => { res.write(': keep-alive\n\n'); }, 15_000);
       keepAlive.unref?.();
-      req.on('close', () => {
+      const stopStreaming = () => {
         clearInterval(keepAlive);
         unsubscribe?.();
-      });
+      };
+      // Shutdown ends the stream without waiting for the setup command to exit.
+      endResponseAtShutdown(deps.shutdown, res, stopStreaming);
+      req.on('close', stopStreaming);
     } catch (error: any) {
       unsubscribe?.();
       if (!res.headersSent) {

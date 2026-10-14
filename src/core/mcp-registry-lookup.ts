@@ -254,7 +254,7 @@ export function registryCandidate(entry: unknown): McpServerCandidate | null {
     } else if (registryType === 'pypi') {
       command = 'uvx';
       args = [...runtimeArgs, pinned ? `${identifier}==${pinned}` : identifier, ...packageArgs];
-      label = `Local: Python package ${identifier}, run with uvx (needs uv)`;
+      label = `Local: Python package ${identifier}, run with uvx`;
     } else if (registryType === 'oci') {
       command = 'docker';
       args = ['run', '-i', '--rm', ...runtimeArgs, ...Object.keys(env.values).flatMap(variable => ['-e', variable]), identifier, ...packageArgs];

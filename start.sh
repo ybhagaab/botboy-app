@@ -294,6 +294,99 @@ git_usable() {
   return 0
 }
 
+# Whether the native modules work in the exact Node this launcher runs. One
+# `name|ok` or `name|<error>` line per module; nonzero when either fails.
+# better-sqlite3 binds its addon only inside `new Database()`, so `require`
+# alone proves nothing (the doctor said "loads" on a teammate Mac where it
+# could not open a database); node-pty must actually spawn a terminal.
+# `repair` first restores the execute bit node-pty 1.1.0's npm tarball drops
+# from its macOS spawn-helper (`posix_spawnp failed` otherwise); `check`
+# changes nothing.
+native_modules_status() {
+  (cd "$PROJ_DIR" && native_exec "$NODE" -e '
+    const fs = require("fs");
+    const path = require("path");
+    const repair = process.argv[1] === "repair";
+    const cwd = process.cwd() + path.sep;
+    const describe = error => String((error && error.message) || error)
+      .split(cwd).join("").replace(/\s+/g, " ").replace(/ (Tried:|Require stack:) .*$/, "")
+      .trim().slice(0, 300) || "unknown error";
+    const results = [];
+    let failed = false;
+    const record = (name, error) => {
+      if (error) failed = true;
+      results.push(`${name}|${error ? describe(error) : "ok"}`);
+    };
+    const finish = () => {
+      process.stdout.write(results.join("\n") + "\n");
+      process.exit(failed ? 1 : 0);
+    };
+    try {
+      new (require("better-sqlite3"))(":memory:").close();
+      record("better-sqlite3");
+    } catch (error) {
+      record("better-sqlite3", error);
+    }
+    if (repair) {
+      for (const platform of ["darwin-arm64", "darwin-x64"]) {
+        const helper = path.join("node_modules", "node-pty", "prebuilds", platform, "spawn-helper");
+        try {
+          const mode = fs.statSync(helper).mode;
+          if ((mode & 0o111) !== 0o111) fs.chmodSync(helper, (mode & 0o777) | 0o755);
+        } catch {}
+      }
+    }
+    let terminal;
+    try {
+      terminal = require("node-pty").spawn("/usr/bin/true", [], { name: "xterm", cols: 80, rows: 24, cwd: process.cwd(), env: process.env });
+    } catch (error) {
+      record("node-pty", error);
+      finish();
+    }
+    const timer = setTimeout(() => {
+      try { terminal.kill(); } catch {}
+      record("node-pty", new Error("a test terminal did not exit within 5 seconds"));
+      finish();
+    }, 5000);
+    terminal.onExit(({ exitCode }) => {
+      clearTimeout(timer);
+      record("node-pty", exitCode === 0 ? undefined : new Error(`a test terminal exited with ${exitCode}`));
+      finish();
+    });
+  ' "${1:-check}" 2>/dev/null)
+}
+
+
+# The folders this launcher puts in front of PATH for the Node lookup and for everything it starts (a user-level
+# Homebrew, ~/.local, Toolbox, then the two system-wide Homebrew folders). ONE list, read in two places: the real start
+# (the PATH export further down) and the Node lookup itself (scripts/node-runtime.sh › node_find_system), so the
+# --update prefetch, which runs before that export, finds the same Node a start finds and never downloads BotBoy's
+# own copy for a Mac whose Node works. Test hook (production never sets it): BOTBOY_TEST_NO_HOST_BIN_DIRS=1 leaves
+# the two system-wide folders out, so a test's lookup does not depend on what is installed on the Mac running it.
+if [ "${BOTBOY_TEST_NO_HOST_BIN_DIRS:-0}" = "1" ]; then
+  START_EXTRA_PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin"
+else
+  START_EXTRA_PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/bin:/opt/homebrew/bin"
+fi
+
+# BotBoy's own Node for a Mac with no usable one: scripts/node-runtime.sh (see its header). It is sourced here, before
+# the --update block and the Node lookup below, because both use it. A checkout without the file behaves as before.
+NODE_RUNTIME_LOADED=0
+NODE_SOURCE=system
+NODE_DOWNLOAD_OK=0
+[ "$DOCTOR$STOP_ONLY$RECOVER_SHUTDOWN$OPEN_WINDOW_ONLY$REBUILD_OCR" = "00000" ] && NODE_DOWNLOAD_OK=1
+if [ -f "$PROJ_DIR/scripts/node-runtime.sh" ]; then
+  # shellcheck source=scripts/node-runtime.sh
+  . "$PROJ_DIR/scripts/node-runtime.sh"
+fi
+# BotBoy's own Python (uv + one CPython) for a Mac without a usable Python or uv: scripts/python-runtime.sh (see its
+# header). Optional: nothing in it ever stops a start. A checkout without the file behaves as before.
+PYTHON_RUNTIME_LOADED=0
+if [ -f "$PROJ_DIR/scripts/python-runtime.sh" ]; then
+  # shellcheck source=scripts/python-runtime.sh
+  . "$PROJ_DIR/scripts/python-runtime.sh"
+fi
+
 # Release checkouts are customizable runtime snapshots. Detect from the
 # generated marker (current releases) or origin URL (backward compatibility).
 BOTBOY_REMOTE_URL=""
@@ -399,6 +492,15 @@ if [ "$UPDATE_ONLY" = "1" ]; then
     fi
   fi
 
+  # An update that will not start BotBoy still brings the pinned Node: when this Mac uses (or needs) BotBoy's own
+  # copy and the new release pins another version, fetch it now. A start does the same on the normal path below.
+  if [ "$NODE_RUNTIME_LOADED" = "1" ] && { [ "$UPDATE_GUARDED" = "1" ] || [ "${BOTBOY_UPDATE_NO_START:-0}" = "1" ]; }; then
+    node_runtime_update_prefetch
+  fi
+  # The same for BotBoy's own Python (uv + CPython). A start fetches it in the background instead.
+  if [ "$PYTHON_RUNTIME_LOADED" = "1" ] && { [ "$UPDATE_GUARDED" = "1" ] || [ "${BOTBOY_UPDATE_NO_START:-0}" = "1" ]; }; then
+    python_runtime_update_prefetch
+  fi
   if [ "$UPDATE_GUARDED" = "1" ]; then
     echo "✅ BotBoy updated. It was not started because an earlier shutdown is still unverified."
     echo "    Next: ./start.sh --recover-shutdown"
@@ -436,7 +538,7 @@ STARTUP_INT_GRACE_SECONDS="${PPT_STARTUP_INT_GRACE_SECONDS:-20}"
 STARTUP_TERM_GRACE_SECONDS="${PPT_STARTUP_TERM_GRACE_SECONDS:-10}"
 DEBUG_PROFILE="$HOME/.chrome-debug-profile"
 CHROME="${BOTBOY_TEST_CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-export PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+export PATH="$START_EXTRA_PATH:$PATH"
 
 # Resolve node without hardcoding any machine-specific path. BotBoy.app
 # launches with a minimal PATH, so check PATH first, then the layouts of
@@ -445,15 +547,23 @@ export PATH="$HOME/homebrew/bin:$HOME/.local/bin:$HOME/.toolbox/bin:/usr/local/b
 # shell init runs, so `command -v node` fails in app launches and bare
 # shells — that produced ':x: node not found' on a machine with a
 # perfectly good nvm-managed Node 22 (2026-08-24).
-NODE="${BOTBOY_TEST_NODE_BIN:-$(command -v node)}"
-if [ -z "$NODE" ]; then
-  for candidate in "$HOME"/n/n/versions/node/*/bin/node "$HOME"/.n/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
-    [ -x "$candidate" ] && NODE="$candidate"
-  done
-fi
-if [ -z "$NODE" ]; then
-  echo "❌ node not found — install Node 22 or newer from nodejs.org (the installer needs no other tools), then re-run ./start.sh" | tee -a "$LOG_FILE"
-  exit 1
+if [ "$NODE_RUNTIME_LOADED" = "1" ]; then
+  # scripts/node-runtime.sh: this Mac's own Node when it works (always preferred, nothing about it changes), else
+  # BotBoy's pinned private copy if it is already installed. Phase 1 never downloads; a real start calls
+  # ensure_node_runtime (phase 2) before its first npm or build step.
+  node_select_phase1
+  [ -n "$NODE" ] || node_none_found
+else
+  NODE="${BOTBOY_TEST_NODE_BIN:-$(command -v node)}"
+  if [ -z "$NODE" ]; then
+    for candidate in "$HOME"/n/n/versions/node/*/bin/node "$HOME"/.n/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
+      [ -x "$candidate" ] && NODE="$candidate"
+    done
+  fi
+  if [ -z "$NODE" ]; then
+    echo "❌ node not found — install Node 24 or newer from nodejs.org (the LTS download; the installer needs no other tools), then re-run ./start.sh" | tee -a "$LOG_FILE"
+    exit 1
+  fi
 fi
 
 LSOF_BIN="${BOTBOY_TEST_LSOF_BIN:-lsof}"
@@ -465,6 +575,7 @@ PS_BIN="${BOTBOY_TEST_PS_BIN:-ps}"
 pick_native_node() {
   local candidate archs
   [ "$HW_ARM64" = "1" ] || return 0
+  [ "$NODE_SOURCE" = "private" ] && return 0
   [ -n "$NODE_ARCHS" ] && ! archs_include_arm64 "$NODE_ARCHS" || return 0
   for candidate in "$HOME/homebrew/bin/node" /opt/homebrew/bin/node \
     "$HOME"/n/n/versions/node/*/bin/node "$HOME"/.n/versions/node/*/bin/node "$HOME"/.nvm/versions/node/*/bin/node; do
@@ -526,9 +637,63 @@ if [ "$DOCTOR$STOP_ONLY$RECOVER_SHUTDOWN$OPEN_WINDOW_ONLY$REBUILD_OCR" = "00000"
   arch_print_warnings
 fi
 
-# Make the chosen node's bin dir visible to child processes (npm, npx).
-PATH="$(dirname "$NODE"):$PATH"
-export PATH
+# Make the chosen node's bin dir visible to child processes (npm, npx). For BotBoy's own Node this is what makes
+# npm's `#!/usr/bin/env node`, npx, postinstall, the build, the OCR and bootstrap jobs, the server, the in-app
+# updater's child and the --foreground flow use it: a $NODE variable alone would not reach them.
+if [ -n "$NODE" ]; then
+  PATH="$(dirname "$NODE"):$PATH"
+  export PATH
+fi
+
+# BotBoy's own Python, phase 1 (scripts/python-runtime.sh): which Python and uv this Mac has, and whether BotBoy's own
+# pair is installed. It never downloads and never changes PATH beyond removing inherited entries of BotBoy's Python;
+# a real start fetches what is missing in the background (python_runtime_fetch_begin) and puts BotBoy's Python on
+# PATH just before the server starts (python_runtime_fetch_join).
+[ "$PYTHON_RUNTIME_LOADED" != "1" ] || python_select_phase1
+
+# Executable test hooks for the Node choice (scripts/node-runtime.sh). _SELECT prints what phase 1 chose and exits;
+# _ENSURE also runs phase 2 (the download) first, as a real start would; _DOCTOR_NODE_RUNTIME prints the two doctor
+# rows. None starts anything else.
+if [ "$NODE_RUNTIME_LOADED" = "1" ]; then
+  if [ "${BOTBOY_TEST_NODE_SELECT:-0}" = "1" ]; then
+    print_node_selection
+    exit 0
+  fi
+  if [ "${BOTBOY_TEST_NODE_ENSURE:-0}" = "1" ]; then
+    ensure_node_runtime
+    print_node_selection
+    exit 0
+  fi
+  if [ "${BOTBOY_TEST_DOCTOR_NODE_RUNTIME:-0}" = "1" ]; then
+    doctor_node_runtime_rows
+    exit 0
+  fi
+fi
+# Executable test hooks for BotBoy's own Python (scripts/python-runtime.sh). _SELECT prints what phase 1 chose; _ENSURE
+# runs the background install as a real start does (begin, then join; BOTBOY_TEST_PYTHON_JOIN_LONG=0 joins like a
+# restart with nothing to build); _DOCTOR_PYTHON_RUNTIME prints the doctor rows; _MAINTENANCE runs the upkeep. None
+# starts anything else.
+if [ "$PYTHON_RUNTIME_LOADED" = "1" ]; then
+  if [ "${BOTBOY_TEST_PYTHON_SELECT:-0}" = "1" ]; then
+    print_python_selection
+    exit 0
+  fi
+  if [ "${BOTBOY_TEST_PYTHON_ENSURE:-0}" = "1" ]; then
+    python_runtime_fetch_begin
+    PY_JOIN_LONG="${BOTBOY_TEST_PYTHON_JOIN_LONG:-1}"
+    python_runtime_fetch_join
+    print_python_selection
+    exit 0
+  fi
+  if [ "${BOTBOY_TEST_DOCTOR_PYTHON_RUNTIME:-0}" = "1" ]; then
+    doctor_python_rows
+    exit 0
+  fi
+  if [ "${BOTBOY_TEST_PYTHON_MAINTENANCE:-0}" = "1" ]; then
+    python_runtime_maintenance
+    exit 0
+  fi
+fi
 
 # Packages package.json declares that node_modules lacks, or holds at another
 # version than an exact pin. Space-separated; empty when everything is there.
@@ -576,7 +741,8 @@ strip_native_download_mark() {
 }
 
 # Node 20 compiles BotBoy's database module from source on `npm install`, which needs the Xcode
-# Command Line Tools; Node 22 and newer download a prebuilt copy. One calm line before an install on a
+# Command Line Tools; Node 22 and newer download a prebuilt copy (BotBoy now recommends 24: Node 22's npm cannot do a first install of it,
+# see scripts/node-runtime.sh). One calm line before an install on a
 # Mac that has the first and not the second. It never blocks the install, and an ordinary start (nothing to
 # install) never gets here. (An npm "preinstall" script cannot say this early: npm runs a dependency's install
 # script before the root package's, measured on npm 10.8.2.)
@@ -588,7 +754,7 @@ warn_if_node_needs_tools_to_install() {
   [[ "$major" =~ ^[0-9]+$ ]] || return 0
   [ "$major" -lt 22 ] || return 0
   clt_installed && return 0
-  echo "ℹ  This Mac has Node ${version} and no Command Line Tools. Installing BotBoy's database module has to compile it. Install Node 22 or newer from nodejs.org (no extra tools needed), or run xcode-select --install first." | tee -a "$LOG_FILE"
+  echo "ℹ  This Mac has Node ${version} and no Command Line Tools. Installing BotBoy's database module has to compile it. Install Node 24 or newer from nodejs.org (the LTS download; no extra tools needed), or run xcode-select --install first." | tee -a "$LOG_FILE"
   return 0
 }
 
@@ -791,16 +957,29 @@ fi
 # says what to do.
 DF_BIN="${BOTBOY_TEST_DF_BIN:-df}"
 # Advice about the Node BotBoy runs on. The `node:` line at the top of the doctor already names the path
-# and version, so this row exists only for a Node below 22: Node 20 reached end-of-life on 2026-04-30 and
-# compiles BotBoy's database module on install, which needs the Command Line Tools (design 5.9, F-F).
+# and version, so this row exists only when there is something to say:
+#  - a Node below 22: Node 20 reached end-of-life on 2026-04-30 and compiles BotBoy's database module on install,
+#    which needs the Command Line Tools (design 5.9, F-F);
+#  - a Node whose npm is 10.9.x (Node 22): that npm crashes on the FIRST `npm install` of this project (npm/cli#8261:
+#    2 of 2 on a clean checkout; 0 of 2 when it only had to add packages to an installed tree, measured 2026-10-14),
+#    so the row appears only while nothing is installed yet. A Mac whose BotBoy already runs gets no row
+#    (scripts/node-runtime.sh › node_runtime_npm_known_bad; the evidence is in the map).
 doctor_node_row() {
-  local version major
+  local version major npm_version
   version="$("$NODE" --version 2>/dev/null)"
   major="${version#v}"
   major="${major%%.*}"
   [[ "$major" =~ ^[0-9]+$ ]] || return 0
-  [ "$major" -lt 22 ] || return 0
-  echo "node advice: Node ${major} is end-of-life and compiles BotBoy's database module on install, which needs the Command Line Tools. Install Node 22 or newer from nodejs.org; its installer needs no other tools."
+  if [ "$major" -lt 22 ]; then
+    echo "node advice: Node ${major} is end-of-life and compiles BotBoy's database module on install, which needs the Command Line Tools. Install Node 24 or newer from nodejs.org (the LTS download); its installer needs no other tools."
+    return 0
+  fi
+  [ "$NODE_RUNTIME_LOADED" = "1" ] || return 0
+  npm_version="$(node_runtime_npm_version "$NODE")"
+  if [ -n "$npm_version" ] && node_runtime_npm_known_bad "$npm_version" && [ ! -f "$PROJ_DIR/node_modules/better-sqlite3/package.json" ]; then
+    echo "node advice: this Node comes with npm ${npm_version}, which can fail the first install of BotBoy's packages with \"Cannot read properties of null (reading 'edgesOut')\", and none are installed yet. Install Node 24 or newer from nodejs.org (the LTS download), or update npm: npm install -g npm@11."
+  fi
+  return 0
 }
 doctor_machine_rows() {
   local ram_bytes ram_gb free_kb free_gb pressure level swap_text swap_gb swap_high chrome_state node_text
@@ -1465,74 +1644,106 @@ if [ "${BOTBOY_TEST_APP_LAUNCHER_APPLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# Whether the native modules work in the exact Node this launcher runs. One
-# `name|ok` or `name|<error>` line per module; nonzero when either fails.
-# better-sqlite3 binds its addon only inside `new Database()`, so `require`
-# alone proves nothing (the doctor said "loads" on a teammate Mac where it
-# could not open a database); node-pty must actually spawn a terminal.
-# `repair` first restores the execute bit node-pty 1.1.0's npm tarball drops
-# from its macOS spawn-helper (`posix_spawnp failed` otherwise); `check`
-# changes nothing.
-native_modules_status() {
-  (cd "$PROJ_DIR" && native_exec "$NODE" -e '
-    const fs = require("fs");
-    const path = require("path");
-    const repair = process.argv[1] === "repair";
-    const cwd = process.cwd() + path.sep;
-    const describe = error => String((error && error.message) || error)
-      .split(cwd).join("").replace(/\s+/g, " ").replace(/ (Tried:|Require stack:) .*$/, "")
-      .trim().slice(0, 300) || "unknown error";
-    const results = [];
-    let failed = false;
-    const record = (name, error) => {
-      if (error) failed = true;
-      results.push(`${name}|${error ? describe(error) : "ok"}`);
-    };
-    const finish = () => {
-      process.stdout.write(results.join("\n") + "\n");
-      process.exit(failed ? 1 : 0);
-    };
-    try {
-      new (require("better-sqlite3"))(":memory:").close();
-      record("better-sqlite3");
-    } catch (error) {
-      record("better-sqlite3", error);
-    }
-    if (repair) {
-      for (const platform of ["darwin-arm64", "darwin-x64"]) {
-        const helper = path.join("node_modules", "node-pty", "prebuilds", platform, "spawn-helper");
-        try {
-          const mode = fs.statSync(helper).mode;
-          if ((mode & 0o111) !== 0o111) fs.chmodSync(helper, (mode & 0o777) | 0o755);
-        } catch {}
+# Settings → AI model rows of --doctor (the BOTBOY_TEST_DOCTOR_AI_MODEL hook runs them alone). Node reads the keys
+# in its own memory and prints only their last four characters plus the HTTP status of each provider's free
+# model-list probe; no key enters this shell, argv, or the output. Every probe uses Node's fetch, the network path the
+# app itself takes (curl would follow proxy variables that the app does not read). The Claude probe sends the headers
+# the app sends (anthropic-models.ts › AUTH_STYLE / ANTHROPIC_VERSION) and follows no redirect, so the key never goes to
+# another address. Tests point it at a loopback stand-in with BOTBOY_TEST_ANTHROPIC_PROBE_URL (production never sets
+# it): only http://127.0.0.1:<port> is accepted, and any other value sends nothing.
+doctor_ai_model_rows() {
+  if [ -f "$AI_MODEL_SETTINGS_FILE" ]; then
+    "$NODE" -e '
+      const fs = require("fs");
+      const file = process.argv[1];
+      const probeOverride = process.argv[2] || "";
+      const anthropicOrigin = !probeOverride ? "https://api.anthropic.com"
+        : /^http:\/\/127\.0\.0\.1:[0-9]{1,5}$/.test(probeOverride) ? probeOverride : "";
+      const mode = (fs.statSync(file).mode & 0o777).toString(8);
+      let value;
+      try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+      const pattern = /^sk-[A-Za-z0-9_-]{16,400}$/;
+      // Same rule as anthropic-models.ts › ANTHROPIC_KEY_PATTERN: a regular key, never an Admin key.
+      const claudePattern = /^sk-ant-(?!admin)[A-Za-z0-9]+-[A-Za-z0-9_-]{16,400}$/;
+      const keys = {};
+      if (value && value.schemaVersion === 1 && value.provider === "openai") keys.openai = value.apiKey;
+      if (value && value.schemaVersion === 2 && value.keys) {
+        keys.openai = value.keys.openai && value.keys.openai.apiKey;
+        keys.deepseek = value.keys.deepseek && value.keys.deepseek.apiKey;
+        keys.anthropic = value.keys.anthropic && value.keys.anthropic.apiKey;
       }
-    }
-    let terminal;
-    try {
-      terminal = require("node-pty").spawn("/usr/bin/true", [], { name: "xterm", cols: 80, rows: 24, cwd: process.cwd(), env: process.env });
-    } catch (error) {
-      record("node-pty", error);
-      finish();
-    }
-    const timer = setTimeout(() => {
-      try { terminal.kill(); } catch {}
-      record("node-pty", new Error("a test terminal did not exit within 5 seconds"));
-      finish();
-    }, 5000);
-    terminal.onExit(({ exitCode }) => {
-      clearTimeout(timer);
-      record("node-pty", exitCode === 0 ? undefined : new Error(`a test terminal exited with ${exitCode}`));
-      finish();
-    });
-  ' "${1:-check}" 2>/dev/null)
+      const probes = [
+        ["openai", "OpenAI", "https://api.openai.com/v1/models", "api.openai.com", pattern],
+        ["deepseek", "DeepSeek", "https://api.deepseek.com/models", "api.deepseek.com", pattern],
+        ["anthropic", "Anthropic (Claude)", `${anthropicOrigin}/v1/models?limit=1`, "api.anthropic.com", claudePattern],
+      ].filter(([id, , , , shape]) => typeof keys[id] === "string" && shape.test(keys[id]));
+      if (!value || (!probes.length && !(value.roles && Object.keys(value.roles).length))) {
+        console.log(`ai-model: Settings file is unreadable (mode ${mode}) — save the key again in Settings → AI model`);
+        process.exit(0);
+      }
+      for (const [id, label] of probes) console.log(`ai-model: ${label} key …${keys[id].slice(-4)} saved in Settings (mode ${mode})`);
+      if (!probes.length) console.log(`ai-model: no API key saved; background model choices only (mode ${mode})`);
+      const roles = value.roles || {};
+      // A hand-edited choice is printed as written, except that anything shaped like a key is masked.
+      const shown = text => String(text).replace(/sk-[A-Za-z0-9_-]{8,}/g, "sk-…").slice(0, 200);
+      const choice = role => shown((roles[role] && roles[role].modelKey) || "automatic");
+      console.log(`ai-model: organizing model ${choice("processing")}; document writing ${choice("documents")}`);
+      // Claude: the app headers (anthropic-models.ts › AUTH_STYLE, ANTHROPIC_VERSION) and no redirect followed.
+      // OpenAI and DeepSeek: a bearer header, as before.
+      const request = (id, key) => (id === "anthropic"
+        ? { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" }, redirect: "manual" }
+        : { headers: { Authorization: `Bearer ${key}` } });
+      Promise.all(probes.map(([id, label, url, host]) => (id === "anthropic" && !anthropicOrigin
+        ? Promise.resolve(`${id} probe: not sent (BOTBOY_TEST_ANTHROPIC_PROBE_URL accepts only http://127.0.0.1:<port>)`)
+        : fetch(url, { ...request(id, keys[id]), signal: AbortSignal.timeout(10000) })
+          .then(response => `${id} probe: HTTP ${response.status} (200=key works, 401=key rejected)`)
+          .catch(() => `${id} probe: HTTP 000 (network, proxy, or VPN blocks ${host})`))))
+        .then(lines => lines.forEach(line => console.log(line)));
+    ' "$AI_MODEL_SETTINGS_FILE" "${BOTBOY_TEST_ANTHROPIC_PROBE_URL:-}" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
+  else
+    echo "ai-model: no API key saved (add an OpenAI, DeepSeek or Anthropic (Claude) key in Settings → AI model)"
+  fi
 }
 
+# Teammate machines run the LLM through the gateway with per-person OAuth
+# credentials. When neither those nor a Bedrock key are present, BotBoy still
+# runs but chat/synthesis are dead — say so at startup instead of letting the
+# owner debug "BotBoy has no LLM" from a screenshot. Owner machines with any
+# credential source stay silent.
+warn_if_no_llm_credentials() {
+  # An OpenAI, DeepSeek or Anthropic (Claude) key saved in Settings → AI model powers BotBoy on its
+  # own. grep -q only tests for a key field; nothing is read into the shell.
+  [ -s "$AI_MODEL_SETTINGS_FILE" ] && grep -q '"apiKey"' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null && return 0
+  [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ] && return 0
+  [ -n "${BOTBOY_INFERENCE_API_KEY:-}" ] && return 0
+  if [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] \
+    && [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ]; then
+    return 0
+  fi
+  echo "⚠️  No AI model set up yet — chat and background organizing stay off until you add one."
+  echo "    In BotBoy, open Settings → AI model and paste an OpenAI, DeepSeek or Anthropic (Claude) API key (it takes effect right away)."
+  echo "    Or, if the owner sent you a botboy-credentials file, put it in ~/Downloads and re-run ./start.sh."
+}
+
+if [ "${BOTBOY_TEST_DOCTOR_AI_MODEL:-0}" = "1" ]; then
+  doctor_ai_model_rows
+  exit 0
+fi
+if [ "${BOTBOY_TEST_LLM_WARNING:-0}" = "1" ]; then
+  warn_if_no_llm_credentials
+  exit 0
+fi
 print_native_modules_failure() {
   local status="$1"
   echo "❌ BotBoy did not start: its native modules do not work with Node $("$NODE" --version 2>/dev/null) (npm $(npm --version 2>/dev/null))."
   printf '%s\n' "$status" | grep -v '|ok$' | sed 's/|/: /; s/^/    /'
   echo "    BotBoy never opened its database, so nothing needs recovery."
-  echo "    Next: run npm install in $PROJ_DIR, read its last errors, then ./start.sh."
+  if [ "$NODE_SOURCE" = "private" ]; then
+    # BotBoy's own Node is on PATH only inside ./start.sh, so "run npm install" would not work from the user's shell.
+    echo "    Next: read the last lines of $LOG_FILE (npm install ran with BotBoy's own Node), then run ./start.sh again; if it repeats, send ./start.sh --doctor to the owner."
+  else
+    echo "    Next: run npm install in $PROJ_DIR, read its last errors, then ./start.sh."
+  fi
   if [ "$HW_ARM64" = "1" ]; then
     case "$NODE_ARCHS" in
       "") ;;
@@ -1552,6 +1763,11 @@ if [ -n "${BOTBOY_TEST_NATIVE_STATUS:-}" ]; then
   native_modules_status "$BOTBOY_TEST_NATIVE_STATUS"
   exit $?
 fi
+# BOTBOY_TEST_NATIVE_FAILURE="<status lines>" prints the message a failed native check ends a start with.
+if [ -n "${BOTBOY_TEST_NATIVE_FAILURE:-}" ]; then
+  print_native_modules_failure "$BOTBOY_TEST_NATIVE_FAILURE"
+  exit 0
+fi
 
 if [ "$RECOVER_SHUTDOWN" = "1" ]; then
   RECOVERY_SCRIPT="$PROJ_DIR/scripts/recover-shutdown.mjs"
@@ -1570,6 +1786,12 @@ if [ "$RECOVER_SHUTDOWN" = "1" ]; then
     exec "$NODE" "$RECOVERY_SCRIPT"
 fi
 
+# Where the dashboard and the debug Chrome's DevTools endpoint are. Tests point both
+# at stand-ins (BOTBOY_TEST_APP_ORIGIN, BOTBOY_TEST_CDP_ORIGIN); a real start never
+# sets them, so these are always BotBoy's own port and the debug Chrome's port.
+DASH_ORIGIN="${BOTBOY_TEST_APP_ORIGIN:-http://localhost:7778}"
+CDP_ORIGIN="${BOTBOY_TEST_CDP_ORIGIN:-http://127.0.0.1:9222}"
+
 server_is_ready() {
   local expected_pid="${1:-}"
   local payload=""
@@ -1578,7 +1800,7 @@ server_is_ready() {
   # can show the self-refreshing startup page. Only the version API proves the
   # real app handler is installed and startup reached its completion boundary.
   payload=$(curl -fsS --max-time 1 \
-    http://localhost:7778/api/dashboard/version 2>/dev/null) || return 1
+    "$DASH_ORIGIN/api/dashboard/version" 2>/dev/null) || return 1
   [ -z "$expected_pid" ] && return 0
   # The version receipt carries a non-secret process id. Parse with the same
   # Node runtime we launch so a competing listener can never satisfy this
@@ -1607,7 +1829,7 @@ if [ -f "$AEA_SRC" ] && [ ! -f "$AEA_DST" ]; then
 fi
 
 # 1. Start debug Chrome if not already running
-if ! curl -s http://127.0.0.1:9222/json >/dev/null 2>&1; then
+if ! curl -s "$CDP_ORIGIN/json" >/dev/null 2>&1; then
   ${CHROME_PREFIX[@]+"${CHROME_PREFIX[@]}"} "$CHROME" \
     --remote-debugging-port=9222 \
     --user-data-dir="$DEBUG_PROFILE" \
@@ -1617,7 +1839,7 @@ if ! curl -s http://127.0.0.1:9222/json >/dev/null 2>&1; then
   # answers so open_dashboard_window never runs before Chrome is ready —
   # that race is why launches used to open Chrome without a BotBoy window.
   for _ in $(seq 1 20); do
-    curl -s --max-time 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
+    curl -s --max-time 1 "$CDP_ORIGIN/json/version" >/dev/null 2>&1 && break
     sleep 1
   done
 else
@@ -1794,6 +2016,15 @@ case "$BOTBOY_INFERENCE_PROVIDER" in
     ;;
 esac
 
+# scripts/dashboard-window.mjs: which Chrome page is the dashboard window ("find": a page on
+# BotBoy's own address, alive) and loading the dashboard again in a tab that is stuck on
+# Chrome's "This site can't be reached" page ("revive"). The answer is on stdout and notes go to
+# the log. It never fails the launcher: a missing helper, or no answer from DevTools, is "no such page".
+dashboard_window() {
+  [ -f "$PROJ_DIR/scripts/dashboard-window.mjs" ] || return 0
+  "$NODE" "$PROJ_DIR/scripts/dashboard-window.mjs" "$1" --cdp "$CDP_ORIGIN" --app "$DASH_ORIGIN" 2>>"$LOG_FILE" || true
+}
+
 # 3. Open the dashboard in its own standalone window (Chrome "app mode": no
 #    tab strip, no omnibox).
 #
@@ -1831,21 +2062,20 @@ open_dashboard_window() {
   # rather than deciding from a single probe.
   local devtools_up=1
   for _ in $(seq 1 5); do
-    curl -s --max-time 2 http://127.0.0.1:9222/json/version >/dev/null 2>&1 && { devtools_up=0; break; }
+    curl -s --max-time 2 "$CDP_ORIGIN/json/version" >/dev/null 2>&1 && { devtools_up=0; break; }
     sleep 1
   done
   if [ "$devtools_up" = "0" ]; then
     # Parse with node (always present — it runs the server); python3 is not a
     # BotBoy prerequisite and may be missing on a fresh machine. Emits
     # "<targetId>\t<url>" so the respawn below can preserve the user's place.
-    DASH_INFO=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
-      | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const t=JSON.parse(d).filter(x=>String(x.url||'').includes('localhost:7778'));process.stdout.write(t.length?(t[0].id+'\t'+String(t[0].url||'')):'')}catch{}})" 2>/dev/null)
+    DASH_INFO=$(dashboard_window find)
     DASH_TARGET="${DASH_INFO%%$'\t'*}"
     DASH_URL="${DASH_INFO#*$'\t'}"
     if [ -n "$DASH_TARGET" ] && [ "$mode" = "focus" ]; then
       # Target.activateTarget: raises the existing app window, page state
       # (route, scroll, drafts) intact.
-      curl -s --max-time 3 "http://127.0.0.1:9222/json/activate/$DASH_TARGET" >/dev/null
+      curl -s --max-time 3 "$CDP_ORIGIN/json/activate/$DASH_TARGET" >/dev/null
       if ! startup_target_is_ready "$expected_pid"; then
         echo "❌ BotBoy stopped before its dashboard window could be focused."
         echo "    Run: ./start.sh --doctor"
@@ -1854,24 +2084,43 @@ open_dashboard_window() {
       echo "✅ Dashboard window focused"
       return 0
     fi
+    if [ -z "$DASH_TARGET" ]; then
+      # No live dashboard page. A tab of ours may be sitting on Chrome's "This site can't be
+      # reached" page (the server was down when it loaded): it runs no JavaScript, so it can
+      # never recover by itself, and another window would leave it dead beside the new one.
+      # Load the dashboard in that same tab, on the same route. Only a tab that Chrome says
+      # failed to load BotBoy's own address is touched (scripts/dashboard-window.mjs).
+      REVIVED_TARGET=$(dashboard_window revive)
+      if [ -n "$REVIVED_TARGET" ]; then
+        if ! startup_target_is_ready "$expected_pid"; then
+          echo "❌ BotBoy stopped before its dashboard window could be reloaded."
+          echo "    Run: ./start.sh --doctor"
+          return 1
+        fi
+        echo "✅ Dashboard window reloaded"
+        # A start or restart ends with the line the teammate docs promise, as when it opens a window.
+        [ "$mode" = "focus" ] || echo "✅ Dashboard ready: $DASH_ORIGIN"
+        return 0
+      fi
+    fi
     # Real start/restart: the fresh window must load current code, but the
     # user's PLACE should survive — reopen at the old window's URL (the route
     # lives in the hash; a since-removed route degrades to the not-found view
     # via parseRoute). Guard: only genuine dashboard URLs are reused, so a
     # connection-error page (chrome-error://…) is never resurrected.
-    REOPEN_URL="http://localhost:7778"
+    REOPEN_URL="$DASH_ORIGIN"
     case "$DASH_URL" in
-      "http://localhost:7778"*) REOPEN_URL="$DASH_URL" ;;
+      "$DASH_ORIGIN"*) REOPEN_URL="$DASH_URL" ;;
     esac
     if [ -n "$DASH_TARGET" ]; then
-      curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$DASH_TARGET" >/dev/null
+      curl -s --max-time 3 "$CDP_ORIGIN/json/close/$DASH_TARGET" >/dev/null
       sleep 1
     fi
     # Snapshot every existing page target after the old dashboard is closed.
     # The singleton Chrome process creates one new page for --app; retaining
     # its new ID lets a failed settle close exactly this launch artifact even
     # if its URL has already become chrome-error://.
-    PRELAUNCH_TARGET_IDS=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
+    PRELAUNCH_TARGET_IDS=$(curl -s --max-time 3 "$CDP_ORIGIN/json/list" \
       | "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{process.stdout.write(JSON.parse(d).filter(x=>x.type==='page').map(x=>String(x.id||'')).filter(Boolean).join('\n'))}catch{}})" 2>/dev/null)
     local window_started=$SECONDS
     ${CHROME_PREFIX[@]+"${CHROME_PREFIX[@]}"} "$CHROME" \
@@ -1893,8 +2142,8 @@ open_dashboard_window() {
     local server_gone=0
     NEW_DASH_TARGET=""
     while :; do
-      NEW_DASH_TARGET=$(curl -s --max-time 3 http://127.0.0.1:9222/json/list \
-        | BOTBOY_PRELAUNCH_TARGET_IDS="$PRELAUNCH_TARGET_IDS" "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const old=new Set(String(process.env.BOTBOY_PRELAUNCH_TARGET_IDS||'').split('\n').filter(Boolean));const launched=u=>u===''||u==='about:blank'||u.startsWith('chrome-error://')||u.startsWith('http://localhost:7778')||u.startsWith('http://127.0.0.1:7778');const t=JSON.parse(d).find(x=>x.type==='page'&&x.id&&!old.has(String(x.id))&&launched(String(x.url||'')));process.stdout.write(String(t?.id||''))}catch{}})" 2>/dev/null)
+      NEW_DASH_TARGET=$(curl -s --max-time 3 "$CDP_ORIGIN/json/list" \
+        | BOTBOY_PRELAUNCH_TARGET_IDS="$PRELAUNCH_TARGET_IDS" BOTBOY_DASH_ORIGIN="$DASH_ORIGIN" "$NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const old=new Set(String(process.env.BOTBOY_PRELAUNCH_TARGET_IDS||'').split('\n').filter(Boolean));const launched=u=>u===''||u==='about:blank'||u.startsWith('chrome-error://')||u.startsWith(process.env.BOTBOY_DASH_ORIGIN)||u.startsWith(process.env.BOTBOY_DASH_ORIGIN.replace('//localhost:','//127.0.0.1:'));const t=JSON.parse(d).find(x=>x.type==='page'&&x.id&&!old.has(String(x.id))&&launched(String(x.url||'')));process.stdout.write(String(t?.id||''))}catch{}})" 2>/dev/null)
       [ -n "$NEW_DASH_TARGET" ] && break
       if [ -n "$expected_pid" ] && ! kill -0 "$expected_pid" 2>/dev/null; then
         server_gone=1
@@ -1920,7 +2169,7 @@ open_dashboard_window() {
     if startup_target_is_ready "$expected_pid"; then
       echo "✅ Dashboard ready: $REOPEN_URL"
     else
-      curl -s --max-time 3 "http://127.0.0.1:9222/json/close/$NEW_DASH_TARGET" >/dev/null
+      curl -s --max-time 3 "$CDP_ORIGIN/json/close/$NEW_DASH_TARGET" >/dev/null
       echo "❌ BotBoy stopped before the dashboard window became usable."
       echo "    Run: ./start.sh --doctor"
       echo "    Runtime log: $LOG_FILE"
@@ -2136,26 +2385,6 @@ stop_startup_child() {
       return 1
       ;;
   esac
-}
-
-# Teammate machines run the LLM through the gateway with per-person OAuth
-# credentials. When neither those nor a Bedrock key are present, BotBoy still
-# runs but chat/synthesis are dead — say so at startup instead of letting the
-# owner debug "BotBoy has no LLM" from a screenshot. Owner machines with any
-# credential source stay silent.
-warn_if_no_llm_credentials() {
-  # An OpenAI or DeepSeek key saved in Settings → AI model powers BotBoy on its
-  # own. grep -q only tests for a key field; nothing is read into the shell.
-  [ -s "$AI_MODEL_SETTINGS_FILE" ] && grep -q '"apiKey"' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null && return 0
-  [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ] && return 0
-  [ -n "${BOTBOY_INFERENCE_API_KEY:-}" ] && return 0
-  if [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_ID:-}" ] \
-    && [ -n "${BOTBOY_INFERENCE_OAUTH_CLIENT_SECRET:-}" ]; then
-    return 0
-  fi
-  echo "⚠️  No AI model set up yet — chat and background organizing stay off until you add one."
-  echo "    In BotBoy, open Settings → AI model and paste an OpenAI or DeepSeek API key (it takes effect right away)."
-  echo "    Or, if the owner sent you a botboy-credentials file, put it in ~/Downloads and re-run ./start.sh."
 }
 
 # The PID file only names a candidate. macOS reuses PIDs, and the server never
@@ -2539,7 +2768,8 @@ foreground_shutdown() {
 cd "$PROJ_DIR" || exit 1
 
 if [ "$OPEN_WINDOW_ONLY" = "1" ]; then
-  if ! open_dashboard_window focus; then
+  # BOTBOY_TEST_OPEN_WINDOW_MODE=fresh lets a test run the start/restart window path without a server start.
+  if ! open_dashboard_window "${BOTBOY_TEST_OPEN_WINDOW_MODE:-focus}"; then
     exit 1
   fi
   exit 0
@@ -2610,6 +2840,8 @@ if [ "$DOCTOR" = "1" ]; then
     echo "shutdown recovery: no active safety guard"
   fi
   doctor_node_row
+  [ "$NODE_RUNTIME_LOADED" != "1" ] || doctor_node_runtime_rows
+  [ "$PYTHON_RUNTIME_LOADED" != "1" ] || doctor_python_rows
   doctor_machine_rows
   doctor_app_launcher_row
   doctor_toolchain_rows
@@ -2685,47 +2917,9 @@ if [ "$DOCTOR" = "1" ]; then
   fi
   DOCTOR_ENV="$HOME/.personal-productivity-tracker/.env"
   echo "llm-provider (launcher): ${BOTBOY_INFERENCE_PROVIDER:-unset}"
-  # Settings → AI model. Node reads the keys in its own memory and prints only
-  # their last four characters plus the HTTP status of each provider's free
-  # model-list probe; no key enters this shell, argv, or the output.
-  if [ -f "$AI_MODEL_SETTINGS_FILE" ]; then
-    "$NODE" -e '
-      const fs = require("fs");
-      const file = process.argv[1];
-      const mode = (fs.statSync(file).mode & 0o777).toString(8);
-      let value;
-      try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
-      const pattern = /^sk-[A-Za-z0-9_-]{16,400}$/;
-      const keys = {};
-      if (value && value.schemaVersion === 1 && value.provider === "openai") keys.openai = value.apiKey;
-      if (value && value.schemaVersion === 2 && value.keys) {
-        keys.openai = value.keys.openai && value.keys.openai.apiKey;
-        keys.deepseek = value.keys.deepseek && value.keys.deepseek.apiKey;
-      }
-      const probes = [
-        ["openai", "OpenAI", "https://api.openai.com/v1/models", "api.openai.com"],
-        ["deepseek", "DeepSeek", "https://api.deepseek.com/models", "api.deepseek.com"],
-      ].filter(([id]) => typeof keys[id] === "string" && pattern.test(keys[id]));
-      if (!value || (!probes.length && !(value.roles && Object.keys(value.roles).length))) {
-        console.log(`ai-model: Settings file is unreadable (mode ${mode}) — save the key again in Settings → AI model`);
-        process.exit(0);
-      }
-      for (const [id, label] of probes) console.log(`ai-model: ${label} key …${keys[id].slice(-4)} saved in Settings (mode ${mode})`);
-      if (!probes.length) console.log(`ai-model: no API key saved; background model choices only (mode ${mode})`);
-      const roles = value.roles || {};
-      const choice = role => (roles[role] && roles[role].modelKey) || "automatic";
-      console.log(`ai-model: organizing model ${choice("processing")}; document writing ${choice("documents")}`);
-      Promise.all(probes.map(([id, label, url, host]) => fetch(url, {
-        headers: { Authorization: `Bearer ${keys[id]}` },
-        signal: AbortSignal.timeout(10000),
-      })
-        .then(response => `${id} probe: HTTP ${response.status} (200=key works, 401=key rejected)`)
-        .catch(() => `${id} probe: HTTP 000 (network, proxy, or VPN blocks ${host})`)))
-        .then(lines => lines.forEach(line => console.log(line)));
-    ' "$AI_MODEL_SETTINGS_FILE" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
-  else
-    echo "ai-model: no API key saved (add an OpenAI or DeepSeek key in Settings → AI model)"
-  fi
+  # Settings → AI model: key suffixes, role choices and one probe per saved key (doctor_ai_model_rows, defined
+  # above beside the test hooks).
+  doctor_ai_model_rows
   # Connections → Gmail. Node reads the OAuth client and refresh token in its
   # own memory and prints only which client is active (the own client; a
   # built-in one only if a build fills that slot, which ships empty), the
@@ -2864,7 +3058,9 @@ fi
 # start a second build and a second server. mkdir is atomic, so the first
 # invocation wins and later ones exit with a pointer to the winner. A lock
 # older than 10 min is from a crashed run — take it over.
-LOCK_DIR="/tmp/ppt-start.lock"
+# PPT_START_LOCK_DIR is a test hook (production never sets it): a test that runs the real start flow takes a lock of
+# its own, never the one a real ./start.sh on the same Mac uses.
+LOCK_DIR="${PPT_START_LOCK_DIR:-/tmp/ppt-start.lock}"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
   if [ "$LOCK_AGE" -lt 600 ]; then
@@ -2876,7 +3072,13 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   mkdir "$LOCK_DIR" 2>/dev/null || exit 0
 fi
 release_start_lock() { rm -rf "$LOCK_DIR"; }
-trap release_start_lock EXIT
+# A start that ends early (a failed build, a blocked takeover) also stops BotBoy's Python download of this start, so
+# no job is left holding its lock; the partial file stays and the next start resumes it.
+on_start_exit() {
+  release_start_lock
+  [ "$PYTHON_RUNTIME_LOADED" != "1" ] || python_runtime_fetch_abort
+}
+trap on_start_exit EXIT
 
 # Build self-heal. Two triggers:
 #   1. dist/index.js missing — fresh clone (dist/ is gitignored). Without
@@ -2885,6 +3087,13 @@ trap release_start_lock EXIT
 #   2. dist/.build-commit differs from git HEAD — stale build after git pull.
 #      Without this, pulled fixes silently never activate (the server keeps
 #      running last week's code and everyone wonders why nothing changed).
+#
+# BotBoy's own Node, when this Mac has no usable one: the only place a start downloads anything (verified, once).
+# It comes before the first npm or build step, which need it.
+[ "$NODE_RUNTIME_LOADED" != "1" ] || ensure_node_runtime
+# BotBoy's own Python, when this Mac has no usable Python or uv: its download starts here, in the background, so it
+# overlaps npm install and the build; python_runtime_fetch_join waits for it just before the server starts.
+[ "$PYTHON_RUNTIME_LOADED" != "1" ] || python_runtime_fetch_begin
 # Clear the browser-download flag on the prebuilt helpers first: npm's
 # postinstall (inside the self-heal) and the server both may run them.
 strip_native_download_mark
@@ -2901,7 +3110,9 @@ startup_safety_allows_takeover || exit 1
 # binary a running BotBoy has loaded. If they still fail, stop here: no child
 # starts, so no guard can be left behind (teammate on Node 26 + npm 12,
 # 2026-10-07).
+NATIVE_REINSTALLED=0
 if ! NATIVE_STATUS="$(native_modules_status repair)"; then
+  NATIVE_REINSTALLED=1
   warn_if_node_needs_tools_to_install
   echo "ℹ️  Reinstalling native modules for Node $("$NODE" --version 2>/dev/null) — npm install" | tee -a "$LOG_FILE"
   printf '%s\n' "$NATIVE_STATUS" | grep -v '|ok$' | sed 's/|/: /; s/^/    /' | tee -a "$LOG_FILE"
@@ -2945,6 +3156,27 @@ if [ -n "$NEED_BUILD" ]; then
   echo "✅ Build complete" | tee -a "$LOG_FILE"
 fi
 
+# BotBoy's own Python: wait for this start's background download, then put what is installed first on PATH, so the
+# server and every MCP server it starts see exactly what exists (scripts/python-runtime.sh, rule 4). The wait lasts
+# until the download's deadline when this start installed packages or built, except the start of an update
+# (BOTBOY_FORCE_BUILD), which, like a restart with nothing to build, waits at most 20 s; a download that has not
+# finished by then is stopped, BotBoy starts without its Python, and the next start resumes it.
+if [ "$PYTHON_RUNTIME_LOADED" = "1" ]; then
+  PY_JOIN_LONG=0
+  if [ "${BOTBOY_FORCE_BUILD:-0}" != "1" ] && { [ -n "$NEED_BUILD" ] || [ "$DEPS_INSTALLED" = "1" ] || [ "$NATIVE_REINSTALLED" = "1" ]; }; then
+    PY_JOIN_LONG=1
+  fi
+  python_runtime_fetch_join
+fi
+# Test hook (production never sets it): what the server would start with (the decision, its PATH and its environment),
+# then stop before any takeover. It works without scripts/python-runtime.sh too, so a test can compare the two.
+if [ "${BOTBOY_TEST_PYTHON_AFTER_JOIN:-0}" = "1" ]; then
+  [ "$PYTHON_RUNTIME_LOADED" != "1" ] || print_python_selection
+  echo "server_path=$PATH"
+  env | LC_ALL=C sort | grep -v -E '^(_|SHLVL|OLDPWD|PWD)=' | sed 's/^/server_env: /'
+  exit 0
+fi
+
 if [ "$FOREGROUND" = "1" ]; then
   # ── Foreground mode (app bundle) ──
   # The server runs as a child of THIS script and the script blocks on it, so
@@ -2953,6 +3185,8 @@ if [ "$FOREGROUND" = "1" ]; then
   # handed over first. This is unconditional: a provisional or wedged process
   # may own the port without satisfying the final-ready endpoint.
   safe_takeover || exit 1
+  # Weekly upkeep of BotBoy's Python, now that the old server and its MCP children are gone (bounded; never fails).
+  [ "$PYTHON_RUNTIME_LOADED" != "1" ] || python_runtime_maintenance
 
   DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
   PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "$NODE" dist/index.js >> "$LOG_FILE" 2>&1 &
@@ -3009,6 +3243,8 @@ if ! server_is_ready; then
   # half-booted server can hold :7778. Clear every old instance before the
   # replacement starts, then verify this exact child through final readiness.
   safe_takeover || exit 1
+  # Weekly upkeep of BotBoy's Python, now that the old server and its MCP children are gone (bounded; never fails).
+  [ "$PYTHON_RUNTIME_LOADED" != "1" ] || python_runtime_maintenance
   DB_OPEN_MARKER="$(new_db_open_marker_path)" || DB_OPEN_MARKER=""
   PPT_DB_OPEN_MARKER="$DB_OPEN_MARKER" nohup ${SERVER_PREFIX[@]+"${SERVER_PREFIX[@]}"} "$NODE" dist/index.js </dev/null >> "$LOG_FILE" 2>&1 &
   SERVER_PID=$!

@@ -26,6 +26,8 @@ import type Database from 'better-sqlite3';
 import { getSetting, setSetting } from './storage.js';
 import { visionHelperStatus } from './deps-check.js';
 import { ocrHelperUnavailableLine, readOcrBuildFailure, type OcrBuildFailure } from './ocr-helper-marker.js';
+import { refreshCommandLineTools } from './command-line-tools.js';
+import { privateUvUse } from './protected-local-resources.js';
 
 export const TOOLCHAIN_SETTING_KEY = 'toolchain.map';
 
@@ -77,7 +79,7 @@ export interface ToolchainSnapshot {
  */
 export const TOOL_REGISTRY: readonly ToolSpec[] = Object.freeze([
   // Core runtime
-  { name: 'node', purpose: 'JavaScript runtime (BotBoy itself, agent scripts)', requirement: 'required', versionArgs: ['--version'], installHint: 'install Node 22 or newer from nodejs.org (the installer needs no other tools)' },
+  { name: 'node', purpose: 'JavaScript runtime (BotBoy itself, agent scripts)', requirement: 'required', versionArgs: ['--version'], installHint: 'install Node 24 or newer from nodejs.org (the LTS download; the installer needs no other tools)' },
   { name: 'curl', purpose: 'HTTP fetches (web_search, web_fetch)', requirement: 'required', versionArgs: ['--version'], macBuiltin: true },
   // Capture pipeline
   { name: 'pdftotext', purpose: 'PDF text extraction fallback (poppler; the native vision-ocr helper is primary)', requirement: 'optional', brewFormula: 'poppler', versionArgs: ['-v'] },
@@ -90,7 +92,9 @@ export const TOOL_REGISTRY: readonly ToolSpec[] = Object.freeze([
   { name: 'open', purpose: 'open files/URLs from the dashboard', requirement: 'required', macBuiltin: true, internalOnly: true },
   { name: 'security', purpose: 'macOS Keychain (MCP secrets)', requirement: 'required', macBuiltin: true, internalOnly: true },
   // General-purpose agent tools
-  { name: 'python3', purpose: 'Python scripts and data crunching', requirement: 'recommended', brewFormula: 'python', versionArgs: ['--version'] },
+  // Python on demand (python-runtime.md): on a Mac without a Python 3.10+ or a uv, ./start.sh sets up BotBoy's own.
+  { name: 'python3', purpose: 'Python scripts and data crunching', requirement: 'recommended', installHint: 'BotBoy sets up its own Python 3.13 when ./start.sh runs while online (./start.sh --doctor, row "python source"); or install Python 3.10+ from python.org', versionArgs: ['--version'] },
+  { name: 'uv', purpose: 'Python packages, tools and Python MCP servers (uv, uvx)', requirement: 'optional', installHint: 'BotBoy sets up its own uv when ./start.sh runs while online (./start.sh --doctor, row "uv source")', versionArgs: ['--version'] },
   { name: 'git', purpose: 'version control', requirement: 'recommended', brewFormula: 'git', versionArgs: ['--version'] },
   { name: 'sqlite3', purpose: 'SQLite CLI', requirement: 'recommended', versionArgs: ['--version'], macBuiltin: true },
   { name: 'jq', purpose: 'JSON processing in shell pipelines', requirement: 'optional', brewFormula: 'jq', versionArgs: ['--version'] },
@@ -240,7 +244,8 @@ export async function discoverToolchain(
       let installHint = spec.installHint;
       if (resolved && XCODE_SHIM_TOOLS.has(resolved) && !developerToolsPresent()) {
         resolved = null; // never run the shim: it would raise the install dialog
-        installHint = XCODE_SHIM_HINT;
+        // python3: BotBoy's own Python is the next step on such a Mac, not Apple's 3.9 (python-runtime.md).
+        installHint = spec.name === 'python3' ? spec.installHint : XCODE_SHIM_HINT;
       }
       const version = resolved && spec.versionArgs ? await probeVersion(resolved, spec.versionArgs) : null;
       return {
@@ -321,6 +326,8 @@ export function getToolchainSnapshot(): ToolchainSnapshot | null {
  * refresh after installing tools (no restart needed).
  */
 export async function initToolchain(db: Database.Database): Promise<ToolchainSnapshot> {
+  // The cached Command Line Tools answer the sandbox reads (design D6); never awaited here.
+  void refreshCommandLineTools();
   const snapshot = await discoverToolchain();
   applyToolchainPath(snapshot);
   activeSnapshot = snapshot;
@@ -346,7 +353,7 @@ export function loadPersistedToolchain(db: Database.Database): ToolchainSnapshot
  * construction: available tools come from resolution, missing tools carry an
  * install command, and nothing is claimed that discovery did not verify.
  */
-export function formatToolInventory(snapshot: ToolchainSnapshot | null): string {
+export function formatToolInventory(snapshot: ToolchainSnapshot | null, botboyUvInUse: boolean = privateUvUse() !== null): string {
   if (!snapshot) {
     return 'CLI tools: not yet discovered this boot — probe with `command -v <tool>` inside run_command before claiming a tool exists.';
   }
@@ -364,6 +371,11 @@ export function formatToolInventory(snapshot: ToolchainSnapshot | null): string 
       .map((t) => `${t.name} (install: ${t.brewFormula ? `brew install ${t.brewFormula}` : t.installHint || 'see docs'})`)
       .join(', ');
     lines.push(`NOT installed: ${missList}. If a task needs one, say it is not installed and offer the install command — never pretend it ran.`);
+  }
+  // Python on demand (design review finding 9): BotBoy's uv keeps its own CPython read-only to chat, so another version
+  // goes into ~/.botboy-python, and is then named by its path. Sent only while BotBoy's uv is the uv in use.
+  if (botboyUvInUse) {
+    lines.push('Another Python version: uv python install 3.14 --install-dir ~/.botboy-python/python, then pass --python ~/.botboy-python/bin/python3.14 (by version it is not found).');
   }
   if (available.some((t) => t.name === 'whisper')) {
     lines.push('When asked to transcribe audio, use: whisper "/path/to/file" --model small --output_format txt --output_dir /tmp');

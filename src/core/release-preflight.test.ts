@@ -15,6 +15,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isLocalPath, packageRoot, releaseFixture, type ReleaseFixture } from './release-harness.testutil';
+import { pinText, shasums, startDistServer } from './node-runtime.testutil';
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -149,6 +150,92 @@ devOnly('release.sh --preflight: the checks, and nothing else', () => {
   });
 });
 
+devOnly('release.sh --preflight: the pinned private Node (node-runtime.pin)', () => {
+  const HASH_A = 'a'.repeat(64);
+  const HASH_B = 'b'.repeat(64);
+  const customPin = (f: ReleaseFixture, extra: Partial<Parameters<typeof pinText>[0]> = {}) => {
+    fs.writeFileSync(path.join(f.pkg, 'node-runtime.pin'), pinText({ version: '22.9.9', arm64: { sha256: HASH_A, bytes: 2_000_000 }, x64: { sha256: HASH_B, bytes: 2_100_000 }, ...extra }));
+    f.commit('pin another Node');
+  };
+  const published = (arm = HASH_A, x64 = HASH_B) => ({
+    '/v22.9.9/SHASUMS256.txt': { body: shasums([{ name: 'node-v22.9.9-darwin-arm64.tar.gz', sha256: arm }, { name: 'node-v22.9.9-darwin-x64.tar.gz', sha256: x64 }]) },
+    '/v22.9.9/node-v22.9.9-darwin-arm64.tar.gz': { body: Buffer.alloc(0), headLength: 2_000_000 },
+    '/v22.9.9/node-v22.9.9-darwin-x64.tar.gz': { body: Buffer.alloc(0), headLength: 2_100_000 },
+  });
+
+  it('passes with the real pin when nodejs.org cannot be reached, and says the hashes were NOT compared (the test URL is a closed port)', () => {
+    const f = fixture();
+    const result = f.release(['--preflight']);
+    expect(result.status, text(result)).toBe(0);
+    expect(result.stdout).toContain('node-runtime.pin: Node 24.');
+    expect(result.stderr).toContain('were NOT compared with the published ones');
+  });
+  it('refuses a malformed pin and names the file and the fix', () => {
+    const f = fixture();
+    fs.writeFileSync(path.join(f.pkg, 'node-runtime.pin'), 'schema=1\nversion=22\n');
+    f.commit('break the pin');
+    const result = f.release(['--preflight']);
+    expect(result.status).toBe(1);
+    expect(text(result)).toContain('node-runtime.pin is not valid');
+    expect(text(result)).toContain('see the header of node-runtime.pin');
+  });
+  it('refuses an uncommitted change to the pin like any release input', () => {
+    const f = fixture();
+    fs.appendFileSync(path.join(f.pkg, 'node-runtime.pin'), '# edited\n');
+    const result = f.release(['--preflight']);
+    expect(result.status).toBe(1);
+    expect(text(result)).toContain('Uncommitted changes in release inputs');
+    expect(text(result)).toContain('node-runtime.pin');
+  });
+  it('passes when the published hashes and sizes equal the pin, and refuses when one differs (a server on 127.0.0.1)', async () => {
+    const f = fixture();
+    customPin(f);
+    const agree = await startDistServer(published());
+    try {
+      const ok = await f.releaseAsync(['--preflight'], { BOTBOY_TEST_NODE_DIST_URL: agree.url });
+      expect(ok.status, text(ok)).toBe(0);
+      expect(ok.stdout).toContain('both pinned hashes and sizes equal what nodejs.org publishes');
+    } finally {
+      await agree.close();
+    }
+    const differ = await startDistServer(published('c'.repeat(64)));
+    try {
+      const bad = await f.releaseAsync(['--preflight'], { BOTBOY_TEST_NODE_DIST_URL: differ.url });
+      expect(bad.status, text(bad)).toBe(1);
+      expect(text(bad)).toContain('pinned sha256 aaaaaaaaaaaa… but nodejs.org publishes cccccccccccc…');
+      expect(text(bad)).toContain('Fix: take the values from https://nodejs.org/dist/v22.9.9/SHASUMS256.txt');
+      expect(text(bad)).not.toContain('Release pre-flight passed');
+    } finally {
+      await differ.close();
+    }
+  });
+});
+devOnly('release.sh --preflight: the pinned private uv + CPython (python-runtime.pin)', () => {
+  it('passes with the real pin when GitHub cannot be reached, and says the hashes were NOT compared (the test URL is a closed port)', () => {
+    const f = fixture();
+    const result = f.release(['--preflight']);
+    expect(result.status, text(result)).toBe(0);
+    expect(result.stdout).toContain('python-runtime.pin: uv 0.13.0 + CPython 3.13.16 (build 20261009');
+    expect(result.stderr).toMatch(/could not reach 127\.0\.0\.1:9 .*the pinned hashes were NOT compared/);
+  });
+  it('refuses a malformed pin and names the file and the fix, before anything is published', () => {
+    const f = fixture();
+    fs.writeFileSync(path.join(f.pkg, 'python-runtime.pin'), 'schema=1\nuv.version=0.13\n');
+    f.commit('break the Python pin');
+    const result = f.release(['--preflight']);
+    expect(result.status).toBe(1);
+    expect(text(result)).toContain('python-runtime.pin is not valid');
+    expect(text(result)).toContain('see the header of python-runtime.pin');
+    expect(text(result)).not.toContain('Release pre-flight passed');
+  });
+  it('refuses an uncommitted change to the pin like any release input', () => {
+    const f = fixture();
+    fs.appendFileSync(path.join(f.pkg, 'python-runtime.pin'), '# edited\n');
+    const result = f.release(['--preflight']);
+    expect(result.status).toBe(1);
+    expect(text(result)).toContain('python-runtime.pin');
+  });
+});
 devOnly('the import check (finding 10): a shipped script may not import what the release does not ship', () => {
   const forms: Array<[string, string]> = [
     ['a static import', "import './not-shipped.mjs';\n"],
@@ -215,6 +302,12 @@ devOnly('the whole release against a local bare repository (it cannot reach the 
     expect(tree).toMatch(/\t\.botboy-distribution$/m);
     expect(tree).toMatch(/\tREADME\.md$/m);
     expect(tree).not.toContain('scripts/build-native-prebuilt.mjs');
+    // The pinned private Node ships (start.sh reads it); its dev-only verifier does not.
+    expect(tree).toMatch(/\tnode-runtime\.pin$/m);
+    expect(tree).not.toContain('scripts/verify-node-runtime.mjs');
+    // The same for the pinned private uv + CPython.
+    expect(tree).toMatch(/\tpython-runtime\.pin$/m);
+    expect(tree).not.toContain('scripts/verify-python-runtime.mjs');
     expect(tree).not.toContain('docs/release/');
     // Run again: nothing new.
     const again = f.release();
