@@ -7,6 +7,7 @@ import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { DocumentParser, SheetReadResult } from './document-parser.js';
 import { readAnalyticsDataRoomVersion } from './analytics-data-room-version.js';
+import { permissionProblem } from './analytics-context.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -45,6 +46,17 @@ export class AnalyticsImportInboxError extends Error {
     super(message);
     this.name = 'AnalyticsImportInboxError';
   }
+}
+
+/**
+ * macOS can withhold the Knowledge folder (Documents access). A read that fails that way is "unavailable" with the
+ * System Settings steps, never a changed file (a conflict) and never a raw errno. Null for any other error, and always null
+ * outside library mode: the analytics folder of every install today is not the Knowledge folder, and its errors propagate
+ * exactly as they did before the library existed.
+ */
+export function blockedContextError(error: unknown, where: string, libraryMode = true): AnalyticsImportInboxError | null {
+  const blocked = libraryMode ? permissionProblem(error, where) : null;
+  return blocked ? new AnalyticsImportInboxError('unavailable', blocked.message, blocked.nextAction) : null;
 }
 
 export type AnalyticsImportStatus = 'receiving' | 'uploaded' | 'inspecting' | 'ready' | 'failed';

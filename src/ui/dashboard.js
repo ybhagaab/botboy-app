@@ -10,6 +10,7 @@ import {
   buildDocumentReviewModel,
   documentChainExpansionState,
   loadedDocumentRevisionLabel,
+  placeDocCitePopover,
   toggleDocumentFocusState,
   toggleDocumentLibraryState,
   toggleDocumentReviewState,
@@ -77,6 +78,7 @@ const state = {
   // Settings → AI model. The key itself never lives in state: it is read
   // from the form once, sent, and the field is cleared by the next repaint.
   aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null },
+  knowledge: { status: null, error: '', loading: false, requestId: 0, busy: '', notice: null, existing: null, createDraft: '', changeDraft: '', changing: false, plan: null, acknowledged: false, pendingFocus: '', changes: null, changesError: '', history: null, historyError: '', historyOpen: '', historyDetail: {}, historyNotice: null, expandedDiffs: {}, cardNotices: {} },
   // Settings → Workplace. Until known, the UI behaves as ON (no change for existing users).
   workplace: { amazonEmployee: true, known: false, status: null, saving: false, footerSaving: false, notice: null, footerError: null, pendingFocus: '' },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
@@ -234,6 +236,7 @@ const state = {
   lastUiVersion: null,
   lastAiModelVersion: null,
   lastAiModelState: null,
+  lastKnowledgeVersion: null,
   lastCaptureHealthVersion: null,
   lastBrowserCaptureVersion: null,
   lastWorkplaceVersion: null,
@@ -325,6 +328,7 @@ function parseRoute() {
   if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
   if (parts[0] === 'settings' && parts[1] === 'ai-model') return { view: 'ai-model-settings' };
   if (parts[0] === 'settings' && parts[1] === 'workplace') return { view: 'workplace-settings' };
+  if (parts[0] === 'settings' && parts[1] === 'knowledge') return { view: 'knowledge-settings' };
   if (parts[0] === 'data-room') {
     let id = parts[2] || parts[1] || '';
     try { id = decodeURIComponent(id); } catch { id = ''; }
@@ -994,7 +998,8 @@ function renderSidebar() {
         || (view === 'connections' && ['mcp-settings', 'profile-settings', 'mcp-add', 'mcp-edit'].includes(route.view))
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
         || (view === 'data-room' && ['data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'].includes(route.view))
-        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings', 'workplace-settings'].includes(route.view));
+        || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings', 'workplace-settings'].includes(route.view))
+        || (view === 'settings' && route.view === 'knowledge-settings');
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
     <section class="nav-section"><div class="nav-label"><span>Areas & projects</span></div><div class="area-tree">
@@ -3584,6 +3589,9 @@ function renderAnalyticsContextCard(profileId) {
 }
 /** The knowledge-directory part of the card (shared by both pages). */
 function renderAnalyticsKnowledgeDirSection(ctx) {
+  // Library mode (GET /mcp/analytics-context answers library: true): the knowledge lives in the Knowledge folder, so this
+  // card links to the page and has no directory field (saving one would be answered 409 moved_to_library).
+  if (ctx?.library && window.BotBoyKnowledge) return window.BotBoyKnowledge.renderAnalyticsInLibrary(ctx, { esc, attr, icon, number, pageHead, loadingView });
   return `<div class="eyebrow">${icon('file', 14)} Analytics knowledge</div>
     <h3 class="card-title">${ctx ? `${number(ctx.fileCount)} knowledge file${ctx.fileCount === 1 ? '' : 's'}` : 'Loading…'}</h3>
     <p class="page-subtitle">BotBoy grounds data questions in local .md/.txt files from this directory — drop your schema or methodology notes at the root; generated business presets land under presets/. Loaded on demand, one file per task.</p>
@@ -4663,7 +4671,7 @@ function renderWorkplaceSettings() {
   const footerHint = 'Printed in the center of every page footer in PDF and Word exports, and in HTML exports when printed. Leave empty for no footer text. You can also ask BotBoy in chat.';
   const footerError = wp.footerError ? `<p class="card-meta" id="workplace-footer-error" role="alert">${esc(wp.footerError)}</p>` : '';
   return `${pageHead('Settings', 'Workplace', 'Which of BotBoy’s paths apply to you, and what your document exports print.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><a class="button ghost" href="#/settings">${icon('settings')} General</a><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace" aria-current="page">${icon(WORKPLACE_ICON)} Workplace</a></nav>
+    <section class="grid settings-layout"><nav class="card settings-nav"><a class="button ghost" href="#/settings">${icon('settings')} General</a><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace" aria-current="page">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a></nav>
     <div style="display:grid; gap:14px; align-content:start; min-width:0">
       <article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">Amazon Employee</h2><div class="card-meta">${esc(workplaceSourceLine(status))}</div></div></div>
         <div class="setting-row"><span class="setting-copy"><strong id="workplace-amazon-label">Amazon Employee</strong><span id="workplace-amazon-help">Turn on if you work at Amazon. BotBoy then offers Amazon's internal connections (Slack through AI Community MCP, Outlook through GRASP, SharePoint, Datanet ETL), Amazon writing style, and Harmony dashboard sharing. Turn off to hide them; their setup and captured data are kept. Applies right away, no restart.</span></span>
@@ -4762,6 +4770,297 @@ async function saveAiModelRole(select) {
   } finally {
     state.aiModel.roleBusy = '';
     if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+// ── Settings → Knowledge (docs/maps/knowledge-library.md K12) ──
+// knowledge-ui.js (window.BotBoyKnowledge) holds the pure renderers; this block owns the state, the requests and the
+// handlers. Every write below is an owner click on a same-origin page. The page refetches only when the version poll sees
+// knowledgeVersion move: it has no timer, scroller or poll of its own.
+function knowledgeErrorText(error) {
+  return String(error?.payload?.error || error?.message || error || 'Unknown error');
+}
+
+function knowledgeNotice(scope, tone, message, nextAction = '') {
+  return { scope, tone, message, nextAction };
+}
+
+/** A write answered with the fresh status: it wins over any status read that began before it. */
+function applyKnowledgeStatus(status) {
+  const k = state.knowledge;
+  k.requestId += 1;
+  k.loading = false;
+  if (status) {
+    k.status = status;
+    k.error = '';
+  }
+}
+
+async function loadKnowledgeStatus() {
+  const k = state.knowledge;
+  const requestId = ++k.requestId;
+  k.loading = true;
+  try {
+    const status = await request('/knowledge/status');
+    if (requestId !== k.requestId) return;
+    k.status = status;
+    k.error = '';
+    // The pending changes and History ride the same refetch (they move the same version); they only exist for a ready folder.
+    await loadKnowledgeWritePath();
+    if (requestId !== k.requestId) return;
+  } catch (error) {
+    if (requestId !== k.requestId) return;
+    k.error = knowledgeErrorText(error);
+  } finally {
+    if (requestId === k.requestId) {
+      k.loading = false;
+      // Background repaint: skipped while a path is half-typed (hasUnsavedUserInput).
+      if (state.route.view === 'knowledge-settings') renderRoute({ preserveScroll: true });
+    }
+  }
+}
+
+/** Pending changes and History for a ready folder. Each fails alone: History being slow never hides a waiting card. */
+async function loadKnowledgeWritePath() {
+  const k = state.knowledge;
+  if (!k.status || !k.status.activated || k.status.state !== 'ready') {
+    Object.assign(k, { changes: null, changesError: '', history: null, historyError: '' });
+    return;
+  }
+  const [changes, history] = await Promise.allSettled([request('/knowledge/changes'), request('/knowledge/history')]);
+  if (changes.status === 'fulfilled') { k.changes = changes.value; k.changesError = ''; } else k.changesError = knowledgeErrorText(changes.reason);
+  if (history.status === 'fulfilled') { k.history = history.value; k.historyError = ''; } else k.historyError = knowledgeErrorText(history.reason);
+}
+/** A click on a change card or a History row on this page (chat has its own listener for its own cards). */
+async function knowledgePageAction(button) {
+  const k = state.knowledge;
+  const action = button.dataset.knowledgeAction;
+  const id = button.dataset.changeId || button.closest('[data-knowledge-change-id]')?.dataset.knowledgeChangeId || '';
+  const repaint = () => { if (state.route.view === 'knowledge-settings') renderRoute({ preserveScroll: true, userAction: true }); };
+  const ui = window.BotBoyKnowledge;
+  if (action === 'diff-more') { k.expandedDiffs[id] = true; repaint(); return; }
+  if (action === 'history-open') {
+    const entryId = button.dataset.entryId || '';
+    k.historyOpen = k.historyOpen === entryId ? '' : entryId;
+    repaint();
+    if (k.historyOpen && !k.historyDetail[entryId]) {
+      try { k.historyDetail[entryId] = await request(`/knowledge/history/${entryId}`); } catch (error) { k.historyNotice = knowledgeNotice('history', 'bad', knowledgeErrorText(error), String(error?.payload?.nextAction || '')); }
+      repaint();
+    }
+    return;
+  }
+  if (action === 'ask-fix' || action === 'redraft') {
+    const input = document.getElementById('chatInput');
+    if (!input || !ui) return;
+    toggleAssistant(true);
+    input.value = ui.followUpMessage(action, id);
+    if (typeof window.submitChat === 'function') await window.submitChat();
+    return;
+  }
+  if (k.busy) return;
+  const change = (k.changes?.changes || []).find(entry => entry.id === id);
+  const routes = { apply: 'apply', 'apply-anyway': 'apply', dismiss: 'dismiss', recheck: 'recheck', undo: 'undo' };
+  await runKnowledgeAction(action, '', async () => {
+    try {
+      if (action === 'history-undo') {
+        // The entry the owner was shown: if another change landed since the page was drawn, the server refuses with not_latest and the page repaints below.
+        await request('/knowledge/undo', { method: 'POST', body: { entryId: button.dataset.entryId || '' } });
+        k.historyNotice = knowledgeNotice('history', 'good', 'Undone. The file is back as it was before the latest change.');
+      } else if (routes[action]) {
+        const body = routes[action] === 'apply' && ui ? ui.applyBody(change, action) : undefined;
+        await request(`/knowledge/changes/${id}/${routes[action]}`, { method: 'POST', ...(body ? { body } : {}) });
+        delete k.cardNotices[id];
+      } else return;
+    } catch (error) {
+      const text = [knowledgeErrorText(error), String(error?.payload?.nextAction || '')].filter(Boolean).join(' ');
+      if (action === 'history-undo') k.historyNotice = knowledgeNotice('history', 'bad', knowledgeErrorText(error), String(error?.payload?.nextAction || ''));
+      else k.cardNotices[id] = text;
+    }
+    k.historyDetail = {};
+    await loadKnowledgeWritePath();
+  });
+}
+/** Arriving on the page: forget the last visit's notices and half-finished forms, then read the status. */
+function enterKnowledgePage() {
+  Object.assign(state.knowledge, { notice: null, existing: null, changing: false, plan: null, acknowledged: false, changeDraft: '', pendingFocus: '', historyOpen: '', historyDetail: {}, historyNotice: null, expandedDiffs: {}, cardNotices: {} });
+  void loadKnowledgeStatus();
+}
+
+function renderKnowledgeSettings() {
+  const k = state.knowledge;
+  const ui = window.BotBoyKnowledge;
+  if (!ui) return errorView('The Knowledge page did not load. Reload this tab.');
+  if (!k.status && !k.error && !k.loading) void loadKnowledgeStatus();
+  return ui.renderPage(k, { esc, attr, icon, number, pageHead, loadingView });
+}
+
+// Change cards and History rows on this page: one delegated listener, scoped to the page so a chat card (app.js) is never handled twice.
+document.addEventListener('click', event => {
+  const button = event.target.closest('.knowledge-settings [data-knowledge-action]');
+  if (button) void knowledgePageAction(button);
+});
+function restoreKnowledgeFocus() {
+  const k = state.knowledge;
+  if (!k.pendingFocus || k.busy) return;
+  const wanted = k.pendingFocus;
+  k.pendingFocus = '';
+  document.querySelector(`[data-knowledge-focus="${CSS.escape(wanted)}"]`)?.focus({ preventScroll: true });
+}
+
+/** Run one owner action: show it busy, keep the focus where it was, and repaint when it ends. */
+async function runKnowledgeAction(busy, focus, work) {
+  const k = state.knowledge;
+  if (k.busy) return;
+  k.busy = busy;
+  k.pendingFocus = focus;
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    await work(k);
+  } finally {
+    k.busy = '';
+    if (state.route.view === 'knowledge-settings') renderRoute({ preserveScroll: true, userAction: true });
+  }
+}
+
+/** The body of POST /knowledge/root: an object with the path, and confirmExisting only once the owner ticked it. */
+function knowledgeRootBody(path, confirmExisting) {
+  return confirmExisting ? { path, confirmExisting: true } : { path };
+}
+
+/** `button` is the control the owner pressed ('create', or 'recreate' on a missing folder): focus returns to it on a failure. */
+async function createKnowledgeFolder(path, confirmExisting, button = 'create') {
+  const typed = String(path ?? '').trim();
+  if (!typed) return;
+  await runKnowledgeAction('create', button, async k => {
+    k.createDraft = typed;
+    k.notice = null;
+    try {
+      const result = await request('/knowledge/root', { method: 'POST', body: knowledgeRootBody(typed, confirmExisting) });
+      k.existing = null;
+      k.createDraft = '';
+      applyKnowledgeStatus(result?.status);
+      k.notice = knowledgeNotice('location', 'good', result?.created ? 'Knowledge folder created.' : 'Knowledge folder ready.', result?.seededGuide ? 'Its GUIDE.md explains how to add sets.' : '');
+      k.pendingFocus = 'change-open';
+    } catch (error) {
+      if (error?.code === 'confirm_existing' && error.payload?.existing) {
+        k.existing = { mode: 'create', path: typed, ...error.payload.existing };
+        k.notice = null;
+        k.pendingFocus = 'existing-create';
+      } else {
+        k.existing = null;
+        k.notice = knowledgeNotice('location', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+      }
+    }
+  });
+}
+
+async function rescanKnowledge() {
+  await runKnowledgeAction('rescan', 'rescan', async k => {
+    k.notice = null;
+    try {
+      applyKnowledgeStatus(await request('/knowledge/rescan', { method: 'POST' }));
+      k.notice = knowledgeNotice('location', 'good', 'Rescanned the Knowledge folder.');
+    } catch (error) {
+      k.notice = knowledgeNotice('location', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+    }
+  });
+}
+
+async function changeKnowledgeLocation(path, confirmExisting) {
+  const typed = String(path ?? '').trim();
+  if (!typed) return;
+  await runKnowledgeAction('change', 'change', async k => {
+    k.changeDraft = typed;
+    k.notice = null;
+    try {
+      const result = await request('/knowledge/root/change', { method: 'POST', body: knowledgeRootBody(typed, confirmExisting) });
+      k.existing = null;
+      k.changing = false;
+      k.changeDraft = '';
+      k.plan = null;
+      applyKnowledgeStatus(result?.status);
+      const copied = Number(result?.copied) || 0;
+      // The server's note says what happens to the old folder and to terminals that were already open: show it as is.
+      // Hidden entries and links are not copied; say so, so nothing is left behind silently.
+      const notCopied = Number(result?.notCopied) || 0;
+      const left = notCopied ? `${notCopied} hidden item${notCopied === 1 ? '' : 's'} or link${notCopied === 1 ? '' : 's'} (${(Array.isArray(result?.notCopiedSample) ? result.notCopiedSample : []).slice(0, 3).join(', ')}${notCopied > 3 ? ', …' : ''}) ${notCopied === 1 ? 'was' : 'were'} not copied and ${notCopied === 1 ? 'is' : 'are'} still in the old folder. ` : '';
+      k.notice = knowledgeNotice('location', 'good', `Switched to ${result?.root || typed}. ${copied} file${copied === 1 ? '' : 's'} copied.`, `${left}${String(result?.note || '')}`);
+      k.pendingFocus = 'change-open';
+    } catch (error) {
+      if (error?.code === 'confirm_existing' && error.payload?.existing) {
+        k.existing = { mode: 'change', path: typed, ...error.payload.existing };
+        k.notice = null;
+        k.pendingFocus = 'existing-change';
+      } else {
+        k.existing = null;
+        k.notice = knowledgeNotice('location', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+      }
+    }
+  });
+}
+
+async function previewKnowledgeMove() {
+  await runKnowledgeAction('preview', 'move-preview', async k => {
+    k.notice = null;
+    k.acknowledged = false;
+    try {
+      k.plan = await request('/knowledge/migration/preview', { method: 'POST' });
+    } catch (error) {
+      k.plan = null;
+      k.notice = knowledgeNotice('move', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+    }
+  });
+}
+
+async function applyKnowledgeMove() {
+  const plan = state.knowledge.plan;
+  if (!plan || !plan.ok) return;
+  await runKnowledgeAction('apply', 'move-apply', async k => {
+    k.notice = null;
+    try {
+      const body = { confirm: plan.planSha256 };
+      if (k.acknowledged) body.acknowledgeReclassified = true;
+      const result = await request('/knowledge/migration/apply', { method: 'POST', body });
+      k.plan = null;
+      k.acknowledged = false;
+      await loadKnowledgeStatusNow();
+      k.notice = knowledgeNotice('move', 'good', `Moved ${Number(result?.copied) || 0} file${result?.copied === 1 ? '' : 's'} into the analytics set.`, 'Your old folder was left as it was.');
+      k.pendingFocus = 'move-revert';
+    } catch (error) {
+      // A changed folder (plan_changed, source_changed) needs a fresh preview: the old plan no longer matches.
+      if (['plan_changed', 'source_changed', 'conflict', 'blocked'].includes(error?.code)) {
+        k.plan = null;
+        k.pendingFocus = 'move-preview';
+      }
+      k.notice = knowledgeNotice('move', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+    }
+  });
+}
+
+async function revertKnowledgeMove() {
+  if (!window.confirm('Revert copies the analytics files back to the old folder and switches BotBoy back to it. Nothing is deleted. Continue?')) return;
+  await runKnowledgeAction('revert', 'move-revert', async k => {
+    k.notice = null;
+    try {
+      const result = await request('/knowledge/migration/revert', { method: 'POST' });
+      k.plan = null;
+      await loadKnowledgeStatusNow();
+      const saved = Number(result?.savedAsPreRevert) || 0;
+      k.notice = knowledgeNotice('move', 'good', `Reverted: ${Number(result?.mirrored) || 0} file${result?.mirrored === 1 ? '' : 's'} copied back to ${result?.source || 'the old folder'}.`, saved ? `${saved} different file${saved === 1 ? ' was' : 's were'} kept as .pre-revert.` : '');
+      k.pendingFocus = 'move-preview';
+    } catch (error) {
+      k.notice = knowledgeNotice('move', 'bad', knowledgeErrorText(error), String(error?.nextAction || ''));
+    }
+  });
+}
+
+/** Read the status inside an action (the action's own busy state stays on until it ends). */
+async function loadKnowledgeStatusNow() {
+  const k = state.knowledge;
+  try {
+    applyKnowledgeStatus(await request('/knowledge/status'));
+  } catch (error) {
+    k.error = knowledgeErrorText(error);
   }
 }
 
@@ -7554,10 +7853,26 @@ function showDocCitePopover(chip) {
         : ''}`;
   const shell = chip.closest('.document-preview-shell') || document.body;
   shell.appendChild(popover);
+  // The shell scrolls and the bubble is positioned inside it, so the chip's viewport rect has to be shifted by the
+  // shell's own scroll offset (placeDocCitePopover): a bare rect difference put the bubble scrollTop pixels too high.
   const chipRect = chip.getBoundingClientRect();
   const shellRect = shell.getBoundingClientRect();
-  popover.style.top = `${chipRect.bottom - shellRect.top + 6}px`;
-  popover.style.left = `${Math.max(8, Math.min(chipRect.left - shellRect.left - 20, shell.clientWidth - 336))}px`;
+  const placed = placeDocCitePopover({
+    chip: chipRect,
+    shell: {
+      top: shellRect.top,
+      left: shellRect.left,
+      clientTop: shell.clientTop,
+      clientLeft: shell.clientLeft,
+      clientWidth: shell.clientWidth,
+      clientHeight: shell.clientHeight,
+      scrollTop: shell.scrollTop,
+      scrollLeft: shell.scrollLeft,
+    },
+    popover: { width: popover.offsetWidth, height: popover.offsetHeight },
+  });
+  popover.style.top = `${placed.top}px`;
+  popover.style.left = `${placed.left}px`;
   document.querySelector(`[data-annotation-cite="${CSS.escape(chip.dataset.citeId)}"]`)?.classList.add('active');
 }
 
@@ -7582,6 +7897,8 @@ document.addEventListener('click', (event) => {
   }
   if (!event.target.closest?.('.doc-cite-popover')) closeDocCitePopover();
 });
+// A resize reflows the text, so the chip moves out from under an open bubble: close it instead of leaving it behind.
+window.addEventListener('resize', closeDocCitePopover);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDocCitePopover();
   if ((event.key === 'Enter' || event.key === ' ') && event.target?.classList?.contains('doc-cite') && !event.target.classList.contains('static')) {
@@ -7940,7 +8257,7 @@ function renderLlmUsageSettings() {
 function renderSettings() {
   const dark = document.documentElement.dataset.theme !== 'light';
   return `${pageHead('Workspace', 'Settings', 'Appearance, diagnostics, and compatibility tools for the local dashboard.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace">${icon(WORKPLACE_ICON)} Workplace</a>${amazonEmployeeOn() ? `<a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a>` : ''}<a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
+    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a>${amazonEmployeeOn() ? `<a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a>` : ''}<a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
 // Repaints rebuild #app-view from scratch, which destroys any text the
@@ -8064,6 +8381,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
   if (routeChanged && state.route.view === 'ai-model-settings') void loadAiModelStatus();
   if (routeChanged && state.route.view === 'workplace-settings') void loadWorkplace({ render: true });
+  if (routeChanged && state.route.view === 'knowledge-settings') enterKnowledgePage();
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
   // hard-reload restore, even if the owner later returns to the same hash.
@@ -8158,6 +8476,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
   if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();
   if (state.route.view === 'workplace-settings') html = renderWorkplaceSettings();
+  if (state.route.view === 'knowledge-settings') html = renderKnowledgeSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   window.BotBoyHtmlViews?.park();
   view.innerHTML = html;
@@ -8183,6 +8502,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
   if (state.route.view === 'ai-model-settings') restoreAiModelRoleFocus();
   if (state.route.view === 'workplace-settings') restoreWorkplaceFocus();
+  if (state.route.view === 'knowledge-settings') restoreKnowledgeFocus();
   // Scroll ownership: only USER-INITIATED renders may reset to top (real
   // navigation). Background renders — polls, loader completions, SSE — always
   // restore the previous position, whether or not preserveScroll was threaded
@@ -8813,6 +9133,30 @@ function bindEvents() {
     }
     if (action === 'ai-model-remove') void removeAiModelKey(target.dataset.provider);
     if (action === 'ai-model-refresh') void loadAiModelStatus();
+    if (action === 'knowledge-refresh') {
+      state.knowledge.error = '';
+      void loadKnowledgeStatus();
+    }
+    if (action === 'knowledge-rescan') void rescanKnowledge();
+    if (action === 'knowledge-recreate') void createKnowledgeFolder(state.knowledge.status?.root, false, 'recreate');
+    if (action === 'knowledge-change-open') {
+      state.knowledge.changing = !state.knowledge.changing;
+      state.knowledge.existing = null;
+      state.knowledge.pendingFocus = state.knowledge.changing ? 'change' : 'change-open';
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'knowledge-change-cancel') {
+      Object.assign(state.knowledge, { changing: false, existing: null, changeDraft: '', pendingFocus: 'change-open' });
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'knowledge-move-preview') void previewKnowledgeMove();
+    if (action === 'knowledge-move-apply') void applyKnowledgeMove();
+    if (action === 'knowledge-move-cancel') {
+      Object.assign(state.knowledge, { plan: null, acknowledged: false, pendingFocus: 'move-preview' });
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
+    if (action === 'knowledge-move-revert') void revertKnowledgeMove();
+    // (The change cards and History rows use data-knowledge-action, handled by the listener below the Knowledge block.)
     if (action === 'llm-usage-range') {
       const days = Number(target.dataset.days);
       if ([30, 90, 365].includes(days) && days !== state.llmUsage.days) {
@@ -9471,6 +9815,14 @@ function bindEvents() {
       void saveAiModelKey(event.target);
       return;
     }
+    if (event.target?.dataset?.knowledgeForm) {
+      event.preventDefault();
+      const form = event.target;
+      const confirmExisting = form.elements?.confirmExisting?.checked === true;
+      if (form.dataset.knowledgeForm === 'create') void createKnowledgeFolder(form.elements?.path?.value, confirmExisting);
+      if (form.dataset.knowledgeForm === 'change') void changeKnowledgeLocation(form.elements?.path?.value, confirmExisting);
+      return;
+    }
     if (event.target?.id === 'mcp-config-form') {
       event.preventDefault();
       void saveMcpConfig();
@@ -9703,6 +10055,12 @@ function bindEvents() {
     if (event.target?.matches?.('[data-ai-model-role]')) {
       void saveAiModelRole(event.target);
     }
+    if (event.target?.matches?.('[data-knowledge-ack]')) {
+      // Ticking it enables Move now; the plan stays as previewed.
+      state.knowledge.acknowledged = event.target.checked === true;
+      state.knowledge.pendingFocus = 'move-ack';
+      renderRoute({ preserveScroll: true, userAction: true });
+    }
   });
 
   document.getElementById('chatInput').addEventListener('keydown', event => {
@@ -9783,6 +10141,8 @@ async function pollVersion() {
     state.lastBrowserCaptureVersion = payload.browserCaptureVersion ?? null;
     const previousWorkplaceVersion = state.lastWorkplaceVersion;
     state.lastWorkplaceVersion = payload.workplaceVersion ?? null;
+    const previousKnowledgeVersion = state.lastKnowledgeVersion;
+    state.lastKnowledgeVersion = payload.knowledgeVersion ?? null;
 
     // Reload the tab when the code it runs is stale. Two triggers:
     //  - bootId change: the server restarted (possibly with new UI code).
@@ -9874,6 +10234,15 @@ async function pollVersion() {
       && ((previousAiModelVersion !== null && state.lastAiModelVersion !== previousAiModelVersion)
         || (previousAiModelState !== null && state.lastAiModelState !== previousAiModelState))) {
       void loadAiModelStatus();
+    }
+
+    // The Knowledge library changed (a rescan, a move, a new location, another tab): refresh the open page. The first
+    // poll only seeds the counter, an action in flight keeps its own result, and a path being typed is never repainted.
+    if (state.route.view === 'knowledge-settings' && !state.knowledge.busy
+      && previousKnowledgeVersion !== null && state.lastKnowledgeVersion !== null
+      && state.lastKnowledgeVersion !== previousKnowledgeVersion
+      && !String(document.activeElement?.id || '').startsWith('knowledge-')) {
+      void loadKnowledgeStatus();
     }
 
     if (previousVersion !== null && payload.version !== previousVersion) {

@@ -25,6 +25,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getSetting, setSetting } from './storage.js';
+import { effectiveAnalyticsDir, resolveKnowledgeRoot } from './knowledge-root.js';
 
 export const ANALYTICS_CONTEXT_DIR_KEY = 'analytics_context.dir';
 const ALLOWED_EXTENSIONS = new Set(['.md', '.txt']);
@@ -62,11 +63,101 @@ function expandHome(value: string): string {
   return value;
 }
 
-/** Directory resolution: explicit setting wins; default lives next to the rest of BotBoy's state. */
+function privateDefaultDir(): string {
+  return path.join(os.homedir(), '.personal-productivity-tracker', 'analytics-context');
+}
+
+/**
+ * Where the analytics knowledge lived BEFORE the Knowledge library: the explicit setting, else the private default.
+ * The migration copies from here; ETL onboarding keeps its work files here (or in the private default once the install
+ * is in library mode), never inside the visible library (knowledge-library.md K10).
+ */
+export function legacyAnalyticsContextDir(db: Database.Database): string {
+  const configured = (getSetting<string>(db, ANALYTICS_CONTEXT_DIR_KEY) ?? '').trim();
+  if (configured) return path.resolve(expandHome(configured));
+  return privateDefaultDir();
+}
+
+/** The private default folder, where ETL onboarding keeps its work files once the analytics knowledge is in the library. */
+export function privateAnalyticsContextDir(): string {
+  return privateDefaultDir();
+}
+
+/**
+ * What the legacy analytics folder holds, read without creating or changing anything (no mkdir, unlike
+ * `listAnalyticsContext` in legacy mode): the `.md` / `.txt` files in its root, `presets/` and `lessons/`, and whether a
+ * `manifest.json` exists. The Knowledge library asks this to decide whether Move is offered and whether a fresh folder can
+ * start in library mode. Never throws.
+ */
+export function legacyAnalyticsContentSummary(db: Database.Database): { dir: string; files: number; hasManifest: boolean } {
+  const dir = legacyAnalyticsContextDir(db);
+  let files = 0;
+  for (const sub of ['', 'presets', 'lessons']) {
+    try {
+      for (const entry of fs.readdirSync(path.join(dir, sub), { withFileTypes: true })) {
+        if (entry.name.startsWith('.') || !entry.isFile() && !entry.isSymbolicLink()) continue;
+        if (ALLOWED_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) files += 1;
+      }
+    } catch { /* absent or unreadable: nothing to move */ }
+  }
+  return { dir, files, hasManifest: fs.existsSync(path.join(dir, 'manifest.json')) };
+}
+
+/** True once this install keeps its analytics knowledge in the Knowledge library's `analytics/` set. */
+export function analyticsLibraryMode(db: Database.Database): boolean {
+  return effectiveAnalyticsDir(db) === 'library';
+}
+
+/**
+ * Directory resolution: explicit setting wins; then, in library mode, the library's `analytics/` set; the default
+ * lives next to the rest of BotBoy's state. Every install today is in legacy mode, where this is exactly what it was.
+ */
 export function resolveAnalyticsContextDir(db: Database.Database): string {
   const configured = (getSetting<string>(db, ANALYTICS_CONTEXT_DIR_KEY) ?? '').trim();
   if (configured) return path.resolve(expandHome(configured));
-  return path.join(os.homedir(), '.personal-productivity-tracker', 'analytics-context');
+  if (analyticsLibraryMode(db)) {
+    const { root } = resolveKnowledgeRoot(db);
+    if (root) return path.join(root, 'analytics');
+  }
+  return privateDefaultDir();
+}
+
+/** Why a library folder cannot be used, in the words the owner needs (macOS Documents access, a missing folder). */
+export interface AnalyticsContextUnavailable {
+  code: 'permission_denied' | 'root_unavailable';
+  message: string;
+  nextAction: string;
+}
+
+const PERMISSION_NEXT_ACTION = 'Open System Settings → Privacy & Security → Files and Folders, allow BotBoy (or the app that starts it) for the Knowledge folder, or choose another location in Settings → Knowledge.';
+
+/** EPERM and EACCES (macOS withholding a protected folder) become a described problem; anything else is null. */
+export function permissionProblem(error: unknown, where: string): AnalyticsContextUnavailable | null {
+  const code = String((error as NodeJS.ErrnoException)?.code ?? '');
+  if (code !== 'EPERM' && code !== 'EACCES') return null;
+  return { code: 'permission_denied', message: `macOS did not let BotBoy read ${where}.`, nextAction: PERMISSION_NEXT_ACTION };
+}
+
+/**
+ * Library mode only: a writer (lesson projection, ETL onboarding) may write into the library only while the root
+ * exists. A deleted root is never recreated by a background writer (design amendment P2-13b); the answer names the fix.
+ */
+export function analyticsLibraryWriteBlocker(db: Database.Database): AnalyticsContextUnavailable | null {
+  if (!analyticsLibraryMode(db)) return null;
+  const { root } = resolveKnowledgeRoot(db);
+  if (!root) {
+    return { code: 'root_unavailable', message: 'The Knowledge folder is not set up.', nextAction: 'Open Settings → Knowledge and create the folder.' };
+  }
+  try {
+    if (!fs.statSync(root).isDirectory()) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' });
+  } catch (error) {
+    return permissionProblem(error, root) ?? {
+      code: 'root_unavailable',
+      message: `The Knowledge folder ${root} is missing, so nothing was written to it.`,
+      nextAction: 'Restore the folder, or choose another location in Settings → Knowledge.',
+    };
+  }
+  return null;
 }
 
 /** Set (or clear with '') the configured directory. Returns the resolved active dir. */
@@ -102,22 +193,48 @@ function titleOf(filePath: string): string {
   return '';
 }
 
-/** List the knowledge files (root + presets/), manifest tags folded in. */
-export function listAnalyticsContext(db: Database.Database): { dir: string; files: AnalyticsContextEntry[] } {
+/**
+ * List the knowledge files (root + presets/ + lessons/), manifest tags folded in.
+ *
+ * Library mode (the analytics knowledge lives in the Knowledge library) differs in four ways, all of them refusals or
+ * reports: it never creates a folder; it skips the root `GUIDE.md` (a guide is not a catalog entry); it skips symbolic
+ * links and anything whose real path leaves the directory, so list and load agree; and a root that macOS will not let
+ * BotBoy read is reported in `unavailable` instead of looking like an empty folder. Legacy mode is unchanged.
+ */
+export function listAnalyticsContext(db: Database.Database): { dir: string; files: AnalyticsContextEntry[]; unavailable?: AnalyticsContextUnavailable } {
   const dir = resolveAnalyticsContextDir(db);
-  fs.mkdirSync(path.join(dir, 'presets'), { recursive: true });
+  const library = analyticsLibraryMode(db);
+  let realDir = dir;
+  if (library) {
+    try {
+      fs.readdirSync(dir);
+      realDir = fs.realpathSync.native(dir);
+    } catch (error) {
+      const blocked = permissionProblem(error, dir);
+      if (blocked) return { dir, files: [], unavailable: blocked };
+    }
+  } else {
+    fs.mkdirSync(path.join(dir, 'presets'), { recursive: true });
+  }
   const manifest = readManifest(dir);
   const files: AnalyticsContextEntry[] = [];
   const scan = (subdir: string): void => {
     const absolute = path.join(dir, subdir);
     let names: string[] = [];
     try { names = fs.readdirSync(absolute); } catch { return; }
+    if (library && subdir) {
+      // A folder that is a link, or resolves outside the directory, holds nothing the library lists.
+      try {
+        if (fs.lstatSync(absolute).isSymbolicLink() || !isInsideDir(fs.realpathSync.native(absolute), realDir)) return;
+      } catch { return; }
+    }
     for (const fileName of names.sort()) {
       if (fileName.startsWith('.')) continue;
+      if (library && !subdir && fileName.toLowerCase() === 'guide.md') continue;
       const relative = subdir ? path.join(subdir, fileName) : fileName;
       const fullPath = path.join(dir, relative);
       let stat: fs.Stats;
-      try { stat = fs.statSync(fullPath); } catch { continue; }
+      try { stat = library ? fs.lstatSync(fullPath) : fs.statSync(fullPath); } catch { continue; }
       if (!stat.isFile()) continue;
       if (!ALLOWED_EXTENSIONS.has(path.extname(fileName).toLowerCase())) continue;
       const tagged = manifest.get(path.normalize(relative));
@@ -142,6 +259,10 @@ export function listAnalyticsContext(db: Database.Database): { dir: string; file
   return { dir, files };
 }
 
+function isInsideDir(child: string, parent: string): boolean {
+  return child === parent || child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
 const SOURCE_LABEL: Record<AnalyticsContextSource, string> = {
   'etl-derived': 'generated from your team\'s production ETL profiles (Datanet)',
   'user-dropped': 'user-supplied warehouse/schema knowledge',
@@ -152,11 +273,24 @@ const ARBITRATION_LINE =
   'Source rules: schema facts transfer across sources; wrapper/submission mechanics are ETL-only; '
   + 'when numbers depend on filters, name the regime used (report-matching vs analytical).';
 
+/**
+ * The provenance header every load starts with: which kind of knowledge this is, and the source-arbitration rule
+ * (schema facts transfer, wrapper mechanics are ETL-only, name the filter regime). One builder, so `knowledge_load` of
+ * an analytics file and `mcp_analytics_load_context` can never disagree about it (design amendment P2-7).
+ */
+export function analyticsContextHeader(name: string, source: AnalyticsContextSource): string {
+  return `[KNOWLEDGE FILE: ${name} — ${SOURCE_LABEL[source]}]\n${ARBITRATION_LINE}\n---\n`;
+}
+
 export type LoadAnalyticsContextResult =
   | { ok: true; name: string; source: AnalyticsContextSource; content: string; truncated: boolean }
   | { ok: false; error: string };
 
-/** Load ONE file with the provenance header. Traversal-safe, size-capped. */
+/**
+ * Load ONE file with the provenance header. Traversal-safe, size-capped. In library mode it also refuses a symbolic link
+ * or a path whose real path leaves the directory, answers "not found" for the root `GUIDE.md` (not a catalog entry), and
+ * answers a macOS permission refusal with the System Settings steps instead of "not found".
+ */
 export function loadAnalyticsContext(
   db: Database.Database,
   name: string,
@@ -177,11 +311,27 @@ export function loadAnalyticsContext(
   if (!ALLOWED_EXTENSIONS.has(path.extname(fullPath).toLowerCase())) {
     return { ok: false, error: 'only .md and .txt knowledge files can be loaded' };
   }
+  const library = analyticsLibraryMode(db);
+  const notFound: LoadAnalyticsContextResult = { ok: false, error: `"${cleaned}" not found — call mcp_analytics_list_context for the current files` };
+  if (library) {
+    if (cleaned.toLowerCase() === 'guide.md') return notFound;
+    try {
+      const entry = fs.lstatSync(fullPath);
+      if (entry.isSymbolicLink() || !entry.isFile()) return notFound;
+      if (!isInsideDir(fs.realpathSync.native(fullPath), fs.realpathSync.native(dir))) {
+        return { ok: false, error: `invalid name "${cleaned}" — it resolves outside the analytics knowledge directory` };
+      }
+    } catch (error) {
+      const blocked = permissionProblem(error, dir);
+      return blocked ? { ok: false, error: `${blocked.message} ${blocked.nextAction}` } : notFound;
+    }
+  }
   let raw: string;
   try {
     raw = fs.readFileSync(fullPath, 'utf8');
-  } catch {
-    return { ok: false, error: `"${cleaned}" not found — call mcp_analytics_list_context for the current files` };
+  } catch (error) {
+    const blocked = library ? permissionProblem(error, dir) : null;
+    return blocked ? { ok: false, error: `${blocked.message} ${blocked.nextAction}` } : notFound;
   }
   const manifest = readManifest(dir);
   const tagged = manifest.get(path.normalize(cleaned));
@@ -193,6 +343,6 @@ export function loadAnalyticsContext(
   const body = truncated
     ? `${raw.slice(0, maxChars)}\n\n[Truncated at ${maxChars} of ${raw.length} characters — the full file is at ${fullPath}.]`
     : raw;
-  const header = `[KNOWLEDGE FILE: ${cleaned} — ${SOURCE_LABEL[source]}]\n${ARBITRATION_LINE}\n---\n`;
+  const header = analyticsContextHeader(cleaned, source);
   return { ok: true, name: cleaned, source, content: `${header}${body}`, truncated };
 }

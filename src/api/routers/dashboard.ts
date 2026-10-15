@@ -79,6 +79,8 @@ export function createDashboardRouter(
   workplace?: () => { version: number; amazonEmployee: boolean },
   /** Browser capture pause/pacing change counter; open tabs refetch /browser-capture on change. */
   browserCapture?: () => { version: number },
+  /** Knowledge library change counter (knowledge-library.md K12); the Settings page refetches only when it moves. */
+  knowledge?: () => { version: number },
 ): Router {
   const router = Router();
 
@@ -215,6 +217,15 @@ export function createDashboardRouter(
         try {
           const summary = browserCapture?.();
           return summary ? { browserCaptureVersion: summary.version } : {};
+        } catch {
+          return {};
+        }
+      })(),
+      // In-memory: changes when the Knowledge library does (create, rescan, a change found on disk, a move).
+      ...(() => {
+        try {
+          const summary = knowledge?.();
+          return summary ? { knowledgeVersion: summary.version } : {};
         } catch {
           return {};
         }

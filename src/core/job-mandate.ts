@@ -34,6 +34,10 @@ export const JOB_SCOPE_TOOLS: ReadonlySet<string> = new Set([
   'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables',
   'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context',
   'mcp_analytics_load_context',
+  // The Knowledge library: reads, and the stage-only proposal (like propose_lesson it only stages an approval card; nothing
+  // in this list can change the library). knowledge_write and knowledge_create_set must never be added here: a
+  // continuation can propose, never write (amendment P2-6; job-mandate.test.ts pins the exact difference).
+  'knowledge_list', 'knowledge_load', 'knowledge_propose',
   // MCP reads (mcp_call_tool runs read-tier only here)
   'mcp_status', 'mcp_describe_tool', 'mcp_get_custom_server_config', 'mcp_call_tool',
   // Datanet ETL: reads, scratch queries, and the job's own runs

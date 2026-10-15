@@ -1646,7 +1646,8 @@ fi
 
 # Settings → AI model rows of --doctor (the BOTBOY_TEST_DOCTOR_AI_MODEL hook runs them alone). Node reads the keys
 # in its own memory and prints only their last four characters plus the HTTP status of each provider's free
-# model-list probe; no key enters this shell, argv, or the output. Every probe uses Node's fetch, the network path the
+# model-list probe (HTTP 000 with the network cause beside it, for example ETIMEDOUT, when nothing answered); no key
+# enters this shell, argv, or the output. Every probe uses Node's fetch, the network path the
 # app itself takes (curl would follow proxy variables that the app does not read). The Claude probe sends the headers
 # the app sends (anthropic-models.ts › AUTH_STYLE / ANTHROPIC_VERSION) and follows no redirect, so the key never goes to
 # another address. Tests point it at a loopback stand-in with BOTBOY_TEST_ANTHROPIC_PROBE_URL (production never sets
@@ -1693,11 +1694,37 @@ doctor_ai_model_rows() {
       const request = (id, key) => (id === "anthropic"
         ? { headers: { "x-api-key": key, "anthropic-version": "2023-06-01" }, redirect: "manual" }
         : { headers: { Authorization: `Bearer ${key}` } });
+      // Why a probe got no answer: the errno codes Node keeps under "fetch failed" (same walk as
+      // transport-errors.ts › transportCodesOf). Codes only, never a URL or a header.
+      const codesOf = error => {
+        const found = [];
+        const seen = new Set();
+        const visit = (value, depth) => {
+          if (!value || typeof value !== "object" || depth > 4 || seen.has(value) || found.length >= 6) return;
+          seen.add(value);
+          const code = typeof value.code === "string" ? value.code.replace(/[^A-Z0-9_]/gi, "").slice(0, 40) : "";
+          if (code && !found.includes(code)) found.push(code);
+          visit(value.cause, depth + 1);
+          visit(value.original, depth + 1);
+          if (Array.isArray(value.errors)) for (const inner of value.errors.slice(0, 6)) visit(inner, depth + 1);
+        };
+        visit(error, 0);
+        return found;
+      };
+      // transport-errors.ts › TLS_INTERCEPTION_CODES: a proxy or security product presents its own certificate.
+      const interception = /^(DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|UNABLE_TO_GET_ISSUER_CERT|UNABLE_TO_GET_ISSUER_CERT_LOCALLY|CERT_UNTRUSTED)$/;
+      const noAnswer = (id, host, error) => {
+        const codes = codesOf(error);
+        const shown = codes.length ? ` (${codes.join("+")})` : "";
+        return codes.some(code => interception.test(code))
+          ? `${id} probe: HTTP 000${shown} (a proxy or security product replaces the certificate of ${host}, and Node does not trust it)`
+          : `${id} probe: HTTP 000${shown} (network, proxy, or VPN blocks ${host})`;
+      };
       Promise.all(probes.map(([id, label, url, host]) => (id === "anthropic" && !anthropicOrigin
         ? Promise.resolve(`${id} probe: not sent (BOTBOY_TEST_ANTHROPIC_PROBE_URL accepts only http://127.0.0.1:<port>)`)
         : fetch(url, { ...request(id, keys[id]), signal: AbortSignal.timeout(10000) })
           .then(response => `${id} probe: HTTP ${response.status} (200=key works, 401=key rejected)`)
-          .catch(() => `${id} probe: HTTP 000 (network, proxy, or VPN blocks ${host})`))))
+          .catch(error => noAnswer(id, host, error)))))
         .then(lines => lines.forEach(line => console.log(line)));
     ' "$AI_MODEL_SETTINGS_FILE" "${BOTBOY_TEST_ANTHROPIC_PROBE_URL:-}" 2>/dev/null || echo "ai-model: could not inspect the Settings file"
   else

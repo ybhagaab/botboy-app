@@ -47,6 +47,7 @@ import { createEtlQueryRunner, createEtlToolCall, type QueryRunner, type QueryRu
 import { workspaceRelativePath, type ChatJobStore, type EtlRunOutcome } from './chat-jobs.js';
 import { outcomeFromReadRun } from './etl-run-watcher.js';
 import { listAnalyticsContext, loadAnalyticsContext } from './analytics-context.js';
+import { knowledgeFolderWriteTip } from './knowledge-chat-tools.js';
 import { proposeLesson, listLessons, adoptLesson, retireLesson } from './lessons-ledger.js';
 import { uiInspect, uiConsoleErrors, uiScreenshot } from './self-eyes.js';
 import type { EtlOnboardingService } from './etl-onboarding.js';
@@ -128,6 +129,40 @@ export interface ToolExecutionContext {
    * (gmail_search / gmail_read).
    */
   ownerStartedRun?: boolean;
+  /**
+   * Server-set each chat iteration, never from model arguments: how many estimated tokens the NEXT prompt can still take
+   * before the pre-flight trim would shrink the newest tool result. knowledge_load keeps a whole-file load under it
+   * (knowledge-library.md K8).
+   */
+  promptHeadroomTokens?: number;
+  /**
+   * Server-set by chat.ts above the whole decorator chain, never from model arguments: the families of UNTRUSTED sources
+   * this turn has touched (mail, Slack and WhatsApp captures, web, documents, connected tools, files and commands ...),
+   * recorded when a call is dispatched, also when it then fails. A direct Knowledge-library write needs this empty
+   * (knowledge-library.md K14).
+   */
+  untrustedFamilies?: Set<string>;
+  /** Server-set by `knowledge_load`: a non-guide library file was loaded this turn (taints a guide edit, not a content edit). */
+  knowledgeNonGuideLoaded?: boolean;
+  /**
+   * Server-set, never from model arguments: which guide rules this turn's model was shown (the injected write block, a
+   * `guide_not_read` payload, a whole `GUIDE.md` load), per set id (`/` for the root guide). A write, propose or create call
+   * is accepted only against such a delivery (knowledge-library.md K15).
+   */
+  guidesDelivered?: Record<string, { rulesSha256: string; full: boolean; whole: boolean; files: string[] }>;
+  /** Server-set: change ids the owner's message opened in this turn (`[[knowledge:kc_…]]`); a revision may name only these. */
+  openChangeIds?: string[];
+  /**
+   * Server-set by `prepareKnowledgeWriteTurn` when the owner's message carries a Knowledge card marker (the fixed follow-up of
+   * "Ask BotBoy to fix" and Re-draft): that sentence asks for a revision of THAT card, so it is never the owner's request for
+   * another change. A change this turn did not reopen does not count the message as intent (knowledge-library.md K18, R35).
+   */
+  intentFromCardOnly?: boolean;
+  /**
+   * Server-set: the write tools' per-request bookkeeping (new-change cap, identical-call replies, changes touched this
+   * turn, and `bornIds`: the changes this request itself created, the only ones a direct apply may revise).
+   */
+  knowledgeRequest?: { newChanges: number; replies: Map<string, string>; seenChangeIds: Set<string>; bornIds: Set<string> };
   /** Server-validated visible project scope; never parsed from model prose or tool args. */
   authoritativeProjectIds?: string[];
   projectContextSource?: 'project_scope_chip' | 'background_project_job';
@@ -2303,11 +2338,13 @@ export function createToolExecutor(
       return raw;
     },
     mcp_analytics_list_context: () => {
-      const { dir, files } = listAnalyticsContext(db);
+      const { dir, files, unavailable } = listAnalyticsContext(db);
       if (files.length === 0) {
         return JSON.stringify({
           dir,
           files: [],
+          // Present only when macOS withholds the Knowledge folder (library mode); legacy output is unchanged.
+          ...(unavailable ? { unavailable } : {}),
           note: 'No analytics knowledge files yet. The user can drop .md/.txt schema or methodology notes into this directory (or configure a different one on the Datanet ETL connection page); generated business presets will land under presets/ once ETL onboarding runs.',
         }, null, 1);
       }
@@ -3905,6 +3942,9 @@ export function createToolExecutor(
         if (FILE_CREATION_PATTERNS.some(p => p.test(cmd))) {
           errorOutput += '\n\nTip: Use the write_file tool instead of shell commands for creating files. It handles any content size reliably.';
         }
+        // The sandbox denies writes to the Knowledge folder with a bare "Operation not permitted"; say why.
+        const knowledgeTip = knowledgeFolderWriteTip(String(msg), cmd);
+        if (knowledgeTip) errorOutput += `\n\n${knowledgeTip}`;
         return errorOutput;
       }
     },

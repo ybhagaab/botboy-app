@@ -8,6 +8,7 @@ import {
   documentChainExpansionState,
   groupDocumentChains,
   loadedDocumentRevisionLabel,
+  placeDocCitePopover,
   shouldCollapseLibraryForReview,
   toggleDocumentFocusState,
   toggleDocumentLibraryState,
@@ -249,5 +250,104 @@ describe('generated-document reading-first view model', () => {
     expect(css).toContain('.document-publication-overlay::backdrop');
     expect(css).toContain('@media(max-width:560px)');
     expect(css).toContain('@media(prefers-reduced-motion:reduce)');
+  });
+});
+
+describe('citation bubble placement', () => {
+  // A reader shell 600 px wide and 500 px tall whose viewport rect starts at (300, 100); the chip rects below are
+  // viewport rects, as getBoundingClientRect returns them.
+  const shellAt = (scroll: { top?: number; left?: number } = {}, extra: Record<string, number> = {}) => ({
+    top: 100, left: 300, clientTop: 0, clientLeft: 0, clientWidth: 600, clientHeight: 500,
+    scrollTop: scroll.top ?? 0, scrollLeft: scroll.left ?? 0, ...extra,
+  });
+  const chipAt = (top: number, left: number) => ({ top, bottom: top + 16, left, right: left + 14 });
+  const popover = { width: 328, height: 150 };
+  // Where the bubble ends up on screen: the shell's padding-box origin moves up by its scroll offset.
+  const onScreen = (placed: { top: number; left: number }, shell: ReturnType<typeof shellAt>) => ({
+    y: shell.top + shell.clientTop - shell.scrollTop + placed.top,
+    x: shell.left + shell.clientLeft - shell.scrollLeft + placed.left,
+  });
+
+  it('sits just under the chip it belongs to and starts a little left of it', () => {
+    const shell = shellAt();
+    const chip = chipAt(220, 520);
+    const placed = placeDocCitePopover({ chip, shell, popover });
+    expect(placed.placement).toBe('below');
+    expect(onScreen(placed, shell)).toEqual({ y: chip.bottom + 6, x: chip.left - 20 });
+  });
+
+  it('follows the shell scroll offset: the same chip on screen gets the same bubble on screen after scrolling', () => {
+    const chip = chipAt(220, 520);
+    const rest = placeDocCitePopover({ chip, shell: shellAt(), popover });
+    for (const scrolled of [1, 240, 1200, 9000]) {
+      const shell = shellAt({ top: scrolled });
+      const placed = placeDocCitePopover({ chip, shell, popover });
+      // The old math (chip.bottom - shell.top + 6) ignored scrollTop and put the bubble `scrolled` px too high.
+      expect(placed.top).toBe(rest.top + scrolled);
+      expect(onScreen(placed, shell).y).toBe(chip.bottom + 6);
+    }
+  });
+
+  it('counts the shell border, which the padding box starts after', () => {
+    const shell = shellAt({ top: 80 }, { clientTop: 1, clientLeft: 1 });
+    const chip = chipAt(300, 520);
+    expect(onScreen(placeDocCitePopover({ chip, shell, popover }), shell)).toEqual({ y: chip.bottom + 6, x: chip.left - 20 });
+  });
+
+  it('goes above the chip when it would run past the bottom of the visible area and fits above', () => {
+    const shell = shellAt({ top: 1200 });
+    const chip = chipAt(560, 520); // 40 px above the shell's visible bottom (600), no room for 150 px below
+    const placed = placeDocCitePopover({ chip, shell, popover });
+    expect(placed.placement).toBe('above');
+    expect(onScreen(placed, shell).y).toBe(chip.top - 6 - popover.height);
+  });
+
+  it('stays below when it fits there, even close to the bottom', () => {
+    const shell = shellAt({ top: 300 });
+    const chip = chipAt(430, 520); // 154 px of room below it inside the visible area
+    expect(placeDocCitePopover({ chip, shell, popover: { width: 328, height: 130 } }).placement).toBe('below');
+  });
+
+  it('keeps the bubble inside the visible area sideways, at either edge', () => {
+    const shell = shellAt();
+    const right = placeDocCitePopover({ chip: chipAt(220, 880), shell, popover });
+    expect(onScreen(right, shell).x + popover.width).toBeLessThanOrEqual(shell.left + shell.clientWidth - 8);
+    const leftEdge = placeDocCitePopover({ chip: chipAt(220, 302), shell, popover });
+    expect(onScreen(leftEdge, shell).x).toBe(shell.left + 8);
+  });
+
+  it('keeps the bubble inside the visible area of a shell that is also scrolled sideways', () => {
+    const shell = shellAt({ left: 400 });
+    const placed = placeDocCitePopover({ chip: chipAt(220, 890), shell, popover });
+    const screen = onScreen(placed, shell);
+    expect(screen.x).toBeGreaterThanOrEqual(shell.left + 8);
+    expect(screen.x + popover.width).toBeLessThanOrEqual(shell.left + shell.clientWidth - 8);
+  });
+
+  it('keeps a bubble that fits on neither side inside the visible area', () => {
+    const shell = shellAt({ top: 700 }, { clientHeight: 230 });
+    const chip = chipAt(220, 520);
+    const placed = placeDocCitePopover({ chip, shell, popover: { width: 328, height: 200 } });
+    expect(placed.placement).toBe('clamped');
+    const y = onScreen(placed, shell).y;
+    expect(y).toBeGreaterThanOrEqual(shell.top + 8);
+    expect(y + 200).toBeLessThanOrEqual(shell.top + shell.clientHeight - 8);
+  });
+
+  it('never returns NaN for a missing or malformed measurement', () => {
+    const placed = placeDocCitePopover({ chip: { bottom: Number.NaN }, shell: undefined, popover: undefined });
+    expect(Number.isFinite(placed.top)).toBe(true);
+    expect(Number.isFinite(placed.left)).toBe(true);
+  });
+
+  it('is what the renderer uses: no bare rect difference, a resize closes the bubble, and the CSS caps its height', () => {
+    const source = readFileSync(new URL('./dashboard.js', import.meta.url), 'utf8');
+    expect(source).toContain('placeDocCitePopover({');
+    expect(source).toContain('scrollTop: shell.scrollTop');
+    expect(source).toContain('scrollLeft: shell.scrollLeft');
+    expect(source).not.toContain('chipRect.bottom - shellRect.top + 6');
+    expect(source).toContain("window.addEventListener('resize', closeDocCitePopover)");
+    const css = readFileSync(new URL('./dashboard.css', import.meta.url), 'utf8');
+    expect(css).toMatch(/\.doc-cite-popover \{[^}]*max-height:min\(360px,calc\(100% - 16px\)\);[^}]*overflow-y:auto;/);
   });
 });

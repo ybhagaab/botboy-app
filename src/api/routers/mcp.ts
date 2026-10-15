@@ -7,12 +7,13 @@ import {
   getBuiltInMcpProfile,
 } from '../../core/mcp-profiles.js';
 import { paramStr, type RouterDeps } from './deps.js';
-import { requireLocalOwnerUiRequest } from './local-owner.js';
+import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
 import { sqlToolTimeoutMs } from '../../core/tool-executor.js';
 import { endResponseAtShutdown } from '../../core/shutdown-coordinator.js';
 import { getSetting } from '../../core/storage.js';
 import {
   ANALYTICS_CONTEXT_DIR_KEY,
+  analyticsLibraryMode,
   listAnalyticsContext,
   setAnalyticsContextDir,
 } from '../../core/analytics-context.js';
@@ -678,16 +679,22 @@ export function createMcpRouter(deps: RouterDeps): Router {
   // mcp_analytics_load_context. Read shows the active dir + file count for
   // the a2-analytics connection page; the write (configure a different
   // directory) needs the owner UI like every config mutation here.
-  router.get('/mcp/analytics-context', (_req: Request, res: Response) => {
+  router.get('/mcp/analytics-context', (req: Request, res: Response) => {
+    // Gated like its neighbours: loopback only, no foreign Origin, never cached (it names a folder and a file count).
+    if (!requireLocalOwnerRequest(req, res, 'Analytics knowledge')) return;
+    res.set('Cache-Control', 'no-store');
     if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
     try {
-      const { dir, files } = listAnalyticsContext(deps.db);
+      const { dir, files, unavailable } = listAnalyticsContext(deps.db);
       const configured = (getSetting<string>(deps.db, ANALYTICS_CONTEXT_DIR_KEY) ?? '').trim();
       res.json({
         dir,
         configured,
         fileCount: files.length,
         onboarding: deps.etlOnboarding?.getStatus() ?? null,
+        // Library mode: the knowledge lives in the Knowledge library, and a folder macOS blocks is named, not hidden.
+        ...(analyticsLibraryMode(deps.db) ? { library: true } : {}),
+        ...(unavailable ? { unavailable } : {}),
       });
     } catch (error: any) {
       res.status(500).json({ error: error?.message ?? String(error) });
@@ -698,6 +705,13 @@ export function createMcpRouter(deps: RouterDeps): Router {
     if (!acceptsOwnerUi(req, res, 'Analytics knowledge change')) return;
     if (!acceptsJsonObjectBody(req, res)) return;
     if (!deps.db) return res.status(503).json({ error: 'Storage is unavailable' });
+    if (analyticsLibraryMode(deps.db)) {
+      return res.status(409).json({
+        error: 'Your analytics knowledge lives in the Knowledge library, so this folder cannot be changed here.',
+        code: 'moved_to_library',
+        nextAction: 'Open Settings → Knowledge.',
+      });
+    }
     try {
       const dir = setAnalyticsContextDir(deps.db, String(req.body?.dir ?? ''));
       const { files } = listAnalyticsContext(deps.db);

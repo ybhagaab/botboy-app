@@ -63,14 +63,19 @@ import {
 import { readGmailSendAs } from '../../monitors/gmail-sync.js';
 import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatTurnEnd } from '../../core/chat-jobs.js';
 import { filterToolsForContinuation } from '../../core/job-mandate.js';
+import { noteToolCalls } from '../../core/knowledge-taint.js';
+import { KNOWLEDGE_CHANGE_TOOLS, knowledgeChangeIdFromToolResult, knowledgeWriteConfirmed, prepareKnowledgeWriteTurn, withKnowledgeCards } from '../../core/knowledge-turn.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
 import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
 import { endResponseAtShutdown } from '../../core/shutdown-coordinator.js';
+import { messageWithTransportCodes } from '../../core/transport-errors.js';
 
 /** Gmail writes count for the integrity gate only with a receipt (gmail-chat-tools.ts). */
 const GMAIL_WRITE_TOOLS = new Set(['gmail_draft', 'gmail_send']);
 /** A WhatsApp send counts only with its receipt (whatsapp-send.ts). */
 const WHATSAPP_WRITE_TOOLS = new Set(['whatsapp_send']);
+/** A job whose goal names warehouse, ETL or dataset work: analytics sets get the routing boost (knowledge-routing.ts). */
+const KNOWLEDGE_DATA_JOB_RE = /\b(?:sql|etl|datanet|datasets?|data room|warehouse|redshift|queries|query)\b/i;
 const GMAIL_TOOL_STATUS: Record<string, string> = {
   gmail_search: '🔎 Searching Gmail...',
   gmail_read: '📨 Reading from Gmail...',
@@ -78,6 +83,12 @@ const GMAIL_TOOL_STATUS: Record<string, string> = {
   gmail_send: '📤 Sending through Gmail...',
   whatsapp_find_contact: '🔎 Looking up the WhatsApp contact...',
   whatsapp_send: '💬 Sending on WhatsApp...',
+};
+/** The Knowledge write tools run a guide check (up to 90 s an attempt) and may draft a guide: one status line, then keepalives. */
+const KNOWLEDGE_TOOL_STATUS: Record<string, string> = {
+  knowledge_propose: '📚 Checking the proposal against the guide...',
+  knowledge_write: '📚 Checking the change against the guide...',
+  knowledge_create_set: '📚 Drafting the guide for the new set...',
 };
 /** Long-running tools: one status line, then keepalives while they run. */
 const ETL_TOOL_STATUS: Record<string, string> = {
@@ -611,6 +622,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
   const analyticsSchemaLoader = createAnalyticsSchemaBriefingLoader(deps.mcpManager, {
     db: deps.db,
+    // When no source has knowledge, the "no knowledge" text points at the library's analytics sets (if it has any).
+    knowledgeHint: () => deps.knowledgeLibrary?.analyticsHint() ?? null,
     // No contextWindowTokens snapshot: the loader then reads the active
     // provider's window per load (limits.ts › endpointContextTokens, which
     // Settings → AI model republishes on every activation).
@@ -1369,6 +1382,40 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // continuation follows for them.
           for (const watch of chatJobs.unconsumedFinished(turnJob.id)) chatJobs.consumeWatch(watch.runId);
         }
+        // The Knowledge library: one standing line when it has sets, plus the matched set's file table when this message
+        // (or the active job's goal) is about one. The tools are offered once the library exists. A slow or unreadable
+        // folder skips the block rather than delay the turn (knowledge-library.md K5, K7).
+        const knowledgeLibrary = deps.knowledgeLibrary;
+        const knowledgeAvailable = Boolean(knowledgeLibrary?.isActivated());
+        let knowledgeBlock: string | undefined;
+        let knowledgeMatchedSetId: string | null = null;
+        if (knowledgeLibrary && knowledgeAvailable) {
+          try {
+            const jobGoal = turnJob?.status === 'active' ? turnJob.goal : undefined;
+            const routed = await knowledgeLibrary.routeTurn({
+              message: continuation ? continuation.job.goal : message,
+              ...(jobGoal && !continuation ? { jobGoal } : {}),
+              analyticsMode: conversationMode === 'analytics_dashboard' || KNOWLEDGE_DATA_JOB_RE.test(jobGoal ?? continuation?.job.goal ?? ''),
+              loadedFiles: analyticsBriefing?.presets ?? [],
+            });
+            if (routed?.text) knowledgeBlock = routed.text;
+            knowledgeMatchedSetId = routed?.matchedSetId ?? null;
+          } catch (error: any) {
+            console.warn(`[Chat] Knowledge routing skipped: ${error?.message ?? error}`);
+          }
+        }
+        // The write path (knowledge-library.md K18): which write tools this turn is offered, the set's rules handed to the drafting
+        // model BEFORE it drafts, and the open change when the owner pressed "Ask BotBoy to fix" on a card. A continuation is
+        // never offered the write tools (it may only propose).
+        let knowledgeWriteAvailable = false;
+        if (knowledgeAvailable) {
+          const prepared = await prepareKnowledgeWriteTurn({
+            message, continuation: Boolean(continuation), ...(turnJob?.status === 'active' ? { jobGoal: turnJob.goal } : {}),
+            matchedSetId: knowledgeMatchedSetId, context: toolExecutionContext,
+          }, { writer: deps.knowledgeWriter, changes: deps.knowledgeChanges });
+          knowledgeWriteAvailable = prepared.writeAvailable;
+          if (prepared.blocks.length) knowledgeBlock = [knowledgeBlock, ...prepared.blocks].filter(Boolean).join('\n\n');
+        }
         const promptContext = {
           nodes,
           conversationMode,
@@ -1379,6 +1426,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           mcpServers,
           ...(jobBlock ? { jobBlock } : {}),
           ...(gmailAccountsBlock ? { gmailAccountsBlock } : {}),
+          ...(knowledgeBlock ? { knowledgeBlock } : {}),
+          knowledgeAvailable,
+          knowledgeWriteAvailable,
           driveConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canReadDrive && !account.needsReconnect),
           amazonEmployee: turnAmazonEmployee,
         };
@@ -1559,11 +1609,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
           ...GMAIL_WRITE_TOOLS,
           ...WHATSAPP_WRITE_TOOLS,
+          ...KNOWLEDGE_CHANGE_TOOLS,
         ]);
         const toolCallMayWrite = (toolCall: any): boolean => WRITE_TOOLS.has(toolCall?.function?.name);
         const ACTION_CLAIM_RE = /(item id[:\s`]|✅[^\n]{0,40}\b(saved|created|done|captured|added|sent|drafted)\b|\bi['’]?ve (created|saved|captured|added|filed|updated|tracked|sent|drafted|emailed)\b)/i;
         // Gmail drafts saved this turn: each gets its card even when the reply omits the token.
         const gmailDraftIds = new Set<string>();
+        // Knowledge changes this turn touched: each gets its card, and one left mid-loop is staged when the turn ends.
+        const knowledgeChangeIds = new Set<string>();
         // MCP servers BotBoy added or changed this turn: each gets its review card.
         const mcpServerCardIds = new Set<string>();
         // Read-only SQL tools that may run as a concurrent batch (the
@@ -1651,6 +1704,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // Qwen stack this computes the exact historical value (25904); for the
           // 256K Kimi-K3 stack trimming becomes a genuine rarity.
           const MAX_INPUT_TOKENS = (SERVER_CONTEXT_TOKENS - 2768) - CHAT_MAX_COMPLETION_TOKENS;
+          // knowledge_load keeps a whole-file load under what the next prompt can still take, so it never lands in the
+          // pre-flight cut below that shrinks the newest tool result.
+          toolExecutionContext.promptHeadroomTokens = Math.max(0, MAX_INPUT_TOKENS - estPromptTokens);
           if (estPromptTokens > MAX_INPUT_TOKENS && messages.length > 2) {
             let trimmed = 0;
             // Compute iteration number for each message (rough — based on position after system)
@@ -1979,7 +2035,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
             turnState.jobEnd = toolsDisabled ? 'repeat_breaker' : 'answered';
             turnState.replyExcerpt = replyExcerptOf(content);
-            content = forTranscript(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds));
+            content = forTranscript(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges));
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -2036,6 +2092,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               function: { name: tc.function.name, arguments: args },
             };
           });
+          // Taint (knowledge-library.md K14): every tool of this assistant message is noted BEFORE the first runs and also when it then
+          // fails, ABOVE the whole decorator chain (decorators answer their own tools without forwarding), so a direct
+          // Knowledge write after a mail read, in the same message or later in the turn, becomes a card.
+          noteToolCalls(toolExecutionContext, sanitizedToolCalls.map((tc: any) => String(tc.function?.name ?? '')));
           // Stream tool-start markers and execute each tool BEFORE pushing the assistant
           // message — so we can decide how to shrink oversized args (e.g. rejected write_file
           // with a 25KB content string) before they bloat future iterations' context.
@@ -2278,6 +2338,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 blockingKeepalive = setInterval(() => {
                   try { res.write(`: mcp-find ${Date.now()}\n\n`); } catch {}
                 }, 10000);
+              } else if (KNOWLEDGE_TOOL_STATUS[tc.function.name]) {
+                try {
+                  res.write(`data: ${JSON.stringify({ type: 'status', text: KNOWLEDGE_TOOL_STATUS[tc.function.name] })}\n\n`);
+                } catch {}
+                blockingKeepalive = setInterval(() => {
+                  try { res.write(`: knowledge ${Date.now()}\n\n`); } catch {}
+                }, 10000);
               } else if (GMAIL_TOOL_STATUS[tc.function.name]) {
                 try {
                   res.write(`data: ${JSON.stringify({ type: 'status', text: GMAIL_TOOL_STATUS[tc.function.name] })}\n\n`);
@@ -2310,6 +2377,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                 const dataRoomTool = dataRoomChatToolName(tc.function.name);
                 writeToolCalled ||= dataRoomTool
                   ? dataRoomWriteEffectConfirmed(dataRoomTool, result?.content)
+                  : KNOWLEDGE_CHANGE_TOOLS.has(tc.function.name)
+                    // A Knowledge write counts only when the file really changed (status applied); a card or a fix list is not an update.
+                    ? knowledgeWriteConfirmed(tc.function.name, result?.content)
                   : GMAIL_WRITE_TOOLS.has(tc.function.name)
                     // A Gmail write counts only with its receipt (draft saved / message sent).
                     ? gmailWriteConfirmed(tc.function.name, result?.content)
@@ -2320,6 +2390,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                         ? exportFooterSetConfirmed(String(result?.content ?? ''))
                         : true;
               }
+              const knowledgeChangeId = knowledgeChangeIdFromToolResult(tc.function.name, result?.content);
+              if (knowledgeChangeId) knowledgeChangeIds.add(knowledgeChangeId);
               const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
               if (savedDraftId) gmailDraftIds.add(savedDraftId);
               // A server definition BotBoy saved is a real local effect ("I've
@@ -2612,7 +2684,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
-        finalContent = forTranscript(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds));
+        finalContent = forTranscript(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges));
         const capId = `asst-${Date.now()}`;
         if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);
@@ -2641,7 +2713,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           try { res.end(); } catch {}
         } else {
           turnState.jobEnd = 'failed';
-          console.error(`[Chat] Stream error:`, err?.message || err, err?.stack ? `\n${err.stack}` : '');
+          console.error(`[Chat] Stream error:`, messageWithTransportCodes(err) || err, err?.stack ? `\n${err.stack}` : '');
           // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
           // and the user saw pure silence after reload). Persist a visible
           // assistant message so the failed turn exists in history — work done

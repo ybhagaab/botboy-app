@@ -47,15 +47,21 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll } from 'vitest';
+import { gitStandIns } from './vitest.git-standin';
 import { RUN_DIR_ENV } from './vitest.no-ui-tools.global';
 
 const LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister';
 /** Tools that get a recording stub first on PATH. */
 const GUARDED_NAMES = ['osascript', 'open', 'lsregister', 'install_name_tool'] as const;
 /** The Xcode stand-ins no test may run (see the header). Their refusal is also recorded. */
-const XCODE_STAND_INS = [['/usr/bin/python3', 'python3'], ['/usr/bin/install_name_tool', 'install_name_tool']] as const;
+const XCODE_STAND_INS: ReadonlyArray<readonly [string, string]> = [
+  ['/usr/bin/python3', 'python3'],
+  ['/usr/bin/install_name_tool', 'install_name_tool'],
+  // `/usr/bin/git` too, but only while no developer-tools git exists (vitest.git-standin.ts): with the tools it is harmless.
+  ...gitStandIns(),
+];
 /** Bare command names a spawn is checked for: a name that PATH resolves to the real tool is refused. */
-const CHECKED_NAMES: readonly string[] = [...GUARDED_NAMES, 'python3'];
+const CHECKED_NAMES: readonly string[] = [...GUARDED_NAMES, 'python3', ...(XCODE_STAND_INS.some(([, name]) => name === 'git') ? ['git'] : [])];
 const INSTALLED = Symbol.for('botboy.test.noUiTools');
 /** A loopback address nothing listens on (the TCP "discard" port), so a download attempt fails at once and offline. */
 export const CLOSED_DIST_URL = 'http://127.0.0.1:9';
@@ -90,7 +96,7 @@ function createGuard(): Guard {
     fs.writeFileSync(path.join(stubDir, name), `#!/bin/sh\necho "${name} $*" >> '${logFile}'\nexit 0\n`, { mode: 0o755 });
   }
   const real = new Map<string, string>();
-  for (const [file, name] of [['/usr/bin/osascript', 'osascript'], ['/usr/bin/open', 'open'], [LSREGISTER, 'lsregister'], ...XCODE_STAND_INS] as const) {
+  for (const [file, name] of [['/usr/bin/osascript', 'osascript'], ['/usr/bin/open', 'open'], [LSREGISTER, 'lsregister'], ...XCODE_STAND_INS] as ReadonlyArray<readonly [string, string]>) {
     real.set(file, name);
     real.set(realpath(file), name);
   }
@@ -191,7 +197,7 @@ function install(first: Guard): void {
       }
       throw new Error(
         `[test hygiene] ${call} would run the REAL ${tool}, an Xcode stand-in: it runs Apple's tool, or raises the "install developer tools" dialog on a Mac without them. `
-        + 'Give the code under test a stand-in path (BOTBOY_TEST_PYTHON_SHIM, BOTBOY_TEST_XCODE_SELECT_BIN, ...) or a PATH whose python3 is a tripwire of your own.',
+        + 'Give the code under test a stand-in path (BOTBOY_TEST_PYTHON_SHIM, BOTBOY_TEST_XCODE_SELECT_BIN, ...) or a PATH whose python3 or git is a tripwire of your own.',
       );
     }
     throw new Error(

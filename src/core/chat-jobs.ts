@@ -36,6 +36,8 @@ export interface ChatJobWorkingSet {
   files: Array<{ path: string; label?: string; at: string }>;
   datasets: Array<{ datasetId?: string; versionId?: string; jobId?: string; title?: string; at: string }>;
   dashboards: Array<{ dashboardId: string; title?: string; at: string }>;
+  /** Library files this job loaded, so a continuation knows what to load again (knowledge-library.md K9). */
+  knowledge: Array<{ set: string; file: string; sha256: string; at: string }>;
 }
 
 /** What a turn said should happen next (job_update continue | needs_owner). */
@@ -189,6 +191,7 @@ export interface ChatJobStore {
   recordFile(jobId: string, filePath: string, label?: string): void;
   recordDataset(jobId: string, entry: { datasetId?: string; versionId?: string; jobId?: string; title?: string }): void;
   recordDashboard(jobId: string, entry: { dashboardId: string; title?: string }): void;
+  recordKnowledge(jobId: string, entry: { set: string; file: string; sha256: string }): void;
   addWatch(input: { runId: string; jobId: string; purpose?: string; source: EtlRunWatch['source'] }): EtlRunWatch;
   watch(runId: string): EtlRunWatch | null;
   watchesForJob(jobId: string): EtlRunWatch[];
@@ -214,7 +217,7 @@ function clip(value: unknown, max: number): string {
 }
 
 function emptyWorkingSet(): ChatJobWorkingSet {
-  return { notes: [], files: [], datasets: [], dashboards: [] };
+  return { notes: [], files: [], datasets: [], dashboards: [], knowledge: [] };
 }
 
 function parseWorkingSet(raw: unknown): ChatJobWorkingSet {
@@ -226,6 +229,7 @@ function parseWorkingSet(raw: unknown): ChatJobWorkingSet {
       files: Array.isArray(value.files) ? value.files : [],
       datasets: Array.isArray(value.datasets) ? value.datasets : [],
       dashboards: Array.isArray(value.dashboards) ? value.dashboards : [],
+      knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
     };
   } catch {
     return emptyWorkingSet();
@@ -506,6 +510,14 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
         if (set.dashboards.length > MAX_LIST) set.dashboards = set.dashboards.slice(-MAX_LIST);
       });
     },
+    recordKnowledge(jobId, entry) {
+      if (!entry.set || !entry.file) return;
+      mutateWorkingSet(jobId, (set) => {
+        set.knowledge = set.knowledge.filter(known => !(known.set === entry.set && known.file === entry.file));
+        set.knowledge.push({ set: clip(entry.set, 120), file: clip(entry.file, 200), sha256: entry.sha256, at: nowIso() });
+        if (set.knowledge.length > MAX_LIST) set.knowledge = set.knowledge.slice(-MAX_LIST);
+      });
+    },
     addWatch(input) {
       const runId = String(input.runId ?? '').trim();
       if (!/^\d{1,32}$/.test(runId)) throw new Error('ETL run id must be numeric');
@@ -612,6 +624,9 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
   if (set.dashboards.length) {
     lines.push('Dashboards:', ...set.dashboards.slice(-8).map(dashboard => `- ${dashboard.dashboardId}${dashboard.title ? ` — ${dashboard.title}` : ''}`));
   }
+  if (set.knowledge.length) {
+    lines.push('Knowledge used (load again with knowledge_load if the task needs it):', ...set.knowledge.slice(-8).map(entry => `- ${entry.set}/${entry.file}`));
+  }
   if (job.pausedAt && job.pauseNote) lines.push(`Paused for the owner: ${clip(job.pauseNote, 400)}`);
   lines.push('Keep the working set current with job_update (next step, decisions). END EVERY TURN of this job with exactly one job_update: "done" when the deliverable is verified; "needs_owner" with the question when only the owner can decide or approve the next step; "continue" with the next step when there is more work you can do yourself (BotBoy starts the next turn at once). Waiting on watched ETL runs needs no call. A turn that ends without one is continued once and then paused.');
   return lines.join('\n').slice(0, 4_500);
@@ -638,6 +653,15 @@ function unwrapEnvelope(value: any): any {
  * unrecognized result shape records nothing.
  */
 export function recordToolOutcome(store: ChatJobStore, jobId: string, toolName: string, argsJson: string, resultContent: string): void {
+  // knowledge_load answers with the fenced file as plain text, so its outcome is read from the fence's opening tag.
+  if (toolName === 'knowledge_load') {
+    const fence = /^<external_untrusted_knowledge set="([^"]*)" file="([^"]*)" sha256="([a-f0-9]{64})" /.exec(resultContent);
+    if (fence) {
+      const plain = (value: string) => value.replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+      store.recordKnowledge(jobId, { set: plain(fence[1]), file: plain(fence[2]), sha256: fence[3] });
+    }
+    return;
+  }
   const result = unwrapEnvelope(parseJsonObject(resultContent));
   if (!result) return;
   const args = parseJsonObject(argsJson) ?? {};

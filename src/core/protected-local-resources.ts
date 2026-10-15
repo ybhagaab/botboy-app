@@ -205,6 +205,48 @@ function runtimeReadRules(
   return { rules, opened };
 }
 
+/**
+ * The folder a model-run process may READ and may not WRITE: the Knowledge library (knowledge-library.md K2, owner
+ * decision "option A" of 2026-10-15). A guide in it is Operating Knowledge that steers later turns, and generated
+ * presets and lessons now live in it instead of private state, so one `echo >> GUIDE.md` from an injected command
+ * would be persistent prompt injection with no owner click. Every write goes through the knowledge tools in the
+ * server process, which this profile does not reach.
+ *
+ * `index.ts` registers the provider right after the database opens, BEFORE the MCP manager launches its custom-command
+ * servers (a server keeps the profile it was launched with, for its life). The provider returns the library's
+ * canonical root, or null while no library exists, and is asked at each launch, so Change location applies to new
+ * launches. With no provider, or a null answer, the profile is byte-identical to what it was before this existed.
+ */
+export type WriteProtectedRootProvider = () => string | readonly string[] | null;
+let writeProtectedRootProvider: WriteProtectedRootProvider | null = null;
+
+export function registerWriteProtectedRoots(provider: WriteProtectedRootProvider | null): void {
+  writeProtectedRootProvider = provider;
+}
+
+/**
+ * The roots a profile built now denies writes to, as real paths (the current root, and for the moment a location change
+ * copies into a new one, both). A root that is, contains or lies inside BotBoy's private state is NOT honored: the deny
+ * comes after the files-workspace allow, so honoring one that contains the files workspace would block `run_command`'s
+ * only writable folder. Activation refuses such roots, so this is a second wall.
+ */
+export function writeProtectedRootsInEffect(options: { privateRoot?: string; filesDir?: string } = {}): string[] {
+  if (!writeProtectedRootProvider) return [];
+  let provided: string | readonly string[] | null = null;
+  try { provided = writeProtectedRootProvider(); } catch { provided = null; }
+  const candidates = Array.isArray(provided) ? provided : [provided];
+  const privateRoot = canonicalLocalPath(options.privateRoot ?? path.join(os.homedir(), '.personal-productivity-tracker'));
+  const filesDir = canonicalLocalPath(options.filesDir ?? path.join(privateRoot, 'files'));
+  const roots: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || !path.isAbsolute(candidate) || /[\0\r\n]/.test(candidate)) continue;
+    const root = canonicalLocalPath(candidate);
+    if (inside(root, privateRoot) || inside(privateRoot, root) || inside(root, filesDir) || inside(filesDir, root)) continue;
+    if (!roots.includes(root)) roots.push(root);
+  }
+  return roots;
+}
+
 function modelSandboxBoundary(options: ModelCommandSandboxOptions): ModelSandboxBoundary {
   const appPort = validPort(options.appPort ?? process.env.PPT_PORT, DEFAULT_APP_PORT);
   const cdpPort = validPort(options.cdpPort, DEFAULT_CDP_PORT);
@@ -233,6 +275,9 @@ function modelSandboxBoundary(options: ModelCommandSandboxOptions): ModelSandbox
       `(allow file-read* file-write* (subpath ${sandboxLiteral(filesDir)}))`,
       // Later rules win in Seatbelt, so these come after the private-root deny. Absent unless a runtime folder was named.
       ...runtimeRules,
+      // Last, so nothing above can re-open it. Absent unless the Knowledge library exists (see writeProtectedRootsInEffect).
+      ...writeProtectedRootsInEffect({ privateRoot: options.privateRoot, filesDir: options.filesDir })
+        .map((root) => `(deny file-write* (subpath ${sandboxLiteral(root)}))`),
     ].join(' '),
   };
 }

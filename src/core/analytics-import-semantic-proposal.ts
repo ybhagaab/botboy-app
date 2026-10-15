@@ -11,8 +11,8 @@ import {
   parseAnalyticsImportSheet,
 } from './analytics-import-complete-parser.js';
 import type { AnalyticsImportCandidateReader, AnalyticsImportCandidateSnapshot } from './analytics-import-inbox.js';
-import { AnalyticsImportInboxError } from './analytics-import-inbox.js';
-import { listAnalyticsContext, loadAnalyticsContext, resolveAnalyticsContextDir, type AnalyticsContextEntry } from './analytics-context.js';
+import { AnalyticsImportInboxError, blockedContextError } from './analytics-import-inbox.js';
+import { analyticsLibraryMode, listAnalyticsContext, loadAnalyticsContext, resolveAnalyticsContextDir, type AnalyticsContextEntry } from './analytics-context.js';
 import { analyticsDatasetContractSha256, analyticsDatasetSchemaSha256 } from './analytics-data-room-store.js';
 import { analyticsSha256, stableAnalyticsJson } from './analytics-data-room-policy.js';
 import type {
@@ -538,6 +538,16 @@ function selectContextFamily(
   };
 }
 
+/**
+ * The analytics catalog, or a typed "unavailable" when the Knowledge folder is blocked (macOS Documents access). It runs
+ * before family selection, so a blocked folder is never mistaken for "no family matches", and it is never a conflict:
+ * the proposal's state is unchanged and the owner can retry once access is back.
+ */
+export function analyticsCatalogOrThrow(db: Database.Database): AnalyticsContextEntry[] {
+  const listing = listAnalyticsContext(db);
+  if (listing.unavailable) throw new AnalyticsImportInboxError('unavailable', listing.unavailable.message, listing.unavailable.nextAction);
+  return listing.files;
+}
 function loadSelectedContext(db: Database.Database, files: AnalyticsContextEntry[], family: string): SelectedContext {
   const selected = files.filter(file => familyOf(file) === family || (file.source === 'lesson' && file.business?.toLowerCase() === family));
   if (!selected.length) throw new AnalyticsImportInboxError('unavailable', `Analytics context family ${family} has no readable files.`);
@@ -548,7 +558,12 @@ function loadSelectedContext(db: Database.Database, files: AnalyticsContextEntry
   for (const file of selected.sort((left, right) => left.name.localeCompare(right.name))) {
     const absolute = path.resolve(root, file.name);
     if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new AnalyticsImportInboxError('integrity_failed', 'Analytics context path escaped its configured root.');
-    const stat = fs.lstatSync(absolute);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(absolute);
+    } catch (error) {
+      throw blockedContextError(error, root, analyticsLibraryMode(db)) ?? error;
+    }
     if (!stat.isFile() || stat.isSymbolicLink()) throw new AnalyticsImportInboxError('integrity_failed', `Analytics context ${file.name} is not a regular file.`);
     const loaded = loadAnalyticsContext(db, file.name, 2_000_000);
     if (!loaded.ok || loaded.truncated) throw new AnalyticsImportInboxError('unavailable', `Analytics context ${file.name} could not be loaded completely.`);
@@ -2236,7 +2251,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
     });
     const ownerAnswers = retainedOwnerAnswers(parseJson<Record<string, string>>(row.owner_answers_json, 'owner answers') ?? {});
     const resolvedOwnerAnswers = resolvedOwnerSemanticAnswers(ownerAnswers);
-    const catalog = listAnalyticsContext(db).files;
+    const catalog = analyticsCatalogOrThrow(db);
     const selected = selectContextFamily(catalog, profileSignals(candidate, parsed), ownerAnswers.contextFamily);
     if (!selected.family) {
       updateNeedsInput(rowById(row.id)!, parsed.profile, [selected.unresolved!], runtime);
@@ -2414,7 +2429,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
       throw new AnalyticsImportInboxError('conflict', 'Complete workbook profile changed after review.', 'Prepare a new semantic review.');
     }
     const ownerAnswers = retainedOwnerAnswers(parseJson<Record<string, string>>(row.owner_answers_json, 'owner answers') ?? {});
-    const catalog = listAnalyticsContext(db).files;
+    const catalog = analyticsCatalogOrThrow(db);
     const selected = selectContextFamily(catalog, profileSignals(candidate, parsed), ownerAnswers.contextFamily);
     if (selected.family !== row.context_family) throw new AnalyticsImportInboxError('conflict', 'Analytics context routing changed after review.', 'Prepare a new semantic review.');
     const context = loadSelectedContext(db, catalog, selected.family);

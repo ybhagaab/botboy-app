@@ -142,7 +142,8 @@ function isExecutableFile(candidate: string): boolean {
   }
 }
 
-function resolveBinary(name: string, pathValue: string, extraDirs: string[]): string | null {
+/** The first executable named `name` along `pathValue`, then `extraDirs`; null when there is none. Starts no process. */
+export function resolveBinary(name: string, pathValue: string, extraDirs: string[]): string | null {
   const seen = new Set<string>();
   const dirs = [...pathValue.split(path.delimiter), ...extraDirs];
   for (const dir of dirs) {
@@ -197,6 +198,9 @@ export function visionHelperInstallHint(failure: OcrBuildFailure | null, offLine
  * when `xcode-select -p` answers. `BOTBOY_TEST_XCODE_SELECT_BIN` replaces the tool in tests.
  */
 const XCODE_SHIM_TOOLS = new Set(['/usr/bin/git', '/usr/bin/python3']);
+// Exported for the git mirror of the Knowledge library (it must never run the stand-in either). The declaration above keeps the text
+// src/core/no-xcode-shim.test.ts reads, so keep it a plain `const` and export the name separately.
+export { XCODE_SHIM_TOOLS };
 const XCODE_SHIM_HINT = 'install the Command Line Tools (xcode-select --install)';
 
 function commandLineToolsPresent(): boolean {

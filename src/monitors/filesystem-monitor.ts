@@ -32,6 +32,7 @@ import type { DocumentParser } from '../core/document-parser.js';
 import type { LocalFolder } from '../core/local-folders-config.js';
 import { listLocalFolders, getLocalFolder } from '../core/local-folders-config.js';
 import type { DiskSpaceMonitor } from '../core/disk-space.js';
+import { isCaptureExcludedPath } from '../core/capture-exclusions.js';
 import { NOOP_MAIN_THREAD_WATCHDOG, type MainThreadWatchdog } from '../core/main-thread-watchdog.js';
 import {
   describeSecretKinds,
@@ -545,6 +546,9 @@ export function createNativeWatchEngine(
     if (!row.recursive && rel.includes(path.sep)) return;
     if (isRelativePathIgnored(rel)) return;
     const absolutePath = path.join(row.path, rel);
+    // The Knowledge library is never captured (knowledge-library.md K1). Dropped before the burst counter, so a
+    // busy library cannot pause its watched ancestor.
+    if (isCaptureExcludedPath(absolutePath)) return;
     if (row.exclude_globs.length > 0 && compileExcludes(row.exclude_globs).matchesFile(absolutePath)) return;
 
     // Burst guard (R3). Window reset first so a long-quiet folder starts
@@ -760,6 +764,8 @@ export function createFilesystemMonitor(deps: {
     row: LocalFolder,
     excludes: CompiledExcludes,
   ): AsyncGenerator<{ path: string } | { error: string }> {
+    // A watched row that is itself inside the Knowledge library yields nothing (knowledge-library.md K1).
+    if (isCaptureExcludedPath(row.path)) return;
     const queue: string[] = [row.path];
     let sliceStarted = performance.now();
     while (queue.length > 0) {
@@ -782,6 +788,8 @@ export function createFilesystemMonitor(deps: {
           if (!row.recursive) continue;
           if (isStaticallyIgnored(entry.name, true)) continue;
           if (excludes.prunesDir(fullPath)) continue;
+          // The Knowledge library's subtree is pruned unread, like an excluded subtree (knowledge-library.md K1).
+          if (isCaptureExcludedPath(fullPath)) continue;
           queue.push(fullPath);
           continue;
         }
@@ -790,6 +798,7 @@ export function createFilesystemMonitor(deps: {
         if (!entry.isFile()) continue;
         if (isStaticallyIgnored(entry.name, false)) continue;
         if (excludes.matchesFile(fullPath)) continue;
+        if (isCaptureExcludedPath(fullPath)) continue;
         yield { path: fullPath };
         sliceStarted = performance.now();
       }
@@ -965,6 +974,12 @@ export function createFilesystemMonitor(deps: {
     }
 
     const ext = path.extname(filePath).toLowerCase();
+
+    // 0. The Knowledge library is on-demand knowledge, never capture (knowledge-library.md K1): every path into
+    //    this function (live, scan, backfill, reference walk, pending import) is stopped here, before anything
+    //    reads the file. The real path is tested too, because `stat` follows a link that a live event can name
+    //    from outside the library.
+    if (isCaptureExcludedPath(filePath, { resolveLinks: true })) return { outcome: 'ignored' };
 
     // 1. Skip clearly-non-textual file types (video/audio/archive/binary/
     //    design assets). A productivity tracker has no text to gain from these,
@@ -1185,6 +1200,11 @@ export function createFilesystemMonitor(deps: {
    * content-hash dedup in `handleAddOrChange`.
    */
   function handleUnlink(row: LocalFolder, filePath: string, knownBefore?: FolderFileRecord | null): void {
+    // A path in the Knowledge library was never captured (knowledge-library.md K1): nothing to archive.
+    if (isCaptureExcludedPath(filePath)) {
+      seenHashes.delete(filePath);
+      return;
+    }
     // A held credential was never captured: nothing to archive, and its
     // hold row goes with the file. `knownBefore` is the row as it was before
     // the unlink handler forgot it.

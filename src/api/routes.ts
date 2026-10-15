@@ -30,6 +30,7 @@ import { createAnalyticsRouter } from './routers/analytics.js';
 import { createAnalyticsDataRoomRouter } from './routers/analytics-data-room.js';
 import { createAnalyticsImportInboxRouter } from './routers/analytics-import-inbox.js';
 import { createLessonsRouter } from './routers/lessons.js';
+import { createKnowledgeRouter } from './routers/knowledge.js';
 import { createWorkspaceRouter } from './routers/workspace.js';
 import { createProductDocumentsRouter } from './routers/product-documents.js';
 import { createDocumentsRouter } from './routers/documents.js';
@@ -70,6 +71,9 @@ export function createRouter(deps: RouterDeps): Router {
     deps.browserCapture
       ? () => ({ version: deps.browserCapture!.state.version() })
       : undefined,
+    deps.knowledgeLibrary
+      ? () => ({ version: deps.knowledgeLibrary!.version() })
+      : undefined,
   ));
   router.use(createCaptureHealthRouter(deps));
   router.use(createBrowserCaptureRouter(deps));
@@ -88,6 +92,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createAnalyticsDataRoomRouter(deps));
   router.use(createAnalyticsImportInboxRouter(deps));
   router.use(createLessonsRouter(deps));
+  router.use(createKnowledgeRouter(deps));
   router.use(createWorkspaceRouter(deps));
   router.use(createProductDocumentsRouter(deps));
   router.use(createVisualAssetsRouter(deps));

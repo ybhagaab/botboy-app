@@ -15,6 +15,16 @@ import http from 'node:http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createStorage } from './core/storage.js';
+import { registerCaptureExcludedRoots } from './core/capture-exclusions.js';
+import { canonicalRootOrNull, knowledgeDenyRoots, knowledgeExcludedRoots } from './core/knowledge-root.js';
+import { createGuideCheck } from './core/knowledge-check.js';
+import { createKnowledgeChangeStore } from './core/knowledge-changes.js';
+import { createGeneratedClassifier } from './core/knowledge-classify.js';
+import { createGuideDrafter } from './core/knowledge-draft.js';
+import { createGitMirror, defaultGitLocations } from './core/knowledge-git.js';
+import { createKnowledgeHistory, defaultHistoryDir } from './core/knowledge-history.js';
+import { createKnowledgeWriter } from './core/knowledge-write.js';
+import { registerWriteProtectedRoots } from './core/protected-local-resources.js';
 import { writeDatabaseOpenMarker } from './core/database-open-marker.js';
 import { createMcpManager } from './core/mcp-manager.js';
 import { createMcpServerFinder } from './core/mcp-registry-lookup.js';
@@ -60,6 +70,9 @@ import { createChatJobStore } from './core/chat-jobs.js';
 import { createEtlRunWatcher } from './core/etl-run-watcher.js';
 import { CONTINUATION_HEADER, createContinuationBridge, createContinuationRunner } from './core/chat-continuations.js';
 import { withJobMandate } from './core/job-mandate.js';
+import { createKnowledgeLibrary } from './core/knowledge-library.js';
+import { createKnowledgeMigration } from './core/knowledge-migration.js';
+import { withKnowledgeChatTools } from './core/knowledge-chat-tools.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
 import { createVisualAssetRegistry } from './core/visual-assets.js';
 import { createVisualInspector } from './core/visual-inspector.js';
@@ -296,6 +309,14 @@ async function main() {
   const storage = createStorage();
   storage.initialize();
   const db = storage.getDb();
+
+  // ── Knowledge library boundaries (knowledge-library.md K1, K2) ──
+  // These two providers need only the database and the environment, so they are registered HERE, before the MCP
+  // manager launches any custom-command server: a server keeps the sandbox profile it was launched with, for its
+  // life, and a provider registered later would leave every boot-time server able to write the folder. The library
+  // service itself is built later; these must not move below `createMcpManager` (knowledge-boot-order.test.ts).
+  registerWriteProtectedRoots(() => knowledgeDenyRoots(db));
+  registerCaptureExcludedRoots(() => knowledgeExcludedRoots(db));
 
   console.log('✅ Database initialized');
 
@@ -711,8 +732,41 @@ async function main() {
   // tools are refused while Amazon Employee is off, and export_footer lives there.
   // The Drive sync is built later (with the Gmail sync); chat reaches it through this reference.
   let gdriveSyncRef: GdriveSyncs | null = null;
+  // The Knowledge library (knowledge-library.md): built here, after the database, from the database alone. Its sandbox
+  // deny and capture exclusion were registered earlier (right after the database opened).
+  const knowledgeLibrary = createKnowledgeLibrary({ db });
+  const knowledgeMigration = createKnowledgeMigration({ db, library: knowledgeLibrary, onboardingBusy: () => etlOnboarding.getStatus().state === 'running' });
+  // The write path (knowledge-library.md K13, K16, K17): History and its best-effort git mirror live in BotBoy's private state
+  // (never in the visible folder); the guide check and the guide drafter run on the Document writing switch the owner already
+  // controls. Nothing here touches the disk before a tool call or a route needs it.
+  const knowledgeRootNow = () => canonicalRootOrNull(db);
+  const knowledgeHistory = createKnowledgeHistory({
+    dir: defaultHistoryDir(), root: knowledgeRootNow,
+    git: createGitMirror({ ...defaultGitLocations(), workTree: knowledgeRootNow }),
+    classify: createGeneratedClassifier(knowledgeRootNow),
+  });
+  // A change staged, applied or dismissed moves the library version, so Settings → Knowledge refetches on its existing poll.
+  const knowledgeChanges = createKnowledgeChangeStore(db, { onChange: () => knowledgeLibrary.bump() });
+  knowledgeChanges.sweep();
+  const knowledgeWriter = createKnowledgeWriter({
+    db, library: knowledgeLibrary, history: knowledgeHistory, changes: knowledgeChanges,
+    check: createGuideCheck({ client: () => aiModelSettings.documents, thinking: () => aiModelSettings.status().roles.documents.thinking }),
+    drafter: createGuideDrafter({ client: () => aiModelSettings.documents }),
+  });
+  // The folder as it stands at boot becomes History's starting point (or edits made while BotBoy was off are recorded), in the
+  // background and only for an owner who created the library: an install without one makes no path access.
+  if (knowledgeLibrary.isActivated()) {
+    startInBackground('Knowledge history', async () => { await knowledgeHistory.reconcile({ force: true }); }, '✅ Knowledge history checked');
+  }
+  // An owner who created the library gets its lesson projections repaired and its sets read once at boot, in the background
+  // (never before the owner's click created the folder: an install without a library makes no path access).
+  if (knowledgeLibrary.isActivated()) {
+    startInBackground('Knowledge library', async () => { await knowledgeLibrary.rescan(); }, '✅ Knowledge library scanned');
+  }
+  // withKnowledgeChatTools sits directly inside withWorkplaceChatTools, so the job mandate filters first, and it answers
+  // its own two tools before the base executor, so the base's result cap never applies to a whole-file load.
   const toolExecutor = withJobMandate(
-    withWorkplaceChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
+    withWorkplaceChatTools(withKnowledgeChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
@@ -720,7 +774,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
@@ -1708,6 +1762,11 @@ async function main() {
     captureHealth,
     chatJobs,
     chatContinuations,
+    knowledgeLibrary,
+    knowledgeWriter,
+    knowledgeHistory,
+    knowledgeChanges,
+    knowledgeMigration,
     appUpdater,
     browserCapture: { state: browserCaptureState, monitor: browserMonitor },
     workplace,

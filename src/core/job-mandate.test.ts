@@ -73,10 +73,11 @@ describe('job mandate gate', () => {
   });
 
   // Source seam: the Gmail and document wrappers answer their tools before the
-  // base executor, so the mandate gate must wrap them all.
+  // base executor, so the mandate gate must wrap them all. The Knowledge library
+  // wrapper sits directly inside the workplace one, so the mandate filters first.
   it('is the outermost wrapper of the chat executor (index.ts)', () => {
     const index = readFileSync(path.join(process.cwd(), 'src/index.ts'), 'utf8');
-    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withKnowledgeChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
   });
 
   it('offers a continuation only the job-scope tools', () => {
@@ -86,5 +87,15 @@ describe('job mandate gate', () => {
       expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom)/);
     }
     expect(isJobScopeTool('mcp_etl_submit_run')).toBe(false);
+  });
+
+  // The Knowledge library (knowledge-library.md K9, K18): a continuation may read the library and PROPOSE a change (a card);
+  // it can never write or create a set.
+  it('lets a continuation read the library and propose, and never write or create a set', () => {
+    expect([...JOB_SCOPE_TOOLS].filter(name => name.startsWith('knowledge_')).sort()).toEqual(['knowledge_list', 'knowledge_load', 'knowledge_propose']);
+    const offered = ['knowledge_list', 'knowledge_load', 'knowledge_propose', 'knowledge_write', 'knowledge_create_set'].map(name => ({ type: 'function', function: { name } }));
+    expect(filterToolsForContinuation(offered).map(tool => tool.function.name)).toEqual(['knowledge_list', 'knowledge_load', 'knowledge_propose']);
+    expect(isJobScopeTool('knowledge_write')).toBe(false);
+    expect(isJobScopeTool('knowledge_create_set')).toBe(false);
   });
 });

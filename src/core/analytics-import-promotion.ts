@@ -7,8 +7,8 @@ import { analyticsDatasetContractSha256 } from './analytics-data-room-store.js';
 import { analyticsSha256, stableAnalyticsJson } from './analytics-data-room-policy.js';
 import type { AnalyticsDatasetDefinitionInput, AnalyticsVersionPromotionReceipt } from './analytics-data-room-types.js';
 import type { AnalyticsImportCandidateReader } from './analytics-import-inbox.js';
-import { AnalyticsImportInboxError } from './analytics-import-inbox.js';
-import { loadAnalyticsContext, resolveAnalyticsContextDir } from './analytics-context.js';
+import { AnalyticsImportInboxError, blockedContextError } from './analytics-import-inbox.js';
+import { analyticsLibraryMode, loadAnalyticsContext, resolveAnalyticsContextDir } from './analytics-context.js';
 import {
   ANALYTICS_IMPORT_TRANSFORM_VERSION,
   type AnalyticsImportPreparedRows,
@@ -217,7 +217,13 @@ export function createAnalyticsImportPromotionService(input: {
     for (const receipt of receipts) {
       const absolute = path.resolve(root, receipt.preset);
       if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) throw new AnalyticsImportInboxError('integrity_failed', 'Analytics context path escaped its configured root.');
-      const stat = fs.lstatSync(absolute);
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(absolute);
+      } catch (error) {
+        // A folder macOS will not let BotBoy read is not a changed file: the state stays as it was and the owner retries.
+        throw blockedContextError(error, root, analyticsLibraryMode(db)) ?? error;
+      }
       if (!stat.isFile() || stat.isSymbolicLink() || sha256(fs.readFileSync(absolute)) !== receipt.sourceSha256) {
         throw new AnalyticsImportInboxError('conflict', `Analytics context ${receipt.preset} changed after review preparation.`, 'Prepare a new semantic review.');
       }

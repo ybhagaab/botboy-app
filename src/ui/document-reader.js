@@ -247,3 +247,52 @@ export function toggleDocumentLibraryState(current, { isMobile = false, hasArtif
   }
   return { state: next, navigateToList: false };
 }
+
+/**
+ * Where an evidence-citation bubble goes, in the scroll-content coordinates of the shell that holds it.
+ *
+ * The bubble is an absolutely positioned child of `.document-preview-shell`, which is a scroll container: `top` and
+ * `left` are measured from the shell's padding box at scroll zero. A viewport rect (`getBoundingClientRect`) therefore
+ * has to be shifted by the shell's own scroll offset. Without it the bubble lands exactly `scrollTop` pixels above the
+ * chip that was clicked, which on a long document is far away from it or out of sight.
+ *
+ * Just below the chip by default. Above it when it would run past the bottom of the visible area and fits above.
+ * Never outside the visible part of the shell sideways, and kept inside it vertically whenever it is short enough.
+ *
+ * Plain numbers in and out (no DOM), so the geometry is testable without a layout engine:
+ * `chip` is the chip's viewport rect ({ top, bottom, left }), `shell` its viewport { top, left } plus the borders
+ * (clientTop, clientLeft), the visible size (clientWidth, clientHeight) and the scroll offset (scrollTop, scrollLeft),
+ * `popover` the bubble's own size ({ width, height }).
+ */
+export function placeDocCitePopover({ chip, shell, popover, gap = 6, margin = 8, nudge = 20 } = {}) {
+  const num = (value, fallback = 0) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const originTop = num(shell?.top) + num(shell?.clientTop) - num(shell?.scrollTop);
+  const originLeft = num(shell?.left) + num(shell?.clientLeft) - num(shell?.scrollLeft);
+  const chipBottom = num(chip?.bottom) - originTop;
+  const chipTop = num(chip?.top, num(chip?.bottom)) - originTop;
+  const width = Math.max(0, num(popover?.width));
+  const height = Math.max(0, num(popover?.height));
+  const visibleTop = num(shell?.scrollTop);
+  const visibleBottom = visibleTop + Math.max(0, num(shell?.clientHeight));
+  const visibleLeft = num(shell?.scrollLeft);
+  const visibleRight = visibleLeft + Math.max(0, num(shell?.clientWidth));
+
+  const below = chipBottom + gap;
+  const above = chipTop - gap - height;
+  const lowest = Math.max(visibleTop + margin, visibleBottom - margin - height);
+  let top = below;
+  let placement = 'below';
+  if (below + height > visibleBottom - margin) {
+    if (above >= visibleTop + margin) {
+      top = above;
+      placement = 'above';
+    } else {
+      top = Math.max(visibleTop + margin, Math.min(below, lowest));
+      placement = 'clamped';
+    }
+  }
+
+  const wanted = num(chip?.left) - originLeft - nudge;
+  const left = Math.max(visibleLeft + margin, Math.min(wanted, visibleRight - margin - width));
+  return { top: Math.round(top), left: Math.round(left), placement };
+}

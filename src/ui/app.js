@@ -1916,6 +1916,9 @@ const GMAIL_DRAFT_MARKER_RE = /\[\[gmail-draft:([A-Za-z0-9_-]{1,128})\]\]/g;
 // [[mcp-server:<id>]] (custom servers only); the chat router appends any
 // marker the model left out (MCP_REMOTE_TRANSPORTS_PLAN.md MR1).
 const MCP_SERVER_MARKER_RE = /\[\[mcp-server:(custom-[a-z0-9][a-z0-9-]{0,79})\]\]/g;
+// knowledge_propose / knowledge_write / knowledge_create_set replies carry [[knowledge:<kc_id>]]; the chat router appends any
+// marker the model left out (docs/maps/knowledge-library.md K18). The card is the Knowledge library's change card.
+const KNOWLEDGE_MARKER_RE = /\[\[knowledge:(kc_[a-f0-9]{12})\]\]/g;
 
 /**
  * Expands every card marker in the chat bubbles under `root`, then fills the
@@ -1933,14 +1936,17 @@ function hydrateChatCards(root) {
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
     MCP_SERVER_MARKER_RE.lastIndex = 0;
-    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html)) continue;
+    KNOWLEDGE_MARKER_RE.lastIndex = 0;
+    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html) && !KNOWLEDGE_MARKER_RE.test(html)) continue;
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
     MCP_SERVER_MARKER_RE.lastIndex = 0;
+    KNOWLEDGE_MARKER_RE.lastIndex = 0;
     bubble.innerHTML = html
       .replace(LESSON_MARKER_RE, (_, id) => `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`)
       .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`)
-      .replace(MCP_SERVER_MARKER_RE, (_, id) => `<div class="mcp-server-card" data-mcp-server-id="${id}" aria-live="polite"><em>Loading the MCP server…</em></div>`);
+      .replace(MCP_SERVER_MARKER_RE, (_, id) => `<div class="mcp-server-card" data-mcp-server-id="${id}" aria-live="polite"><em>Loading the MCP server…</em></div>`)
+      .replace(KNOWLEDGE_MARKER_RE, (_, id) => `<div class="knowledge-card knowledge-chat-card" data-knowledge-change-id="${id}" aria-live="polite"><em>Loading the change…</em></div>`);
   }
   for (const card of root.querySelectorAll('.lesson-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
@@ -1953,6 +1959,10 @@ function hydrateChatCards(root) {
   for (const card of root.querySelectorAll('.mcp-server-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
     void fillMcpServerCard(card);
+  }
+  for (const card of root.querySelectorAll('.knowledge-chat-card:not([data-hydrated])')) {
+    card.dataset.hydrated = '1';
+    void fillKnowledgeCard(card);
   }
 }
 
@@ -1982,6 +1992,77 @@ function paintLessonCard(card, lesson) {
   }
 }
 
+// ── Knowledge library: the chat card for a proposed, held or applied change (docs/maps/knowledge-library.md K18, K19) ──
+// The rendering is knowledge-ui.js (window.BotBoyKnowledge.renderChangeCard, escaped there); the buttons are the owner's
+// decisions. Apply sends two booleans and no text: the server applies the change it stored. Ask BotBoy to fix and Re-draft
+// are ordinary owner messages that carry the card marker (no route of their own).
+async function fillKnowledgeCard(card) {
+  try {
+    const change = await api(`/knowledge/changes/${card.dataset.knowledgeChangeId}`);
+    if (!change || !change.id) throw new Error(change?.error || 'unavailable');
+    paintKnowledgeCard(card, change);
+  } catch {
+    card.innerHTML = '<em>This change is unavailable.</em>';
+  }
+}
+function paintKnowledgeCard(card, change, notice) {
+  const ui = window.BotBoyKnowledge;
+  card.knowledgeChange = change;
+  card.innerHTML = ui && ui.renderChangeCard
+    ? ui.renderChangeCard(change, { esc: lessonEsc, attr: lessonEsc }, { expandDiff: card.dataset.expanded === '1', notice })
+    : '<em>The Knowledge card did not load. Reload this tab.</em>';
+}
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('.knowledge-chat-card [data-knowledge-action]');
+  if (!button) return;
+  const card = button.closest('.knowledge-chat-card');
+  const change = card?.knowledgeChange;
+  const action = button.dataset.knowledgeAction;
+  const id = card?.dataset.knowledgeChangeId;
+  if (!card || !change || !id) return;
+  if (action === 'diff-more') {
+    card.dataset.expanded = '1';
+    paintKnowledgeCard(card, change);
+    return;
+  }
+  const ui = window.BotBoyKnowledge;
+  if (action === 'ask-fix' || action === 'redraft') {
+    const input = document.getElementById('chatInput');
+    if (!input || !ui) return;
+    input.value = ui.followUpMessage(action, id);
+    if (typeof window.submitChat === 'function') await window.submitChat();
+    return;
+  }
+  const routes = { apply: 'apply', 'apply-anyway': 'apply', dismiss: 'dismiss', recheck: 'recheck', undo: 'undo' };
+  const route = routes[action];
+  if (!route) return;
+  for (const other of card.querySelectorAll('button')) other.disabled = true;
+  try {
+    const body = route === 'apply' && ui ? ui.applyBody(change, action) : undefined;
+    const payload = await api(`/knowledge/changes/${id}/${route}`, { method: 'POST', ...(body ? { body } : {}) });
+    if (route === 'undo' && payload && payload.ok) {
+      paintKnowledgeCard(card, { ...change, status: 'undone' });
+      return;
+    }
+    if (payload && payload.change && (payload.ok || payload.code)) {
+      paintKnowledgeCard(card, payload.change, payload.ok ? undefined : [payload.error, payload.nextAction].filter(Boolean).join(' '));
+    } else if (payload && payload.ok) {
+      await fillKnowledgeCard(card);
+    } else {
+      throw new Error(payload?.error || 'unexpected response');
+    }
+  } catch (error) {
+    for (const other of card.querySelectorAll('button')) other.disabled = false;
+    let note = card.querySelector('.knowledge-card-error');
+    if (!note) {
+      note = document.createElement('div');
+      note.className = 'knowledge-card-error';
+      note.setAttribute('role', 'alert');
+      card.appendChild(note);
+    }
+    note.textContent = `Could not do that: ${String(error?.message || error)}. Try again.`;
+  }
+});
 document.addEventListener('click', async (event) => {
   const button = event.target.closest('[data-lesson-action]');
   if (!button) return;

@@ -998,7 +998,7 @@ body.chat-width-expand.assistant-open .workspace { margin-right:0; }
 .doc-cite.flash { animation:doc-cite-flash 1.6s ease; }
 @keyframes doc-cite-flash { 0%,60% { box-shadow:0 0 0 4px var(--accent-soft); color:#fff; background:var(--accent-strong); } 100% { box-shadow:none; } }
 .doc-cite.static { cursor:default; pointer-events:none; flex:0 0 auto; }
-.doc-cite-popover { position:absolute; z-index:60; display:flex; flex-direction:column; gap:7px; width:min(328px,calc(100% - 16px)); padding:13px 14px; border:1px solid var(--border-strong); border-radius:12px; background:var(--bg-raised); box-shadow:0 18px 50px rgba(0,0,0,.4); font-size:12px; }
+.doc-cite-popover { position:absolute; z-index:60; display:flex; flex-direction:column; gap:7px; width:min(328px,calc(100% - 16px)); max-height:min(360px,calc(100% - 16px)); overflow-y:auto; padding:13px 14px; border:1px solid var(--border-strong); border-radius:12px; background:var(--bg-raised); box-shadow:0 18px 50px rgba(0,0,0,.4); font-size:12px; }
 .doc-cite-popover strong { font-size:12px; line-height:1.4; }
 .doc-cite-popover blockquote { margin:0; padding:7px 10px; border-left:2px solid var(--accent); border-radius:0 8px 8px 0; color:var(--soft); background:var(--surface-2); font-size:11.5px; font-style:italic; }
 .doc-cite-popover a { color:var(--accent); font-size:11.5px; }
@@ -2086,3 +2086,42 @@ a.data-room-row:hover { background:var(--hover); }
 @keyframes uc-dots { 0% { content:""; } 25% { content:"."; } 50% { content:".."; } 75%,100% { content:"..."; } }
 @media (prefers-reduced-motion: reduce) { .update-chip, .update-chip *, .update-chip::after, .update-chip .uc-bar::before { animation:none !important; } }
 .chat-via-whatsapp { display:block; margin-bottom:4px; color:var(--muted); font-size:10.5px; font-weight:600; letter-spacing:.02em; }
+/* ── Settings → Knowledge (Knowledge library, 2026-10-15): no new motion, scroller or poll ── */
+.knowledge-settings { display:grid; gap:14px; max-width:980px; }
+.knowledge-settings .settings-panel .mcp-alert { margin:0 0 12px; }
+.knowledge-location .mcp-form-body p.card-meta { margin:4px 0 0; line-height:1.5; }
+.knowledge-path { display:block; color:var(--soft) !important; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; overflow-wrap:anywhere; }
+.knowledge-sets-table th[scope="row"] { text-align:left; font-weight:inherit; }
+.knowledge-set-id { display:block; margin-top:2px; color:var(--faint); font-size:10px; overflow-wrap:anywhere; }
+.knowledge-description { max-width:340px; color:var(--muted); overflow-wrap:anywhere; }
+.knowledge-issues { margin:0; padding-left:16px; color:var(--yellow); font-size:11px; }
+.knowledge-confirm { display:flex; align-items:flex-start; gap:8px; margin-top:8px; color:var(--soft); font-size:11px; }
+.knowledge-form-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+.knowledge-change-form { margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
+.knowledge-plan { display:grid; gap:10px; margin-top:12px; }
+.knowledge-plan .mcp-alert { margin:0; }
+.knowledge-sync-note { margin:8px 0 0; }
+.knowledge-usage-list { display:grid; gap:8px; margin:0; padding-left:18px; color:var(--muted); font-size:11px; line-height:1.55; }
+.knowledge-usage-list strong { color:var(--soft); }
+/* Knowledge write path (K19): the change card in chat and on the page, the pending list and History. */
+.knowledge-card { margin:10px 0 4px; padding:11px 12px; border:1px solid var(--border-strong); border-radius:11px; background:var(--surface); display:grid; gap:8px; }
+.knowledge-page-card { margin:0 0 10px; }
+.knowledge-card-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.knowledge-card-kind { font-size:10px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); }
+.knowledge-card-why { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
+.knowledge-card-source { margin:0; padding:7px 9px; border:1px solid rgba(255,190,90,.4); border-radius:8px; background:rgba(255,190,90,.08); font-size:12px; line-height:1.5; }
+.knowledge-diff { margin:0; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel, rgba(0,0,0,.18)); font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.knowledge-diff-line { display:block; }
+.knowledge-diff-line.add { color:#7bd88f; }
+.knowledge-diff-line.del { color:#ff8f8f; }
+.knowledge-items { margin:0; padding-left:18px; font-size:12px; line-height:1.55; }
+.knowledge-items q { color:var(--soft); }
+.knowledge-card-state { font-size:12px; color:var(--muted); }
+.knowledge-card-state.good { color:#7bd88f; }
+.knowledge-card-state.warn { color:#ffbe5a; }
+.knowledge-card-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.knowledge-card-note, .knowledge-card-error { font-size:12px; color:#ffbe5a; }
+.knowledge-card-error { color:#ff8f8f; }
+.knowledge-history { list-style:none; margin:0; padding:0; display:grid; gap:10px; }
+.knowledge-history-entry { display:grid; gap:6px; padding-bottom:10px; border-bottom:1px solid var(--border); }
+.knowledge-history-file { display:grid; gap:4px; margin-top:6px; }

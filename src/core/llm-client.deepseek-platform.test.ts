@@ -184,6 +184,69 @@ describe('DeepSeek platform transport', () => {
     client.close();
   });
 
+  // D1 (report 2026-10-15 § 6): a 503 on a non-streaming call used to read "503 — retryable" and drop the provider's
+  // words, which Save then took for a network failure. The hosted platforms now say what the provider said.
+  it('says what the provider said on a 503 from a non-streaming call, after the same one-second wait as before', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = installFetch(() => new Response('Server Overloaded', { status: 503 }));
+      const client = createLlmClient(deepSeekConfig());
+      let settled = false;
+      const pending = client.chatCompletion({ messages: [{ role: 'user', content: 'hi' }] }).catch(e => e as Error).finally(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled, 'the first backoff is still 1 s').toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await pending;
+      expect(error.message).toBe('HTTP 503: Server Overloaded');
+      expect(error.message).not.toContain('retryable');
+      // One request: the retry stays with the caller, as it did, and a 503 is not a credential problem.
+      expect(posts(fetchMock)).toHaveLength(1);
+      expect(client.getProviderIssue?.()).toBeUndefined();
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives the same provider text on a 503 for the OpenAI platform, and the streaming path is unchanged', async () => {
+    vi.useFakeTimers();
+    try {
+      installFetch(() => json(503, { error: { message: 'The server is overloaded' } }));
+      const client = createLlmClient(deepSeekConfig({ providerId: 'openai', platform: 'openai' }));
+      const pending = client.chatCompletion({ messages: [{ role: 'user', content: 'hi' }] }).catch(e => e as Error);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await pending).message).toBe('HTTP 503: {"error":{"message":"The server is overloaded"}}');
+      const stream = client.chatCompletionStream({ messages: [{ role: 'user', content: 'hi' }] });
+      const streamError = await stream.next().catch(e => e as Error);
+      expect((streamError as Error).message).toBe('HTTP 503: {"error":{"message":"The server is overloaded"}}');
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the short retryable marker for a team gateway, which is not a hosted platform', async () => {
+    vi.useFakeTimers();
+    try {
+      installFetch(() => new Response('upstream gone', { status: 503 }));
+      const client = createLlmClient(deepSeekConfig({ providerId: 'gateway', platform: undefined }));
+      const pending = client.chatCompletion({ messages: [{ role: 'user', content: 'hi' }] }).catch(e => e as Error);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await pending).message).toBe('503 — retryable');
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits nothing on a health-neutral 503 (the Save check) and still shows the provider text', async () => {
+    installFetch(() => new Response('Server Overloaded', { status: 503 }));
+    const client = createLlmClient(deepSeekConfig());
+    const error = await client.chatCompletionPrimary({ messages: [{ role: 'user', content: 'hi' }] }).catch(e => e as Error);
+    expect(error.message).toBe('HTTP 503: Server Overloaded');
+    client.close();
+  });
+
   it('labels usage rows deepseek', async () => {
     let storage: StorageLayer | undefined;
     try {

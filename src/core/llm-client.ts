@@ -7,6 +7,7 @@
 import type { AcpResponse, AcpChatMessage } from './types.js';
 import { signBedrockRequest } from './aws-sigv4.js';
 import { logLlmPrompt } from './llm-prompt-log.js';
+import { withTransportCodes } from './transport-errors.js';
 import type { LlmModelOperation } from './llm-model-operation.js';
 import {
   createNoopLlmUsageService,
@@ -1214,7 +1215,9 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           errorClass: usageErrorClass(error, 'FetchError'),
           usage: emptyProviderUsage(),
         });
-        throw error;
+        // `TypeError: fetch failed` keeps its errno one level down (cause). Say it where people read it:
+        // `fetch failed (ETIMEDOUT+EHOSTUNREACH)`, with words for a certificate a proxy replaced. Same error object.
+        throw withTransportCodes(error);
       }
     };
 
@@ -1697,6 +1700,10 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         const wait = Math.min(1000 * Math.pow(2, requestEp.retryCount++), 30000);
         await new Promise(r => setTimeout(r, wait));
       }
+      // The hosted platforms (the owner's own OpenAI or DeepSeek key) say what the provider said, like the streaming
+      // path does ("HTTP 503: Server Overloaded"); a 429 never gets here for them (postWithAuthRetry owns it). A team
+      // gateway keeps its short marker.
+      if (hostedPlatform && !requestEp.useOllamaApi) throw providerHttpError(resp.status, detail, size);
       throw new Error(`${resp.status} — retryable`);
     }
 

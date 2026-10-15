@@ -12,6 +12,8 @@
 
 import WebSocket from 'ws';
 import type { RawWorkItem, WorkItemType } from '../core/types.js';
+import { fileURLToPath } from 'url';
+import { isCaptureExcludedPath } from '../core/capture-exclusions.js';
 import { redactSecrets } from '../core/sensitive-files.js';
 import {
   FORM_FIELDS_READER,
@@ -238,6 +240,20 @@ export function isNoiseFrame(url: string): boolean {
     return true;
   }
 }
+
+/**
+ * A `file:` page that lives in the Knowledge library (or in a former library folder) is never polled, so a reference
+ * file the owner opens in the debug Chrome does not become a page capture (knowledge-library.md K1; P1 review N3). A
+ * `file:` URL that cannot be turned into a local path is not judged here (it is captured as before).
+ */
+export function isCaptureExcludedFileUrl(url: string): boolean {
+  if (!/^file:/i.test(String(url ?? ''))) return false;
+  try {
+    return isCaptureExcludedPath(fileURLToPath(url), { resolveLinks: true });
+  } catch {
+    return false;
+  }
+}
 interface TabInfo {
   url: string;
   title: string;
@@ -291,6 +307,7 @@ async function fetchTabs(endpoint: string, shouldSkipTarget?: (targetId: string)
       .filter((t: any) => {
         if (t.type !== 'page' || !t.url) return false;
         if (shouldSkipTarget?.(String(t.id ?? ''))) return false;
+        if (isCaptureExcludedFileUrl(t.url)) return false;
         return !BLOCKED_URLS.some(p => p.test(t.url));
       })
       .map((t: any) => ({

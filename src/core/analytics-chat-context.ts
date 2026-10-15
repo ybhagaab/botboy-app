@@ -10,9 +10,9 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 /** Kimi-era floor for analytics operating knowledge; the old path allowed only 16K characters. */
 const MIN_ANALYTICS_CONTEXT_BUDGET_TOKENS = 80_000;
 /** Reserve completion, tools, schema observations, and conversation state outside operating knowledge. */
-const RUNTIME_RESERVE_TOKENS = 48_000;
+export const RUNTIME_RESERVE_TOKENS = 48_000;
 /** Conservative estimator already used by the chat loop for JSON/Markdown-heavy prompts. */
-const ESTIMATED_CHARS_PER_TOKEN = 2.7;
+export const ESTIMATED_CHARS_PER_TOKEN = 2.7;
 
 const GENERIC_GROUNDING_TERMS = new Set([
   'analysis', 'analytics', 'schema', 'context', 'table', 'tables', 'query', 'queries',
@@ -66,7 +66,7 @@ interface SchemaContextResult {
  * the complete-context guarantee (the token budget check downstream governs
  * whether the briefing fits the model window).
  */
-const KNOWLEDGE_COMPLETE_MAX_CHARS = 2_000_000;
+export const KNOWLEDGE_COMPLETE_MAX_CHARS = 2_000_000;
 
 export interface AnalyticsContextFileReceipt {
   preset: string;
@@ -98,6 +98,12 @@ export interface AnalyticsSchemaBriefingLoaderOptions {
   contextWindowTokens?: number;
   /** Enables the knowledge-directory catalog source (listAnalyticsContext/loadAnalyticsContext). */
   db?: Database.Database;
+  /**
+   * The Knowledge library's one-sentence pointer to its analytics sets, or null/empty when it has none. Added to the
+   * "no knowledge" text only; absent, or returning nothing, that text is exactly what it was
+   * (knowledge-library.md K10).
+   */
+  knowledgeHint?: () => string | null;
 }
 
 const ANALYTICS_STRONG_SIGNAL_RE = /\b(?:analytics?|business intelligence|data (?:analysis|exploration|insights?)|kpis?|cohort(?: analysis)?|funnel(?: analysis)?|retention(?: analysis)?|attribution(?: analysis)?|segmentation|time[- ]series)\b/i;
@@ -377,6 +383,16 @@ export function analyticsBriefingUnavailableText(amazonEmployee: boolean): strin
   return `BotBoy could not load business/schema knowledge from any source. Check the managed SQL connector (#/connections/sql-context) and the analytics knowledge directory ${amazonEmployee ? '(a2-analytics connection card)' : '(shown on the same SQL connection page)'} before building a dashboard.`;
 }
 
+/** The Knowledge library pointer for the "no knowledge" text; empty unless the library reports analytics sets. */
+function libraryPointer(options: AnalyticsSchemaBriefingLoaderOptions): string {
+  try {
+    const hint = options.knowledgeHint?.();
+    return hint ? ` ${hint}` : '';
+  } catch {
+    return '';
+  }
+}
+
 export function createAnalyticsSchemaBriefingLoader(
   mcpManager?: McpManager,
   options: AnalyticsSchemaBriefingLoaderOptions = {},
@@ -425,9 +441,14 @@ export function createAnalyticsSchemaBriefingLoader(
       // ── Source 2: local analytics knowledge directory ──
       const knowledgeCatalog: AnalyticsContextCatalogEntry[] = [];
       let knowledgeSignature = 'no-db';
+      // Library mode only: a Knowledge folder macOS will not let BotBoy read is named in the "no knowledge" text, never
+      // mistaken for an empty folder. Legacy mode never sets it, so that text is byte-identical.
+      let blockedFolderNote = '';
       if (options.db) {
         try {
-          const { files } = listAnalyticsContext(options.db);
+          const listing = listAnalyticsContext(options.db);
+          if (listing.unavailable) blockedFolderNote = ` The Knowledge folder is blocked: ${listing.unavailable.message} ${listing.unavailable.nextAction}`;
+          const { files } = listing;
           knowledgeSignature = files.map(file => `${file.name}:${file.modifiedAt}:${file.bytes}`).join('|') || 'empty';
           for (const file of files) {
             const parts = [
@@ -459,7 +480,7 @@ export function createAnalyticsSchemaBriefingLoader(
         return unavailable(
           `${sqlStatusLine} No business/schema knowledge is available from any source. Configure a schema knowledge source at #/connections/sql-context, or add knowledge files to the analytics knowledge directory ${runtimeOptions.amazonEmployee === false
             ? 'shown on the SQL connection page (#/connections/sql-context).'
-            : '(a2-analytics connection card — ETL onboarding can generate business presets).'}`,
+            : '(a2-analytics connection card — ETL onboarding can generate business presets).'}${blockedFolderNote}${libraryPointer(options)}`,
         );
       }
 

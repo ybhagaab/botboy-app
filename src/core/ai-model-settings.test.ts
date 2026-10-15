@@ -5,7 +5,7 @@ import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { inspect } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AI_MODEL_SETTINGS_FILE, AiModelSettingsError, aiModelIssueText, createAiModelSettingsService } from './ai-model-settings.js';
+import { AI_MODEL_SETTINGS_FILE, AiModelSettingsError, aiModelIssueText, createAiModelSettingsService, modelSettingsError } from './ai-model-settings.js';
 import {
   FAKE_ANTHROPIC_KEY,
   FAKE_D10_ROWS,
@@ -20,6 +20,7 @@ import { createLlmUsageService } from './llm-usage.js';
 import { pinLlmClient } from './llm-client-switch.js';
 import type { LlmClient } from './llm-client.js';
 import { createStorage, type StorageLayer } from './storage.js';
+import { canMakeSelfSignedCert, closedLoopbackPort, startSelfSignedServer } from './tls-loopback.testutil.js';
 
 /**
  * Settings → AI model end to end against local fakes of the OpenAI and
@@ -34,6 +35,13 @@ const QUOTA_KEY = 'sk-proj-noquotasettingskey0000000000qqqq';
 const NO_TERRA_KEY = 'sk-proj-noterrasettingskey0000000000nnnn';
 const DEEPSEEK_KEY = 'sk-deepseeksettings0000000000000000dddd';
 const DEEPSEEK_EMPTY_KEY = 'sk-deepseekempty000000000000000000eeee';
+// A DeepSeek key whose model list works but whose generations answer HTTP 503 "Server Overloaded".
+const DEEPSEEK_BUSY_KEY = 'sk-deepseekbusy00000000000000000000bbbb';
+// A DeepSeek key whose model list works but whose generations are cut off mid-request (the socket is destroyed).
+const DEEPSEEK_CUT_KEY = 'sk-deepseekcut000000000000000000000cccc';
+// A DeepSeek key whose model list works but whose generations answer HTTP 400 with a long body that echoes a key.
+const DEEPSEEK_REJECT_KEY = 'sk-deepseekreject00000000000000000rrrr';
+const ECHOED_KEY = 'sk-plantedecho0123456789abcdefghij';
 
 const DEEPSEEK_MODELS = [
   {
@@ -80,10 +88,18 @@ async function startFakes(): Promise<Fakes> {
       const key = auth.replace(/^Bearer /, '');
       if (host === 'gateway') return send(200, completed('gateway'));
       if (host === 'deepseek') {
-        if (![DEEPSEEK_KEY, DEEPSEEK_EMPTY_KEY].includes(key)) return send(401, { error: { message: 'Authentication Fails, Your api key is invalid' } });
+        if (![DEEPSEEK_KEY, DEEPSEEK_EMPTY_KEY, DEEPSEEK_BUSY_KEY, DEEPSEEK_CUT_KEY, DEEPSEEK_REJECT_KEY].includes(key)) return send(401, { error: { message: 'Authentication Fails, Your api key is invalid' } });
         if (req.method === 'GET' && url === '/models') return send(200, { object: 'list', data: DEEPSEEK_MODELS });
         if (req.method === 'POST' && url === '/responses') {
+          if (key === DEEPSEEK_CUT_KEY) { req.socket.destroy(); return; }
+          if (key === DEEPSEEK_REJECT_KEY) {
+            return send(400, { error: { message: `Invalid request: reasoning is not accepted here. Echoed ${ECHOED_KEY} ${'padding '.repeat(60)}` } });
+          }
           if (key === DEEPSEEK_EMPTY_KEY) return send(402, { error: { message: 'Insufficient Balance' } });
+          if (key === DEEPSEEK_BUSY_KEY) {
+            res.writeHead(503, { 'content-type': 'text/plain' });
+            return res.end('Server Overloaded');
+          }
           return send(200, completed('deepseek'));
         }
         return send(404, { error: { message: 'not found' } });
@@ -155,7 +171,7 @@ describe('Settings → AI model connections', () => {
     await fakes.close();
   });
 
-  async function service(options: { onActivated?: ReturnType<typeof vi.fn>; credentials?: boolean; anthropicEndpoint?: string; now?: () => Date; fetchImpl?: typeof fetch } = {}) {
+  async function service(options: { onActivated?: ReturnType<typeof vi.fn>; credentials?: boolean; anthropicEndpoint?: string; now?: () => Date; fetchImpl?: typeof fetch; deepSeekEndpoint?: string } = {}) {
     const created = await createAiModelSettingsService({
       envProvider,
       usageService: createLlmUsageService(storage.getDb(), { primaryProvider: envProvider.id }),
@@ -163,7 +179,7 @@ describe('Settings → AI model connections', () => {
       privateRoot,
       environmentCredentialsPresent: options.credentials ?? true,
       openAiEndpoint: fakes.openai,
-      deepSeekEndpoint: fakes.deepseek,
+      deepSeekEndpoint: options.deepSeekEndpoint ?? fakes.deepseek,
       ...(options.anthropicEndpoint ? { anthropicEndpoint: options.anthropicEndpoint } : {}),
       ...(options.onActivated ? { onActivated: options.onActivated } : {}),
       ...(options.now ? { now: options.now } : {}),
@@ -344,6 +360,131 @@ describe('Settings → AI model connections', () => {
     await expect(settings.saveApiKey('deepseek', WRONG_KEY)).rejects.toMatchObject({ code: 'invalid_key', nextAction: expect.stringContaining('platform.deepseek.com') });
     expect(fs.existsSync(settingsFile())).toBe(false);
     expect(settings.status().connections.map(connection => connection.id)).toEqual(['team']);
+  });
+
+  // D1 (deepseek-failures report § 6): a provider 5xx at Save used to read "BotBoy could not reach api.deepseek.com
+  // (check your internet, proxy or VPN)", a network verdict for a service that had answered.
+  it('reports a DeepSeek 503 at Save as the provider\'s own trouble, never as a network failure, and changes nothing', async () => {
+    const settings = await service();
+    const error = await settings.saveApiKey('deepseek', DEEPSEEK_BUSY_KEY).catch(e => e);
+    expect(error).toBeInstanceOf(AiModelSettingsError);
+    expect(error).toMatchObject({ code: 'provider_unavailable', httpStatus: 502 });
+    expect(error.message).toBe("DeepSeek answered HTTP 503 (Server Overloaded). That is a problem on DeepSeek's side, so BotBoy could not finish checking the key.");
+    expect(error.nextAction).toBe('Wait a minute, then save the key again. If it keeps failing, the provider may be having an outage.');
+    for (const text of [error.message, error.nextAction]) expect(text).not.toMatch(/could not reach|internet|proxy|VPN/i);
+    expect(String(error.message) + String(error.nextAction)).not.toContain(DEEPSEEK_BUSY_KEY);
+    expect(fs.existsSync(settingsFile())).toBe(false);
+    expect(settings.status().connections.map(connection => connection.id)).toEqual(['team']);
+    // The verification generation ran once; Save does not wait out the client's backoff for a health-neutral check.
+    expect(posts('deepseek')).toHaveLength(1);
+  });
+
+  // D2 (deepseek-failures report § 6): "BotBoy could not reach api.deepseek.com" hid WHY, because getJson swallowed the
+  // error and Node keeps the errno one level down (TypeError: fetch failed → cause). Codes only: never a URL or a key.
+  // D4 (report § 6): the owner sees "rejected the verification request (HTTP 400)" and the provider's own words, which
+  // say WHAT it rejected, were dropped; a failed Save left nothing in /tmp/ppt.log to read.
+  describe('a failed Save check leaves a trace in the log (D4)', () => {
+    const keyCheckLines = () => vi.mocked(console.warn).mock.calls.map(call => call.map(String).join(' ')).filter(text => text.includes('key check failed'));
+
+    it('logs the status and the provider\'s words for a 400, redacted and bounded to 200 characters, while the owner still sees the short sentence', async () => {
+      const settings = await service();
+      const error = await settings.saveApiKey('deepseek', DEEPSEEK_REJECT_KEY).catch(e => e);
+      expect(error).toMatchObject({ code: 'rejected', httpStatus: 502, message: 'DeepSeek rejected the verification request (HTTP 400).' });
+      const lines = keyCheckLines();
+      expect(lines).toHaveLength(1);
+      const [line] = lines;
+      expect(line).toMatch(/^\[AI model\] DeepSeek key check failed: HTTP 400 \{"error":\{"message":"Invalid request: reasoning is not accepted here\. Echoed sk-…\[redacted\]/);
+      // A key-shaped string the provider echoed, and the saved key itself, never reach the log.
+      expect(line).not.toContain(ECHOED_KEY);
+      expect(line).not.toContain(DEEPSEEK_REJECT_KEY);
+      expect(line.length).toBeLessThanOrEqual('[AI model] DeepSeek key check failed: HTTP 400 '.length + 200);
+      expect(line).not.toContain('\n');
+    });
+
+    it('logs the same line for a 503 and a cut connection, and nothing for a Save that works', async () => {
+      const settings = await service();
+      await settings.saveApiKey('deepseek', DEEPSEEK_BUSY_KEY).catch(() => undefined);
+      expect(keyCheckLines().at(-1)).toBe('[AI model] DeepSeek key check failed: HTTP 503 Server Overloaded');
+      await settings.saveApiKey('deepseek', DEEPSEEK_CUT_KEY).catch(() => undefined);
+      expect(keyCheckLines().at(-1)).toMatch(/^\[AI model\] DeepSeek key check failed: fetch failed \((UND_ERR_SOCKET|ECONNRESET)\)$/);
+      expect(keyCheckLines()).toHaveLength(2);
+      await settings.saveApiKey('deepseek', DEEPSEEK_KEY);
+      expect(keyCheckLines()).toHaveLength(2);
+    });
+
+    it('names the provider of the card, and logs a typed limit (no HTTP status in its message) by its own words', async () => {
+      const settings = await service();
+      await settings.saveApiKey('openai', QUOTA_KEY).catch(() => undefined);
+      expect(keyCheckLines()).toEqual(['[AI model] OpenAI key check failed: The OpenAI account behind this API key has no available credit.']);
+    });
+  });
+
+  describe('the network cause at Save (D2)', () => {
+    const errno = (code: string) => Object.assign(new Error(`connect ${code}`), { code, syscall: 'connect' });
+    const failingFetch = (error: unknown) => (async () => { throw error; }) as unknown as typeof fetch;
+
+    it('names the errno of a refused connection (a real loopback socket nothing listens on)', async () => {
+      const settings = await service({ deepSeekEndpoint: `http://127.0.0.1:${await closedLoopbackPort()}` });
+      const error = await settings.saveApiKey('deepseek', DEEPSEEK_KEY).catch(e => e);
+      expect(error).toBeInstanceOf(AiModelSettingsError);
+      expect(error).toMatchObject({ code: 'unreachable', httpStatus: 502, message: 'BotBoy could not reach api.deepseek.com (ECONNREFUSED).' });
+      expect(error.nextAction).toBe('Check your internet connection (and any proxy or VPN rules for api.deepseek.com), then try again.');
+      expect(String(error.message) + String(error.nextAction)).not.toMatch(/127\.0\.0\.1|sk-/);
+      expect(fs.existsSync(settingsFile())).toBe(false);
+    });
+
+    it('lists every address of a failed connect the way Node reports them, and calls a timeout a timeout', async () => {
+      const both = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([errno('ETIMEDOUT'), errno('EHOSTUNREACH')], ''), { code: 'ETIMEDOUT' }) });
+      for (const provider of ['openai', 'deepseek'] as const) {
+        const settings = await service({ fetchImpl: failingFetch(both) });
+        const error = await settings.saveApiKey(provider, provider === 'openai' ? OPENAI_KEY : DEEPSEEK_KEY).catch(e => e);
+        expect(error, provider).toMatchObject({ code: 'unreachable', message: `BotBoy could not reach ${provider === 'openai' ? 'api.openai.com' : 'api.deepseek.com'} (ETIMEDOUT+EHOSTUNREACH).` });
+      }
+      const slow = await service({ fetchImpl: failingFetch(new DOMException('The operation was aborted due to timeout', 'TimeoutError')) });
+      await expect(slow.saveApiKey('deepseek', DEEPSEEK_KEY)).rejects.toMatchObject({ code: 'unreachable', message: 'BotBoy could not reach api.deepseek.com (timed out).' });
+      // No cause to show: the text is what it was.
+      const bare = await service({ fetchImpl: failingFetch(new Error('boom')) });
+      await expect(bare.saveApiKey('deepseek', DEEPSEEK_KEY)).rejects.toMatchObject({ code: 'unreachable', message: 'BotBoy could not reach api.deepseek.com.' });
+    });
+
+    it.skipIf(!canMakeSelfSignedCert())('says in words that a proxy or security product replaced the certificate (a real self-signed loopback server)', async () => {
+      const tls = await startSelfSignedServer();
+      try {
+        const settings = await service({ deepSeekEndpoint: tls.url });
+        const error = await settings.saveApiKey('deepseek', DEEPSEEK_KEY).catch(e => e);
+        expect(error).toMatchObject({ code: 'unreachable', httpStatus: 502, message: 'BotBoy could not reach api.deepseek.com (DEPTH_ZERO_SELF_SIGNED_CERT).' });
+        expect(error.nextAction).toBe("A proxy or security product on this network replaces api.deepseek.com's certificate, and BotBoy does not trust the replacement. Try another network (a phone hotspot works) and tell the owner.");
+        expect(tls.requests, 'the handshake failed, so no request was served').toEqual([]);
+      } finally {
+        await tls.close();
+      }
+    });
+
+    it('keeps the cause when the failure is in the verification generation, through the client\'s own rethrow', async () => {
+      const settings = await service();
+      const error = await settings.saveApiKey('deepseek', DEEPSEEK_CUT_KEY).catch(e => e);
+      expect(error).toBeInstanceOf(AiModelSettingsError);
+      expect(error.code).toBe('unreachable');
+      expect(error.message).toMatch(/^BotBoy could not reach api\.deepseek\.com \((UND_ERR_SOCKET|ECONNRESET)\)\.$/);
+      expect(fs.existsSync(settingsFile())).toBe(false);
+    });
+  });
+
+  it('maps a provider 5xx to provider_unavailable with its words, and leaves 4xx answers and network failures where they were', () => {
+    for (const status of [500, 502, 503, 504]) {
+      const error = modelSettingsError(new Error(`HTTP ${status}: {"error":{"message":"upstream trouble"}}`), 'deepseek');
+      expect(error, String(status)).toMatchObject({ code: 'provider_unavailable', httpStatus: 502, message: expect.stringContaining(`answered HTTP ${status} (upstream trouble)`) });
+    }
+    // A plain-text body is shown as it came, on one line and bounded; a key echoed in it never reaches the owner.
+    const wordy = modelSettingsError(new Error(`HTTP 503: ${'busy '.repeat(100)}\nsk-plantedleakage0123456789abcdef`), 'openai');
+    expect(wordy.message.length).toBeLessThan(260);
+    expect(wordy.message).not.toContain('plantedleakage');
+    expect(wordy.message).toMatch(/^OpenAI answered HTTP 503 \(busy busy/);
+    expect(modelSettingsError(new Error('HTTP 503:'), 'deepseek').message).toMatch(/^DeepSeek answered HTTP 503\. That is/);
+    expect(modelSettingsError(new Error('HTTP 400: nope'), 'deepseek').code).toBe('rejected');
+    expect(modelSettingsError(new Error('HTTP 404: nope'), 'deepseek').code).toBe('model_unavailable');
+    expect(modelSettingsError(new Error('fetch failed'), 'deepseek').code).toBe('unreachable');
+    expect(modelSettingsError(new Error('boom'), 'deepseek').code).toBe('unreachable');
   });
 
   it('changes nothing when OpenAI rejects the key', async () => {

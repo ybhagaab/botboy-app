@@ -26,7 +26,7 @@ import fs from 'fs';
 import path from 'path';
 import { getSetting, setSetting } from './storage.js';
 import { resolveOwnerIdentity } from './owner-identity.js';
-import { resolveAnalyticsContextDir } from './analytics-context.js';
+import { analyticsLibraryMode, analyticsLibraryWriteBlocker, legacyAnalyticsContextDir, privateAnalyticsContextDir, resolveAnalyticsContextDir } from './analytics-context.js';
 import type { EtlToolCall } from './etl-adhoc.js';
 import type { LlmUsageContext } from './llm-usage.js';
 
@@ -129,7 +129,9 @@ export function createEtlOnboardingService(options: EtlOnboardingOptions): EtlOn
     lastResult: getSetting<EtlOnboardingResult>(db, LAST_RESULT_KEY) ?? undefined,
   };
 
-  const workDir = () => path.join(resolveAnalyticsContextDir(db), '.onboarding');
+  // Work files (estate, SQL, clusters) are BotBoy's own and never belong in the visible Knowledge library: in library
+  // mode they stay in private state; before that they sit beside the knowledge as they always did.
+  const workDir = () => path.join(analyticsLibraryMode(db) ? privateAnalyticsContextDir() : legacyAnalyticsContextDir(db), '.onboarding');
   const sqlDir = () => path.join(workDir(), 'sql');
   const knowledgeDir = () => resolveAnalyticsContextDir(db);
 
@@ -658,6 +660,9 @@ Rules: attach the given corpus counts inline to claims; use confidence tags [STR
       const written: string[] = [];
       const errors: string[] = [];
       const manifestEntries: Array<Record<string, unknown>> = [];
+      // Library mode: a deleted or blocked root is never recreated by a background writer.
+      const blocker = analyticsLibraryWriteBlocker(db);
+      if (blocker) throw new Error(`${blocker.message} ${blocker.nextAction}`);
       const presetsDir = path.join(knowledgeDir(), 'presets');
       fs.mkdirSync(presetsDir, { recursive: true });
       let done = 0;

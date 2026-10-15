@@ -44,7 +44,9 @@ const DRAFT = {
 
 beforeAll(() => {
   const source = [
-    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'),
+    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'), constLine('KNOWLEDGE_MARKER_RE'),
+    // hydrateChatCards also expands Knowledge change cards (app.knowledge-card.test.ts).
+    topLevel('fillKnowledgeCard'), topLevel('paintKnowledgeCard'),
     topLevel('hydrateChatCards'), topLevel('fillLessonCard'), topLevel('lessonEsc'), topLevel('paintLessonCard'),
     // hydrateChatCards also expands MCP server cards (app.mcp-server-card.test.ts).
     topLevel('fillMcpServerCard'), topLevel('mcpCardTransport'), topLevel('paintMcpServerCard'),

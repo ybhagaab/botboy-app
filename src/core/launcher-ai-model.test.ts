@@ -24,6 +24,7 @@ import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TLS_INTERCEPTION_CODES, transportCodesOf } from './transport-errors.js';
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -67,6 +68,9 @@ const FETCH_STUB = [
   '  const headers = (init && init.headers) || {};',
   "  fs.appendFileSync(process.env.STUB_FETCH_LOG, JSON.stringify({ url: String(url), bearer: Boolean(headers.Authorization), apiKeyHeader: Boolean(headers['x-api-key']) }) + '\\n');",
   "  if (process.env.STUB_FETCH_STATUS === 'offline') throw new Error('offline');",
+  // What Node threw for every fetch on the owner's Mac (a failed connect to both addresses), and for a certificate a proxy replaced.
+  "  if (process.env.STUB_FETCH_STATUS === 'timeout') throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' }), Object.assign(new Error('connect EHOSTUNREACH'), { code: 'EHOSTUNREACH' })], ''), { code: 'ETIMEDOUT' }) });",
+  "  if (process.env.STUB_FETCH_STATUS === 'tls') throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('self-signed certificate'), { code: 'DEPTH_ZERO_SELF_SIGNED_CERT' }) });",
   '  return { status: Number(process.env.STUB_FETCH_STATUS || 401) };',
   '};',
   '',
@@ -199,7 +203,9 @@ const doctor = (b: ReturnType<typeof box>, extra: Record<string, string> = {}) =
 const doctorAt = (b: ReturnType<typeof box>, api: { origin: string }, extra: Record<string, string> = {}) =>
   doctor(b, { BOTBOY_TEST_ANTHROPIC_PROBE_URL: api.origin, ...extra });
 const lines = (text: string) => text.split('\n').filter(Boolean);
-const NETWORK_HINT = 'anthropic probe: HTTP 000 (network, proxy, or VPN blocks api.anthropic.com)';
+// D2: a probe that got no answer prints the network cause Node kept, beside HTTP 000.
+const NETWORK_HINT = 'anthropic probe: HTTP 000 (ECONNREFUSED) (network, proxy, or VPN blocks api.anthropic.com)';
+const RESET_HINT = /^anthropic probe: HTTP 000 \((UND_ERR_SOCKET|ECONNRESET)\) \(network, proxy, or VPN blocks api\.anthropic\.com\)$/;
 
 describe('start.sh › warn_if_no_llm_credentials', () => {
   const second = '    In BotBoy, open Settings → AI model and paste an OpenAI, DeepSeek or Anthropic (Claude) API key (it takes effect right away).';
@@ -312,13 +318,52 @@ describe('start.sh › the doctor ai-model rows', () => {
     const reset = box();
     const resetApi = await standIn({ kind: 'reset' });
     reset.writeSettings(fileWith({ anthropic: claudeKey() }));
-    expect(lines((await doctorAt(reset, resetApi)).stdout).at(-1)).toBe(NETWORK_HINT);
+    expect(lines((await doctorAt(reset, resetApi)).stdout).at(-1)).toMatch(RESET_HINT);
     expect(resetApi.requests).toHaveLength(1);
     const closed = box();
     const closedApi = await standIn();
     await closedApi.close();
     closed.writeSettings(fileWith({ anthropic: claudeKey() }));
     expect(lines((await doctorAt(closed, closedApi)).stdout).at(-1)).toBe(NETWORK_HINT);
+  });
+
+  // D2 of the DeepSeek diagnosability fixes: HTTP 000 used to hide WHY nothing answered. The same walk as
+  // transport-errors.ts › transportCodesOf finds the errno under fetch's "fetch failed"; codes only, never a URL.
+  it('prints the network cause beside HTTP 000 for all three providers (the codes transportCodesOf finds), and keeps the hint', async () => {
+    const b = box();
+    const keys = { openai: openAiKey(), deepseek: deepSeekKey(), anthropic: claudeKey() };
+    b.writeSettings(fileWith(keys));
+    const result = await doctor(b, { STUB_FETCH_STATUS: 'timeout' });
+    const errno = (code: string) => Object.assign(new Error(`connect ${code}`), { code });
+    const shapeOfTheStub = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new AggregateError([errno('ETIMEDOUT'), errno('EHOSTUNREACH')], ''), { code: 'ETIMEDOUT' }) });
+    const codes = transportCodesOf(shapeOfTheStub).join('+');
+    expect(codes).toBe('ETIMEDOUT+EHOSTUNREACH');
+    expect(lines(result.stdout).slice(-3)).toEqual([
+      `openai probe: HTTP 000 (${codes}) (network, proxy, or VPN blocks api.openai.com)`,
+      `deepseek probe: HTTP 000 (${codes}) (network, proxy, or VPN blocks api.deepseek.com)`,
+      `anthropic probe: HTTP 000 (${codes}) (network, proxy, or VPN blocks api.anthropic.com)`,
+    ]);
+    for (const text of [result.stdout, result.stderr]) {
+      for (const key of Object.values(keys)) expect(text).not.toContain(key);
+    }
+    expect(b.curlCalls()).toEqual([]);
+  });
+
+  it('says in words that a proxy or security product replaced the certificate, for all three providers', async () => {
+    const b = box();
+    b.writeSettings(fileWith({ openai: openAiKey(), deepseek: deepSeekKey(), anthropic: claudeKey() }));
+    const result = await doctor(b, { STUB_FETCH_STATUS: 'tls' });
+    expect(lines(result.stdout).slice(-3)).toEqual([
+      'openai probe: HTTP 000 (DEPTH_ZERO_SELF_SIGNED_CERT) (a proxy or security product replaces the certificate of api.openai.com, and Node does not trust it)',
+      'deepseek probe: HTTP 000 (DEPTH_ZERO_SELF_SIGNED_CERT) (a proxy or security product replaces the certificate of api.deepseek.com, and Node does not trust it)',
+      'anthropic probe: HTTP 000 (DEPTH_ZERO_SELF_SIGNED_CERT) (a proxy or security product replaces the certificate of api.anthropic.com, and Node does not trust it)',
+    ]);
+  });
+
+  it('keeps one list of certificate-interception codes: the doctor\'s equals transport-errors.ts', () => {
+    const listed = /const interception = \/\^\(([A-Z_|]+)\)\$\//.exec(launcher)?.[1].split('|') ?? [];
+    expect(new Set(listed)).toEqual(new Set(TLS_INTERCEPTION_CODES));
+    expect(listed).toHaveLength(TLS_INTERCEPTION_CODES.size);
   });
 
   it('follows no redirect, so the key never reaches another address (the status is printed as it came)', async () => {

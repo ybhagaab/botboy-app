@@ -23,6 +23,7 @@ import type { ContentStore } from './content-store.js';
 import { refToColumns } from './content-store.js';
 import type { FailureRecorder } from './failures.js';
 import { describeSecretKinds, detectSecrets, sensitiveLocalFileReason } from './sensitive-files.js';
+import { isCaptureExcludedPath } from './capture-exclusions.js';
 import { recordSensitiveLocalFile } from './local-folder-imports.js';
 import { deleteWorkItemFts } from './work-items-fts.js';
 import { isRawFileText } from './raw-file-text.js';
@@ -191,6 +192,33 @@ export function createExtractor(deps: {
     return { itemId: row.id, kind: 'none', bytes: 0, ocrConfidence: null, state: 'noise' };
   }
 
+  /**
+   * A file inside the Knowledge library is on-demand knowledge, never capture (knowledge-library.md K1). A row queued
+   * before the library existed, or a file moved into it, is stopped before anything reads it: a one-line stub replaces
+   * its content and search text and the item becomes `noise`, so routing, brains and gists never see it. No ledger
+   * row is written (the file is not sensitive, it is simply not captured).
+   */
+  function excludeLibraryFile(row: ItemRow): ExtractOutcome {
+    const stub = 'Content withheld: this file is part of your Knowledge library. BotBoy reads it only when a task needs it, so it is not captured.';
+    const ref = contentStore.put(row.id, stub);
+    const cols = refToColumns(ref);
+    const title = (db.prepare('SELECT title FROM work_items WHERE id = ?').get(row.id) as { title: string | null } | undefined)?.title ?? '';
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE work_items SET
+           raw_text = ?, content_storage = ?, content_path = ?, content_sha256 = ?, content_bytes = ?, summary = '',
+           extraction_kind = 'none', ocr_confidence = NULL, process_state = 'noise'
+         WHERE id = ?`,
+      ).run(cols.raw_text, cols.content_storage, cols.content_path, cols.content_sha256, cols.content_bytes, row.id);
+      db.prepare('DELETE FROM item_ocr_lines WHERE item_id = ?').run(row.id);
+      try {
+        deleteWorkItemFts(db, row.id);
+        db.prepare('INSERT INTO work_items_fts (item_id, title, body) VALUES (?, ?, ?)').run(row.id, title, stub);
+      } catch { /* FTS is best-effort */ }
+    })();
+    return { itemId: row.id, kind: 'none', bytes: 0, ocrConfidence: null, state: 'noise' };
+  }
+
   /** Local-file text is checked for secrets before it is stored or sent. */
   function persistLocal(
     row: ItemRow,
@@ -244,6 +272,11 @@ export function createExtractor(deps: {
       }
 
       const ext = path.extname(sourcePath).toLowerCase();
+
+      // ── The Knowledge library: decided from the path alone, never read ──
+      if (row.source === 'filesystem' && isCaptureExcludedPath(sourcePath, { resolveLinks: true })) {
+        return excludeLibraryFile(row);
+      }
 
       // ── Local credentials: decided from the path alone, never read ──
       // (Covers rows captured before the folder monitor's gate existed.)

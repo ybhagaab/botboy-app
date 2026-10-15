@@ -63,6 +63,7 @@ import { ANTHROPIC_BILLING_URL, ANTHROPIC_KEYS_URL, isAnthropicApiError } from '
 import {
   isLlmProviderLimitError,
   redactProviderSecrets,
+  type ChatCompletionRequest,
   type LlmClient,
   type LlmProviderIssue,
 } from './llm-client.js';
@@ -95,6 +96,7 @@ import {
 import { createConnectionChatModelSource, type ChatModelSource } from './chat-model-source.js';
 import type { LlmThinkingOffMode } from './llm-model-operation.js';
 import type { LlmUsageService } from './llm-usage.js';
+import { hasTlsInterceptionCode, transportCodesOf } from './transport-errors.js';
 
 export const AI_MODEL_SETTINGS_FILE = 'ai-model.json';
 const SCHEMA_VERSION = 2;
@@ -370,6 +372,33 @@ function issueFor(issue: LlmProviderIssue | undefined, connection: LlmConnection
   return aiModelIssueText(issue, connection.id);
 }
 
+/**
+ * What the provider said in an `HTTP nnn: <body>` message, for an owner-facing line: the JSON `error.message` when the
+ * body has one, else the text itself, on one line and bounded. ` (…)` or '' (the message is already redacted).
+ */
+function providerWords(message: string): string {
+  let said = message.replace(/^HTTP \d{3}:?\s*/, '');
+  try {
+    const parsed = JSON.parse(said);
+    const inner = parsed?.error?.message ?? parsed?.message;
+    if (typeof inner === 'string') said = inner;
+  } catch { /* plain text: use it as it came */ }
+  said = said.replace(/\s+/g, ' ').trim().slice(0, 120);
+  return said ? ` (${said})` : '';
+}
+
+/**
+ * The log line of a failed Save check (D4): `[AI model] DeepSeek key check failed: HTTP 400 <the provider's body, first
+ * 200 characters>`. Provider text only, through `redactProviderSecrets`, on one line; a failure with no HTTP status
+ * (a network cause, a typed limit) logs its own message. The key itself is never part of an error message.
+ */
+function keyCheckFailureLine(error: unknown, label: string): string {
+  const message = redactProviderSecrets(error instanceof Error ? error.message : String(error)).replace(/\s+/g, ' ').trim();
+  const http = /^HTTP (\d{3}):?\s*(.*)$/.exec(message);
+  const said = http ? `HTTP ${http[1]} ${http[2].slice(0, 200)}`.trimEnd() : message.slice(0, 200);
+  return `[AI model] ${label} key check failed: ${said}`;
+}
+
 /** Exported for tests. */
 export function modelSettingsError(error: unknown, provider: AiModelKeyProvider): AiModelSettingsError {
   if (error instanceof AiModelSettingsError) return error;
@@ -402,10 +431,29 @@ export function modelSettingsError(error: unknown, provider: AiModelKeyProvider)
   if (status === '404') {
     return new AiModelSettingsError('model_unavailable', 'This key cannot use the model BotBoy checked it with.', `Check the key's model access at ${text.keysUrl.split('/')[0]}, then try again.`);
   }
+  // A 5xx is the provider's own trouble, not a verdict on the key and not a network failure: say so, with its words.
+  if (status && Number(status) >= 500) {
+    return new AiModelSettingsError(
+      'provider_unavailable',
+      `${text.label} answered HTTP ${status}${providerWords(message)}. That is a problem on ${text.label}'s side, so BotBoy could not finish checking the key.`,
+      'Wait a minute, then save the key again. If it keeps failing, the provider may be having an outage.',
+      502,
+    );
+  }
   if (status) {
     return new AiModelSettingsError('rejected', `${text.label} rejected the verification request (HTTP ${status}).`, `Try again in a minute. If it keeps failing, create a new key at ${text.keysUrl}.`, 502);
   }
-  return new AiModelSettingsError('unreachable', `BotBoy could not reach ${text.host}.`, `Check your internet connection (and any proxy or VPN rules for ${text.host}), then try again.`, 502);
+  // No HTTP answer at all. Name the cause Node kept (errno codes, or a timeout) so the fix can be the right one.
+  const codes = transportCodesOf(error);
+  const cause = codes.length ? codes.join('+') : (error as { name?: unknown } | null)?.name === 'TimeoutError' ? 'timed out' : '';
+  return new AiModelSettingsError(
+    'unreachable',
+    `BotBoy could not reach ${text.host}${cause ? ` (${cause})` : ''}.`,
+    hasTlsInterceptionCode(codes)
+      ? `A proxy or security product on this network replaces ${text.host}'s certificate, and BotBoy does not trust the replacement. Try another network (a phone hotspot works) and tell the owner.`
+      : `Check your internet connection (and any proxy or VPN rules for ${text.host}), then try again.`,
+    502,
+  );
 }
 
 async function getJson(
@@ -421,8 +469,9 @@ async function getJson(
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(timeoutMs),
     });
-  } catch {
-    throw modelSettingsError(new Error('fetch failed'), provider);
+  } catch (error) {
+    // The real error goes on: its cause chain holds the errno (or the timeout) that tells the owner what to fix.
+    throw modelSettingsError(error, provider);
   }
   return { status: response.status, text: await response.text().catch(() => '') };
 }
@@ -447,7 +496,9 @@ async function listOpenAiModels(endpoint: string, apiKey: string, fetchImpl: typ
   return [...new Set(ids.filter(isOpenAiChatModelId))].slice(0, 300);
 }
 
-/** DeepSeek GET /models: id, display name, window, output limit, image input, effort levels. */
+/**
+ * DeepSeek GET /models: id, display name, window, output limit, image input, effort levels.
+ */
 async function listDeepSeekModels(endpoint: string, apiKey: string, fetchImpl: typeof fetch, timeoutMs?: number): Promise<DeepSeekModelProfile[]> {
   const { status, text } = await getJson(`${endpoint.replace(/\/+$/, '')}/models`, apiKey, fetchImpl, 'deepseek', timeoutMs);
   if (status < 200 || status >= 300) throw modelSettingsError(new Error(`HTTP ${status}: ${text}`), 'deepseek');
@@ -456,6 +507,51 @@ async function listDeepSeekModels(endpoint: string, apiKey: string, fetchImpl: t
   } catch {
     throw modelSettingsError(new Error('HTTP 502: unreadable model list'), 'deepseek');
   }
+}
+
+/**
+ * A DeepSeek connection for a key's model list: one client, the default pick (`deepseek-flash` when listed, else the
+ * first listed model) and one entry per model. This is what Save and the boot refresh build.
+ */
+function createDeepSeekConnection(input: {
+  apiKey: string;
+  models: readonly DeepSeekModelProfile[];
+  endpoint: string;
+  env: NodeJS.ProcessEnv;
+  usageService?: LlmUsageService;
+  version: number;
+}): LlmConnection {
+  const defaultModel = pickDeepSeekDefaultModel(input.models);
+  const provider = createDeepSeekInferenceProvider({
+    apiKey: input.apiKey,
+    availableModels: input.models.map(model => model.id),
+    defaultModel,
+    defaultContextTokens: deepSeekModelCapabilities(input.models.find(model => model.id === defaultModel)).contextWindow,
+    endpoint: input.endpoint,
+    env: input.env,
+  });
+  return {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    source: 'settings',
+    client: provider.createClient({ usageService: input.usageService }),
+    provider: { id: provider.id, endpoint: provider.endpoint, model: provider.model, apiMode: provider.apiMode },
+    models: deepSeekModelEntries(input.models, defaultModel),
+    version: input.version,
+  };
+}
+
+/**
+ * The one tiny generation Save runs to prove auth, model access and credit (a fresh object each call: the client never
+ * sees a shared one).
+ */
+function keyVerificationRequest(): ChatCompletionRequest {
+  return {
+    messages: [{ role: 'user', content: 'Reply with the single word OK.' }],
+    maxTokens: 16,
+    think: false,
+    usageContext: { workload: 'system' },
+  };
 }
 
 function noPassthrough(): StoredPassthrough {
@@ -702,24 +798,14 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
   }
 
   function buildDeepSeekConnection(key: StoredDeepSeekKey): LlmConnection {
-    const defaultModel = pickDeepSeekDefaultModel(key.models);
-    const provider = createDeepSeekInferenceProvider({
+    return createDeepSeekConnection({
       apiKey: key.apiKey,
-      availableModels: key.models.map(model => model.id),
-      defaultModel,
-      defaultContextTokens: deepSeekModelCapabilities(key.models.find(model => model.id === defaultModel)).contextWindow,
+      models: key.models,
       endpoint: deepSeekEndpoint,
       env,
-    });
-    return {
-      id: 'deepseek',
-      label: 'DeepSeek',
-      source: 'settings',
-      client: provider.createClient({ usageService: deps.usageService }),
-      provider: descriptor(provider),
-      models: deepSeekModelEntries(key.models, defaultModel),
+      usageService: deps.usageService,
       version: ++connectionCounter,
-    };
+    });
   }
 
   /**
@@ -1049,15 +1135,13 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
       throw new AiModelSettingsError('no_chat_models', `This ${PROVIDER_TEXT[provider].label} key lists no chat models BotBoy can use.`, `Check the key's model access at ${PROVIDER_TEXT[provider].keysUrl.split('/')[0]}, then try again.`);
     }
     try {
-      await bindLlmModel(candidate, entry).chatCompletionPrimary({
-        messages: [{ role: 'user', content: 'Reply with the single word OK.' }],
-        maxTokens: 16,
-        think: false,
-        usageContext: { workload: 'system' },
-      });
+      await bindLlmModel(candidate, entry).chatCompletionPrimary(keyVerificationRequest());
       await candidate.client.healthCheck();
     } catch (error) {
       candidate.client.close();
+      // The owner sees a short mapped sentence ("rejected the verification request (HTTP 400)"); the provider's own
+      // words, which say WHAT it rejected, are kept here for whoever reads the log.
+      console.warn(keyCheckFailureLine(error, PROVIDER_TEXT[provider].label));
       throw modelSettingsError(error, provider);
     }
   }

@@ -168,6 +168,14 @@ export interface RouterDeps {
   appUpdater?: import('../../core/app-update.js').AppUpdater;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
   chatJobs?: ChatJobStore;
+  /** The Knowledge library: sets, loads, status, routing (knowledge-library.ts). */
+  knowledgeLibrary?: import('../../core/knowledge-library.js').KnowledgeLibrary;
+  /** The write path (P2): the composite writer, its History and the staged-changes store. */
+  knowledgeWriter?: import('../../core/knowledge-write.js').KnowledgeWriter;
+  knowledgeHistory?: import('../../core/knowledge-history.js').KnowledgeHistory;
+  knowledgeChanges?: import('../../core/knowledge-changes.js').KnowledgeChangeStore;
+  /** Moving the analytics knowledge into the library, and changing the library's location (knowledge-migration.ts). */
+  knowledgeMigration?: import('../../core/knowledge-migration.js').KnowledgeMigration;
   /** Continuation turns: secret, live hub, runner (chat-continuations.ts). */
   chatContinuations?: ContinuationBridge;
 }

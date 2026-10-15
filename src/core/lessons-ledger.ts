@@ -26,7 +26,7 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type Database from 'better-sqlite3';
-import { resolveAnalyticsContextDir } from './analytics-context.js';
+import { analyticsLibraryMode, analyticsLibraryWriteBlocker, permissionProblem, resolveAnalyticsContextDir } from './analytics-context.js';
 
 export type LessonStatus = 'proposed' | 'adopted' | 'retired';
 
@@ -171,34 +171,16 @@ export function retireLesson(db: Database.Database, id: string): Lesson {
   return getLesson(db, id)!;
 }
 
+/** The projection's file name inside the analytics knowledge dir. */
+function lessonFileName(scope: string): string {
+  return `lessons/${scope.replace(/[^a-z0-9_-]+/g, '-')}.md`;
+}
+
 /**
- * Projection: adopted lessons of one scope → `lessons/<scope>.md` in the
- * analytics knowledge dir + a manifest entry (`source: 'lesson'`). Zero
- * adopted lessons removes the file and the entry. The onboarding
- * generator's mergeManifest only replaces `etl-derived` rows, so lesson
- * entries survive preset regeneration by construction.
+ * The projection's text, a pure function of the ledger rows: the same adopted lessons always render the same bytes,
+ * which is what lets `renderAllLessonScopes` leave an equal file untouched (design amendment P2-12b).
  */
-export function renderLessonScope(db: Database.Database, scope: string): void {
-  const dir = resolveAnalyticsContextDir(db);
-  const lessonsDir = path.join(dir, 'lessons');
-  const fileName = `lessons/${scope.replace(/[^a-z0-9_-]+/g, '-')}.md`;
-  const fullPath = path.join(dir, fileName);
-  const adopted = listLessons(db, { scope, status: 'adopted' });
-
-  const manifestPath = path.join(dir, 'manifest.json');
-  let files: Array<Record<string, unknown>> = [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as { files?: Array<Record<string, unknown>> };
-    files = Array.isArray(parsed.files) ? parsed.files : [];
-  } catch { /* fresh manifest */ }
-  files = files.filter(entry => entry.file !== fileName);
-
-  if (adopted.length === 0) {
-    try { fs.rmSync(fullPath, { force: true }); } catch { /* already gone */ }
-    fs.writeFileSync(manifestPath, JSON.stringify({ files }, null, 1));
-    return;
-  }
-
+export function lessonScopeMarkdown(scope: string, adopted: Lesson[]): string {
   const lines = [
     `# Lessons — ${scope} (BotBoy experiential operating rules)`,
     '',
@@ -216,8 +198,69 @@ export function renderLessonScope(db: Database.Database, scope: string): void {
       '',
     ].join('\n')),
   ];
+  return lines.join('\n');
+}
+
+/** A held projection is logged once per reason, not once per lesson. */
+const heldProjectionWarned = new Set<string>();
+function warnProjectionHeld(reason: string): void {
+  if (heldProjectionWarned.has(reason)) return;
+  heldProjectionWarned.add(reason);
+  console.warn(`[Lessons] projection held: ${reason}`);
+}
+
+/**
+ * Projection: adopted lessons of one scope → `lessons/<scope>.md` in the
+ * analytics knowledge dir + a manifest entry (`source: 'lesson'`). Zero
+ * adopted lessons removes the file and the entry. The onboarding
+ * generator's mergeManifest only replaces `etl-derived` rows, so lesson
+ * entries survive preset regeneration by construction.
+ *
+ * Returns true when the projection is in step with the ledger. In library mode (the knowledge dir is inside the
+ * Knowledge library) a deleted root is never recreated and a folder macOS will not let BotBoy write is not a crash:
+ * the adopted row stays, the projection waits, and `renderAllLessonScopes` writes it when the folder is available again.
+ * Legacy mode behaves exactly as before.
+ */
+export function renderLessonScope(db: Database.Database, scope: string): boolean {
+  const blocker = analyticsLibraryWriteBlocker(db);
+  if (blocker) {
+    warnProjectionHeld(blocker.message);
+    return false;
+  }
+  const dir = resolveAnalyticsContextDir(db);
+  try {
+    writeLessonProjection(db, dir, scope);
+    return true;
+  } catch (error) {
+    const blocked = analyticsLibraryMode(db) ? permissionProblem(error, dir) : null;
+    if (!blocked) throw error;
+    warnProjectionHeld(blocked.message);
+    return false;
+  }
+}
+
+function writeLessonProjection(db: Database.Database, dir: string, scope: string): void {
+  const lessonsDir = path.join(dir, 'lessons');
+  const fileName = lessonFileName(scope);
+  const fullPath = path.join(dir, fileName);
+  const adopted = listLessons(db, { scope, status: 'adopted' });
+
+  const manifestPath = path.join(dir, 'manifest.json');
+  let files: Array<Record<string, unknown>> = [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as { files?: Array<Record<string, unknown>> };
+    files = Array.isArray(parsed.files) ? parsed.files : [];
+  } catch { /* fresh manifest */ }
+  files = files.filter(entry => entry.file !== fileName);
+
+  if (adopted.length === 0) {
+    try { fs.rmSync(fullPath, { force: true }); } catch { /* already gone */ }
+    fs.writeFileSync(manifestPath, JSON.stringify({ files }, null, 1));
+    return;
+  }
+
   fs.mkdirSync(lessonsDir, { recursive: true });
-  fs.writeFileSync(fullPath, lines.join('\n'));
+  fs.writeFileSync(fullPath, lessonScopeMarkdown(scope, adopted));
   files.push({
     file: fileName,
     business: scope,
@@ -227,4 +270,34 @@ export function renderLessonScope(db: Database.Database, scope: string): void {
     derivedAt: new Date().toISOString().slice(0, 10),
   });
   fs.writeFileSync(manifestPath, JSON.stringify({ files }, null, 1));
+}
+
+/**
+ * Write every projection that is missing or differs from the text the ledger implies, and leave an equal file
+ * untouched (so bytes a migration copied, and the R6.2a receipts over them, never change). Called when the Knowledge
+ * folder becomes available: activation, Change location, rescan and boot. Does nothing while the folder is blocked.
+ *
+ * Library mode only (P1 review N1). In legacy mode the lessons live in the old private folder, which stays exactly as it
+ * is until the owner presses Move: a repair there would rewrite a file whose bytes an R6.2a receipt may already pin, and
+ * `writeLessonProjection` removes a `lessons/<scope>.md` whose scope has no adopted lesson, which would delete a file the
+ * owner made by hand.
+ */
+export function renderAllLessonScopes(db: Database.Database): { rendered: string[]; unchanged: string[]; held: boolean } {
+  if (!analyticsLibraryMode(db)) return { rendered: [], unchanged: [], held: false };
+  if (analyticsLibraryWriteBlocker(db)) return { rendered: [], unchanged: [], held: true };
+  const dir = resolveAnalyticsContextDir(db);
+  const scopes = (db.prepare('SELECT DISTINCT scope FROM lessons ORDER BY scope').all() as Array<{ scope: string }>).map(row => row.scope);
+  const rendered: string[] = [];
+  const unchanged: string[] = [];
+  let held = false;
+  for (const scope of scopes) {
+    const adopted = listLessons(db, { scope, status: 'adopted' });
+    let current: string | null = null;
+    try { current = fs.readFileSync(path.join(dir, lessonFileName(scope)), 'utf8'); } catch { /* absent */ }
+    const inStep = adopted.length === 0 ? current === null : current === lessonScopeMarkdown(scope, adopted);
+    if (inStep) { unchanged.push(scope); continue; }
+    if (renderLessonScope(db, scope)) rendered.push(scope);
+    else held = true;
+  }
+  return { rendered, unchanged, held };
 }

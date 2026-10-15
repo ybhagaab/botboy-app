@@ -2,6 +2,7 @@ import os from 'os';
 import path from 'path';
 import fs from 'fs';
 import type Database from 'better-sqlite3';
+import { isCaptureExcludedPath } from './capture-exclusions.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ export type AddLocalFolderResult =
   | { ok: true; folder: LocalFolder }
   | {
       ok: false;
-      code: 'not_found' | 'not_dir' | 'outside_home' | 'duplicate';
+      code: 'not_found' | 'not_dir' | 'outside_home' | 'duplicate' | 'knowledge_library';
       message: string;
     };
 
@@ -228,6 +229,16 @@ export function addLocalFolder(
       ok: false,
       code: 'not_dir',
       message: `Path is not a directory: ${input.path}`,
+    };
+  }
+
+  // 4b. The Knowledge library is on-demand knowledge, never capture (knowledge-library.md K1): a folder that is the
+  //     library or lies inside it is refused. An ancestor stays allowed; its walks and live events skip the library.
+  if (isCaptureExcludedPath(canonical)) {
+    return {
+      ok: false,
+      code: 'knowledge_library',
+      message: 'That folder is part of your Knowledge library. BotBoy reads it only when a task needs it, so it is not watched.',
     };
   }
 

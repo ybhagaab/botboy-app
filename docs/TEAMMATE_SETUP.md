@@ -241,6 +241,21 @@ teammates do not need a replacement credential attachment.
   key. It ignores it, and drops it the next time it saves its Settings file, so
   after going back to an older release paste the Claude key again.
 
+#### When a provider call fails
+
+Read the error first: Settings and the chat message now say what the provider
+answered (for example `HTTP 503: Server Overloaded`), or what Node found when
+nothing answered (for example `fetch failed (ETIMEDOUT+EHOSTUNREACH)`, or a note
+that a proxy or security product replaced the provider's certificate).
+`./start.sh --doctor` prints the same cause beside `HTTP 000` on its
+`openai probe`, `deepseek probe` and `anthropic probe` rows. `/tmp/ppt.log`
+keeps the provider's own words for a failed key check
+(`grep 'key check failed' /tmp/ppt.log`) and the cause behind a failed chat
+turn (`grep 'Stream error' /tmp/ppt.log`). A provider outage shows up as an
+`HTTP 5xx` answer or a timeout: check the provider's status page or its emails
+before changing anything on your Mac. If it still fails, send the owner those
+lines and the `./start.sh --doctor` output.
+
 ### Updating and customizations
 
 `./start.sh --update` is the supported update path for `botboy-app`. Before
@@ -323,7 +338,8 @@ guided setup.
   The **Storage** card
   on the same page shows where BotBoy's disk space goes. Imports pause below
   10 GB free; below 2 GB, new changes wait until space returns. Watching
-  continues either way.
+  continues either way. The Knowledge folder (see **Your knowledge folder**) is
+  never watched or captured, even though it sits inside Documents by default.
 
 #### Datanet ETL
 
@@ -491,6 +507,119 @@ remote host change. Servers that sign in through a browser (OAuth) cannot
 be added yet; BotBoy says so and offers a local or AIM version when there is
 one. **Connections** lists every server, with **Edit** and **Delete**.
 
+### Your knowledge folder
+
+BotBoy can keep your own reference notes in one visible folder and read the right
+ones when a question needs them. Put there what BotBoy cannot learn from your
+mail, chats and documents alone: how your data tables fit together, how a
+product you work on behaves, the rules you follow, a method you want applied the
+same way every time.
+
+**What it is.** The folder holds *sets*. A set is a folder of reference or
+how-to files plus a `GUIDE.md` that says what each file is for, how to change
+it and what to avoid. BotBoy does not read the folder on every message. Each chat
+carries one short line that names your sets. When a message matches a set's
+topic, BotBoy adds that set's file table (names and one-line purposes) and then
+opens exactly the file it needs, whole. Files it does not open are never sent
+anywhere. A file it opens goes to the AI model you picked for that chat, like any
+other message. You can add and edit files yourself, in Finder or any editor, and
+BotBoy can also write to your sets under each set's guide (see **BotBoy writes
+to your sets**). Generated analytics presets and lessons you adopt are written
+for you, into the `analytics` set.
+
+**First step: Settings → Knowledge → Create folder.** Nothing is created until
+you click it. The default place is `~/Documents/BotBoy Knowledge`; type another
+folder first if you prefer. macOS may ask once whether BotBoy can use your
+Documents folder: choose **Allow**. If you chose Don't Allow, open System
+Settings → Privacy & Security → Files and Folders, allow BotBoy (or the app that
+starts it), then press **Rescan** on the page. **Change location** moves to
+another place: it copies your sets across, checks every file, and only then
+switches. The old folder is left exactly as it was; BotBoy never deletes it.
+The `GUIDE.md` that Create folder puts at the top of the folder shows the
+layout and the optional header (name, description, keywords, kind).
+
+**Add a set.** Make a folder inside the Knowledge folder, put your `.md`,
+`.txt`, `.yaml`, `.json` or `.sql` files in it (each up to 4 MB), and press
+**Rescan**. Without a guide the set is listed as "No guide yet" and its files
+are still usable. A `GUIDE.md` in the set's folder makes it a full set: BotBoy
+reads its file table, the one-line summary of each file, and its rules ("Do NOT
+…"). You can write a guide by hand in any editor; it needs a title and a table
+of files. Keep secrets out: BotBoy refuses to load a file that contains a
+recognizable key or token.
+
+**Analytics knowledge.** If you already keep data-table notes for BotBoy's
+analytics work (notes in the analytics knowledge folder, generated presets,
+adopted lessons), Settings → Knowledge offers to move them into the `analytics`
+set. The move copies first, checks every file, and switches only if all of them
+match; your old folder stays untouched and **Revert** switches back. Until you
+move them nothing changes.
+
+**BotBoy writes to your sets, under the set's guide.** Ask in chat ("add a note
+about refunds to the shop reference", "make a set for my garden notes") and BotBoy
+reads the set's guide first: the rules in it ("Do NOT …") are handed to the model
+before it drafts, and a second model call (your *Document writing* model,
+Settings → AI model) checks the result against the same guide. Only a clear
+breach of a rule stops a change: BotBoy gets a short list of what to fix and
+tries again, at most three times. If it still does not fit, the change waits for
+you as a card with the open items, and you choose **Apply anyway**, **Dismiss** or
+**Ask BotBoy to fix**; you stay the authority over your own guides. If the check
+cannot run (no model, a timeout), the change waits as a card with **Retry
+check**; BotBoy never applies a change unchecked.
+**When it applies, and when it asks.** A change you asked for in your current
+message is applied at once and recorded. Anything BotBoy thinks of itself while
+it works (a fact it verified, a correction you gave, a new column it found, a
+failure it worked around) arrives as a **card** in the chat and under **Settings →
+Knowledge → Waiting for your decision**, and nothing is written until you press
+**Apply**. Changes to a `GUIDE.md`, and anything BotBoy read in an email, a
+message, a web page or a document before proposing it, never apply by
+themselves: the card names where the text came from and shows the whole change,
+and you apply it with **Review and apply**. A new set starts from a guide that
+BotBoy drafts from the closest template for its kind (analytics, product,
+research, memory or general); you read it and approve it before anything is
+created. Automatic follow-up runs and background work can only propose.
+**History and Undo.** Every change BotBoy makes is listed under **Settings →
+Knowledge → History** with a diff, and **Undo** takes back the latest one (Undo
+refuses if you edited the same file by hand afterwards, so it never erases your
+edit). An edit you make in Finder or an editor is listed there too, as "Edited
+outside BotBoy". History is kept on this Mac, outside the Knowledge folder, in
+`~/.personal-productivity-tracker/`: it is included in a Time Machine backup of
+your home folder, it is not synced by iCloud, and it is not part of the folder you
+share or move. Where the Mac's developer tools provide git, the same history is
+also browsable with git from the command shown on that page; without it BotBoy
+keeps plain copies and Undo works the same. BotBoy has no delete: a file leaves a
+set by being **archived** into the set's `_archive` folder, and removing a file for
+good is yours to do in Finder. The only thing BotBoy removes is a folder that
+archiving, moving or Undo has just left empty (so a set you undid or archived can
+be created again); a folder that still holds anything stays.
+**What BotBoy can and cannot do to the folder.** BotBoy never watches this
+folder: its files do not become captures, project evidence or Today items. The
+commands BotBoy runs for you (the `run_command` tool, the chat terminal and MCP
+servers you added with a command) can read the folder but cannot change it: its
+own writes go through the checked, recorded path above.
+Built-in connections and the browser BotBoy drives are not covered by that
+protection. Whatever is in a guide or a file is untrusted text to BotBoy: it can
+describe how files are organized, but it can never change what BotBoy is allowed
+to do (approvals, the sandbox, sending).
+
+**Backup and sync.** These are plain files. Time Machine backs them up, and
+iCloud Drive syncs them if it syncs your Documents folder. If you do not want
+that, use **Change location** before you add anything private. BotBoy itself
+syncs nothing, and `./start.sh --update` never touches this folder or its History.
+
+**Reset or removal.** Deleting `~/.personal-productivity-tracker/` (a factory
+reset) does not delete the Knowledge folder, but it does delete its History.
+Afterwards press **Create folder** with the same location and confirm that it
+already holds files. To remove the folder, delete it in Finder; nothing else
+depends on it, except the `analytics` set if you moved your analytics knowledge
+into it (Revert first, or keep a copy).
+**History keeps older copies.** Taking text out of a file, or removing the whole
+folder, does not remove the copies History made before. It keeps the older version
+of every file BotBoy changed (the newest 200 changes, within 100 MB) in
+`~/.personal-productivity-tracker/knowledge-history/` and, where git is available,
+every version in `~/.personal-productivity-tracker/knowledge-history.git`. To erase
+something for good (a personal fact in a memory set, say), remove the text, quit
+BotBoy, and delete those two items; History then starts empty.
+
 ### Optional local tools
 
 - **Pandoc** is optional. Markdown downloads work without it. For Word, PDF,
@@ -599,7 +728,7 @@ credential attachment before producing the report.
 | Settings → AI model says OpenAI, DeepSeek or Anthropic rejected the key | Copy a current key from platform.openai.com/api-keys, platform.deepseek.com/api_keys or platform.claude.com/settings/keys and save it again. |
 | Settings → AI model says the account has no credit | Add credit in OpenAI Billing, top up the DeepSeek account, or add credit at platform.claude.com/settings/billing. BotBoy resumes on its own once calls succeed. |
 | Settings → AI model says the Claude key is an Admin key, or is not tied to one workspace | Create a regular API key in the Anthropic Console (Settings → API keys → Create key), choose a workspace when you create it, and save that key in the **Anthropic (Claude)** card. |
-| Settings → AI model cannot reach api.openai.com, api.deepseek.com or api.anthropic.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` / `anthropic probe` status. |
+| Settings → AI model cannot reach api.openai.com, api.deepseek.com or api.anthropic.com | Check your internet connection and any proxy or VPN rules for that host, then save again. `./start.sh --doctor` prints an `openai probe` / `deepseek probe` / `anthropic probe` status. The message names the cause in brackets (for example `ETIMEDOUT`); **When a provider call fails** above says what to read and run next. |
 | Images are not inspected | The organizing model is text-only (for example DeepSeek V4 Pro). Choose an image-capable organizing model in **Settings → AI model → Background work**. |
 | Build fails on a clean clone | Run `./start.sh` again; it installs the packages itself, with the Node `./start.sh --doctor` names under `node source:`. The errors are at the end of `/tmp/ppt.log`. |
 | `BotBoy did not start: its native modules do not work with Node …` | BotBoy already reinstalled them once and did not start, so nothing needs recovery. Read the errors at the end of `/tmp/ppt.log` (BotBoy ran `npm install` with the Node `./start.sh --doctor` names under `node source:`), fix what they name, then `./start.sh`. On your own Node 20, install Xcode Command Line Tools first (`xcode-select --install`). |
@@ -722,6 +851,10 @@ server and never follows it to another site. When BotBoy looks up a server
 for you, only the search words go to the official MCP Registry. Any document publication, message draft or send, or
 production pipeline change requires your explicit request and follows its own
 review/approval boundary.
+
+Your Knowledge folder (**Settings → Knowledge**) follows the same rule: its files stay
+on this Mac and are never watched or captured, and a file leaves only when a chat
+or job opens it, to the model doing that work (see **Your knowledge folder**).
 
 ### Lost laptop or suspected exposure
 
