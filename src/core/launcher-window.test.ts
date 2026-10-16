@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { stubUiTools } from './launcher-fixtures.testutil.js';
@@ -333,6 +333,76 @@ describe('start.sh › open_dashboard_window: the dashboard tab stuck on Chrome\
     expect(run.code).toBe(0);
     expect(navigations()).toEqual([]);
     expect(spawns()).toHaveLength(1);
+  });
+});
+
+describe('start.sh › the readiness check after the window opens', () => {
+  // 2026-10-16: a healthy, freshly booted server was stopped twice in a row ("BotBoy stopped before the dashboard window
+  // became usable") because ONE 1-second probe of the version API met a busy event loop. The probe now retries.
+  // `fastFirst: 1` lets the first check (before the window opens) pass at once, so only the checks AFTER the window opens
+  // meet the slow receipts: that is where the lone probe used to fail.
+  const versionReceipts = (stub: StubApp) => stub.requests.filter((request) => request.includes('/api/dashboard/version')).length;
+
+  it('keeps probing while the version receipt is slow after the window opens, and reports the dashboard ready', async () => {
+    const slow = await startStubApp(424242, { fastFirst: 1, stallFirst: 2, stallMs: 1600 });
+    try {
+      const b = box();
+      const run = await b.launch('fresh', { BOTBOY_TEST_APP_ORIGIN: slow.origin });
+      expect(run.stdout).toContain('Dashboard ready');
+      expect(run.stdout).not.toContain('became usable');
+      expect(run.code).toBe(0);
+      // one fast check before the window, two that timed out, one that answered
+      expect(versionReceipts(slow)).toBeGreaterThanOrEqual(4);
+    } finally {
+      await slow.close();
+    }
+  });
+
+  it('gives up after the deadline when the receipt never answers in time (the recheck is bounded)', async () => {
+    const stuck = await startStubApp(424242, { fastFirst: 1, stallFirst: 1000, stallMs: 5000 });
+    try {
+      const b = box();
+      const run = await b.launch('fresh', { BOTBOY_TEST_APP_ORIGIN: stuck.origin, BOTBOY_READY_RECHECK_SECONDS: '2' });
+      expect(run.stdout).toContain('became usable');
+      expect(run.code).not.toBe(0);
+      expect(versionReceipts(stuck)).toBeGreaterThanOrEqual(3);
+    } finally {
+      await stuck.close();
+    }
+  });
+
+  it('with the recheck switched off (0 s) one slow receipt ends the start, which is what used to happen', async () => {
+    const slow = await startStubApp(424242, { fastFirst: 1, stallFirst: 1, stallMs: 1600 });
+    try {
+      const b = box();
+      const run = await b.launch('fresh', { BOTBOY_TEST_APP_ORIGIN: slow.origin, BOTBOY_READY_RECHECK_SECONDS: '0' });
+      expect(run.stdout).toContain('became usable');
+      expect(run.code).not.toBe(0);
+    } finally {
+      await slow.close();
+    }
+  });
+
+  it('stops waiting at once when the server process itself is gone: a crash is not a slow start', () => {
+    const script = fs.readFileSync(startShPath, 'utf8');
+    const definition = (name: string) => {
+      const match = script.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'));
+      if (!match) throw new Error(`start.sh no longer defines ${name}()`);
+      return match[0];
+    };
+    // A process id that is certain to be gone: a shell that has already finished.
+    const finished = spawnSync('/bin/sh', ['-c', 'echo $$'], { encoding: 'utf8' });
+    const gonePid = finished.stdout.trim();
+    expect(gonePid).toMatch(/^\d+$/);
+    const functions = ['server_is_ready', 'startup_target_is_ready', 'wait_until_startup_target_ready'].map(definition).join('\n');
+    const started = Date.now();
+    const run = spawnSync('/bin/bash', ['-c', `${functions}\nwait_until_startup_target_ready "${gonePid}"; echo "result=$?"`], {
+      encoding: 'utf8',
+      env: { ...process.env, DASH_ORIGIN: 'http://127.0.0.1:9', NODE: process.execPath, BOTBOY_READY_RECHECK_SECONDS: '20' },
+      timeout: 15_000,
+    });
+    expect(run.stdout).toContain('result=1');
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });
 

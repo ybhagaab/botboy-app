@@ -168,14 +168,29 @@ export type StubApp = {
   close(): Promise<void>;
 };
 
-/** BotBoy's server as start.sh sees it: only the version receipt answers. */
-export async function startStubApp(processId = 424242): Promise<StubApp> {
+/**
+ * BotBoy's server as start.sh sees it: only the version receipt answers. The first `fastFirst` receipts answer at once,
+ * the next `stallFirst` take `stallMs`, like a freshly booted server whose event loop is busy for a second or two (the
+ * launcher probes with a 1 s limit); every later one answers at once.
+ */
+export async function startStubApp(processId = 424242, options: { fastFirst?: number; stallFirst?: number; stallMs?: number } = {}): Promise<StubApp> {
   const requests: string[] = [];
+  const stalled = new Set<NodeJS.Timeout>();
+  let fastLeft = options.fastFirst ?? 0;
+  let stallLeft = options.stallFirst ?? 0;
   const server = http.createServer((req, res) => {
     requests.push(`${req.method} ${req.url}`);
     if ((req.url ?? '').startsWith('/api/dashboard/version')) {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ bootId: 'stub-boot', processId }));
+      let stall = 0;
+      if (fastLeft > 0) fastLeft -= 1;
+      else if (stallLeft > 0) { stallLeft -= 1; stall = options.stallMs ?? 1500; }
+      const timer = setTimeout(() => {
+        stalled.delete(timer);
+        if (res.destroyed || res.writableEnded) return;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ bootId: 'stub-boot', processId }));
+      }, stall);
+      stalled.add(timer);
       return;
     }
     res.writeHead(404);
@@ -190,6 +205,8 @@ export async function startStubApp(processId = 424242): Promise<StubApp> {
     host: `localhost:${port}`,
     requests,
     close: () => new Promise<void>((resolve) => {
+      for (const timer of stalled) clearTimeout(timer);
+      stalled.clear();
       server.closeAllConnections?.();
       server.close(() => resolve());
     }),

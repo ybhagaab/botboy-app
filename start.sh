@@ -1847,6 +1847,25 @@ startup_target_is_ready() {
   [ -z "$expected_pid" ] || kill -0 "$expected_pid" 2>/dev/null
 }
 
+# The checks after the dashboard window opens used ONE 1-second probe of the version API. A freshly booted server is busy for
+# a second or two (the window's first requests, the first page capture, the MCP runtime), so that lone probe could time
+# out although the server was healthy, and the launcher then stopped it ("BotBoy stopped before the dashboard window became
+# usable", twice in a row on 2026-10-16 with a healthy server). Retry until BOTBOY_READY_RECHECK_SECONDS (default 20); only
+# a gone server PID, or the deadline, ends it as a failure.
+wait_until_startup_target_ready() {
+  local expected_pid="${1:-}"
+  local recheck="${BOTBOY_READY_RECHECK_SECONDS:-20}"
+  [[ "$recheck" =~ ^[0-9]+$ ]] || recheck=20
+  local deadline=$((SECONDS + recheck))
+  while :; do
+    startup_target_is_ready "$expected_pid" && return 0
+    if [ -n "$expected_pid" ] && ! kill -0 "$expected_pid" 2>/dev/null; then
+      return 1
+    fi
+    [ "$SECONDS" -ge "$deadline" ] && return 1
+    sleep 0.5
+  done
+}
 # 0. Ensure AEA native messaging host is in debug profile (needed for Midway SSO)
 AEA_SRC="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/amazon_enterprise_access.json"
 AEA_DST="$DEBUG_PROFILE/NativeMessagingHosts/amazon_enterprise_access.json"
@@ -2079,7 +2098,7 @@ open_dashboard_window() {
   # than the running server.
   local mode="${1:-fresh}"
   local expected_pid="${2:-}"
-  if ! startup_target_is_ready "$expected_pid"; then
+  if ! wait_until_startup_target_ready "$expected_pid"; then
     echo "❌ BotBoy is not ready — dashboard window was not opened."
     echo "    Run: ./start.sh --doctor"
     echo "    Runtime log: $LOG_FILE"
@@ -2103,7 +2122,7 @@ open_dashboard_window() {
       # Target.activateTarget: raises the existing app window, page state
       # (route, scroll, drafts) intact.
       curl -s --max-time 3 "$CDP_ORIGIN/json/activate/$DASH_TARGET" >/dev/null
-      if ! startup_target_is_ready "$expected_pid"; then
+      if ! wait_until_startup_target_ready "$expected_pid"; then
         echo "❌ BotBoy stopped before its dashboard window could be focused."
         echo "    Run: ./start.sh --doctor"
         return 1
@@ -2119,7 +2138,7 @@ open_dashboard_window() {
       # failed to load BotBoy's own address is touched (scripts/dashboard-window.mjs).
       REVIVED_TARGET=$(dashboard_window revive)
       if [ -n "$REVIVED_TARGET" ]; then
-        if ! startup_target_is_ready "$expected_pid"; then
+        if ! wait_until_startup_target_ready "$expected_pid"; then
           echo "❌ BotBoy stopped before its dashboard window could be reloaded."
           echo "    Run: ./start.sh --doctor"
           return 1
@@ -2193,7 +2212,7 @@ open_dashboard_window() {
     local window_seconds=$((SECONDS - window_started))
     [ "$window_seconds" -ge 3 ] && echo "ℹ️  Chrome took ${window_seconds}s to open the dashboard window"
     sleep 2
-    if startup_target_is_ready "$expected_pid"; then
+    if wait_until_startup_target_ready "$expected_pid"; then
       echo "✅ Dashboard ready: $REOPEN_URL"
     else
       curl -s --max-time 3 "$CDP_ORIGIN/json/close/$NEW_DASH_TARGET" >/dev/null
@@ -2203,7 +2222,7 @@ open_dashboard_window() {
       return 1
     fi
   else
-    if ! startup_target_is_ready "$expected_pid"; then
+    if ! wait_until_startup_target_ready "$expected_pid"; then
       echo "❌ BotBoy stopped while waiting for the dashboard window."
       echo "    Run: ./start.sh --doctor"
       echo "    Runtime log: $LOG_FILE"
