@@ -151,7 +151,7 @@ function waitingForOwner(change: { id: string; status: string }, state: NonNulla
 }
 
 function waitingReply(change: { id: string }): WriterReply {
-  return fail('change_waiting', 'This turn already finished that change: it is a card waiting for the owner.', 'Tell the owner a card is waiting in this chat and in Settings → Knowledge, and do not call with this changeId again. A new round starts only when the owner presses Ask BotBoy to fix or Re-draft on the card.', { changeId: change.id });
+  return fail('change_waiting', 'This turn already finished that change: it is a card waiting for the owner.', 'Tell the owner a card is waiting in this chat: its Review in Knowledge button opens Settings → Knowledge, where the owner reads the whole change and applies or dismisses it. Do not call with this changeId again. A new round starts only when the owner presses Ask BotBoy to fix or Re-draft on the card.', { changeId: change.id });
 }
 
 /** Record what a rules delivery covered; a delivery for a changed digest replaces the old one. */
@@ -908,7 +908,7 @@ export function createKnowledgeWriter(deps: KnowledgeWriterDeps): KnowledgeWrite
       message: row.unresolved.length > 0
         ? 'The change was not applied: the guide check still has open items. It is saved as a card the owner can apply anyway, dismiss, or ask you to fix.'
         : `The change is saved as a card for the owner's approval${untrusted ? ` (derived from ${sourceLabel(row.sources)}, so it never applies by itself)` : ''}. It is NOT applied yet.`,
-      nextAction: 'Tell the owner a card is waiting in this chat and in Settings → Knowledge; do not say the file was updated.',
+      nextAction: 'Tell the owner a card is waiting in this chat: its Review in Knowledge button opens Settings → Knowledge, where the owner reads the whole change and applies it. Do not say the file was updated, and do not ask the owner to approve it in the chat.',
       ...(row.unresolved.length > 0 ? { unresolved: row.unresolved.slice(0, 8).map((item) => ({ tier: item.tier, rule: item.rule, problem: item.problem, fix: item.fix })) } : {}),
     });
   }

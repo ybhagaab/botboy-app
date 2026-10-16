@@ -78,7 +78,7 @@ const state = {
   // Settings → AI model. The key itself never lives in state: it is read
   // from the form once, sent, and the field is cleared by the next repaint.
   aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null },
-  knowledge: { status: null, error: '', loading: false, requestId: 0, busy: '', notice: null, existing: null, createDraft: '', changeDraft: '', changing: false, plan: null, acknowledged: false, pendingFocus: '', changes: null, changesError: '', history: null, historyError: '', historyOpen: '', historyDetail: {}, historyNotice: null, expandedDiffs: {}, cardNotices: {} },
+  knowledge: { status: null, error: '', loading: false, requestId: 0, busy: '', notice: null, existing: null, createDraft: '', changeDraft: '', changing: false, plan: null, acknowledged: false, pendingFocus: '', changes: null, changesError: '', history: null, historyError: '', historyOpen: '', historyDetail: {}, historyNotice: null, cardNotices: {}, overlay: null },
   // Settings → Workplace. Until known, the UI behaves as ON (no change for existing users).
   workplace: { amazonEmployee: true, known: false, status: null, saving: false, footerSaving: false, notice: null, footerError: null, pendingFocus: '' },
   today: { data: null, error: '', opening: false, pending: new Set(), focus: null, deferredProject: '' },
@@ -4785,6 +4785,15 @@ function knowledgeNotice(scope, tone, message, nextAction = '') {
   return { scope, tone, message, nextAction };
 }
 
+/**
+ * Tells the chat panel (app.js) that the Knowledge changes moved, so its change cards read themselves again and a card that said
+ * "Review in Knowledge" stops saying it once the change is decided (docs/maps/knowledge-library.md K20). An event, not a timer:
+ * it is sent from the version poll that already runs, and right after the owner's own click on this page.
+ */
+function announceKnowledgeChanged() {
+  window.dispatchEvent?.(new CustomEvent('botboy:knowledge-changed'));
+}
+
 /** A write answered with the fresh status: it wins over any status read that began before it. */
 function applyKnowledgeStatus(status) {
   const k = state.knowledge;
@@ -4830,6 +4839,7 @@ async function loadKnowledgeWritePath() {
   const [changes, history] = await Promise.allSettled([request('/knowledge/changes'), request('/knowledge/history')]);
   if (changes.status === 'fulfilled') { k.changes = changes.value; k.changesError = ''; } else k.changesError = knowledgeErrorText(changes.reason);
   if (history.status === 'fulfilled') { k.history = history.value; k.historyError = ''; } else k.historyError = knowledgeErrorText(history.reason);
+  refreshKnowledgeOverlay(false);
 }
 /** A click on a change card or a History row on this page (chat has its own listener for its own cards). */
 async function knowledgePageAction(button) {
@@ -4838,7 +4848,18 @@ async function knowledgePageAction(button) {
   const id = button.dataset.changeId || button.closest('[data-knowledge-change-id]')?.dataset.knowledgeChangeId || '';
   const repaint = () => { if (state.route.view === 'knowledge-settings') renderRoute({ preserveScroll: true, userAction: true }); };
   const ui = window.BotBoyKnowledge;
-  if (action === 'diff-more') { k.expandedDiffs[id] = true; repaint(); return; }
+  if (action === 'overlay-close') { window.BotBoyKnowledgeOverlay?.close(); return; }
+  if (action === 'diff-expand') {
+    openKnowledgeOverlay(button.dataset.entryId ? { entryId: button.dataset.entryId, fileIndex: Number(button.dataset.fileIndex) || 0 } : { changeId: id }, button);
+    return;
+  }
+  // A change derived from an untrusted source (or flagged as instructions) is applied from the overlay only: its button on the
+  // card opens the whole change first, so there is no way to apply it without having it in front of you.
+  const waiting = (k.changes?.changes || []).find(entry => entry.id === id);
+  if ((action === 'apply' || action === 'apply-anyway') && !button.closest('.knowledge-overlay') && waiting && ((waiting.sources || []).length > 0 || waiting.suspicious)) {
+    openKnowledgeOverlay({ changeId: id }, button);
+    return;
+  }
   if (action === 'history-open') {
     const entryId = button.dataset.entryId || '';
     k.historyOpen = k.historyOpen === entryId ? '' : entryId;
@@ -4852,6 +4873,7 @@ async function knowledgePageAction(button) {
   if (action === 'ask-fix' || action === 'redraft') {
     const input = document.getElementById('chatInput');
     if (!input || !ui) return;
+    window.BotBoyKnowledgeOverlay?.close(); // the chat panel is behind the overlay
     toggleAssistant(true);
     input.value = ui.followUpMessage(action, id);
     if (typeof window.submitChat === 'function') await window.submitChat();
@@ -4878,11 +4900,56 @@ async function knowledgePageAction(button) {
     }
     k.historyDetail = {};
     await loadKnowledgeWritePath();
+    refreshKnowledgeOverlay(true);
+    announceKnowledgeChanged(); // a chat card for this change is stale now; do not wait for the next poll
   });
+}
+
+/** What the overlay shows for a target: a pending change {changeId} or one History file {entryId, fileIndex}; '' when it is gone. */
+function knowledgeOverlayHtml(target, notice) {
+  const k = state.knowledge;
+  const ui = window.BotBoyKnowledge;
+  if (!ui || !target) return '';
+  const helpers = { esc, attr, icon };
+  if (target.changeId) {
+    const change = (k.changes?.changes || []).find(entry => entry.id === target.changeId);
+    return change ? ui.renderChangeOverlay(change, helpers, { notice }) : '';
+  }
+  const entry = (k.history?.entries || []).find(item => item.id === target.entryId);
+  const file = k.historyDetail?.[target.entryId]?.files?.[target.fileIndex];
+  return entry && file ? ui.renderHistoryOverlay(entry, file, helpers) : '';
+}
+
+/** Opens the overlay with the whole change; focus returns to `trigger`, or to the matching Expand button if the page was repainted. */
+function openKnowledgeOverlay(target, trigger) {
+  const overlay = window.BotBoyKnowledgeOverlay;
+  const k = state.knowledge;
+  const html = knowledgeOverlayHtml(target, target.changeId ? k.cardNotices[target.changeId] : '');
+  if (!overlay || !html) return;
+  k.overlay = target;
+  const focusBack = () => {
+    if (trigger && trigger.isConnected) return trigger;
+    return Array.from(document.querySelectorAll('[data-knowledge-action="diff-expand"]')).find(element => (target.changeId
+      ? element.dataset.changeId === target.changeId
+      : element.dataset.entryId === target.entryId && Number(element.dataset.fileIndex) === target.fileIndex)) || null;
+  };
+  overlay.open(html, { focusBack, onClose: () => { if (k.overlay === target) k.overlay = null; } });
+}
+
+/** After the lists were read again: close the overlay when what it shows is gone; after an owner action (`redraw`), redraw it so a refusal's note shows. */
+function refreshKnowledgeOverlay(redraw) {
+  const overlay = window.BotBoyKnowledgeOverlay;
+  const k = state.knowledge;
+  if (!overlay || !overlay.isOpen() || !k.overlay) return;
+  const html = knowledgeOverlayHtml(k.overlay, k.overlay.changeId ? k.cardNotices[k.overlay.changeId] : '');
+  if (!html) overlay.close();
+  else if (redraw) overlay.update(html);
 }
 /** Arriving on the page: forget the last visit's notices and half-finished forms, then read the status. */
 function enterKnowledgePage() {
-  Object.assign(state.knowledge, { notice: null, existing: null, changing: false, plan: null, acknowledged: false, changeDraft: '', pendingFocus: '', historyOpen: '', historyDetail: {}, historyNotice: null, expandedDiffs: {}, cardNotices: {} });
+  Object.assign(state.knowledge, { notice: null, existing: null, changing: false, plan: null, acknowledged: false, changeDraft: '', pendingFocus: '', historyOpen: '', historyDetail: {}, historyNotice: null, cardNotices: {}, overlay: null });
+  // The overlay belongs to the page: arriving on it (or leaving it, which the overlay itself notices) never leaves one open.
+  window.BotBoyKnowledgeOverlay?.close();
   void loadKnowledgeStatus();
 }
 
@@ -4896,8 +4963,17 @@ function renderKnowledgeSettings() {
 
 // Change cards and History rows on this page: one delegated listener, scoped to the page so a chat card (app.js) is never handled twice.
 document.addEventListener('click', event => {
-  const button = event.target.closest('.knowledge-settings [data-knowledge-action]');
+  const button = event.target.closest('.knowledge-settings [data-knowledge-action], .knowledge-overlay [data-knowledge-action]');
   if (button) void knowledgePageAction(button);
+});
+// The chat card's "Review in Knowledge" is a link to this page. Already on the page, it opens the whole change instead of doing nothing.
+document.addEventListener('click', event => {
+  const link = event.target.closest('.knowledge-chat-card [data-knowledge-action="open-page"]');
+  if (!link || state.route.view !== 'knowledge-settings') return;
+  const id = link.dataset.changeId || '';
+  if (!(state.knowledge.changes?.changes || []).some(entry => entry.id === id)) return;
+  event.preventDefault();
+  openKnowledgeOverlay({ changeId: id }, link);
 });
 function restoreKnowledgeFocus() {
   const k = state.knowledge;
@@ -10243,6 +10319,11 @@ async function pollVersion() {
       && state.lastKnowledgeVersion !== previousKnowledgeVersion
       && !String(document.activeElement?.id || '').startsWith('knowledge-')) {
       void loadKnowledgeStatus();
+    }
+    // Wherever the owner is, the chat panel's change cards follow the same version (an Apply in another tab, a card BotBoy just
+    // staged). The first poll only seeds the counter, like the page block above.
+    if (previousKnowledgeVersion !== null && state.lastKnowledgeVersion !== null && state.lastKnowledgeVersion !== previousKnowledgeVersion) {
+      announceKnowledgeChanged();
     }
 
     if (previousVersion !== null && payload.version !== previousVersion) {

@@ -247,6 +247,11 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
   };
   const badId = (res: Response) => res.status(400).json({ error: 'That is not a change id.', code: 'invalid_id', nextAction: 'Use the id of a card from this page.' });
   const internal = (res: Response, error: any, next = 'Try again; tell the owner if it repeats.') => res.status(500).json({ error: String(error?.message ?? error).slice(0, 300), code: 'internal_error', nextAction: next });
+  /**
+   * A job that paused for this decision goes on (knowledge-job-wake.ts). Called AFTER the answer is sent, so nothing here can fail
+   * the click: the waker never throws, and this guard keeps a future one from turning a finished click into an unhandled rejection.
+   */
+  const wakeJobAfterDecision = () => { try { deps.knowledgeJobWaker?.wakeIfDecided(); } catch { /* the decision is already made and answered */ } };
 
   /** What a card or the pending list needs. The stored plan (the exact texts to write) never leaves the server. */
   function changeView(change: KnowledgeChange): Record<string, unknown> {
@@ -308,6 +313,7 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       const result = await parts.writer.apply(id, { anyway: body.anyway === true, confirmFlagged: body.confirmFlagged === true });
       if (!result.ok) return refused(res, result);
       res.json({ ok: true, change: changeView(result.change), historyId: result.historyId, summary: result.summary });
+      wakeJobAfterDecision();
     } catch (error: any) {
       internal(res, error, 'Nothing is known to have changed; open History to see.');
     }
@@ -323,6 +329,7 @@ export function createKnowledgeRouter(deps: RouterDeps): Router {
       const change = parts.writer.dismiss(id);
       if (!change) return res.status(404).json({ error: 'That change is unknown or has expired.', code: 'change_not_found', nextAction: 'Nothing to do.' });
       res.json({ ok: true, change: changeView(change) });
+      wakeJobAfterDecision();
     } catch (error: any) {
       internal(res, error);
     }

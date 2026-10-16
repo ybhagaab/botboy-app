@@ -2091,10 +2091,15 @@ a.data-room-row:hover { background:var(--hover); }
 .knowledge-settings .settings-panel .mcp-alert { margin:0 0 12px; }
 .knowledge-location .mcp-form-body p.card-meta { margin:4px 0 0; line-height:1.5; }
 .knowledge-path { display:block; color:var(--soft) !important; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px; overflow-wrap:anywhere; }
-.knowledge-sets-table th[scope="row"] { text-align:left; font-weight:inherit; }
+/* The shared Data Room table keeps every cell on one line and styles every th as a small uppercase column heading. The sets table
+   holds prose, so its row headers read as names (not capitals) and its prose cells wrap. Before this, a long description ran over
+   the Files and Guide cells and the table was cut off at the right (owner report 2026-10-16). Files and Guide stay on one line. */
+.knowledge-sets-table tbody th, .knowledge-sets-table tbody td { vertical-align:top; }
+.knowledge-sets-table th[scope="row"] { min-width:170px; max-width:300px; text-align:left; font-weight:inherit; font-size:11px; letter-spacing:normal; text-transform:none; color:var(--text); background:transparent; white-space:normal; overflow-wrap:anywhere; }
 .knowledge-set-id { display:block; margin-top:2px; color:var(--faint); font-size:10px; overflow-wrap:anywhere; }
-.knowledge-description { max-width:340px; color:var(--muted); overflow-wrap:anywhere; }
-.knowledge-issues { margin:0; padding-left:16px; color:var(--yellow); font-size:11px; }
+.knowledge-sets-table td.knowledge-description { min-width:200px; max-width:340px; color:var(--muted); white-space:normal; overflow-wrap:anywhere; }
+.knowledge-sets-table td:last-child { white-space:normal; }
+.knowledge-issues { margin:0; padding-left:16px; min-width:180px; color:var(--yellow); font-size:11px; }
 .knowledge-confirm { display:flex; align-items:flex-start; gap:8px; margin-top:8px; color:var(--soft); font-size:11px; }
 .knowledge-form-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
 .knowledge-change-form { margin-top:12px; padding-top:12px; border-top:1px solid var(--border); }
@@ -2103,25 +2108,55 @@ a.data-room-row:hover { background:var(--hover); }
 .knowledge-sync-note { margin:8px 0 0; }
 .knowledge-usage-list { display:grid; gap:8px; margin:0; padding-left:18px; color:var(--muted); font-size:11px; line-height:1.55; }
 .knowledge-usage-list strong { color:var(--soft); }
-/* Knowledge write path (K19): the change card in chat and on the page, the pending list and History. */
-.knowledge-card { margin:10px 0 4px; padding:11px 12px; border:1px solid var(--border-strong); border-radius:11px; background:var(--surface); display:grid; gap:8px; }
+/* Knowledge write path (K19): the change card in chat and on the page, the pending list and History.
+   Its colors are explicit variables, dark here and light below, and knowledge-colors.test.ts keeps every text/background pair
+   at WCAG AA (4.5:1) in BOTH themes. The first version used pastel greens chosen for the dark theme only; on the light theme
+   the added lines read 1.1:1 (owner report 2026-10-16). */
+:root { --kn-diff-bg:#0e0e13; --kn-ctx-fg:#f4f4f5; --kn-meta-fg:#b4b4be; --kn-add-bg:#12301f; --kn-add-fg:#9fe8c3; --kn-del-bg:#3a1b20; --kn-del-fg:#ffb8bd; --kn-ok-fg:#86e0b2; --kn-warn-fg:#f3ba63; --kn-bad-fg:#ff9aa0; --kn-notice-bg:#2a2210; --kn-notice-border:#6b5320; --kn-notice-fg:#f4f4f5; --kn-card-bg:#131319; }
+:root[data-theme="light"] { --kn-diff-bg:#f6f7f9; --kn-ctx-fg:#1c1926; --kn-meta-fg:#4a4658; --kn-add-bg:#e2f4ea; --kn-add-fg:#0b5a3a; --kn-del-bg:#fbe6e8; --kn-del-fg:#8c1d2a; --kn-ok-fg:#0b6b45; --kn-warn-fg:#8a5200; --kn-bad-fg:#a3262f; --kn-notice-bg:#fdf2de; --kn-notice-border:#e2c58a; --kn-notice-fg:#1c1926; --kn-card-bg:#ffffff; }
+.knowledge-card { margin:10px 0 4px; padding:11px 12px; border:1px solid var(--border-strong); border-radius:11px; background:var(--kn-card-bg); display:grid; gap:8px; }
 .knowledge-page-card { margin:0 0 10px; }
 .knowledge-card-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
 .knowledge-card-kind { font-size:10px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); }
 .knowledge-card-why { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
-.knowledge-card-source { margin:0; padding:7px 9px; border:1px solid rgba(255,190,90,.4); border-radius:8px; background:rgba(255,190,90,.08); font-size:12px; line-height:1.5; }
-.knowledge-diff { margin:0; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel, rgba(0,0,0,.18)); font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-.knowledge-diff-line { display:block; }
-.knowledge-diff-line.add { color:#7bd88f; }
-.knowledge-diff-line.del { color:#ff8f8f; }
+.knowledge-card-source { margin:0; padding:7px 9px; border:1px solid var(--kn-notice-border); border-radius:8px; background:var(--kn-notice-bg); color:var(--kn-notice-fg); font-size:12px; line-height:1.5; }
+.knowledge-card-summary { margin:0; color:var(--muted); font-size:12px; line-height:1.5; }
+/* One line per element, no blank line between them (the lines are blocks in a pre-wrap box, so the newline that joins them is not rendered). */
+.knowledge-diff { margin:0; padding:8px 0; border:1px solid var(--border); border-radius:8px; background:var(--kn-diff-bg); color:var(--kn-ctx-fg); font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:normal; overflow-wrap:anywhere; }
+.knowledge-diff-line { display:block; min-height:1.5em; padding:0 10px; white-space:pre-wrap; }
+.knowledge-diff-line.add { color:var(--kn-add-fg); background:var(--kn-add-bg); }
+.knowledge-diff-line.del { color:var(--kn-del-fg); background:var(--kn-del-bg); }
+.knowledge-diff-line.meta { color:var(--kn-meta-fg); }
 .knowledge-items { margin:0; padding-left:18px; font-size:12px; line-height:1.55; }
 .knowledge-items q { color:var(--soft); }
 .knowledge-card-state { font-size:12px; color:var(--muted); }
-.knowledge-card-state.good { color:#7bd88f; }
-.knowledge-card-state.warn { color:#ffbe5a; }
-.knowledge-card-actions { display:flex; flex-wrap:wrap; gap:8px; }
-.knowledge-card-note, .knowledge-card-error { font-size:12px; color:#ffbe5a; }
-.knowledge-card-error { color:#ff8f8f; }
+.knowledge-card-state.good { color:var(--kn-ok-fg); }
+.knowledge-card-state.warn { color:var(--kn-warn-fg); }
+.knowledge-card-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.knowledge-card-note, .knowledge-card-error { font-size:12px; color:var(--kn-warn-fg); }
+.knowledge-card-error { color:var(--kn-bad-fg); }
 .knowledge-history { list-style:none; margin:0; padding:0; display:grid; gap:10px; }
 .knowledge-history-entry { display:grid; gap:6px; padding-bottom:10px; border-bottom:1px solid var(--border); }
 .knowledge-history-file { display:grid; gap:4px; margin-top:6px; }
+/* ── Knowledge diff preview and overlay (owner request 2026-10-16) ──
+   The page card shows a FIXED-HEIGHT window onto the first lines of a diff; Expand opens the whole change in an overlay that
+   covers the page, scrolls its own body, and keeps its buttons in a footer. These are the only scroller and fixed layer in the
+   Knowledge UI, and knowledge-settings-ui.test.ts pins that the rest of its styles have none. */
+.knowledge-diff-preview { display:grid; gap:6px; }
+.knowledge-diff-window { position:relative; height:220px; overflow:hidden; border:1px solid var(--border); border-radius:8px; background:var(--kn-diff-bg); }
+.knowledge-diff-window .knowledge-diff { border:0; border-radius:0; }
+.knowledge-diff-window::after { content:""; position:absolute; left:0; right:0; bottom:0; height:64px; background:linear-gradient(to bottom, transparent, var(--kn-diff-bg)); pointer-events:none; }
+.knowledge-diff-bar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
+.knowledge-overlay { position:fixed; inset:0; z-index:200; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(5,5,8,.62); }
+.knowledge-overlay-panel { display:flex; flex-direction:column; width:min(1040px,100%); height:calc(100vh - 32px); border:1px solid var(--border-strong); border-radius:14px; color:var(--text); background:var(--bg-raised); box-shadow:0 24px 80px rgba(0,0,0,.42); overflow:hidden; }
+.knowledge-overlay-head { flex:0 0 auto; display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid var(--border); }
+.knowledge-overlay-titles { display:grid; gap:3px; min-width:0; }
+.knowledge-overlay-titles strong { font-size:14px; overflow-wrap:anywhere; }
+.knowledge-overlay-x { flex:0 0 auto; min-width:32px; font-size:14px; line-height:1; }
+.knowledge-overlay-body { flex:1 1 auto; min-height:0; overflow:auto; overscroll-behavior:contain; display:grid; gap:10px; align-content:start; padding:14px 16px; }
+.knowledge-overlay-body:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.knowledge-overlay-foot { flex:0 0 auto; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; padding:12px 16px; border-top:1px solid var(--border); background:var(--bg-raised); }
+.knowledge-overlay-foot > .knowledge-card-state, .knowledge-overlay-foot > .knowledge-card-note { flex:1 1 280px; margin:0; }
+.knowledge-overlay-foot .knowledge-card-actions { margin-left:auto; }
+.knowledge-overlay kbd { margin-left:4px; padding:0 4px; border:1px solid var(--border-strong); border-radius:4px; font:10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+@media (max-width:720px) { .knowledge-overlay { padding:0; } .knowledge-overlay-panel { height:100vh; border-radius:0; } }

@@ -724,6 +724,11 @@ describe('Settings → Knowledge wiring', () => {
     expect(html).not.toMatch(/<script[^>]*type="module"[^>]*knowledge-ui\.js/);
     expect(html.indexOf(tag)).toBeGreaterThan(html.indexOf('<script src="./analytics-html-view.js"></script>'));
     expect(html.indexOf(tag)).toBeLessThan(html.indexOf('<script type="module" src="./dashboard.js"></script>'));
+    // The overlay controller is a second classic script (the renderer file must stay free of the DOM), between the two.
+    const overlayTag = '<script src="./knowledge-overlay.js"></script>';
+    expect(html).toContain(overlayTag);
+    expect(html.indexOf(overlayTag)).toBeGreaterThan(html.indexOf(tag));
+    expect(html.indexOf(overlayTag)).toBeLessThan(html.indexOf('<script type="module" src="./dashboard.js"></script>'));
     expect(uiSource).toContain('window.BotBoyKnowledge = {');
   });
 
@@ -740,14 +745,73 @@ describe('Settings → Knowledge wiring', () => {
     expect(refresh).not.toMatch(/location\.reload|setTimeout|setInterval/);
   });
 
+  it('announces a moved knowledgeVersion to the chat panel from the same poll, on any page, never on the first poll, and without a timer', () => {
+    const announce = between(dashboard, '// Wherever the owner is, the chat panel', 'if (previousVersion !== null && payload.version !== previousVersion)');
+    expect(announce).toContain('previousKnowledgeVersion !== null && state.lastKnowledgeVersion !== null && state.lastKnowledgeVersion !== previousKnowledgeVersion');
+    expect(announce).toContain('announceKnowledgeChanged();');
+    expect(announce).not.toContain('state.route.view'); // the chat panel is on every page
+    expect(announce).not.toMatch(/location\.reload|setTimeout|setInterval/);
+    // The helper is one event on window; the page needs no listener of its own (app.js listens).
+    const helper = between(dashboard, 'function announceKnowledgeChanged() {', '\n}\n');
+    expect(helper).toContain("new CustomEvent('botboy:knowledge-changed')");
+    expect(helper).toContain('window.dispatchEvent?.(');
+    expect(dashboard).not.toContain("addEventListener('botboy:knowledge-changed'");
+  });
+
   it('adds no timer, poll, scroller or storage: the whole block and the renderer are free of them', () => {
     const block = between(dashboard, '// ── Settings → Knowledge (docs/maps/knowledge-library.md K12) ──', '// ── Explicitly confirmed S3/CloudFront snapshot publishing ──');
     expect(block).not.toMatch(/setTimeout|setInterval|requestAnimationFrame|scrollTo|scrollTop|scrollIntoView|localStorage|sessionStorage|new EventSource|WebSocket/);
     expect(block).toContain("renderRoute({ preserveScroll: true, userAction: true })");
     expect(uiSource).not.toMatch(/setTimeout|setInterval|requestAnimationFrame|scrollTo|scrollTop|scrollIntoView|localStorage|sessionStorage|fetch\(|document\.|XMLHttpRequest|innerHTML\s*=/);
-    const styles = css.slice(css.indexOf('/* ── Settings → Knowledge'));
-    // No motion, no fixed layer and no scroll container of its own (overflow-wrap is text wrapping, not a scroller).
-    expect(styles).not.toMatch(/animation|transition|position:\s*(fixed|sticky)|overflow(?:-[xy])?\s*:/);
+    const from = css.indexOf('/* ── Settings → Knowledge');
+    const overlayFrom = css.indexOf('/* ── Knowledge diff preview and overlay');
+    expect(overlayFrom).toBeGreaterThan(from);
+    // The page itself: no motion, no fixed layer and no scroll container of its own (overflow-wrap is text wrapping, not a scroller).
+    expect(css.slice(from, overlayFrom)).not.toMatch(/animation|transition|position:\s*(fixed|sticky)|overflow(?:-[xy])?\s*:/);
+    // The overlay section is the one deliberate exception: a fixed layer, a body that scrolls without chaining to the page,
+    // a clipped preview window of fixed height, and still no motion.
+    const overlayStyles = css.slice(overlayFrom);
+    expect(overlayStyles).toMatch(/\.knowledge-overlay \{[^}]*position:fixed/);
+    expect(overlayStyles).toMatch(/\.knowledge-overlay-body \{[^}]*overflow:auto;[^}]*overscroll-behavior:contain/);
+    expect(overlayStyles).toMatch(/\.knowledge-diff-window \{[^}]*height:220px;[^}]*overflow:hidden/);
+    expect(overlayStyles).not.toMatch(/animation|transition|sticky/);
+  });
+
+  it('the sets table wraps its prose and shows names as names, with selectors that outrank the shared Data Room table rules', () => {
+    // jsdom has no layout, so the guard is on the rules. A long description once ran over the Files and Guide cells and the table was
+    // cut off at the right (owner report 2026-10-16): `.data-room-table td { white-space: nowrap }` (0,1,1) beat `.knowledge-description`
+    // (0,1,0), which never set white-space, and the row header inherited the 8px uppercase column-heading look.
+    expect(css).toMatch(/\.data-room-table th,\.data-room-table td \{[^}]*white-space:nowrap/); // the premise: the shared rule is still there
+    const specificity = (selector: string) => {
+      const bare = selector.trim().replace(/\[[^\]]*\]/g, '[]');
+      const ids = (bare.match(/#[\w-]+/g) ?? []).length;
+      const classes = (bare.match(/\.[\w-]+|\[\]|:(?!:)[\w-]+/g) ?? []).length;
+      const types = (bare.replace(/\[\]|[.#:][\w-]+/g, ' ').match(/(?:^|[\s>+~])[a-z][\w-]*/gi) ?? []).length;
+      return ids * 10000 + classes * 100 + types;
+    };
+    const declarationsOf = (selector: string): Record<string, string> => {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const match = css.match(new RegExp(`(?:^|\\n)${escaped} \\{([^}]*)\\}`));
+      expect(match, `missing the rule for ${selector}`).not.toBeNull();
+      return Object.fromEntries(match![1].split(';').map(part => part.trim()).filter(Boolean).map(part => [part.slice(0, part.indexOf(':')).trim(), part.slice(part.indexOf(':') + 1).trim()]));
+    };
+    expect(specificity('.data-room-table td')).toBe(101); // 0,1,1: what the sets rules have to beat
+    const description = declarationsOf('.knowledge-sets-table td.knowledge-description');
+    expect(description).toMatchObject({ 'white-space': 'normal', 'overflow-wrap': 'anywhere', 'max-width': '340px' });
+    expect(specificity('.knowledge-sets-table td.knowledge-description')).toBeGreaterThan(specificity('.data-room-table td'));
+    const rowHeader = declarationsOf('.knowledge-sets-table th[scope="row"]');
+    expect(rowHeader).toMatchObject({ 'white-space': 'normal', 'text-transform': 'none', 'font-size': '11px', 'letter-spacing': 'normal', background: 'transparent' });
+    expect(specificity('.knowledge-sets-table th[scope="row"]')).toBeGreaterThan(specificity('.data-room-table th'));
+    expect(declarationsOf('.knowledge-sets-table td:last-child')['white-space']).toBe('normal');
+    expect(specificity('.knowledge-sets-table td:last-child')).toBeGreaterThan(specificity('.data-room-table td'));
+    expect(declarationsOf('.knowledge-sets-table tbody th, .knowledge-sets-table tbody td')['vertical-align']).toBe('top');
+    // The real markup still has the hooks those selectors need: a row header, the description as the third cell, the issues in the last.
+    paint(modelOf({ status: statusOf({ sets: [set({ description: 'x'.repeat(220), issues: [{ code: 'a', message: 'One' }] })] }) }));
+    const row = document.querySelector('.knowledge-sets-table tbody tr')!;
+    expect(row.children[0].matches('th[scope="row"]')).toBe(true);
+    expect(row.children[2].matches('td.knowledge-description')).toBe(true);
+    expect(row.lastElementChild!.matches('td')).toBe(true);
+    expect(row.lastElementChild!.querySelector('.knowledge-issues')).not.toBeNull();
   });
 
   it('keeps no secret or key in the page state, and every request goes to a /knowledge route', () => {

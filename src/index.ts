@@ -71,6 +71,7 @@ import { createEtlRunWatcher } from './core/etl-run-watcher.js';
 import { CONTINUATION_HEADER, createContinuationBridge, createContinuationRunner } from './core/chat-continuations.js';
 import { withJobMandate } from './core/job-mandate.js';
 import { createKnowledgeLibrary } from './core/knowledge-library.js';
+import { createKnowledgeJobWaker } from './core/knowledge-job-wake.js';
 import { createKnowledgeMigration } from './core/knowledge-migration.js';
 import { withKnowledgeChatTools } from './core/knowledge-chat-tools.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
@@ -824,6 +825,9 @@ async function main() {
     filesDir: path.dirname(etlResultsDir),
   });
   chatContinuations.bindRunner(continuationRunner);
+  // A job that paused for the owner's decision on a Knowledge card wakes when the decision is made (knowledge-job-wake.ts):
+  // from the apply and dismiss routes, and once at boot for a decision made before this check existed.
+  const knowledgeJobWaker = createKnowledgeJobWaker({ jobs: chatJobs, changes: knowledgeChanges, request: (jobId) => continuationRunner.request(jobId) });
   // Read-only watcher over the job's runs, with its own runner (it never
   // claims scratch pairs; readRun only reads status and downloads).
   const etlWatchRunner = createEtlQueryRunner({ db, call: createEtlToolCall(mcpManager), downloadDir: etlResultsDir });
@@ -1766,6 +1770,7 @@ async function main() {
     knowledgeWriter,
     knowledgeHistory,
     knowledgeChanges,
+    knowledgeJobWaker,
     knowledgeMigration,
     appUpdater,
     browserCapture: { state: browserCaptureState, monitor: browserMonitor },
@@ -1843,6 +1848,7 @@ async function main() {
   console.log('✅ Folder imports scheduled (first pass in 30 s; big files wait for your review)');
   // ETL watches resume from SQLite; a finished run continues its job in chat.
   continuationRunner.start();
+  knowledgeJobWaker.wakeIfDecided();
   whatsAppChat.start();
   // Keep the Mac awake while a turn runs or a job is active (keep-awake.ts).
   createKeepAwake({ busy: () => chatContinuations.isTurnActive() || Boolean(chatJobs.activeJob()) }).start();

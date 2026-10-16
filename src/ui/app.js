@@ -547,7 +547,11 @@ function createChatStreamBubble(chatEl, hooks = {}) {
       renderPending = true;
       requestAnimationFrame(() => {
         renderPending = false;
-        renderSegments();
+        // A frame the last token queued can fire AFTER `done` (or a failure) has drawn the final bubble and expanded its
+        // approval cards. Drawing again from the raw segments would turn every card back into its marker text, and
+        // nothing repaints a finished bubble (live bug 2026-10-16: the Knowledge approval card). Only a bubble that is
+        // still streaming draws on a frame; a finished one only scrolls.
+        if (isLive()) renderSegments();
         autoScroll();
       });
     }
@@ -1996,20 +2000,34 @@ function paintLessonCard(card, lesson) {
 // The rendering is knowledge-ui.js (window.BotBoyKnowledge.renderChangeCard, escaped there); the buttons are the owner's
 // decisions. Apply sends two booleans and no text: the server applies the change it stored. Ask BotBoy to fix and Re-draft
 // are ordinary owner messages that carry the card marker (no route of their own).
-async function fillKnowledgeCard(card) {
+async function fillKnowledgeCard(card, { refresh = false } = {}) {
+  // A refresh (the Knowledge changes moved) leaves a card alone when nothing can change on it any more, while a click on it is in
+  // flight, and when the answer is what it already shows; a refresh that fails keeps the card the owner is reading.
+  const leaveAlone = () => ['dismissed', 'expired', 'undone'].includes(card.knowledgeChange?.status) || card.querySelector('button:disabled') !== null;
+  if (refresh && leaveAlone()) return;
   try {
     const change = await api(`/knowledge/changes/${card.dataset.knowledgeChangeId}`);
     if (!change || !change.id) throw new Error(change?.error || 'unavailable');
+    if (refresh && (!card.isConnected || leaveAlone() || JSON.stringify(change) === JSON.stringify(card.knowledgeChange))) return;
     paintKnowledgeCard(card, change);
   } catch {
-    card.innerHTML = '<em>This change is unavailable.</em>';
+    if (!refresh) card.innerHTML = '<em>This change is unavailable.</em>';
   }
 }
+/**
+ * The Knowledge changes moved (an Apply or Dismiss on the Settings page or in another tab, a card BotBoy just staged): every
+ * change card in the chat reads itself again, so "Review in Knowledge" does not outlive the decision. dashboard.js announces it
+ * from the version poll it already runs and right after the owner's own click, so this adds no timer (knowledge-library.md K20).
+ */
+function refreshKnowledgeCards() {
+  for (const card of document.querySelectorAll('.knowledge-chat-card[data-hydrated]')) void fillKnowledgeCard(card, { refresh: true });
+}
+window.addEventListener('botboy:knowledge-changed', refreshKnowledgeCards);
 function paintKnowledgeCard(card, change, notice) {
   const ui = window.BotBoyKnowledge;
   card.knowledgeChange = change;
   card.innerHTML = ui && ui.renderChangeCard
-    ? ui.renderChangeCard(change, { esc: lessonEsc, attr: lessonEsc }, { expandDiff: card.dataset.expanded === '1', notice })
+    ? ui.renderChangeCard(change, { esc: lessonEsc, attr: lessonEsc }, { surface: 'chat', notice })
     : '<em>The Knowledge card did not load. Reload this tab.</em>';
 }
 document.addEventListener('click', async (event) => {
@@ -2020,11 +2038,6 @@ document.addEventListener('click', async (event) => {
   const action = button.dataset.knowledgeAction;
   const id = card?.dataset.knowledgeChangeId;
   if (!card || !change || !id) return;
-  if (action === 'diff-more') {
-    card.dataset.expanded = '1';
-    paintKnowledgeCard(card, change);
-    return;
-  }
   const ui = window.BotBoyKnowledge;
   if (action === 'ask-fix' || action === 'redraft') {
     const input = document.getElementById('chatInput');
@@ -2033,13 +2046,13 @@ document.addEventListener('click', async (event) => {
     if (typeof window.submitChat === 'function') await window.submitChat();
     return;
   }
-  const routes = { apply: 'apply', 'apply-anyway': 'apply', dismiss: 'dismiss', recheck: 'recheck', undo: 'undo' };
+  // No apply here: a change is read in full and applied on Settings → Knowledge (the card's link goes there), never from a bubble.
+  const routes = { dismiss: 'dismiss', recheck: 'recheck', undo: 'undo' };
   const route = routes[action];
   if (!route) return;
   for (const other of card.querySelectorAll('button')) other.disabled = true;
   try {
-    const body = route === 'apply' && ui ? ui.applyBody(change, action) : undefined;
-    const payload = await api(`/knowledge/changes/${id}/${route}`, { method: 'POST', ...(body ? { body } : {}) });
+    const payload = await api(`/knowledge/changes/${id}/${route}`, { method: 'POST' });
     if (route === 'undo' && payload && payload.ok) {
       paintKnowledgeCard(card, { ...change, status: 'undone' });
       return;

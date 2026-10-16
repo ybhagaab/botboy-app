@@ -25,6 +25,7 @@ import {
   type ChatJobStore,
   type EtlRunWatch,
 } from './chat-jobs.js';
+import { DECISION_SEPARATOR } from './knowledge-job-wake.js';
 
 export const CONTINUATION_HEADER = 'x-botboy-continuation';
 const RETRY_INTERVAL_MS = 5_000;
@@ -189,16 +190,22 @@ export function buildContinuationTrigger(
 /** The trigger for a continuation the job itself asked for (no finished run). */
 export function buildSelfContinuationTrigger(job: ChatJob, reason: string, pendingRuns: EtlRunWatch[]): { message: string; note: string } {
   const undeclared = /ended without saying/.test(reason);
+  // A wake-up by the owner's decision on a Knowledge card (knowledge-job-wake.ts): its headline is the chat note, and the
+  // turn is told the decision is in, so it finishes the job instead of redoing the work.
+  const decision = reason.includes(DECISION_SEPARATOR);
+  const [headline] = reason.split(DECISION_SEPARATOR);
   const message = [
     '[Automatic continuation — not a message from the owner]',
-    `Why this turn started: ${reason}`,
+    `Why this turn started: ${reason.split(DECISION_SEPARATOR).join(' ')}`,
     ...(job.workingSet.nextStep ? [`Next step you recorded: ${job.workingSet.nextStep}`] : []),
     ...(pendingRuns.length ? [`Still running (BotBoy continues again when they finish): ${pendingRuns.map(watch => watch.runId).join(', ')}.`] : []),
     undeclared
       ? 'Your previous turn ended without job_update. If work remains that you can do yourself, do it now. End this turn with job_update: continue (more to do), needs_owner (a question only the owner can answer), or done (verified). Without one, the job pauses.'
-      : 'Continue the job from where it stands: take the next steps and verify the deliverable. Do not repeat work already done (see the ACTIVE JOB block and the conversation). End the turn with job_update continue, needs_owner, or done.',
+      : decision
+        ? 'The decision the job waited for is in. Check only what you need (knowledge_list shows the set), do not redo finished work, and end this turn with job_update: done when the deliverable is finished, continue if there is more you can do yourself, or needs_owner with the question if a dismissal means the owner has to say what to change.'
+        : 'Continue the job from where it stands: take the next steps and verify the deliverable. Do not repeat work already done (see the ACTIVE JOB block and the conversation). End the turn with job_update continue, needs_owner, or done.',
   ].join('\n');
-  return { message, note: '↻ Continued automatically: the job\'s next step.' };
+  return { message, note: decision ? `↻ Continued automatically: ${headline.replace(/^The owner /, 'you ')}` : '↻ Continued automatically: the job\'s next step.' };
 }
 
 // ── Runner ──

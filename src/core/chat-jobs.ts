@@ -184,6 +184,12 @@ export interface ChatJobStore {
   settle(jobId: string, settlement: ChatTurnSettlement, end: ChatTurnEnd): ChatJob | null;
   /** The owner replied: clears a pause, a due continuation, and the streaks. */
   ownerResumed(jobId: string): void;
+  /**
+   * Something outside a turn answered what a PAUSED job was waiting for (the owner decided on a Knowledge card on the
+   * Settings page): clears the pause and makes a continuation due, with `reason` as the turn's stated cause. Returns the job,
+   * or null when it is not active and paused (a running job is never disturbed, and a continuation already due stays as it is).
+   */
+  wake(jobId: string, reason: string): ChatJob | null;
   /** A continuation turn was admitted for this request. */
   clearContinueRequest(jobId: string): void;
   /** Expires idle jobs; returns their ids. */
@@ -462,6 +468,15 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
           continuation_count = 0
         WHERE id = ? AND status = 'active'`).run(jobId);
       if (result.changes) changed();
+    },
+    wake(jobId, reason) {
+      const at = nowIso();
+      const result = db.prepare(`UPDATE chat_jobs SET continue_requested_at = ?, continue_reason = ?, paused_at = NULL, pause_note = NULL,
+          declaration = NULL, declared_at = NULL, last_activity_at = ?
+        WHERE id = ? AND status = 'active' AND paused_at IS NOT NULL AND continue_requested_at IS NULL`).run(at, clip(reason, 600), at, jobId);
+      if (!result.changes) return null;
+      changed();
+      return rowToJob(selectJob.get(jobId));
     },
     clearContinueRequest(jobId) {
       const result = db.prepare(`UPDATE chat_jobs SET continue_requested_at = NULL, paused_at = NULL, pause_note = NULL

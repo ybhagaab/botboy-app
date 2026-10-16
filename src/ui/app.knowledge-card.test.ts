@@ -19,6 +19,12 @@ function constLine(name: string): string {
   expect(match, `missing const ${name}`).not.toBeNull();
   return match![0];
 }
+/** The one line that subscribes the chat cards to the dashboard's "the Knowledge changes moved" event. */
+function knowledgeChangedListener(): string {
+  const line = "window.addEventListener('botboy:knowledge-changed', refreshKnowledgeCards);";
+  expect(app, 'missing the knowledge-changed subscription').toContain(`\n${line}\n`);
+  return line;
+}
 function knowledgeClickListener(): string {
   const start = app.indexOf("document.addEventListener('click', async (event) => {\n  const button = event.target.closest('.knowledge-chat-card [data-knowledge-action]');");
   expect(start, 'missing the knowledge card click listener').toBeGreaterThanOrEqual(0);
@@ -47,7 +53,7 @@ beforeAll(() => {
     topLevel('hydrateChatCards'), topLevel('fillLessonCard'), topLevel('lessonEsc'), topLevel('paintLessonCard'),
     topLevel('fillGmailDraftCard'), topLevel('gmailDraftWhen'), topLevel('gmailFileSize'), topLevel('paintGmailDraftCard'),
     topLevel('fillMcpServerCard'), topLevel('mcpCardTransport'), topLevel('paintMcpServerCard'),
-    topLevel('fillKnowledgeCard'), topLevel('paintKnowledgeCard'),
+    topLevel('fillKnowledgeCard'), topLevel('paintKnowledgeCard'), topLevel('refreshKnowledgeCards'), knowledgeChangedListener(),
     knowledgeClickListener(),
     'return { hydrateChatCards };',
   ].join('\n');
@@ -75,7 +81,8 @@ async function mount(content = `I prepared a change. [[knowledge:${ID}]]`, role 
   return bubble;
 }
 const card = () => document.querySelector('.knowledge-chat-card') as HTMLElement;
-const labels = () => [...card().querySelectorAll('button')].map((button) => button.textContent);
+// Everything in the card's action row: the "Review in Knowledge" link counts beside the buttons.
+const labels = () => [...card().querySelectorAll('.knowledge-card-actions > a, .knowledge-card-actions > button')].map((element) => element.textContent);
 const click = async (action: string) => {
   (card().querySelector(`[data-knowledge-action="${action}"]`) as HTMLElement).click();
   await settle();
@@ -89,7 +96,7 @@ describe('the marker becomes a card', () => {
     expect(card().textContent).toContain('Edit orders.md in shop-data');
     expect(card().textContent).toContain('verified in a real query');
     expect(document.body.textContent).not.toContain('[[knowledge:');
-    expect(labels()).toEqual(['Apply', 'Dismiss']);
+    expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
     document.getElementById('chat-messages')!.innerHTML = '';
     await mount(`Please fix it. [[knowledge:${ID}]]`, 'user');
     expect(card()).not.toBeNull();
@@ -112,10 +119,58 @@ describe('the marker becomes a card', () => {
   });
 });
 
+describe('the compact chat card (owner decision 2026-10-16: no preview in a bubble, a button to Settings → Knowledge instead)', () => {
+  it('shows a summary and a link to the Knowledge page, never the diff, and no way to apply from chat', async () => {
+    const long = ['--- a/orders.md', '+++ b/orders.md', '@@ -0,0 +1,400 @@', ...Array.from({ length: 400 }, (_, index) => `+ line ${index}`)].join('\n');
+    holder.api = async () => change({ diff: long, files: Array.from({ length: 9 }, (_, index) => ({ path: `set/file-${index}.md`, effect: 'created' })) });
+    await mount();
+    expect(card().querySelector('.knowledge-diff')).toBeNull();
+    expect(card().querySelectorAll('.knowledge-diff-line')).toHaveLength(0);
+    expect(card().querySelector('[data-knowledge-action="diff-expand"]')).toBeNull();
+    expect(card().querySelector('.knowledge-card-summary')!.textContent).toBe('9 files · 400 lines added');
+    const link = card().querySelector('a[data-knowledge-action="open-page"]') as HTMLAnchorElement;
+    expect(link.textContent).toBe('Review in Knowledge');
+    expect(link.getAttribute('href')).toBe('#/settings/knowledge');
+    expect(link.getAttribute('data-change-id')).toBe(ID);
+    expect(card().textContent).toContain('Read the whole change in Settings → Knowledge');
+    expect(card().querySelector('[data-knowledge-action="apply"], [data-knowledge-action="apply-anyway"]')).toBeNull();
+    expect(card().textContent).not.toContain('line 399');
+  });
+
+  it('counts removed lines too, and says so when a change has no text diff', async () => {
+    await mount();
+    expect(card().querySelector('.knowledge-card-summary')!.textContent).toBe('1 file · 2 lines added, 1 removed');
+    document.getElementById('chat-messages')!.innerHTML = '';
+    holder.api = async () => change({ diff: '' });
+    await mount();
+    expect(card().querySelector('.knowledge-card-summary')).toBeNull();
+  });
+
+  it('a click on the link is left to the browser: chat posts nothing and does not stop the navigation', async () => {
+    await mount();
+    const link = card().querySelector('a[data-knowledge-action="open-page"]') as HTMLAnchorElement;
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    link.dispatchEvent(event);
+    await settle();
+    expect(event.defaultPrevented).toBe(false);
+    expect(calls.filter((entry) => entry.options?.method === 'POST')).toEqual([]);
+  });
+
+  it('chat has no apply code path at all: a forged apply button posts nothing', async () => {
+    await mount();
+    const forged = document.createElement('button');
+    forged.setAttribute('data-knowledge-action', 'apply');
+    forged.setAttribute('data-change-id', ID);
+    card().appendChild(forged);
+    forged.click();
+    await settle();
+    expect(calls.filter((entry) => entry.options?.method === 'POST')).toEqual([]);
+  });
+});
 describe('the five states and their buttons', () => {
   it.each([
-    ['clean', change(), ['Apply', 'Dismiss']],
-    ['a guide breach is open', change({ unresolved: [BREACH], needsAnyway: true }), ['Apply anyway', 'Ask BotBoy to fix', 'Dismiss']],
+    ['clean', change(), ['Review in Knowledge', 'Dismiss']],
+    ['a guide breach is open', change({ unresolved: [BREACH], needsAnyway: true }), ['Review in Knowledge', 'Ask BotBoy to fix', 'Dismiss']],
     ['the check could not run', change({ status: 'held', check: { nextAction: 'Open Settings → AI model.' } }), ['Retry check', 'Dismiss']],
     ['the file moved on', change({ status: 'stale' }), ['Re-draft', 'Dismiss']],
     ['applied', change({ status: 'applied', historyId: 'h_000000000001' }), ['Undo']],
@@ -138,23 +193,14 @@ describe('the five states and their buttons', () => {
     expect(card().textContent).toContain('Open Settings → AI model.');
   });
 
-  it('a card for text from an untrusted source says where it came from, shows the WHOLE diff, and its button reads Review and apply', async () => {
+  it('a card for text from an untrusted source says where it came from and still shows no diff in chat, only the way to read it', async () => {
     const long = ['--- a/orders.md', '+++ b/orders.md', ...Array.from({ length: 400 }, (_, index) => `+ line ${index}`)].join('\n');
     holder.api = async () => change({ sources: ['email', 'web page'], needsConfirm: true, diff: long });
     await mount();
     expect(card().textContent).toContain('Derived from email, web page');
-    expect(card().querySelectorAll('.knowledge-diff-line')).toHaveLength(402);
-    expect(card().querySelector('[data-knowledge-action="diff-more"]')).toBeNull();
-    expect(labels()).toEqual(['Review and apply', 'Dismiss']);
-  });
-
-  it('shows the first 200 diff lines of a clean card, with a button for the rest', async () => {
-    const long = ['--- a/orders.md', '+++ b/orders.md', ...Array.from({ length: 400 }, (_, index) => `+ line ${index}`)].join('\n');
-    holder.api = async () => change({ diff: long });
-    await mount();
-    expect(card().querySelectorAll('.knowledge-diff-line')).toHaveLength(200);
-    await click('diff-more');
-    expect(card().querySelectorAll('.knowledge-diff-line')).toHaveLength(402);
+    expect(card().textContent).toContain('read the whole change before you apply it');
+    expect(card().querySelectorAll('.knowledge-diff-line')).toHaveLength(0);
+    expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
   });
 
   it('escapes everything a model or a file could have written into a card', async () => {
@@ -169,35 +215,19 @@ describe('the five states and their buttons', () => {
     expect(card().querySelector('i')).toBeNull();
     expect(card().querySelector('u')).toBeNull();
     expect(card().querySelector('s')).toBeNull();
-    expect(card().textContent).toContain('<script>alert(2)</script>');
+    expect(card().textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(card().textContent).toContain('<script>p</script>');
+    // The diff text itself is not in the chat card at all.
+    expect(card().textContent).not.toContain('alert(2)');
   });
 });
 
 describe('the buttons', () => {
-  it('Apply sends two booleans and NO text, then paints the applied card', async () => {
-    holder.api = async (p: string, o?: ApiCall['options']) => (o?.method === 'POST' ? { ok: true, change: change({ status: 'applied' }) } : change());
-    await mount();
-    await click('apply');
-    const post = calls.find((entry) => entry.options?.method === 'POST')!;
-    expect(post.path).toBe(`/knowledge/changes/${ID}/apply`);
-    expect(post.options?.body).toEqual({ anyway: false, confirmFlagged: false });
-    expect(labels()).toEqual(['Undo']);
-    expect(card().textContent).toContain('Applied');
-  });
-
-  it('Apply anyway sets anyway; Review and apply on an untrusted card sets confirmFlagged, and neither carries content', async () => {
-    holder.api = async (p: string, o?: ApiCall['options']) => (o?.method === 'POST' ? { ok: true, change: change({ status: 'applied' }) } : change({ unresolved: [BREACH], needsAnyway: true, sources: ['email'], needsConfirm: true }));
-    await mount();
-    await click('apply-anyway');
-    expect(calls.find((entry) => entry.options?.method === 'POST')!.options?.body).toEqual({ anyway: true, confirmFlagged: true });
-    expect(JSON.stringify(calls.map((entry) => entry.options?.body))).not.toMatch(/content|edits/);
-  });
-
   it('a refusal from the server repaints the card with the reason and the next step, and the buttons work again', async () => {
     holder.api = async (p: string, o?: ApiCall['options']) => (o?.method === 'POST'
       ? { error: 'The file or the guide changed after this was prepared.', code: 'stale_base', nextAction: 'Use Re-draft.', change: change({ status: 'stale' }) } : change());
     await mount();
-    await click('apply');
+    await click('dismiss');
     expect(labels()).toEqual(['Re-draft', 'Dismiss']);
     expect(card().textContent).toContain('The file or the guide changed after this was prepared. Use Re-draft.');
     expect([...card().querySelectorAll('button')].every((button) => !button.disabled)).toBe(true);
@@ -206,9 +236,9 @@ describe('the buttons', () => {
   it('a request that fails says so, keeps the card, and re-enables the buttons', async () => {
     holder.api = async (p: string, o?: ApiCall['options']) => { if (o?.method === 'POST') throw new Error('network down'); return change(); };
     await mount();
-    await click('apply');
+    await click('dismiss');
     expect(card().textContent).toContain('Could not do that: network down');
-    expect(labels()).toEqual(['Apply', 'Dismiss']);
+    expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
     expect([...card().querySelectorAll('button')].every((button) => !button.disabled)).toBe(true);
   });
 
@@ -224,7 +254,7 @@ describe('the buttons', () => {
     await mount();
     await click('recheck');
     expect(calls.at(-1)!.path).toBe(`/knowledge/changes/${ID}/recheck`);
-    expect(labels()).toEqual(['Apply', 'Dismiss']);
+    expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
     await click('dismiss');
     expect(calls.at(-1)!.path).toBe(`/knowledge/changes/${ID}/dismiss`);
     expect(card().textContent).toContain('Dismissed. Nothing was written.');
@@ -243,5 +273,117 @@ describe('the buttons', () => {
     await click('redraft');
     expect((document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe(`Please prepare this change again from the current file and rules. [[knowledge:${ID}]]`);
     expect(submit).toHaveBeenCalledTimes(2);
+  });
+});
+
+// Owner report 2026-10-16: "when I saved a proposed knowledge the CTA in chat still said Review in Knowledge; after I refreshed it
+// went away." The card read its change once, when the bubble was drawn. dashboard.js now announces "the Knowledge changes moved"
+// (an event, from the version poll it already runs and right after the owner's own click), and each card reads itself again.
+describe('the card follows its change (K20)', () => {
+  const announce = () => window.dispatchEvent(new CustomEvent('botboy:knowledge-changed'));
+  const OTHER = 'kc_abcdef012345';
+
+  it('a decision made on the Settings page or in another tab repaints the card: the Review link is gone and Undo is offered', async () => {
+    await mount();
+    expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
+    calls.length = 0;
+    holder.api = async () => change({ status: 'applied', historyId: 'h_000000000001' });
+    announce();
+    await settle();
+    expect(calls).toEqual([{ path: `/knowledge/changes/${ID}`, options: undefined }]);
+    expect(labels()).toEqual(['Undo']);
+    expect(card().textContent).not.toContain('Review in Knowledge');
+  });
+
+  it('when nothing moved on this change the card is not redrawn at all (the same nodes stay: no flicker, no lost focus)', async () => {
+    await mount();
+    const link = card().querySelector('a[data-knowledge-action="open-page"]');
+    const dismiss = card().querySelector('button[data-knowledge-action="dismiss"]');
+    calls.length = 0;
+    announce();
+    await settle();
+    expect(calls).toHaveLength(1); // it did look
+    expect(card().querySelector('a[data-knowledge-action="open-page"]')).toBe(link);
+    expect(card().querySelector('button[data-knowledge-action="dismiss"]')).toBe(dismiss);
+  });
+
+  it('a refresh that fails keeps the card the owner is reading, whether the network is down or the change is gone', async () => {
+    await mount();
+    for (const broken of [async () => { throw new Error('network down'); }, async () => ({ error: 'That change is unknown or has expired.' })]) {
+      holder.api = broken;
+      announce();
+      await settle();
+      expect(card().textContent).toContain('Edit orders.md in shop-data');
+      expect(card().textContent).not.toContain('unavailable');
+      expect(labels()).toEqual(['Review in Knowledge', 'Dismiss']);
+    }
+  });
+
+  it('a card that can not change any more is not asked about again: dismissed, expired, and undone from the card', async () => {
+    for (const status of ['dismissed', 'expired']) {
+      document.getElementById('chat-messages')!.innerHTML = '';
+      holder.api = async () => change({ status, actions: [] });
+      await mount();
+      calls.length = 0;
+      announce();
+      await settle();
+      expect(calls, status).toEqual([]);
+    }
+    document.getElementById('chat-messages')!.innerHTML = '';
+    holder.api = async (p: string, o?: ApiCall['options']) => (o?.method === 'POST' ? { ok: true, entry: {}, undone: {} } : change({ status: 'applied', historyId: 'h_000000000001' }));
+    await mount();
+    await click('undo');
+    calls.length = 0;
+    announce();
+    await settle();
+    expect(calls).toEqual([]);
+    expect(card().textContent).toContain('Undone. The file is back as it was before this change.');
+  });
+
+  it('a click in flight owns the card: no refresh is sent, and a refresh that began earlier cannot repaint over the click', async () => {
+    await mount();
+    let finishClick!: (value: unknown) => void;
+    holder.api = (_p: string, o?: ApiCall['options']) => (o?.method === 'POST' ? new Promise((resolve) => { finishClick = resolve; }) : Promise.resolve(change()));
+    (card().querySelector('[data-knowledge-action="dismiss"]') as HTMLElement).click();
+    await settle();
+    expect([...card().querySelectorAll('button')].every((button) => button.disabled)).toBe(true);
+    calls.length = 0;
+    announce();
+    await settle();
+    expect(calls).toEqual([]); // not even asked while the click is in flight
+    finishClick({ ok: true, change: change({ status: 'dismissed', actions: [] }) });
+    await settle();
+    expect(card().textContent).toContain('Dismissed. Nothing was written.');
+
+    // The other order: the refresh starts first and its answer is slow; the owner clicks meanwhile.
+    document.getElementById('chat-messages')!.innerHTML = '';
+    holder.api = async () => change();
+    await mount();
+    let lateAnswer!: (value: unknown) => void;
+    let secondClick!: (value: unknown) => void;
+    holder.api = (_p: string, o?: ApiCall['options']) => (o?.method === 'POST'
+      ? new Promise((resolve) => { secondClick = resolve; })
+      : new Promise((resolve) => { lateAnswer = resolve; }));
+    announce(); // the refresh GET is now waiting for its answer
+    (card().querySelector('[data-knowledge-action="dismiss"]') as HTMLElement).click(); // the click disables the buttons
+    await settle();
+    lateAnswer(change({ why: 'a reason that arrived late' }));
+    await settle();
+    expect(card().textContent).not.toContain('a reason that arrived late');
+    expect([...card().querySelectorAll('button')].every((button) => button.disabled)).toBe(true);
+    secondClick({ ok: true, change: change({ status: 'dismissed', actions: [] }) });
+    await settle();
+    expect(card().textContent).toContain('Dismissed. Nothing was written.');
+  });
+
+  it('every change card in the chat reads itself again, each one for its own change', async () => {
+    holder.api = async (p: string) => change({ id: p.split('/').pop() });
+    await mount();
+    await mount(`another [[knowledge:${OTHER}]]`);
+    expect(document.querySelectorAll('.knowledge-chat-card')).toHaveLength(2);
+    calls.length = 0;
+    announce();
+    await settle();
+    expect(calls.map((entry) => entry.path).sort()).toEqual([`/knowledge/changes/${ID}`, `/knowledge/changes/${OTHER}`].sort());
   });
 });

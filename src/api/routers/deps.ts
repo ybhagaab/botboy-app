@@ -174,6 +174,8 @@ export interface RouterDeps {
   knowledgeWriter?: import('../../core/knowledge-write.js').KnowledgeWriter;
   knowledgeHistory?: import('../../core/knowledge-history.js').KnowledgeHistory;
   knowledgeChanges?: import('../../core/knowledge-changes.js').KnowledgeChangeStore;
+  /** Wakes a job that paused for the owner's decision on a Knowledge card once the decision is made (knowledge-job-wake.ts). */
+  knowledgeJobWaker?: import('../../core/knowledge-job-wake.js').KnowledgeJobWaker;
   /** Moving the analytics knowledge into the library, and changing the library's location (knowledge-migration.ts). */
   knowledgeMigration?: import('../../core/knowledge-migration.js').KnowledgeMigration;
   /** Continuation turns: secret, live hub, runner (chat-continuations.ts). */

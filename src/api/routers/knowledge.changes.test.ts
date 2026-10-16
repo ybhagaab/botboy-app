@@ -9,7 +9,9 @@ import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import express from 'express';
 import request from 'supertest';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createChatJobStore, type ChatJobStore } from '../../core/chat-jobs.js';
+import { createKnowledgeJobWaker } from '../../core/knowledge-job-wake.js';
 import { fakePrivateKeyBlock } from '../../core/knowledge-fixtures.testutil.js';
 import { noteToolCall } from '../../core/knowledge-taint.js';
 import { dateBreach, makeHarness, type Harness } from '../../core/knowledge-write.testutil.js';
@@ -18,6 +20,13 @@ import { createKnowledgeRouter } from './knowledge.js';
 let h: Harness;
 let server: http.Server;
 let base: string;
+/** The router's dependencies, kept so a test can take the job waker away or swap it. */
+let deps: any;
+let jobs: ChatJobStore;
+/** The job ids the waker asked the continuation runner to run. */
+let wakeRequests: string[];
+/** Errors that reached Express after a route had already answered (a client cannot see these). */
+let lateErrors: Error[];
 const ui = (test: request.Test) => test.set('Origin', base).set('Sec-Fetch-Site', 'same-origin');
 const ADD = { set: 'shop-data', file: 'orders.md', mode: 'edit', edits: [{ find: '- Always filter by channel.', replace: '- Always filter by channel.\n- Use placeholders for dates.' }] };
 const PROPOSE = { why: 'verified in a real query', trigger: 'verified_fact' };
@@ -27,8 +36,18 @@ beforeEach(async () => {
   h = await makeHarness();
   const app = express();
   app.use(express.json());
-  const deps: any = { nodeManager: {} as any, db: h.storage.getDb(), knowledgeLibrary: h.library, knowledgeWriter: h.writer, knowledgeHistory: h.history, knowledgeChanges: h.changes };
+  jobs = createChatJobStore(h.storage.getDb());
+  wakeRequests = [];
+  const knowledgeJobWaker = createKnowledgeJobWaker({ jobs, changes: h.changes, request: (jobId) => { wakeRequests.push(jobId); }, log: () => undefined });
+  deps = { nodeManager: {} as any, db: h.storage.getDb(), knowledgeLibrary: h.library, knowledgeWriter: h.writer, knowledgeHistory: h.history, knowledgeChanges: h.changes, knowledgeJobWaker };
   app.use('/api', createKnowledgeRouter(deps));
+  lateErrors = [];
+  app.use((error: Error, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    lateErrors.push(error);
+    if (res.headersSent) return;
+    res.status(500).json({ error: String(error?.message ?? error) });
+    void next;
+  });
   server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -274,5 +293,123 @@ describe('History', () => {
     const detail = await request(server).get(`/api/knowledge/history/${entry.id}`).set('Origin', base);
     expect(JSON.stringify(detail.body)).not.toContain('PRIVATE KEY');
     expect(detail.body.files[0]).toMatchObject({ path: 'shop-data/secrets.md', diff: null, note: expect.stringContaining('not shown') });
+  });
+});
+
+describe('a job that paused for the owner\'s decision goes on once the owner decides (K21)', () => {
+  // The job store stamps with the real clock and the harness with its own: put both on one timeline, one minute per step.
+  const tick = (ms: number) => { h.advance(ms); vi.setSystemTime(Date.now() + ms); };
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(1_800_000_000_000);
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** The owner's story: the job starts, BotBoy stages a card while it works, and the turn ends asking the owner to review it. */
+  async function pausedJobWithCard() {
+    const job = jobs.start({ goal: 'Rework the notes' });
+    tick(60_000);
+    const id = String((await propose()).changeId);
+    tick(60_000);
+    jobs.settle(job.id, { action: 'pause', note: 'Please review the proposal in Settings → Knowledge.' }, 'answered');
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
+    tick(60_000);
+    return { job, id };
+  }
+  const OTHER_FILE = { set: 'shop-data', file: 'orders_analysis.md', mode: 'edit', edits: [{ find: 'Methodology only.', replace: 'Methodology only, extended.' }] };
+
+  it('applying the card wakes the job: the pause is gone, one continuation is requested, and the reason says what was saved', async () => {
+    const { job, id } = await pausedJobWithCard();
+    expect(wakeRequests).toEqual([]);
+    const applied = await ui(request(server).post(`/api/knowledge/changes/${id}/apply`)).send({});
+    expect(applied.status).toBe(200);
+    const woken = jobs.get(job.id)!;
+    expect(woken.pausedAt).toBeUndefined();
+    expect(woken.continueRequestedAt).toBeTruthy();
+    expect(woken.continueReason).toContain('The owner applied "Edit orders.md in shop-data", which this job was waiting on.');
+    expect(wakeRequests).toEqual([job.id]);
+    // The same state seen again (a second request, the boot check) wakes nothing more.
+    expect(deps.knowledgeJobWaker.wakeIfDecided()).toBeNull();
+    expect(wakeRequests).toHaveLength(1);
+  });
+
+  it('dismissing the card wakes it too, and the reason says nothing was written', async () => {
+    const { job, id } = await pausedJobWithCard();
+    expect((await ui(request(server).post(`/api/knowledge/changes/${id}/dismiss`)).send({})).status).toBe(200);
+    const woken = jobs.get(job.id)!;
+    expect(woken.continueReason).toContain('The owner dismissed "Edit orders.md in shop-data"');
+    expect(woken.continueReason).toContain('Dismissed changes wrote nothing.');
+    expect(wakeRequests).toEqual([job.id]);
+    expect(h.read('shop-data/orders.md')).not.toContain('placeholders');
+  });
+
+  it('a click that is refused wakes nothing; the deliberate one that applies it does', async () => {
+    const job = jobs.start({ goal: 'Rework the notes' });
+    tick(60_000);
+    h.queue({ items: [dateBreach('The 2026-03-14 note')] });
+    const staged = await h.write(h.turn('please add a note to shop-data orders.md'), { ...ADD, edits: [{ find: '- Always filter by channel.', replace: '- Always filter by channel.\n- The 2026-03-14 note' }], stageAsIs: true });
+    const id = String(staged.changeId);
+    tick(60_000);
+    jobs.settle(job.id, { action: 'pause', note: 'Please review it.' }, 'answered');
+    tick(60_000);
+    expect((await ui(request(server).post(`/api/knowledge/changes/${id}/apply`)).send({})).body.code).toBe('needs_anyway');
+    expect((await ui(request(server).post('/api/knowledge/changes/kc_000000000000/dismiss')).send({})).status).toBe(404);
+    expect((await ui(request(server).post('/api/knowledge/changes/nope/apply')).send({})).status).toBe(400);
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
+    expect(wakeRequests).toEqual([]);
+    expect((await ui(request(server).post(`/api/knowledge/changes/${id}/apply`)).send({ anyway: true })).status).toBe(200);
+    expect(wakeRequests).toEqual([job.id]);
+  });
+
+  it('two cards: the first decision waits, the last one wakes the job once and names both', async () => {
+    const job = jobs.start({ goal: 'Rework the notes' });
+    tick(60_000);
+    const first = String((await propose()).changeId);
+    tick(60_000);
+    const second = String((await propose(OTHER_FILE)).changeId);
+    tick(60_000);
+    jobs.settle(job.id, { action: 'pause', note: 'Please review both cards.' }, 'answered');
+    tick(60_000);
+    expect((await ui(request(server).post(`/api/knowledge/changes/${first}/apply`)).send({})).status).toBe(200);
+    expect(wakeRequests).toEqual([]);
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
+    tick(60_000);
+    expect((await ui(request(server).post(`/api/knowledge/changes/${second}/dismiss`)).send({})).status).toBe(200);
+    expect(wakeRequests).toEqual([job.id]);
+    expect(jobs.get(job.id)!.continueReason).toContain('applied "Edit orders.md in shop-data", dismissed "Edit orders_analysis.md in shop-data"');
+  });
+
+  it('a card the job did not stage does not wake it: the job paused on a question, not on that card', async () => {
+    const earlier = String((await propose()).changeId); // staged before the job began
+    tick(60_000);
+    const job = jobs.start({ goal: 'Find the cause of the dip' });
+    tick(60_000);
+    jobs.settle(job.id, { action: 'pause', note: 'Which quarter should I look at?' }, 'answered');
+    tick(60_000);
+    expect((await ui(request(server).post(`/api/knowledge/changes/${earlier}/apply`)).send({})).status).toBe(200);
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
+    expect(wakeRequests).toEqual([]);
+  });
+
+  it('without a waker the click still works and the job is left alone; a waker that throws cannot fail the click', async () => {
+    const { job, id } = await pausedJobWithCard();
+    delete deps.knowledgeJobWaker;
+    expect((await ui(request(server).post(`/api/knowledge/changes/${id}/apply`)).send({})).status).toBe(200);
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
+    expect(wakeRequests).toEqual([]);
+    // A waker that fails after the answer was sent: the owner still sees the click succeed, and nothing is left unhandled
+    // (the dismiss route is synchronous, so a late error would reach Express; the apply route is async, so it would be an
+    // unhandled rejection, which fails the whole test run).
+    deps.knowledgeJobWaker = { wakeIfDecided: () => { throw new Error('waker broke'); } };
+    const other = String((await propose(OTHER_FILE)).changeId);
+    const dismissed = await ui(request(server).post(`/api/knowledge/changes/${other}/dismiss`)).send({});
+    expect(dismissed.status).toBe(200);
+    expect(dismissed.body).toMatchObject({ ok: true, change: { status: 'dismissed' } });
+    const third = String((await propose({ set: 'shop-data', file: 'SHOP_PRODUCT_GUIDE.md', mode: 'edit', edits: [{ find: 'Flows.', replace: 'Flows, extended.' }] })).changeId);
+    const applied = await ui(request(server).post(`/api/knowledge/changes/${third}/apply`)).send({});
+    expect(applied.status).toBe(200);
+    await new Promise((resolve) => setImmediate(resolve)); // let a late rejection or error surface
+    expect(lateErrors).toEqual([]);
+    expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
   });
 });
