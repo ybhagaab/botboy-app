@@ -103,3 +103,31 @@ describe('html view checks', () => {
     expect(view.window.document.querySelector('[data-bb-metric="Streams"]')!.getAttribute('data-bb-issue')).toMatch(/base is zero/);
   });
 });
+describe('chat visuals follow a theme made in chat (docs/maps/ui-themes.md)', () => {
+  const colourSet = (accent: string, bg: string) => ({ '--bg': bg, '--surface': bg, '--surface-2': bg, '--text': '#eeeeee', '--soft': '#cccccc', '--muted': '#aaaaaa', '--accent': accent, '--border': 'rgba(255,255,255,.1)', '--green': '#55dd99', '--yellow': '#f3ba63', '--red': '#f0777d', '--blue': '#6faef5' });
+  function setTheme(win: any, values: Record<string, string>, choice: string) {
+    for (const [name, value] of Object.entries(values)) win.document.documentElement.style.setProperty(name, value);
+    win.document.documentElement.setAttribute('data-botboy-choice', choice);
+  }
+  it('re-themes an open visual when the colours change inside the same mode, and leaves it alone when nothing changed', async () => {
+    const dom = new JSDOM('<!doctype html><html data-theme="dark"><body><div class="bubble"><pre><code class="language-svg">&lt;svg&gt;&lt;circle r="4"/&gt;&lt;/svg&gt;</code></pre></div></body></html>', { runScripts: 'outside-only', url: 'http://localhost:7778/' });
+    const win = dom.window as any;
+    setTheme(win, colourSet('#9d8cff', '#09090b'), 'builtin:dark');
+    win.eval(source);
+    win.BotBoyHtmlViews.mountChatVisuals(win.document.body);
+    const frame = win.document.querySelector('iframe') as HTMLIFrameElement;
+    const first = frame.srcdoc;
+    expect(first).toContain('#9d8cff');
+    // A teal theme: still dark, different colours.
+    setTheme(win, colourSet('#2dd4bf', '#06100f'), 'th_0123456789ab');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(frame.srcdoc).not.toBe(first);
+    expect(frame.srcdoc).toContain('#2dd4bf');
+    expect(frame.srcdoc).not.toContain('#9d8cff');
+    // The same colours again (an attribute touched, nothing else): the frame is not rebuilt.
+    const second = frame.srcdoc;
+    win.document.documentElement.setAttribute('data-botboy-choice', 'th_0123456789ab ');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(frame.srcdoc).toBe(second);
+  });
+});

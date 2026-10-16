@@ -45,12 +45,13 @@ beforeAll(() => {
   // eslint-disable-next-line no-new-func
   new Function(uiSource)();
   const source = [
-    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'), constLine('KNOWLEDGE_MARKER_RE'),
+    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'), constLine('KNOWLEDGE_MARKER_RE'), constLine('THEME_MARKER_RE'),
     topLevel('escHtml'), topLevel('createChatStreamBubble'),
     topLevel('hydrateChatCards'), topLevel('fillLessonCard'), topLevel('lessonEsc'), topLevel('paintLessonCard'),
     topLevel('fillGmailDraftCard'), topLevel('gmailDraftWhen'), topLevel('gmailFileSize'), topLevel('paintGmailDraftCard'),
     topLevel('fillMcpServerCard'), topLevel('mcpCardTransport'), topLevel('paintMcpServerCard'),
     topLevel('fillKnowledgeCard'), topLevel('paintKnowledgeCard'),
+    topLevel('fillThemeCard'), topLevel('paintThemeCard'),
     'return { createChatStreamBubble };',
   ].join('\n');
   // eslint-disable-next-line no-new-func

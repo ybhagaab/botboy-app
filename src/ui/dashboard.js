@@ -240,6 +240,9 @@ const state = {
   lastCaptureHealthVersion: null,
   lastBrowserCaptureVersion: null,
   lastWorkplaceVersion: null,
+  lastThemeVersion: null,
+  // Settings → Appearance and the saved themes (docs/maps/ui-themes.md). `data` is GET /ui-theme.
+  uiTheme: { data: null, error: '', notice: '', busy: false, renaming: '', confirmingDelete: '', pendingFocus: '' },
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -328,6 +331,7 @@ function parseRoute() {
   if (parts[0] === 'settings' && parts[1] === 'llm-usage') return { view: 'llm-usage-settings' };
   if (parts[0] === 'settings' && parts[1] === 'ai-model') return { view: 'ai-model-settings' };
   if (parts[0] === 'settings' && parts[1] === 'workplace') return { view: 'workplace-settings' };
+  if (parts[0] === 'settings' && parts[1] === 'appearance') return { view: 'appearance-settings' };
   if (parts[0] === 'settings' && parts[1] === 'knowledge') return { view: 'knowledge-settings' };
   if (parts[0] === 'data-room') {
     let id = parts[2] || parts[1] || '';
@@ -999,6 +1003,7 @@ function renderSidebar() {
         || (view === 'dashboards' && route.view === 'analytics-dashboard')
         || (view === 'data-room' && ['data-room-dataset', 'data-room-version', 'data-room-imports', 'data-room-import'].includes(route.view))
         || (view === 'settings' && ['publisher-settings', 'llm-usage-settings', 'ai-model-settings', 'workplace-settings'].includes(route.view))
+        || (view === 'settings' && route.view === 'appearance-settings')
         || (view === 'settings' && route.view === 'knowledge-settings');
       return `<a class="nav-item ${active ? 'active' : ''}" href="${href}" aria-label="${attr(label)}" title="${attr(label)}" ${active ? 'aria-current="page"' : ''}>${icon(ico)}<span class="nav-text">${esc(label)}</span>${count ? `<span class="nav-count">${esc(count)}</span>` : ''}</a>`;
     }).join('')}</nav>
@@ -1911,7 +1916,7 @@ function jumpToDocPassage(anchorText) {
   el.scrollIntoView({ behavior: 'smooth', block: 'center' });
   const prev = el.style.transition;
   el.style.transition = 'background-color .3s';
-  el.style.backgroundColor = 'rgba(157,140,255,.28)';
+  el.style.backgroundColor = 'rgba(var(--accent-rgb),.28)';
   setTimeout(() => { el.style.backgroundColor = ''; el.style.transition = prev; }, 2200);
   return true;
 }
@@ -4671,7 +4676,7 @@ function renderWorkplaceSettings() {
   const footerHint = 'Printed in the center of every page footer in PDF and Word exports, and in HTML exports when printed. Leave empty for no footer text. You can also ask BotBoy in chat.';
   const footerError = wp.footerError ? `<p class="card-meta" id="workplace-footer-error" role="alert">${esc(wp.footerError)}</p>` : '';
   return `${pageHead('Settings', 'Workplace', 'Which of BotBoy’s paths apply to you, and what your document exports print.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><a class="button ghost" href="#/settings">${icon('settings')} General</a><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace" aria-current="page">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a></nav>
+    <section class="grid settings-layout"><nav class="card settings-nav"><a class="button ghost" href="#/settings">${icon('settings')} General</a><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/appearance">${icon('sun')} Appearance</a><a class="button ghost" href="#/settings/workplace" aria-current="page">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a></nav>
     <div style="display:grid; gap:14px; align-content:start; min-width:0">
       <article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">Amazon Employee</h2><div class="card-meta">${esc(workplaceSourceLine(status))}</div></div></div>
         <div class="setting-row"><span class="setting-copy"><strong id="workplace-amazon-label">Amazon Employee</strong><span id="workplace-amazon-help">Turn on if you work at Amazon. BotBoy then offers Amazon's internal connections (Slack through AI Community MCP, Outlook through GRASP, SharePoint, Datanet ETL), Amazon writing style, and Harmony dashboard sharing. Turn off to hide them; their setup and captured data are kept. Applies right away, no restart.</span></span>
@@ -5274,7 +5279,7 @@ function renderPublisherSettings() {
   const midwayHint = probe && probe.cliPresent && probe.midwayLive === false
     ? `<div class="mcp-alert">${icon('alert', 15)}<span>The Harmony CLI's Midway session is missing or expired (your browser's Midway is separate). </span><button class="button" type="button" data-action="harmony-mwinit" ${state.publisher.mwinitOpening ? 'disabled' : ''}>${state.publisher.mwinitOpening ? 'Opening terminal…' : 'Sign in (mwinit) in BotBoy terminal'}</button></div>`
     : '';
-  const harmonyBody = `${harmony.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(harmony.lastError)}</span></div>` : ''}${midwayHint}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Use Harmony for dashboard sharing</strong><small>Publishes run <code>harmony app deploy</code> and apply your audience choice. Every publish keeps the expiring confirmation.</small></span><input name="enabled" type="checkbox" ${harmony.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Step 1 · CLI</h3>${cliStep}</div><div class="mcp-section"><h3>Step 2 · Team bindle</h3>${state.publisher.provisionPlan ? `<div class="mcp-alert" style="border-color:rgba(157,140,255,.35)">${icon('shield', 15)}<span><strong>Review before creating:</strong> ${esc(state.publisher.provisionPlan.summary)}</span></div><div class="publisher-inline-actions"><button class="button primary" type="button" data-action="harmony-provision-confirm" ${state.publisher.provisioning ? 'disabled' : ''}>${state.publisher.provisioning ? 'Creating…' : 'Create these for me'}</button><button class="button" type="button" data-action="harmony-provision-cancel" ${state.publisher.provisioning ? 'disabled' : ''}>Cancel</button></div>` : `<button class="button" type="button" data-action="harmony-provision-plan">Set up automatically</button><small class="card-meta">BotBoy creates a personal team + team bindle for you (you confirm the exact names first). Personal bindles are rejected by Harmony; the bindle binds permanently at first publish.</small>`}${mcpField('bindleId', 'Team bindle ID', config.harmony?.bindleId || '', { placeholder: 'amzn1.bindle.resource.…', help: 'Or paste one from bindles.amazon.com (a Software Application bindle of a team you belong to).' })}</div><div class="mcp-section"><h3>Step 3 · Target</h3><div class="mcp-field-grid"><label class="mcp-field"><span>Stage</span><select name="stage">${['beta', 'gamma', 'prod'].map(stage => `<option value="${stage}" ${config.harmony?.stage === stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><small>Start with beta. Prod = permanent URL; deploys run in a BotBoy-managed terminal.</small></label><label class="mcp-field"><span>Who can view</span><select name="visibility"><option value="everyone" ${visibility === 'everyone' ? 'selected' : ''}>Everyone at Amazon (Midway)</option><option value="private" ${visibility === 'private' ? 'selected' : ''}>Only me</option></select><small>App-wide, re-applied on every publish. Never publish Critical/Restricted data. "Only me" caveat: the classic console path bypasses it until the subdomain redirect is on.</small></label></div><small class="card-meta">App name is fixed: <code>${esc(config.harmony?.appName || '')}</code>; dashboards live under <code>/d/&lt;id&gt;/</code>.</small></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Deploys use your local Midway session (mwinit)</span><button class="button primary" type="submit" ${saving ? 'disabled' : ''}>${saving ? 'Saving…' : 'Save Harmony'}</button></div>`;
+  const harmonyBody = `${harmony.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(harmony.lastError)}</span></div>` : ''}${midwayHint}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Use Harmony for dashboard sharing</strong><small>Publishes run <code>harmony app deploy</code> and apply your audience choice. Every publish keeps the expiring confirmation.</small></span><input name="enabled" type="checkbox" ${harmony.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Step 1 · CLI</h3>${cliStep}</div><div class="mcp-section"><h3>Step 2 · Team bindle</h3>${state.publisher.provisionPlan ? `<div class="mcp-alert" style="border-color:rgba(var(--accent-rgb),.35)">${icon('shield', 15)}<span><strong>Review before creating:</strong> ${esc(state.publisher.provisionPlan.summary)}</span></div><div class="publisher-inline-actions"><button class="button primary" type="button" data-action="harmony-provision-confirm" ${state.publisher.provisioning ? 'disabled' : ''}>${state.publisher.provisioning ? 'Creating…' : 'Create these for me'}</button><button class="button" type="button" data-action="harmony-provision-cancel" ${state.publisher.provisioning ? 'disabled' : ''}>Cancel</button></div>` : `<button class="button" type="button" data-action="harmony-provision-plan">Set up automatically</button><small class="card-meta">BotBoy creates a personal team + team bindle for you (you confirm the exact names first). Personal bindles are rejected by Harmony; the bindle binds permanently at first publish.</small>`}${mcpField('bindleId', 'Team bindle ID', config.harmony?.bindleId || '', { placeholder: 'amzn1.bindle.resource.…', help: 'Or paste one from bindles.amazon.com (a Software Application bindle of a team you belong to).' })}</div><div class="mcp-section"><h3>Step 3 · Target</h3><div class="mcp-field-grid"><label class="mcp-field"><span>Stage</span><select name="stage">${['beta', 'gamma', 'prod'].map(stage => `<option value="${stage}" ${config.harmony?.stage === stage ? 'selected' : ''}>${stage}</option>`).join('')}</select><small>Start with beta. Prod = permanent URL; deploys run in a BotBoy-managed terminal.</small></label><label class="mcp-field"><span>Who can view</span><select name="visibility"><option value="everyone" ${visibility === 'everyone' ? 'selected' : ''}>Everyone at Amazon (Midway)</option><option value="private" ${visibility === 'private' ? 'selected' : ''}>Only me</option></select><small>App-wide, re-applied on every publish. Never publish Critical/Restricted data. "Only me" caveat: the classic console path bypasses it until the subdomain redirect is on.</small></label></div><small class="card-meta">App name is fixed: <code>${esc(config.harmony?.appName || '')}</code>; dashboards live under <code>/d/&lt;id&gt;/</code>.</small></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Deploys use your local Midway session (mwinit)</span><button class="button primary" type="submit" ${saving ? 'disabled' : ''}>${saving ? 'Saving…' : 'Save Harmony'}</button></div>`;
 
   const s3Body = `${s3.lastError ? `<div class="mcp-alert">${icon('alert', 15)}<span>${esc(s3.lastError)}</span></div>` : ''}<div class="mcp-form-body"><label class="mcp-toggle-row"><span><strong>Use S3 + CloudFront for dashboard sharing</strong><small>Your admin provisions bucket + CDN; BotBoy only ever does one PutObject per confirmed publish.</small></span><input name="enabled" type="checkbox" ${s3.enabled ? 'checked' : ''}></label><div class="mcp-section"><h3>Destination</h3><div class="mcp-field-grid">${mcpField('bucket', 'S3 bucket', config.s3?.bucket || '', { placeholder: 'company-dashboard-snapshots' })}${mcpField('prefix', 'Object prefix', config.s3?.prefix || '', { placeholder: 'botboy-dashboards' })}${mcpField('region', 'AWS region', config.s3?.region || '', { placeholder: 'us-east-1' })}${mcpField('awsProfile', 'Least-privilege AWS profile', config.s3?.awsProfile || '', { placeholder: 'BotBoyDashboardPublisher', help: 'A profile allowed to PutObject only under this prefix — never AdministratorAccess.' })}</div>${mcpField('cloudFrontBaseUrl', 'CloudFront base URL', config.s3?.cloudFrontBaseUrl || '', { placeholder: 'https://dashboards.example.com', help: 'An existing distribution whose private origin reads this bucket/prefix.' })}</div><div class="mcp-section"><h3>Safety boundary</h3><div class="publisher-safety-list"><span>${icon('check', 14)} One PutObject per confirmation</span><span>${icon('check', 14)} Never touches ACLs, policies, or CDN config</span><span>${icon('check', 14)} No SQL or credentials in output</span><span>${icon('check', 14)} Local dashboard remains canonical</span></div></div></div><div class="mcp-form-actions"><span>${icon('shield', 14)} Treat the destination as production</span><button class="button primary" type="submit" ${saving ? 'disabled' : ''}>${saving ? 'Saving…' : 'Save S3'}</button></div>`;
 
@@ -8330,10 +8335,148 @@ function renderLlmUsageSettings() {
     <section class="card" style="margin-top:16px"><div class="card-header"><div><h2 class="card-title">Daily usage by model</h2><div class="card-meta">Cache and reasoning are provider detail subsets; they are not added to Total.</div></div>${rangeBusy}</div>${rows.length ? `<div class="analytics-table-wrap" data-scroll-key="settings:llm-usage:daily"><table class="analytics-table"><thead><tr><th>Day</th><th>Model</th><th class="analytics-number">Input</th><th class="analytics-number">Output</th><th class="analytics-number">Cache read</th><th class="analytics-number">Cache write</th><th class="analytics-number">Reasoning</th><th class="analytics-number">Total</th><th class="analytics-number">Calls</th><th>Workloads</th><th class="analytics-number">Unknown</th></tr></thead><tbody>${rows.map(row => `<tr><td>${esc(row.day)}</td><td title="${attr(row.model)}"><strong>${esc(llmUsageModelLabel(row.model))}</strong></td><td class="analytics-number">${llmUsageToken(row.inputTokens)}</td><td class="analytics-number">${llmUsageToken(row.outputTokens)}</td><td class="analytics-number">${llmUsageToken(row.cacheReadTokens)}</td><td class="analytics-number">${llmUsageToken(row.cacheWriteTokens)}</td><td class="analytics-number">${llmUsageToken(row.reasoningTokens)}</td><td class="analytics-number"><strong>${llmUsageToken(row.totalTokens)}</strong></td><td class="analytics-number">${number(row.attempts)}</td><td><span class="card-meta">I ${number(row.interactiveAttempts)} · B ${number(row.backgroundAttempts)} · S ${number(row.systemAttempts)}</span></td><td class="analytics-number">${number(row.unknownAttempts)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-state">Usage tracking starts after this BotBoy update. Make a chat request or let a background pass run, then refresh.</div>'}</section>`;
 }
 
+// ── Settings → Appearance: the themes BotBoy made in chat, kept here (docs/maps/ui-themes.md) ──
+// ui-theme.js (window.BotBoyTheme) applies a theme and renders the rows; this block owns the state, the requests and the handlers.
+// Every change below is an owner click on this same-origin page. The page refetches only when the version poll sees themeVersion
+// move (or right after the owner's own click), so it adds no timer of its own.
+function themeErrorText(error) {
+  return [error?.payload?.error || error?.message || String(error || 'Unknown error'), error?.nextAction].filter(Boolean).join(' ');
+}
+async function loadUiTheme({ render = false } = {}) {
+  const theme = state.uiTheme;
+  try {
+    const view = await request('/ui-theme');
+    theme.data = view;
+    theme.error = '';
+    state.lastThemeVersion = view.version;
+    // What the server holds wins over this browser's own light/dark memory; a server nobody has asked yet changes nothing.
+    window.BotBoyTheme?.applyView(view);
+  } catch (error) {
+    theme.data = null;
+    theme.error = error?.status === 404 ? 'This BotBoy server does not have themes yet. Update BotBoy, then reload this tab.' : themeErrorText(error);
+  }
+  if (render && state.route.view === 'appearance-settings') renderRoute({ preserveScroll: true });
+}
+/** Another place (a chat card's Keep, another tab) changed the themes: take the new view and repaint what shows it. */
+function takeUiThemeView(view) {
+  if (!view || typeof view.version !== 'number') return;
+  state.uiTheme.data = view;
+  state.uiTheme.error = '';
+  state.lastThemeVersion = view.version;
+  if (state.route.view === 'appearance-settings') renderRoute({ preserveScroll: true });
+}
+window.addEventListener('botboy:theme-saved', event => takeUiThemeView(event.detail));
+function renderAppearanceSettings() {
+  const theme = state.uiTheme;
+  const data = theme.data;
+  const ui = window.BotBoyTheme;
+  const head = `<div class="breadcrumb"><a href="#/settings">Settings</a>${icon('chevron-right', 11)}<span>Appearance</span></div>${pageHead('Settings', 'Appearance', 'Themes you keep from chat live here. Apply one, rename it, or delete it.', '<a class="button" href="#/settings">Back</a>')}`;
+  let panel;
+  if (!ui) {
+    panel = '<p class="card-meta" role="alert">The theme script did not load. Reload this tab.</p>';
+  } else if (!data) {
+    panel = theme.error ? `<p class="card-meta" role="alert">${esc(theme.error)}</p>` : '<p class="card-meta">Loading themes…</p>';
+  } else {
+    const rows = [...data.builtins, ...data.themes];
+    const rowUi = { renaming: theme.renaming, confirmingDelete: theme.confirmingDelete, busy: theme.busy };
+    const list = `<ul class="theme-list" aria-label="Themes">${rows.map(row => ui.rowHtml(row, { esc, attr }, rowUi)).join('')}</ul>`;
+    const empty = data.themes.length ? '' : '<p class="theme-empty">No themes of your own yet. In the BotBoy chat, ask for one, for example “make me a calm green dark theme”. You preview it, then keep it, and it shows up here.</p>';
+    const resetTo = data.active !== null && data.active !== 'builtin:dark'
+      ? `<div class="setting-row"><span class="setting-copy"><strong>Back to the default</strong><span>Use BotBoy Dark again. Your saved themes stay.</span></span><button class="button small" type="button" data-action="theme-reset" ${theme.busy ? 'disabled' : ''}>Use BotBoy Dark</button></div>`
+      : '';
+    const limit = data.themes.length >= data.limits.maxThemes ? `<p class="card-meta">You have ${data.limits.maxThemes} saved themes, the most BotBoy keeps. Delete one to keep another.</p>` : '';
+    panel = `${list}${empty}${limit}${resetTo}`;
+  }
+  const error = data && theme.error ? `<p class="card-meta" role="alert">${esc(theme.error)}</p>` : '';
+  return `${head}<article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">Themes</h2><div class="card-meta">The theme in use is marked. The sun or moon button in the top bar switches between BotBoy Dark and BotBoy Light.</div></div></div>
+    ${panel}<p class="card-meta" role="status">${theme.notice ? esc(theme.notice) : ''}</p>${error}</article>`;
+}
+function restoreAppearanceFocus() {
+  const pending = state.uiTheme.pendingFocus;
+  if (!pending || state.uiTheme.busy) return;
+  state.uiTheme.pendingFocus = '';
+  const row = pending === 'rename' ? null : [...document.querySelectorAll('[data-theme-row]')].find(element => element.dataset.themeRow === pending);
+  const target = pending === 'rename' ? document.getElementById('theme-rename-input') : row?.querySelector('button, input');
+  target?.focus({ preventScroll: true });
+  if (pending === 'rename') target?.select?.();
+}
+function themeRowName(id) {
+  const data = state.uiTheme.data;
+  return [...(data?.builtins || []), ...(data?.themes || [])].find(row => row.id === id)?.name || 'the theme';
+}
+/** One owner click that changes the themes on the server: runs `change`, takes the new view, and says what happened. */
+async function changeUiTheme(change, { notice = '', focus = '' } = {}) {
+  const theme = state.uiTheme;
+  if (theme.busy) return null;
+  theme.busy = true;
+  theme.error = '';
+  theme.notice = 'Saving…';
+  if (state.route.view === 'appearance-settings') renderRoute({ preserveScroll: true, userAction: true });
+  let view = null;
+  try {
+    const result = await change();
+    view = result?.view || result;
+    if (!view || typeof view.version !== 'number') throw new Error('unexpected response');
+    theme.data = view;
+    state.lastThemeVersion = view.version;
+    window.BotBoyTheme?.applyView(view);
+    theme.renaming = '';
+    theme.confirmingDelete = '';
+    theme.notice = notice;
+    window.dispatchEvent(new CustomEvent('botboy:themes-changed'));
+  } catch (error) {
+    theme.notice = '';
+    theme.error = themeErrorText(error);
+    view = null;
+  }
+  theme.busy = false;
+  theme.pendingFocus = focus;
+  if (state.route.view === 'appearance-settings') renderRoute({ preserveScroll: true, userAction: true });
+  return view;
+}
+function applyUiTheme(id) {
+  return changeUiTheme(() => request('/ui-theme/active', { method: 'PUT', body: { id } }), { notice: `Applied ${themeRowName(id)}.`, focus: id });
+}
+function startThemeRename(id) {
+  state.uiTheme.renaming = id;
+  state.uiTheme.confirmingDelete = '';
+  state.uiTheme.pendingFocus = 'rename';
+  renderRoute({ preserveScroll: true, userAction: true });
+}
+function cancelThemeEdit(focusId) {
+  state.uiTheme.renaming = '';
+  state.uiTheme.confirmingDelete = '';
+  state.uiTheme.pendingFocus = focusId || '';
+  renderRoute({ preserveScroll: true, userAction: true });
+}
+function saveThemeRename(form) {
+  const id = form.dataset.themeId;
+  const name = String(form.querySelector('input')?.value || '').trim();
+  if (!name) {
+    state.uiTheme.error = 'Type a name for the theme.';
+    renderRoute({ preserveScroll: true, userAction: true });
+    return Promise.resolve(null);
+  }
+  return changeUiTheme(() => request(`/ui-theme/themes/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name } }), { notice: 'Renamed.', focus: id });
+}
+function askThemeDelete(id) {
+  state.uiTheme.confirmingDelete = id;
+  state.uiTheme.renaming = '';
+  state.uiTheme.pendingFocus = id;
+  renderRoute({ preserveScroll: true, userAction: true });
+}
+function deleteUiTheme(id) {
+  const name = themeRowName(id);
+  return changeUiTheme(() => request(`/ui-theme/themes/${encodeURIComponent(id)}`, { method: 'DELETE' }), { notice: `Deleted ${name}.` });
+}
+function resetUiTheme() {
+  return changeUiTheme(() => request('/ui-theme/reset', { method: 'POST' }), { notice: 'Back to BotBoy Dark.' });
+}
+
 function renderSettings() {
   const dark = document.documentElement.dataset.theme !== 'light';
   return `${pageHead('Workspace', 'Settings', 'Appearance, diagnostics, and compatibility tools for the local dashboard.')}
-    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/workplace">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a>${amazonEmployeeOn() ? `<a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a>` : ''}<a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
+    <section class="grid settings-layout"><nav class="card settings-nav"><button class="button ghost" type="button">${icon('settings')} General</button><a class="button ghost" href="#/settings/ai-model">${icon('sparkles')} AI model</a><a class="button ghost" href="#/settings/appearance">${icon('sun')} Appearance</a><a class="button ghost" href="#/settings/workplace">${icon(WORKPLACE_ICON)} Workplace</a><a class="button ghost" href="#/settings/knowledge">${icon('folder')} Knowledge</a>${amazonEmployeeOn() ? `<a class="button ghost" href="#/settings/dashboard-sharing">${icon('globe')} Dashboard sharing</a>` : ''}<a class="button ghost" href="#/settings/llm-usage">${icon('activity')} LLM generation usage</a><button class="button ghost" type="button" data-action="open-nodes">${icon('branch')} Legacy nodes</button><button class="button ghost" type="button" data-action="open-logs">${icon('activity')} Diagnostics</button></nav><article class="card settings-panel"><div class="card-header" style="padding:0 0 16px"><div><h2 class="card-title">General</h2><div class="card-meta">Workspace appearance and behavior</div></div></div><div class="setting-row"><span class="setting-copy"><strong>Dark appearance</strong><span>Switch between BotBoy’s dark and light palettes.</span></span><button class="toggle ${dark ? 'on' : ''}" type="button" data-action="toggle-theme" aria-label="Toggle dark appearance"></button></div><div class="setting-row"><span class="setting-copy"><strong>Contextual assistant</strong><span>The assistant opens when needed instead of permanently consuming workspace width.</span></span><span class="pill accent">Enabled</span></div><div class="setting-row"><span class="setting-copy"><strong>Legacy node browser</strong><span>Available during migration for depth-four nodes and manual node actions.</span></span><button class="button small" type="button" data-action="open-nodes">Open</button></div><div class="setting-row"><span class="setting-copy"><strong>Agent and app logs</strong><span>Open the existing local diagnostics viewer.</span></span><button class="button small" type="button" data-action="open-logs">View logs</button></div></article></section>`;
 }
 
 // Repaints rebuild #app-view from scratch, which destroys any text the
@@ -8457,6 +8600,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (routeChanged && state.route.view === 'llm-usage-settings') void loadLlmUsage({ force: true });
   if (routeChanged && state.route.view === 'ai-model-settings') void loadAiModelStatus();
   if (routeChanged && state.route.view === 'workplace-settings') void loadWorkplace({ render: true });
+  if (routeChanged && state.route.view === 'appearance-settings') void loadUiTheme({ render: true });
   if (routeChanged && state.route.view === 'knowledge-settings') enterKnowledgePage();
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
@@ -8552,6 +8696,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'llm-usage-settings') html = renderLlmUsageSettings();
   if (state.route.view === 'ai-model-settings') html = renderAiModelSettings();
   if (state.route.view === 'workplace-settings') html = renderWorkplaceSettings();
+  if (state.route.view === 'appearance-settings') html = renderAppearanceSettings();
   if (state.route.view === 'knowledge-settings') html = renderKnowledgeSettings();
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   window.BotBoyHtmlViews?.park();
@@ -8578,6 +8723,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'mcp-settings') requestAnimationFrame(updateMcpFormVisibility);
   if (state.route.view === 'ai-model-settings') restoreAiModelRoleFocus();
   if (state.route.view === 'workplace-settings') restoreWorkplaceFocus();
+  if (state.route.view === 'appearance-settings') restoreAppearanceFocus();
   if (state.route.view === 'knowledge-settings') restoreKnowledgeFocus();
   // Scroll ownership: only USER-INITIATED renders may reset to top (real
   // navigation). Background renders — polls, loader completions, SSE — always
@@ -8668,12 +8814,28 @@ function updateMobileNav() {
   });
 }
 
+// The top-bar button is a quick switch between the two shipped palettes. From a theme made in chat it goes to the shipped palette
+// of the OTHER mode and stops using the custom theme (the custom theme stays saved; Settings → Appearance brings it back).
 function toggleTheme() {
-  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem('botboy-theme', next);
-  document.querySelectorAll('[data-action="toggle-theme"] use').forEach(use => use.setAttribute('href', next === 'dark' ? '#i-sun' : '#i-moon'));
-  if (state.route.view === 'settings' || state.route.view === 'analytics-dashboard') {
+  const next = (window.BotBoyTheme?.currentMode() ?? (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')) === 'light' ? 'dark' : 'light';
+  if (window.BotBoyTheme) {
+    window.BotBoyTheme.setBuiltin(next);
+  } else {
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('botboy-theme', next);
+    document.querySelectorAll('[data-action="toggle-theme"] use').forEach(use => use.setAttribute('href', next === 'dark' ? '#i-sun' : '#i-moon'));
+  }
+  // The server remembers it too, so the next load opens on it and other tabs follow. A failure leaves this tab as it is.
+  request('/ui-theme/active', { method: 'PUT', body: { id: `builtin:${next}` } })
+    .then(view => {
+      if (!view || typeof view.version !== 'number') return;
+      state.uiTheme.data = view;
+      state.lastThemeVersion = view.version;
+      if (state.route.view === 'appearance-settings') renderRoute({ preserveScroll: true });
+      window.dispatchEvent(new CustomEvent('botboy:themes-changed'));
+    })
+    .catch(() => {});
+  if (state.route.view === 'settings' || state.route.view === 'analytics-dashboard' || state.route.view === 'appearance-settings') {
     renderRoute({ preserveScroll: state.route.view === 'analytics-dashboard', userAction: true });
   }
 }
@@ -8909,6 +9071,13 @@ function bindEvents() {
     if (action === 'close-assistant') toggleAssistant(false);
     if (action === 'toggle-theme') toggleTheme();
     if (action === 'workplace-toggle') void saveWorkplaceToggle();
+    if (action === 'theme-apply') void applyUiTheme(target.dataset.themeId);
+    if (action === 'theme-rename') startThemeRename(target.dataset.themeId);
+    if (action === 'theme-rename-cancel') cancelThemeEdit(state.uiTheme.renaming);
+    if (action === 'theme-delete') askThemeDelete(target.dataset.themeId);
+    if (action === 'theme-delete-cancel') cancelThemeEdit(state.uiTheme.confirmingDelete);
+    if (action === 'theme-delete-confirm') void deleteUiTheme(target.dataset.themeId);
+    if (action === 'theme-reset') void resetUiTheme();
     if (action === 'open-command') openCommand();
     if (action === 'close-command') document.getElementById('command-dialog').close();
     if (action === 'plan-day') planDay();
@@ -9861,6 +10030,11 @@ function bindEvents() {
       void saveExportFooter(event.target);
       return;
     }
+    if (event.target?.matches?.('[data-theme-rename-form]')) {
+      event.preventDefault();
+      void saveThemeRename(event.target);
+      return;
+    }
     if (event.target?.matches('.analytics-control-form')) {
       event.preventDefault();
       void applyAnalyticsControls(event.target);
@@ -10219,6 +10393,7 @@ async function pollVersion() {
     state.lastWorkplaceVersion = payload.workplaceVersion ?? null;
     const previousKnowledgeVersion = state.lastKnowledgeVersion;
     state.lastKnowledgeVersion = payload.knowledgeVersion ?? null;
+    const themeVersion = payload.themeVersion ?? null;
 
     // Reload the tab when the code it runs is stale. Two triggers:
     //  - bootId change: the server restarted (possibly with new UI code).
@@ -10324,6 +10499,13 @@ async function pollVersion() {
     // staged). The first poll only seeds the counter, like the page block above.
     if (previousKnowledgeVersion !== null && state.lastKnowledgeVersion !== null && state.lastKnowledgeVersion !== previousKnowledgeVersion) {
       announceKnowledgeChanged();
+    }
+    // Themes: another tab kept, applied or deleted one, or BotBoy staged a proposal. This tab shows what the server now holds and
+    // the chat's theme cards read themselves again. The first load already took the version, so a poll that matches it does nothing.
+    if (themeVersion !== null && state.lastThemeVersion !== null && themeVersion !== state.lastThemeVersion && !state.uiTheme.busy) {
+      void loadUiTheme({ render: !String(document.activeElement?.id || '').startsWith('theme-') }).then(() => {
+        window.dispatchEvent(new CustomEvent('botboy:themes-changed'));
+      });
     }
 
     if (previousVersion !== null && payload.version !== previousVersion) {
@@ -10447,8 +10629,12 @@ function initialize() {
   window.addEventListener('scroll', enforceShellRootScroll, { passive: true });
   window.addEventListener('pageshow', enforceShellRootScroll);
   enforceShellRootScroll();
+  // The server's choice rides the first bytes of the page (data-botboy-choice) and wins; this browser's own memory of light or
+  // dark is only the fallback for a server nobody has asked yet.
   const theme = localStorage.getItem('botboy-theme');
-  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  if (!document.documentElement.hasAttribute('data-botboy-choice') && (theme === 'light' || theme === 'dark')) document.documentElement.dataset.theme = theme;
+  window.BotBoyTheme?.syncControls();
+  void loadUiTheme();
   setSidebarCollapsed(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true', { persist: false });
   setMobileSidebarOpen(false);
   if (!location.hash || location.hash === '#') history.replaceState(null, '', '#/today');

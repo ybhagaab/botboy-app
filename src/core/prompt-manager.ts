@@ -9,6 +9,7 @@ import type { McpProfileSnapshot, McpServerSnapshot } from './mcp-types.js';
 import { isAmazonOnlyChatTool } from './workplace.js';
 import { applyOffPromptEdits } from './prompt-workplace-edits.js';
 import { GDRIVE_CHAT_TOOL_NAMES, GDRIVE_GUIDANCE_BLOCK } from './gdrive-chat-tools.js';
+import { UI_THEME_CHAT_TOOL_NAMES, UI_THEME_GUIDANCE_BLOCK } from './ui-theme-chat-tools.js';
 import { KNOWLEDGE_CHAT_TOOL_NAMES, KNOWLEDGE_WRITE_TOOL_NAMES } from './knowledge-chat-tools.js';
 import { mcpServerCardMarker } from './mcp-custom-config.js';
 import { writeFileMaxChars } from './limits.js';
@@ -44,6 +45,11 @@ export interface PromptContext {
   gmailAccountsBlock?: string;
   /** Some Google account has Drive connected: the Drive tools and their guidance are offered. */
   driveConnected?: boolean;
+  /**
+   * The owner's message in this live turn is about how BotBoy looks (or follows a theme proposal made minutes ago):
+   * ui_theme_propose and its guidance are offered. Every other turn pays no prompt text and no tool definition for themes.
+   */
+  uiThemeAvailable?: boolean;
   /**
    * The Knowledge library exists (the owner created the folder): knowledge_list and knowledge_load are offered. Absent or
    * false, they are not, and an install that never created the library pays no prompt text and no tool definitions
@@ -624,6 +630,25 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
       },
     },
   },
+  // ── UI themes (docs/maps/ui-themes.md; handler in ui-theme-chat-tools.ts; offered only on appearance turns) ──
+  ui_theme_propose: {
+    type: 'function',
+    function: {
+      name: 'ui_theme_propose',
+      description: 'Propose a colour theme for the BotBoy UI. You give four small choices; the server derives every other colour, nudges any that would be hard to read, and refuses a seed it cannot make readable (with the closest colours that work). It only STAGES a proposal: the owner presses Preview, then Keep or Discard on a card, and nothing changes until Keep. Returns proposalId and a card marker to put on its own line in your reply. Never recolour the UI by editing files instead.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', maxLength: 40, description: 'A few plain words, like "Evergreen" or "Midnight Teal".' },
+          mode: { type: 'string', enum: ['dark', 'light'], description: 'Whether the page is dark or light.' },
+          accent: { type: 'string', description: 'The main accent colour as a hex like "#2dd4bf" (buttons, links, highlights).' },
+          background: { type: 'string', description: 'Optional tint for the page background as a hex like "#0b1220". Dark themes need a dark one, light themes a light one. Leave it out and the server derives one from the accent.' },
+        },
+        required: ['name', 'mode', 'accent'],
+      },
+    },
+  },
   // ── Gmail (GMAIL_CHAT_TOOLS_PLAN.md; handlers in gmail-chat-tools.ts) ──
   gmail_search: {
     type: 'function',
@@ -1102,7 +1127,7 @@ const TOOL_DEFS: Record<string, ToolDefinition> = {
 
 const ROLE_TOOLS: Record<AgentRole, string[]> = {
   orchestrator: ['query_db', 'list_nodes', 'get_node_items', 'assign_item', 'create_node', 'search_items', 'send_chat_message', 'enrich_item', 'run_command', 'create_item', 'update_item', 'write_file', 'read_file'],
-  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'assign_project_artifact', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source', 'edit_analytics_dashboard', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_find_server', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'knowledge_list', 'knowledge_load', 'knowledge_propose', 'knowledge_write', 'knowledge_create_set', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'wait_for_etl_run', 'job_update', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'gmail_search', 'gmail_read', 'gmail_draft', 'gmail_send', 'gdrive_search', 'gdrive_read', 'whatsapp_find_contact', 'whatsapp_send', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'export_footer', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
+  chat: ['get_today', 'list_projects', 'manage_area', 'manage_project', 'assign_project_artifact', 'manage_page_layout', 'get_project_brain', 'get_channels', 'set_task_state', 'add_task', 'reject_evidence', 'discard_item', 'rebuild_brain', 'get_dashboard_sharing_status', 'publish_static_artifact_to_harmony', 'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source', 'edit_analytics_dashboard', 'list_analytics_dashboards', 'get_analytics_dashboard', 'create_analytics_dashboard', 'update_analytics_dashboard', 'configure_analytics_schedule', 'refresh_analytics_dashboard', 'mcp_status', 'mcp_profile_action', 'mcp_find_server', 'mcp_add_custom_server', 'mcp_update_custom_server', 'mcp_get_custom_server_config', 'mcp_call_tool', 'mcp_describe_tool', 'mcp_sql_list_presets', 'mcp_sql_get_schema_context', 'mcp_sql_list_schemas', 'mcp_sql_list_tables', 'mcp_sql_describe_table', 'mcp_sql_sample_data', 'mcp_sql_query', 'mcp_analytics_list_context', 'mcp_analytics_load_context', 'knowledge_list', 'knowledge_load', 'knowledge_propose', 'knowledge_write', 'knowledge_create_set', 'propose_lesson', 'list_lessons', 'adopt_lesson', 'retire_lesson', 'ui_inspect', 'ui_console_errors', 'ui_screenshot', 'browser_hands', 'browser_screenshot', 'inspect_visual_assets', 'mcp_etl_generate_presets', 'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql', 'mcp_etl_search', 'mcp_etl_run_query', 'wait_for_etl_run', 'job_update', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_submit_run', 'mcp_etl_alter_run', 'mcp_etl_force_deps', 'mcp_etl_create_profile', 'mcp_etl_update_profile_sql', 'save_mcp_analysis', 'sharepoint_reply_comment', 'sharepoint_add_comment', 'sharepoint_update_document', 'sharepoint_edit_docx_body', 'sharepoint_create_document', 'list_documents', 'read_document', 'read_spreadsheet', 'gmail_search', 'gmail_read', 'gmail_draft', 'gmail_send', 'gdrive_search', 'gdrive_read', 'ui_theme_propose', 'whatsapp_find_contact', 'whatsapp_send', 'list_nodes', 'get_node_items', 'search_items', 'send_chat_message', 'query_db', 'run_command', 'enrich_item', 'create_item', 'update_item', 'get_chat_messages', 'web_search', 'web_fetch', 'get_document_writing_guide', 'save_product_document', 'export_product_document', 'export_footer', 'publish_product_document_to_sharepoint', 'write_file', 'read_file', 'open_terminal', 'read_terminal', 'wait_for_terminal', 'send_terminal_input', 'close_terminal', 'refresh_toolchain'],
   classifier: [], // no tools — just returns JSON
   enricher: ['enrich_item', 'query_db'],
   organizer: ['list_nodes', 'get_node_items', 'create_node', 'assign_item'],
@@ -1665,6 +1690,7 @@ You should PROACTIVELY think about the best way to display information. For ever
 - Is important info hidden? Surface it.
 
 You have FULL authority to modify any UI element. Do not ask permission — just improve it.
+Colours and themes are the one exception to editing styles by hand: a new look (a theme, a colour scheme, an accent colour, dark or light variants) goes through the ui_theme_propose tool on the turns where it is offered, so the owner can preview, keep or discard it. Do not recolour the UI by running sed on dashboard.css.
 
 ## File Creation: ALWAYS use write_file
 For ALL file creation and content writing tasks, use write_file instead of run_command with heredocs or redirects.
@@ -1770,6 +1796,7 @@ export function createPromptManager(): PromptManager {
       if (context?.customInstructions) prompt += `\n\n${context.customInstructions}`;
       if (role === 'chat' && context?.gmailAccountsBlock) prompt += `\n\n${context.gmailAccountsBlock}`;
       if (role === 'chat' && context?.driveConnected === true) prompt += `\n\n${GDRIVE_GUIDANCE_BLOCK}`;
+      if (role === 'chat' && context?.uiThemeAvailable === true) prompt += `\n\n${UI_THEME_GUIDANCE_BLOCK}`;
       // The library's block rides just before the active job, which stays last (volatile text goes last).
       if (role === 'chat' && context?.knowledgeBlock) prompt += `\n\n${context.knowledgeBlock}`;
       if (role === 'chat' && context?.jobBlock) prompt += `\n\n${context.jobBlock}`;
@@ -1790,6 +1817,8 @@ export function createPromptManager(): PromptManager {
         .filter(name => amazon || !isAmazonOnlyChatTool(name))
         // Drive tools exist only while some account has Drive connected.
         .filter(name => context?.driveConnected === true || !(GDRIVE_CHAT_TOOL_NAMES as readonly string[]).includes(name))
+        // The theme tool exists only on turns where the owner's message is about how BotBoy looks.
+        .filter(name => context?.uiThemeAvailable === true || !(UI_THEME_CHAT_TOOL_NAMES as readonly string[]).includes(name))
         // The library tools exist only once the owner has created the library.
         .filter(name => context?.knowledgeAvailable === true || !(KNOWLEDGE_CHAT_TOOL_NAMES as readonly string[]).includes(name))
         // The write tools are offered only on turns whose routing saw a write intent (the proposal tool is always offered).

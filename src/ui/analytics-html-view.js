@@ -314,8 +314,9 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
       frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.setAttribute('title', kind === 'mermaid' ? 'Diagram' : 'Visual');
       frame.style.height = '160px';
-      frame.srcdoc = chatSrcdoc(kind, source, cssVars());
-      frame._botboyVisual = { kind, source, mode: cssVars().mode };
+      const theme = cssVars();
+      frame.srcdoc = chatSrcdoc(kind, source, theme);
+      frame._botboyVisual = { kind, source, mode: theme.mode, theme };
       CHAT_FRAMES.add(frame);
       const error = document.createElement('div');
       error.className = 'chat-visual-error';
@@ -337,8 +338,10 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
     const theme = cssVars();
     for (const frame of CHAT_FRAMES) {
       const visual = frame._botboyVisual;
-      if (!frame.isConnected || !visual || visual.mode === theme.mode) continue;
+      // A theme made in chat changes the colours without changing the mode, so the colours are compared too (docs/maps/ui-themes.md).
+      if (!frame.isConnected || !visual || (visual.mode === theme.mode && JSON.stringify(visual.theme?.colors) === JSON.stringify(theme.colors))) continue;
       visual.mode = theme.mode;
+      visual.theme = theme;
       frame.srcdoc = chatSrcdoc(visual.kind, visual.source, theme);
     }
     for (const view of VIEWS.values()) {
@@ -346,7 +349,7 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
       view.pending = { ...view.pending, theme, dataKey: '' };
       view.frame.contentWindow?.postMessage({ botboyHtmlView: 1, type: 'data', datasets: view.pending.datasets, theme }, '*');
     }
-  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-botboy-choice'] });
 
   /** Issues each live view last reported (widgetId → list). */
   function viewIssues() {

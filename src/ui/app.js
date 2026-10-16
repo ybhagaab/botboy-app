@@ -968,12 +968,19 @@ function chatJobShortGoal(job) {
   return { goal, shortGoal: goal.length > 120 ? `${goal.slice(0, 117)}…` : goal };
 }
 
+// The strip's border tells the state (dashboard.css, docs/maps/job-continuations.md): `running` = a faint light travels around
+// it, `paused` = all yellow, `done` = all green; a job the owner stopped, or that expired, is `ended` and stays neutral. Each
+// class is set by an explicit boolean, which changes nothing when it is already right, so the 5 s re-render (it rewrites only
+// the strip's children) never restarts a running light.
+function setChatJobStripState(strip, on) {
+  for (const name of ['continuing', 'running', 'paused', 'done', 'ended']) strip.classList.toggle(name, on[name] === true);
+}
+
 function renderChatJobStrip(payload) {
   const strip = document.getElementById('chat-job-strip');
   if (!strip) return;
   const job = payload && payload.job;
   const recent = payload && payload.recent;
-  strip.classList.remove('continuing', 'paused', 'ended');
   if (!job || job.status !== 'active' || !/^cj_[a-f0-9]{24}$/.test(String(job.id || ''))) {
     // A job that just ended says how it ended until dismissed.
     if (recent && /^cj_[a-f0-9]{24}$/.test(String(recent.id || '')) && !chatJobDismissed.has(recent.id)) {
@@ -981,10 +988,12 @@ function renderChatJobStrip(payload) {
       const label = recent.status === 'done' ? 'Done' : recent.status === 'stopped' ? 'Stopped' : recent.status === 'expired' ? 'Ended (idle)' : 'Ended';
       const detail = [goal, recent.endReason || ''].filter(Boolean).join('\n');
       strip.hidden = false;
-      strip.classList.add('ended');
+      // Only a job that FINISHED is green; one the owner stopped, or that expired, did not complete and stays neutral.
+      setChatJobStripState(strip, { ended: true, done: recent.status === 'done' });
       strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${chatJobEsc(label)}:</strong> ${chatJobEsc(shortGoal)}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(recent.status === 'done' ? 'completed' : 'not running')}</span><button type="button" class="button small" data-chat-job-dismiss="${chatJobEsc(recent.id)}" aria-label="Dismiss" title="Hide this line">×</button>`;
       return;
     }
+    setChatJobStripState(strip, {});
     strip.hidden = true;
     strip.innerHTML = '';
     return;
@@ -1009,8 +1018,7 @@ function renderChatJobStrip(payload) {
     ...(waiting.length && !job.continuing ? [`BotBoy continues on its own when ${waiting.length === 1 ? 'it finishes' : 'they finish'}.`] : []),
   ].join('\n');
   strip.hidden = false;
-  strip.classList.toggle('continuing', Boolean(job.continuing));
-  strip.classList.toggle('paused', paused);
+  setChatJobStripState(strip, { continuing: Boolean(job.continuing), running: !paused, paused });
   const lead = paused ? 'Paused' : 'Working on';
   const question = paused && job.pauseNote ? `<span class="chat-job-note">${chatJobEsc(job.pauseNote)}</span>` : '';
   strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${lead}:</strong> ${chatJobEsc(shortGoal)}${question}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(progress)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">${paused ? 'End job' : 'Stop'}</button>`;
@@ -1923,6 +1931,9 @@ const MCP_SERVER_MARKER_RE = /\[\[mcp-server:(custom-[a-z0-9][a-z0-9-]{0,79})\]\
 // knowledge_propose / knowledge_write / knowledge_create_set replies carry [[knowledge:<kc_id>]]; the chat router appends any
 // marker the model left out (docs/maps/knowledge-library.md K18). The card is the Knowledge library's change card.
 const KNOWLEDGE_MARKER_RE = /\[\[knowledge:(kc_[a-f0-9]{12})\]\]/g;
+// ui_theme_propose replies carry [[theme:<th_id>]]; the chat router appends any marker the model left out
+// (docs/maps/ui-themes.md). The card is the theme proposal's Preview / Keep / Discard card.
+const THEME_MARKER_RE = /\[\[theme:(th_[0-9a-f]{12})\]\]/g;
 
 /**
  * Expands every card marker in the chat bubbles under `root`, then fills the
@@ -1941,16 +1952,19 @@ function hydrateChatCards(root) {
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
     MCP_SERVER_MARKER_RE.lastIndex = 0;
     KNOWLEDGE_MARKER_RE.lastIndex = 0;
-    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html) && !KNOWLEDGE_MARKER_RE.test(html)) continue;
+    THEME_MARKER_RE.lastIndex = 0;
+    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html) && !KNOWLEDGE_MARKER_RE.test(html) && !THEME_MARKER_RE.test(html)) continue;
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
     MCP_SERVER_MARKER_RE.lastIndex = 0;
     KNOWLEDGE_MARKER_RE.lastIndex = 0;
+    THEME_MARKER_RE.lastIndex = 0;
     bubble.innerHTML = html
       .replace(LESSON_MARKER_RE, (_, id) => `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`)
       .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`)
       .replace(MCP_SERVER_MARKER_RE, (_, id) => `<div class="mcp-server-card" data-mcp-server-id="${id}" aria-live="polite"><em>Loading the MCP server…</em></div>`)
-      .replace(KNOWLEDGE_MARKER_RE, (_, id) => `<div class="knowledge-card knowledge-chat-card" data-knowledge-change-id="${id}" aria-live="polite"><em>Loading the change…</em></div>`);
+      .replace(KNOWLEDGE_MARKER_RE, (_, id) => `<div class="knowledge-card knowledge-chat-card" data-knowledge-change-id="${id}" aria-live="polite"><em>Loading the change…</em></div>`)
+      .replace(THEME_MARKER_RE, (_, id) => `<div class="theme-chat-card" data-theme-id="${id}" aria-live="polite"><em>Loading the theme…</em></div>`);
   }
   for (const card of root.querySelectorAll('.lesson-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
@@ -1967,6 +1981,10 @@ function hydrateChatCards(root) {
   for (const card of root.querySelectorAll('.knowledge-chat-card:not([data-hydrated])')) {
     card.dataset.hydrated = '1';
     void fillKnowledgeCard(card);
+  }
+  for (const card of root.querySelectorAll('.theme-chat-card:not([data-hydrated])')) {
+    card.dataset.hydrated = '1';
+    void fillThemeCard(card);
   }
 }
 
@@ -2074,6 +2092,104 @@ document.addEventListener('click', async (event) => {
       card.appendChild(note);
     }
     note.textContent = `Could not do that: ${String(error?.message || error)}. Try again.`;
+  }
+});
+// ── Themes: the chat card for a theme BotBoy proposed (docs/maps/ui-themes.md) ──
+// Rendering is ui-theme.js (window.BotBoyTheme.cardHtml, escaped there). The buttons are the owner's decisions: Preview changes only
+// this page in memory, Keep saves it on the server and makes it the theme in use, Discard drops the proposal. The model that made
+// the proposal can do none of this.
+async function fillThemeCard(card, { refresh = false } = {}) {
+  const ui = window.BotBoyTheme;
+  const busy = () => card.querySelector('button:disabled') !== null;
+  if (refresh && (busy() || (ui && ui.previewing() === card.dataset.themeId))) return;
+  try {
+    const proposal = await api(`/ui-theme/proposals/${card.dataset.themeId}`);
+    if (!proposal || !proposal.id) throw new Error(proposal?.error || 'unavailable');
+    if (refresh && (!card.isConnected || busy() || JSON.stringify(proposal) === JSON.stringify(card.themeProposal))) return;
+    paintThemeCard(card, proposal);
+  } catch {
+    if (!refresh) card.innerHTML = '<div class="theme-card-state">This theme proposal is no longer available. Ask BotBoy to make it again.</div>';
+  }
+}
+function paintThemeCard(card, proposal, notice) {
+  const ui = window.BotBoyTheme;
+  card.themeProposal = proposal;
+  card.innerHTML = ui
+    ? ui.cardHtml(proposal, { esc: lessonEsc, attr: lessonEsc }, { previewing: ui.previewing() === proposal.id, notice })
+    : '<em>The theme card did not load. Reload this tab.</em>';
+}
+/** The themes changed (kept, applied or deleted here or in another tab): every theme card reads itself again. dashboard.js announces it from the version poll it already runs. */
+function refreshThemeCards() {
+  for (const card of document.querySelectorAll('.theme-chat-card[data-hydrated]')) void fillThemeCard(card, { refresh: true });
+}
+window.addEventListener('botboy:themes-changed', refreshThemeCards);
+// A preview starting or ending flips the card's Preview / Stop preview button.
+window.addEventListener('botboy:theme-preview', () => {
+  for (const card of document.querySelectorAll('.theme-chat-card[data-hydrated]')) {
+    if (card.themeProposal && !card.querySelector('button:disabled')) paintThemeCard(card, card.themeProposal);
+  }
+});
+function themeCardNote(card, message) {
+  let note = card.querySelector('.theme-card-note[role="alert"]');
+  if (!note) {
+    note = document.createElement('div');
+    note.className = 'theme-card-note';
+    note.setAttribute('role', 'alert');
+    card.appendChild(note);
+  }
+  note.textContent = message;
+}
+async function keepThemeCard(card) {
+  const ui = window.BotBoyTheme;
+  const proposal = card.themeProposal;
+  if (!ui || !proposal) return;
+  for (const other of card.querySelectorAll('button')) other.disabled = true;
+  try {
+    const result = await api(`/ui-theme/proposals/${card.dataset.themeId}/keep`, { method: 'POST' });
+    if (!result || !result.theme || !result.view) throw new Error([result?.error, result?.nextAction].filter(Boolean).join(' ') || 'unexpected response');
+    // The page already shows the theme (or nothing is up); end the preview without restoring, then show what the server now holds.
+    ui.endPreview(false);
+    ui.applyView(result.view);
+    paintThemeCard(card, { ...proposal, status: 'kept', name: result.theme.name, active: true, tokens: null });
+    window.dispatchEvent(new CustomEvent('botboy:theme-saved', { detail: result.view }));
+  } catch (error) {
+    for (const other of card.querySelectorAll('button')) other.disabled = false;
+    themeCardNote(card, `Could not keep it: ${String(error?.message || error)}`);
+  }
+}
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('.theme-chat-card [data-theme-card-action]');
+  if (!button) return;
+  const card = button.closest('.theme-chat-card');
+  const proposal = card?.themeProposal;
+  const ui = window.BotBoyTheme;
+  if (!card || !proposal || !ui) return;
+  const action = button.dataset.themeCardAction;
+  const id = card.dataset.themeId;
+  if (action === 'preview') {
+    const shown = proposal.tokens && ui.startPreview({ id: proposal.id, mode: proposal.mode, tokens: proposal.tokens }, proposal.name, { onKeep: () => keepThemeCard(card) });
+    if (!shown) paintThemeCard(card, proposal, 'This theme could not be previewed. Ask BotBoy to make it again.');
+    return;
+  }
+  if (action === 'stop-preview') { ui.endPreview(true); return; }
+  if (action === 'keep') { await keepThemeCard(card); return; }
+  for (const other of card.querySelectorAll('button')) other.disabled = true;
+  try {
+    if (action === 'discard') {
+      const result = await api(`/ui-theme/proposals/${id}/discard`, { method: 'POST' });
+      if (!result || result.status !== 'discarded') throw new Error([result?.error, result?.nextAction].filter(Boolean).join(' ') || 'unexpected response');
+      if (ui.previewing() === id) ui.endPreview(true);
+      paintThemeCard(card, { ...proposal, status: 'discarded', tokens: null });
+    } else if (action === 'apply') {
+      const view = await api('/ui-theme/active', { method: 'PUT', body: { id } });
+      if (!view || view.active !== id) throw new Error([view?.error, view?.nextAction].filter(Boolean).join(' ') || 'unexpected response');
+      ui.applyView(view);
+      paintThemeCard(card, { ...proposal, active: true });
+      window.dispatchEvent(new CustomEvent('botboy:theme-saved', { detail: view }));
+    }
+  } catch (error) {
+    for (const other of card.querySelectorAll('button')) other.disabled = false;
+    themeCardNote(card, `Could not do that: ${String(error?.message || error)}`);
   }
 });
 document.addEventListener('click', async (event) => {
@@ -2854,7 +2970,7 @@ function renderSearchResults() {
     if (!text || !q) return escHtml(text);
     const safe = escHtml(text);
     const re = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-    return safe.replace(re, '<mark style="background:#7c3aed44;color:var(--accent);border-radius:2px;padding:0 2px">$1</mark>');
+    return safe.replace(re, '<mark style="background:rgba(var(--accent-rgb),.27);color:var(--accent);border-radius:2px;padding:0 2px">$1</mark>');
   }
 
   el.innerHTML = `

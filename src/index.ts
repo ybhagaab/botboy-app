@@ -92,6 +92,8 @@ import { createSlackMonitor, type ReloadableSlackMonitor } from './monitors/slac
 import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createWorkplace } from './core/workplace.js';
 import { withWorkplaceChatTools } from './core/workplace-chat-tools.js';
+import { createUiThemes, indexHtmlHandler } from './core/ui-theme.js';
+import { withUiThemeChatTools } from './core/ui-theme-chat-tools.js';
 import { createExportFooterSettings } from './product-manager/export-footer.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
 import { createGraspSync, createBrowserEmailCaptureGate, isBrowserEmailItem } from './monitors/grasp-sync.js';
@@ -380,6 +382,8 @@ async function main() {
   const workplace = createWorkplace({ db, env: inferenceEnv });
   const exportFooter = createExportFooterSettings({ db, amazonEmployee: () => workplace.amazonEmployee() });
   exportFooter.seedLegacyFooterOnce();
+  // UI themes (docs/maps/ui-themes.md): saved themes, staged proposals and the active choice, in one settings row.
+  const uiThemes = createUiThemes({ db });
 
   // macOS Keychain through McpManager's secret store.
   const mcpManager = createMcpManager({ db, amazonEmployee: () => workplace.amazonEmployee() });
@@ -764,10 +768,11 @@ async function main() {
   if (knowledgeLibrary.isActivated()) {
     startInBackground('Knowledge library', async () => { await knowledgeLibrary.rescan(); }, '✅ Knowledge library scanned');
   }
-  // withKnowledgeChatTools sits directly inside withWorkplaceChatTools, so the job mandate filters first, and it answers
-  // its own two tools before the base executor, so the base's result cap never applies to a whole-file load.
+  // withKnowledgeChatTools sits inside withWorkplaceChatTools (withUiThemeChatTools is the layer between them), so the job
+  // mandate filters first, and it answers its own two tools before the base executor, so the base's result cap never applies
+  // to a whole-file load. The theme tool is not a job-scope tool: a continuation never reaches it.
   const toolExecutor = withJobMandate(
-    withWorkplaceChatTools(withKnowledgeChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
+    withWorkplaceChatTools(withUiThemeChatTools(withKnowledgeChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
@@ -775,7 +780,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { themes: uiThemes }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
@@ -1776,6 +1781,7 @@ async function main() {
     browserCapture: { state: browserCaptureState, monitor: browserMonitor },
     workplace,
     exportFooter,
+    uiThemes,
   };
   // Workplace listeners, in order (design §6.4). Each is isolated by workplace.ts.
   workplace.onChange(() => mcpManager.applyWorkplaceChange(), 'mcpManager.applyWorkplaceChange');
@@ -1787,6 +1793,9 @@ async function main() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
   const uiDir = path.resolve(__dirname, 'ui');
+  // The page's first bytes carry the owner's active theme, so a chosen theme never flashes the default one first
+  // (docs/maps/ui-themes.md). This sits before the static handler, which would otherwise serve index.html as it is on disk.
+  app.get(['/', '/index.html'], indexHtmlHandler(uiDir, uiThemes));
   app.use(express.static(uiDir, { etag: false, lastModified: false, maxAge: 0 }));
   app.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate');

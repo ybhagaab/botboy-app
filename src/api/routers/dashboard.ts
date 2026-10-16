@@ -81,6 +81,8 @@ export function createDashboardRouter(
   browserCapture?: () => { version: number },
   /** Knowledge library change counter (knowledge-library.md K12); the Settings page refetches only when it moves. */
   knowledge?: () => { version: number },
+  /** UI theme revision (ui-themes.md); open tabs re-apply the active theme and repaint theme cards when it moves. */
+  uiTheme?: () => { version: number },
 ): Router {
   const router = Router();
 
@@ -226,6 +228,15 @@ export function createDashboardRouter(
         try {
           const summary = knowledge?.();
           return summary ? { knowledgeVersion: summary.version } : {};
+        } catch {
+          return {};
+        }
+      })(),
+      // In-memory: changes when a theme is kept, applied, renamed, deleted, proposed or reset.
+      ...(() => {
+        try {
+          const summary = uiTheme?.();
+          return summary ? { themeVersion: summary.version } : {};
         } catch {
           return {};
         }

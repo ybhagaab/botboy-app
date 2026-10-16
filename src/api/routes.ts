@@ -38,6 +38,7 @@ import { createVisualAssetsRouter } from './routers/visual-assets.js';
 import { createLlmUsageRouter } from './routers/llm-usage.js';
 import { createAiModelRouter } from './routers/ai-model.js';
 import { createWorkplaceRouter } from './routers/workplace.js';
+import { createUiThemeRouter } from './routers/ui-theme.js';
 import { createCaptureHealthRouter } from './routers/capture-health.js';
 import { createAppUpdateRouter } from './routers/app-update.js';
 import { createBrowserCaptureRouter } from './routers/browser-capture.js';
@@ -74,6 +75,9 @@ export function createRouter(deps: RouterDeps): Router {
     deps.knowledgeLibrary
       ? () => ({ version: deps.knowledgeLibrary!.version() })
       : undefined,
+    deps.uiThemes
+      ? () => ({ version: deps.uiThemes!.version() })
+      : undefined,
   ));
   router.use(createCaptureHealthRouter(deps));
   router.use(createBrowserCaptureRouter(deps));
@@ -99,6 +103,7 @@ export function createRouter(deps: RouterDeps): Router {
   router.use(createLlmUsageRouter(deps));
   router.use(createAiModelRouter(deps));
   router.use(createWorkplaceRouter(deps));
+  router.use(createUiThemeRouter(deps));
   // Workbench paths (/projects/:id/documents, /documents/*) are disjoint from
   // /product-documents — the writing workspace stays untouched.
   router.use(createDocumentsRouter(deps));

@@ -77,14 +77,15 @@ describe('job mandate gate', () => {
   // wrapper sits directly inside the workplace one, so the mandate filters first.
   it('is the outermost wrapper of the chat executor (index.ts)', () => {
     const index = readFileSync(path.join(process.cwd(), 'src/index.ts'), 'utf8');
-    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withKnowledgeChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+    // withUiThemeChatTools (docs/maps/ui-themes.md) sits between the workplace and Knowledge wrappers: inside the mandate too.
+    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withUiThemeChatTools\(withKnowledgeChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
   });
 
   it('offers a continuation only the job-scope tools', () => {
     const tools = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'open_terminal'].map(name => ({ type: 'function', function: { name } }));
     expect(filterToolsForContinuation(tools).map(tool => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query']);
     for (const name of JOB_SCOPE_TOOLS) {
-      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom)/);
+      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_)/);
     }
     expect(isJobScopeTool('mcp_etl_submit_run')).toBe(false);
   });

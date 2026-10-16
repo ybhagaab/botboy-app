@@ -102,6 +102,8 @@ export interface RouterDeps {
   workplace?: Workplace;
   /** Document export footer text (export-footer.ts). */
   exportFooter?: ExportFooterSettings;
+  /** Saved UI themes, staged proposals and the active choice (ui-theme.ts; Settings → Appearance). */
+  uiThemes?: import('../../core/ui-theme.js').UiThemes;
   llmUsageService?: LlmUsageService;
   toolExecutor?: ToolExecutor;
   promptManager?: PromptManager;

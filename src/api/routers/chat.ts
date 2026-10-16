@@ -54,6 +54,7 @@ import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-ch
 import { whatsAppSendConfirmed } from '../../core/whatsapp-send.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
 import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
+import { asksAboutAppearance, uiThemeIdFromToolResult, withUiThemeCards } from '../../core/ui-theme-chat-tools.js';
 import {
   authenticateContinuationRequest,
   CONTINUATION_HEADER,
@@ -1228,6 +1229,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             projectContextSource: projectScope.source,
           } : {}),
         };
+        // Themes (docs/maps/ui-themes.md): ui_theme_propose is offered, and accepted, only on a live owner turn about how BotBoy
+        // looks, or in the minutes after a proposal (a follow-up like "warmer"). A continuation never gets it.
+        const uiThemeTurn = !continuation && Boolean(deps.uiThemes) && (asksAboutAppearance(message) || Boolean(deps.uiThemes?.hasRecentProposal()));
+        if (uiThemeTurn) toolExecutionContext.uiThemeTurn = true;
 
         if (!llmClient || !toolExecutor) {
           if (continuation) {
@@ -1430,6 +1435,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           knowledgeAvailable,
           knowledgeWriteAvailable,
           driveConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canReadDrive && !account.needsReconnect),
+          uiThemeAvailable: uiThemeTurn,
           amazonEmployee: turnAmazonEmployee,
         };
         const systemPrompt = promptManager
@@ -1619,6 +1625,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const knowledgeChangeIds = new Set<string>();
         // MCP servers BotBoy added or changed this turn: each gets its review card.
         const mcpServerCardIds = new Set<string>();
+        // Theme proposals staged this turn: each gets its card (Preview / Keep / Discard).
+        const themeProposalIds = new Set<string>();
         // Read-only SQL tools that may run as a concurrent batch (the
         // connector's profile allows 4 in-flight calls; the manager's
         // per-server gate arbitrates anything beyond that).
@@ -2035,7 +2043,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
             turnState.jobEnd = toolsDisabled ? 'repeat_breaker' : 'answered';
             turnState.replyExcerpt = replyExcerptOf(content);
-            content = forTranscript(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges));
+            content = forTranscript(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes));
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
@@ -2392,6 +2400,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               }
               const knowledgeChangeId = knowledgeChangeIdFromToolResult(tc.function.name, result?.content);
               if (knowledgeChangeId) knowledgeChangeIds.add(knowledgeChangeId);
+              const themeProposalId = uiThemeIdFromToolResult(tc.function.name, result?.content);
+              if (themeProposalId) themeProposalIds.add(themeProposalId);
               const savedDraftId = gmailDraftIdFromResult(tc.function.name, result?.content);
               if (savedDraftId) gmailDraftIds.add(savedDraftId);
               // A server definition BotBoy saved is a real local effect ("I've
@@ -2684,7 +2694,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
-        finalContent = forTranscript(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges));
+        finalContent = forTranscript(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes));
         const capId = `asst-${Date.now()}`;
         if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);

@@ -163,6 +163,11 @@ export interface ToolExecutionContext {
    * turn, and `bornIds`: the changes this request itself created, the only ones a direct apply may revise).
    */
   knowledgeRequest?: { newChanges: number; replies: Map<string, string>; seenChangeIds: Set<string>; bornIds: Set<string> };
+  /**
+   * Server-set by the chat route, never from model arguments: the owner's message in this live turn is about how BotBoy looks
+   * (or follows a theme proposal made minutes ago), so `ui_theme_propose` is offered and accepted (ui-theme-chat-tools.ts).
+   */
+  uiThemeTurn?: boolean;
   /** Server-validated visible project scope; never parsed from model prose or tool args. */
   authoritativeProjectIds?: string[];
   projectContextSource?: 'project_scope_chip' | 'background_project_job';
