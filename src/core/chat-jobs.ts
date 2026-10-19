@@ -22,8 +22,18 @@ export type EtlWatchStatus = 'pending' | 'finished' | 'abandoned';
 
 /** A job with no owner or continuation turn for this long expires. */
 export const CHAT_JOB_IDLE_MS = 24 * 60 * 60_000;
+/**
+ * The end reason `start()` writes when a new job replaces the active one. The WhatsApp notifier (job-notifier.ts) reads it: a job the
+ * owner replaced by asking for something else is not news, so it stays silent.
+ */
+export const CHAT_JOB_REPLACED_REASON = 'replaced by a new job';
 /** Automatic continuations in a row (since the owner's last message) before BotBoy pauses and asks. */
 export const CHAT_JOB_MAX_CONTINUATIONS = 25;
+
+/** The report body kept on the job: the latest turn's closing words (a phone message, so bounded). */
+export const NOTIFY_REPLY_CHARS = 3_000;
+/** Events remembered per job, newest last; a job has a handful of pause/finish events, so this never bites. */
+const NOTIFY_SENT_KEEP = 40;
 
 const MAX_GOAL_CHARS = 4_000;
 const MAX_NOTES = 12;
@@ -42,6 +52,21 @@ export interface ChatJobWorkingSet {
 
 /** What a turn said should happen next (job_update continue | needs_owner). */
 export type ChatJobDeclaration = 'continue' | 'needs_owner';
+
+/**
+ * "Tell me on WhatsApp" for ONE job (docs/maps/job-notify.md). Set from a live owner turn; BotBoy's own notifier then sends
+ * a message when the job needs the owner, finishes, or ends, with no model turn. `sent` records each event once, so a
+ * restart or a retry never repeats a message. Mirrors the owner's request: it is the owner's word, kept on the job.
+ */
+export interface ChatJobNotify {
+  channel: 'whatsapp';
+  /** When the owner asked, and the words they used (shown in the confirmation, never executed). */
+  armedAt: string;
+  /** Each event BotBoy has already told the owner about (or given up on), keyed by `eventKey`. */
+  sent: Array<{ key: string; at: string; outcome: 'sent' | 'unknown' | 'gave_up' }>;
+  /** A message that failed to send and will be retried: how many attempts, and when the next one may run. */
+  retry?: { key: string; attempts: number; notBefore: string };
+}
 
 export interface ChatJob {
   id: string;
@@ -67,6 +92,11 @@ export interface ChatJob {
   /** Consecutive turn ends with no declaration / consecutive failed turns. */
   undeclaredEnds: number;
   failedTurns: number;
+  /** The owner asked to be told on WhatsApp when this job needs them or ends (job-notify.md). Absent: not asked. */
+  notify?: ChatJobNotify;
+  /** The final words of the job's latest turn: the body of the report the owner receives. Set when a turn settles. */
+  lastReply?: string;
+  lastReplyAt?: string;
 }
 
 /** How a chat turn ended, for the job's end-of-turn settle. */
@@ -194,6 +224,24 @@ export interface ChatJobStore {
   clearContinueRequest(jobId: string): void;
   /** Expires idle jobs; returns their ids. */
   expireIdle(nowMs?: number): string[];
+  /**
+   * The owner asked to be told on WhatsApp (job_notify on) or changed their mind (off). Works on an active job only; arming
+   * an already-armed job keeps what it has sent. Returns the job, or null when it is not active.
+   */
+  setNotify(jobId: string, on: boolean): ChatJob | null;
+  /**
+   * The words of the latest turn's final reply, kept (bounded, line breaks kept) as the report body, with the time it was
+   * written. Only a job that asked to be told keeps one; an ended job still takes it (its closing report follows `done`).
+   */
+  recordLastReply(jobId: string, text: string): void;
+  /**
+   * Records what the notifier did with one event. `sent` and `unknown` close the event for good (an unknown effect is never
+   * resent); `gave_up` closes it after the retry budget; `retry` keeps it open with a backoff. Works on ended jobs too: an
+   * ended job's "finished" message is sent after it ended.
+   */
+  recordNotifyOutcome(jobId: string, key: string, outcome: 'sent' | 'unknown' | 'gave_up' | { retryAt: string; attempts: number }): void;
+  /** Jobs that asked to be told and may still owe a message: every active armed job, and armed jobs that ended recently. */
+  notifyCandidates(sinceIso: string): ChatJob[];
   recordFile(jobId: string, filePath: string, label?: string): void;
   recordDataset(jobId: string, entry: { datasetId?: string; versionId?: string; jobId?: string; title?: string }): void;
   recordDashboard(jobId: string, entry: { dashboardId: string; title?: string }): void;
@@ -239,6 +287,25 @@ function parseWorkingSet(raw: unknown): ChatJobWorkingSet {
     };
   } catch {
     return emptyWorkingSet();
+  }
+}
+
+/** The stored notify record, or undefined when it is missing or malformed (never throws). */
+function parseNotify(raw: unknown): ChatJobNotify | undefined {
+  if (typeof raw !== 'string' || !raw) return undefined;
+  try {
+    const value = JSON.parse(raw);
+    if (!value || value.channel !== 'whatsapp' || typeof value.armedAt !== 'string') return undefined;
+    const sent = Array.isArray(value.sent)
+      ? value.sent.filter((entry: any) => entry && typeof entry.key === 'string' && typeof entry.at === 'string'
+        && (entry.outcome === 'sent' || entry.outcome === 'unknown' || entry.outcome === 'gave_up'))
+      : [];
+    const retry = value.retry && typeof value.retry.key === 'string' && typeof value.retry.notBefore === 'string'
+      ? { key: value.retry.key, attempts: Math.max(0, Number(value.retry.attempts) || 0), notBefore: value.retry.notBefore }
+      : undefined;
+    return { channel: 'whatsapp', armedAt: value.armedAt, sent, ...(retry ? { retry } : {}) };
+  } catch {
+    return undefined;
   }
 }
 
@@ -288,6 +355,8 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
     ['declaration', 'TEXT'], ['declared_at', 'TEXT'], ['paused_at', 'TEXT'], ['pause_note', 'TEXT'],
     ['continue_requested_at', 'TEXT'], ['continue_reason', 'TEXT'],
     ['undeclared_ends', 'INTEGER NOT NULL DEFAULT 0'], ['failed_turns', 'INTEGER NOT NULL DEFAULT 0'],
+    // WhatsApp updates for a job (2026-10-19, job-notify.md): the owner's request and what BotBoy has already sent.
+    ['notify_json', 'TEXT'], ['last_reply', 'TEXT'], ['last_reply_at', 'TEXT'],
   ] as const) {
     if (!jobColumns.has(name)) db.exec(`ALTER TABLE chat_jobs ADD COLUMN ${name} ${type}`);
   }
@@ -303,6 +372,7 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
 
   function rowToJob(row: any): ChatJob | null {
     if (!row) return null;
+    const notify = parseNotify(row.notify_json);
     return {
       id: row.id,
       goal: row.goal,
@@ -323,6 +393,9 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
       ...(row.continue_reason ? { continueReason: row.continue_reason } : {}),
       undeclaredEnds: Number(row.undeclared_ends) || 0,
       failedTurns: Number(row.failed_turns) || 0,
+      ...(notify ? { notify } : {}),
+      ...(row.last_reply ? { lastReply: String(row.last_reply) } : {}),
+      ...(row.last_reply_at ? { lastReplyAt: String(row.last_reply_at) } : {}),
     };
   }
 
@@ -353,7 +426,9 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
 
   function endJob(jobId: string, status: Exclude<ChatJobStatus, 'active'>, reason: string): ChatJob | null {
     const ended = db.transaction(() => {
-      const result = db.prepare(`UPDATE chat_jobs SET status = ?, ended_at = ?, end_reason = ?
+      // The report kept before the end is dropped with it: a "finished" message carries only words written AFTER the job ended (the
+      // closing report follows `job_update done` in the same turn), never an older progress note (job-notify.md).
+      const result = db.prepare(`UPDATE chat_jobs SET status = ?, ended_at = ?, end_reason = ?, last_reply = NULL, last_reply_at = NULL
         WHERE id = ? AND status = 'active'`).run(status, nowIso(), clip(reason, 200), jobId);
       if (result.changes) abandonWatches(jobId);
       return result.changes > 0;
@@ -378,8 +453,8 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
     db.transaction(() => {
       const current = selectActive.get() as any;
       if (current) {
-        db.prepare(`UPDATE chat_jobs SET status = 'done', ended_at = ?, end_reason = 'replaced by a new job'
-          WHERE id = ?`).run(at, current.id);
+        db.prepare(`UPDATE chat_jobs SET status = 'done', ended_at = ?, end_reason = ?
+          WHERE id = ?`).run(at, CHAT_JOB_REPLACED_REASON, current.id);
         abandonWatches(current.id);
       }
       insertJob.run(id, goal, input.modelKey ?? null, thinkingOf(input.thinking), at, at);
@@ -488,6 +563,51 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
       const idle = db.prepare("SELECT id FROM chat_jobs WHERE status = 'active' AND last_activity_at < ?").all(cutoff) as Array<{ id: string }>;
       for (const { id } of idle) endJob(id, 'expired', 'idle for 24 hours');
       return idle.map(row => row.id);
+    },
+    setNotify(jobId, on) {
+      const job = rowToJob(selectJob.get(jobId));
+      if (!job || job.status !== 'active') return null;
+      if (!on) {
+        db.prepare('UPDATE chat_jobs SET notify_json = NULL, last_reply = NULL, last_reply_at = NULL WHERE id = ?').run(jobId);
+      } else if (!job.notify) {
+        const armed: ChatJobNotify = { channel: 'whatsapp', armedAt: nowIso(), sent: [] };
+        db.prepare('UPDATE chat_jobs SET notify_json = ? WHERE id = ?').run(JSON.stringify(armed), jobId);
+      }
+      changed();
+      return rowToJob(selectJob.get(jobId));
+    },
+    recordLastReply(jobId, text) {
+      // Line breaks stay (the report is read on a phone); only a job that asked to be told keeps its reply at all.
+      const reply = String(text ?? '').replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, NOTIFY_REPLY_CHARS);
+      if (!reply) return;
+      // Also a job that has just ended: `job_update done` ends it in the middle of a turn and the closing report is written
+      // after that. The timestamp lets the notifier wait for the reply that belongs to the end.
+      const result = db.prepare('UPDATE chat_jobs SET last_reply = ?, last_reply_at = ? WHERE id = ? AND notify_json IS NOT NULL').run(reply, nowIso(), jobId);
+      if (result.changes) changed();
+    },
+    recordNotifyOutcome(jobId, key, outcome) {
+      const job = rowToJob(selectJob.get(jobId));
+      if (!job?.notify) return;
+      // Any earlier entry for this event is replaced: the in-flight 'unknown' by its result, or removed when a retry reopens it.
+      const notify: ChatJobNotify = { ...job.notify, sent: job.notify.sent.filter(entry => entry.key !== key) };
+      if (typeof outcome === 'string') {
+        // An attempt in flight is written as 'unknown' BEFORE the send, then replaced by its result: a crash in between
+        // leaves 'unknown', and an unknown event is never sent again.
+        notify.sent.push({ key, at: nowIso(), outcome });
+        if (notify.retry?.key === key) delete notify.retry;
+      } else {
+        // The attempt provably sent nothing: the event is open again, to be retried after the backoff.
+        notify.retry = { key, attempts: outcome.attempts, notBefore: outcome.retryAt };
+      }
+      if (notify.sent.length > NOTIFY_SENT_KEEP) notify.sent = notify.sent.slice(-NOTIFY_SENT_KEEP);
+      db.prepare('UPDATE chat_jobs SET notify_json = ? WHERE id = ?').run(JSON.stringify(notify), jobId);
+      changed();
+    },
+    notifyCandidates(sinceIso) {
+      const rows = db.prepare(`SELECT * FROM chat_jobs
+        WHERE notify_json IS NOT NULL AND (status = 'active' OR ended_at >= ?)
+        ORDER BY last_activity_at DESC LIMIT 20`).all(sinceIso) as any[];
+      return rows.map(row => rowToJob(row)).filter((job): job is ChatJob => Boolean(job?.notify));
     },
     recordFile(jobId, filePath, label) {
       const clean = clip(filePath, 1_000);
@@ -643,6 +763,9 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
     lines.push('Knowledge used (load again with knowledge_load if the task needs it):', ...set.knowledge.slice(-8).map(entry => `- ${entry.set}/${entry.file}`));
   }
   if (job.pausedAt && job.pauseNote) lines.push(`Paused for the owner: ${clip(job.pauseNote, 400)}`);
+  if (job.notify) {
+    lines.push('WhatsApp updates are ON for this job (the owner asked): BotBoy itself sends a WhatsApp message to the owner when the job needs them, finishes or is stopped, using your closing words as the report. You have no WhatsApp tool here and need none; never say you could not send it. Make the last words of a turn that pauses or finishes the job the short, plain report to read on a phone, answer first.');
+  }
   lines.push('Keep the working set current with job_update (next step, decisions). END EVERY TURN of this job with exactly one job_update: "done" when the deliverable is verified; "needs_owner" with the question when only the owner can decide or approve the next step; "continue" with the next step when there is more work you can do yourself (BotBoy starts the next turn at once). Waiting on watched ETL runs needs no call. A turn that ends without one is continued once and then paused.');
   return lines.join('\n').slice(0, 4_500);
 }

@@ -269,6 +269,22 @@ describe('continuation turns in the chat route', () => {
     }
   });
 
+  it('the strip payload says whether the owner asked to be told on WhatsApp (job-notify.md), and only as a boolean', async () => {
+    const job = jobs.start({ goal: 'Study the home screen' });
+    const server = await listening(makeApp(model([{ text: 'x' }]), { executeTool: vi.fn() }));
+    try {
+      expect((await request(server).get('/api/chat/jobs/active')).body.job.notifyWhatsApp).toBe(false);
+      jobs.setNotify(job.id, true);
+      const armed = (await request(server).get('/api/chat/jobs/active')).body.job;
+      expect(armed.notifyWhatsApp).toBe(true);
+      // Nothing about what was sent, or the report, leaks into the polled payload.
+      expect(JSON.stringify(armed)).not.toContain('lastReply');
+      expect(JSON.stringify(armed)).not.toContain('armedAt');
+    } finally {
+      server.close();
+    }
+  });
+
   it('a stopped job ends its running continuation with a plain note', async () => {
     const job = jobs.start({ goal: 'Build the PV dashboard' });
     const never = deferred();

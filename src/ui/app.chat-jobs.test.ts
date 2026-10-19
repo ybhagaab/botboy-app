@@ -111,6 +111,25 @@ describe('job strip', () => {
     expect(strip.classList.contains('paused')).toBe(false);
   });
 
+  // WhatsApp updates for a job (docs/maps/job-notify.md): the strip says so when the owner asked, so the promise is visible.
+  it('says "WhatsApp on" beside the state only when the owner asked to be told, and leaves every other state text unchanged', () => {
+    const strip = document.getElementById('chat-job-strip') as HTMLElement;
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'working', waitingRuns: [] } });
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('working');
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'working', waitingRuns: [], notifyWhatsApp: true } });
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('working · WhatsApp on');
+    expect((strip.querySelector('.chat-job-state') as HTMLElement).title).toContain('BotBoy messages you on WhatsApp when this job needs you, finishes, or is stopped.');
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'paused', pauseNote: 'Which cohort?', waitingRuns: [], notifyWhatsApp: true } });
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('paused, needs you · WhatsApp on');
+    ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'waiting', waitingRuns: [{ runId: '9' }], notifyWhatsApp: true } });
+    expect(strip.querySelector('.chat-job-state')?.textContent).toBe('waiting for 1 ETL run · WhatsApp on');
+    // Only a boolean true turns it on: a string or any other value never does, and nothing from the payload is shown as text.
+    for (const value of ['<b>on</b>', 'true', 1, {}, null]) {
+      ui.renderChatJobStrip({ job: { id: JOB_ID, status: 'active', goal: 'g', phase: 'working', waitingRuns: [], notifyWhatsApp: value } });
+      expect(strip.querySelector('.chat-job-state')?.textContent, String(value)).toBe('working');
+    }
+  });
+
   it('a job that just ended shows Done until dismissed', () => {
     ui.renderChatJobStrip({ job: null, recent: { id: JOB_ID, goal: 'Build it', status: 'done', endReason: 'dashboard verified' } });
     const strip = document.getElementById('chat-job-strip') as HTMLElement;

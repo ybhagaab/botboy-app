@@ -55,6 +55,7 @@ import { whatsAppSendConfirmed } from '../../core/whatsapp-send.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
 import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
 import { asksAboutAppearance, uiThemeIdFromToolResult, withUiThemeCards } from '../../core/ui-theme-chat-tools.js';
+import { asksForJobNotification, jobNotifyArmed } from '../../core/job-notify-chat-tools.js';
 import {
   authenticateContinuationRequest,
   CONTINUATION_HEADER,
@@ -84,6 +85,7 @@ const GMAIL_TOOL_STATUS: Record<string, string> = {
   gmail_send: '📤 Sending through Gmail...',
   whatsapp_find_contact: '🔎 Looking up the WhatsApp contact...',
   whatsapp_send: '💬 Sending on WhatsApp...',
+  job_notify: '💬 Turning on WhatsApp updates (sending a confirmation)...',
 };
 /** The Knowledge write tools run a guide check (up to 90 s an attempt) and may draft a guide: one status line, then keepalives. */
 const KNOWLEDGE_TOOL_STATUS: Record<string, string> = {
@@ -769,6 +771,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     jobEnd?: ChatTurnEnd;
     /** The final reply's tail, the pause note when the turn declared nothing. */
     replyExcerpt?: string;
+    /** The whole final reply: the body of a WhatsApp update when the owner asked to be told (job-notify.md). */
+    replyFull?: string;
     /** Model tool calls this turn. */
     toolCalls?: number;
     abortController: AbortController;
@@ -812,11 +816,25 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     startedAt: number;
     toolCalls: number;
     replyExcerpt?: string;
+    replyFull?: string;
   }): string | null {
     if (!chatJobs || !input.end) return null;
     try {
       const startedIso = new Date(input.startedAt).toISOString();
       let job = input.continuationJobId ? chatJobs.get(input.continuationJobId) : chatJobs.activeJob();
+      // WhatsApp updates (job-notify.md): the turn's closing words are the report. The job this turn worked on is the active one, or
+      // the one `job_update done` ended during this very turn (its closing report is written after the end). Recorded only for a
+      // job that asked to be told; the notifier then sends it, and a "finished" message waits for it.
+      if (input.replyFull?.trim()) {
+        const worked = job ?? (() => {
+          const ended = chatJobs.lastEnded();
+          return ended?.endedAt && ended.endedAt >= startedIso ? ended : null;
+        })();
+        if (worked?.notify) {
+          chatJobs.recordLastReply(worked.id, input.replyFull);
+          deps.jobNotifier?.nudge();
+        }
+      }
       // A turn that did real work and was cut off becomes a job, so it continues.
       if (!job && input.ownerMessage?.trim() && input.toolCalls > 0
         && (input.end === 'ceiling' || input.end === 'failed' || input.end === 'shutdown')) {
@@ -918,6 +936,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         continuing: Boolean(running && running.jobId === job.id),
         phase,
         pauseNote: phase === 'paused' ? (job.pauseNote ?? 'Nothing is running. Reply in chat to continue.') : null,
+        // The owner asked to be told on WhatsApp (job-notify.md): the strip says so, so the promise is visible, not only remembered.
+        notifyWhatsApp: Boolean(job.notify),
       },
     });
   });
@@ -933,6 +953,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     const stoppedTurns = await stopContinuationTurns('job_stopped', jobId);
     continuations?.runner()?.forget(jobId);
     dashboardState.bump();
+    // A job that asked to be told on WhatsApp hears about its own Stop at once (job-notify.md).
+    if (ended?.notify) deps.jobNotifier?.nudge();
     res.json({ ok: true, job: { id: jobId, status: ended?.status ?? job.status }, stoppedTurns });
   });
 
@@ -1233,6 +1255,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // looks, or in the minutes after a proposal (a follow-up like "warmer"). A continuation never gets it.
         const uiThemeTurn = !continuation && Boolean(deps.uiThemes) && (asksAboutAppearance(message) || Boolean(deps.uiThemes?.hasRecentProposal()));
         if (uiThemeTurn) toolExecutionContext.uiThemeTurn = true;
+        // WhatsApp updates for a job (docs/maps/job-notify.md): job_notify is offered only on a live owner turn that asks to be told
+        // when a job needs them or ends (or switches updates off). A continuation never gets it; the notifier sends the messages.
+        const jobNotifyTurn = !continuation && Boolean(deps.jobNotifyEnabled) && asksForJobNotification(message, chatJobs?.activeJob() ?? null);
 
         if (!llmClient || !toolExecutor) {
           if (continuation) {
@@ -1436,6 +1461,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           knowledgeWriteAvailable,
           driveConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canReadDrive && !account.needsReconnect),
           uiThemeAvailable: uiThemeTurn,
+          jobNotifyAvailable: jobNotifyTurn,
           amazonEmployee: turnAmazonEmployee,
         };
         const systemPrompt = promptManager
@@ -1615,6 +1641,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
           ...GMAIL_WRITE_TOOLS,
           ...WHATSAPP_WRITE_TOOLS,
+          'job_notify',
           ...KNOWLEDGE_CHANGE_TOOLS,
         ]);
         const toolCallMayWrite = (toolCall: any): boolean => WRITE_TOOLS.has(toolCall?.function?.name);
@@ -2043,6 +2070,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
             turnState.jobEnd = toolsDisabled ? 'repeat_breaker' : 'answered';
             turnState.replyExcerpt = replyExcerptOf(content);
+            turnState.replyFull = content;
             content = forTranscript(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes));
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
@@ -2393,6 +2421,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                     ? gmailWriteConfirmed(tc.function.name, result?.content)
                     : WHATSAPP_WRITE_TOOLS.has(tc.function.name)
                       ? whatsAppSendConfirmed(tc.function.name, result?.content)
+                      // "Updates are on" counts only when job_notify really armed them (its confirmation reached the phone).
+                      : tc.function.name === 'job_notify'
+                        ? jobNotifyArmed(tc.function.name, result?.content)
                       // The footer counts only for a confirmed set (get and refusals never do).
                       : tc.function.name === 'export_footer'
                         ? exportFooterSetConfirmed(String(result?.content ?? ''))
@@ -2761,6 +2792,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           startedAt: turnState.startedAt,
           toolCalls: turnState.toolCalls ?? 0,
           replyExcerpt: turnState.replyExcerpt,
+          replyFull: turnState.replyFull,
         });
         activeChatTurns.delete(turnId);
         resolveTurnFinished();

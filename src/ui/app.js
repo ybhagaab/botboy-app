@@ -1014,6 +1014,7 @@ function renderChatJobStrip(payload) {
   const detail = [
     goal,
     ...(paused && job.pauseNote ? [job.pauseNote] : []),
+    ...(job.notifyWhatsApp === true ? ['BotBoy messages you on WhatsApp when this job needs you, finishes, or is stopped.'] : []),
     ...waiting.map(run => `Run ${run.runId}${run.purpose ? ` (${run.purpose})` : ''}: ${run.remoteStatus || 'submitted'}`),
     ...(waiting.length && !job.continuing ? [`BotBoy continues on its own when ${waiting.length === 1 ? 'it finishes' : 'they finish'}.`] : []),
   ].join('\n');
@@ -1021,7 +1022,9 @@ function renderChatJobStrip(payload) {
   setChatJobStripState(strip, { continuing: Boolean(job.continuing), running: !paused, paused });
   const lead = paused ? 'Paused' : 'Working on';
   const question = paused && job.pauseNote ? `<span class="chat-job-note">${chatJobEsc(job.pauseNote)}</span>` : '';
-  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${lead}:</strong> ${chatJobEsc(shortGoal)}${question}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(progress)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">${paused ? 'End job' : 'Stop'}</button>`;
+  // "· WhatsApp on" beside the state: the owner can see that BotBoy will message them (job-notify.md).
+  const stateText = job.notifyWhatsApp === true ? `${progress} · WhatsApp on` : progress;
+  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${lead}:</strong> ${chatJobEsc(shortGoal)}${question}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(stateText)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">${paused ? 'End job' : 'Stop'}</button>`;
 }
 
 async function refreshChatJobStrip() {

@@ -170,6 +170,10 @@ export interface RouterDeps {
   appUpdater?: import('../../core/app-update.js').AppUpdater;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
   chatJobs?: ChatJobStore;
+  /** True when the WhatsApp job notifier is wired (index.ts): job_notify is then offered on turns that ask for it. */
+  jobNotifyEnabled?: boolean;
+  /** The notifier, so a job that just paused or ended is told about without waiting for the next sweep. */
+  jobNotifier?: Pick<import('../../core/job-notifier.js').JobNotifier, 'nudge'>;
   /** The Knowledge library: sets, loads, status, routing (knowledge-library.ts). */
   knowledgeLibrary?: import('../../core/knowledge-library.js').KnowledgeLibrary;
   /** The write path (P2): the composite writer, its History and the staged-changes store. */

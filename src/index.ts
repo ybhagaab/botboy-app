@@ -109,6 +109,8 @@ import { defaultAttachmentPolicy } from './core/gmail-attachments.js';
 import { withGmailChatTools } from './core/gmail-chat-tools.js';
 import { cdpWhatsAppPage, createWhatsAppSender, withWhatsAppChatTools } from './core/whatsapp-send.js';
 import { createWhatsAppChatBridge } from './core/whatsapp-chat.js';
+import { createJobNotifier } from './core/job-notifier.js';
+import { withJobNotifyChatTools } from './core/job-notify-chat-tools.js';
 import { createWhatsAppConnection } from './core/whatsapp-connection.js';
 import { GMAIL_OAUTH_CALLBACK_PATH } from './api/routers/gmail-sync.js';
 import { SLACK_OAUTH_CALLBACK_PATH } from './api/routers/slack.js';
@@ -733,6 +735,20 @@ async function main() {
   // WhatsApp in chat: the owner's own WhatsApp Web tab (whatsapp-send.ts).
   const whatsAppSender = createWhatsAppSender({ page: cdpWhatsAppPage() });
   const whatsAppConnection = createWhatsAppConnection({ db, page: cdpWhatsAppPage() });
+  // WhatsApp updates for a job (job-notifier.ts, job-notify.md): BotBoy's own notifier tells the owner on WhatsApp when a job they asked
+  // about needs them or ends. It is no model turn, so it works while a job runs on its own. It shares the sender (one send at a time)
+  // with the chat tools and the WhatsApp chat bridge.
+  const jobNotifier = createJobNotifier({
+    jobs: chatJobs,
+    sender: whatsAppSender,
+    connection: whatsAppConnection,
+    postNote: (text) => {
+      db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)')
+        .run(`asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 'assistant', text);
+      const sessionId = conversationManager.getActiveSessionId('chat');
+      if (sessionId) conversationManager.appendAssistant(sessionId, text);
+    },
+  });
   // withWorkplaceChatTools sits directly inside the mandate: Amazon-only
   // tools are refused while Amazon Employee is off, and export_footer lives there.
   // The Drive sync is built later (with the Gmail sync); chat reaches it through this reference.
@@ -772,7 +788,7 @@ async function main() {
   // mandate filters first, and it answers its own two tools before the base executor, so the base's result cap never applies
   // to a whole-file load. The theme tool is not a job-scope tool: a continuation never reaches it.
   const toolExecutor = withJobMandate(
-    withWorkplaceChatTools(withUiThemeChatTools(withKnowledgeChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
+    withWorkplaceChatTools(withUiThemeChatTools(withJobNotifyChatTools(withKnowledgeChatTools(withWhatsAppChatTools(withGdriveChatTools(withGmailChatTools(
       withProductDocumentChatTools(
         baseToolExecutor,
         productDocumentService,
@@ -780,7 +796,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { themes: uiThemes }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { jobs: chatJobs, sender: whatsAppSender, connection: whatsAppConnection, notifier: jobNotifier }), { themes: uiThemes }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the
@@ -1599,6 +1615,7 @@ async function main() {
       stop('chat-terminal', () => chatTerminal.shutdown());
       stop('folder-imports', () => folderImports.stop());
       stop('etl-run-watcher', () => etlRunWatcher.stop());
+      stop('job-notifier', () => jobNotifier.stop());
       stop('chat-continuations', () => continuationRunner.stop());
       stop('main-thread-watchdog', () => mainThreadWatchdog.stop());
       if (failures.length) throw new Error(`Quiesce failures: ${failures.join('; ')}`);
@@ -1770,6 +1787,9 @@ async function main() {
     storageUsage,
     captureHealth,
     chatJobs,
+    // WhatsApp updates for a job: job_notify is offered on turns that ask for it, and a Stop or a closing report wakes the notifier.
+    jobNotifyEnabled: true,
+    jobNotifier,
     chatContinuations,
     knowledgeLibrary,
     knowledgeWriter,
@@ -1859,6 +1879,7 @@ async function main() {
   continuationRunner.start();
   knowledgeJobWaker.wakeIfDecided();
   whatsAppChat.start();
+  jobNotifier.start();
   // Keep the Mac awake while a turn runs or a job is active (keep-awake.ts).
   createKeepAwake({ busy: () => chatContinuations.isTurnActive() || Boolean(chatJobs.activeJob()) }).start();
   etlRunWatcher.start();

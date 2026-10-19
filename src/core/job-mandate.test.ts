@@ -77,8 +77,20 @@ describe('job mandate gate', () => {
   // wrapper sits directly inside the workplace one, so the mandate filters first.
   it('is the outermost wrapper of the chat executor (index.ts)', () => {
     const index = readFileSync(path.join(process.cwd(), 'src/index.ts'), 'utf8');
-    // withUiThemeChatTools (docs/maps/ui-themes.md) sits between the workplace and Knowledge wrappers: inside the mandate too.
-    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withUiThemeChatTools\(withKnowledgeChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+    // withUiThemeChatTools (docs/maps/ui-themes.md) and withJobNotifyChatTools (docs/maps/job-notify.md) sit between the workplace and
+    // Knowledge wrappers: inside the mandate too, so a continuation never reaches either tool.
+    expect(index).toMatch(/const toolExecutor = withJobMandate\(\s*withWorkplaceChatTools\(withUiThemeChatTools\(withJobNotifyChatTools\(withKnowledgeChatTools\(withWhatsAppChatTools\(withGdriveChatTools\(withGmailChatTools\(\s*withProductDocumentChatTools\(\s*baseToolExecutor,/);
+  });
+
+  // WhatsApp updates for a job are BotBoy's own doing (job-notifier.ts): neither the setter (job_notify) nor any WhatsApp tool may ever
+  // be a job-scope tool, or a job could message the owner, or turn its own updates on or off, with no owner in the loop.
+  it('never admits job_notify or any whatsapp tool to a continuation', () => {
+    for (const name of ['job_notify', 'whatsapp_send', 'whatsapp_find_contact']) {
+      expect(JOB_SCOPE_TOOLS.has(name), name).toBe(false);
+    }
+    expect([...JOB_SCOPE_TOOLS].filter(name => name.startsWith('whatsapp_') || name.startsWith('job_') && name !== 'job_update')).toEqual([]);
+    const offered = filterToolsForContinuation(['job_update', 'job_notify', 'whatsapp_send'].map(name => ({ function: { name } })));
+    expect(offered.map(tool => tool.function.name)).toEqual(['job_update']);
   });
 
   it('offers a continuation only the job-scope tools', () => {
