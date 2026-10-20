@@ -61,7 +61,9 @@ import {
   CONTINUATION_HEADER,
   continuationRequestId,
   continuationSecretMatches,
+  isContinuationTrigger,
 } from '../../core/chat-continuations.js';
+import { CHAT_HISTORY_OMITTED_NOTE, chatHistoryWindowOptions } from '../../core/chat-history-window.js';
 import { readGmailSendAs } from '../../monitors/gmail-sync.js';
 import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatTurnEnd } from '../../core/chat-jobs.js';
 import { filterToolsForContinuation } from '../../core/job-mandate.js';
@@ -1543,14 +1545,28 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           })();
         }
 
-        // Build messages: system + summary (if exists) + recent messages only
+        // Build messages: system + summary (if exists) + the history window.
         const freshSummary = convManager ? convManager.getSummary(sessionId!) : null;
-        const recentMessages = convManager && sessionId ? convManager.getRecentMessages(sessionId, 10) : [{ role: 'user' as const, content: message }];
+        // The history sent word for word (chat-history-window.ts, docs/maps/chat-agent.md "Chat history window"): the newest
+        // messages up to a tenth of this model's window and at most 50K tokens, never fewer than the 20 newest, and always the
+        // owner's own last 15 messages, however many automatic continuation turns ran in between. A manager without the method
+        // (a scripted test double) keeps the old 20-message read.
+        const historyWindow = convManager && sessionId && typeof convManager.getHistoryWindow === 'function'
+          ? convManager.getHistoryWindow(sessionId, chatHistoryWindowOptions(llmClient.getContextWindow?.() ?? 32_768, row => isContinuationTrigger(row.content)))
+          : null;
+        const recentMessages = historyWindow
+          ? historyWindow.messages
+          : convManager && sessionId ? convManager.getRecentMessages(sessionId, 10) : [{ role: 'user' as const, content: message }];
+        if (historyWindow) {
+          const stats = historyWindow.window;
+          console.log(`[Chat] History window: ${stats.contiguousRows + stats.pinnedRows} messages (~${stats.tokens} tokens), ${stats.ownerMessages} of them yours${stats.pinnedRows ? `; ${stats.pinnedRows} older kept for your messages` : ''}`);
+        }
 
         // Merge summary into system prompt (vLLM requires system messages only at the beginning)
-        const fullSystemPrompt = freshSummary
-          ? `${systemPrompt}\n\n## Conversation Summary (use get_chat_messages tool to retrieve full messages by ID range if you need more context)\n${freshSummary.summary}`
-          : systemPrompt;
+        const summarySection = freshSummary
+          ? `\n\n## Conversation Summary (use get_chat_messages tool to retrieve full messages by ID range if you need more context)\n${freshSummary.summary}`
+          : '';
+        const fullSystemPrompt = `${systemPrompt}${summarySection}${historyWindow?.window.omittedBetween ? `\n\n${CHAT_HISTORY_OMITTED_NOTE}` : ''}`;
 
         const messages: any[] = [
           { role: 'system', content: fullSystemPrompt },

@@ -28,6 +28,18 @@ import {
 import { DECISION_SEPARATOR } from './knowledge-job-wake.js';
 
 export const CONTINUATION_HEADER = 'x-botboy-continuation';
+
+/**
+ * The first line of every continuation trigger. The trigger is stored in the chat session as a user message, so this line is how
+ * the history window (chat-history-window.ts) tells BotBoy's own text from the owner's: a trigger never counts as, or is kept as,
+ * one of the owner's messages.
+ */
+export const CONTINUATION_TRIGGER_HEADER = '[Automatic continuation — not a message from the owner]';
+
+/** True for a stored user message that is a continuation trigger. */
+export function isContinuationTrigger(content: unknown): boolean {
+  return typeof content === 'string' && content.startsWith(CONTINUATION_TRIGGER_HEADER);
+}
 const RETRY_INTERVAL_MS = 5_000;
 const MAX_LIVE_EVENTS = 6_000;
 const MAX_LIVE_CHARS = 4_000_000;
@@ -173,7 +185,7 @@ export function buildContinuationTrigger(
   const finishedIds = new Set(finished.map(watch => watch.runId));
   const stillRunning = allWatches.filter(watch => watch.status === 'pending' && !finishedIds.has(watch.runId));
   const message = [
-    '[Automatic continuation — not a message from the owner]',
+    CONTINUATION_TRIGGER_HEADER,
     'ETL runs for the job you are working on finished:',
     ...finished.map(describe),
     ...(stillRunning.length ? [`Still running (BotBoy continues again when they finish): ${stillRunning.map(watch => watch.runId).join(', ')}.`] : []),
@@ -195,7 +207,7 @@ export function buildSelfContinuationTrigger(job: ChatJob, reason: string, pendi
   const decision = reason.includes(DECISION_SEPARATOR);
   const [headline] = reason.split(DECISION_SEPARATOR);
   const message = [
-    '[Automatic continuation — not a message from the owner]',
+    CONTINUATION_TRIGGER_HEADER,
     `Why this turn started: ${reason.split(DECISION_SEPARATOR).join(' ')}`,
     ...(job.workingSet.nextStep ? [`Next step you recorded: ${job.workingSet.nextStep}`] : []),
     ...(pendingRuns.length ? [`Still running (BotBoy continues again when they finish): ${pendingRuns.map(watch => watch.runId).join(', ')}.`] : []),

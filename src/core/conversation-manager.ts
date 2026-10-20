@@ -7,8 +7,12 @@
 import Database from 'better-sqlite3';
 import { randomUUID as uuid } from 'node:crypto';
 import type { LlmMessage } from './llm-client.js';
+import { selectHistoryWindow, type HistoryWindow, type HistoryWindowOptions } from './chat-history-window.js';
 
 export type SessionType = 'chat' | 'background' | 'subagent';
+
+/** Newest rows read for one history window: enough for the 50K budget and the owner's older messages behind a long job. */
+const HISTORY_SCAN_ROWS = 1_000;
 
 export interface StoredConversationMessage extends LlmMessage {
   id: string;
@@ -23,6 +27,11 @@ export interface ConversationManager {
   /** Same bounded history as getMessages, with durable DB ids for summaries. */
   getMessagesWithIds(sessionId: string, maxTokens?: number): StoredConversationMessage[];
   getRecentMessages(sessionId: string, maxPairs?: number): LlmMessage[];
+  /**
+   * The history one chat turn sends word for word, oldest first (chat-history-window.ts › selectHistoryWindow): the newest messages
+   * up to a token budget, and the owner's own last messages however many automatic turns ran in between.
+   */
+  getHistoryWindow(sessionId: string, options: HistoryWindowOptions): { messages: LlmMessage[]; window: Omit<HistoryWindow, 'rows'> };
   countUserMessages(sessionId: string): number;
   getSummary(sessionId: string): { summary: string; coversFromMsgId: string; coversToMsgId: string; userMsgCount: number } | null;
   saveSummary(sessionId: string, summary: string, fromMsgId: string, toMsgId: string, userMsgCount: number): void;
@@ -156,6 +165,22 @@ export function createConversationManager(db: Database.Database): ConversationMa
         content: msg.content,
         toolCallId: msg.tool_call_id || undefined,
       }));
+    },
+
+    getHistoryWindow(sessionId: string, options: HistoryWindowOptions) {
+      // The same rows as getRecentMessages (every role but system), newest first, with their stored token estimate.
+      const newestFirst = (selectRecentMessages.all(sessionId, HISTORY_SCAN_ROWS) as any[]).map(row => ({
+        id: String(row.id),
+        role: String(row.role),
+        content: row.content ?? null,
+        tokens: Number(row.token_count) || 0,
+        ...(row.tool_call_id ? { toolCallId: String(row.tool_call_id) } : {}),
+      }));
+      const { rows, ...window } = selectHistoryWindow(newestFirst, options);
+      return {
+        messages: rows.map(row => ({ role: row.role as LlmMessage['role'], content: row.content as string, toolCallId: row.toolCallId })),
+        window,
+      };
     },
 
     countUserMessages(sessionId: string): number {
