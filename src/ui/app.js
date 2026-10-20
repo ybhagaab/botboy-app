@@ -563,7 +563,7 @@ function createChatStreamBubble(chatEl, hooks = {}) {
         const cls = seg.complete ? 'collapsed' : '';
         return `<div class="thinking-block ${cls}" onclick="this.classList.toggle('collapsed')">
           <span class="thinking-label">💭 Thinking${seg.complete ? '' : '...'}</span>
-          <div class="thinking-content">${escHtml(seg.content)}</div>
+          <div class="thinking-content">${thinkingTextHtml(seg.content)}</div>
         </div>`;
       }
       if (seg.type === 'tool_call') {
@@ -1622,6 +1622,14 @@ async function stopChatTerminal() {
   } catch { /* end event updates the card */ }
 }
 
+/**
+ * A thinking block's text: escaped plain text, except that a `**title**` on one line (the heading of each
+ * OpenAI thinking-summary part) is shown bold instead of with its asterisks.
+ */
+function thinkingTextHtml(text) {
+  return escHtml(String(text || '')).replace(/\*\*([^*<]{1,200}?)\*\*/g, '<strong>$1</strong>');
+}
+
 function escHtml(s) {
   if (!s) return '';
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
@@ -2524,7 +2532,7 @@ function renderChatMsgInner(m) {
 
   const content = formatMarkdownContent(raw);
 
-  const thinkHtml = reasoning ? `<div class="thinking-block collapsed" onclick="this.classList.toggle('collapsed')"><span class="thinking-label">💭 Thinking</span><div class="thinking-content">${reasoning.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div></div>` : '';
+  const thinkHtml = reasoning ? `<div class="thinking-block collapsed" onclick="this.classList.toggle('collapsed')"><span class="thinking-label">💭 Thinking</span><div class="thinking-content">${thinkingTextHtml(reasoning)}</div></div>` : '';
 
   // Image attachments (user messages): thumbnails above the text, served by
   // the attachments route only — any other URL shape is dropped, so message

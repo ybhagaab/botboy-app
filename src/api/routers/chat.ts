@@ -1111,6 +1111,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     const turnModelOperation = chatBinding?.operation;
     // Settings → Workplace (Amazon Employee), read once per turn for prompt, tools, and briefing.
     const turnAmazonEmployee = deps.workplace ? deps.workplace.amazonEmployee() : true;
+    // Settings → AI model → Show model thinking, read once per turn. Off: no
+    // provider is asked for thinking text and none reaches the panel.
+    const turnShowThinking = deps.chatThinking ? deps.chatThinking.showThinking() : true;
+    const writeThinking = (text: string | undefined) => {
+      if (turnShowThinking) res.write(`data: ${JSON.stringify({ type: 'thinking', text })}\n\n`);
+    };
     // modeHint is ambient page context (an analytics route being open). It is
     // advisory — the message must corroborate — unlike mode, which commands.
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
@@ -1862,6 +1868,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               ...(documentAuthoringThink
                 ? { reasoningEffort: 'max' as const }
                 : thinkingLevel !== 'off' ? { reasoningEffort: thinkingLevel } : {}),
+              // Readable thinking for the panel only when the owner's
+              // dropdown thinks (never for a forced document-writing floor).
+              ...(turnShowThinking && thinkingLevel !== 'off' ? { showThinking: true } : {}),
               // Server-admitted model route; transport profile and budgets
               // were validated before the option entered the catalog.
               ...(modelRoute ? { route: modelRoute } : {}),
@@ -1877,7 +1886,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             while (!iterResult.done) {
               const chunk = iterResult.value;
               if (chunk.type === 'thinking') {
-                res.write(`data: ${JSON.stringify({ type: 'thinking', text: chunk.text })}\n\n`);
+                writeThinking(chunk.text);
               } else if (chunk.type === 'content') {
                 res.write(`data: ${JSON.stringify({ type: 'token', text: chunk.text })}\n\n`);
               } else if (chunk.type === 'tool_call_start' && chunk.toolCall?.name) {
@@ -2091,7 +2100,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             const assistantId = `asst-${Date.now()}`;
             if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
-            res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content, reasoning: streamResult.reasoning || undefined, createdAt: new Date().toISOString() } })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content, reasoning: (turnShowThinking && streamResult.reasoning) || undefined, createdAt: new Date().toISOString() } })}\n\n`);
             res.end();
             return;
           }
@@ -2727,7 +2736,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           while (!iterResult.done) {
             const chunk = iterResult.value;
             if (chunk.type === 'thinking') {
-              res.write(`data: ${JSON.stringify({ type: 'thinking', text: chunk.text })}\n\n`);
+              writeThinking(chunk.text);
             } else if (chunk.type === 'content') {
               res.write(`data: ${JSON.stringify({ type: 'token', text: chunk.text })}\n\n`);
             }

@@ -93,6 +93,7 @@ import { loadEnv as loadSlackEnv } from './monitors/slack-monitor.js';
 import { createWorkplace } from './core/workplace.js';
 import { withWorkplaceChatTools } from './core/workplace-chat-tools.js';
 import { createUiThemes, indexHtmlHandler } from './core/ui-theme.js';
+import { createChatThinkingDisplay } from './core/chat-thinking-display.js';
 import { withUiThemeChatTools } from './core/ui-theme-chat-tools.js';
 import { createExportFooterSettings } from './product-manager/export-footer.js';
 import { createFilesystemMonitor } from './monitors/filesystem-monitor.js';
@@ -386,6 +387,8 @@ async function main() {
   exportFooter.seedLegacyFooterOnce();
   // UI themes (docs/maps/ui-themes.md): saved themes, staged proposals and the active choice, in one settings row.
   const uiThemes = createUiThemes({ db });
+  // Settings → AI model → Show model thinking: read once per chat turn.
+  const chatThinking = createChatThinkingDisplay({ db });
 
   // macOS Keychain through McpManager's secret store.
   const mcpManager = createMcpManager({ db, amazonEmployee: () => workplace.amazonEmployee() });
@@ -1737,6 +1740,7 @@ async function main() {
     db,
     llmClient,
     aiModelSettings,
+    chatThinking,
     llmUsageService,
     toolExecutor,
     promptManager,

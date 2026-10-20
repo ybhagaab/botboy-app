@@ -77,7 +77,7 @@ const state = {
   llmUsage: { data: null, error: '', loading: false, days: 30, timeZone: LLM_USAGE_TIME_ZONE, requestId: 0 },
   // Settings → AI model. The key itself never lives in state: it is read
   // from the form once, sent, and the field is cleared by the next repaint.
-  aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null },
+  aiModel: { status: null, error: '', loading: false, saving: false, removing: false, savingProvider: '', roleBusy: '', requestId: 0, saveError: null, roleError: null, pendingFocus: null, chatBusy: false, chatError: '' },
   knowledge: { status: null, error: '', loading: false, requestId: 0, busy: '', notice: null, existing: null, createDraft: '', changeDraft: '', changing: false, plan: null, acknowledged: false, pendingFocus: '', changes: null, changesError: '', history: null, historyError: '', historyOpen: '', historyDetail: {}, historyNotice: null, cardNotices: {}, overlay: null },
   // Settings → Workplace. Until known, the UI behaves as ON (no change for existing users).
   workplace: { amazonEmployee: true, known: false, status: null, saving: false, footerSaving: false, notice: null, footerError: null, pendingFocus: '' },
@@ -4371,6 +4371,7 @@ const AI_MODEL_ROLE_COPY = {
   documents: { title: 'Document writing', detail: 'Product documents and email drafts, plus the review of documents written in chat.' },
 };
 const AI_MODEL_THINKING_LEVELS = [['off', 'Off'], ['low', 'Low'], ['high', 'High'], ['max', 'Max']];
+const AI_MODEL_SHOW_THINKING_HELP = 'When the chat’s Thinking is Low or higher, each reply shows the model’s thinking above it: a summary on GPT and Claude models, the full text on DeepSeek. A reply the model gives without thinking (common on GPT-5.6) shows none. OpenAI shares summaries only with verified organizations; with an unverified one, replies come without it. Applies from your next message.';
 // Thinking "Off" on a Claude model (design D5): not every Claude model can turn thinking off, so its row and any role
 // caption naming it carry a small badge whose tooltip (and screen-reader text) says what Off does there. A model whose
 // Off is native has no badge, and models of the other providers send no `thinkingOff` at all.
@@ -4523,7 +4524,43 @@ function renderAiModelSettings() {
   const teamCard = team && !notSetUp
     ? `<article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">${esc(team.label)}</h2><div class="card-meta">Set up by the BotBoy launcher configuration.</div></div><span class="pill ${team.healthy ? 'good' : 'warn'}">${team.healthy ? 'Ready' : 'Needs attention'}</span></div>${aiModelIssueAlert(team.issue)}${aiModelModelList(team)}</article>`
     : '';
-  return `${head}<section class="ai-model-settings"><article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Background work</h2><div class="card-meta">Models BotBoy uses when you are not chatting</div></div><button class="button small ghost" type="button" data-action="ai-model-refresh" ${ai.loading || busy ? 'disabled' : ''}>${ai.loading ? 'Checking…' : 'Refresh'}</button></div>${ai.roleError ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.roleError.message)}</strong>${ai.roleError.nextAction ? ` ${esc(ai.roleError.nextAction)}` : ''}</span></div>` : ''}${intro}</article>${teamCard}${AI_MODEL_KEY_PROVIDERS.map(provider => aiModelKeyCard(status, provider)).join('')}</section>`;
+  const chatCard = notSetUp ? '' : aiModelChatCard(status);
+  return `${head}<section class="ai-model-settings"><article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Background work</h2><div class="card-meta">Models BotBoy uses when you are not chatting</div></div><button class="button small ghost" type="button" data-action="ai-model-refresh" ${ai.loading || busy ? 'disabled' : ''}>${ai.loading ? 'Checking…' : 'Refresh'}</button></div>${ai.roleError ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.roleError.message)}</strong>${ai.roleError.nextAction ? ` ${esc(ai.roleError.nextAction)}` : ''}</span></div>` : ''}${intro}</article>${chatCard}${teamCard}${AI_MODEL_KEY_PROVIDERS.map(provider => aiModelKeyCard(status, provider)).join('')}</section>`;
+}
+
+/** Chat panel: the Show model thinking switch (chat-thinking-display.ts on the server). */
+function aiModelChatCard(status) {
+  const chat = status?.chat;
+  if (!chat || typeof chat.showThinking !== 'boolean') return '';
+  const ai = state.aiModel;
+  const on = chat.showThinking;
+  const error = ai.chatError
+    ? `<div class="mcp-alert" role="alert">${icon('alert', 15)}<span><strong>${esc(ai.chatError)}</strong></span></div>`
+    : '';
+  return `<article class="card settings-panel"><div class="card-header ai-model-status-head"><div><h2 class="card-title">Chat panel</h2><div class="card-meta">What the chat shows while a model works</div></div></div>${error}<div class="setting-row"><span class="setting-copy"><strong id="ai-model-thinking-label">Show model thinking</strong><span id="ai-model-thinking-help">${esc(AI_MODEL_SHOW_THINKING_HELP)}</span></span><button class="toggle ${on ? 'on' : ''}" style="flex:none" type="button" role="switch" aria-checked="${on ? 'true' : 'false'}" aria-labelledby="ai-model-thinking-label" aria-describedby="ai-model-thinking-help" data-action="ai-model-thinking-toggle" ${ai.chatBusy ? 'disabled' : ''}></button></div></article>`;
+}
+
+async function saveAiModelShowThinking() {
+  const ai = state.aiModel;
+  const current = ai.status?.chat?.showThinking;
+  if (ai.chatBusy || typeof current !== 'boolean') return;
+  ai.chatBusy = true;
+  ai.chatError = '';
+  ai.pendingFocus = { thinkingToggle: true };
+  renderRoute({ preserveScroll: true, userAction: true });
+  try {
+    const status = await request('/settings/ai-model/chat', { method: 'PUT', body: { showThinking: !current } });
+    ai.requestId += 1;
+    ai.loading = false;
+    ai.status = status;
+    ai.error = '';
+    toast(status?.chat?.showThinking ? 'Chat shows model thinking from your next message.' : 'Chat hides model thinking from your next message.');
+  } catch (error) {
+    ai.chatError = `Could not change it: ${aiModelErrorText(error)}`;
+  } finally {
+    ai.chatBusy = false;
+    if (state.route.view === 'ai-model-settings') renderRoute({ preserveScroll: true, userAction: true });
+  }
 }
 
 /** Tell the chat panel (app.js) to refresh its model picker and notice now. */
@@ -4741,8 +4778,12 @@ async function saveExportFooter(form) {
 }
 function restoreAiModelRoleFocus() {
   const pending = state.aiModel.pendingFocus;
-  if (!pending || state.aiModel.roleBusy) return;
+  if (!pending || state.aiModel.roleBusy || state.aiModel.chatBusy) return;
   state.aiModel.pendingFocus = null;
+  if (pending.thinkingToggle) {
+    document.querySelector('[data-action="ai-model-thinking-toggle"]')?.focus({ preventScroll: true });
+    return;
+  }
   document.querySelector(`select[data-ai-model-role="${CSS.escape(pending.role)}"][data-ai-model-field="${CSS.escape(pending.field)}"]`)
     ?.focus({ preventScroll: true });
 }
@@ -9378,6 +9419,7 @@ function bindEvents() {
     }
     if (action === 'ai-model-remove') void removeAiModelKey(target.dataset.provider);
     if (action === 'ai-model-refresh') void loadAiModelStatus();
+    if (action === 'ai-model-thinking-toggle') void saveAiModelShowThinking();
     if (action === 'knowledge-refresh') {
       state.knowledge.error = '';
       void loadKnowledgeStatus();

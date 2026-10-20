@@ -51,9 +51,9 @@ function loadSettingsPage() {
   const state = { aiModel: { status: null as unknown, error: '', loading: false, saving: false, removing: false, roleError: null } };
   // eslint-disable-next-line no-new-func
   const render = new Function(
-    'state', 'icon', 'pageHead', 'loadingView', 'errorView', 'loadAiModelStatus', 'aiModelRoleRow', 'aiModelIssueAlert', 'aiModelModelList', 'aiModelKeyCard',
+    'state', 'icon', 'pageHead', 'loadingView', 'errorView', 'loadAiModelStatus', 'aiModelRoleRow', 'aiModelIssueAlert', 'aiModelModelList', 'aiModelKeyCard', 'aiModelChatCard',
     source,
-  )(state, noop, noop, noop, noop, noop, () => '<div class="role-row"></div>', noop, noop, (_status: unknown, provider: { id: string }) => `<form data-provider="${provider.id}"></form>`) as () => string;
+  )(state, noop, noop, noop, noop, noop, () => '<div class="role-row"></div>', noop, noop, (_status: unknown, provider: { id: string }) => `<form data-provider="${provider.id}"></form>`, () => '<article class="chat-card"></article>') as () => string;
   return { render: (status: unknown) => { state.aiModel.status = status; return render(); } };
 }
 
@@ -88,8 +88,9 @@ describe('the setup copy names every provider card', () => {
     expect(page).toContain(`Chat and background organizing are off until you add an ${providerPhrase()} API key below.`);
     expect(page).toContain('<span class="pill">Not set up</span>');
     expect(page).not.toContain('OpenAI or DeepSeek');
-    // One key card per provider sits under the intro.
+    // One key card per provider sits under the intro; with no model there is no chat to show thinking in.
     expect(page.match(/data-provider="/g)).toHaveLength(3);
+    expect(page).not.toContain('class="chat-card"');
   });
 
   it('the 409 next action of a turn on an install with no AI model asks for any of the three keys', () => {
@@ -126,5 +127,6 @@ describe('with a Claude key saved nothing asks for another provider\'s key', () 
     expect(page).not.toContain('Not set up');
     expect(page).not.toMatch(/add an OpenAI/i);
     expect(page).toContain('class="role-row"');
+    expect(page).toContain('class="chat-card"');
   });
 });

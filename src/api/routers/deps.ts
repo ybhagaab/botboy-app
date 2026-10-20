@@ -98,6 +98,8 @@ export interface RouterDeps {
   llmClient?: LlmClient;
   /** Settings → AI model: model connections, background role choices, chat model catalog, live status. */
   aiModelSettings?: AiModelSettingsService;
+  /** Settings → AI model → Show model thinking, read once per chat turn (chat-thinking-display.ts). */
+  chatThinking?: import('../../core/chat-thinking-display.js').ChatThinkingDisplay;
   /** Settings → Workplace: the owner-attested Amazon Employee toggle (workplace.ts). */
   workplace?: Workplace;
   /** Document export footer text (export-footer.ts). */

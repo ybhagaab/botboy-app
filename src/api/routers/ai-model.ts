@@ -25,6 +25,11 @@ function jsonBody(req: Request): Record<string, unknown> {
   return req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
 }
 
+/** Every answer carries the chat display choice, so the page keeps it across key and role changes. */
+function withChat<T extends object>(deps: RouterDeps, status: T): T & { chat?: { showThinking: boolean; updatedAt: string | null } } {
+  return deps.chatThinking ? { ...status, chat: deps.chatThinking.status() } : status;
+}
+
 /**
  * Settings → AI model. Status is readable by any local caller; keys and model
  * choices can only be changed from the rendered same-origin owner page. No
@@ -37,7 +42,25 @@ export function createAiModelRouter(deps: RouterDeps): Router {
     if (!requireLocalOwnerRequest(req, res, 'AI model status')) return;
     if (!deps.aiModelSettings) return res.status(503).json({ error: 'AI model settings are unavailable.' });
     res.set('Cache-Control', 'no-store');
-    return res.json(deps.aiModelSettings.status());
+    return res.json(withChat(deps, deps.aiModelSettings.status()));
+  });
+
+  // Show model thinking in the chat panel (chat-thinking-display.ts). Applies from the next chat turn.
+  router.put('/settings/ai-model/chat', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Changing how chat shows model thinking', OWNER_UI_NEXT_ACTION)) return;
+    if (!deps.aiModelSettings || !deps.chatThinking) return res.status(503).json({ error: 'AI model settings are unavailable.' });
+    const body = jsonBody(req);
+    const unexpected = Object.keys(body).filter(key => key !== 'showThinking');
+    if (unexpected.length || typeof body.showThinking !== 'boolean') {
+      return res.status(400).json({ error: 'Send showThinking as true or false only.', code: 'invalid_request', nextAction: 'Use the Show model thinking switch in Settings → AI model.' });
+    }
+    res.set('Cache-Control', 'no-store');
+    try {
+      deps.chatThinking.setShowThinking(body.showThinking);
+      return res.json(withChat(deps, deps.aiModelSettings.status()));
+    } catch (error) {
+      return sendFailure(res, error);
+    }
   });
 
   for (const provider of KEY_PROVIDERS) {
@@ -51,7 +74,7 @@ export function createAiModelRouter(deps: RouterDeps): Router {
       }
       res.set('Cache-Control', 'no-store');
       try {
-        return res.json(await deps.aiModelSettings.saveApiKey(provider, body.apiKey));
+        return res.json(withChat(deps, await deps.aiModelSettings.saveApiKey(provider, body.apiKey)));
       } catch (error) {
         return sendFailure(res, error);
       }
@@ -62,7 +85,7 @@ export function createAiModelRouter(deps: RouterDeps): Router {
       if (!deps.aiModelSettings) return res.status(503).json({ error: 'AI model settings are unavailable.' });
       res.set('Cache-Control', 'no-store');
       try {
-        return res.json(await deps.aiModelSettings.removeApiKey(provider));
+        return res.json(withChat(deps, await deps.aiModelSettings.removeApiKey(provider)));
       } catch (error) {
         return sendFailure(res, error);
       }
@@ -80,10 +103,10 @@ export function createAiModelRouter(deps: RouterDeps): Router {
     }
     res.set('Cache-Control', 'no-store');
     try {
-      return res.json(await deps.aiModelSettings.setRole(String(req.params.role), {
+      return res.json(withChat(deps, await deps.aiModelSettings.setRole(String(req.params.role), {
         ...('modelKey' in body ? { modelKey: body.modelKey } : {}),
         ...('thinking' in body ? { thinking: body.thinking } : {}),
-      }));
+      })));
     } catch (error) {
       return sendFailure(res, error);
     }

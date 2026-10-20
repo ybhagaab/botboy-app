@@ -284,6 +284,15 @@ export interface ChatCompletionRequest {
    */
   reasoningEffort?: ReasoningEffort;
   /**
+   * Chat panel only (Settings → AI model → Show model thinking): ask the
+   * provider for readable thinking. Responses streams on the team gateway and
+   * the owner's OpenAI key add `reasoning.summary: 'auto'`; Claude streams its
+   * thinking summarized. Ignored unless think is true, on non-stream calls, and
+   * on DeepSeek, which always returns its reasoning text. Background work
+   * never sets it.
+   */
+  showThinking?: boolean;
+  /**
    * Server-admitted per-request route. The alternate endpoint reuses the
    * primary OAuth authorizer and wire dialect while keeping endpoint health
    * independent. Route values and headers never originate in request JSON.
@@ -594,6 +603,15 @@ function bytesFromHumanSize(value: string, unit: string): number | null {
   };
   const multiplier = multipliers[unit.toLowerCase()];
   return multiplier ? Math.floor(numeric * multiplier) : null;
+}
+
+/**
+ * An HTTP 400 that refuses `reasoning.summary`: OpenAI's "Your organization
+ * must be verified to generate reasoning summaries", or a gateway naming the
+ * field. Any other answer stays an ordinary failure.
+ */
+export function isReasoningSummaryRefusal(status: number, responseText: string): boolean {
+  return status === 400 && /reasoning[._ ]?summar/i.test(String(responseText ?? ''));
 }
 
 /** Normalize only the provider's explicit payload-limit rejection. */
@@ -1090,6 +1108,11 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     });
   }
   const hostedPlatform = config.platform;
+  // Endpoint + model pairs that answered a thinking-summary request with HTTP
+  // 400 (an unverified OpenAI organization, or a gateway that rejects the
+  // field). Their chat keeps working without summaries until this client is
+  // rebuilt (a restart or a changed key).
+  const reasoningSummaryRefused = new Set<string>();
 
   // Ollama endpoint (native API with think control)
   if (config.ollama.endpoint) {
@@ -1473,6 +1496,22 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
     return (req.route?.supportsReasoning ?? ep.supportsReasoning) !== false;
   }
 
+  function reasoningSummaryKey(ep: Endpoint, req: ChatCompletionRequest): string {
+    return `${remoteRequestUrl(ep)}|${effectiveModel(ep, req)}`;
+  }
+
+  /**
+   * Readable thinking for the chat panel. Streams only: the stream path owns
+   * the one resend without summaries when a provider refuses them.
+   */
+  function wantsReasoningSummary(ep: Endpoint, req: ChatCompletionRequest, stream: boolean): boolean {
+    return stream
+      && req.showThinking === true
+      && req.think === true
+      && hostedPlatform !== 'deepseek'
+      && !reasoningSummaryRefused.has(reasoningSummaryKey(ep, req));
+  }
+
   function buildResponsesBody(ep: Endpoint, req: ChatCompletionRequest, stream: boolean): any {
     const prompt = toResponsesInput(req.messages);
     const reasoning = reasoningSupported(ep, req);
@@ -1481,8 +1520,14 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       ...prompt,
       max_output_tokens: req.maxTokens ?? config.defaults.maxCompletionTokens,
       // Non-reasoning models (GPT-4o on the hosted OpenAI API) reject both
-      // fields, so they are omitted together.
-      ...(reasoning ? { reasoning: { effort: responsesReasoningEffort(ep, req) } } : {}),
+      // fields, so they are omitted together. OpenAI never returns raw
+      // reasoning; `summary: 'auto'` asks for its readable summary.
+      ...(reasoning ? {
+        reasoning: {
+          effort: responsesReasoningEffort(ep, req),
+          ...(wantsReasoningSummary(ep, req, stream) ? { summary: 'auto' } : {}),
+        },
+      } : {}),
       // store:false disables server-side turn state. Request encrypted reasoning
       // so it can be replayed locally with function outputs on the next turn.
       // DeepSeek does not support `include`; it replays plain-text reasoning.
@@ -1600,9 +1645,12 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
         // OpenAI returns reasoning summaries; DeepSeek returns the plain
         // chain-of-thought as reasoning_text content parts.
         const summaries = Array.isArray(item.summary) ? item.summary : [];
-        for (const summary of summaries) {
-          if (typeof summary?.text === 'string') reasoningParts.push(summary.text);
-        }
+        // One paragraph per summary part, as the stream shows them.
+        const summaryText = summaries
+          .map((summary: any) => (typeof summary?.text === 'string' ? summary.text : ''))
+          .filter(Boolean)
+          .join('\n\n');
+        if (summaryText) reasoningParts.push(summaryText);
         if (!summaries.length && Array.isArray(item.content)) {
           for (const part of item.content) {
             if (part?.type === 'reasoning_text' && typeof part.text === 'string') reasoningParts.push(part.text);
@@ -1835,6 +1883,14 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
       if (idleTimer) clearTimeout(idleTimer);
       const detail = await resp.text().catch(() => '');
       failStreamAttempt(`HTTP_${resp.status}`, 'failed', parseUsageFromText(detail));
+      if (responsesBody.reasoning?.summary && isReasoningSummaryRefusal(resp.status, detail)) {
+        // Thinking summaries are optional. Remember the refusal and send the
+        // same turn once more; the rebuilt body has no summary field, so this
+        // cannot repeat, and the 400 never reaches endpoint health.
+        reasoningSummaryRefused.add(reasoningSummaryKey(ep, req));
+        console.warn(`[LLM] ${model} refused thinking summaries (HTTP 400); chat continues without them until BotBoy restarts: ${redactProviderSecrets(detail).slice(0, 240)}`);
+        return yield* streamResponsesEndpoint(ep, req, context);
+      }
       throw providerHttpError(resp.status, detail, size);
     }
     if (!resp.body) {
@@ -1848,6 +1904,8 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
 
     let contentAcc = '';
     let reasoningAcc = '';
+    // The summary part (reasoning item + summary index) the last delta belonged to.
+    let summaryPart: string | undefined;
     const toolCallsAcc = new Map<number, { id: string; name: string; arguments: string }>();
     const startedToolCalls = new Set<number>();
     let usageAcc: LlmUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -1911,8 +1969,17 @@ export function createLlmClient(config: LlmConfig, usageService?: LlmUsageServic
           // chain-of-thought as reasoning_text deltas.
           if ((eventType === 'response.reasoning_summary_text.delta' || eventType === 'response.reasoning_text.delta')
             && typeof event.delta === 'string') {
-            reasoningAcc += event.delta;
-            yield { type: 'thinking', text: event.delta };
+            let text = event.delta;
+            if (eventType === 'response.reasoning_summary_text.delta') {
+              // Each summary part is its own paragraph.
+              const part = `${event.item_id ?? ''}:${event.summary_index ?? 0}`;
+              if (summaryPart !== undefined && part !== summaryPart && reasoningAcc && !reasoningAcc.endsWith('\n\n')) {
+                text = `\n\n${text}`;
+              }
+              summaryPart = part;
+            }
+            reasoningAcc += text;
+            yield { type: 'thinking', text };
             continue;
           }
 

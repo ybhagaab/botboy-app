@@ -4,6 +4,8 @@ import express from 'express';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AiModelSettingsError, type AiModelSettingsService, type AiModelStatus } from '../../core/ai-model-settings.js';
+import { createChatThinkingDisplay, type ChatThinkingDisplay } from '../../core/chat-thinking-display.js';
+import { createStorage } from '../../core/storage.js';
 import { createAiModelRouter } from './ai-model.js';
 
 /**
@@ -56,10 +58,10 @@ describe('AI model settings router', () => {
   let origin: string;
   let settings: AiModelSettingsService;
 
-  function listen(service: AiModelSettingsService | undefined): Promise<void> {
+  function listen(service: AiModelSettingsService | undefined, chatThinking?: ChatThinkingDisplay): Promise<void> {
     const app = express();
     app.use(express.json());
-    app.use('/api', createAiModelRouter({ nodeManager: {} as any, ...(service ? { aiModelSettings: service } : {}) }));
+    app.use('/api', createAiModelRouter({ nodeManager: {} as any, ...(service ? { aiModelSettings: service } : {}), ...(chatThinking ? { chatThinking } : {}) }));
     server = http.createServer(app);
     return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
       origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -193,5 +195,49 @@ describe('AI model settings router', () => {
     await new Promise<void>(resolve => server.close(() => resolve()));
     await listen(undefined);
     expect((await request(server).get('/api/settings/ai-model')).status).toBe(503);
+  });
+
+  it('Show model thinking: every answer carries it, and only the owner page changes it, with a boolean only', async () => {
+    const storage = createStorage(':memory:');
+    storage.initialize();
+    try {
+      const chatThinking = createChatThinkingDisplay({ db: storage.getDb(), now: () => new Date('2026-10-19T08:00:00.000Z') });
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await listen(settings, chatThinking);
+
+      expect((await request(server).get('/api/settings/ai-model')).body.chat).toEqual({ showThinking: true, updatedAt: null });
+      const blocked = await request(server).put('/api/settings/ai-model/chat').send({ showThinking: false });
+      expect(blocked.status).toBe(403);
+      expect(blocked.body).toMatchObject({ code: 'owner_action_required', nextAction: expect.stringContaining('Settings → AI model') });
+      const crossSite = await request(server).put('/api/settings/ai-model/chat')
+        .set('Origin', origin).set('Sec-Fetch-Site', 'cross-site').send({ showThinking: false });
+      expect(crossSite.status).toBe(403);
+      for (const body of [{}, { showThinking: 'false' }, { showThinking: 0 }, { showThinking: false, model: 'team.terra' }]) {
+        const rejected = await ownerPut('/api/settings/ai-model/chat', body);
+        expect(rejected.status).toBe(400);
+        expect(rejected.body.code).toBe('invalid_request');
+      }
+      expect(chatThinking.showThinking()).toBe(true);
+
+      const off = await ownerPut('/api/settings/ai-model/chat', { showThinking: false });
+      expect(off.status).toBe(200);
+      expect(off.headers['cache-control']).toBe('no-store');
+      expect(off.body).toMatchObject({ state: 'ready', roles: { processing: { modelKey: 'team.terra' } }, chat: { showThinking: false, updatedAt: '2026-10-19T08:00:00.000Z' } });
+      expect(chatThinking.showThinking()).toBe(false);
+      // Kept across a restart, and carried by the key, role and status answers the page repaints from.
+      expect(createChatThinkingDisplay({ db: storage.getDb() }).showThinking()).toBe(false);
+      expect((await ownerPut('/api/settings/ai-model/roles/documents', { thinking: 'high' })).body.chat.showThinking).toBe(false);
+      expect((await ownerPut('/api/settings/ai-model/openai', { apiKey: 'sk-proj-ownerkey' })).body.chat.showThinking).toBe(false);
+      expect((await owner(request(server).delete('/api/settings/ai-model/deepseek'))).body.chat.showThinking).toBe(false);
+      expect((await request(server).get('/api/settings/ai-model')).body.chat.showThinking).toBe(false);
+      expect((await ownerPut('/api/settings/ai-model/chat', { showThinking: true })).body.chat.showThinking).toBe(true);
+    } finally {
+      storage.close();
+    }
+  });
+
+  it('answers 503 for Show model thinking when its setting is absent', async () => {
+    expect((await request(server).get('/api/settings/ai-model')).body).not.toHaveProperty('chat');
+    expect((await ownerPut('/api/settings/ai-model/chat', { showThinking: false })).status).toBe(503);
   });
 });

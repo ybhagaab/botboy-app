@@ -216,9 +216,10 @@ export function createAnthropicLlmClient(
       wireTools,
       level,
       maxTokens: request.maxTokens ?? config.defaults.maxCompletionTokens,
-      // Summaries are for the UI's thinking block: interactive streaming with thinking on. Everything else
-      // skips the text (same billing, faster first token).
-      display: interactive && level !== 'off' ? 'summarized' : 'omitted',
+      // Summaries are for the chat panel's thinking block: interactive, thinking on, and Settings → AI model →
+      // Show model thinking on (request.showThinking). Everything else skips the text (same billing, faster
+      // first token).
+      display: interactive && level !== 'off' && request.showThinking === true ? 'summarized' : 'omitted',
       responseFormat: request.responseFormat,
       cache: promptCaching && interactive,
       stream: true,

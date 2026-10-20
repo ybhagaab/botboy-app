@@ -296,7 +296,7 @@ describe('Anthropic client: streaming and results', () => {
       ],
       stream: { pings: true, chunk: 5 },
     });
-    const generator = client.chatCompletionStream({ ...hello, tools: [tool('read_file')], think: true, reasoningEffort: 'low', usageContext: { workload: 'interactive' } });
+    const generator = client.chatCompletionStream({ ...hello, tools: [tool('read_file')], think: true, reasoningEffort: 'low', showThinking: true, usageContext: { workload: 'interactive' } });
     const chunks = [];
     let step = await generator.next();
     while (!step.done) { chunks.push(step.value); step = await generator.next(); }
@@ -309,8 +309,29 @@ describe('Anthropic client: streaming and results', () => {
     expect(result.toolCalls).toEqual([{ id: 'toolu_a', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.txt"}' } }]);
     expect(result.providerOutput?.map((block: any) => block.type)).toEqual(['thinking', 'text', 'tool_use']);
     expect((result.providerOutput![0] as any).signature).toMatch(/^sig_fake_/);
-    // summarized thinking text reaches the UI only for interactive streaming with thinking on
+    // summarized thinking text reaches the UI only for interactive streaming with thinking on and Show model thinking on
     expect(posts()[0].body.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+  });
+
+  it('omits the thinking text when Show model thinking is off, and keeps the signed block for replay', async () => {
+    await startFake();
+    const { client } = makeClient();
+    fake!.reply = () => ({ content: [{ type: 'thinking', thinking: 'plan the read' }, { type: 'text', text: 'Done.' }] });
+    for (const showThinking of [false, undefined]) {
+      const generator = client.chatCompletionStream({ ...hello, think: true, reasoningEffort: 'low', ...(showThinking === undefined ? {} : { showThinking }), usageContext: { workload: 'interactive' } });
+      const chunks = [];
+      let step = await generator.next();
+      while (!step.done) { chunks.push(step.value); step = await generator.next(); }
+      expect(posts().at(-1)!.body.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
+      expect(chunks.some(chunk => chunk.type === 'thinking')).toBe(false);
+      expect((step.value.providerOutput![0] as any)).toMatchObject({ type: 'thinking', thinking: '' });
+      expect((step.value.providerOutput![0] as any).signature).toMatch(/^sig_fake_/);
+    }
+    // Background work never shows thinking, even if a caller sets the flag.
+    const background = client.chatCompletionStream({ ...hello, think: true, reasoningEffort: 'low', showThinking: true, usageContext: { workload: 'background' } });
+    let step = await background.next();
+    while (!step.done) step = await background.next();
+    expect(posts().at(-1)!.body.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
   });
 
   it('answers a non-streaming call through the same SSE path', async () => {
