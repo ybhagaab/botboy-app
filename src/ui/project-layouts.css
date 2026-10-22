@@ -90,5 +90,5 @@
 .layout-density-compact .portfolio-project { min-height:178px; padding:14px; }
 .layout-density-compact .portfolio-project h3 { margin-top:16px; }
 @media(max-width:1040px){.roadmap-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:720px){.roadmap-summary{grid-template-columns:1fr 1fr}.roadmap-legend{display:none}.roadmap-matrix{grid-template-columns:minmax(230px,1.3fr) repeat(var(--roadmap-columns),minmax(175px,1fr))}.roadmap-row{grid-template-columns:minmax(230px,1.3fr) repeat(var(--roadmap-columns),minmax(175px,1fr))}.roadmap-page-head .head-actions{display:flex}.portfolio-grid{grid-template-columns:1fr}}
-@media(max-width:480px){.roadmap-summary{grid-template-columns:1fr}.roadmap-metric{min-height:94px}.roadmap-page-head .head-actions{align-items:stretch;flex-direction:column}.roadmap-page-head .head-actions .button{width:100%}}
+@media(max-width:720px){.roadmap-summary{grid-template-columns:1fr 1fr}.roadmap-legend{display:none}.roadmap-matrix{grid-template-columns:minmax(230px,1.3fr) repeat(var(--roadmap-columns),minmax(175px,1fr))}.roadmap-row{grid-template-columns:minmax(230px,1.3fr) repeat(var(--roadmap-columns),minmax(175px,1fr))}.portfolio-grid{grid-template-columns:1fr}}
+@media(max-width:480px){.roadmap-summary{grid-template-columns:1fr}.roadmap-metric{min-height:94px}.roadmap-layout .project-head-bar .head-actions{flex-basis:100%;align-items:stretch;flex-direction:column}.roadmap-layout .project-head-bar .head-actions .button{width:100%}}

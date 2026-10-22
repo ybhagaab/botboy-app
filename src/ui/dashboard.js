@@ -210,6 +210,8 @@ const state = {
     pandocPrompt: null,
   },
   rebuilding: new Set(),
+  // Project ids with an Archive or Restore request in flight (setProjectArchived).
+  archivingProjects: new Set(),
   evidencePending: new Set(),
   discarded: { data: null, error: '' },
   // Document workbench: per-project grouped documents + the reader view.
@@ -1090,6 +1092,32 @@ function renderAllAreas() {
     <section class="grid three-col">${state.areas.map(area => `<a class="card project-card" href="#/areas/${encodeURIComponent(area.id)}"><div><span class="area-color" style="display:block;background:${area.color};width:12px;height:12px"></span></div><h3>${esc(area.title)}</h3><p>${esc(area.description || `${area.projects.length} related projects`)}</p><div class="project-card-foot"><span>${number(area.projects.length)} projects</span><span>${number(area.projects.reduce((sum, project) => sum + project.itemCount, 0))} evidence items</span></div></a>`).join('')}</section>`;
 }
 
+// Archive on an active project, Restore on an archived one (owner request 2026-10-22). setProjectArchived does the
+// work; the roadmap template shows the same button (project-layouts.js › renderRoadmap › archiveActionHtml).
+function projectArchiveButton(project) {
+  const archived = project.status === 'archived';
+  const busy = state.archivingProjects.has(project.id);
+  const label = busy ? (archived ? 'Restoring…' : 'Archiving…') : (archived ? 'Restore' : 'Archive');
+  const hint = archived ? 'Bring this project back to its area' : 'Hide this project from your areas and the sidebar. Nothing is deleted.';
+  return `<button class="button" type="button" data-action="${archived ? 'restore-project' : 'archive-project'}" data-project="${attr(project.id)}" title="${attr(hint)}" ${busy ? 'disabled' : ''}>${icon(archived ? 'archive-restore' : 'archive')} ${label}</button>`;
+}
+
+// The project page header (owner request 2026-10-22): the breadcrumb and the actions share the top row and wrap when the
+// page is narrow (beside the chat panel), so the title and its facts below get the full width instead of a squeezed
+// column. The facts sit on one wrapping row. A status line that only repeats the status pill ("active") is not shown.
+function renderProjectHead(project, detail, area, brain) {
+  const title = brain.title || project.title;
+  const tone = projectTone(project, detail);
+  const status = String(project.status || 'active').trim().toLowerCase();
+  const statusLine = String(brain.statusLine || project.oneLiner || 'No current status line has been synthesized.').trim();
+  const showStatusLine = Boolean(statusLine) && statusLine.toLowerCase() !== status;
+  const rebuilding = state.rebuilding.has(project.id);
+  const breadcrumb = `<div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${area ? `<a href="#/areas/${encodeURIComponent(area.id)}" title="${attr(area.title)}">${esc(area.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Project</span></div>`;
+  const actions = `<div class="head-actions">${projectArchiveButton(project)}<button class="button" type="button" data-action="rebuild-brain" data-project="${attr(project.id)}" ${rebuilding ? 'disabled' : ''}>${icon('refresh')} ${rebuilding ? 'Rebuilding…' : 'Rebuild from evidence'}</button><button class="button primary" type="button" data-prompt="${attr(projectAskSeed(title, project.id))}" data-project-context="${attr(project.id)}" data-project-title="${attr(title)}">${icon('sparkles')} Ask BotBoy</button></div>`;
+  const meta = `<div class="project-meta"><span>${icon('refresh', 13)} Updated ${esc(relativeTime(brain.updated || project.updatedAt))}</span><span>${icon('file', 13)} ${number(project.itemCount)} evidence items</span><span>${icon('shield', 13)} Local workspace</span>${detail.scopeAlertCount ? `<span class="pill warn" title="Evidence flagged by the brain pass because it also anchors another project's scope. Flagged evidence is still synthesized here; review its placement in the Evidence tab.">${icon('alert', 12)} Scope alerts: ${number(detail.scopeAlertCount)}</span>` : ''}</div>`;
+  return `<div class="project-head-bar">${breadcrumb}${actions}</div><header class="page-head project-page-head"><div class="project-head-main"><div class="project-title-row"><h1 class="page-title">${esc(title)}</h1><span class="pill ${tone}"><span class="status-dot ${tone}"></span>${esc(statusLabel(project))}</span></div>${showStatusLine ? `<p class="project-status-line">${esc(statusLine)}</p>` : ''}${meta}</div></header>`;
+}
+
 function renderProject(projectId) {
   const project = projectById(projectId);
   if (!project) return errorView('This project is no longer available.');
@@ -1123,13 +1151,14 @@ function renderProject(projectId) {
   if (state.projectTab === 'files') content = renderProjectFiles(projectId);
   if (state.projectTab === 'timeline') content = renderTimeline(brain.activityLog || []);
   if (state.projectTab === 'artifacts') content = renderProjectArtifacts(projectId);
-  const fallbackHtml = `<div class="breadcrumb"><a href="#/today">Workspace</a>${icon('chevron-right', 11)}${area ? `<a href="#/areas/${encodeURIComponent(area.id)}">${esc(area.title)}</a>${icon('chevron-right', 11)}` : ''}<span>Project</span></div><header class="page-head"><div><div class="project-title-row"><h1 class="page-title">${esc(brain.title || project.title)}</h1><span class="pill ${projectTone(project, detail)}"><span class="status-dot ${projectTone(project, detail)}"></span>${esc(statusLabel(project))}</span></div><p class="project-status-line">${esc(brain.statusLine || project.oneLiner || 'No current status line has been synthesized.')}</p><div class="project-meta"><span>${icon('refresh', 13)} Updated ${esc(relativeTime(brain.updated || project.updatedAt))}</span><span>${icon('file', 13)} ${number(project.itemCount)} evidence items</span><span>${icon('shield', 13)} Local workspace</span>${detail.scopeAlertCount ? `<span class="pill warn" title="Evidence flagged by the brain pass because it also anchors another project's scope. Flagged evidence is still synthesized here; review its placement in the Evidence tab.">${icon('alert', 12)} Scope alerts: ${number(detail.scopeAlertCount)}</span>` : ''}</div></div><div class="head-actions"><button class="button" type="button" data-action="rebuild-brain" data-project="${attr(project.id)}" ${state.rebuilding.has(project.id) ? 'disabled' : ''}>${icon('refresh')} ${state.rebuilding.has(project.id) ? 'Rebuilding…' : 'Rebuild from evidence'}</button><button class="button primary" type="button" data-prompt="${attr(projectAskSeed(brain.title || project.title, project.id))}" data-project-context="${attr(project.id)}" data-project-title="${attr(brain.title || project.title)}">${icon('sparkles')} Ask BotBoy</button></div></header><div class="tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${state.projectTab === id ? 'active' : ''}" type="button" role="tab" aria-selected="${state.projectTab === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div><div role="tabpanel">${content}</div>`;
+  const fallbackHtml = `${renderProjectHead(project, detail, area, brain)}<div class="tabs" role="tablist" aria-label="Project sections">${tabs.map(([id, label]) => `<button class="tab ${state.projectTab === id ? 'active' : ''}" type="button" role="tab" aria-selected="${state.projectTab === id}" data-action="project-tab" data-tab="${id}">${esc(label)}</button>`).join('')}</div><div role="tabpanel">${content}</div>`;
   return window.BotBoyLayouts?.renderProject({
     project,
     detail,
     area,
     activeTab: state.projectTab,
     rebuilding: state.rebuilding.has(project.id),
+    archiveActionHtml: projectArchiveButton(project),
     documentCount: typeof docsCount === 'number' ? docsCount : null,
     artifactCount: typeof artifactCount === 'number' ? artifactCount : null,
     fileCount,
@@ -2466,6 +2495,29 @@ async function rebuildProjectBrain(projectId) {
     toast(`Rebuild failed: ${error.message}`, 'bad');
   } finally {
     state.rebuilding.delete(projectId);
+    if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ userAction: true });
+  }
+}
+
+// Archive and Restore from the project page (owner request 2026-10-22: a button, a confirmation, done). Chat's
+// manage_project uses the same workspace catalog; these routes take same-origin owner clicks only. Restore asks
+// nothing: it is the undo. The project stays open, now Archived, with Restore in place of Archive.
+async function setProjectArchived(projectId, archived) {
+  const project = projectById(projectId);
+  if (!project || state.archivingProjects.has(projectId)) return;
+  const title = state.projectDetails.get(projectId)?.brain?.title || project.title;
+  if (archived && !window.confirm(`Archive "${title}"?\n\nIt leaves your areas and the sidebar. Its brain, evidence and documents are kept, and Restore on this page brings it back.`)) return;
+  state.archivingProjects.add(projectId);
+  renderRoute({ userAction: true });
+  try {
+    await request(`/workspace/projects/${encodeURIComponent(projectId)}/${archived ? 'archive' : 'restore'}`, { method: 'POST', body: {} });
+    toast(archived ? `Archived "${title}"` : `Restored "${title}"`);
+    state.projectDetails.delete(projectId);
+    await loadCore({ quiet: true });
+  } catch (error) {
+    toast(`${archived ? 'Archive' : 'Restore'} failed: ${error.message}`, 'bad');
+  } finally {
+    state.archivingProjects.delete(projectId);
     if (state.route.view === 'project' && state.route.projectId === projectId) renderRoute({ userAction: true });
   }
 }
@@ -9434,6 +9486,8 @@ function bindEvents() {
     if (action === 'read-document-in-full') void readDocumentInFull(target.dataset.project, target.dataset.item);
     if (action === 'restore-evidence') void restoreEvidence(target.dataset.project, target.dataset.item);
     if (action === 'rebuild-brain') void rebuildProjectBrain(target.dataset.project);
+    if (action === 'archive-project') void setProjectArchived(target.dataset.project, true);
+    if (action === 'restore-project') void setProjectArchived(target.dataset.project, false);
     if (action === 'dismiss-relation') void dismissRelation(target.dataset.project, target.dataset.other);
     if (action === 'discard-item') void discardItem(target.dataset.item, target.dataset.project);
     if (action === 'restore-discard') void restoreDiscardedItem(target.dataset.item);
