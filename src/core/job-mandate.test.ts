@@ -8,7 +8,8 @@ import type { ToolExecutionContext } from './tool-executor.js';
 
 /**
  * The job mandate (ANALYTICS_AUTONOMY_PLAN.md D1): a continuation turn takes
- * the job's data steps with no owner present; it never sends, publishes,
+ * the job's steps with no owner present (data work, BotBoy documents, and the
+ * browser on BotBoy's own tabs since 2026-10-22); it never sends, publishes,
  * syncs, schedules, changes production, or drives the owner's surfaces.
  */
 describe('job mandate gate', () => {
@@ -37,14 +38,14 @@ describe('job mandate gate', () => {
   });
 
   it('admits the job steps of a live job', async () => {
-    for (const name of ['mcp_etl_run_query', 'wait_for_etl_run', 'create_data_room_dataset', 'create_analytics_dashboard', 'run_command', 'query_data_room', 'job_update']) {
+    for (const name of ['mcp_etl_run_query', 'wait_for_etl_run', 'create_data_room_dataset', 'create_analytics_dashboard', 'run_command', 'query_data_room', 'read_product_document', 'edit_product_document', 'save_product_document', 'browser_hands', 'job_update']) {
       const result = await gate().executeTool(call(name), continuation());
       expect(result.content, name).toContain(`ran ${name}`);
     }
   });
 
   it('refuses effects outside the job, and every step once the job ended', async () => {
-    for (const name of ['gmail_send', 'gmail_draft', 'publish_static_artifact_to_harmony', 'sharepoint_edit_docx_body', 'mcp_etl_submit_run', 'mcp_etl_update_profile_sql', 'mcp_etl_force_deps', 'open_terminal', 'browser_hands', 'mcp_profile_action', 'manage_project', 'configure_analytics_schedule', 'some_future_tool']) {
+    for (const name of ['gmail_send', 'gmail_draft', 'publish_static_artifact_to_harmony', 'sharepoint_edit_docx_body', 'mcp_etl_submit_run', 'mcp_etl_update_profile_sql', 'mcp_etl_force_deps', 'open_terminal', 'mcp_profile_action', 'manage_project', 'configure_analytics_schedule', 'export_product_document', 'some_future_tool']) {
       const result = await gate().executeTool(call(name), continuation());
       expect(JSON.parse(result.content), name).toMatchObject({ status: 'blocked', code: 'outside_job_mandate' });
       expect(result.isError).toBe(true);
@@ -93,11 +94,22 @@ describe('job mandate gate', () => {
     expect(offered.map(tool => tool.function.name)).toEqual(['job_update']);
   });
 
+  // Owner requests 2026-10-22: a job reads, edits and saves BotBoy documents (a full save included) and clicks and types in
+  // the browser in its automatic turns. Sending, publishing and the terminal stay owner turns.
+  it('admits document reads, edits and full saves, and browser hands, in a job', () => {
+    for (const name of ['read_product_document', 'edit_product_document', 'save_product_document', 'edit_file', 'browser_hands', 'browser_screenshot']) {
+      expect(isJobScopeTool(name), name).toBe(true);
+    }
+    const offered = filterToolsForContinuation(['read_product_document', 'edit_product_document', 'save_product_document', 'export_product_document', 'browser_hands', 'open_terminal']
+      .map(name => ({ function: { name } })));
+    expect(offered.map(tool => tool.function.name)).toEqual(['read_product_document', 'edit_product_document', 'save_product_document', 'browser_hands']);
+  });
+
   it('offers a continuation only the job-scope tools', () => {
     const tools = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'open_terminal'].map(name => ({ type: 'function', function: { name } }));
     expect(filterToolsForContinuation(tools).map(tool => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query']);
     for (const name of JOB_SCOPE_TOOLS) {
-      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|browser_hands|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_)/);
+      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_|whatsapp_)/);
     }
     expect(isJobScopeTool('mcp_etl_submit_run')).toBe(false);
   });
@@ -110,5 +122,16 @@ describe('job mandate gate', () => {
     expect(filterToolsForContinuation(offered).map(tool => tool.function.name)).toEqual(['knowledge_list', 'knowledge_load', 'knowledge_propose']);
     expect(isJobScopeTool('knowledge_write')).toBe(false);
     expect(isJobScopeTool('knowledge_create_set')).toBe(false);
+  });
+});
+
+// The prompt says the same as the mandate (owner requests 2026-10-22): an automatic turn uses the tools it is offered and
+// leaves only what they refuse for the owner, instead of stopping at "data work".
+describe('the automatic-turn guidance', () => {
+  it('follows the offered tools, not a data-work-only rule', async () => {
+    const { createPromptManager } = await import('./prompt-manager.js');
+    const prompt = createPromptManager().getSystemPrompt('chat');
+    expect(prompt).toContain('- A turn marked AUTOMATIC CONTINUATION has no owner message: continue the job from where it stands with the tools it offers, and leave what they refuse (outside_job_mandate) for the owner\'s go-ahead.');
+    expect(prompt).not.toContain('outside the job\'s data work');
   });
 });

@@ -87,6 +87,45 @@ describe('dashboard Data Room version receipt', () => {
     }
   });
 });
+describe('dashboard analytics version', () => {
+  // An in-place presentation edit runs no query, so analytics_runs never moves;
+  // open dashboard pages must still reload (2026-10-21).
+  it('changes when a widget revision, the widget set, or a dashboard updated_at changes, and only then', async () => {
+    const storage = createStorage(':memory:');
+    storage.initialize();
+    try {
+      const db = storage.getDb();
+      db.prepare(`INSERT INTO analytics_dashboards (id, title, updated_at) VALUES ('dash_v', 'V', '2026-10-21 01:00:00')`).run();
+      db.prepare(`INSERT INTO analytics_widgets (id, dashboard_id, position, kind, title) VALUES ('w_a', 'dash_v', 0, 'table', 'A')`).run();
+      const app = express();
+      app.use('/api', createDashboardRouter(createDashboardState(), db));
+      const version = async () => (await request(app).get('/api/dashboard/version')).body.analyticsVersion as string;
+      const first = await version();
+      expect(first).not.toBe('0');
+      expect(await version()).toBe(first);
+      db.prepare(`UPDATE analytics_widgets SET revision = revision + 1 WHERE id = 'w_a'`).run();
+      const revised = await version();
+      expect(revised).not.toBe(first);
+      db.prepare(`UPDATE analytics_dashboards SET updated_at = '2026-10-21 01:00:01' WHERE id = 'dash_v'`).run();
+      const retitled = await version();
+      expect(retitled).not.toBe(revised);
+      db.prepare(`INSERT INTO analytics_widgets (id, dashboard_id, position, kind, title) VALUES ('w_b', 'dash_v', 1, 'text', 'B')`).run();
+      const added = await version();
+      expect(added).not.toBe(retitled);
+      // Removing it again moves the receipt too (pages compare with the last poll).
+      db.prepare(`DELETE FROM analytics_widgets WHERE id = 'w_b'`).run();
+      const removed = await version();
+      expect(removed).not.toBe(added);
+      // A revision-2 widget replaced by two new ones keeps the revision sum (2) but not the count.
+      db.prepare(`DELETE FROM analytics_widgets WHERE id = 'w_a'`).run();
+      db.prepare(`INSERT INTO analytics_widgets (id, dashboard_id, position, kind, title) VALUES ('w_c', 'dash_v', 0, 'text', 'C'), ('w_d', 'dash_v', 1, 'text', 'D')`).run();
+      expect(await version()).not.toBe(removed);
+    } finally {
+      storage.close();
+    }
+  });
+});
+
 describe('dashboard browser capture version', () => {
   const versionOf = async (callback?: () => { version: number }) => {
     const app = express();

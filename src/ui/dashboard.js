@@ -6280,6 +6280,22 @@ function renderAnalyticsText(raw) {
   return blocks.join('') || '<p>—</p>';
 }
 
+/** A table header's display name: config.columnLabels[column] when one is set, else the column name. */
+function analyticsColumnLabel(widget, column) {
+  const labels = widget?.config?.columnLabels;
+  const name = String(column);
+  const label = labels && typeof labels === 'object' && !Array.isArray(labels) && Object.prototype.hasOwnProperty.call(labels, name)
+    ? labels[name]
+    : null;
+  return typeof label === 'string' && label.trim() ? label.trim() : name;
+}
+
+/** config.note: plain text shown in italics under a widget. */
+function analyticsWidgetNote(widget) {
+  const note = widget?.config?.note;
+  return typeof note === 'string' && note.trim() ? `<p class="analytics-note">${esc(note.trim())}</p>` : '';
+}
+
 function renderAnalyticsTable(widget, result) {
   const columns = Array.isArray(result.columns) ? result.columns : [];
   const canonicalRows = Array.isArray(result.rows) ? result.rows : [];
@@ -6290,7 +6306,9 @@ function renderAnalyticsTable(widget, result) {
   return `<div class="analytics-table-wrap" data-scroll-key="analytics:table:${attr(widget.id)}"><table class="analytics-table"><thead><tr>${columns.map((column, index) => {
     const selected = activeSort?.columnIndex === index;
     const ariaSort = selected ? ` aria-sort="${activeSort.direction === 'desc' ? 'descending' : 'ascending'}"` : '';
-    return `<th${numericColumn[index] ? ' class="analytics-cell-number"' : ''}${ariaSort}><button type="button" data-action="analytics-shown-sort" data-widget="${attr(widget.id)}" data-column="${index}" title="Sort only the rows currently shown">${esc(column)}${selected ? `<span aria-hidden="true">${activeSort.direction === 'desc' ? '↓' : '↑'}</span>` : ''}</button></th>`;
+    const label = analyticsColumnLabel(widget, column);
+    const sortTitle = label === String(column) ? 'Sort only the rows currently shown' : `Column ${column}. Sort only the rows currently shown`;
+    return `<th${numericColumn[index] ? ' class="analytics-cell-number"' : ''}${ariaSort}><button type="button" data-action="analytics-shown-sort" data-widget="${attr(widget.id)}" data-column="${index}" data-column-name="${attr(column)}" title="${attr(sortTitle)}">${esc(label)}${selected ? `<span aria-hidden="true">${activeSort.direction === 'desc' ? '↓' : '↑'}</span>` : ''}</button></th>`;
   }).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${columns.map((_, index) => analyticsCell(row[index])).join('')}</tr>`).join('')}</tbody></table></div>${result.rowCount > canonicalRows.length ? `<div class="analytics-truncated">Showing ${number(canonicalRows.length)} of ${number(result.rowCount)} rows. Header sorting reorders only these shown rows; use Dataset order in Manage data to change which rows are selected before the limit.</div>` : activeSort ? '<div class="analytics-truncated">Header sorting changes only this local view and never runs a query.</div>' : ''}`;
 }
 
@@ -6627,16 +6645,22 @@ function renderAnalyticsWidget(widget, currentWidgetId = '', span = 0, chatSelec
   const issueClass = widgetIssues.length ? ' has-issues' : '';
   if (widget.kind === 'html') {
     const inputs = Array.isArray(widget.config?.inputs) ? widget.config.inputs : [];
-    return `<article class="card analytics-widget analytics-html-widget${spanClass}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chatSelector}</div></div><div class="analytics-widget-body">${body}</div>${inputs.length ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Data behind this view</span><b>${esc(inputs.join(', '))}</b></summary><div><span>Reads</span><strong>${esc(inputs.join(', '))}</strong></div><div><span>Runs</span><strong>Sandboxed: no network, no access to BotBoy</strong></div></details>` : ''}</article>`;
+    return `<article class="card analytics-widget analytics-html-widget${spanClass}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chatSelector}</div></div><div class="analytics-widget-body">${body}</div>${analyticsWidgetNote(widget)}${inputs.length ? `<details class="analytics-provenance"><summary>${icon('database', 12)}<span>Data behind this view</span><b>${esc(inputs.join(', '))}</b></summary><div><span>Reads</span><strong>${esc(inputs.join(', '))}</strong></div><div><span>Runs</span><strong>Sandboxed: no network, no access to BotBoy</strong></div></details>` : ''}</article>`;
   }
   // Columns an issue names are marked in the table header and metric value.
+  // Issues name the query's column; a relabelled header carries it in data-column-name.
   if (widgetIssues.length) {
     const flagged = new Set(widgetIssues.map(issue => issue.metric).filter(Boolean));
-    body = body.replace(/<th([^>]*)><button([^>]*)>([^<]+)/g, (whole, thAttrs, buttonAttrs, label) => flagged.has(label.trim())
-      ? `<th${thAttrs} class="analytics-issue-cell"><button${buttonAttrs} title="${attr(widgetIssues.filter(issue => issue.metric === label.trim()).map(issue => issue.message).join('\n'))}">⚠ ${label}`
-      : whole);
+    const unescape = value => value.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    body = body.replace(/<th([^>]*)><button([^>]*)>([^<]+)/g, (whole, thAttrs, buttonAttrs, label) => {
+      const named = /data-column-name="([^"]*)"/.exec(buttonAttrs);
+      const column = named ? unescape(named[1]) : label.trim();
+      return flagged.has(column)
+        ? `<th${thAttrs} class="analytics-issue-cell"><button${buttonAttrs} title="${attr(widgetIssues.filter(issue => issue.metric === column).map(issue => issue.message).join('\n'))}">⚠ ${label}`
+        : whole;
+    });
   }
-  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chip}${chatSelector}${manageButton}</div></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${manage}${provenance}</article>`;
+  return `<article class="card analytics-widget analytics-${attr(widget.kind)}${spanClass}${wideMetric}${selectedClass}${issueClass}" data-widget-id="${attr(widget.id)}"><div class="analytics-widget-head"><div><div class="eyebrow">${esc(widget.kind)}</div><h2>${esc(widget.title)}</h2>${widget.subtitle ? `<p>${esc(widget.subtitle)}</p>` : ''}</div><div class="analytics-widget-actions">${issueBadge}${chip}${chatSelector}${manageButton}</div></div>${widget.lastError ? `<div class="analytics-widget-error">${icon('alert', 13)}<span>${esc(widget.lastError)}</span>${result ? '<small>last good result shown</small>' : ''}</div>` : ''}<div class="analytics-widget-body">${body}</div>${analyticsWidgetNote(widget)}${manage}${provenance}</article>`;
 }
 
 function renderAnalyticsList() {

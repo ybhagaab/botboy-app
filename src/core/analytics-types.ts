@@ -136,6 +136,18 @@ export interface AnalyticsWidgetEditPresentation {
   title?: string;
   subtitle?: string;
   layout?: 'vconcat' | 'hconcat';
+  /** Plain text shown in italics under the widget; '' removes it. */
+  note?: string;
+  /** Table header display names by exact result column name; {} removes them all. */
+  columnLabels?: Record<string, string>;
+  /** A text widget's text. */
+  text?: string;
+  /** An html view's complete new page. */
+  html?: string;
+  /** Exact replacements in an html view's page, applied in order; each find must occur once. */
+  htmlEdits?: Array<{ find: string; replace: string }>;
+  span?: number;
+  hidden?: boolean;
 }
 
 export interface AnalyticsWidgetEditInput {

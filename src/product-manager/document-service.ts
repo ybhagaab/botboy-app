@@ -33,6 +33,7 @@ import {
   sourceCoverageSummary,
 } from './source-fidelity.js';
 import { STE_CHECKER_VERSION } from './ste-checker.js';
+import { applyExactEdits, parseExactEdits } from '../core/exact-text-edits.js';
 
 const STE_MODES = new Set<SteEnforcementMode>(['off', 'advisory', 'enforced_sections', 'enforced_full']);
 const DOCUMENT_MATURITY_SET = new Set<DocumentMaturity>(DOCUMENT_MATURITIES);
@@ -186,6 +187,62 @@ export class ProductDocumentGenerationError extends Error {
     super(message);
     this.name = 'ProductDocumentGenerationError';
   }
+}
+
+export type ProductDocumentEditErrorCode =
+  | 'invalid_input'
+  | 'store_unavailable'
+  | 'not_found'
+  | 'not_newest'
+  | 'invalid_edits'
+  | 'edit_not_found'
+  | 'edit_not_unique'
+  | 'no_change'
+  | 'too_large'
+  | 'too_many_citations';
+
+/** A targeted edit that changed nothing. Every one names what to do instead. */
+export class ProductDocumentEditError extends Error {
+  constructor(
+    public readonly code: ProductDocumentEditErrorCode,
+    message: string,
+    public readonly nextAction: string,
+    public readonly details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = 'ProductDocumentEditError';
+  }
+}
+
+const MAX_CITATIONS = 50;
+
+/** Bounded citation normalization, never a gate: malformed entries are dropped rather than rejected. */
+function normalizeCitations(value: unknown): DocumentCitation[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is DocumentCitation => isRecord(entry)
+      && typeof entry.id === 'string' && /^[A-Za-z0-9_-]{1,20}$/.test(entry.id)
+      && typeof entry.label === 'string' && entry.label.trim().length > 0)
+    .slice(0, MAX_CITATIONS)
+    .map((entry) => ({
+      id: entry.id,
+      label: entry.label.trim().slice(0, 300),
+      ...(typeof entry.source === 'string' && entry.source.trim() ? { source: entry.source.trim().slice(0, 40) } : {}),
+      ...(typeof entry.date === 'string' && entry.date.trim() ? { date: entry.date.trim().slice(0, 40) } : {}),
+      ...(typeof entry.quote === 'string' && entry.quote.trim() ? { quote: entry.quote.trim().slice(0, 500) } : {}),
+      ...(typeof entry.workItemId === 'string' && entry.workItemId.trim() ? { workItemId: entry.workItemId.trim().slice(0, 100) } : {}),
+      ...(typeof entry.url === 'string' && /^https?:\/\//i.test(entry.url.trim()) ? { url: entry.url.trim().slice(0, 500) } : {}),
+    }));
+}
+
+/** The reader renders "[id]" as a citation chip when a citation has that id (dashboard.js › annotateDocumentCitations). */
+function citesMarker(content: string, id: string): boolean {
+  return content.includes(`[${id}]`);
+}
+
+/** [cN]-style markers, the convention the writing guide teaches. */
+function citationStyleMarkers(content: string): Set<string> {
+  return new Set([...content.matchAll(/\[(c\d{1,4})\]/g)].map((match) => match[1]));
 }
 
 interface ParsedGeneration {
@@ -1172,22 +1229,7 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
       // Citations: bounded normalization, never a gate. Malformed entries are
       // dropped rather than rejected — a missing annotation must not lose a
       // document.
-      const citations: DocumentCitation[] = Array.isArray(request.citations)
-        ? request.citations
-          .filter((entry): entry is DocumentCitation => isRecord(entry)
-            && typeof entry.id === 'string' && /^[A-Za-z0-9_-]{1,20}$/.test(entry.id)
-            && typeof entry.label === 'string' && entry.label.trim().length > 0)
-          .slice(0, 50)
-          .map((entry) => ({
-            id: entry.id,
-            label: entry.label.trim().slice(0, 300),
-            ...(typeof entry.source === 'string' && entry.source.trim() ? { source: entry.source.trim().slice(0, 40) } : {}),
-            ...(typeof entry.date === 'string' && entry.date.trim() ? { date: entry.date.trim().slice(0, 40) } : {}),
-            ...(typeof entry.quote === 'string' && entry.quote.trim() ? { quote: entry.quote.trim().slice(0, 500) } : {}),
-            ...(typeof entry.workItemId === 'string' && entry.workItemId.trim() ? { workItemId: entry.workItemId.trim().slice(0, 100) } : {}),
-            ...(typeof entry.url === 'string' && /^https?:\/\//i.test(entry.url.trim()) ? { url: entry.url.trim().slice(0, 500) } : {}),
-          }))
-        : [];
+      const citations = normalizeCitations(request.citations);
       const profileId = (typeof request.profileId === 'string' && request.profileId.trim())
         || parent?.profileId
         || 'business_document/adaptive.v1';
@@ -1386,6 +1428,168 @@ export function createProductDocumentService(dependencies: ProductDocumentServic
         ...(parent ? { parentArtifactId: parent.artifactId } : {}),
         revisionOrigin: 'chat_authored',
       });
+    },
+
+    getVersionChain: (artifactId) => dependencies.store?.versionChain?.(artifactId) ?? [],
+
+    editAuthoredDocument(request) {
+      // Owner report 2026-10-21: every change rewrote the whole document (six
+      // full versions of a launch email in one hour for column and alias
+      // changes). A targeted edit changes only the exact text it names. No
+      // await anywhere below: the newest-version check and the save cannot
+      // interleave with a second edit of the same chain.
+      const store = dependencies.store;
+      if (!store) {
+        throw new ProductDocumentEditError('store_unavailable', 'No document store is configured, so nothing can be edited.', 'Tell the owner the document library is unavailable; nothing was saved.');
+      }
+      if (!isRecord(request) || !boundedString(request.artifactId, 200)) {
+        throw new ProductDocumentEditError('invalid_input', 'artifactId is required: the id in the document\'s #/documents/<id> link.', 'Call read_product_document with words from the title to find the document and its newest artifactId.');
+      }
+      const artifactId = request.artifactId.trim();
+      const parsed = parseExactEdits(request.edits);
+      if (!parsed.ok) {
+        throw new ProductDocumentEditError('invalid_edits', parsed.message, 'Send edits as [{find: exact current text, replace: new text}], 1 to 50 pairs. Nothing was saved.', parsed.index === undefined ? {} : { index: parsed.index });
+      }
+      if (request.title !== undefined && !boundedString(request.title, 300)) {
+        throw new ProductDocumentEditError('invalid_input', 'title must be non-empty text of at most 300 characters when given.', 'Omit title to keep the current one. Nothing was saved.');
+      }
+      if (request.citations !== undefined && !Array.isArray(request.citations)) {
+        throw new ProductDocumentEditError('invalid_input', 'citations must be a list of {id, label, source?, date?, quote?, workItemId?, url?}.', 'Omit citations to keep the current ones. Nothing was saved.');
+      }
+      const parent = store.get(artifactId);
+      if (!parent) {
+        throw new ProductDocumentEditError('not_found', `Document version ${artifactId} was not found.`, 'Call read_product_document with words from the title to find the document and its newest artifactId.', { artifactId });
+      }
+      const newest = store.versionChain?.(parent.artifactId)[0];
+      if (newest && newest.artifactId !== parent.artifactId) {
+        throw new ProductDocumentEditError(
+          'not_newest',
+          `Version ${parent.artifactId} is not the newest version of "${parent.title}": the newest is ${newest.artifactId} (saved ${newest.createdAt}).`,
+          `Read ${newest.artifactId} with read_product_document, then send the edits against its text. Nothing was saved.`,
+          { artifactId: parent.artifactId, newestArtifactId: newest.artifactId },
+        );
+      }
+      const applied = applyExactEdits(parent.content, parsed.edits);
+      if (!applied.ok) {
+        throw new ProductDocumentEditError(
+          applied.code,
+          applied.message.replace('the current text', `version ${parent.artifactId}`),
+          applied.code === 'edit_not_unique'
+            ? `Make edits[${applied.index}].find longer, with enough surrounding text to match exactly one place, then send all the edits again. Nothing was saved.`
+            : `Read the document again with read_product_document and copy edits[${applied.index}].find exactly from its lines, without the "N: " prefix. Edits apply in order, each to the result of the one before. Nothing was saved.`,
+          { artifactId: parent.artifactId, ...(applied.index === undefined ? {} : { index: applied.index }) },
+        );
+      }
+      const content = applied.text;
+      if (!content.trim()) {
+        throw new ProductDocumentEditError('invalid_edits', 'The edits would leave the document empty.', 'Keep the document text; only the owner can delete a document, on the Documents page. Nothing was saved.');
+      }
+      if (content.length > 400_000) {
+        throw new ProductDocumentEditError('too_large', `The edited document would be ${content.length.toLocaleString('en-US')} characters; the limit is 400,000.`, 'Shorten the replacements. Nothing was saved.');
+      }
+      const title = request.title?.trim().normalize('NFC') || parent.title;
+
+      // Citations carry over. The request may add or replace them by id; a
+      // citation whose last [id] marker the edits removed goes with it.
+      const carried = normalizeCitations(parent.citations);
+      const incoming = normalizeCitations(request.citations);
+      const byId = new Map(carried.map((citation) => [citation.id, citation]));
+      const citationsAdded: string[] = [];
+      const citationsReplaced: string[] = [];
+      for (const citation of incoming) {
+        (byId.has(citation.id) ? citationsReplaced : citationsAdded).push(citation.id);
+        byId.set(citation.id, citation);
+      }
+      const incomingIds = new Set(incoming.map((citation) => citation.id));
+      const citationsDropped: string[] = [];
+      for (const id of [...byId.keys()]) {
+        if (!incomingIds.has(id) && citesMarker(parent.content, id) && !citesMarker(content, id)) {
+          byId.delete(id);
+          citationsDropped.push(id);
+        }
+      }
+      if (byId.size > MAX_CITATIONS) {
+        throw new ProductDocumentEditError('too_many_citations', `The document would hold ${byId.size} citations; the limit is ${MAX_CITATIONS}.`, 'Reuse an existing citation id for the same source. Nothing was saved.');
+      }
+      const citations = [...byId.values()];
+      const carriedById = new Map(carried.map((citation) => [citation.id, JSON.stringify(citation)]));
+      const citationsChanged = citationsAdded.length > 0 || citationsDropped.length > 0
+        || citationsReplaced.some((id) => carriedById.get(id) !== JSON.stringify(byId.get(id)));
+      if (content === parent.content && title === parent.title && !citationsChanged) {
+        throw new ProductDocumentEditError('no_change', `The edits leave version ${parent.artifactId} exactly as it is.`, 'Nothing was saved. Check the replacements against the owner\'s request.');
+      }
+      const markersBefore = citationStyleMarkers(parent.content);
+      const markersWithoutCitation = [...citationStyleMarkers(content)]
+        .filter((id) => !markersBefore.has(id) && !byId.has(id))
+        .slice(0, 20);
+
+      const createdAt = now();
+      const maturity = parent.maturity ?? 'working';
+      let validation: DocumentValidationResult;
+      try {
+        validation = dependencies.validator.validate({ profileId: parent.profileId, title, content, steMode: 'advisory', maturity });
+      } catch {
+        validation = {
+          status: 'not_checked',
+          profile: { status: 'not_checked', findings: [] },
+          evidence: { status: 'not_checked', findings: [] },
+          writing: { status: 'not_checked', findings: [] },
+          glossary: { status: 'not_checked', findings: [] },
+          ste: { status: 'not_checked', findings: [] },
+          findings: [],
+          checkedAt: createdAt.toISOString(),
+          checkerVersion: STE_CHECKER_VERSION,
+          conformanceStatement: 'Targeted edit persisted without validation; no conformance claim is made.',
+        };
+      }
+      const artifact = saveArtifact({
+        artifactId: createArtifactId(),
+        ...(parent.projectId === undefined ? {} : { projectId: parent.projectId }),
+        // Advisory-only, like every chat-authored save.
+        state: 'ready_for_review',
+        profileId: parent.profileId,
+        profileVersion: parent.profileVersion,
+        overlayVersions: parent.overlayVersions,
+        maturity,
+        ...(parent.authoringPlan === undefined ? {} : { authoringPlan: parent.authoringPlan }),
+        title,
+        content,
+        assumptions: [],
+        openQuestions: [],
+        claims: [],
+        omittedSourceUnits: [],
+        sourceCoverage: sourceCoverageSummary({ units: [], truncated: false }, [], []),
+        // The writing context and glossary of the version it edits: an exact
+        // replacement does not change what the document was written from.
+        context: parent.context,
+        glossary: parent.glossary,
+        validation,
+        model: dependencies.llmClient.getActiveModel?.(),
+        checkerVersion: validation.checkerVersion,
+        createdAt: createdAt.toISOString(),
+        emailSendApprovalRequired: parent.emailSendApprovalRequired,
+        ...(citations.length > 0 ? { citations } : {}),
+        // Owner decision 2026-10-21: a targeted edit gets the quick checks
+        // only; the model review runs on full saves. The reader shows "Not run".
+        conformanceReview: {
+          status: 'unavailable',
+          findings: [],
+          summary: 'Not run for this version: it is a targeted edit of the previous version (exact text replacements). Full rewrites get the review.',
+          correctionApplied: false,
+          checkedAt: createdAt.toISOString(),
+        },
+        parentArtifactId: parent.artifactId,
+        revisionOrigin: 'chat_authored',
+      });
+      return {
+        artifact,
+        parent: { artifactId: parent.artifactId, title: parent.title, contentChars: parent.content.length },
+        changes: applied.changes,
+        citationsAdded,
+        citationsReplaced,
+        citationsDropped,
+        markersWithoutCitation,
+      };
     },
   };
 }

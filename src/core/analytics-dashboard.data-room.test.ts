@@ -1595,6 +1595,44 @@ describe('analytics dashboard R4.1 deterministic widget editing', () => {
     expect(environment.db.prepare('SELECT COUNT(*) AS count FROM analytics_dashboard_edit_receipts').get()).toEqual({ count: 0 });
   });
 
+  // Owner report 2026-10-20: wording and notes must be editable in place on every widget.
+  it('gives a bound widget a note and column labels, keeping its verified rows and binding', async () => {
+    const environment = openEnvironment();
+    environment.room.registerDataset(sourceDefinition());
+    ingest(environment, V1_ROWS);
+    const dashboard = createVisualDashboard(environment);
+    const bound = await bindAndProcess(environment, dashboard.id, dashboard.widgets[0].id);
+    const bindingBefore = environment.db.prepare('SELECT * FROM analytics_widget_dataset_bindings WHERE widget_id = ?').get(bound.id);
+    const edited = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [bound.id],
+      presentation: { note: '  Events are counted once per region and day.  ', columnLabels: { events: 'Events', event_date: 'Day' }, span: 6 },
+    });
+    expect(edited).toMatchObject({ resultDisposition: 'preserved', widget: { id: bound.id, revision: bound.revision + 1 } });
+    expect(edited.widget.config).toMatchObject({ note: 'Events are counted once per region and day.', columnLabels: { events: 'Events', event_date: 'Day' }, span: 6 });
+    expect(edited.widget.result!.rows).toEqual(bound.result!.rows);
+    expect((edited.widget.result!.source as any).widgetRevision).toBe(bound.revision + 1);
+    expect(environment.db.prepare('SELECT * FROM analytics_widget_dataset_bindings WHERE widget_id = ?').get(bound.id)).toEqual(bindingBefore);
+    // The bound path is still the R4 composite: its rows still pass the provenance check afterwards.
+    const again = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [bound.id], presentation: { title: 'Trend by day' },
+    });
+    expect(again.widget).toMatchObject({ title: 'Trend by day', revision: bound.revision + 2, config: { note: 'Events are counted once per region and day.' } });
+    expect(() => environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [bound.id], presentation: { html: '<p>x</p>' },
+    })).toThrow(/is not an html view/);
+    // Stale rows on a bound widget are refused, never relabelled as current by a wording edit.
+    environment.db.prepare(`UPDATE analytics_widgets SET result_json = json_set(result_json, '$.source.bindingRevision', 999) WHERE id = ?`).run(bound.id);
+    const staleBefore = environment.db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(bound.id);
+    let stale: any;
+    try {
+      environment.dashboards.editDataRoomWidget({ action: 'presentation', dashboardId: dashboard.id, widgetIds: [bound.id], presentation: { note: 'x' } });
+    } catch (error) {
+      stale = error;
+    }
+    expect(stale).toMatchObject({ code: 'result_provenance_mismatch' });
+    expect(environment.db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(bound.id)).toEqual(staleBefore);
+  });
+
   it('rejects unknown fields and active-run edits before effects', async () => {
     const environment = openEnvironment();
     environment.room.registerDataset(sourceDefinition());
@@ -2268,5 +2306,210 @@ describe('analytics dashboard direct Data Room widget sources', () => {
       sql: undefined,
       result: { rows: DAILY_ROWS, source: { provider: 'data-room-query' } },
     });
+  });
+});
+
+// Owner report 2026-10-20: BotBoy could not reword an OTT Downloads dashboard
+// (eight hidden warehouse tables + one html page) without replacing every
+// widget. A presentation edit now works on any widget and keeps its data.
+describe('analytics dashboard in-place presentation edits', () => {
+  const PAGE = '<h2>Successful terminal reports</h2><p id="share">Recorded terminal success share</p><script>botboy.onData(d => { share.dataset.rows = d.lifecycle.rowCount; })</script>';
+
+  async function downloadsDashboard() {
+    const mcp = fakeMcp('sql');
+    const environment = openEnvironment({ mcp });
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'OTT Downloads',
+      widgets: [
+        { kind: 'table', title: 'Daily download lifecycle health', sql: 'SELECT 7', config: { key: 'lifecycle', hidden: true } },
+        { kind: 'html', title: 'Overview', config: { html: PAGE, inputs: ['lifecycle'], span: 12 } },
+        { kind: 'text', title: 'About', config: { text: 'Old wording.' } },
+      ],
+    });
+    environment.dashboards.enqueueRefresh(dashboard.id, 'manual');
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    const loaded = environment.dashboards.getDashboard(dashboard.id)!;
+    const [table, page, about] = loaded.widgets;
+    expect(table.result).toMatchObject({ lane: 'sql-mcp', columns: ['value'], rows: [[7]] });
+    return { environment, mcp, dashboard: loaded, table, page, about };
+  }
+
+  const widgetRow = (environment: ReturnType<typeof openEnvironment>, id: string) =>
+    environment.db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(id);
+  const runCount = (environment: ReturnType<typeof openEnvironment>) =>
+    Number((environment.db.prepare('SELECT COUNT(*) AS count FROM analytics_runs').get() as any).count);
+
+  function captured(work: () => unknown): any {
+    try { work(); } catch (error) { return error; }
+    throw new Error('Expected the call to throw');
+  }
+
+  it('rewords a warehouse table, an html page and a text widget in place: same IDs and rows, no run, no query', async () => {
+    const { environment, mcp, dashboard, table, page, about } = await downloadsDashboard();
+    const runs = runCount(environment);
+    const queries = mcp.stats().sqlCalls.length;
+    // Open pages reload on the dashboard's updated_at too (dashboard.ts › currentAnalyticsVersion).
+    environment.db.prepare(`UPDATE analytics_dashboards SET updated_at = '2000-01-01 00:00:00' WHERE id = ?`).run(dashboard.id);
+
+    const labelled = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [table.id],
+      presentation: {
+        title: 'Download lifecycle',
+        subtitle: 'Last 30 days',
+        // Sent with spaces around it; stored trimmed.
+        note: '  Successful download reports: download-finished events marked successful. These count reports, not unique downloads.\n',
+        columnLabels: { value: 'Successful download reports' },
+        hidden: false,
+        span: 6,
+      },
+    });
+    expect(labelled).toMatchObject({ action: 'presentation', resultDisposition: 'preserved', sourceWidgetIds: [table.id] });
+    expect(labelled.run).toBeUndefined();
+    expect(labelled.widget).toMatchObject({ id: table.id, revision: table.revision + 1, title: 'Download lifecycle', subtitle: 'Last 30 days', sql: 'SELECT 7' });
+    expect(labelled.widget.config).toEqual({
+      key: 'lifecycle',
+      span: 6,
+      note: 'Successful download reports: download-finished events marked successful. These count reports, not unique downloads.',
+      columnLabels: { value: 'Successful download reports' },
+    });
+    expect(labelled.widget.result).toEqual(table.result);
+    expect(labelled.widget.lastRefreshedAt).toBe(table.lastRefreshedAt);
+    expect((environment.db.prepare('SELECT updated_at FROM analytics_dashboards WHERE id = ?').get(dashboard.id) as any).updated_at)
+      .not.toBe('2000-01-01 00:00:00');
+
+    const reworded = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [page.id],
+      presentation: {
+        htmlEdits: [
+          { find: 'Successful terminal reports', replace: 'Successful download reports' },
+          { find: 'Recorded terminal success share', replace: 'Success share of reported outcomes' },
+        ],
+      },
+    });
+    expect(reworded.widget.config).toEqual({
+      html: PAGE.replace('Successful terminal reports', 'Successful download reports').replace('Recorded terminal success share', 'Success share of reported outcomes'),
+      inputs: ['lifecycle'],
+      span: 12,
+    });
+    expect(reworded.widget.revision).toBe(page.revision + 1);
+
+    const rewritten = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [about.id], presentation: { text: 'Plain wording for everyone.' },
+    });
+    expect(rewritten.widget.config).toEqual({ text: 'Plain wording for everyone.' });
+    expect(rewritten.widget.result).toMatchObject({ trust: 'local_static_content', rows: [['Plain wording for everyone.']] });
+
+    const after = environment.dashboards.getDashboard(dashboard.id)!;
+    expect(after.widgets.map(widget => widget.id)).toEqual(dashboard.widgets.map(widget => widget.id));
+    expect(after.widgets[0].result).toEqual(table.result);
+    expect(runCount(environment)).toBe(runs);
+    expect(mcp.stats().sqlCalls).toHaveLength(queries);
+
+    // A whole page can be replaced too, and a note removed with an empty string.
+    const replaced = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [page.id], presentation: { html: '<p>New page</p>' },
+    });
+    expect(replaced.widget.config).toMatchObject({ html: '<p>New page</p>', inputs: ['lifecycle'] });
+    const cleared = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [table.id], presentation: { note: '', columnLabels: {}, hidden: true },
+    });
+    expect(cleared.widget.config).toEqual({ key: 'lifecycle', span: 6, hidden: true });
+    expect(cleared.widget.result).toEqual(table.result);
+  });
+
+  it('keeps an independent Data Room result matched to its widget after the edit', async () => {
+    const environment = openEnvironment();
+    environment.room.registerDataset(sourceDefinition());
+    ingest(environment, V1_ROWS);
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Room',
+      widgets: [{ kind: 'table', title: 'Daily events', source: { kind: 'data_room_query', datasetId: 'ds_r4_events', sql: 'SELECT event_date, SUM(events) AS events FROM source.data GROUP BY event_date ORDER BY event_date' } }] as any,
+    });
+    expect(await environment.dashboards.processQueuedRuns(1)).toBe(1);
+    const before = environment.dashboards.getDashboard(dashboard.id)!.widgets[0];
+    expect(before.result!.source).toMatchObject({ provider: 'data-room-query', widgetRevision: before.revision });
+    const edited = environment.dashboards.editDataRoomWidget({
+      action: 'presentation', dashboardId: dashboard.id, widgetIds: [before.id], presentation: { columnLabels: { event_date: 'Day' } },
+    });
+    expect(edited.widget.revision).toBe(before.revision + 1);
+    expect(edited.widget.config.dataSource).toEqual(before.config.dataSource);
+    expect(edited.widget.result).toEqual({ ...before.result, source: { ...(before.result!.source as any), widgetRevision: before.revision + 1 } });
+  });
+
+  it('refuses without effect when a run or a late Datanet result is pending, and for malformed or misplaced fields', async () => {
+    const { environment, dashboard, table, page, about } = await downloadsDashboard();
+    const tableBefore = widgetRow(environment, table.id);
+    const pageBefore = widgetRow(environment, page.id);
+    const edit = (widgetId: string, presentation: Record<string, unknown>, action = 'presentation') =>
+      captured(() => environment.dashboards.editDataRoomWidget({ action, dashboardId: dashboard.id, widgetIds: [widgetId], presentation } as any));
+
+    for (const [widgetId, presentation, code, message] of [
+      [table.id, { html: '<p>x</p>' }, 'invalid_input', /is not an html view/],
+      [page.id, { text: 'x' }, 'invalid_input', /is not a text widget/],
+      [about.id, { text: '   ' }, 'invalid_input', /non-empty text/],
+      [table.id, { renderer: 'area' }, 'invalid_input', /is not a visualization/],
+      [page.id, { htmlEdits: [{ find: 'Not on the page', replace: 'x' }] }, 'invalid_input', /does not occur/],
+      [page.id, { htmlEdits: [{ find: 'terminal', replace: 'x' }] }, 'invalid_input', /more than once/],
+      [page.id, { htmlEdits: [{ find: PAGE, replace: '  ' }] }, 'invalid_input', /would be empty/],
+      [page.id, { html: '<p>x</p>', htmlEdits: [{ find: 'h2', replace: 'h3' }] }, 'invalid_input', /not both/],
+      [page.id, { htmlEdits: [{ find: '', replace: 'x' }] }, 'invalid_input', /non-empty find/],
+      [page.id, { htmlEdits: Array.from({ length: 31 }, () => ({ find: '<h2>', replace: '<h2>' })) }, 'invalid_input', /1 to 30/],
+      [page.id, { htmlEdits: [{ find: 'Recorded terminal success share', replace: 'x'.repeat(400 * 1024) }] }, 'invalid_input', /would exceed/],
+      [table.id, { columnLabels: { value: 5 } }, 'invalid_input', /columnLabels must map/],
+      [table.id, { columnLabels: Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`c${index}`, 'x'])) }, 'invalid_input', /columnLabels must map/],
+      [table.id, { columnLabels: { value: 'x'.repeat(121) } }, 'invalid_input', /columnLabels must map/],
+      [table.id, { note: 'x'.repeat(2_001) }, 'invalid_input', /note must be text/],
+      [table.id, { span: 13 }, 'invalid_input', /span must be/],
+      [table.id, { hidden: 'yes' }, 'invalid_input', /hidden must be/],
+      [table.id, { sql: 'SELECT 1' }, 'invalid_input', /unsupported fields: sql/],
+      ['widget_missing', { note: 'x' }, 'not_found', /was not found/],
+    ] as const) {
+      const failure = edit(widgetId, presentation as any);
+      expect(failure, JSON.stringify(presentation)).toBeInstanceOf(AnalyticsWidgetEditError);
+      expect(failure, JSON.stringify(presentation)).toMatchObject({ code, nextAction: expect.any(String) });
+      expect(failure.message).toMatch(message);
+    }
+    expect(edit(table.id, { note: 'x' }, 'date_range')).toMatchObject({ code: 'invalid_input', message: expect.stringMatching(/apply only to action=presentation/) });
+
+    const run = environment.dashboards.enqueueRefresh(dashboard.id, 'manual');
+    expect(edit(table.id, { note: 'x' })).toMatchObject({ code: 'active_run', message: expect.stringContaining(run.id) });
+    expect(environment.dashboards.cancelActiveRun(dashboard.id).result).toBe('cancelled');
+    expect(environment.dashboards.getRun(run.id)?.status).toBe('cancelled');
+
+    const at = new Date().toISOString();
+    environment.db.prepare(`
+      INSERT INTO analytics_late_etl_results (run_id, widget_id, external_run_id, definition_sha256, state, next_check_at, created_at, updated_at)
+      VALUES (?, ?, '424242', ?, 'pending', ?, ?, ?)
+    `).run(run.id, table.id, 'f'.repeat(64), at, at, at);
+    expect(edit(table.id, { note: 'x' })).toMatchObject({ code: 'conflict', message: expect.stringMatching(/late Datanet result/) });
+    environment.db.prepare(`UPDATE analytics_late_etl_results SET state = 'applied' WHERE widget_id = ?`).run(table.id);
+
+    environment.dashboards.updateDashboard(dashboard.id, { status: 'archived' });
+    expect(edit(table.id, { note: 'x' })).toMatchObject({ code: 'archived' });
+
+    expect(widgetRow(environment, table.id)).toEqual(tableBefore);
+    expect(widgetRow(environment, page.id)).toEqual(pageBefore);
+  });
+
+  it('accepts note and columnLabels on create, trimmed, and rejects malformed ones', () => {
+    const environment = openEnvironment();
+    const dashboard = environment.dashboards.createDashboard({
+      title: 'Notes',
+      widgets: [
+        { kind: 'table', title: 'T', sql: 'SELECT 7', config: { note: '  What it means.  ', columnLabels: { value: '  Plain  ', other: ' ' } } },
+        { kind: 'table', title: 'Blank', sql: 'SELECT 7', config: { note: '   ', columnLabels: { value: ' ' } } },
+      ],
+    });
+    expect(dashboard.widgets[0].config).toEqual({ note: 'What it means.', columnLabels: { value: 'Plain' } });
+    expect(dashboard.widgets[1].config).toEqual({});
+    for (const [config, message] of [
+      [{ note: 5 }, /config\.note must be text/],
+      [{ note: 'x'.repeat(2_001) }, /config\.note must be text/],
+      [{ columnLabels: { value: 1 } }, /config\.columnLabels must map/],
+      [{ columnLabels: ['value'] }, /config\.columnLabels must map/],
+      [{ columnLabels: JSON.parse('{"__proto__": "x"}') }, /config\.columnLabels must map/],
+    ] as const) {
+      expect(() => environment.dashboards.createDashboard({ title: 'Bad', widgets: [{ kind: 'table', title: 'T', sql: 'SELECT 7', config }] as any })).toThrow(message);
+    }
   });
 });

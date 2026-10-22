@@ -55,6 +55,10 @@ describe('family labels', () => {
     expect(familyOf('get_chat_messages')).toBe('captured items');
     expect(familyOf('mcp_etl_download_results')).toBe('connected tool');
     expect(familyOf('run_command')).toBe('files and commands');
+    // A BotBoy document or file can carry text from mail, Slack or the web (2026-10-21).
+    expect(familyOf('read_product_document')).toBe('documents');
+    expect(familyOf('edit_product_document')).toBe('documents');
+    expect(familyOf('edit_file')).toBe('files and commands');
     expect(familyOf('something_new')).toBe('other source');
   });
 

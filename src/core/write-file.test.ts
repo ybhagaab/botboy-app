@@ -321,16 +321,50 @@ describe('read_file handler', () => {
     expect(result).toBe('hello\nworld\nfoo\nbar');
   });
 
-  it('reads specific line range with line numbers', () => {
+  it('reads specific line range with line numbers and says which lines of how many', () => {
     fs.writeFileSync(path.join(tempDir, 'lines.txt'), 'a\nb\nc\nd\ne', 'utf-8');
     const result = readFileHandler(tempDir, { filename: 'lines.txt', startLine: 2, endLine: 4 });
-    expect(result).toBe('2: b\n3: c\n4: d');
+    expect(result).toBe('2: b\n3: c\n4: d\n[lines 2–4 of 5]');
   });
 
   it('reads from startLine to end when no endLine', () => {
     fs.writeFileSync(path.join(tempDir, 'partial.txt'), 'one\ntwo\nthree\nfour', 'utf-8');
     const result = readFileHandler(tempDir, { filename: 'partial.txt', startLine: 3 });
-    expect(result).toBe('3: three\n4: four');
+    expect(result).toBe('3: three\n4: four\n[lines 3–4 of 4]');
+  });
+
+  // Owner report 2026-10-21: a full read was cut at 40,000 characters without saying so.
+  it('returns a long file as its first whole lines, numbered, and names where to read on', () => {
+    const lines = Array.from({ length: 2_000 }, (_, index) => `row ${index + 1}: ${'x'.repeat(40)}`);
+    fs.writeFileSync(path.join(tempDir, 'long.txt'), lines.join('\n'), 'utf-8');
+    const result = readFileHandler(tempDir, { filename: 'long.txt' });
+    expect(result.length).toBeLessThanOrEqual(38_000);
+    const body = result.split('\n');
+    const note = body.pop()!;
+    const shown = body.length;
+    expect(shown).toBeGreaterThan(500);
+    expect(body).toEqual(lines.slice(0, shown).map((line, index) => `${index + 1}: ${line}`));
+    expect(note).toBe(`[read_file: long.txt is 2000 lines (${lines.join('\n').length.toLocaleString('en-US')} characters), longer than one read, so lines 1–${shown} are shown, numbered. Read on with startLine ${shown + 1}.]`);
+
+    const next = readFileHandler(tempDir, { filename: 'long.txt', startLine: shown + 1 });
+    expect(next.split('\n')[0]).toBe(`${shown + 1}: ${lines[shown]}`);
+    expect(next.length).toBeLessThanOrEqual(38_000);
+    expect(next.split('\n').pop()).toMatch(new RegExp(`^\\[lines ${shown + 1}–\\d+ of 2000; the range continues: read on with startLine \\d+\\]$`));
+  });
+
+  it('shows the start of one line longer than a read, and says the rest is past the end of a range', () => {
+    // The leading "x" puts every emoji's second half on an even offset, so a plain cut would split one.
+    fs.writeFileSync(path.join(tempDir, 'wide.txt'), `head\nx${'😀'.repeat(30_000)}\ntail`, 'utf-8');
+    const wide = readFileHandler(tempDir, { filename: 'wide.txt', startLine: 2, endLine: 2 });
+    const [line, note] = wide.split('\n');
+    expect(line.startsWith('2: x😀')).toBe(true);
+    expect(/[\ud800-\udbff]$/.test(line)).toBe(false);
+    expect(note).toMatch(/^\[lines 2–2 of 3\. Line 2 is 60,001 characters; only its first [\d,]+ are shown\.\]$/);
+    expect(readFileHandler(tempDir, { filename: 'wide.txt', startLine: 9 })).toBe('[read_file: startLine 9 is past the end; wide.txt has 3 lines]');
+    expect(readFileHandler(tempDir, { filename: 'wide.txt', startLine: 3, endLine: 2 })).toBe('[read_file: endLine 2 is before startLine 3; wide.txt has 3 lines]');
+    // A whole file that fits is returned exactly, with no note.
+    fs.writeFileSync(path.join(tempDir, 'short.json'), '{"a": 1}\n', 'utf-8');
+    expect(readFileHandler(tempDir, { filename: 'short.json' })).toBe('{"a": 1}\n');
   });
 
   it('rejects path traversal', () => {

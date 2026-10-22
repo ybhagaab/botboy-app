@@ -1,4 +1,5 @@
 import { dashboardIssues, viewIssueReports } from './analytics-dashboard-issues.js';
+import { dashboardReadForModel, widgetReadForModel } from './analytics-dashboard-read.js';
 /**
  * Tool Executor — executes tool calls returned by the LLM.
  * Replaces kiro-cli's built-in bash/file tools with sandboxed, scoped operations.
@@ -8,8 +9,9 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
+import { applyExactEdits, changedLineText, parseExactEdits } from './exact-text-edits.js';
 import type { NodeManager } from './node-manager.js';
 import type { BrainStore } from './brain-store.js';
 import { setBrainTaskState } from './brain-tasks.js';
@@ -504,34 +506,48 @@ function dataRoomAuthorizationFailure(input: {
   }));
 }
 
-/** Standalone write_file handler — accepts filesDir for testability */
-export function writeFileHandler(filesDir: string, args: { filename: string; content: string; mode?: 'overwrite' | 'append' }): string {
-  const filename = (args.filename || '').trim();
-  if (!filename) return 'Error: filename is required';
-  if (filename.includes('\0')) return 'Error: filename contains a NUL byte';
-  if (filename.split(/[\\/]/).includes('..')) return 'Error: path traversal not allowed (..)';
-  if (path.isAbsolute(filename)) return 'Error: absolute paths not allowed';
+/**
+ * A path inside BotBoy's files workspace (write_file, edit_file): no NUL, no
+ * `..` segment, not absolute, contained after resolution, and no existing
+ * symlink component. A symlink component could redirect a contained-looking
+ * write out of the workspace; the Data Room CSV reader independently rechecks
+ * realpath and exact bytes at execution.
+ */
+function containedFilesPath(
+  filesDir: string,
+  rawFilename: unknown,
+): { ok: true; filename: string; resolved: string; normalizedFilename: string } | { ok: false; error: string } {
+  const filename = (typeof rawFilename === 'string' ? rawFilename : '').trim();
+  if (!filename) return { ok: false, error: 'Error: filename is required' };
+  if (filename.includes('\0')) return { ok: false, error: 'Error: filename contains a NUL byte' };
+  if (filename.split(/[\\/]/).includes('..')) return { ok: false, error: 'Error: path traversal not allowed (..)' };
+  if (path.isAbsolute(filename)) return { ok: false, error: 'Error: absolute paths not allowed' };
 
   const filesRoot = path.resolve(filesDir);
   const resolved = path.resolve(filesRoot, filename);
   const relative = path.relative(filesRoot, resolved);
   if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    return 'Error: path escapes files directory';
+    return { ok: false, error: 'Error: path escapes files directory' };
   }
   const normalizedFilename = relative.split(path.sep).join('/');
 
-  // Existing symlink components could redirect a contained-looking write out
-  // of BotBoy's files workspace. Reject them before mkdir/write; the Data Room
-  // CSV reader independently rechecks realpath and exact bytes at execution.
   let cursor = filesRoot;
   for (const segment of relative.split(path.sep)) {
     cursor = path.join(cursor, segment);
     try {
-      if (fs.lstatSync(cursor).isSymbolicLink()) return 'Error: symlink paths are not allowed';
+      if (fs.lstatSync(cursor).isSymbolicLink()) return { ok: false, error: 'Error: symlink paths are not allowed' };
     } catch (error: any) {
-      if (error?.code !== 'ENOENT') return `Error: ${error?.message ?? error}`;
+      if (error?.code !== 'ENOENT') return { ok: false, error: `Error: ${error?.message ?? error}` };
     }
   }
+  return { ok: true, filename, resolved, normalizedFilename };
+}
+
+/** Standalone write_file handler — accepts filesDir for testability */
+export function writeFileHandler(filesDir: string, args: { filename: string; content: string; mode?: 'overwrite' | 'append' }): string {
+  const target = containedFilesPath(filesDir, args.filename);
+  if (!target.ok) return target.error;
+  const { filename, resolved, normalizedFilename } = target;
 
   // HARD LIMIT per call — prevents context overflow on next iteration when history carries
   // the tool call back. Scales with the model's context window (8000 on the 32K stack,
@@ -618,6 +634,102 @@ export function writeFileHandler(filesDir: string, args: { filename: string; con
   }
 }
 
+/** edit_file changes text files up to this size. */
+export const MAX_EDIT_FILE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Standalone edit_file handler (owner report 2026-10-21): exact find/replace
+ * pairs in an existing text file of the files workspace, each find matching
+ * exactly one place, applied in order. Everything else stays byte for byte; a
+ * failed edit writes nothing, and the write itself is atomic (temp + rename).
+ */
+export function editFileHandler(
+  filesDir: string,
+  args: { filename: string; edits: unknown },
+  options: { privateRoot?: string } = {},
+): string {
+  const target = containedFilesPath(filesDir, args.filename);
+  if (!target.ok) return target.error;
+  const { resolved, normalizedFilename } = target;
+  if (resolvesIntoPrivateState(resolved, { filesDir, ...(options.privateRoot ? { privateRoot: options.privateRoot } : {}) })) {
+    return 'Error: this path leads into BotBoy private state, which edit_file cannot change';
+  }
+  // An export is a copy of an official document: editing it would leave the
+  // document and its export saying different things.
+  if (/^document-exports\//.test(normalizedFilename)) {
+    return 'Error: this file is an export of an official Documents-page document. Change the document with edit_product_document, then export it again with export_product_document. Nothing was changed.';
+  }
+  const parsed = parseExactEdits(args.edits);
+  if (!parsed.ok) return `Error: ${parsed.message} Nothing was changed.`;
+
+  let before: fs.Stats;
+  try {
+    before = fs.lstatSync(resolved);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return `Error: ${normalizedFilename} does not exist. Create it with write_file; edit_file only changes an existing file.`;
+    return `Error: ${error?.message ?? error}`;
+  }
+  if (!before.isFile() || before.isSymbolicLink()) return 'Error: edit target is not a regular file';
+  if (before.size > MAX_EDIT_FILE_BYTES) {
+    return `Error: ${normalizedFilename} is ${before.size.toLocaleString('en-US')} bytes; edit_file changes text files up to 10 MB. Nothing was changed.`;
+  }
+  try {
+    const bytes = fs.readFileSync(resolved);
+    if (bytes.subarray(0, 8192).includes(0)) return `Error: ${normalizedFilename} is not a text file. Nothing was changed.`;
+    const original = bytes.toString('utf8');
+    if (!Buffer.from(original, 'utf8').equals(bytes)) {
+      return `Error: ${normalizedFilename} is not valid UTF-8 text, so edit_file would change bytes it was not asked to. Nothing was changed.`;
+    }
+    // A file whose every line break is CRLF is edited with LF breaks (what
+    // read_file shows) and written back with CRLF.
+    const crlf = original.includes('\r\n') && !original.replace(/\r\n/g, '').includes('\n');
+    const view = crlf ? original.replace(/\r\n/g, '\n') : original;
+    const edits = crlf
+      ? parsed.edits.map(edit => ({ find: edit.find.replace(/\r\n/g, '\n'), replace: edit.replace.replace(/\r\n/g, '\n') }))
+      : parsed.edits;
+    const applied = applyExactEdits(view, edits);
+    if (!applied.ok) {
+      const next = applied.code === 'edit_not_unique'
+        ? `Make edits[${applied.index}].find longer, with enough surrounding text to match exactly one place.`
+        : `Read the file again with read_file and copy edits[${applied.index}].find exactly, without the "N: " line-number prefix. Edits apply in order, each to the result of the one before.`;
+      return `Error: ${applied.message.replace('the current text', normalizedFilename)} ${next} Nothing was changed.`;
+    }
+    if (applied.text === view) return `Error: the edits leave ${normalizedFilename} exactly as it is. Nothing was changed.`;
+    const output = crlf ? applied.text.replace(/\n/g, '\r\n') : applied.text;
+
+    // Synchronous from read to rename, so two edits can never interleave; the
+    // rename makes the new bytes appear all at once, with the file's own mode.
+    const temporary = path.join(path.dirname(resolved), `.${path.basename(resolved)}.${randomUUID()}.tmp`);
+    try {
+      fs.writeFileSync(temporary, output, { encoding: 'utf8', flag: 'wx' });
+      fs.chmodSync(temporary, before.mode & 0o777);
+      fs.renameSync(temporary, resolved);
+    } finally {
+      fs.rmSync(temporary, { force: true });
+    }
+    const after = fs.statSync(resolved);
+    const result: Record<string, unknown> = {
+      path: resolved,
+      filename: normalizedFilename,
+      url: `/api/files/${normalizedFilename}`,
+      editsApplied: applied.changes.length,
+      changes: applied.changes.map(change => ({ edit: change.index, line: change.line, lineText: changedLineText(applied.text, change) })),
+      lineCount: applied.text.split('\n').length,
+      bytes: after.size,
+      bytesChanged: after.size - before.size,
+    };
+    if (/\.(?:csv|tsv|tab)$/i.test(normalizedFilename)) result.dataRoomSource = { kind: 'local_file', path: normalizedFilename };
+    console.log(`[edit_file] ${normalizedFilename} edits=${applied.changes.length} bytes=${before.size}→${after.size}`);
+    return JSON.stringify(result);
+  } catch (error: any) {
+    console.error(`[edit_file] ERROR editing ${normalizedFilename}: ${error?.message ?? error}`);
+    return `Error: ${error?.message ?? error}`;
+  }
+}
+
+/** Room below the 40,000-character tool-result cap for read_file's own note. */
+const READ_FILE_BUDGET_CHARS = 38_000;
+
 /** Standalone read_file handler — accepts filesDir for testability */
 export function readFileHandler(
   filesDir: string,
@@ -640,17 +752,50 @@ export function readFileHandler(
 
   try {
     const content = fs.readFileSync(resolved, 'utf-8');
+    const ranged = args.startLine != null || args.endLine != null;
 
-    if (args.startLine != null || args.endLine != null) {
-      const lines = content.split('\n');
-      const start = Math.max((args.startLine || 1) - 1, 0);
-      const end = args.endLine != null ? Math.min(args.endLine, lines.length) : lines.length;
-      console.log(`[read_file] ${filename} range=${start + 1}-${end} (total ${lines.length} lines) — likely junction verification`);
-      return lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`).join('\n');
+    // A whole file that fits comes back exactly as it is.
+    if (!ranged && content.length <= READ_FILE_BUDGET_CHARS) {
+      console.log(`[read_file] ${filename} full read (${content.length} chars)`);
+      return content;
     }
 
-    console.log(`[read_file] ${filename} full read (${content.length} chars)`);
-    return content.slice(0, MAX_MODEL_VISIBLE_TOOL_RESULT_CHARS);
+    // Otherwise numbered lines, whole lines only, and a note that says which
+    // lines of how many were shown and where to read on (owner report
+    // 2026-10-21: a full read was cut at 40,000 characters without saying so).
+    const lines = content.split('\n');
+    const total = lines.length;
+    const start = ranged ? Math.max((args.startLine || 1) - 1, 0) : 0;
+    const end = ranged && args.endLine != null ? Math.min(args.endLine, total) : total;
+    if (start >= total) return `[read_file: startLine ${start + 1} is past the end; ${filename} has ${total} lines]`;
+    if (end <= start) return `[read_file: endLine ${args.endLine} is before startLine ${start + 1}; ${filename} has ${total} lines]`;
+    const room = READ_FILE_BUDGET_CHARS - 600;
+    const shown: string[] = [];
+    let used = 0;
+    let index = start;
+    for (; index < end; index += 1) {
+      const numbered = `${index + 1}: ${lines[index]}`;
+      const cost = numbered.length + (shown.length ? 1 : 0);
+      if (used + cost > room) break;
+      shown.push(numbered);
+      used += cost;
+    }
+    let cutNote = '';
+    if (!shown.length) {
+      // One line longer than a read (embedded data): show its start.
+      let cut = room;
+      const code = lines[start].charCodeAt(cut - 1);
+      if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+      shown.push(`${start + 1}: ${lines[start].slice(0, cut)}`);
+      index = start + 1;
+      cutNote = ` Line ${start + 1} is ${lines[start].length.toLocaleString('en-US')} characters; only its first ${cut.toLocaleString('en-US')} are shown.`;
+    }
+    const shownEnd = index;
+    const note = ranged
+      ? `[lines ${start + 1}–${shownEnd} of ${total}${shownEnd < end ? `; the range continues: read on with startLine ${shownEnd + 1}` : ''}${cutNote ? `.${cutNote}` : ''}]`
+      : `[read_file: ${filename} is ${total} lines (${content.length.toLocaleString('en-US')} characters), longer than one read, so lines ${start + 1}–${shownEnd} are shown, numbered.${cutNote}${shownEnd < total ? ` Read on with startLine ${shownEnd + 1}.` : ''}]`;
+    console.log(`[read_file] ${filename} lines ${start + 1}-${shownEnd} of ${total}${ranged ? '' : ' (full read longer than one result)'}`);
+    return `${shown.join('\n')}\n${note}`;
   } catch (e: any) {
     console.error(`[read_file] ERROR reading ${filename}: ${e.message}`);
     return `Error: ${e.message}`;
@@ -3814,7 +3959,18 @@ export function createToolExecutor(
       if (!dashboard) return `Error: dashboard ${dashboardId} not found`;
       // Warnings & issues the owner sees on the page (data checks + view checks).
       const issues = dashboardIssues(dashboard, viewIssueReports.get(dashboard.id));
-      return JSON.stringify({ ...dashboard, issues }, null, 1);
+      // Both reads fit under the tool-result cap by design (analytics-dashboard-read.ts).
+      const widgetId = typeof args.widgetId === 'string' ? args.widgetId.trim() : '';
+      if (widgetId) {
+        const widget = dashboard.widgets.find(item => item.id === widgetId);
+        if (!widget) {
+          return `Error: widget ${widgetId} is not on dashboard ${dashboardId}. Its widgets: ${dashboard.widgets.map(item => `${item.id} "${item.title}"`).join(', ')}`;
+        }
+        const htmlOffset = args.htmlOffset === undefined || args.htmlOffset === null ? 0 : Number(args.htmlOffset);
+        if (!Number.isInteger(htmlOffset) || htmlOffset < 0) return 'Error: htmlOffset must be a whole number of characters, 0 or more';
+        return widgetReadForModel(dashboard, widget, issues, { htmlOffset });
+      }
+      return dashboardReadForModel(dashboard, issues);
     },
 
     create_analytics_dashboard: async (args, context) => {
@@ -4390,31 +4546,13 @@ export function createToolExecutor(
 
     write_file: (args, context: ToolExecutionContext = {}) => {
       const filesDir = `${os.homedir()}/.personal-productivity-tracker/files`;
-      const output = writeFileHandler(filesDir, args);
-      if (!projectArtifacts || output.startsWith('Error:')) return output;
-      try {
-        const receipt = JSON.parse(output);
-        const artifact = projectArtifacts.registerFile(
-          String(receipt.path || ''),
-          context.authoritativeProjectIds || [],
-          'explicit_context',
-        );
-        if (!artifact) return output;
-        return JSON.stringify({
-          ...receipt,
-          artifact: {
-            id: artifact.id,
-            projectId: artifact.projectId,
-            assignment: artifact.assignment,
-            assignmentRequired: artifact.assignmentRequired,
-            nextAction: artifact.assignmentRequired
-              ? 'Ask the owner which project should own this HTML artifact, or leave it unassigned.'
-              : 'The HTML artifact is available in the owning project Artifacts tab.',
-          },
-        });
-      } catch {
-        return output;
-      }
+      return withProjectArtifactReceipt(writeFileHandler(filesDir, args), context);
+    },
+
+    // An edited HTML artifact keeps its project row current (sha, bytes), as a write does.
+    edit_file: (args, context: ToolExecutionContext = {}) => {
+      const filesDir = `${os.homedir()}/.personal-productivity-tracker/files`;
+      return withProjectArtifactReceipt(editFileHandler(filesDir, args), context);
     },
 
     read_file: (args) => {
@@ -4514,6 +4652,34 @@ export function createToolExecutor(
       return rows.map((r: any) => `[${r.id}] ${r.role}: ${(r.content || '').slice(0, 1000)}`).join('\n\n');
     },
   };
+
+  /** A write_file/edit_file receipt, plus the project artifact an HTML file belongs to. */
+  function withProjectArtifactReceipt(output: string, context: ToolExecutionContext): string {
+    if (!projectArtifacts || output.startsWith('Error:')) return output;
+    try {
+      const receipt = JSON.parse(output);
+      const artifact = projectArtifacts.registerFile(
+        String(receipt.path || ''),
+        context.authoritativeProjectIds || [],
+        'explicit_context',
+      );
+      if (!artifact) return output;
+      return JSON.stringify({
+        ...receipt,
+        artifact: {
+          id: artifact.id,
+          projectId: artifact.projectId,
+          assignment: artifact.assignment,
+          assignmentRequired: artifact.assignmentRequired,
+          nextAction: artifact.assignmentRequired
+            ? 'Ask the owner which project should own this HTML artifact, or leave it unassigned.'
+            : 'The HTML artifact is available in the owning project Artifacts tab.',
+        },
+      });
+    } catch {
+      return output;
+    }
+  }
 
   return {
     async executeTool(call: ToolCall, context: ToolExecutionContext = {}): Promise<ToolResult> {

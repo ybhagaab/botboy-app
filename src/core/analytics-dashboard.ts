@@ -70,6 +70,12 @@ export function isStaticWidgetKind(kind: unknown): boolean {
 }
 /** An html view's own markup, CSS, and script (sandboxed in the UI). */
 export const MAX_HTML_WIDGET_BYTES = 400 * 1024;
+/** config.note: plain text shown in italics under a widget (presentation only). */
+export const MAX_WIDGET_NOTE_CHARS = 2_000;
+/** config.columnLabels: table header display names by exact result column name. */
+export const MAX_COLUMN_LABELS = 64;
+export const MAX_COLUMN_LABEL_CHARS = 120;
+const MAX_HTML_EDITS = 30;
 const WIDGET_KEY_RE = /^[a-z][a-z0-9_]{0,47}$/;
 /** Rows a Data Room widget may carry (html views cut and filter them in the page). */
 export const MAX_DATA_ROOM_WIDGET_ROWS = 5000;
@@ -483,12 +489,13 @@ function normalizeWidget(
   const title = cleanText(input.title, `Widget ${position + 1} title`, 200, true);
   const subtitle = cleanText(input.subtitle, `Widget ${position + 1} subtitle`, 500);
   let preset = cleanText(input.preset, `Widget ${position + 1} preset`, 256);
-  const config = jsonObject(input.config);
-  if (Object.prototype.hasOwnProperty.call(config, 'dataSource')) {
+  const rawConfig = jsonObject(input.config);
+  if (Object.prototype.hasOwnProperty.call(rawConfig, 'dataSource')) {
     throw new Error(`Widget ${position + 1} config.dataSource is server-owned; give the widget's data source as widget.source instead ({kind:"data_room_query", datasetId, sql} for a Data Room dataset)`);
   }
   const source = input.source as unknown;
-  validateLayoutConfig(config, position);
+  validateLayoutConfig(rawConfig, position);
+  const config = normalizePresentationConfig(rawConfig, position);
   if (input.kind === 'text') {
     if (source !== undefined) throw new Error(`Widget ${position + 1} is a text widget; remove source`);
     const text = cleanText(config.text, `Widget ${position + 1} text`, 20_000, true);
@@ -540,6 +547,47 @@ function normalizeWidget(
     nextConfig = { ...nextConfig, spec: validateVisualizationSpec(config.spec) };
   }
   return { kind: input.kind, title, subtitle, ...(sql ? { sql } : {}), preset, config: nextConfig };
+}
+
+/**
+ * A valid columnLabels map with empty labels dropped, or null when the value is malformed.
+ * Keys are exact result column names; values are what the table header shows.
+ */
+export function columnLabelsFrom(value: unknown): Record<string, string> | null {
+  if (!isPlainObject(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length > MAX_COLUMN_LABELS) return null;
+  const labels: Record<string, string> = {};
+  for (const [column, label] of entries) {
+    if (!column || column.length > 200 || ['__proto__', 'constructor', 'prototype'].includes(column) || typeof label !== 'string') return null;
+    const text = label.trim().normalize('NFC');
+    if (text.length > MAX_COLUMN_LABEL_CHARS) return null;
+    if (text) labels[column] = text;
+  }
+  return labels;
+}
+
+/** Presentation fields any widget may carry: note (italic text under it) and columnLabels. Empty ones are dropped. */
+function normalizePresentationConfig(config: Record<string, unknown>, position: number): Record<string, unknown> {
+  if (config.note === undefined && config.columnLabels === undefined) return config;
+  const next = { ...config };
+  if (config.note !== undefined) {
+    if (typeof config.note !== 'string' || config.note.trim().length > MAX_WIDGET_NOTE_CHARS) {
+      throw new Error(`Widget ${position + 1} config.note must be text of at most ${MAX_WIDGET_NOTE_CHARS.toLocaleString('en-US')} characters`);
+    }
+    const note = config.note.trim().normalize('NFC');
+    if (note) next.note = note;
+    else delete next.note;
+  }
+  if (config.columnLabels !== undefined) {
+    const labels = columnLabelsFrom(config.columnLabels);
+    if (!labels) {
+      throw new Error(`Widget ${position + 1} config.columnLabels must map result column names to display names (at most ${MAX_COLUMN_LABELS}, each at most ${MAX_COLUMN_LABEL_CHARS} characters)`);
+    }
+    if (Object.keys(labels).length) next.columnLabels = labels;
+    else delete next.columnLabels;
+  }
+  return next;
 }
 
 /** Layout fields any widget may carry: key (html views read it by key), hidden, span (1–12 columns). */
@@ -1345,11 +1393,78 @@ export function createAnalyticsDashboardService(options: {
     return JSON.parse(JSON.stringify(value)) as T;
   }
 
+  /** Presentation fields the edit schema accepts; the second list is presentation-action only. */
+  const PRESENTATION_KEYS = ['renderer', 'title', 'subtitle', 'layout', 'note', 'columnLabels', 'text', 'html', 'htmlEdits', 'span', 'hidden'];
+  const IN_PLACE_PRESENTATION_KEYS = ['note', 'columnLabels', 'text', 'html', 'htmlEdits', 'span', 'hidden'] as const;
+
+  /** note, column labels, text, html, span and hidden: validated before any read or write. */
+  function normalizeInPlacePresentation(value: Record<string, unknown>): Partial<AnalyticsWidgetEditPresentation> {
+    const out: Partial<AnalyticsWidgetEditPresentation> = {};
+    if (value.note !== undefined) {
+      if (typeof value.note !== 'string' || value.note.trim().length > MAX_WIDGET_NOTE_CHARS) {
+        editError('invalid_input', `presentation.note must be text of at most ${MAX_WIDGET_NOTE_CHARS.toLocaleString('en-US')} characters.`, 'Shorten the note, or send an empty string to remove it.');
+      }
+      out.note = value.note.trim().normalize('NFC');
+    }
+    if (value.columnLabels !== undefined) {
+      const labels = columnLabelsFrom(value.columnLabels);
+      if (!labels) {
+        editError('invalid_input', `presentation.columnLabels must map result column names to display names (at most ${MAX_COLUMN_LABELS}, each at most ${MAX_COLUMN_LABEL_CHARS} characters).`, 'Send {"exact_column_name": "Plain label"} for every column to relabel; {} removes all labels.');
+      }
+      out.columnLabels = labels;
+    }
+    if (value.text !== undefined) {
+      if (typeof value.text !== 'string' || !value.text.trim() || value.text.trim().length > 20_000) {
+        editError('invalid_input', 'presentation.text must be non-empty text of at most 20,000 characters.', 'Send the text widget\'s complete new text.');
+      }
+      out.text = value.text.trim().normalize('NFC');
+    }
+    if (value.html !== undefined) {
+      if (typeof value.html !== 'string' || !value.html.trim()) {
+        editError('invalid_input', 'presentation.html must be the complete, non-empty page.', 'Send the whole page, or use htmlEdits for a few exact changes.');
+      }
+      if (Buffer.byteLength(value.html, 'utf8') > MAX_HTML_WIDGET_BYTES) {
+        editError('invalid_input', `presentation.html exceeds ${MAX_HTML_WIDGET_BYTES / 1024} KB.`, 'Shorten the page.');
+      }
+      out.html = value.html;
+    }
+    if (value.htmlEdits !== undefined) {
+      if (!Array.isArray(value.htmlEdits) || value.htmlEdits.length < 1 || value.htmlEdits.length > MAX_HTML_EDITS) {
+        editError('invalid_input', `presentation.htmlEdits must be a list of 1 to ${MAX_HTML_EDITS} {find, replace} edits.`, 'Send each change as {find: exact current text, replace: new text}.');
+      }
+      out.htmlEdits = value.htmlEdits.map((edit: unknown, index: number) => {
+        if (!isPlainObject(edit)) editError('invalid_input', `presentation.htmlEdits[${index}] must be {find, replace}.`, 'Send each change as {find: exact current text, replace: new text}.');
+        assertOnlyKeys(edit, ['find', 'replace'], `presentation.htmlEdits[${index}]`);
+        if (typeof edit.find !== 'string' || !edit.find || typeof edit.replace !== 'string') {
+          editError('invalid_input', `presentation.htmlEdits[${index}] needs a non-empty find and a replace, both text.`, 'Copy find exactly from the page get_analytics_dashboard returns for this widget.');
+        }
+        return { find: edit.find, replace: edit.replace };
+      });
+    }
+    if (out.html !== undefined && out.htmlEdits !== undefined) {
+      editError('invalid_input', 'Send presentation.html or presentation.htmlEdits, not both.', 'Use htmlEdits for a few exact changes, html to replace the whole page.');
+    }
+    if (value.span !== undefined) {
+      if (!Number.isInteger(value.span) || (value.span as number) < 1 || (value.span as number) > 12) {
+        editError('invalid_input', 'presentation.span must be a whole number of grid columns from 1 to 12.', 'Use 12 for full width or 6 for half.');
+      }
+      out.span = value.span as number;
+    }
+    if (value.hidden !== undefined) {
+      if (typeof value.hidden !== 'boolean') {
+        editError('invalid_input', 'presentation.hidden must be true or false.', 'true keeps a data widget off the page; its rows still feed html views.');
+      }
+      out.hidden = value.hidden;
+    }
+    return out;
+  }
+
   function normalizeEditPresentation(value: unknown): AnalyticsWidgetEditPresentation | undefined {
     if (value === undefined) return undefined;
-    if (!isPlainObject(value)) editError('invalid_input', 'presentation must be a plain object.', 'Provide only renderer, title, subtitle, or layout.');
-    assertOnlyKeys(value, ['renderer', 'title', 'subtitle', 'layout'], 'presentation');
-    if (!Object.keys(value).length) editError('invalid_input', 'presentation must contain at least one change.', 'Provide a renderer, title, subtitle, or layout.');
+    if (!isPlainObject(value)) editError('invalid_input', 'presentation must be a plain object.', 'Provide only the presentation fields to change.');
+    assertOnlyKeys(value, PRESENTATION_KEYS, 'presentation');
+    if (!Object.keys(value).length) editError('invalid_input', 'presentation must contain at least one change.', 'Provide at least one presentation field to change.');
+    const inPlace = normalizeInPlacePresentation(value);
     const renderer = value.renderer;
     if (renderer !== undefined && !['line', 'bar', 'area', 'point'].includes(String(renderer))) {
       editError('invalid_input', 'presentation.renderer must be line, bar, area, or point.', 'Choose one supported data-preserving renderer.');
@@ -1369,6 +1484,7 @@ export function createAnalyticsDashboardService(options: {
       ...(title === undefined ? {} : { title }),
       ...(subtitle === undefined ? {} : { subtitle }),
       ...(layout === undefined ? {} : { layout: layout as AnalyticsWidgetEditPresentation['layout'] }),
+      ...inPlace,
     };
   }
 
@@ -1399,6 +1515,9 @@ export function createAnalyticsDashboardService(options: {
         editError('invalid_input', 'dateRange must contain ordered inclusive YYYY-MM-DD dates.', 'Correct the requested start/end dates.');
       }
       dateRange = { start, end };
+    }
+    if (presentation && action !== 'presentation' && IN_PLACE_PRESENTATION_KEYS.some(key => presentation[key] !== undefined)) {
+      editError('invalid_input', `${IN_PLACE_PRESENTATION_KEYS.join(', ')} apply only to action=presentation.`, 'Send them in a separate presentation edit of the widget.');
     }
     if (action === 'presentation') {
       if (widgetIds.length !== 1 || !presentation || presentation.layout || dateRange) editError('invalid_input', 'presentation requires one widget, presentation fields, no layout, and no dateRange.', 'Submit one exact presentation-only edit.');
@@ -1488,12 +1607,31 @@ export function createAnalyticsDashboardService(options: {
     };
   }
 
-  function presentationWidget(
-    source: AnalyticsWidget,
+  /** An html view's page after exact replacements, applied in order; each find must occur exactly once. */
+  function applyHtmlEdits(html: string, edits: Array<{ find: string; replace: string }>, widgetId: string): string {
+    let next = html;
+    edits.forEach((edit, index) => {
+      const at = next.indexOf(edit.find);
+      if (at < 0) {
+        editError('invalid_input', `htmlEdits[${index}].find does not occur in the page of widget ${widgetId}.`, 'Read the widget again with get_analytics_dashboard (dashboardId and widgetId) and copy the exact current text. Edits apply in order, each to the result of the one before.');
+      }
+      if (next.indexOf(edit.find, at + 1) >= 0) {
+        editError('invalid_input', `htmlEdits[${index}].find occurs more than once in the page of widget ${widgetId}.`, 'Make find longer so it matches exactly one place.');
+      }
+      next = next.slice(0, at) + edit.replace + next.slice(at + edit.find.length);
+    });
+    return next;
+  }
+
+  /**
+   * A widget's config after a presentation edit: renderer, note, column labels,
+   * text, html, span and hidden. Its query, source, key and inputs never change.
+   */
+  function presentationConfig(
+    source: Pick<AnalyticsWidget, 'id' | 'kind' | 'config'>,
     presentation: AnalyticsWidgetEditPresentation,
-    position: number,
-  ): AnalyticsWidgetInput {
-    let config = cloneJsonValue(source.config);
+  ): Record<string, unknown> {
+    let config = cloneJsonValue(source.config ?? {});
     if (presentation.renderer) {
       if (source.kind !== 'visualization') editError('invalid_input', `Widget ${source.id} is not a visualization.`, 'Choose a visualization source for renderer changes.');
       const spec = cloneJsonValue(jsonObject(config.spec));
@@ -1506,14 +1644,138 @@ export function createAnalyticsDashboardService(options: {
         : presentation.renderer;
       config = { ...config, spec };
     }
+    if (presentation.note !== undefined) {
+      if (presentation.note) config.note = presentation.note;
+      else delete config.note;
+    }
+    if (presentation.columnLabels !== undefined) {
+      if (Object.keys(presentation.columnLabels).length) config.columnLabels = { ...presentation.columnLabels };
+      else delete config.columnLabels;
+    }
+    if (presentation.text !== undefined) {
+      if (source.kind !== 'text') editError('invalid_input', `Widget ${source.id} is not a text widget.`, 'Use text only on a text widget; a line under a data widget is note.');
+      config.text = presentation.text;
+    }
+    if (presentation.html !== undefined || presentation.htmlEdits !== undefined) {
+      if (source.kind !== 'html') editError('invalid_input', `Widget ${source.id} is not an html view.`, 'Use html or htmlEdits only on an html view widget.');
+      let html = presentation.html ?? String(config.html ?? '');
+      if (presentation.htmlEdits) html = applyHtmlEdits(html, presentation.htmlEdits, source.id);
+      if (!html.trim()) editError('invalid_input', `The page of widget ${source.id} would be empty.`, 'Keep the page content.');
+      if (Buffer.byteLength(html, 'utf8') > MAX_HTML_WIDGET_BYTES) {
+        editError('invalid_input', `The page of widget ${source.id} would exceed ${MAX_HTML_WIDGET_BYTES / 1024} KB.`, 'Shorten the page.');
+      }
+      config.html = html;
+    }
+    if (presentation.span !== undefined) config.span = presentation.span;
+    if (presentation.hidden !== undefined) {
+      if (presentation.hidden) config.hidden = true;
+      else delete config.hidden;
+    }
+    return config;
+  }
+
+  function presentationWidget(
+    source: AnalyticsWidget,
+    presentation: AnalyticsWidgetEditPresentation,
+    position: number,
+  ): AnalyticsWidgetInput {
     return normalizeWidget({
       kind: source.kind,
       title: presentation.title === undefined ? source.title : presentation.title,
       subtitle: presentation.subtitle === undefined ? source.subtitle : presentation.subtitle,
       sql: source.sql,
       preset: source.preset,
-      config,
+      config: presentationConfig(source, presentation),
     }, position);
+  }
+
+  /** The loaded result after a presentation edit: the same rows, widgetRevision following the widget, a text widget's new text. */
+  function presentedResult(result: AnalyticsWidgetResult, revision: number, text?: string): AnalyticsWidgetResult {
+    const next = cloneJsonValue(result);
+    const source = next.source as unknown as Record<string, unknown> | undefined;
+    if (source && typeof source.widgetRevision === 'number') source.widgetRevision = revision;
+    if (text !== undefined && next.trust === 'local_static_content' && next.columns?.[0] === 'text') next.rows = [[text]];
+    return next;
+  }
+
+  /**
+   * A presentation edit of a widget without a managed Data Room binding
+   * (warehouse SQL/ETL, an independent Data Room source, text, an html view).
+   * Changes only how the widget reads: it keeps its ID, query, source and
+   * loaded rows, and starts no run. Bound widgets keep the R4 path below.
+   */
+  function editUnboundPresentation(input: AnalyticsWidgetEditInput): AnalyticsWidgetEditMutationResult {
+    const { dashboardId } = input;
+    const widgetId = input.widgetIds[0];
+    const presentation = input.presentation!;
+    const persisted = db.prepare('SELECT status FROM analytics_dashboards WHERE id = ?').get(dashboardId) as { status: string } | undefined;
+    if (!persisted) editError('not_found', `Dashboard ${dashboardId} was not found.`, 'Copy the exact current dashboard ID.');
+    if (persisted.status === 'archived') editError('archived', `Dashboard ${dashboardId} is archived.`, 'Restore the dashboard before editing its widgets.');
+    const running = activeRun(dashboardId);
+    if (running) {
+      editError('active_run', `Dashboard edit conflicts with refresh ${running.id} (${running.status}).`, `Wait for run ${running.id} to finish (get_analytics_dashboard shows it), then send the same edit once.`);
+    }
+    const row = db.prepare('SELECT * FROM analytics_widgets WHERE id = ? AND dashboard_id = ?').get(widgetId, dashboardId);
+    if (!row) editError('not_found', `Widget ${widgetId} was not found in dashboard ${dashboardId}.`, 'Copy the exact current widget ID from get_analytics_dashboard.');
+    const pendingLate = db.prepare(`
+      SELECT 1 FROM analytics_late_etl_results
+      WHERE widget_id = ? AND state IN ('pending','checking') LIMIT 1
+    `).get(widgetId);
+    if (pendingLate) {
+      editError('conflict', `Widget ${widgetId} is waiting for a late Datanet result.`, 'Let that result arrive first (get_analytics_dashboard shows it), then send the same edit once.');
+    }
+    const current = mapWidget(row);
+    const config = presentationConfig(current, presentation);
+    if (presentation.renderer) {
+      try {
+        config.spec = validateVisualizationSpec(config.spec);
+      } catch (error) {
+        editError('invalid_input', error instanceof Error ? error.message : 'The visualization spec was rejected.', 'Change only the title, subtitle or note of this chart.');
+      }
+    }
+    const title = presentation.title ?? current.title;
+    const subtitle = presentation.subtitle ?? current.subtitle;
+    const result = current.result
+      ? presentedResult(current.result, current.revision + 1, presentation.text)
+      : undefined;
+    db.transaction(() => {
+      const changed = db.prepare(`
+        UPDATE analytics_widgets
+        SET title = ?, subtitle = ?, config_json = ?, result_json = ?,
+            revision = revision + 1, updated_at = datetime('now')
+        WHERE id = ? AND dashboard_id = ? AND revision = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM analytics_runs run
+            WHERE run.dashboard_id = analytics_widgets.dashboard_id
+              AND run.status IN ('queued','running')
+          )
+      `).run(
+        title,
+        subtitle || '',
+        JSON.stringify(config),
+        result ? JSON.stringify(result) : null,
+        widgetId,
+        dashboardId,
+        current.revision,
+      );
+      if (changed.changes !== 1) editError('conflict', 'Widget changed during the presentation edit.', 'Read the widget again and send the edit once.');
+      // Open dashboard pages refresh on this (currentAnalyticsVersion).
+      db.prepare(`UPDATE analytics_dashboards SET updated_at = datetime('now') WHERE id = ?`).run(dashboardId);
+    })();
+    return {
+      action: 'presentation',
+      dashboardId,
+      sourceWidgetIds: [widgetId],
+      widget: mapWidget(db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(widgetId)),
+      resultDisposition: 'preserved',
+    };
+  }
+
+  /** True when the widget has a managed Data Room binding: the R4 composite owns its edits. */
+  function hasManagedBinding(dashboardId: string, widgetId: string): boolean {
+    const row = db.prepare('SELECT 1 FROM analytics_widgets WHERE id = ? AND dashboard_id = ?').get(widgetId, dashboardId);
+    if (!row) return false;
+    return Boolean(db.prepare('SELECT 1 FROM analytics_widget_dataset_bindings WHERE widget_id = ?').get(widgetId));
   }
 
   function assertCommonRowset(
@@ -2014,6 +2276,10 @@ export function createAnalyticsDashboardService(options: {
     rawIdentity?: AnalyticsWidgetEditRequestIdentity,
   ): AnalyticsWidgetEditMutationResult {
     const input = normalizeWidgetEditInput(rawInput);
+    // How a widget reads is editable on any widget, with or without a binding.
+    if (input.action === 'presentation' && !hasManagedBinding(input.dashboardId, input.widgetIds[0])) {
+      return editUnboundPresentation(input);
+    }
     const durable = input.action === 'add_from_widget' || input.action === 'combine_compatible_widgets';
     let identity = durable ? normalizeDurableEditIdentity(input, rawIdentity) : undefined;
     try {

@@ -4,13 +4,19 @@ import os from 'node:os';
 import path from 'node:path';
 import type { ToolCall } from '../core/llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from '../core/tool-executor.js';
+import { changedLineText } from '../core/exact-text-edits.js';
 import { DocumentExportError, exportDocument, isDocumentExportFormat } from './document-exporter.js';
+import { ProductDocumentEditError } from './document-service.js';
+import { documentVersionOf, productDocumentListForModel, productDocumentReadForModel } from './document-read.js';
 import { DOCUMENT_MATURITIES } from './types.js';
 import type { ProductDocumentPublicationService } from './product-document-publications.js';
 import type {
   DocumentMaturity,
+  EditAuthoredDocumentRequest,
+  EditAuthoredDocumentResult,
   ProductDocumentArtifact,
   ProductDocumentService,
+  ProductDocumentSummary,
   SaveAuthoredDocumentRequest,
   SteEnforcementMode,
 } from './types.js';
@@ -130,6 +136,74 @@ function saveReceipt(artifact: ProductDocumentArtifact) {
     next: artifact.persisted
       ? `The document is saved. Link the owner to #/documents/${encodeURIComponent(artifact.artifactId)} and mention notable advisory findings honestly.`
       : 'No durable product-document store is configured, so the document was NOT saved. Say so plainly.',
+  };
+}
+
+/** The id in an artifactId argument, also when the model pastes the reader link (#/documents/<id>). */
+function artifactIdArgument(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  const link = /(?:^|#|\/)documents\/([^/?#\s]+)\/?$/.exec(trimmed);
+  if (!link) return trimmed;
+  try {
+    return decodeURIComponent(link[1]);
+  } catch {
+    return link[1];
+  }
+}
+
+function lineArgument(value: unknown): number | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  return Number.isInteger(value) && (value as number) >= 1 ? value as number : null;
+}
+
+/** What the chat model needs after a targeted edit: what changed and where, and the honest check state. */
+function editReceipt(edited: EditAuthoredDocumentResult, chain: readonly ProductDocumentSummary[]) {
+  const { artifact } = edited;
+  const findingCounts = artifact.validation.findings.reduce<Record<string, number>>((counts, finding) => {
+    counts[finding.severity] = (counts[finding.severity] ?? 0) + 1;
+    return counts;
+  }, {});
+  const version = documentVersionOf(artifact.artifactId, chain);
+  const link = `#/documents/${encodeURIComponent(artifact.artifactId)}`;
+  return {
+    ok: artifact.persisted,
+    persisted: artifact.persisted,
+    artifactId: artifact.artifactId,
+    parentArtifactId: edited.parent.artifactId,
+    title: brief(artifact.title),
+    ...(artifact.title !== edited.parent.title ? { previousTitle: brief(edited.parent.title) } : {}),
+    ...(artifact.projectId ? { projectId: artifact.projectId } : { unassigned: true }),
+    version: { number: version.number, of: version.of },
+    editsApplied: edited.changes.length,
+    changes: edited.changes.map((change) => ({
+      edit: change.index,
+      line: change.line,
+      lineText: changedLineText(artifact.content, change),
+    })),
+    totalLines: artifact.content.split('\n').length,
+    contentChars: artifact.content.length,
+    charsChanged: artifact.content.length - edited.parent.contentChars,
+    ...(artifact.citations?.length ? { citationCount: artifact.citations.length } : {}),
+    ...(edited.citationsAdded.length ? { citationsAdded: edited.citationsAdded } : {}),
+    ...(edited.citationsReplaced.length ? { citationsReplaced: edited.citationsReplaced } : {}),
+    ...(edited.citationsDropped.length ? { citationsDropped: edited.citationsDropped, citationsDroppedNote: 'The edits removed the last marker of these citations, so they left the document with it.' } : {}),
+    ...(edited.markersWithoutCitation.length ? {
+      markersWithoutCitation: edited.markersWithoutCitation,
+      markersNote: 'These new markers have no citation, so the reader shows them as plain text. Add citations with these ids in another edit, or remove the markers.',
+    } : {}),
+    validationStatus: artifact.validation.status,
+    findingCounts,
+    advisoryFindings: artifact.validation.findings.slice(0, 5).map((finding) => ({
+      code: finding.code,
+      severity: finding.severity,
+      message: brief(finding.message),
+    })),
+    conformance: 'Not run: a targeted edit gets the quick advisory checks only. Full rewrites saved with save_product_document get the review.',
+    documentsUrl: artifact.persisted ? link : null,
+    next: artifact.persisted
+      ? `Saved as version ${version.number} of ${version.of}. Link the owner to ${link} and say in a sentence what changed. To check a change, read_product_document with startLine and endLine around its line.`
+      : 'No durable product-document store is configured, so the edit was NOT saved. Say so plainly.',
   };
 }
 
@@ -292,6 +366,64 @@ export function withProductDocumentChatTools(
               ? { exported: false, code: error.code, artifactId, format: args.format }
               : { exported: false, artifactId, format: args.format },
           );
+        }
+      }
+
+      if (call.function.name === 'read_product_document') {
+        const args = parseArguments(call);
+        if (!args) return result(call, { ok: false, error: 'Tool arguments must be one JSON object.' }, true);
+        const startLine = lineArgument(args.startLine);
+        const endLine = lineArgument(args.endLine);
+        if (startLine === null || endLine === null) {
+          return result(call, { ok: false, error: 'startLine and endLine must be whole numbers, 1 or more.', nextAction: 'Omit them to read from the start.' }, true);
+        }
+        const artifactId = artifactIdArgument(args.artifactId);
+        if (!artifactId) {
+          const query = typeof args.query === 'string' ? args.query.trim().slice(0, 200) : '';
+          const projectId = typeof args.projectId === 'string' && args.projectId.trim() ? args.projectId.trim().slice(0, 200) : undefined;
+          try {
+            const summaries = service.listArtifacts(100, projectId ? { projectId } : undefined);
+            return result(call, productDocumentListForModel(summaries, (id) => service.getVersionChain(id).length, { query, ...(projectId ? { projectId } : {}) }));
+          } catch (error) {
+            return result(call, { ok: false, error: error instanceof Error ? error.message : 'Listing documents failed.' }, true);
+          }
+        }
+        const artifact = service.getArtifact(artifactId);
+        if (!artifact) {
+          return result(call, {
+            ok: false,
+            code: 'not_found',
+            error: `Document version ${artifactId} was not found.`,
+            nextAction: 'Call read_product_document without artifactId, with words from the title as query, to find the document and its newest artifactId.',
+          }, true);
+        }
+        return result(call, productDocumentReadForModel(artifact, service.getVersionChain(artifact.artifactId), {
+          ...(startLine === undefined ? {} : { startLine }),
+          ...(endLine === undefined ? {} : { endLine }),
+        }));
+      }
+
+      if (call.function.name === 'edit_product_document') {
+        const args = parseArguments(call);
+        if (!args) return errorResult(call, 'Tool arguments must be one JSON object.');
+        if (args.ownerRequested !== true) {
+          return errorResult(call, 'ownerRequested must be true — edit a document only when the owner asked for this change in this conversation.');
+        }
+        try {
+          const edited = service.editAuthoredDocument({
+            artifactId: artifactIdArgument(args.artifactId),
+            edits: args.edits as EditAuthoredDocumentRequest['edits'],
+            ...(args.title !== undefined ? { title: args.title as string } : {}),
+            ...(args.citations !== undefined ? { citations: args.citations as EditAuthoredDocumentRequest['citations'] } : {}),
+          });
+          return result(call, editReceipt(edited, service.getVersionChain(edited.artifact.artifactId)));
+        } catch (error) {
+          if (error instanceof ProductDocumentEditError) {
+            return errorResult(call, error.message, { code: error.code, nextAction: error.nextAction, ...error.details });
+          }
+          return errorResult(call, error instanceof Error ? error.message : 'Editing the document failed.', {
+            nextAction: 'Nothing was saved. Read the document again with read_product_document before trying once more.',
+          });
         }
       }
 

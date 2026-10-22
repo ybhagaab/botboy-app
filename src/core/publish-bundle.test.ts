@@ -170,3 +170,57 @@ describe('html views in a published bundle', () => {
     expect(a.manifestSha256).not.toBe(b.manifestSha256);
   });
 });
+
+/**
+ * Plain wording on a shared copy (2026-10-21): config.columnLabels names a
+ * table's headers and config.note sits in italics under the widget, as in
+ * BotBoy's own page. Both are owner-facing text, escaped like every title.
+ */
+describe('column labels and notes in a published bundle', () => {
+  const table = (config: Record<string, unknown>, id = 'w_table') => ({
+    id, dashboardId: 'dash_test', position: 0, revision: 1, bindingRevision: 0, kind: 'table', title: 'Weekly', subtitle: '',
+    preset: '', config,
+    result: { trust: 'local_verified_data', columns: ['wk', 'dau', 'constructor'], rows: [['2026-W40', 12, 1]], rowCount: 1, displayedRowCount: 1, refreshedAt: '2026-10-10T00:00:00.000Z' },
+  });
+  const index = (widgets: unknown[]) => String(renderDashboardBundle(dashboard({ widgets } as any), '2026-10-10T01:00:00.000Z', { vendorDir })
+    .files.find(file => file.path === 'index.html')!.content);
+
+  it('labels the headers, keeps unlabelled columns, and puts the escaped note between the body and the footer', () => {
+    const html = index([table({ columnLabels: { wk: ' Week <b> ', dau: 'Daily users' }, note: ' Daily users: people who\nplayed <one> title. ' })]);
+    expect(html).toContain('<th>Week &lt;b&gt;</th><th>Daily users</th><th>constructor</th>');
+    expect(html).toContain('</section><p class="note">Daily users: people who<br>played &lt;one&gt; title.</p><footer>');
+  });
+
+  it('shows the raw column names and no note when neither is set, or when they are blank', () => {
+    for (const config of [{}, { note: '   ', columnLabels: { wk: '  ' } }, { note: 7, columnLabels: ['Week'] }]) {
+      const html = index([table(config)]);
+      expect(html).toContain('<th>wk</th><th>dau</th><th>constructor</th>');
+      expect(html).not.toContain('class="note"');
+    }
+  });
+
+  it('labels the no-script rows of a chart and notes a hidden data widget under "Data behind this dashboard"', () => {
+    const chart = { ...table({ spec: { mark: 'bar' }, columnLabels: { dau: 'Daily users' } }, 'w_chart'), kind: 'visualization', position: 1 };
+    const hidden = table({ hidden: true, note: 'Behind the page.' }, 'w_hidden');
+    const html = index([chart, { ...hidden, position: 2 }]);
+    expect(html).toMatch(/<noscript><div class="table-wrap"><table><thead><tr><th>wk<\/th><th>Daily users<\/th>/);
+    const details = html.slice(html.indexOf('<details class="hidden-data">'));
+    expect(details).toContain('<p class="note">Behind the page.</p>');
+  });
+
+  it('puts an html view\'s note under its frame, as BotBoy\'s page does', () => {
+    const view = {
+      id: 'w_view', dashboardId: 'dash_test', position: 0, revision: 1, bindingRevision: 0, kind: 'html', title: 'Overview', subtitle: '',
+      preset: '', config: { html: '<p>x</p>', inputs: [], note: 'About this page.' },
+      result: { trust: 'local_static_content', columns: ['html'], rows: [['html view']], rowCount: 1, displayedRowCount: 1, refreshedAt: '2026-10-10T00:00:00.000Z' },
+    };
+    expect(index([view])).toContain('loading="eager"></iframe><p class="note">About this page.</p></article>');
+  });
+
+  it('a changed note or label changes the publication hash', () => {
+    const hash = (config: Record<string, unknown>) => renderDashboardBundle(dashboard({ widgets: [table(config)] } as any), '2026-10-10T01:00:00.000Z', { vendorDir }).manifestSha256;
+    const base = hash({ note: 'One.', columnLabels: { wk: 'Week' } });
+    expect(hash({ note: 'Two.', columnLabels: { wk: 'Week' } })).not.toBe(base);
+    expect(hash({ note: 'One.', columnLabels: { wk: 'Week of' } })).not.toBe(base);
+  });
+});

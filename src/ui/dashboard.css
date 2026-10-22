@@ -493,6 +493,7 @@ body.chat-width-expand.assistant-open .workspace { margin-right:0; }
 .analytics-metric-wide .analytics-widget-body { flex-direction:row; align-items:center; justify-content:space-between; gap:18px; }
 .analytics-metric-wide .analytics-metric-foot { margin-top:0; }
 .analytics-metric-foot,.analytics-truncated { margin-top:12px; color:var(--faint); font-size:10px; }
+.analytics-note { margin:0; padding:0 18px 16px; color:var(--muted); font-size:11px; font-style:italic; line-height:1.55; white-space:pre-line; overflow-wrap:anywhere; }
 .analytics-table-wrap { max-width:100%; overflow:auto; border:1px solid var(--border); border-radius:10px; }
 .analytics-table { width:100%; border-collapse:collapse; color:var(--soft); font-size:12px; }
 .analytics-table th { position:sticky; top:0; z-index:1; padding:10px 12px; border-bottom:1px solid var(--border-strong); color:var(--muted); background:var(--surface-2); text-align:left; font-size:9.5px; font-weight:650; text-transform:uppercase; letter-spacing:.07em; white-space:nowrap; }

@@ -721,6 +721,30 @@ export interface SaveAuthoredDocumentRequest {
   parentArtifactId?: string;
 }
 
+export interface EditAuthoredDocumentRequest {
+  /** The newest version of the chain; the edit is saved as its child. */
+  artifactId: string;
+  /** Exact find/replace pairs, applied in order; each find must occur exactly once. */
+  edits: Array<{ find: string; replace: string }>;
+  /** Optional replacement title; defaults to the edited version's title. */
+  title?: string;
+  /** Citations to add, or to replace by id. The edited version's citations carry over. */
+  citations?: DocumentCitation[];
+}
+
+export interface EditAuthoredDocumentResult {
+  artifact: ProductDocumentArtifact;
+  parent: { artifactId: string; title: string; contentChars: number };
+  /** Where each edit landed in the new version (1-based line, offsets). */
+  changes: Array<{ index: number; line: number; start: number; length: number }>;
+  citationsAdded: string[];
+  citationsReplaced: string[];
+  /** Citations whose last [id] marker the edits removed. */
+  citationsDropped: string[];
+  /** New [cN] markers the edits added that have no citation. */
+  markersWithoutCitation: string[];
+}
+
 export interface OwnerRevisionRequest {
   /** Artifact being revised; must exist in the store. */
   parentArtifactId: string;
@@ -751,6 +775,8 @@ export interface ProductDocumentStore {
   save(artifact: ProductDocumentArtifact): void;
   list(limit: number, options?: ProductDocumentListOptions): ProductDocumentSummary[];
   get(artifactId: string): ProductDocumentArtifact | null;
+  /** Every version connected to this one by parent links, newest first; [] when it does not exist. */
+  versionChain?(artifactId: string): ProductDocumentSummary[];
   assignProject(artifactId: string, projectId: string | undefined): ProductDocumentProjectAssignment;
   /**
    * Permanently delete one artifact. Children of the deleted version are
@@ -787,6 +813,20 @@ export interface ProductDocumentService {
    * findings are recorded on the artifact but never block the save.
    */
   saveAuthoredDocument(request: SaveAuthoredDocumentRequest): Promise<ProductDocumentArtifact>;
+  /**
+   * Every version of the chain this artifact belongs to, newest first (the
+   * Documents page's head rule). [] when the artifact does not exist.
+   */
+  getVersionChain(artifactId: string): ProductDocumentSummary[];
+  /**
+   * A targeted chat edit: exact find/replace pairs applied to the NEWEST
+   * version of a chain, saved as its next version. Everything the edits do not
+   * touch stays as it was (project, profile, maturity, citations). Runs the
+   * deterministic advisory checks only, never the model conformance review.
+   * Synchronous, so the newest-version check and the save cannot interleave
+   * with another edit. Throws ProductDocumentEditError with a next action.
+   */
+  editAuthoredDocument(request: EditAuthoredDocumentRequest): EditAuthoredDocumentResult;
   /**
    * Read-only authoring guidance for one document type: the same per-profile
    * structure/style/narrative instructions the retired two-pass writer

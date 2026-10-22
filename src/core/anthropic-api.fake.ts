@@ -561,9 +561,14 @@ export async function startFakeAnthropic(options: FakeAnthropicOptions = {}): Pr
   };
 
   const server = http.createServer((req, res) => {
-    let rawBody = '';
-    req.on('data', chunk => { rawBody += chunk; });
+    // Bytes first, decoded once: decoding each chunk on its own turns a UTF-8
+    // character split across two chunks into U+FFFD, so two identical requests
+    // could differ (an em dash at the 64 KiB mark broke the P8 cache case,
+    // 2026-10-21).
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => { chunks.push(chunk); });
     req.on('end', async () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
       if (fake.dropNext > 0) {
         fake.dropNext -= 1;
         req.socket.destroy();

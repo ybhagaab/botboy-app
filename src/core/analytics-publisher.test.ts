@@ -13,6 +13,7 @@ import { createStorage, StorageLayer } from './storage.js';
 import {
   createDashboardPublisherService,
   DashboardPublicationError,
+  renderDashboardSnapshot,
   type DashboardPublishAdapter,
   type DashboardPublishAdapterInput,
 } from './analytics-publisher.js';
@@ -1044,5 +1045,29 @@ describe('static Harmony deployment-scoped verification recovery', () => {
       fixture.storage.close();
       rmSync(filesRoot, { recursive: true, force: true });
     }
+  });
+});
+
+/** The single-file snapshot shows the same plain wording as BotBoy's page (2026-10-21). */
+describe('column labels and notes in a single-file snapshot', () => {
+  it('labels the table headers and puts the escaped italic note under the widget', () => {
+    const dashboard = dash();
+    dashboard.widgets = [{
+      ...dashboard.widgets[0], kind: 'table',
+      config: { columnLabels: { n: 'Viewers <all>' }, note: 'Viewers: people who\nwatched & paid.' },
+    } as AnalyticsWidget];
+    const html = renderDashboardSnapshot(dashboard, '2026-09-08T01:00:00.000Z');
+    expect(html).toContain('<th>Viewers &lt;all&gt;</th>');
+    expect(html).toContain('</section><p class="note">Viewers: people who<br>watched &amp; paid.</p><footer>');
+    expect(SNAPSHOT_CSS).toContain('.note{');
+  });
+
+  it('leaves a widget without a note or labels as it was', () => {
+    const dashboard = dash();
+    dashboard.widgets = [{ ...dashboard.widgets[0], kind: 'table', config: {} } as AnalyticsWidget];
+    const html = renderDashboardSnapshot(dashboard, '2026-09-08T01:00:00.000Z');
+    expect(html).toContain('<th>n</th>');
+    expect(html).toContain('</section><footer>');
+    expect(html).not.toContain('class="note"');
   });
 });

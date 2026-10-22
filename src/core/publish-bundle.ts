@@ -34,6 +34,7 @@ import {
   renderMetric,
   renderTable,
   renderTextBody,
+  renderWidgetNote,
   SNAPSHOT_CSS,
 } from './snapshot-render.js';
 
@@ -367,7 +368,7 @@ function renderWidgetShell(widget: AnalyticsWidget): string {
     if (widget.kind === 'text') body = renderTextBody(widget);
     // A model-designed page: its own same-origin file, framed here.
     if (widget.kind === 'html') {
-      return `<article class="widget html-view"><iframe class="html-view-frame" src="assets/view-${escapeHtml(widget.id)}.html" title="${escapeHtml(widget.title)}" loading="eager"></iframe></article>`;
+      return `<article class="widget html-view"><iframe class="html-view-frame" src="assets/view-${escapeHtml(widget.id)}.html" title="${escapeHtml(widget.title)}" loading="eager"></iframe>${renderWidgetNote(widget)}</article>`;
     }
     if (widget.kind === 'visualization') {
       // Interactive chart hydrated by assets/render.js; the exact persisted
@@ -375,7 +376,7 @@ function renderWidgetShell(widget: AnalyticsWidget): string {
       body = `<div class="analytics-vega" data-analytics-visualization="${escapeHtml(widget.id)}" role="img" aria-label="${escapeHtml(widget.title)}"><span>Loading interactive chart…</span></div><noscript>${renderTable(widget)}</noscript>`;
     }
   }
-  return `<article class="widget ${escapeHtml(widget.kind)}"><header><div><span>${escapeHtml(widget.kind)}</span><h2>${escapeHtml(widget.title)}</h2>${widget.subtitle ? `<p>${escapeHtml(widget.subtitle)}</p>` : ''}</div>${widget.lastError ? '<b class="warn">Stale</b>' : ''}</header><section>${body}</section><footer>${widget.result ? `Updated ${escapeHtml(new Date(widget.result.refreshedAt).toLocaleString())}` : 'Not refreshed'} · external analytical data</footer></article>`;
+  return `<article class="widget ${escapeHtml(widget.kind)}"><header><div><span>${escapeHtml(widget.kind)}</span><h2>${escapeHtml(widget.title)}</h2>${widget.subtitle ? `<p>${escapeHtml(widget.subtitle)}</p>` : ''}</div>${widget.lastError ? '<b class="warn">Stale</b>' : ''}</header><section>${body}</section>${renderWidgetNote(widget)}<footer>${widget.result ? `Updated ${escapeHtml(new Date(widget.result.refreshedAt).toLocaleString())}` : 'Not refreshed'} · external analytical data</footer></article>`;
 }
 
 function renderIndexHtml(dashboard: AnalyticsDashboard, snapshotCreatedAt: string): string {

@@ -9,6 +9,7 @@ import {
   renderMetric,
   renderTable,
   renderTextBody,
+  renderWidgetNote,
   SNAPSHOT_CSS,
 } from './snapshot-render.js';
 import { renderDashboardBundle, type DashboardBundle } from './publish-bundle.js';
@@ -93,7 +94,7 @@ function renderWidget(widget: AnalyticsWidget): string {
     // An html view runs scripts in BotBoy only; a shared copy shows its data widgets.
     if (widget.kind === 'html') body = '<div class="empty">This interactive view is available in BotBoy. Its data appears in the widgets of this snapshot.</div>';
   }
-  return `<article class="widget ${escapeHtml(widget.kind)}"><header><div><span>${escapeHtml(widget.kind)}</span><h2>${escapeHtml(widget.title)}</h2>${widget.subtitle ? `<p>${escapeHtml(widget.subtitle)}</p>` : ''}</div>${widget.lastError ? '<b class="warn">Stale</b>' : ''}</header>${widget.lastError ? `<div class="error">Latest refresh error: ${escapeHtml(widget.lastError)}${widget.result ? ' · showing the previous successful result' : ''}</div>` : ''}<section>${body}</section><footer>${widget.result ? `Updated ${escapeHtml(new Date(widget.result.refreshedAt).toLocaleString())}` : 'Not refreshed'} · external analytical data</footer></article>`;
+  return `<article class="widget ${escapeHtml(widget.kind)}"><header><div><span>${escapeHtml(widget.kind)}</span><h2>${escapeHtml(widget.title)}</h2>${widget.subtitle ? `<p>${escapeHtml(widget.subtitle)}</p>` : ''}</div>${widget.lastError ? '<b class="warn">Stale</b>' : ''}</header>${widget.lastError ? `<div class="error">Latest refresh error: ${escapeHtml(widget.lastError)}${widget.result ? ' · showing the previous successful result' : ''}</div>` : ''}<section>${body}</section>${renderWidgetNote(widget)}<footer>${widget.result ? `Updated ${escapeHtml(new Date(widget.result.refreshedAt).toLocaleString())}` : 'Not refreshed'} · external analytical data</footer></article>`;
 }
 
 /** A self-contained, script-free snapshot. SQL and connection configuration are intentionally omitted. */

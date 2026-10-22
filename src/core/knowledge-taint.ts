@@ -24,11 +24,11 @@ const FAMILIES: ReadonlyArray<{ label: string; test: RegExp }> = [
   { label: 'email', test: /^(?:gmail_|grasp_)/ },
   { label: 'Drive', test: /^gdrive_/ },
   { label: 'WhatsApp', test: /^whatsapp_/ },
-  { label: 'documents', test: /^(?:sharepoint_|list_documents$|read_document$|read_spreadsheet$|get_document_writing_guide$|save_product_document$|export_product_document$|publish_product_document_)/ },
+  { label: 'documents', test: /^(?:sharepoint_|list_documents$|read_document$|read_spreadsheet$|get_document_writing_guide$|save_product_document$|read_product_document$|edit_product_document$|export_product_document$|publish_product_document_)/ },
   { label: 'web page', test: /^(?:web_|browser_|ui_|inspect_visual_assets$)/ },
   { label: 'captured items', test: /^(?:get_today$|list_projects$|get_project_brain$|get_channels$|list_nodes$|get_node_items$|search_items$|get_chat_messages$|query_db$|enrich_item$|create_item$|update_item$|send_chat_message$|rebuild_brain$|reject_evidence$|discard_item$|set_task_state$|add_task$)/ },
   { label: 'connected tool', test: /^(?:mcp_|save_mcp_analysis$|query_data_room$|list_data_room_datasets$|create_data_room_dataset$|configure_analytics_widget_source$|wait_for_etl_run$)/ },
-  { label: 'files and commands', test: /^(?:read_file$|run_command$|read_terminal$|wait_for_terminal$|send_terminal_input$)/ },
+  { label: 'files and commands', test: /^(?:read_file$|edit_file$|run_command$|read_terminal$|wait_for_terminal$|send_terminal_input$)/ },
 ];
 
 /** The family label of an untrusted tool call. */

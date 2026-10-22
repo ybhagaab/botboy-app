@@ -4,12 +4,13 @@
  *
  * A continuation turn (callerKind 'continuation') works on the job the owner
  * asked for. It may take the job's steps: reads, warehouse SQL, scratch ETL
- * queries and their fixes, Data Room imports, BotBoy dashboards, files, shell,
- * and visual checks. It may not send, post, publish, sync, schedule, change
- * production pipelines, open terminals, drive the browser, change
- * connections, or edit the workspace; those need the owner's explicit ask in
- * a live chat turn. The allowlist is closed: a tool not named here is refused,
- * so a new effect tool is never admitted by accident.
+ * queries and their fixes, Data Room imports, BotBoy dashboards, BotBoy
+ * documents (read, edit, save), files, shell, visual checks, and the browser
+ * on BotBoy's own tabs. It may not send, post, publish, sync, schedule, change
+ * production pipelines, open terminals, change connections, or edit the
+ * workspace; those need the owner's explicit ask in a live chat turn. The
+ * allowlist is closed: a tool not named here is refused, so a new effect tool
+ * is never admitted by accident.
  *
  * This wrapper must be the OUTERMOST executor (index.ts): the Gmail and
  * product-document wrappers answer their tools before the base executor, and
@@ -25,6 +26,9 @@ export const JOB_SCOPE_TOOLS: ReadonlySet<string> = new Set([
   // Workspace and evidence reads
   'get_today', 'list_projects', 'get_project_brain', 'get_channels', 'list_nodes', 'get_node_items',
   'search_items', 'query_db', 'get_chat_messages', 'list_documents', 'read_document', 'read_spreadsheet',
+  // BotBoy documents (owner requests 2026-10-22): a job that researches and then writes reads, edits and saves the
+  // documents it works on, a new one or a full rewrite included. A save never overwrites: a rewrite is the next version.
+  'read_product_document', 'edit_product_document', 'save_product_document',
   'list_lessons', 'propose_lesson', 'web_search', 'web_fetch',
   // Data Room and BotBoy dashboards (local, reversible)
   'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source',
@@ -44,9 +48,10 @@ export const JOB_SCOPE_TOOLS: ReadonlySet<string> = new Set([
   'mcp_etl_job_run', 'mcp_etl_latest_run', 'mcp_etl_runs_for_job', 'mcp_etl_job', 'mcp_etl_profile_sql',
   'mcp_etl_search', 'mcp_etl_diagnose_run', 'mcp_etl_download_results', 'mcp_etl_run_query',
   'wait_for_etl_run', 'mcp_etl_alter_run',
-  // Files, shell (Seatbelt-sandboxed), visual checks
-  'write_file', 'read_file', 'run_command', 'ui_inspect', 'ui_console_errors', 'ui_screenshot',
-  'browser_screenshot', 'inspect_visual_assets',
+  // Files, shell (Seatbelt-sandboxed), visual checks, and the browser: browser_hands opens, reads, clicks, types and
+  // fills on the external tabs BotBoy opened itself (owner request 2026-10-22: jobs need it to finish their work).
+  'write_file', 'read_file', 'edit_file', 'run_command', 'ui_inspect', 'ui_console_errors', 'ui_screenshot',
+  'browser_hands', 'browser_screenshot', 'inspect_visual_assets',
   // The job itself
   'job_update',
 ]);

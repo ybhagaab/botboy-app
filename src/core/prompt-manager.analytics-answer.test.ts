@@ -127,3 +127,40 @@ describe('edit_analytics_dashboard prompt and tool contract', () => {
     expect(prompt).toContain('derived_data_required');
   });
 });
+
+// Owner report 2026-10-20: BotBoy had no way to reword a dashboard in place.
+describe('in-place dashboard presentation edits', () => {
+  const tool = (name: string) => createPromptManager().getToolDefinitions('chat').find(item => item.function.name === name)!;
+
+  it('lets the presentation edit change every in-place field and keeps the schema closed', () => {
+    const schema = tool('edit_analytics_dashboard').function.parameters as any;
+    const presentation = schema.properties.presentation;
+    expect(presentation.additionalProperties).toBe(false);
+    expect(Object.keys(presentation.properties)).toEqual([
+      'renderer', 'title', 'subtitle', 'layout', 'note', 'columnLabels', 'text', 'html', 'htmlEdits', 'span', 'hidden',
+    ]);
+    expect(presentation.properties.htmlEdits.items).toMatchObject({ additionalProperties: false, required: ['find', 'replace'] });
+    expect(presentation.properties.columnLabels.additionalProperties).toMatchObject({ type: 'string', maxLength: 120 });
+    const description = tool('edit_analytics_dashboard').function.description;
+    expect(description).toContain('on any dashboard and any widget (bound or not)');
+    expect(description).toContain('keeps the widget’s ID, query and loaded rows and runs no query');
+  });
+
+  it('lets get_analytics_dashboard read one widget whole and continue a long page', () => {
+    const read = tool('get_analytics_dashboard').function;
+    expect((read.parameters as any).properties).toMatchObject({ widgetId: { type: 'string' }, htmlOffset: { type: 'integer', minimum: 0 } });
+    expect((read.parameters as any).required).toEqual(['dashboardId']);
+    expect(read.description).toContain('Pass widgetId to read one widget complete');
+  });
+
+  it('sends wording, notes and page edits to edit_analytics_dashboard, never to update', () => {
+    const prompt = createPromptManager().getSystemPrompt('chat', { conversationMode: 'analytics_dashboard', mcpServers: [] });
+    expect(prompt).toContain('call edit_analytics_dashboard action=presentation once per widget, on any dashboard, bound or not');
+    expect(prompt).toContain('Never use update_analytics_dashboard for these edits: it replaces every widget, gives them new IDs, and drops their loaded rows.');
+    expect(prompt).toContain('read it with get_analytics_dashboard({dashboardId, widgetId}) and call edit_analytics_dashboard action=presentation with htmlEdits');
+    expect(prompt).not.toContain('update_analytics_dashboard replaces the html like any widget');
+    for (const name of ['create_analytics_dashboard', 'update_analytics_dashboard']) {
+      expect(JSON.stringify(tool(name).function.parameters)).toContain('note (plain text shown in italics under the widget');
+    }
+  });
+});

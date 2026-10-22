@@ -150,12 +150,22 @@ export function createDashboardRouter(
         heartbeatAt: string;
         completedAt: string;
       };
+      // Edits that run no query (an in-place presentation edit, a title
+      // change) change widgets and dashboards only; open pages reload on them.
+      const definitions = db.prepare(`
+        SELECT (SELECT COUNT(*) FROM analytics_widgets) AS widgetCount,
+          (SELECT COALESCE(SUM(revision), 0) FROM analytics_widgets) AS revisionSum,
+          (SELECT COALESCE(MAX(updated_at), '') FROM analytics_dashboards) AS dashboardUpdatedAt
+      `).get() as { widgetCount: number; revisionSum: number; dashboardUpdatedAt: string };
       return [
         analytics.runCount,
         analytics.runRowId,
         analytics.queuedAt,
         analytics.heartbeatAt,
         analytics.completedAt,
+        definitions.widgetCount,
+        definitions.revisionSum,
+        definitions.dashboardUpdatedAt,
       ].join(':');
     } catch {
       return '0';

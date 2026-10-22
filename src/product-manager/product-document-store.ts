@@ -197,6 +197,11 @@ export function createProductDocumentStore(db: Database.Database): ProductDocume
     SELECT artifact_id FROM product_document_artifacts WHERE parent_artifact_id = ?
     ORDER BY created_at, artifact_id
   `);
+  const getSummary = db.prepare(`
+    SELECT ${summaryColumns}
+    FROM product_document_artifacts
+    WHERE artifact_id = ?
+  `);
   const updateArtifactProject = db.prepare(`
     UPDATE product_document_artifacts
     SET project_id = ?, artifact_json = ?
@@ -296,6 +301,42 @@ export function createProductDocumentStore(db: Database.Database): ProductDocume
     get(artifactId) {
       const row = getArtifact.get(artifactId) as ArtifactRow | undefined;
       return row ? deserializeArtifact(row) : null;
+    },
+
+    /** Every version connected to this one by parent links, newest first (the
+     * Documents page's head rule: created_at, then artifact_id, descending).
+     * Corrupt cycles terminate through `visited`; the same hard bound as a
+     * chain relink keeps a malformed database from unbounded work. */
+    versionChain(artifactId) {
+      if (!getSummary.get(artifactId)) return [];
+      let root = artifactId;
+      const climbed = new Set<string>([root]);
+      for (;;) {
+        const parent = getParentId.get(root) as { parent_artifact_id: string | null } | undefined;
+        const parentId = parent?.parent_artifact_id;
+        if (!parentId || climbed.has(parentId) || !getSummary.get(parentId)) break;
+        if (climbed.size >= 10_000) throw new Error('Product-document version chain exceeds the safe read bound.');
+        climbed.add(parentId);
+        root = parentId;
+      }
+      const members: SummaryRow[] = [];
+      const visited = new Set<string>();
+      const queue = [root];
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        if (visited.has(current)) continue;
+        if (visited.size >= 10_000) throw new Error('Product-document version chain exceeds the safe read bound.');
+        visited.add(current);
+        const row = getSummary.get(current) as SummaryRow | undefined;
+        if (row) members.push(row);
+        for (const child of getChildren.all(current) as Array<{ artifact_id: string }>) {
+          if (!visited.has(child.artifact_id)) queue.push(child.artifact_id);
+        }
+      }
+      members.sort((left, right) => (left.created_at === right.created_at
+        ? (left.artifact_id < right.artifact_id ? 1 : left.artifact_id > right.artifact_id ? -1 : 0)
+        : (left.created_at < right.created_at ? 1 : -1)));
+      return members.map(summaryFromRow);
     },
 
     assignProject(artifactId, projectId) {

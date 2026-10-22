@@ -1,3 +1,4 @@
+import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   FAKE_ANTHROPIC_KEY,
@@ -129,6 +130,33 @@ describe('fake Anthropic: replies', () => {
     const uncached = await post('/v1/messages', base());
     expect(uncached.json.usage.cache_read_input_tokens).toBe(0);
     expect(uncached.json.usage.cache_creation_input_tokens).toBe(0);
+  });
+  // 2026-10-21: the body was decoded chunk by chunk, so an em dash at the 64 KiB mark of the real chat
+  // prompt became U+FFFD in one of two identical requests, and the probe's P8 cache read missed.
+  it('decodes a body once: a character split across two chunks arrives intact, and the repeat reads the cache', async () => {
+    await start();
+    const system = `${'Plain words for the cache. '.repeat(20)}Do not ask permission — just act.`;
+    const bytes = Buffer.from(JSON.stringify(base({ system, cache_control: { type: 'ephemeral' } })), 'utf8');
+    const split = bytes.indexOf(Buffer.from('—', 'utf8')) + 1;
+    const send = () => new Promise<any>((resolve, reject) => {
+      const request = http.request(`${fake!.url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'x-api-key': FAKE_ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json', 'content-length': String(bytes.length) },
+      }, (response) => {
+        const parts: Buffer[] = [];
+        response.on('data', (part: Buffer) => parts.push(part));
+        response.on('end', () => resolve(JSON.parse(Buffer.concat(parts).toString('utf8'))));
+      });
+      request.on('error', reject);
+      // Inside the dash's three bytes; the pause makes the server read two chunks.
+      request.write(bytes.subarray(0, split));
+      setTimeout(() => request.end(bytes.subarray(split)), 25);
+    });
+    const first = await send();
+    const second = await send();
+    for (const recorded of fake!.requests) expect(recorded.body.system).toBe(system);
+    expect(first.usage.cache_creation_input_tokens).toBeGreaterThan(0);
+    expect(second.usage.cache_read_input_tokens).toBeGreaterThan(0);
   });
 });
 

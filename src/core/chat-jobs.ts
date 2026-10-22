@@ -740,7 +740,7 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
     `The owner asked for this, and BotBoy is working on it: "${clip(job.goal, 1_200)}"`,
     `Started ${job.createdAt}; ${job.continuationCount} automatic continuation(s) since the owner's last message.`,
     options.continuation
-      ? 'This turn is an AUTOMATIC CONTINUATION: no owner message started it. The owner\'s request above is your authority, so set ownerRequested=true for the job\'s steps. Take them (data reads, SQL, scratch ETL queries and their fixes, Data Room imports, BotBoy dashboards, files, checks). Tools that send, post, publish, sync, schedule, or change production return outside_job_mandate here: finish what you can, then call job_update needs_owner with what needs the owner\'s go-ahead.'
+      ? 'This turn is an AUTOMATIC CONTINUATION: no owner message started it. The owner\'s request above is your authority, so set ownerRequested=true for the job\'s steps. Take them (data reads, SQL, scratch ETL queries and their fixes, Data Room imports, BotBoy dashboards, BotBoy documents: read, edit and save, browser clicks and typing on the tabs you open, files, checks). Tools that send, post, publish, sync, schedule, or change production return outside_job_mandate here: finish what you can, then call job_update needs_owner with what needs the owner\'s go-ahead.'
       : 'The owner\'s request above authorizes every step of this job, in this turn and later ones: a short "check", "continue", or "go ahead" means resume the job, not ask again. Set ownerRequested=true for job steps. If the owner\'s new message asks for something different, it is a new job: call job_update with action "start".',
   ];
   const set = job.workingSet;

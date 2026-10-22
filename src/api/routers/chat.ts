@@ -1658,7 +1658,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // force one corrective pass; if it still claims falsely, append an
         // honest system note so the user is never misled.
         const WRITE_TOOLS = new Set([
-          'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'run_command', 'save_mcp_analysis', 'save_product_document',
+          'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'edit_file', 'run_command', 'save_mcp_analysis', 'save_product_document', 'edit_product_document',
           'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
           ...GMAIL_WRITE_TOOLS,
