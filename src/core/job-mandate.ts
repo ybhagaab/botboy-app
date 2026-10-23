@@ -29,6 +29,11 @@ export const JOB_SCOPE_TOOLS: ReadonlySet<string> = new Set([
   // BotBoy documents (owner requests 2026-10-22): a job that researches and then writes reads, edits and saves the
   // documents it works on, a new one or a full rewrite included. A save never overwrites: a rewrite is the next version.
   'read_product_document', 'edit_product_document', 'save_product_document',
+  // Google Drive, Docs, Sheets, Slides, Forms and Calendar (owner request 2026-10-23, "same permissions for jobs" as the
+  // document tools): a job finds, reads, creates, edits, uploads, downloads and organizes files and changes its own
+  // calendar events. The handlers refuse what reaches other people (a published form, an event with guests, a reply to
+  // an invitation) with outside_job_mandate, and gdrive_share (sharing and comments) is never here.
+  'gdrive_search', 'gdrive_read', 'gdrive_edit', 'gdrive_files', 'gcalendar',
   'list_lessons', 'propose_lesson', 'web_search', 'web_fetch',
   // Data Room and BotBoy dashboards (local, reversible)
   'list_data_room_datasets', 'query_data_room', 'create_data_room_dataset', 'configure_analytics_widget_source',

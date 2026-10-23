@@ -23,6 +23,7 @@ export const TRUSTED_TOOLS: ReadonlySet<string> = new Set([
 const FAMILIES: ReadonlyArray<{ label: string; test: RegExp }> = [
   { label: 'email', test: /^(?:gmail_|grasp_)/ },
   { label: 'Drive', test: /^gdrive_/ },
+  { label: 'Calendar', test: /^gcalendar$/ },
   { label: 'WhatsApp', test: /^whatsapp_/ },
   { label: 'documents', test: /^(?:sharepoint_|list_documents$|read_document$|read_spreadsheet$|get_document_writing_guide$|save_product_document$|read_product_document$|edit_product_document$|export_product_document$|publish_product_document_)/ },
   { label: 'web page', test: /^(?:web_|browser_|ui_|inspect_visual_assets$)/ },

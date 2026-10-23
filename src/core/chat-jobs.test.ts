@@ -158,7 +158,9 @@ describe('job block and tool outcomes', () => {
     const continuation = formatChatJobBlock(jobs.get(job.id)!, jobs.watchesForJob(job.id), { continuation: true });
     expect(continuation).toContain('AUTOMATIC CONTINUATION');
     // Owner requests 2026-10-22: a job reads, edits and saves BotBoy documents and clicks in the browser in its automatic turns.
-    expect(continuation).toContain('BotBoy dashboards, BotBoy documents: read, edit and save, browser clicks and typing on the tabs you open, files, checks');
+    expect(continuation).toContain('BotBoy dashboards, BotBoy documents: read, edit and save, browser clicks and typing on the tabs you open, Google files and the owner\'s own calendar events: create, edit, upload, download and organize, files, checks');
+    // Owner request 2026-10-23 (google-workspace.md): sharing and invites stay the owner's.
+    expect(continuation).toContain('Tools that send, post, publish, share, invite, sync, schedule, or change production return outside_job_mandate here');
     expect(continuation).toContain('outside_job_mandate');
     expect(continuation.length).toBeLessThanOrEqual(4_500);
   });

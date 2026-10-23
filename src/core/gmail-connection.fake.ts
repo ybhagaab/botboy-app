@@ -16,12 +16,17 @@ export interface FakeGmailAccount {
   needsReconnect?: boolean;
   canReadDrive?: boolean;
   canPublishDrive?: boolean;
+  /** Full drive (google-workspace.md); implies read and publish when set. */
+  canEditDrive?: boolean;
+  canUseCalendar?: boolean;
   drive?: StoredDriveSettings | null;
   client: GmailClient;
 }
 
 export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnection {
   const live = () => accounts.filter(account => account.connected !== false);
+  const canRead = (account: FakeGmailAccount) => account.canReadDrive === true || account.canEditDrive === true;
+  const canPublish = (account: FakeGmailAccount) => account.canPublishDrive === true || account.canEditDrive === true;
   const summary = (account: FakeGmailAccount): GmailAccountSummary => ({
     id: account.id,
     label: account.label ?? '',
@@ -33,8 +38,10 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     grantedScopes: [],
     canCompose: account.canCompose !== false,
     needsComposeGrant: account.canCompose === false,
-    canReadDrive: account.canReadDrive === true,
-    canPublishDrive: account.canPublishDrive === true,
+    canReadDrive: canRead(account),
+    canPublishDrive: canPublish(account),
+    canEditDrive: account.canEditDrive === true,
+    canUseCalendar: account.canUseCalendar === true,
     drive: account.drive ?? null,
   });
   const view = (account: FakeGmailAccount): GmailAccountConnection => ({
@@ -47,8 +54,10 @@ export function fakeGmailConnection(accounts: FakeGmailAccount[]): GmailConnecti
     isConnected: () => account.connected !== false,
     accountEmail: () => (account.connected !== false ? account.email : null),
     canCompose: () => account.canCompose !== false,
-    canReadDrive: () => account.canReadDrive === true,
-    canPublishDrive: () => account.canPublishDrive === true,
+    canReadDrive: () => canRead(account),
+    canPublishDrive: () => canPublish(account),
+    canEditDrive: () => account.canEditDrive === true,
+    canUseCalendar: () => account.canUseCalendar === true,
     drive: () => account.drive ?? null,
     accessToken: async () => 'token',
     invalidateAccessToken: () => {},

@@ -435,17 +435,30 @@ kept, including mail BotBoy sends for you. The client and your sign-in token sta
 read; the BotBoy owner never sees your token or your mail. **Disconnect**
 revokes the access at Google; mail that BotBoy already captured stays.
 
-#### Google Drive
+#### Google Drive, Docs, Sheets, Slides, Forms and Calendar
 
-Drive rides on a connected Gmail account. On **Connections → Gmail**, choose
-**Connect Google Drive** on the account card and allow both Drive boxes on
-Google's screen. First enable the **Google Drive API** in the same Google Cloud
-project as your Gmail client (Cloud Console → APIs & Services → Enable APIs);
-without it Drive capture warns "Enable the Google Drive API in your Cloud
-project". BotBoy asks for `drive.readonly` (read the files you choose) and
-`drive.file` (create files and update only files it created); never full Drive
-access. A Cloud project left in **Testing** ends the sign-in after 7 days (as
-for Gmail); publish the app for personal use.
+Drive rides on a connected Gmail account. First, in the same Google Cloud
+project as your Gmail client (Cloud Console → APIs & Services → Enable APIs),
+enable these APIs: **Google Drive API**, **Google Docs API**, **Google Sheets
+API**, **Google Slides API**, **Google Forms API** and **Google Calendar API**.
+Then on **Connections → Gmail**, choose **Connect Google Drive** on the account
+card and leave the Drive and Calendar boxes ticked on Google's screen.
+
+BotBoy asks for full Drive access (`drive`) and `calendar`. Capture still reads
+only the sources you pick below; full access is what lets BotBoy, when you ask
+in chat, create Docs, Sheets, Slides decks, Forms and folders, change part of a
+Doc, Sheet, deck or Form in place, upload any file (images, JSON, PDFs and so
+on), download any file, rename, move, copy, trash or restore files, share them
+and comment, and read and change your calendar events. Sharing, comments,
+publishing a form and events with guests happen only when you ask in chat,
+never in a job; sharing with anyone who has the link needs you to say so.
+Trash keeps files 30 days, and BotBoy never deletes a file for good.
+
+If you connected Drive before this, the Drive section says BotBoy can only
+read and publish: press **Allow full access** and tick both boxes. If an API is
+off, BotBoy's answer names it and links to the page that turns it on. A Cloud
+project left in **Testing** ends the sign-in after 7 days (as for Gmail);
+publish the app for personal use.
 
 Then pick what BotBoy captures: **Files I own**, **Shared with me**, and
 folders (paste a folder link). The first run reads the last 30 days; after that
@@ -752,6 +765,8 @@ credential attachment before producing the report.
 | The Gmail page asks for a Google OAuth client although Gmail worked before, or the doctor says only the retired shared client is saved | BotBoy no longer uses a shared Google client. Create your own client (steps under **Gmail**), choose its JSON file, then choose **Connect Gmail**. |
 | Google or the Gmail page shows `redirect_uri_mismatch` or `invalid_client`, or says the file is for a Web application client | The saved client is not a **Desktop app** client, or its ID or secret is wrong. Create a Desktop app client and choose its JSON file (or save its ID and secret) again. |
 | Google shows `access_denied` when you connect Gmail | You chose Cancel, or a test-mode app admits only its listed test users. Connect again and choose **Allow**; or publish your app, or add your address under **Audience → Test users**. |
+| BotBoy says the Google Docs, Sheets, Slides, Forms or Calendar API is off | That API is not enabled in the Google Cloud project of your Gmail client. Open the link BotBoy gives (or APIs & Services → Library), choose **Enable**, wait a minute, and ask again. |
+| BotBoy says it can read Drive but not create, change, move or share files, or that Calendar is not connected | Drive was connected before full access existed, or a box was left unticked. On **Connections → Gmail**, press **Allow full access** (or **Add Calendar**) and tick the Drive and Calendar boxes. |
 | Connecting Gmail, Google Drive, or Slack says BotBoy couldn't reach the service (a timeout such as `ETIMEDOUT`) while your browser reaches it fine | BotBoy waits up to 2 seconds for each connection attempt; Node's own limit is 0.25 seconds, which is too short on some networks. `./start.sh --doctor` prints the `node connect timeout:` and `connect probe:` lines. To wait longer or shorter (250 to 10000 ms), start BotBoy with `BOTBOY_NET_ATTEMPT_TIMEOUT_MS=5000 ./start.sh`. |
 
 ### Unverified shutdown recovery
@@ -844,8 +859,9 @@ that work: through the authenticated team gateway, or to OpenAI, DeepSeek or
 Anthropic (Claude) under your own account when one of your saved keys' models is
 chosen in chat or in **Settings → AI model**. Connections communicate with
 the services you enable; Gmail talks only to Google's sign-in and Gmail API
-endpoints, and mail BotBoy reads for a chat answer goes to the chat model like
-any other content. A remote MCP server you add receives the arguments of
+endpoints, Google Drive only to Google's Drive, Docs, Sheets, Slides, Forms
+and Calendar APIs, and mail or files BotBoy reads for a chat answer go to the
+chat model like any other content. A remote MCP server you add receives the arguments of
 every call BotBoy makes to it; BotBoy sends its saved keys only to that
 server and never follows it to another site. When BotBoy looks up a server
 for you, only the search words go to the official MCP Registry. Any document publication, message draft or send, or

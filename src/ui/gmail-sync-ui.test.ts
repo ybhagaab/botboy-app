@@ -555,10 +555,20 @@ describe('Gmail sign-in notices: the badge and any message never contradict', ()
     expect(partial.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (read only)');
     expect(partial.textContent).toContain('Drive not granted in full');
     expect(partial.querySelector('button[data-action="gdrive-connect"]')).not.toBeNull();
-    const full = sectionOf({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true, sources: { ownedByMe: true, sharedWithMe: false, folderIds: [] } } });
-    expect(full.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (read + publish)');
+    // A grant from before full Drive access keeps its sources and offers the upgrade (google-workspace.md).
+    const older = sectionOf({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true, sources: { ownedByMe: true, sharedWithMe: false, folderIds: [] } } });
+    expect(older.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (read + publish)');
+    expect(older.querySelector('button[data-action="gdrive-connect"]')!.textContent).toContain('Allow full access');
+    expect(older.querySelector('[data-gdrive-upgrade]')!.textContent).toContain('not create, edit, move or share');
+    expect(older.querySelector('button[data-action="gdrive-save-sources"]')).not.toBeNull();
+    const full = sectionOf({ canReadDrive: true, canPublishDrive: true, canEditDrive: true, canUseCalendar: true, drive: { enabled: true, sources: { ownedByMe: true, sharedWithMe: false, folderIds: [] } } });
+    expect(full.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (full access + Calendar)');
     expect(full.querySelector('button[data-action="gdrive-connect"]')).toBeNull();
+    expect(full.textContent).toContain('BotBoy creates, edits, moves, shares and trashes Drive files only when you ask');
     expect(full.querySelector('button[data-action="gdrive-save-sources"]')).not.toBeNull();
+    const noCalendar = sectionOf({ canReadDrive: true, canPublishDrive: true, canEditDrive: true, drive: { enabled: true, sources: { ownedByMe: false, sharedWithMe: false, folderIds: [] } } });
+    expect(noCalendar.querySelector('[data-gdrive-state]')!.textContent).toBe('Connected (full access)');
+    expect(noCalendar.querySelector('button[data-action="gdrive-connect"]')!.textContent).toContain('Add Calendar');
   });
 
   it('shows a success notice in a good tone, and hides any notice older than 15 minutes', () => {

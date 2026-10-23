@@ -52,7 +52,7 @@ import {
 } from './gmail-api.js';
 import { sleepMs } from './transport-errors.js';
 import { randomBytes } from 'node:crypto';
-import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE, GDRIVE_REQUESTED_SCOPES } from './gdrive-api.js';
+import { GCALENDAR_SCOPE, GDRIVE_FILE_SCOPE, GDRIVE_FULL_SCOPE, GDRIVE_READONLY_SCOPE, GDRIVE_REQUESTED_SCOPES, googleGrantOf } from './gdrive-api.js';
 import {
   GMAIL_DEFAULT_ACCOUNT_ID,
   activeGmailClient,
@@ -158,9 +158,13 @@ export interface GmailConnectionStatus {
   canCompose: boolean;
   /** Connected with read access only: Reconnect to allow drafting and sending. */
   needsComposeGrant: boolean;
-  /** The focused account's grant covers drive.readonly / drive.file, and its Drive choices. */
+  /** The focused account's grant covers drive.readonly / drive.file (or full drive), and its Drive choices. */
   canReadDrive: boolean;
   canPublishDrive: boolean;
+  /** Full drive: create, edit, move, share and trash any file the account can (google-workspace.md). */
+  canEditDrive: boolean;
+  /** The calendar scope. */
+  canUseCalendar: boolean;
   drive: StoredDriveSettings | null;
 }
 
@@ -191,6 +195,10 @@ export interface GmailAccountSummary {
   canReadDrive: boolean;
   /** The grant covers drive.file (publishing BotBoy documents). */
   canPublishDrive: boolean;
+  /** The grant covers full drive (create, edit, move, share, trash; Docs, Sheets, Slides, Forms). */
+  canEditDrive: boolean;
+  /** The grant covers calendar. */
+  canUseCalendar: boolean;
   /** Drive capture choices; null until the owner connects Drive. */
   drive: StoredDriveSettings | null;
 }
@@ -213,6 +221,10 @@ export interface GmailAccountConnection {
   canReadDrive(): boolean;
   /** The stored grant includes drive.file. */
   canPublishDrive(): boolean;
+  /** The stored grant includes full drive. */
+  canEditDrive(): boolean;
+  /** The stored grant includes calendar. */
+  canUseCalendar(): boolean;
   /** Drive capture choices (null until Drive is connected). */
   drive(): StoredDriveSettings | null;
   accessToken(): Promise<string>;
@@ -400,11 +412,14 @@ function describeFailure(kind: GmailSignInKind, ctx: FailureContext): { message:
  * nothing about Gmail's health: the notice outlives the moment it was written
  * (see `failureAssurance`), and "Google connected" already tells what happened.
  */
-function driveNotGrantedMessage(read: boolean, publish: boolean): string {
-  const next = 'Press Connect Google Drive and tick both Drive boxes.';
-  if (!read && !publish) return `Drive not granted: Google connected, but both Drive boxes were left unticked. ${next}`;
-  return read
-    ? `Drive not granted in full: Google allowed reading Drive but not publishing to it. ${next}`
+function driveNotGrantedMessage(grant: { readDrive: boolean; publishDrive: boolean }): string {
+  const next = 'Press Connect Google Drive and tick the Drive box.';
+  if (!grant.readDrive && !grant.publishDrive) return `Drive not granted: Google connected, but the Drive box was left unticked. ${next}`;
+  if (grant.readDrive && grant.publishDrive) {
+    return `Drive editing not granted: BotBoy can still read Drive and publish its documents, but not create, edit, move or share your files. ${next}`;
+  }
+  return grant.readDrive
+    ? `Drive not granted in full: Google allowed reading Drive but not changing it. ${next}`
     : `Drive not granted in full: Google allowed publishing to Drive but not reading it. ${next}`;
 }
 
@@ -566,8 +581,10 @@ export function createGmailConnection(deps: {
       grantedScopes: granted,
       canCompose,
       needsComposeGrant: !canCompose,
-      canReadDrive: granted.includes(GDRIVE_READONLY_SCOPE),
-      canPublishDrive: granted.includes(GDRIVE_FILE_SCOPE),
+      canReadDrive: googleGrantOf(granted).readDrive,
+      canPublishDrive: googleGrantOf(granted).publishDrive,
+      canEditDrive: googleGrantOf(granted).editDrive,
+      canUseCalendar: googleGrantOf(granted).calendar,
       drive: account.drive ?? null,
     };
   }
@@ -601,8 +618,10 @@ export function createGmailConnection(deps: {
       grantedScopes: granted,
       canCompose,
       needsComposeGrant: Boolean(account) && !canCompose,
-      canReadDrive: granted.includes(GDRIVE_READONLY_SCOPE),
-      canPublishDrive: granted.includes(GDRIVE_FILE_SCOPE),
+      canReadDrive: googleGrantOf(granted).readDrive,
+      canPublishDrive: googleGrantOf(granted).publishDrive,
+      canEditDrive: googleGrantOf(granted).editDrive,
+      canUseCalendar: googleGrantOf(granted).calendar,
       drive: account?.drive ?? null,
     };
   }
@@ -692,8 +711,10 @@ export function createGmailConnection(deps: {
       isConnected: () => Boolean(storedAccount(accountId)),
       accountEmail: () => storedAccount(accountId)?.connection.accountEmail ?? null,
       canCompose: () => scopesOf(storedAccount(accountId)).includes(GMAIL_COMPOSE_SCOPE),
-      canReadDrive: () => scopesOf(storedAccount(accountId)).includes(GDRIVE_READONLY_SCOPE),
-      canPublishDrive: () => scopesOf(storedAccount(accountId)).includes(GDRIVE_FILE_SCOPE),
+      canReadDrive: () => googleGrantOf(scopesOf(storedAccount(accountId))).readDrive,
+      canPublishDrive: () => googleGrantOf(scopesOf(storedAccount(accountId))).publishDrive,
+      canEditDrive: () => googleGrantOf(scopesOf(storedAccount(accountId))).editDrive,
+      canUseCalendar: () => googleGrantOf(scopesOf(storedAccount(accountId))).calendar,
       drive: () => storedAccount(accountId)?.drive ?? null,
       async accessToken() {
         const state = runtime(accountId);
@@ -758,8 +779,10 @@ export function createGmailConnection(deps: {
     isConnected: () => Boolean(firstAccount()),
     accountEmail: () => firstAccount()?.connection.accountEmail ?? null,
     canCompose: () => scopesOf(firstAccount()).includes(GMAIL_COMPOSE_SCOPE),
-    canReadDrive: () => scopesOf(firstAccount()).includes(GDRIVE_READONLY_SCOPE),
-    canPublishDrive: () => scopesOf(firstAccount()).includes(GDRIVE_FILE_SCOPE),
+    canReadDrive: () => googleGrantOf(scopesOf(firstAccount())).readDrive,
+    canPublishDrive: () => googleGrantOf(scopesOf(firstAccount())).publishDrive,
+    canEditDrive: () => googleGrantOf(scopesOf(firstAccount())).editDrive,
+    canUseCalendar: () => googleGrantOf(scopesOf(firstAccount())).calendar,
     drive: () => firstAccount()?.drive ?? null,
     accessToken: () => accountView(primaryId()).accessToken(),
     invalidateAccessToken: () => accountView(primaryId()).invalidateAccessToken(),
@@ -831,7 +854,7 @@ export function createGmailConnection(deps: {
       // A reconnect of an account that already has Drive asks for Drive again,
       // so a fresh consent never silently drops it.
       const targetScopes = scopesOf(target);
-      const keepDrive = targetScopes.includes(GDRIVE_READONLY_SCOPE) || targetScopes.includes(GDRIVE_FILE_SCOPE);
+      const keepDrive = [GDRIVE_READONLY_SCOPE, GDRIVE_FILE_SCOPE, GDRIVE_FULL_SCOPE, GCALENDAR_SCOPE].some(scope => targetScopes.includes(scope));
       const scopes = forDrive || keepDrive ? [...GMAIL_REQUESTED_SCOPES, ...GDRIVE_REQUESTED_SCOPES] : GMAIL_REQUESTED_SCOPES;
       prunePending();
       while (pending.size >= MAX_PENDING_STATES) {
@@ -932,9 +955,12 @@ export function createGmailConnection(deps: {
         const existing = accounts.find(account => account.connection.accountEmail === email);
         const accountId = existing?.id ?? (accounts.length ? newAccountId() : GMAIL_DEFAULT_ACCOUNT_ID);
         store.saveConnection(accountId, { refreshToken: tokens.refreshToken, accountEmail: email, scope: granted.join(' ') });
-        const driveRead = granted.includes(GDRIVE_READONLY_SCOPE);
-        const drivePublish = granted.includes(GDRIVE_FILE_SCOPE);
+        const grant = googleGrantOf(granted);
+        const driveRead = grant.readDrive;
+        const drivePublish = grant.publishDrive;
+        // Capture and publishing work on an old grant too; Connect Google Drive now asks for full Drive (google-workspace.md).
         const driveGranted = driveRead && drivePublish;
+        const driveComplete = grant.editDrive;
         if (entry.purpose === 'drive' && driveGranted && !store.read().accounts.find(account => account.id === accountId)?.drive) {
           // Drive is on; nothing is captured until the owner picks sources.
           store.setDrive(accountId, { enabled: true, sources: { ownedByMe: false, sharedWithMe: false, folderIds: [] } });
@@ -949,27 +975,28 @@ export function createGmailConnection(deps: {
         // Drive boxes are granted, an earlier Drive failure on any sign-in).
         dropAttempts([null, targetId, accountId], [action]);
         dropAttempts([null], ['unknown']);
-        if (driveGranted) dropAttempts([targetId, accountId], ['drive_connect']);
+        if (driveComplete) dropAttempts([targetId, accountId], ['drive_connect']);
         let attempt: GmailSignInAttempt;
-        if (entry.purpose === 'drive' && !driveGranted) {
+        if (entry.purpose === 'drive' && !driveComplete) {
           attempt = recordAttempt({
             action, kind: 'drive_not_granted', ok: false, accountId,
-            message: driveNotGrantedMessage(driveRead, drivePublish),
-            nextAction: 'Press Connect Google Drive and tick both Drive boxes.',
+            message: driveNotGrantedMessage(grant),
+            nextAction: 'Press Connect Google Drive and tick the Drive box.',
           });
         } else {
           attempt = recordAttempt({
             action, kind: 'ok', ok: true, accountId, nextAction: '',
             message: entry.purpose === 'drive'
-              ? 'Google Drive connected. Choose the Drive sources BotBoy should capture below.'
+              ? `Google Drive connected: BotBoy can create, edit, move and share your Drive files when you ask. ${grant.calendar ? 'Google Calendar is connected too. ' : 'Calendar was left unticked: press Connect Google Drive again and tick Calendar to use it in chat. '}Choose the Drive sources BotBoy should capture below.`
               : `Gmail ${existing ? 'reconnected' : 'connected'} as ${email}.`,
           });
         }
         changed();
-        const drive = driveGranted ? 'Drive read + publish'
-          : driveRead ? 'Drive read only'
-            : drivePublish ? 'Drive publish only'
-              : entry.purpose === 'drive' ? 'Drive not granted' : 'no Drive';
+        const drive = driveComplete ? `Drive full${grant.calendar ? ' + Calendar' : ''}`
+          : driveGranted ? 'Drive read + publish'
+            : driveRead ? 'Drive read only'
+              : drivePublish ? 'Drive publish only'
+                : entry.purpose === 'drive' ? 'Drive not granted' : 'no Drive';
         console.log(`[Gmail] ${existing ? 'Reconnected' : 'Connected'} ${email} as account ${accountId} (${active.source} client ${clientIdSuffix(active.client.clientId)}; ${granted.includes(GMAIL_COMPOSE_SCOPE) ? 'read + compose' : 'read only'}; ${drive})`);
         return { connected: true, accountId, accountEmail: email, attempt, replay: false };
       } catch (error) {

@@ -109,9 +109,17 @@ describe('job mandate gate', () => {
     const tools = ['query_db', 'gmail_send', 'mcp_etl_run_query', 'open_terminal'].map(name => ({ type: 'function', function: { name } }));
     expect(filterToolsForContinuation(tools).map(tool => tool.function.name)).toEqual(['query_db', 'mcp_etl_run_query']);
     for (const name of JOB_SCOPE_TOOLS) {
-      expect(name).not.toMatch(/^(gmail_|gdrive_|sharepoint_|publish_|open_terminal|send_terminal|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_|whatsapp_)/);
+      expect(name).not.toMatch(/^(gmail_|gdrive_share|sharepoint_|publish_|open_terminal|send_terminal|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_|whatsapp_)/);
     }
     expect(isJobScopeTool('mcp_etl_submit_run')).toBe(false);
+  });
+
+  // Google (owner request 2026-10-23, "same permissions for jobs" as the document tools): a job reads, creates, edits,
+  // uploads, downloads and organizes files and changes its own events; sharing and comments are never a job's.
+  it('lets a continuation use Drive and Calendar like the document tools, and never share or comment', () => {
+    expect([...JOB_SCOPE_TOOLS].filter(name => name.startsWith('gdrive_') || name.startsWith('gcalendar')).sort())
+      .toEqual(['gcalendar', 'gdrive_edit', 'gdrive_files', 'gdrive_read', 'gdrive_search']);
+    expect(isJobScopeTool('gdrive_share')).toBe(false);
   });
 
   // The Knowledge library (knowledge-library.md K9, K18): a continuation may read the library and PROPOSE a change (a card);

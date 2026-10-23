@@ -52,11 +52,15 @@ function makeApp(options: { library?: KnowledgeLibrary; llm: any; executor?: any
   return server;
 }
 
-/** A model that records every request and answers with plain text, or calls one tool first. */
-function recordingModel(toolFirst?: { name: string; arguments: string }) {
+/**
+ * A model that records every request and answers with plain text, or calls one tool first. Without `contextWindow` it has
+ * no `getContextWindow`, so `chat.ts` falls back to its 32,768-token window for scripted doubles.
+ */
+function recordingModel(toolFirst?: { name: string; arguments: string }, contextWindow?: number) {
   const requests: any[] = [];
   let call = 0;
   const llm = {
+    ...(contextWindow ? { getContextWindow: () => contextWindow } : {}),
     getActiveEndpoint: () => 'ecs',
     chatCompletionStream: vi.fn((req: any) => {
       requests.push(req);
@@ -142,13 +146,23 @@ describe('a library with sets', () => {
   });
 
   it('tells a tool how much room the next prompt has, so a whole-file load stays under it', async () => {
+    // The smallest window a supported chat model declares is 128K (llm-model-catalog.ts: gpt-4 / gpt-4o and the default
+    // profile). On the 32,768 fallback the system prompt alone nearly fills the window, so this test would cap prompt
+    // growth instead of checking the headroom. The completion budget is pinned so a developer's env cannot move it.
+    const modelWindow = 128_000;
+    const completionBudget = 32_768;
+    vi.stubEnv('CHAT_MAX_COMPLETION_TOKENS', String(completionBudget));
     const executor = { executeTool: vi.fn(async () => ({ content: 'loaded' })) };
-    const model = recordingModel({ name: 'knowledge_load', arguments: '{"set":"shop-data","file":"orders.md"}' });
+    const model = recordingModel({ name: 'knowledge_load', arguments: '{"set":"shop-data","file":"orders.md"}' }, modelWindow);
     await request(makeApp({ library, llm: model.llm, executor })).post('/api/chat/messages').send({ message: 'load the orders reference', stream: true });
     expect(executor.executeTool).toHaveBeenCalledTimes(1);
     const context = (executor.executeTool.mock.calls[0] as unknown as [unknown, { promptHeadroomTokens?: number }])[1];
     expect(typeof context.promptHeadroomTokens).toBe('number');
     expect(context.promptHeadroomTokens).toBeGreaterThan(1_000);
+    // It is the room LEFT: the prompt the model was sent is subtracted (any estimator counts at least 1 token per 8
+    // characters), not just the window less the completion budget.
+    const systemPromptChars = systemPromptOf(model.requests[0]).length;
+    expect(context.promptHeadroomTokens).toBeLessThan(modelWindow - completionBudget - systemPromptChars / 8);
   });
 
   it('a folder macOS blocks skips the block, keeps the tools, and never fails or delays the turn', async () => {

@@ -8,7 +8,7 @@ import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from '../../core/storage.js';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from '../../core/gmail-api.js';
-import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE } from '../../core/gdrive-api.js';
+import { GCALENDAR_SCOPE, GDRIVE_FULL_SCOPE, GDRIVE_READONLY_SCOPE } from '../../core/gdrive-api.js';
 import { createGmailConnection, type GmailConnection } from '../../core/gmail-connection.js';
 import { createGmailCredentialStore } from '../../core/gmail-credentials.js';
 import { createGmailSyncs, type GmailSyncs } from '../../monitors/gmail-sync.js';
@@ -52,7 +52,7 @@ const fakeFetch = async (input: string, init?: RequestInit): Promise<Response> =
     }
     if (exchangeMode === 'invalid_grant') return json({ error: 'invalid_grant', error_description: 'Bad Request' }, 400);
     const scope = exchangeMode === 'drive_all'
-      ? `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`
+      ? `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_FULL_SCOPE} ${GCALENDAR_SCOPE}`
       : exchangeMode === 'drive_read_only'
         ? `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE}`
         : GMAIL_READONLY_SCOPE;
@@ -249,7 +249,7 @@ describe('Gmail sync router', () => {
     const partial = await driveCallback('drive_read_only');
     expect(partial.status).toBe(200);
     expect(partial.text).toContain('Google connected, but Drive was not allowed');
-    expect(partial.text).toContain('Drive not granted in full: Google allowed reading Drive but not publishing to it.');
+    expect(partial.text).toContain('Drive not granted in full: Google allowed reading Drive but not changing it.');
     expect(partial.text).toContain('Use the link below to go back to Connections → Gmail, then press Connect Google Drive again.');
     expect(partial.text).not.toMatch(/close this tab/i);
     expect(partial.text).not.toContain('<script>');

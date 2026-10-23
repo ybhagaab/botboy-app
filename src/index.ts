@@ -799,7 +799,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { jobs: chatJobs, sender: whatsAppSender, connection: whatsAppConnection, notifier: jobNotifier }), { themes: uiThemes }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs, images: visualAssets }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { jobs: chatJobs, sender: whatsAppSender, connection: whatsAppConnection, notifier: jobNotifier }), { themes: uiThemes }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the

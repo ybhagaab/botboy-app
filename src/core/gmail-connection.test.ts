@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, type GoogleEndpoints } from './gmail-api.js';
-import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE } from './gdrive-api.js';
+import { GCALENDAR_SCOPE, GDRIVE_FULL_SCOPE, GDRIVE_READONLY_SCOPE } from './gdrive-api.js';
 import { createGmailConnection, GmailAuthError } from './gmail-connection.js';
 import { BOTBOY_GOOGLE_CLIENT } from './gmail-builtin-client.js';
 import { createGmailCredentialStore, GmailCredentialInputError, usableBuiltInClient, validateGmailClient } from './gmail-credentials.js';
@@ -653,7 +653,8 @@ describe('Gmail connection: built-in client and granted scopes', () => {
  * measured cause of the ETIMEDOUT itself (Node's 250 ms connect limit) is
  * network-defaults.test.ts; here the code exchange meets the failure it caused.
  */
-const WITH_DRIVE = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`;
+// Connect Google Drive with every box ticked: full Drive and Calendar (google-workspace.md).
+const WITH_DRIVE = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE} ${GDRIVE_FULL_SCOPE} ${GCALENDAR_SCOPE}`;
 const GMAIL_ONLY = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE}`;
 const errnoError = (code: string, syscall = 'connect') => Object.assign(new Error(`${syscall} ${code}`), { code, syscall });
 /** What Node threw for every fetch to Google on the owner's Mac: a failed connect to both addresses. */
@@ -907,16 +908,16 @@ describe('Gmail sign-in results: the last attempt is not the connection’s heal
     expect(messages.filter(message => message.includes('Your current Gmail connection is unchanged.'))).toHaveLength(4);
   });
 
-  it('says a Drive box was left unticked, for none or one of the two, and keeps Gmail connected', async () => {
+  it('says the Drive box was left unticked, or only part of Drive was allowed, and keeps Gmail connected', async () => {
     const { service } = make();
     await signIn(service);
     google.grantScope = GMAIL_ONLY;
     const none = (await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-2')).result;
     expect(none).toMatchObject({ connected: true, attempt: { kind: 'drive_not_granted', ok: false, action: 'drive_connect' } });
-    expect(none.attempt!.message).toBe('Drive not granted: Google connected, but both Drive boxes were left unticked. Press Connect Google Drive and tick both Drive boxes.');
+    expect(none.attempt!.message).toBe('Drive not granted: Google connected, but the Drive box was left unticked. Press Connect Google Drive and tick the Drive box.');
     google.grantScope = `${GMAIL_ONLY} ${GDRIVE_READONLY_SCOPE}`;
     const some = (await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-3')).result;
-    expect(some.attempt!.message).toBe('Drive not granted in full: Google allowed reading Drive but not publishing to it. Press Connect Google Drive and tick both Drive boxes.');
+    expect(some.attempt!.message).toBe('Drive not granted in full: Google allowed reading Drive but not changing it. Press Connect Google Drive and tick the Drive box.');
     expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: false, drive: null, lastError: null });
   });
 
@@ -1006,7 +1007,7 @@ describe('Gmail sign-in results: the last attempt is not the connection’s heal
     google.grantScope = WITH_DRIVE;
     clock += 60_000;
     expect((await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-ok')).result.connected).toBe(true);
-    expect(service.status().signIn.drive).toMatchObject({ kind: 'ok', ok: true, message: 'Google Drive connected. Choose the Drive sources BotBoy should capture below.' });
+    expect(service.status().signIn.drive).toMatchObject({ kind: 'ok', ok: true, message: 'Google Drive connected: BotBoy can create, edit, move and share your Drive files when you ask. Google Calendar is connected too. Choose the Drive sources BotBoy should capture below.' });
     expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: true });
   });
 
@@ -1096,7 +1097,7 @@ describe('Gmail sign-in results: the last attempt is not the connection’s heal
 
     google.grantScope = WITH_DRIVE;
     await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-4');
-    expect(logs.filter(line => line.includes('Reconnected')).at(-1)).toContain('; Drive read + publish)');
+    expect(logs.filter(line => line.includes('Reconnected')).at(-1)).toContain('; Drive full + Calendar)');
 
     google.exchangeError = 'invalid_grant';
     await signIn(service, { accountId: 'default', purpose: 'drive' }, 'code-5');
@@ -1196,11 +1197,11 @@ describe('Regression: a recorded sign-in failure never gates a new attempt', () 
     expect(service.accounts()[0]).toMatchObject({ canReadDrive: false, canPublishDrive: false, drive: null });
     const before = exchanges().length;
 
-    // With the notice still visible a new Drive start is accepted and asks for both Drive scopes.
+    // With the notice still visible a new Drive start is accepted and asks for full Drive and Calendar.
     google.grantScope = WITH_DRIVE;
     const retry = service.beginConnect({ accountId: 'default', purpose: 'drive' });
-    expect(queryOf(retry.authUrl).get('scope')).toContain(GDRIVE_READONLY_SCOPE);
-    expect(queryOf(retry.authUrl).get('scope')).toContain(GDRIVE_FILE_SCOPE);
+    expect(queryOf(retry.authUrl).get('scope')).toContain(GDRIVE_FULL_SCOPE);
+    expect(queryOf(retry.authUrl).get('scope')).toContain(GCALENDAR_SCOPE);
     expect(service.status().signIn.drive).toMatchObject({ kind: 'network' });
     const done = await service.completeSignIn({ code: 'retry-code', state: queryOf(retry.authUrl).get('state') });
 
@@ -1208,7 +1209,7 @@ describe('Regression: a recorded sign-in failure never gates a new attempt', () 
     expect(exchanges().length - before).toBe(1);
     expect(exchanges().at(-1)!.form.code).toBe('retry-code');
     expect(service.accounts()[0]).toMatchObject({ canReadDrive: true, canPublishDrive: true, drive: { enabled: true } });
-    expect(store.read().accounts[0].connection.scope).toContain(GDRIVE_FILE_SCOPE);
+    expect(store.read().accounts[0].connection.scope).toContain(GDRIVE_FULL_SCOPE);
     expect(service.status().signIn.drive).toMatchObject({ kind: 'ok', ok: true });
     expect(pauses).toEqual([1500]);
   });

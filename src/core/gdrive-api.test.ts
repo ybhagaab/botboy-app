@@ -8,14 +8,23 @@ import {
   createDriveClient,
   driveFailureForHealth,
   escapeDriveQueryLiteral,
+  googleGrantOf,
 } from './gdrive-api.js';
 import { createFakeDrive } from './gdrive-api.fake.js';
 import { classifyCaptureFailure } from './capture-health.js';
 
 describe('Drive scopes', () => {
-  it('asks for drive.readonly + drive.file, never full drive', () => {
-    expect(GDRIVE_REQUESTED_SCOPES).toEqual([GDRIVE_READONLY_SCOPE, GDRIVE_FILE_SCOPE]);
-    expect(GDRIVE_REQUESTED_SCOPES).not.toContain('https://www.googleapis.com/auth/drive');
+  // Owner decision 2026-10-23 ("renaming, deleting, moving, sharing, everything"): full Drive, which the Docs, Sheets,
+  // Slides and Forms APIs also accept, plus Calendar. It replaced the 2026-10-12 drive.readonly + drive.file grant.
+  it('asks for full drive and calendar', () => {
+    expect(GDRIVE_REQUESTED_SCOPES).toEqual(['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/calendar']);
+  });
+
+  it('reads an older readonly + file grant as read and publish, not edit; full drive covers all three', () => {
+    expect(googleGrantOf([GDRIVE_READONLY_SCOPE, GDRIVE_FILE_SCOPE])).toEqual({ readDrive: true, publishDrive: true, editDrive: false, calendar: false });
+    expect(googleGrantOf(['https://www.googleapis.com/auth/drive'])).toEqual({ readDrive: true, publishDrive: true, editDrive: true, calendar: false });
+    expect(googleGrantOf(['https://www.googleapis.com/auth/calendar'])).toEqual({ readDrive: false, publishDrive: false, editDrive: false, calendar: true });
+    expect(googleGrantOf([])).toEqual({ readDrive: false, publishDrive: false, editDrive: false, calendar: false });
   });
 });
 

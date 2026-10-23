@@ -2891,6 +2891,8 @@ function renderGmailSignInNotice(attempt) {
 function gdriveStateOf(conn) {
   const read = Boolean(conn?.canReadDrive);
   const publish = Boolean(conn?.canPublishDrive);
+  // Full Drive (google-workspace.md): BotBoy may create, edit, move, share and trash files when the owner asks.
+  if (conn?.canEditDrive) return { key: 'full', label: `Connected (full access${conn?.canUseCalendar ? ' + Calendar' : ''})`, tone: 'good' };
   if (read && publish) return { key: 'connected', label: 'Connected (read + publish)', tone: 'good' };
   if (read) return { key: 'read_only', label: 'Connected (read only)', tone: 'warn' };
   if (publish) return { key: 'publish_only', label: 'Connected (publish only)', tone: 'warn' };
@@ -2912,17 +2914,26 @@ function renderGdriveSection(account, busy) {
   // Drive's own capture trouble (for example the Drive API is not enabled) belongs here, not only on the top-bar chip.
   const issue = conn.canReadDrive || conn.canPublishDrive ? captureIssueFor('gdrive') : null;
   const issueAlert = issue ? `<div class="mcp-alert warn gdrive-issue" role="status">${icon('alert', 14)}<span><strong>Drive is not syncing.</strong> ${esc(captureIssueDetail(issue))}</span></div>` : '';
+  const opening = busy === `drive:${account.id}` ? 'Opening Google…' : null;
   if (!conn.canReadDrive || !conn.canPublishDrive) {
     return `<section class="card pad" style="margin-top:8px">${head}
-      <p class="page-subtitle">${conn.canReadDrive || conn.canPublishDrive ? 'Drive is only partly allowed. Connect again and tick both Drive boxes.' : 'Capture the Drive files you choose and publish BotBoy documents to Drive. Google asks you to allow Drive for this account.'}</p>
+      <p class="page-subtitle">${conn.canReadDrive || conn.canPublishDrive ? 'Drive is only partly allowed. Connect again and tick the Drive box.' : 'Capture the Drive files you choose, and let BotBoy create, edit, move, share and trash Docs, Sheets, Slides, Forms and other files when you ask in chat, plus your Calendar. Google asks you to allow Drive and Calendar for this account.'}</p>
       ${notice}${issueAlert}
-      <button class="button" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled} style="margin-top:8px">${icon('link', 14)} ${busy === `drive:${account.id}` ? 'Opening Google…' : 'Connect Google Drive'}</button></section>`;
+      <button class="button" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled} style="margin-top:8px">${icon('link', 14)} ${opening ?? 'Connect Google Drive'}</button></section>`;
   }
   const sources = conn.drive?.sources || { ownedByMe: false, sharedWithMe: false, folderIds: [] };
   const enabled = conn.drive?.enabled !== false;
+  // An account connected before full Drive access existed (or with Calendar left unticked) can be upgraded in place.
+  const upgrade = !conn.canEditDrive
+    ? `<div class="mcp-alert" data-gdrive-upgrade>${icon('alert', 14)}<span>BotBoy can read this Drive and publish its documents, but not create, edit, move or share your files, or use your Calendar. Press Allow full access and tick the Drive and Calendar boxes.</span></div>
+      <button class="button small" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled}>${icon('link', 14)} ${opening ?? 'Allow full access'}</button>`
+    : !conn.canUseCalendar
+      ? `<div class="mcp-alert" data-gdrive-upgrade>${icon('alert', 14)}<span>Calendar is not connected. Press Add Calendar and tick the Calendar box.</span></div>
+      <button class="button small" type="button" data-action="gdrive-connect" data-account="${id}" ${disabled}>${icon('link', 14)} ${opening ?? 'Add Calendar'}</button>`
+      : '';
   return `<section class="card pad" style="margin-top:8px" data-gdrive-account="${id}">${head}
-    <p class="page-subtitle">BotBoy reads only what you choose here. It never changes Drive files it did not publish.</p>
-    ${notice}${issueAlert}
+    <p class="page-subtitle">Capture reads only the sources you choose here.${conn.canEditDrive ? ' In chat, BotBoy creates, edits, moves, shares and trashes Drive files only when you ask.' : ' It never changes Drive files it did not publish.'}</p>
+    ${notice}${issueAlert}${upgrade}
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-enabled ${enabled ? 'checked' : ''}> Capture from Drive</label>
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-owned ${sources.ownedByMe ? 'checked' : ''}> Files I own</label>
     <label class="page-subtitle" style="display:flex;gap:8px;align-items:center"><input type="checkbox" data-gdrive-shared ${sources.sharedWithMe ? 'checked' : ''}> Shared with me</label>

@@ -51,6 +51,7 @@ import {
 } from '../../core/data-room-tool-failure.js';
 import { stableAnalyticsJson } from '../../core/analytics-data-room-policy.js';
 import { gmailDraftIdFromResult, gmailWriteConfirmed } from '../../core/gmail-chat-tools.js';
+import { GOOGLE_WRITE_TOOLS, googleWriteConfirmed } from '../../core/gdrive-chat-tools.js';
 import { whatsAppSendConfirmed } from '../../core/whatsapp-send.js';
 import { gmailDraftMarker } from '../../core/gmail-compose.js';
 import { mcpServerIdFromToolResult, withMcpServerCards } from '../../core/mcp-custom-config.js';
@@ -1468,6 +1469,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           knowledgeAvailable,
           knowledgeWriteAvailable,
           driveConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canReadDrive && !account.needsReconnect),
+          driveEditable: (deps.gmailConnection?.accounts() ?? []).some(account => account.canEditDrive && !account.needsReconnect),
+          calendarConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canUseCalendar && !account.needsReconnect),
           uiThemeAvailable: uiThemeTurn,
           jobNotifyAvailable: jobNotifyTurn,
           amazonEmployee: turnAmazonEmployee,
@@ -1663,6 +1666,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
           ...GMAIL_WRITE_TOOLS,
           ...WHATSAPP_WRITE_TOOLS,
+          ...GOOGLE_WRITE_TOOLS,
           'job_notify',
           ...KNOWLEDGE_CHANGE_TOOLS,
         ]);
@@ -2444,6 +2448,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                   : GMAIL_WRITE_TOOLS.has(tc.function.name)
                     // A Gmail write counts only with its receipt (draft saved / message sent).
                     ? gmailWriteConfirmed(tc.function.name, result?.content)
+                  : GOOGLE_WRITE_TOOLS.has(tc.function.name)
+                    // A Google write counts only with its receipt (ok: true and what changed); a list or a refusal never does.
+                    ? googleWriteConfirmed(tc.function.name, result?.content)
                     : WHATSAPP_WRITE_TOOLS.has(tc.function.name)
                       ? whatsAppSendConfirmed(tc.function.name, result?.content)
                       // "Updates are on" counts only when job_notify really armed them (its confirmation reached the phone).

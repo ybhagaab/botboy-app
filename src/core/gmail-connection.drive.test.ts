@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE, GMAIL_REQUESTED_SCOPES, buildAuthorizationUrl, type GoogleEndpoints } from './gmail-api.js';
 import { createGmailConnection } from './gmail-connection.js';
 import { createGmailCredentialStore, parseDriveSettings } from './gmail-credentials.js';
-import { GDRIVE_FILE_SCOPE, GDRIVE_READONLY_SCOPE } from './gdrive-api.js';
+import { GCALENDAR_SCOPE, GDRIVE_FILE_SCOPE, GDRIVE_FULL_SCOPE, GDRIVE_READONLY_SCOPE } from './gdrive-api.js';
 
 const CLIENT = { clientId: '1234567890-abcdefghijkl.apps.googleusercontent.com', clientSecret: 'GOCSPX-test-secret-value' };
 const ENDPOINTS: GoogleEndpoints = {
@@ -16,7 +16,10 @@ const ENDPOINTS: GoogleEndpoints = {
 };
 const REDIRECT = 'http://127.0.0.1:7778/api/gmail-sync/oauth/callback';
 const GMAIL_ONLY = `${GMAIL_READONLY_SCOPE} ${GMAIL_COMPOSE_SCOPE}`;
-const WITH_DRIVE = `${GMAIL_ONLY} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`;
+/** What Connect Google Drive grants when every box is ticked (google-workspace.md). */
+const WITH_DRIVE = `${GMAIL_ONLY} ${GDRIVE_FULL_SCOPE} ${GCALENDAR_SCOPE}`;
+/** A grant made before full Drive access existed. */
+const OLD_DRIVE = `${GMAIL_ONLY} ${GDRIVE_READONLY_SCOPE} ${GDRIVE_FILE_SCOPE}`;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -63,23 +66,36 @@ describe('Connect Google Drive (incremental grant on the Gmail account)', () => 
     const { service } = make();
     await sign(service);
     const [account] = service.accounts();
-    expect(account).toMatchObject({ canReadDrive: false, canPublishDrive: false, drive: null, canCompose: true });
+    expect(account).toMatchObject({ canReadDrive: false, canPublishDrive: false, canEditDrive: false, canUseCalendar: false, drive: null, canCompose: true });
     expect(service.slot(account.id).canReadDrive()).toBe(false);
   });
 
-  it('the Drive URL carries both scope sets, include_granted_scopes, and login_hint; the grant flips capabilities', async () => {
+  it('the Drive URL asks for full Drive and Calendar with include_granted_scopes and login_hint; the grant flips every capability', async () => {
     const { service, store } = make();
     await sign(service);
     grantScope = WITH_DRIVE;
     const { authUrl, outcome } = await sign(service, { accountId: 'default', purpose: 'drive' });
-    expect(authUrl.searchParams.get('scope')!.split(' ')).toEqual([...GMAIL_REQUESTED_SCOPES, GDRIVE_READONLY_SCOPE, GDRIVE_FILE_SCOPE]);
+    expect(authUrl.searchParams.get('scope')!.split(' ')).toEqual([...GMAIL_REQUESTED_SCOPES, GDRIVE_FULL_SCOPE, GCALENDAR_SCOPE]);
     expect(authUrl.searchParams.get('include_granted_scopes')).toBe('true');
     expect(authUrl.searchParams.get('login_hint')).toBe('jane@gmail.com');
     expect(outcome.ok).toBe(true);
     const [account] = service.accounts();
-    expect(account).toMatchObject({ canReadDrive: true, canPublishDrive: true, lastError: null });
+    expect(account).toMatchObject({ canReadDrive: true, canPublishDrive: true, canEditDrive: true, canUseCalendar: true, lastError: null });
+    expect(account.signIn.drive).toMatchObject({ ok: true, message: expect.stringMatching(/create, edit, move and share.*Google Calendar is connected too/) });
     expect(account.drive).toEqual({ enabled: true, sources: { ownedByMe: false, sharedWithMe: false, folderIds: [] } });
     expect(store.read().accounts[0].drive?.enabled).toBe(true);
+    const slot = service.slot(account.id);
+    expect([slot.canEditDrive(), slot.canUseCalendar()]).toEqual([true, true]);
+  });
+
+  it('Drive without Calendar connects Drive and says how to add Calendar', async () => {
+    const { service } = make();
+    await sign(service);
+    grantScope = `${GMAIL_ONLY} ${GDRIVE_FULL_SCOPE}`;
+    await sign(service, { accountId: 'default', purpose: 'drive' });
+    const [account] = service.accounts();
+    expect(account).toMatchObject({ canEditDrive: true, canUseCalendar: false });
+    expect(account.signIn.drive).toMatchObject({ ok: true, message: expect.stringMatching(/Calendar was left unticked/) });
   });
 
   it('a partial grant keeps Gmail and says Drive was not granted', async () => {
@@ -97,13 +113,28 @@ describe('Connect Google Drive (incremental grant on the Gmail account)', () => 
     expect(account.drive).toBeNull();
   });
 
+  it('an older Drive grant keeps reading and publishing, and Connect Google Drive asks for full access', async () => {
+    const { service } = make();
+    await sign(service);
+    grantScope = OLD_DRIVE;
+    await sign(service, { accountId: 'default', purpose: 'drive' });
+    const [account] = service.accounts();
+    expect(account).toMatchObject({ canReadDrive: true, canPublishDrive: true, canEditDrive: false, canUseCalendar: false });
+    // Full Drive was asked for and not given: the Drive section says what is missing.
+    expect(account.signIn.drive).toMatchObject({ kind: 'drive_not_granted', message: expect.stringMatching(/Drive editing not granted/) });
+    // A Gmail Reconnect of such an account asks for the full set again.
+    const { authUrl } = await sign(service, { accountId: 'default' });
+    expect(authUrl.searchParams.get('scope')!.split(' ')).toEqual([...GMAIL_REQUESTED_SCOPES, GDRIVE_FULL_SCOPE, GCALENDAR_SCOPE]);
+  });
+
   it('a later Gmail Reconnect of a Drive account asks for Drive again', async () => {
     const { service } = make();
     await sign(service);
     grantScope = WITH_DRIVE;
     await sign(service, { accountId: 'default', purpose: 'drive' });
     const { authUrl } = await sign(service, { accountId: 'default' });
-    expect(authUrl.searchParams.get('scope')).toContain(GDRIVE_READONLY_SCOPE);
+    expect(authUrl.searchParams.get('scope')).toContain(GDRIVE_FULL_SCOPE);
+    expect(authUrl.searchParams.get('scope')).toContain(GCALENDAR_SCOPE);
   });
 
   it('drive settings survive every write: client save, label, reconnect, another account leaving', async () => {
