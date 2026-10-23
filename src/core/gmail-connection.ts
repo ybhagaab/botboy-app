@@ -637,7 +637,14 @@ export function createGmailConnection(deps: {
     }
   }
 
-  async function refresh(accountId: string): Promise<string> {
+  /** The sign-in a token request uses (client and refresh token), compared before an answer may mark the account. */
+  function signInOf(stored: StoredGmailCredentials, accountId: string): string | null {
+    const active = activeOf(stored);
+    const account = stored.accounts.find(entry => entry.id === accountId);
+    return active && account ? `${active.client.clientId}\n${active.client.clientSecret}\n${account.connection.refreshToken}` : null;
+  }
+
+  async function refresh(accountId: string, retried = false): Promise<string> {
     const stored = store.read();
     const active = activeOf(stored);
     const account = stored.accounts.find(entry => entry.id === accountId);
@@ -645,6 +652,7 @@ export function createGmailConnection(deps: {
     if (!active || !account) {
       throw new GmailAuthError('Gmail is not connected. Open Connections → Gmail and connect your account.', 'not_connected');
     }
+    const used = signInOf(stored, accountId);
     try {
       const tokens = await refreshAccessToken(fetchImpl, endpoints, {
         clientId: active.client.clientId,
@@ -658,6 +666,14 @@ export function createGmailConnection(deps: {
       return tokens.accessToken;
     } catch (error) {
       if (error instanceof GoogleApiError && ['invalid_grant', 'invalid_client', 'unauthorized_client'].includes(error.code)) {
+        // Owner report 2026-10-23 (chat called a working Gmail disconnected): a Reconnect or a client change that lands
+        // while this request is out makes Google's "no" about a sign-in BotBoy no longer uses. It never marks the
+        // account: hand out the token the Reconnect stored, or ask once more with the current sign-in.
+        if (signInOf(store.read(), accountId) !== used) {
+          if (state.access && state.access.expiresAt - ACCESS_TOKEN_SKEW_MS > now()) return state.access.token;
+          if (!retried) return refresh(accountId, true);
+          throw error;
+        }
         if (!state.needsReconnect) { state.needsReconnect = true; changed(); }
         state.lastError = error.code === 'invalid_grant'
           ? `Google ended BotBoy’s access to ${gmailAccountName({ label: account.label, email: account.connection.accountEmail })} (revoked, expired, or the password changed). Choose Reconnect.`
@@ -693,10 +709,20 @@ export function createGmailConnection(deps: {
       client() {
         return createGmailClient({
           // Any successful Gmail answer proves the grant and the route work: it
-          // outdates an earlier transient sign-in failure for this account.
+          // outdates an earlier transient sign-in failure for this account, and
+          // a remembered "needs Reconnect" (owner report 2026-10-23: chat refused
+          // a working Gmail on that flag until the next token renewal).
           fetchImpl: async (input, init) => {
             const response = await fetchImpl(input, init);
-            if (response.ok) runtime(accountId).okAt = now();
+            if (response.ok) {
+              const state = runtime(accountId);
+              state.okAt = now();
+              if (state.needsReconnect) {
+                state.needsReconnect = false;
+                state.lastError = null;
+                changed();
+              }
+            }
             return response;
           },
           endpoints,

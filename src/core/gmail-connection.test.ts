@@ -43,6 +43,10 @@ function fakeGoogle() {
     profileFailures: [] as Error[],
     /** When set, every Gmail profile read answers with this HTTP status and body (a Cloud project with the API off, say). */
     profileHttpError: null as { status: number; body: unknown } | null,
+    /** Delays every Gmail profile read (a request still out while something else happens). */
+    profileDelayMs: 0,
+    /** A token renewal sent with this client secret answers invalid_client (an old secret Google no longer takes). */
+    rejectClientSecret: '' as string,
     /** When set, the code exchange answers HTTP 400 with this error code. */
     exchangeError: '' as string,
     fetch: async (input: string, init?: RequestInit): Promise<Response> => {
@@ -61,12 +65,14 @@ function fakeGoogle() {
       }
       if (input === ENDPOINTS.tokenUrl && form.grant_type === 'refresh_token') {
         if (google.refreshDelayMs) await new Promise(resolve => setTimeout(resolve, google.refreshDelayMs));
+        if (google.rejectClientSecret && form.client_secret === google.rejectClientSecret) return json({ error: 'invalid_client', error_description: 'Unauthorized' }, 400);
         if (google.refreshError) return json({ error: google.refreshError, error_description: 'Token has been expired or revoked.' }, 400);
         google.issued++;
         return json({ access_token: `access-${google.issued}`, expires_in: 3600, scope: GMAIL_READONLY_SCOPE });
       }
       if (input === ENDPOINTS.revokeUrl) return json({});
       if (input.startsWith(`${ENDPOINTS.apiBase}/gmail/v1/users/me/profile`)) {
+        if (google.profileDelayMs) await new Promise(resolve => setTimeout(resolve, google.profileDelayMs));
         const failure = google.profileFailures.shift();
         if (failure) throw failure;
         if (google.profileHttpError) return json(google.profileHttpError.body, google.profileHttpError.status);
@@ -338,6 +344,64 @@ describe('Gmail connection (OAuth loopback + PKCE)', () => {
     google.refreshError = '';
     expect(await service.accessToken()).toBe('access-3');
     expect(service.status()).toMatchObject({ needsReconnect: false, lastError: null });
+  });
+
+  // Owner report 2026-10-23: chat called a working Gmail disconnected. The "needs Reconnect" flag is only Google's
+  // answer about the sign-in BotBoy still uses, and any successful Gmail answer clears it.
+  it('a token request still out when the owner reconnects neither marks the account nor fails its callers', async () => {
+    const service = connection();
+    service.saveClient(CLIENT);
+    await connect(service);
+    clock += 3600_000; // access-1 expired
+    google.refreshError = 'invalid_grant'; // Google ended refresh-1 ...
+    google.refreshDelayMs = 20; // ... and its answer is slow
+    const waiting = service.accessToken();
+    await new Promise(resolve => setTimeout(resolve, 2));
+    expect(google.calls.filter(call => call.form.grant_type === 'refresh_token').map(call => call.form.refresh_token)).toEqual(['refresh-1']);
+    google.grantRefreshToken = 'refresh-2';
+    expect((await connect(service, 'code-2')).outcome).toMatchObject({ ok: true, accountId: 'default' });
+    // The old request's "revoked" now arrives: it was about refresh-1, which BotBoy no longer uses.
+    expect(await waiting).toBe('access-2');
+    expect(service.status()).toMatchObject({ connected: true, needsReconnect: false, lastError: null });
+    // A real revocation of the current sign-in still marks the account.
+    google.refreshDelayMs = 0;
+    service.invalidateAccessToken();
+    const failure = await service.accessToken().catch(error => error);
+    expect(failure).toMatchObject({ code: 'reconnect_required' });
+    expect(service.status()).toMatchObject({ needsReconnect: true, lastError: expect.stringContaining('Choose Reconnect') });
+  });
+
+  it('asks once more with the current sign-in when the client secret changed while a token request was out', async () => {
+    const service = connection();
+    service.saveClient(CLIENT);
+    await connect(service);
+    clock += 3600_000;
+    google.rejectClientSecret = CLIENT.clientSecret; // the old secret no longer works ...
+    google.refreshDelayMs = 20;
+    const waiting = service.accessToken();
+    await new Promise(resolve => setTimeout(resolve, 2));
+    service.saveClient({ clientId: CLIENT.clientId, clientSecret: 'GOCSPX-new-secret-value' }); // ... the owner saves the new one; same ID keeps the grant
+    expect(await waiting).toBe('access-2');
+    expect(google.calls.filter(call => call.form.grant_type === 'refresh_token').map(call => call.form.client_secret)).toEqual([CLIENT.clientSecret, 'GOCSPX-new-secret-value']);
+    expect(service.status()).toMatchObject({ needsReconnect: false, lastError: null });
+  });
+
+  it('a successful Gmail answer clears a remembered needs-Reconnect, and says so', async () => {
+    const service = connection();
+    service.saveClient(CLIENT);
+    await connect(service);
+    google.profileDelayMs = 20;
+    const read = service.client().getProfile(); // out with access-1, which Google still accepts
+    await new Promise(resolve => setTimeout(resolve, 2));
+    service.invalidateAccessToken();
+    google.refreshError = 'invalid_grant';
+    await service.accessToken().catch(() => undefined);
+    expect(service.status()).toMatchObject({ needsReconnect: true });
+    let changes = 0;
+    service.onChange(() => { changes++; });
+    await expect(read).resolves.toMatchObject({ emailAddress: 'jane.doe@gmail.com' });
+    expect(service.status()).toMatchObject({ needsReconnect: false, lastError: null });
+    expect(changes).toBe(1);
   });
 
   it('never revokes on reconnect; another address adds an account, each with its own token, label, and disconnect', async () => {
