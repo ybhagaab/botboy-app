@@ -8126,6 +8126,8 @@ function hydrateDocumentPreview() {
     // hostile document content renders literally inside the rich preview.
     preview.innerHTML = window.formatMarkdownContent(content);
     annotateDocumentCitations(preview, Array.isArray(artifact?.citations) ? artifact.citations : []);
+    // ```mermaid and ```svg blocks draw as they export (docs/maps/document-media.md).
+    window.BotBoyHtmlViews?.mountDocumentVisuals?.(preview, state.route.artifactId);
   } else {
     preview.textContent = content;
   }

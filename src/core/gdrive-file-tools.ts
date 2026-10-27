@@ -51,6 +51,7 @@ import {
   googleResult,
   invalid,
   numberedLines,
+  PUBLIC_WORDS,
   trimmed,
   untrustedEnvelope,
   type GoogleFailure,
@@ -261,10 +262,16 @@ export async function driveCreate(env: GoogleToolEnv, hooks: CreateHooks = {}): 
       return done(await drive.createFolder({ name, ...(parents ? { parents } : {}), appProperties }));
     }
     if (kind === 'doc') {
-      const file = content.trim()
-        ? await drive.createFile({ name, parents: parents ?? [], mimeType: GDRIVE_DOC_MIME, appProperties, media: Buffer.from(content, 'utf8'), mediaMimeType: 'text/markdown' })
-        : await drive.createMetadataFile({ name, mimeType: GDRIVE_DOC_MIME, ...(parents ? { parents } : {}), appProperties });
-      return done(file, content.trim() ? { from: 'markdown' } : { blank: true });
+      // Pictures and diagrams in the Markdown: Drive's Word import carries them, its Markdown import cannot.
+      const word = content.trim() && env.wordFromMarkdown ? await env.wordFromMarkdown(content) : null;
+      const file = word
+        ? await drive.createFile({ name, parents: parents ?? [], mimeType: GDRIVE_DOC_MIME, appProperties, media: word.data, mediaMimeType: DOCX_MIME })
+        : content.trim()
+          ? await drive.createFile({ name, parents: parents ?? [], mimeType: GDRIVE_DOC_MIME, appProperties, media: Buffer.from(content, 'utf8'), mediaMimeType: 'text/markdown' })
+          : await drive.createMetadataFile({ name, mimeType: GDRIVE_DOC_MIME, ...(parents ? { parents } : {}), appProperties });
+      return done(file, word
+        ? { from: 'markdown', via: 'word', pictures: word.media.pictures, diagrams: word.media.diagrams, ...(word.media.problems.length ? { mediaProblems: word.media.problems.slice(0, 10) } : {}) }
+        : content.trim() ? { from: 'markdown' } : { blank: true });
     }
     if (kind === 'sheet') {
       const csv = isRowList(env.args.rows) ? rowsToCsv(env.args.rows) : content;
@@ -617,8 +624,6 @@ export async function driveManage(env: GoogleToolEnv): Promise<ToolResult> {
 const ROLES = ['reader', 'commenter', 'writer'] as const;
 const EMAIL = /^[^\s@<>()",;:]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,}$/;
 const DOMAIN = /^(?=.{3,253}$)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
-/** Words the owner's own message must hold before anyone with the link, or a whole domain, may open a file. */
-const PUBLIC_WORDS = /\b(?:anyone|anybody|everyone|public|publicly)\b/i;
 
 function compactPermission(permission: DrivePermission): Record<string, unknown> {
   return {

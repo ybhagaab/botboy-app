@@ -23,7 +23,9 @@ interface Unit {
   mark: Mark;
   style?: DocsTextStyle;
   /** On a newline: the paragraph's properties. */
-  para?: { namedStyle: string; bullet: { listId: string; nesting: number } | null };
+  para?: { namedStyle: string; bullet: { listId: string; nesting: number } | null; alignment?: string };
+  /** On an inserted picture: the address Google fetched it from. */
+  uri?: string;
 }
 
 interface FakeDoc {
@@ -45,6 +47,10 @@ export interface FakeDocs extends DocsClient {
   failNext(error: GoogleApiError, options?: { afterEffect?: boolean }): void;
   /** Someone else edits: bumps the revision. */
   touch(documentId: string): void;
+  /** insertInlineImage from a matching address fails like Google's fetch failure (HTTP 400, nothing written). */
+  refuseImageUri?: (uri: string) => boolean;
+  /** The addresses of the pictures inserted into a document, in document order. */
+  pictures(documentId: string): string[];
 }
 
 const PRESET_ORDERED = 'NUMBERED_DECIMAL_ALPHA_ROMAN';
@@ -58,6 +64,8 @@ export function createFakeDocs(): FakeDocs {
   const calls: FakeDocs['calls'] = [];
   let pending: { error: GoogleApiError; afterEffect: boolean } | null = null;
   let listSeq = 0;
+  /** The fake itself, for settings tests change after creating it (refuseImageUri). */
+  let api: FakeDocs | null = null;
 
   function doc(id: string): FakeDoc {
     const found = docs.get(id);
@@ -267,10 +275,26 @@ export function createFakeDocs(): FakeDocs {
       units.splice(at, 0, ...inserted);
       return;
     }
+    if (request.insertInlineImage) {
+      const uri = String(request.insertInlineImage.uri ?? '');
+      if (!/^https:\/\//.test(uri) || api?.refuseImageUri?.(uri)) {
+        throw new GoogleApiError('Google Docs edit failed (HTTP 400 INVALID_ARGUMENT: Invalid requests[0].insertInlineImage: There was a problem retrieving the image. The provided image should be publicly accessible, within size limit, and in supported formats.)', 400, 'INVALID_ARGUMENT');
+      }
+      const at = posOf(request.insertInlineImage.location.index);
+      if (!(at >= 0 && at < units.length) || ['tableStart', 'rowStart', 'cellStart', 'tableEnd'].includes(units[at].mark)) {
+        throw new GoogleApiError('Google Docs edit failed (HTTP 400 INVALID_ARGUMENT: insertion index must be inside a paragraph)', 400, 'INVALID_ARGUMENT');
+      }
+      units.splice(at, 0, { ch: '\u0000', mark: 'object', uri });
+      return;
+    }
     const overlapped = (range: { startIndex: number; endIndex: number }) => paragraphsOf(units)
       .filter(paragraph => paragraph.from + 1 < range.endIndex && paragraph.to + 2 > range.startIndex);
     if (request.updateParagraphStyle) {
-      for (const paragraph of overlapped(request.updateParagraphStyle.range)) units[paragraph.to].para!.namedStyle = request.updateParagraphStyle.paragraphStyle.namedStyleType;
+      for (const paragraph of overlapped(request.updateParagraphStyle.range)) {
+        const style = request.updateParagraphStyle.paragraphStyle;
+        if (style.namedStyleType) units[paragraph.to].para!.namedStyle = style.namedStyleType;
+        if (style.alignment) units[paragraph.to].para!.alignment = style.alignment;
+      }
       return;
     }
     if (request.deleteParagraphBullets) {
@@ -315,6 +339,7 @@ export function createFakeDocs(): FakeDocs {
     fromMarkdown,
     failNext(error, options = {}) { pending = { error, afterEffect: Boolean(options.afterEffect) }; },
     touch(documentId) { doc(documentId).revision++; },
+    pictures(documentId) { return doc(documentId).units.filter(unit => unit.mark === 'object' && unit.uri).map(unit => unit.uri!); },
     lines(documentId) {
       const fakeDoc = doc(documentId);
       const out: string[] = [];
@@ -353,7 +378,7 @@ export function createFakeDocs(): FakeDocs {
       if (requiredRevisionId && requiredRevisionId !== `rev-${fakeDoc.revision}`) {
         throw new GoogleApiError('Google Docs edit failed (HTTP 400 FAILED_PRECONDITION: The document was modified since the required revision.)', 400, 'FAILED_PRECONDITION');
       }
-      const copy: FakeDoc = { ...fakeDoc, units: fakeDoc.units.map(unit => ({ ...unit, style: unit.style ? { ...unit.style } : undefined, para: unit.para ? { namedStyle: unit.para.namedStyle, bullet: unit.para.bullet ? { ...unit.para.bullet } : null } : undefined })), lists: { ...fakeDoc.lists } };
+      const copy: FakeDoc = { ...fakeDoc, units: fakeDoc.units.map(unit => ({ ...unit, style: unit.style ? { ...unit.style } : undefined, para: unit.para ? { ...unit.para, bullet: unit.para.bullet ? { ...unit.para.bullet } : null } : undefined })), lists: { ...fakeDoc.lists } };
       for (const request of requests) apply(copy, request);
       copy.revision = fakeDoc.revision + 1;
       docs.set(documentId, copy);
@@ -361,5 +386,6 @@ export function createFakeDocs(): FakeDocs {
       return { replies: requests.map(() => ({})), writeControl: { requiredRevisionId: `rev-${copy.revision}` } };
     },
   };
+  api = fake;
   return fake;
 }

@@ -26,7 +26,8 @@ import type {
 
 // ── Sheets ───────────────────────────────────────────────────────────────────
 
-interface FakeTab { sheetId: number; title: string; rows: number; cols: number; frozenRows: number; frozenCols: number; cells: Map<string, { typed: unknown; shown: string }>; formats: unknown[] }
+interface FakeChart { chartId: number; spec: any; position: any }
+interface FakeTab { sheetId: number; title: string; rows: number; cols: number; frozenRows: number; frozenCols: number; cells: Map<string, { typed: unknown; shown: string }>; formats: unknown[]; charts?: FakeChart[] }
 export interface FakeSheets extends SheetsClient {
   books: Map<string, { title: string; tabs: FakeTab[] }>;
   create(id: string, title: string, rows?: unknown[][]): void;
@@ -127,7 +128,7 @@ export function createFakeSheets(): FakeSheets {
     async get(id) {
       calls.push({ op: 'get', args: [id] });
       const entry = book(id);
-      return { spreadsheetId: id, properties: { title: entry.title }, sheets: entry.tabs.map((tab, index) => ({ properties: { sheetId: tab.sheetId, title: tab.title, index, gridProperties: { rowCount: tab.rows, columnCount: tab.cols, frozenRowCount: tab.frozenRows, frozenColumnCount: tab.frozenCols } } })) };
+      return { spreadsheetId: id, properties: { title: entry.title }, sheets: entry.tabs.map((tab, index) => ({ properties: { sheetId: tab.sheetId, title: tab.title, index, gridProperties: { rowCount: tab.rows, columnCount: tab.cols, frozenRowCount: tab.frozenRows, frozenColumnCount: tab.frozenCols } }, ...(tab.charts?.length ? { charts: tab.charts.map(chart => ({ chartId: chart.chartId, spec: chart.spec })) } : {}) })) };
     },
     async valuesBatchGet(id, ranges, render) {
       calls.push({ op: 'valuesBatchGet', args: [id, ranges, render] });
@@ -166,17 +167,43 @@ export function createFakeSheets(): FakeSheets {
     async batchUpdate(id, requests) {
       calls.push({ op: 'batchUpdate', args: [id, requests] });
       const entry = book(id);
-      const copy = entry.tabs.map(tab => ({ ...tab, cells: new Map(tab.cells), formats: [...tab.formats] }));
+      const copy = entry.tabs.map(tab => ({ ...tab, cells: new Map(tab.cells), formats: [...tab.formats], charts: [...(tab.charts ?? [])] }));
       const byId = (sheetId: number) => {
         const tab = copy.find(t => t.sheetId === sheetId);
         if (!tab) throw new GoogleApiError(`Google Sheets edit failed (HTTP 400 INVALID_ARGUMENT: No grid with id: ${sheetId})`, 400, 'INVALID_ARGUMENT');
         return tab;
       };
+      const replies: unknown[] = [];
       for (const request of requests as any[]) {
+        if (request.addChart) {
+          const chart = request.addChart.chart;
+          const anchor = chart.position?.overlayPosition?.anchorCell;
+          const tab = byId(anchor?.sheetId);
+          const sources = chart.spec.basicChart
+            ? [...chart.spec.basicChart.domains.map((d: any) => d.domain.sourceRange.sources[0]), ...chart.spec.basicChart.series.map((s: any) => s.series.sourceRange.sources[0])]
+            : [chart.spec.pieChart.domain.sourceRange.sources[0], chart.spec.pieChart.series.sourceRange.sources[0]];
+          for (const source of sources) byId(source.sheetId);
+          if (chart.spec.basicChart?.chartType === 'BAR' && chart.spec.basicChart.series.some((s: any) => s.targetAxis !== 'BOTTOM_AXIS')) {
+            throw new GoogleApiError('Google Sheets edit failed (HTTP 400 INVALID_ARGUMENT: Bar chart series must target the BOTTOM_AXIS.)', 400, 'INVALID_ARGUMENT');
+          }
+          const chartId = nextSheetId++ * 1000;
+          tab.charts!.push({ chartId, spec: chart.spec, position: chart.position });
+          replies.push({ addChart: { chart: { chartId, spec: chart.spec, position: chart.position } } });
+          continue;
+        }
+        if (request.deleteEmbeddedObject) {
+          const id = request.deleteEmbeddedObject.objectId;
+          const tab = copy.find(t => t.charts?.some(chart => chart.chartId === id));
+          if (!tab) throw new GoogleApiError(`Google Sheets edit failed (HTTP 400 INVALID_ARGUMENT: No object with id: ${id})`, 400, 'INVALID_ARGUMENT');
+          tab.charts = tab.charts!.filter(chart => chart.chartId !== id);
+          replies.push({});
+          continue;
+        }
+        replies.push({});
         if (request.addSheet) {
           const title = request.addSheet.properties.title;
           if (copy.some(t => t.title === title)) throw new GoogleApiError(`Google Sheets edit failed (HTTP 400 INVALID_ARGUMENT: A sheet with the name "${title}" already exists.)`, 400, 'INVALID_ARGUMENT');
-          copy.push({ sheetId: nextSheetId++, title, rows: request.addSheet.properties.gridProperties?.rowCount ?? 1000, cols: request.addSheet.properties.gridProperties?.columnCount ?? 26, frozenRows: 0, frozenCols: 0, cells: new Map(), formats: [] });
+          copy.push({ sheetId: nextSheetId++, title, rows: request.addSheet.properties.gridProperties?.rowCount ?? 1000, cols: request.addSheet.properties.gridProperties?.columnCount ?? 26, frozenRows: 0, frozenCols: 0, cells: new Map(), formats: [], charts: [] });
         } else if (request.updateSheetProperties) {
           const props = request.updateSheetProperties.properties;
           const tab = byId(props.sheetId);
@@ -213,7 +240,7 @@ export function createFakeSheets(): FakeSheets {
         }
       }
       entry.tabs = copy;
-      return { replies: requests.map(() => ({})) };
+      return { replies };
     },
   };
   return fake;
@@ -221,13 +248,27 @@ export function createFakeSheets(): FakeSheets {
 
 // ── Slides ───────────────────────────────────────────────────────────────────
 
-interface FakeElement { objectId: string; placeholder?: string; text: string; kind?: 'shape' | 'image' }
+interface FakeElement {
+  objectId: string;
+  placeholder?: string;
+  text: string;
+  kind?: 'shape' | 'image' | 'line';
+  shapeType?: string;
+  category?: string;
+  url?: string;
+  size?: any;
+  transform?: any;
+  /** Properties set by update*Properties / update*Style requests, by request kind. */
+  props?: Record<string, unknown>;
+}
 interface FakeSlide { objectId: string; layout: string; elements: FakeElement[]; notesId: string; notesText: string }
 export interface FakeSlides extends SlidesClient {
   decks: Map<string, { title: string; revision: number; slides: FakeSlide[] }>;
   addBlank(id: string, title: string): void;
   calls: Array<{ op: string; args: unknown[] }>;
   touch(id: string): void;
+  /** createImage from a matching URL fails like Google's fetch failure (HTTP 400). */
+  refuseImageUrl?: (url: string) => boolean;
 }
 
 const LAYOUT_HOLDERS: Record<string, string[]> = {
@@ -265,11 +306,15 @@ export function createFakeSlides(): FakeSlides {
       presentationId: id,
       title: entry.title,
       revisionId: `srev-${entry.revision}`,
+      pageSize: { width: { magnitude: 9144000, unit: 'EMU' }, height: { magnitude: 5143500, unit: 'EMU' } },
       slides: entry.slides.map(slide => ({
         objectId: slide.objectId,
-        pageElements: slide.elements.map(element => (element.kind === 'image'
-          ? { objectId: element.objectId, image: {} }
-          : { objectId: element.objectId, shape: { shapeType: 'TEXT_BOX', ...(element.placeholder ? { placeholder: { type: element.placeholder } } : {}), text: { textElements: textElements(element.text) } } })),
+        pageElements: slide.elements.map(element => {
+          const place = element.size ? { size: element.size, transform: element.transform } : {};
+          if (element.kind === 'image') return { objectId: element.objectId, image: { sourceUrl: element.url }, ...place };
+          if (element.kind === 'line') return { objectId: element.objectId, line: { lineCategory: element.category, lineProperties: element.props?.line ?? {} }, ...place };
+          return { objectId: element.objectId, shape: { shapeType: element.shapeType ?? 'TEXT_BOX', ...(element.placeholder ? { placeholder: { type: element.placeholder } } : {}), text: { textElements: textElements(element.text) } }, ...place };
+        }),
         slideProperties: {
           layoutObjectId: `layout_${slide.layout}`,
           notesPage: { notesProperties: { speakerNotesObjectId: slide.notesId }, pageElements: [{ objectId: slide.notesId, shape: { shapeType: 'TEXT_BOX', text: { textElements: textElements(slide.notesText) } } }] },
@@ -332,10 +377,44 @@ export function createFakeSlides(): FakeSlides {
           const { objectId, insertionIndex, slideLayoutReference, placeholderIdMappings } = request.createSlide;
           slides.splice(insertionIndex ?? slides.length, 0, slideFor(slideLayoutReference.predefinedLayout, objectId, placeholderIdMappings));
           replies.push({ createSlide: { objectId } });
+        } else if (request.createShape || request.createLine || request.createImage) {
+          const create = request.createShape ?? request.createLine ?? request.createImage;
+          const slide = slides.find(entry => entry.objectId === create.elementProperties?.pageObjectId);
+          if (!slide) throw new GoogleApiError(`Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: page ${create.elementProperties?.pageObjectId} not found)`, 400, 'INVALID_ARGUMENT');
+          if (slides.some(entry => entry.objectId === create.objectId || entry.elements.some(e => e.objectId === create.objectId))) throw new GoogleApiError(`Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: The object ID (${create.objectId}) should be unique.)`, 400, 'INVALID_ARGUMENT');
+          const { size, transform } = create.elementProperties;
+          if (!size?.width?.magnitude || !size?.height?.magnitude) throw new GoogleApiError('Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: size must be positive)', 400, 'INVALID_ARGUMENT');
+          if (request.createImage) {
+            if (!/^https:\/\//.test(create.url) || fake.refuseImageUrl?.(create.url)) {
+              throw new GoogleApiError('Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: Invalid requests[0].createImage: There was a problem retrieving the image. The provided image should be publicly accessible, within size limit, and in supported formats.)', 400, 'INVALID_ARGUMENT');
+            }
+            slide.elements.push({ objectId: create.objectId, kind: 'image', text: '', url: create.url, size, transform });
+            replies.push({ createImage: { objectId: create.objectId } });
+          } else if (request.createLine) {
+            slide.elements.push({ objectId: create.objectId, kind: 'line', text: '', category: create.category, size, transform });
+            replies.push({ createLine: { objectId: create.objectId } });
+          } else {
+            slide.elements.push({ objectId: create.objectId, kind: 'shape', shapeType: create.shapeType, text: '', size, transform });
+            replies.push({ createShape: { objectId: create.objectId } });
+          }
+        } else if (request.updateShapeProperties || request.updateLineProperties || request.updateTextStyle || request.updateParagraphStyle) {
+          const kind = request.updateShapeProperties ? 'shape' : request.updateLineProperties ? 'line' : request.updateTextStyle ? 'text' : 'paragraph';
+          const update = request.updateShapeProperties ?? request.updateLineProperties ?? request.updateTextStyle ?? request.updateParagraphStyle;
+          const target = slides.flatMap(slide => slide.elements).find(e => e.objectId === update.objectId);
+          if (!target) throw new GoogleApiError(`Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: object ${update.objectId} not found)`, 400, 'INVALID_ARGUMENT');
+          if (!update.fields) throw new GoogleApiError('Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: fields is required)', 400, 'INVALID_ARGUMENT');
+          target.props = { ...(target.props ?? {}), [kind]: update.shapeProperties ?? update.lineProperties ?? update.style };
+          replies.push({});
         } else if (request.deleteObject) {
           const at = slides.findIndex(slide => slide.objectId === request.deleteObject.objectId);
-          if (at < 0) throw new GoogleApiError('Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: not found)', 400, 'INVALID_ARGUMENT');
-          slides.splice(at, 1);
+          if (at >= 0) {
+            slides.splice(at, 1);
+            replies.push({});
+            continue;
+          }
+          const holder = slides.find(slide => slide.elements.some(e => e.objectId === request.deleteObject.objectId));
+          if (!holder) throw new GoogleApiError('Google Slides edit failed (HTTP 400 INVALID_ARGUMENT: not found)', 400, 'INVALID_ARGUMENT');
+          holder.elements = holder.elements.filter(e => e.objectId !== request.deleteObject.objectId);
           replies.push({});
         } else if (request.updateSlidesPosition) {
           const [moving] = request.updateSlidesPosition.slideObjectIds;

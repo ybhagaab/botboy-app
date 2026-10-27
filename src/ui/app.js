@@ -2584,6 +2584,73 @@ function safeMarkdownHref(value) {
   }
 }
 
+// ── Pictures in Markdown (docs/maps/document-media.md) ──
+// ![description](source) shows a picture only when the source is one BotBoy
+// holds, at a same-origin route: a file in its files workspace, a chat image or
+// screenshot (va_…), or a chat attachment (att_…). The forms match
+// core/media-sources.ts › resolveBotboyImage, which exports use; anything else
+// (a web link, a path elsewhere on the Mac) stays text, so a document can never
+// make the page load an outside address.
+const IMAGE_ASSET_SOURCE = /^(?:\/api\/visual-assets\/)?(va_[a-f0-9]{32})(?:\/original)?(?:\?versionId=(vav_[a-f0-9]{32}))?$/;
+const IMAGE_ATTACHMENT_SOURCE = /^(?:\/api\/chat\/attachments\/)?(att_[a-f0-9]{12})$/;
+const IMAGE_ATTACHMENT_PATH = /\/\.personal-productivity-tracker\/chat-attachments\/(att_[a-f0-9]{12})\.(?:png|jpe?g|webp|gif)$/;
+const FILES_FOLDER_MARK = '/.personal-productivity-tracker/files/';
+
+function filesWorkspaceUrl(relative) {
+  const segments = [];
+  for (const segment of String(relative).split(/[?#]/)[0].split('/')) {
+    if (!segment) continue;
+    let decoded;
+    try { decoded = decodeURIComponent(segment); } catch { return null; }
+    if (decoded === '.' || decoded === '..' || decoded.includes('/') || /[\u0000-\u001f\u007f]/.test(decoded)) return null;
+    segments.push(encodeURIComponent(decoded));
+  }
+  return segments.length ? `/api/files/${segments.join('/')}` : null;
+}
+
+function markdownImageUrl(value) {
+  let source = String(value ?? '').trim();
+  if (source.startsWith('<') && source.endsWith('>')) source = source.slice(1, -1).trim();
+  if (!source || source.length > 2048 || /[\u0000-\u001f\u007f"'\\]/.test(source)) return null;
+  const asset = IMAGE_ASSET_SOURCE.exec(source);
+  if (asset) return `/api/visual-assets/${asset[1]}/original${asset[2] ? `?versionId=${asset[2]}` : ''}`;
+  const attachment = IMAGE_ATTACHMENT_SOURCE.exec(source) || IMAGE_ATTACHMENT_PATH.exec(source);
+  if (attachment) return `/api/chat/attachments/${attachment[1]}`;
+  if (source.startsWith('/api/files/')) return filesWorkspaceUrl(source.slice('/api/files/'.length));
+  const folder = source.indexOf(FILES_FOLDER_MARK);
+  if (folder >= 0 && (source.startsWith('~/') || source.startsWith('/'))) return filesWorkspaceUrl(source.slice(folder + FILES_FOLDER_MARK.length));
+  // A plain relative path names a file in the files workspace (as write_file returns it).
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(source) && !/^[/~#]/.test(source)) return filesWorkspaceUrl(source);
+  return null;
+}
+
+// Natural sizes of pictures already shown, so a repaint reserves their space and the page does not jump.
+const MARKDOWN_IMAGE_SIZES = new Map();
+
+function markdownImage(alt, url) {
+  const size = MARKDOWN_IMAGE_SIZES.get(url);
+  const description = String(alt ?? '').trim();
+  return `<a class="md-image-link" href="${escAttr(url)}" target="_blank" rel="noopener noreferrer"><img class="md-image" src="${escAttr(url)}" alt="${escAttr(description)}" loading="lazy" decoding="async"${size ? ` width="${size[0]}" height="${size[1]}"` : ''}></a>`;
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('load', event => {
+    const image = event.target;
+    if (image instanceof HTMLImageElement && image.classList.contains('md-image') && image.naturalWidth) {
+      MARKDOWN_IMAGE_SIZES.set(image.getAttribute('src'), [image.naturalWidth, image.naturalHeight]);
+    }
+  }, true);
+  // A picture whose file is gone says so, instead of a broken-image icon.
+  document.addEventListener('error', event => {
+    const image = event.target;
+    if (!(image instanceof HTMLImageElement) || !image.classList.contains('md-image')) return;
+    const note = document.createElement('span');
+    note.className = 'md-image-missing';
+    note.textContent = image.alt ? `Picture not found: ${image.alt}` : 'Picture not found';
+    (image.closest('a.md-image-link') || image).replaceWith(note);
+  }, true);
+}
+
 function markdownAnchor(label, href) {
   const safeHref = safeMarkdownHref(href);
   if (!safeHref) return null;
@@ -2737,6 +2804,14 @@ function formatMarkdownInline(raw, allowLinks = true) {
   let text = String(raw ?? '').replace(/[\uE000\uE001]/g, '�');
 
   if (allowLinks) {
+    // Pictures first: an image line is also link-shaped, and must not become a "!" plus a link.
+    // One written as `code` stays code, as in exports (document-media.ts › findDocumentMedia).
+    const codeSpans = [...text.matchAll(/`[^`\n]+`/g)].map(match => [match.index, match.index + match[0].length]);
+    text = text.replace(/!\[([^\]\n]*)\]\(\s*(<[^<>\n]+>|[^\s()<>]+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/g, (match, alt, source, offset) => {
+      if (codeSpans.some(([start, end]) => offset >= start && offset < end)) return match;
+      const url = markdownImageUrl(source);
+      return url ? stash(markdownImage(alt, url)) : match;
+    });
     text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (match, label, href) => {
       const anchor = markdownAnchor(label, href);
       return anchor ? stash(anchor) : match;
@@ -3042,6 +3117,7 @@ window.submitChat = async () => { const el = document.getElementById('chatInput'
 // (dashboard.js). All text is escaped before any tags are produced, so
 // rendering hostile document content cannot inject markup.
 window.formatMarkdownContent = formatMarkdownContent;
+window.markdownImageUrl = markdownImageUrl;
 window.archiveNode = archiveNode;
 window.deleteNode = deleteNode;
 window.processInbox = processInbox;

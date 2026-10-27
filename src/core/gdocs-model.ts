@@ -313,6 +313,25 @@ export interface DocEditPlan {
   requests: unknown[];
   /** Per edit: the line it starts on in the view as read, and the new text's plain form (to verify after the write). */
   changes: Array<{ index: number; line: number; inserted: string }>;
+  /** The same requests by the document range each edit touches, so other edits can be ordered among them. */
+  blocks?: DocRequestBlock[];
+}
+
+/** Requests that act at one place, and the range of the document as read that they change. */
+export interface DocRequestBlock {
+  /** Where the requests act (a document index of the read). Blocks apply from the highest down. */
+  at: number;
+  /** The range the requests change: [from, to). An insert has from === to. */
+  from: number;
+  to: number;
+  /** Edit order, for blocks at the same place (a later edit goes in first, so the earlier ends up first). */
+  order: number;
+  requests: unknown[];
+}
+
+/** Blocks from the end of the document back, so every block's indexes are still right when it applies. */
+export function orderDocBlocks(blocks: readonly DocRequestBlock[]): unknown[] {
+  return [...blocks].sort((a, b) => (b.at - a.at) || (b.order - a.order)).flatMap(block => block.requests);
 }
 
 interface PlannedEdit {
@@ -519,7 +538,101 @@ export function planDocEdits(doc: DocsDocument, edits: readonly DocEditInput[], 
   }
   // From the end of the document back, so each edit's indexes are still right when it applies.
   const requests = [...planned].sort((x, y) => y.docStart - x.docStart).flatMap(edit => edit.requests);
-  return { ok: true, requests, changes: planned.map(edit => ({ index: edit.index, line: edit.line, inserted: edit.inserted })) };
+  return {
+    ok: true,
+    requests,
+    changes: planned.map(edit => ({ index: edit.index, line: edit.line, inserted: edit.inserted })),
+    blocks: planned.map(edit => ({ at: edit.docStart, from: edit.docStart, to: edit.docEnd, order: edit.index, requests: edit.requests })),
+  };
+}
+
+// ── Pictures ─────────────────────────────────────────────────────────────────
+
+export interface DocPictureInsert {
+  /** The edit's index in the call. */
+  index: number;
+  /** Exact text of the paragraph the picture goes after (copied from the read). */
+  after?: string;
+  /** Or: after the document's last paragraph. */
+  atEnd?: boolean;
+  uri: string;
+  widthPt?: number;
+}
+
+export interface DocPicturePlan {
+  ok: true;
+  blocks: DocRequestBlock[];
+  /** Per picture: the view line it goes after. */
+  lines: Array<{ index: number; line: number }>;
+}
+
+/**
+ * A picture goes in a new paragraph of its own after the named one: a newline is
+ * inserted before that paragraph's newline, which makes an empty paragraph after
+ * it; that paragraph is made normal text, centred, without a bullet (Google copies
+ * the style of the paragraph it split), and the picture goes in it.
+ */
+export function planDocPictureInserts(doc: DocsDocument, inserts: readonly DocPictureInsert[]): DocPicturePlan | DocEditFailure {
+  const view = buildDocView(doc);
+  const blocks: DocRequestBlock[] = [];
+  const lines: DocPicturePlan['lines'] = [];
+  for (const insert of inserts) {
+    const index = insert.index;
+    let line: DocParagraphLine | null = null;
+    let lineNumber = 0;
+    if (insert.atEnd) {
+      line = view.lastParagraph;
+      if (!line) return { ok: false, code: 'edit_not_editable', index, message: `edits[${index}]: the document has no paragraph to put a picture after.` };
+      lineNumber = view.lines.indexOf(line) + 1;
+    } else {
+      const after = String(insert.after ?? '');
+      if (!after) return { ok: false, code: 'invalid_edits', index, message: `edits[${index}].after is empty: copy the paragraph's text from gdrive_read.` };
+      const a = view.text.indexOf(after);
+      if (a < 0) return { ok: false, code: 'edit_not_found', index, message: `edits[${index}].after does not occur in the document as read (copy it from gdrive_read's lines, without the "N: " prefix).` };
+      if (view.text.indexOf(after, a + 1) >= 0) return { ok: false, code: 'edit_not_unique', index, message: `edits[${index}].after occurs more than once; make it longer so it occurs once.` };
+      const lineIndex = lineIndexAt(view, a + after.length - 1);
+      const found = view.lines[lineIndex];
+      if (found.kind !== 'paragraph') return { ok: false, code: 'edit_not_editable', index, message: `edits[${index}].after is in a table; a picture goes after a paragraph, so name the paragraph before or after the table.` };
+      line = found;
+      lineNumber = lineIndex + 1;
+    }
+    const empty = line.end - line.start <= 1;
+    // An empty last paragraph takes the picture itself; otherwise a new paragraph starts after the line.
+    const at = empty && insert.atEnd ? line.start : line.end;
+    const requests: unknown[] = [];
+    if (!(empty && insert.atEnd)) requests.push({ insertText: { location: { index: line.end - 1 }, text: '\n' } });
+    requests.push({ updateParagraphStyle: { range: { startIndex: at, endIndex: at + 1 }, paragraphStyle: { namedStyleType: 'NORMAL_TEXT', alignment: 'CENTER' }, fields: 'namedStyleType,alignment' } });
+    if (line.bullet) requests.push({ deleteParagraphBullets: { range: { startIndex: at, endIndex: at + 1 } } });
+    requests.push({
+      insertInlineImage: {
+        location: { index: at },
+        uri: insert.uri,
+        ...(insert.widthPt ? { objectSize: { width: { magnitude: insert.widthPt, unit: 'PT' } } } : {}),
+      },
+    });
+    const place = empty && insert.atEnd ? line.start : line.end - 1;
+    blocks.push({ at: place, from: place, to: place, order: index, requests });
+    lines.push({ index, line: lineNumber });
+  }
+  return { ok: true, blocks, lines };
+}
+
+/** Text edits whose range takes in the place a picture goes (the end of its paragraph). */
+export function pictureOverlapsEdit(picture: DocRequestBlock, edits: readonly DocRequestBlock[]): DocRequestBlock | null {
+  return edits.find(edit => edit.from <= picture.at && picture.at < edit.to) ?? null;
+}
+
+/** How many pictures (inline images) a document holds, tables included. */
+export function inlinePictureCount(doc: DocsDocument): number {
+  let count = 0;
+  const walk = (content: DocsStructuralElement[] | undefined) => {
+    for (const element of content ?? []) {
+      for (const part of element.paragraph?.elements ?? []) if (part.inlineObjectElement) count++;
+      for (const row of element.table?.tableRows ?? []) for (const cell of row.tableCells ?? []) walk(cell.content);
+    }
+  };
+  walk(doc.body?.content);
+  return count;
 }
 
 /** Requests that add Markdown lines after the document's last paragraph. */
@@ -541,5 +654,10 @@ export function planDocAppend(doc: DocsDocument, markdownText: string, options: 
     ? replacementRequests(at, at, paragraphs, Boolean(last.bullet))
     : replacementRequests(at, at, [{ text: '', spans: [], tabs: 0, target: null, force: false }, ...paragraphs], Boolean(last.bullet));
   // The leading empty paragraph above stands for the end of the last line: its text is ''.
-  return { ok: true, requests, changes: [{ index: 0, line: view.lines.length + (lastIsEmpty ? 0 : 1), inserted: paragraphs.map(paragraph => paragraph.text.replace(/^\t+/, '')).join('\n') }] };
+  return {
+    ok: true,
+    requests,
+    changes: [{ index: 0, line: view.lines.length + (lastIsEmpty ? 0 : 1), inserted: paragraphs.map(paragraph => paragraph.text.replace(/^\t+/, '')).join('\n') }],
+    blocks: [{ at, from: at, to: at, order: -1, requests }],
+  };
 }

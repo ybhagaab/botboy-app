@@ -119,8 +119,13 @@ export function rowLine(formulas: readonly unknown[] = [], shown: readonly unkno
 
 // ── Edits ────────────────────────────────────────────────────────────────────
 
-export const SHEET_ACTIONS = ['set', 'append', 'clear', 'add_sheet', 'rename_sheet', 'delete_sheet', 'insert_rows', 'delete_rows', 'insert_columns', 'delete_columns', 'freeze', 'format'] as const;
+export const SHEET_ACTIONS = ['set', 'append', 'clear', 'add_sheet', 'rename_sheet', 'delete_sheet', 'insert_rows', 'delete_rows', 'insert_columns', 'delete_columns', 'freeze', 'format', 'add_chart', 'delete_chart'] as const;
 export type SheetAction = typeof SHEET_ACTIONS[number];
+
+/** Chart kinds add_chart takes, as Google's chart types (a donut is a pie with a hole). */
+export const CHART_KINDS: Readonly<Record<string, string>> = Object.freeze({
+  column: 'COLUMN', bar: 'BAR', line: 'LINE', area: 'AREA', scatter: 'SCATTER', combo: 'COMBO', stepped_area: 'STEPPED_AREA', pie: 'PIE', donut: 'PIE',
+});
 
 export interface SheetEditPlan {
   ok: true;
@@ -130,7 +135,7 @@ export interface SheetEditPlan {
   appends: Array<{ range: string; values: unknown[][] }>;
   expects: Array<{ index: number; range: string; values: unknown[][] }>;
   /** Per edit, what it will do (for the receipt). */
-  summary: Array<{ edit: number; action: SheetAction; range?: string; sheet?: string; cells?: number }>;
+  summary: Array<{ edit: number; action: SheetAction; range?: string; sheet?: string; cells?: number; chart?: string; chartId?: number }>;
 }
 
 export interface SheetPlanFailure {
@@ -170,7 +175,7 @@ function numberFormatOf(pattern: string): { type: string; pattern: string } {
  * Plan edits against the tabs as read. Tab names resolve case-insensitively;
  * a range without a tab uses `sheet`, else the first tab.
  */
-export function planSheetEdits(tabs: readonly SheetProperties[], edits: readonly Record<string, unknown>[]): SheetEditPlan | SheetPlanFailure {
+export function planSheetEdits(tabs: readonly SheetProperties[], edits: readonly Record<string, unknown>[], options: { chartIds?: ReadonlySet<number> } = {}): SheetEditPlan | SheetPlanFailure {
   if (!Array.isArray(edits) || edits.length < 1 || edits.length > 50) return { ok: false, message: 'edits must be a list of 1 to 50 edits.' };
   // The tabs as they will be after each structural edit (adds and renames resolve later edits).
   const current = tabs.map(tab => ({
@@ -304,6 +309,83 @@ export function planSheetEdits(tabs: readonly SheetProperties[], edits: readonly
       current.push({ sheetId: null, title: name, pendingId, rows: rows ?? 1000, cols: columns ?? 26 });
       plan.structural.push({ addSheet: { properties: { title: name, ...(rows || columns ? { gridProperties: { ...(rows ? { rowCount: rows } : {}), ...(columns ? { columnCount: columns } : {}) } } : {}) } } });
       plan.summary.push({ edit: index, action, sheet: name });
+      continue;
+    }
+    if (action === 'add_chart') {
+      // A native Sheets chart over a block: header row on top, labels in the first column, one series per other column.
+      const picked = rangeOf(true);
+      if ('error' in picked) return picked.error!;
+      const { tab, range } = picked as { tab: (typeof current)[number]; range: A1Range };
+      const blocked = notDeleted(tab);
+      if (blocked) return blocked;
+      if (tab.sheetId === null) return fail(`tab "${tab.title}" is added in this call; add the chart in a second call once it exists.`);
+      if (range.startRow === undefined || range.endRow === undefined || range.startCol === undefined || range.endCol === undefined) {
+        return fail('range is the data block with its header row, like "A1:C13": the first column holds the labels, each other column one series.');
+      }
+      if (range.endRow - range.startRow < 2 || range.endCol - range.startCol < 2) return fail('range needs a header row and at least one data row, and a label column and at least one value column.');
+      const kindName = String(edit.chart ?? 'column').toLowerCase().replace(/[\s-]+/g, '_');
+      const chartType = CHART_KINDS[kindName];
+      if (!chartType) return fail(`chart is one of: ${Object.keys(CHART_KINDS).join(', ')}.`);
+      const title = typeof edit.title === 'string' ? edit.title.slice(0, 200) : '';
+      const width = edit.width === undefined ? 600 : Number(edit.width);
+      const height = edit.height === undefined ? 371 : Number(edit.height);
+      if (!Number.isInteger(width) || !Number.isInteger(height) || width < 100 || height < 80 || width > 4000 || height > 4000) return fail('width and height are the chart size in pixels (100 to 4000 wide, 80 to 4000 high).');
+      let anchorRow = range.startRow;
+      let anchorCol = range.endCol + 1;
+      if (edit.anchor !== undefined) {
+        const anchor = parseA1(String(edit.anchor));
+        if (!anchor || anchor.startRow === undefined || anchor.startCol === undefined || (anchor.sheet && anchor.sheet.toLowerCase() !== tab.title.toLowerCase())) return fail('anchor is the cell the chart’s top-left corner sits on, like "E2", on the same tab.');
+        anchorRow = anchor.startRow;
+        anchorCol = anchor.startCol;
+      }
+      const column = (col: number, skipHeader = false) => ({ sheetId: tab.sheetId, startRowIndex: range.startRow! + (skipHeader ? 1 : 0), endRowIndex: range.endRow!, startColumnIndex: col, endColumnIndex: col + 1 });
+      let spec: Record<string, unknown>;
+      if (chartType === 'PIE') {
+        if (range.endCol - range.startCol !== 2) return fail('a pie or donut takes one value column: give range as the labels column and one column of numbers.');
+        spec = {
+          ...(title ? { title } : {}),
+          pieChart: {
+            legendPosition: 'RIGHT_LEGEND',
+            domain: { sourceRange: { sources: [column(range.startCol, true)] } },
+            series: { sourceRange: { sources: [column(range.startCol + 1, true)] } },
+            ...(kindName === 'donut' ? { pieHole: 0.5 } : {}),
+          },
+        };
+      } else {
+        const series = [];
+        for (let col = range.startCol + 1; col < range.endCol; col++) {
+          series.push({ series: { sourceRange: { sources: [column(col)] } }, targetAxis: chartType === 'BAR' ? 'BOTTOM_AXIS' : 'LEFT_AXIS' });
+        }
+        spec = {
+          ...(title ? { title } : {}),
+          basicChart: {
+            chartType,
+            legendPosition: 'BOTTOM_LEGEND',
+            headerCount: 1,
+            axis: [{ position: 'BOTTOM_AXIS' }, { position: 'LEFT_AXIS' }],
+            domains: [{ domain: { sourceRange: { sources: [column(range.startCol)] } } }],
+            series,
+            ...(edit.stacked === true && ['COLUMN', 'BAR', 'AREA', 'STEPPED_AREA'].includes(chartType) ? { stackedType: 'STACKED' } : {}),
+          },
+        };
+      }
+      plan.structural.push({
+        addChart: {
+          chart: {
+            spec,
+            position: { overlayPosition: { anchorCell: { sheetId: tab.sheetId, rowIndex: anchorRow, columnIndex: anchorCol }, widthPixels: width, heightPixels: height } },
+          },
+        },
+      });
+      plan.summary.push({ edit: index, action, sheet: tab.title, range: a1Of(tab.title, range), chart: kindName });
+      continue;
+    }
+    if (action === 'delete_chart') {
+      const chartId = Number(edit.chartId);
+      if (!Number.isInteger(chartId) || chartId < 0) return fail('chartId is the id of a chart from gdrive_read (its charts list).');
+      if (options.chartIds && !options.chartIds.has(chartId)) return fail(`there is no chart ${chartId} in this spreadsheet; gdrive_read lists its charts.`);
+      plan.structural.push({ deleteEmbeddedObject: { objectId: chartId } });
+      plan.summary.push({ edit: index, action, chartId });
       continue;
     }
     const picked = tabNamed('sheet', action === 'rename_sheet' || action === 'delete_sheet');

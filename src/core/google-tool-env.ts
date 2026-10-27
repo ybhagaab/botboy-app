@@ -36,6 +36,11 @@ export interface GoogleToolEnv {
   local: LocalFilePolicy;
   /** Receipts of creates already made in this request, by create key (the in-turn duplicate guard). */
   created: Map<string, unknown>;
+  /**
+   * Markdown that has pictures or diagrams, as a Word file for Drive to convert into a Doc
+   * (product-manager/document-exporter.ts › markdownToWordForGoogle); null keeps Markdown import.
+   */
+  wordFromMarkdown?(markdown: string): Promise<{ data: Buffer; media: { pictures: number; diagrams: number; embedded: number; problems: Array<{ line: number; kind: string; message: string }> } } | null>;
 }
 
 export type Need = 'read' | 'edit' | 'calendar';

@@ -2242,3 +2242,11 @@ a.data-room-row:hover { background:var(--hover); }
 .theme-preview-bar .theme-preview-keep { border-color:#2a9d6c; background:#1f7a54; }
 .theme-preview-bar button:focus-visible { outline:2px solid #fff; outline-offset:2px; }
 @media (max-width:560px) { .theme-preview-bar { flex-wrap:wrap; justify-content:flex-end; } .theme-row { flex-wrap:wrap; } }
+/* Pictures and diagrams in Markdown (docs/maps/document-media.md): app.js › markdownImage, analytics-html-view.js › mountDocumentVisuals. */
+.md-image-link { display:inline-block; max-width:100%; line-height:0; border-radius:6px; }
+.md-image-link:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.md-image { max-width:100%; height:auto; border:1px solid var(--border); border-radius:6px; background:var(--surface-2); }
+.chat-msg .md-image { max-height:360px; width:auto; }
+.document-rendered .md-image-link { display:table; margin:14px auto; }
+.md-image-missing { display:inline-block; padding:2px 8px; border:1px dashed var(--border-strong); border-radius:6px; color:var(--muted); font-size:11px; line-height:1.6; }
+.document-visual { margin:14px 0; }

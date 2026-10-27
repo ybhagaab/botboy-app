@@ -35,6 +35,7 @@ import {
   type PublicationTarget,
   type WriteOutcome,
 } from './publication-destination.js';
+import { findDocumentMedia } from './document-media.js';
 
 /**
  * Exact bytes are the default until a live check proves converted Docs pass
@@ -71,9 +72,17 @@ export function docTokens(text: string, options: { dropLineStartMarkers?: boolea
   return out;
 }
 
-/** The artifact's body as the DOCX exporter renders it, minus markdown syntax and list markers. */
+/**
+ * The artifact's body as the DOCX exporter renders it, minus markdown syntax and list markers.
+ * Pictures and diagrams are pictures in the Doc, not words (document-media.md), so they add no
+ * tokens: a picture whose file is gone or a diagram that does not draw makes this loose check fail.
+ */
 export function sourceTokensFromMarkdown(markdown: string): string[] {
-  const body = String(markdown ?? '')
+  let text = String(markdown ?? '');
+  for (const ref of findDocumentMedia(text).sort((a, b) => b.start - a.start)) {
+    text = `${text.slice(0, ref.start)}${ref.kind === 'diagram' ? '\n' : ''}${text.slice(ref.end)}`;
+  }
+  const body = text
     .split(/\r?\n/)
     .map(line => line
       .replace(/^\s{0,3}#{1,6}\s+/, '')

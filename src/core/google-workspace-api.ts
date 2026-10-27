@@ -98,10 +98,15 @@ export interface SheetProperties {
   gridProperties?: { rowCount?: number; columnCount?: number; frozenRowCount?: number; frozenColumnCount?: number };
 }
 
+export interface SheetChart {
+  chartId: number;
+  spec?: { title?: string; basicChart?: { chartType?: string }; pieChart?: { pieHole?: number } };
+}
+
 export interface Spreadsheet {
   spreadsheetId: string;
   properties?: { title?: string; locale?: string; timeZone?: string };
-  sheets?: Array<{ properties: SheetProperties }>;
+  sheets?: Array<{ properties: SheetProperties; charts?: SheetChart[] }>;
   spreadsheetUrl?: string;
 }
 
@@ -127,8 +132,13 @@ export interface SlidesTextElement {
   autoText?: { content?: string };
 }
 
+export interface SlidesDimension { magnitude?: number; unit?: 'EMU' | 'PT' | string }
+
 export interface SlidesPageElement {
   objectId: string;
+  /** The element's built-in size; with `transform` it gives where it sits (EMU unless unit says PT). */
+  size?: { width?: SlidesDimension; height?: SlidesDimension };
+  transform?: { scaleX?: number; scaleY?: number; shearX?: number; shearY?: number; translateX?: number; translateY?: number; unit?: string };
   shape?: { shapeType?: string; placeholder?: { type?: string; index?: number }; text?: { textElements?: SlidesTextElement[] } };
   table?: { rows?: number; columns?: number; tableRows?: Array<{ tableCells?: Array<{ text?: { textElements?: SlidesTextElement[] } }> }> };
   image?: Record<string, unknown>;
@@ -152,6 +162,8 @@ export interface Presentation {
   presentationId: string;
   title?: string;
   revisionId?: string;
+  /** The slide size (EMU); 9144000×5143500 is the usual 16:9, 720×405 pt. */
+  pageSize?: { width?: SlidesDimension; height?: SlidesDimension };
   slides?: SlidesPage[];
   layouts?: SlidesPage[];
 }
@@ -306,7 +318,7 @@ export function createGoogleWorkspaceClients(deps: {
   };
 
   const sheets: SheetsClient = {
-    get: spreadsheetId => rest.json(`${sheetsBase}/v4/spreadsheets/${id(spreadsheetId)}?fields=${id('spreadsheetId,properties(title,locale,timeZone),spreadsheetUrl,sheets(properties(sheetId,title,index,sheetType,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount)))')}`, get, 'Google Sheets read'),
+    get: spreadsheetId => rest.json(`${sheetsBase}/v4/spreadsheets/${id(spreadsheetId)}?fields=${id('spreadsheetId,properties(title,locale,timeZone),spreadsheetUrl,sheets(properties(sheetId,title,index,sheetType,gridProperties(rowCount,columnCount,frozenRowCount,frozenColumnCount)),charts(chartId,spec(title,basicChart(chartType),pieChart(pieHole))))')}`, get, 'Google Sheets read'),
     async valuesBatchGet(spreadsheetId, ranges, render) {
       const params = new URLSearchParams({ valueRenderOption: render, dateTimeRenderOption: 'FORMATTED_STRING', majorDimension: 'ROWS' });
       for (const range of ranges) params.append('ranges', range);

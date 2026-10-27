@@ -6,6 +6,7 @@ import type { ToolCall } from '../core/llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from '../core/tool-executor.js';
 import { changedLineText } from '../core/exact-text-edits.js';
 import { DocumentExportError, exportDocument, isDocumentExportFormat } from './document-exporter.js';
+import { checkDocumentMedia, findDocumentMedia, type DocumentMediaCheck } from './document-media.js';
 import { ProductDocumentEditError } from './document-service.js';
 import { documentVersionOf, productDocumentListForModel, productDocumentReadForModel } from './document-read.js';
 import { DOCUMENT_MATURITIES } from './types.js';
@@ -89,8 +90,23 @@ async function materializeCanonicalExport(
   return { filePath, relativePath, downloadUrl: `/api/files/${urlPath}` };
 }
 
+/** Pictures and diagrams in a saved version (docs/maps/document-media.md): what shows, and what to fix. */
+function mediaReceipt(check: DocumentMediaCheck | null): Record<string, unknown> {
+  if (!check) return {};
+  return {
+    media: {
+      pictures: check.pictures,
+      diagrams: check.diagrams,
+      picturesShown: check.shown,
+      ...(check.problems.length ? { problems: check.problems.slice(0, 10).map(problem => ({ ...problem, message: brief(problem.message, 400) })) } : {}),
+      ...(check.diagramsChecked ? {} : { diagramsNotChecked: 'Google Chrome is not on this Mac, so diagrams were not drawn to check them (and exports keep them as code).' }),
+      note: 'Pictures and diagrams show in the reader and are embedded in Word, HTML and PDF exports, so a published copy keeps them.',
+    },
+  };
+}
+
 /** Compact receipt: everything the chat model needs to report honestly, nothing more. */
-function saveReceipt(artifact: ProductDocumentArtifact) {
+function saveReceipt(artifact: ProductDocumentArtifact, media: DocumentMediaCheck | null = null) {
   const findingCounts = artifact.validation.findings.reduce<Record<string, number>>((counts, finding) => {
     counts[finding.severity] = (counts[finding.severity] ?? 0) + 1;
     return counts;
@@ -131,10 +147,11 @@ function saveReceipt(artifact: ProductDocumentArtifact) {
       },
     } : {}),
     ...(artifact.parentArtifactId ? { parentArtifactId: artifact.parentArtifactId } : {}),
+    ...mediaReceipt(media),
     documentsUrl: artifact.persisted ? `#/documents/${encodeURIComponent(artifact.artifactId)}` : null,
     apiUrl: artifact.persisted ? `/api/product-documents/${encodeURIComponent(artifact.artifactId)}` : null,
     next: artifact.persisted
-      ? `The document is saved. Link the owner to #/documents/${encodeURIComponent(artifact.artifactId)} and mention notable advisory findings honestly.`
+      ? `The document is saved. ${media?.problems.length ? 'Fix the pictures or diagrams under media.problems with edit_product_document first. ' : ''}Link the owner to #/documents/${encodeURIComponent(artifact.artifactId)} and mention notable advisory findings honestly.`
       : 'No durable product-document store is configured, so the document was NOT saved. Say so plainly.',
   };
 }
@@ -158,7 +175,7 @@ function lineArgument(value: unknown): number | undefined | null {
 }
 
 /** What the chat model needs after a targeted edit: what changed and where, and the honest check state. */
-function editReceipt(edited: EditAuthoredDocumentResult, chain: readonly ProductDocumentSummary[]) {
+function editReceipt(edited: EditAuthoredDocumentResult, chain: readonly ProductDocumentSummary[], media: DocumentMediaCheck | null = null) {
   const { artifact } = edited;
   const findingCounts = artifact.validation.findings.reduce<Record<string, number>>((counts, finding) => {
     counts[finding.severity] = (counts[finding.severity] ?? 0) + 1;
@@ -200,9 +217,10 @@ function editReceipt(edited: EditAuthoredDocumentResult, chain: readonly Product
       message: brief(finding.message),
     })),
     conformance: 'Not run: a targeted edit gets the quick advisory checks only. Full rewrites saved with save_product_document get the review.',
+    ...mediaReceipt(media),
     documentsUrl: artifact.persisted ? link : null,
     next: artifact.persisted
-      ? `Saved as version ${version.number} of ${version.of}. Link the owner to ${link} and say in a sentence what changed. To check a change, read_product_document with startLine and endLine around its line.`
+      ? `Saved as version ${version.number} of ${version.of}. ${media?.problems.length ? 'Fix the pictures or diagrams under media.problems in another edit. ' : ''}Link the owner to ${link} and say in a sentence what changed. To check a change, read_product_document with startLine and endLine around its line.`
       : 'No durable product-document store is configured, so the edit was NOT saved. Say so plainly.',
   };
 }
@@ -354,6 +372,17 @@ export function withProductDocumentChatTools(
             mediaType: exported.mediaType,
             bytes: exported.data.length,
             sha256: createHash('sha256').update(exported.data).digest('hex'),
+            ...(exported.media ? {
+              media: {
+                pictures: exported.media.pictures,
+                diagrams: exported.media.diagrams,
+                embedded: exported.media.embedded,
+                ...(exported.media.problems.length ? { problems: exported.media.problems.slice(0, 10).map(problem => ({ ...problem, message: brief(problem.message, 400) })) } : {}),
+              },
+            } : {}),
+            ...(args.format === 'markdown' && findDocumentMedia(artifact.content).length
+              ? { mediaNote: 'A Markdown export keeps picture lines and diagram blocks as text; docx, html and pdf embed them.' }
+              : {}),
             ...materialized,
             documentsUrl: `#/documents/${encodeURIComponent(artifact.artifactId)}`,
             next: 'Use filePath verbatim for any upload or attachment tool. This receipt proves only that the canonical file was exported locally; claim a delivery only after the destination tool returns its own successful receipt.',
@@ -416,7 +445,8 @@ export function withProductDocumentChatTools(
             ...(args.title !== undefined ? { title: args.title as string } : {}),
             ...(args.citations !== undefined ? { citations: args.citations as EditAuthoredDocumentRequest['citations'] } : {}),
           });
-          return result(call, editReceipt(edited, service.getVersionChain(edited.artifact.artifactId)));
+          const media = await checkDocumentMedia(edited.artifact.content).catch(() => null);
+          return result(call, editReceipt(edited, service.getVersionChain(edited.artifact.artifactId), media));
         } catch (error) {
           if (error instanceof ProductDocumentEditError) {
             return errorResult(call, error.message, { code: error.code, nextAction: error.nextAction, ...error.details });
@@ -483,7 +513,8 @@ export function withProductDocumentChatTools(
           ...(args.parentArtifactId !== undefined ? { parentArtifactId: (args.parentArtifactId as string).trim() } : {}),
           ...(args.citations !== undefined ? { citations: args.citations as SaveAuthoredDocumentRequest['citations'] } : {}),
         });
-        return result(call, saveReceipt(artifact));
+        const media = await checkDocumentMedia(artifact.content).catch(() => null);
+        return result(call, saveReceipt(artifact, media));
       } catch (error) {
         const details = error as { issues?: unknown };
         return errorResult(

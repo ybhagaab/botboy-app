@@ -358,3 +358,34 @@ describe('edit_product_document', () => {
     expect(names).toEqual(expect.arrayContaining(['save_product_document', 'read_product_document', 'edit_product_document', 'write_file', 'read_file', 'edit_file']));
   });
 });
+
+describe('pictures in a document (document-media.md)', () => {
+  it('an edit that adds a picture says it will show, and one whose file is gone says how to fix it', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-doc-media-'));
+    cleanup.push(home);
+    const filesDir = path.join(home, '.personal-productivity-tracker', 'files');
+    fs.mkdirSync(filesDir, { recursive: true });
+    fs.writeFileSync(path.join(filesDir, 'launch.png'), Buffer.from('89504e470d0a1a0a0000000d494844520000000400000004080200000000000000', 'hex'));
+    const { configureMediaSources } = await import('../core/media-sources.js');
+    configureMediaSources({ homeDir: home, filesDir, attachmentsDir: path.join(home, '.personal-productivity-tracker', 'chat-attachments') });
+    const f = fixture();
+    const saved = await savedLaunch(f);
+    const shown = await f.run('edit_product_document', {
+      artifactId: saved.artifactId,
+      ownerRequested: true,
+      edits: [{ find: '# MX Player S2S launch\n', replace: '# MX Player S2S launch\n\n![Launch screen](/api/files/launch.png)\n' }],
+    });
+    expect(shown.body).toMatchObject({ ok: true, media: { pictures: 1, diagrams: 0, picturesShown: 1, note: expect.stringMatching(/embedded in Word, HTML and PDF/) } });
+    expect(shown.body.media.problems).toBeUndefined();
+    const gone = await f.run('edit_product_document', {
+      artifactId: shown.body.artifactId,
+      ownerRequested: true,
+      edits: [{ find: '/api/files/launch.png', replace: '/api/files/missing.png' }],
+    });
+    expect(gone.body.media).toMatchObject({ pictures: 1, picturesShown: 0, problems: [{ line: 3, kind: 'picture', nextAction: expect.stringMatching(/files workspace|va_/) }] });
+    expect(gone.body.next).toMatch(/Fix the pictures or diagrams under media\.problems/);
+    // A document with neither gets no media field at all.
+    const plain = await f.run('edit_product_document', { artifactId: gone.body.artifactId, ownerRequested: true, edits: [{ find: '\n\n![Launch screen](/api/files/missing.png)', replace: '' }] });
+    expect(plain.body.media).toBeUndefined();
+  });
+});

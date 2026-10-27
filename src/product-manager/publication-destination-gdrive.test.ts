@@ -39,6 +39,8 @@ describe('docTokens', () => {
     expect(docTokens('• bullet one\n1. first\na) second', { dropLineStartMarkers: true })).toEqual(['bullet', 'one', 'first', 'second']);
     expect(docTokens('Café', {})).toEqual(['Café']);
     expect(sourceTokensFromMarkdown('# Title\n\n- bullet one\n1. first\n[link](https://x.example) “q”')).toEqual(['Title', 'bullet', 'one', 'first', 'link', 'q']);
+    // Pictures and diagrams are pictures in the converted Doc, not words (document-media.md).
+    expect(sourceTokensFromMarkdown('Before ![Pie chart](/api/files/a.png) after\n```mermaid\nflowchart LR\n  A-->B\n```\nEnd')).toEqual(['Before', 'after', 'End']);
   });
   it('reports the first mismatch and hashes token sequences', () => {
     expect(firstMismatchIndex(['a', 'b', 'c'], ['a', 'x', 'c'])).toBe(1);

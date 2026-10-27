@@ -235,6 +235,7 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
       if (typeof lot.moveBefore === 'function') lot.moveBefore(view.frame, null);
       else lot.appendChild(view.frame);
     }
+    parkDocumentVisuals(lot);
   }
 
   /** After a repaint: put each view's frame in its container (new frame only when the page changed). */
@@ -274,12 +275,16 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
   // The same sandbox as dashboard views, with no data at all: the reply's
   // own markup is the whole page. The fenced source stays one click away.
   const CHAT_LANGUAGES = { visual: 'visual', html_visual: 'visual', svg: 'svg', mermaid: 'mermaid' };
+  // Documents draw only what their exports draw (docs/maps/document-media.md).
+  const DOCUMENT_LANGUAGES = { svg: 'svg', mermaid: 'mermaid' };
+  /** Document diagram frames by document key + position + source, reused across repaints. */
+  const DOC_VISUALS = new Map();
 
   function escapeHtml(value) {
     return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  function chatSrcdoc(kind, source, theme) {
+  function chatSrcdoc(kind, source, theme, options = {}) {
     const origin = location.origin;
     const c = theme.colors;
     const sizer = `<script>(function(){function size(){parent.postMessage({botboyHtmlView:1,type:'height',height:Math.ceil(Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0))},'*');}new ResizeObserver(size).observe(document.documentElement);addEventListener('load',size);addEventListener('error',function(e){parent.postMessage({botboyHtmlView:1,type:'error',message:String(e.message||e.error||'')},'*');});})();<\/script>`;
@@ -288,11 +293,46 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
     let scripts = '';
     if (kind === 'mermaid') {
       body = `<pre class="mermaid">${escapeHtml(source)}</pre>`;
-      scripts = `<script src="${origin}/vendor/mermaid.min.js"><\/script><script>mermaid.initialize({startOnLoad:false,securityLevel:'strict',theme:${JSON.stringify(theme.mode === 'light' ? 'default' : 'dark')},fontFamily:'Inter, sans-serif'});mermaid.run({querySelector:'.mermaid'}).catch(function(e){parent.postMessage({botboyHtmlView:1,type:'error',message:String(e&&e.message||e)},'*');});<\/script>`;
+      // A document's diagram uses plain SVG text labels, as its exports do (core/visual-render.ts).
+      const labels = options.document ? 'htmlLabels:false,flowchart:{htmlLabels:false},' : '';
+      scripts = `<script src="${origin}/vendor/mermaid.min.js"><\/script><script>mermaid.initialize({startOnLoad:false,securityLevel:'strict',${labels}theme:${JSON.stringify(theme.mode === 'light' ? 'default' : 'dark')},fontFamily:'Inter, sans-serif'});mermaid.run({querySelector:'.mermaid'}).catch(function(e){parent.postMessage({botboyHtmlView:1,type:'error',message:String(e&&e.message||e)},'*');});<\/script>`;
     } else if (kind === 'visual') {
       scripts = `<script src="${origin}/vendor/vega.min.js"><\/script><script src="${origin}/vendor/vega-lite.min.js"><\/script><script src="${origin}/vendor/vega-embed.min.js"><\/script>`;
     }
     return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy()}">${base}${sizer}${kind === 'visual' ? scripts : ''}</head><body>${body}${kind === 'mermaid' ? scripts : ''}</body></html>`;
+  }
+
+  function languageOf(code) {
+    return (String(code.className).match(/language-([\w-]+)/) || [])[1]?.toLowerCase().replace(/-/g, '_') || '';
+  }
+
+  /** Replaces a code block with its live sandboxed view; the block itself moves under "Show source". */
+  function mountVisual(pre, kind, source, options = {}) {
+    pre.dataset.visualMounted = '1';
+    const figure = document.createElement('figure');
+    figure.className = `chat-visual chat-visual-${kind}${options.document ? ' document-visual' : ''}`;
+    const frame = document.createElement('iframe');
+    frame.className = 'chat-visual-frame';
+    frame.setAttribute('sandbox', 'allow-scripts');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('title', kind === 'mermaid' ? 'Diagram' : 'Visual');
+    frame.style.height = '160px';
+    const theme = cssVars();
+    frame.srcdoc = chatSrcdoc(kind, source, theme, options);
+    frame._botboyVisual = { kind, source, mode: theme.mode, theme, options };
+    CHAT_FRAMES.add(frame);
+    const error = document.createElement('div');
+    error.className = 'chat-visual-error';
+    error.hidden = true;
+    const details = document.createElement('details');
+    details.className = 'chat-visual-source';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Show source';
+    details.append(summary);
+    pre.replaceWith(figure);
+    details.append(pre);
+    figure.append(frame, error, details);
+    return figure;
   }
 
   /** Turns finished replies' visual code blocks into live sandboxed views. */
@@ -301,34 +341,52 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
     for (const code of root.querySelectorAll('pre > code[class*="language-"]')) {
       const pre = code.parentElement;
       if (!pre || pre.dataset.visualMounted || pre.closest('.streaming-live')) continue;
-      const language = (String(code.className).match(/language-([\w-]+)/) || [])[1]?.toLowerCase().replace(/-/g, '_');
-      const kind = CHAT_LANGUAGES[language || ''];
+      const kind = CHAT_LANGUAGES[languageOf(code)];
       if (!kind) continue;
-      pre.dataset.visualMounted = '1';
+      mountVisual(pre, kind, code.textContent || '');
+    }
+  }
+
+  /**
+   * A document's ```mermaid and ```svg blocks as live diagrams (the reader;
+   * dashboard.js › hydrateDocumentPreview). The page repaints often, so a
+   * diagram whose document, position and source are unchanged keeps its frame:
+   * park() moves it aside before the repaint and this puts it back (moveBefore
+   * keeps the frame alive), instead of redrawing it and moving the page.
+   */
+  function mountDocumentVisuals(root, documentKey) {
+    if (!root?.querySelectorAll) return;
+    const lot = document.getElementById('analytics-html-parking');
+    let position = 0;
+    for (const code of root.querySelectorAll('pre > code[class*="language-"]')) {
+      const pre = code.parentElement;
+      if (!pre || pre.dataset.visualMounted) continue;
+      const kind = DOCUMENT_LANGUAGES[languageOf(code)];
+      if (!kind) continue;
       const source = code.textContent || '';
-      const figure = document.createElement('figure');
-      figure.className = `chat-visual chat-visual-${kind}`;
-      const frame = document.createElement('iframe');
-      frame.className = 'chat-visual-frame';
-      frame.setAttribute('sandbox', 'allow-scripts');
-      frame.setAttribute('referrerpolicy', 'no-referrer');
-      frame.setAttribute('title', kind === 'mermaid' ? 'Diagram' : 'Visual');
-      frame.style.height = '160px';
-      const theme = cssVars();
-      frame.srcdoc = chatSrcdoc(kind, source, theme);
-      frame._botboyVisual = { kind, source, mode: theme.mode, theme };
-      CHAT_FRAMES.add(frame);
-      const error = document.createElement('div');
-      error.className = 'chat-visual-error';
-      error.hidden = true;
-      const details = document.createElement('details');
-      details.className = 'chat-visual-source';
-      const summary = document.createElement('summary');
-      summary.textContent = 'Show source';
-      details.append(summary);
-      pre.replaceWith(figure);
-      details.append(pre);
-      figure.append(frame, error, details);
+      const cacheKey = [String(documentKey ?? ''), position++, kind, hashText(source)].join('\u0001');
+      const kept = DOC_VISUALS.get(cacheKey);
+      if (kept && kept.parentElement === lot && pre.parentNode) {
+        if (typeof pre.parentNode.moveBefore === 'function') pre.parentNode.moveBefore(kept, pre);
+        else pre.parentNode.insertBefore(kept, pre);
+        pre.remove();
+        continue;
+      }
+      DOC_VISUALS.set(cacheKey, mountVisual(pre, kind, source, { document: true }));
+    }
+  }
+
+  /** park(): diagrams not put back since the last repaint go; the shown ones wait in the lot. */
+  function parkDocumentVisuals(lot) {
+    for (const [cacheKey, figure] of DOC_VISUALS) {
+      if (figure.parentElement === lot || !figure.isConnected) {
+        figure.querySelectorAll('iframe').forEach(frame => CHAT_FRAMES.delete(frame));
+        figure.remove();
+        DOC_VISUALS.delete(cacheKey);
+        continue;
+      }
+      if (typeof lot.moveBefore === 'function') lot.moveBefore(figure, null);
+      else lot.appendChild(figure);
     }
   }
 
@@ -342,7 +400,7 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
       if (!frame.isConnected || !visual || (visual.mode === theme.mode && JSON.stringify(visual.theme?.colors) === JSON.stringify(theme.colors))) continue;
       visual.mode = theme.mode;
       visual.theme = theme;
-      frame.srcdoc = chatSrcdoc(visual.kind, visual.source, theme);
+      frame.srcdoc = chatSrcdoc(visual.kind, visual.source, theme, visual.options);
     }
     for (const view of VIEWS.values()) {
       if (!view.ready || !view.pending) continue;
@@ -364,5 +422,5 @@ html,body{margin:0;background:transparent;color:var(--bb-text);font-family:Inter
     view?.frame.contentWindow?.postMessage({ botboyHtmlView: 1, type: 'focus', metric }, '*');
   }
 
-  window.BotBoyHtmlViews = { focusIssue, park, mount, datasetsFor, srcdoc, chatSrcdoc, mountChatVisuals, viewIssues, ISSUE_HELPER };
+  window.BotBoyHtmlViews = { focusIssue, park, mount, datasetsFor, srcdoc, chatSrcdoc, mountChatVisuals, mountDocumentVisuals, viewIssues, ISSUE_HELPER };
 })();

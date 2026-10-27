@@ -76,6 +76,8 @@ import { createKnowledgeMigration } from './core/knowledge-migration.js';
 import { withKnowledgeChatTools } from './core/knowledge-chat-tools.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
 import { createVisualAssetRegistry } from './core/visual-assets.js';
+import { configureMediaSources } from './core/media-sources.js';
+import { markdownToWordForGoogle } from './product-manager/document-exporter.js';
 import { createVisualInspector } from './core/visual-inspector.js';
 import { createProjectArtifactService } from './core/project-artifacts.js';
 import { createEtlQueryRunner, createEtlToolCall } from './core/etl-adhoc.js';
@@ -663,6 +665,8 @@ async function main() {
   // question-directed inspection. Constructed before all visual producers and
   // the executor so uploads/screenshots can register IDs atomically.
   const visualAssets = createVisualAssetRegistry(db);
+  // Chat images and screenshots (va_…) can be pictures in documents and Google files (docs/maps/document-media.md).
+  configureMediaSources({ visualAssets });
   const visualInspector = createVisualInspector({ db, registry: visualAssets, llmClient });
   const projectArtifacts = createProjectArtifactService({ db });
   const discoveredArtifacts = projectArtifacts.discoverExisting();
@@ -799,7 +803,7 @@ async function main() {
         { footerText: () => exportFooter.effective() },
       ),
       { connection: gmailConnection, compose: gmailCompose },
-    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs, images: visualAssets }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { jobs: chatJobs, sender: whatsAppSender, connection: whatsAppConnection, notifier: jobNotifier }), { themes: uiThemes }), { workplace, exportFooter }),
+    ), { connection: gmailConnection, drive: { clientFor: id => gdriveSyncRef?.clientFor(id) ?? null, readFile: (id, fileId) => gdriveSyncRef!.readFile(id, fileId) } as GdriveSyncs, images: visualAssets, wordFromMarkdown: markdownToWordForGoogle }), { sender: whatsAppSender, attachments: defaultAttachmentPolicy(visualAssets), connection: whatsAppConnection }), { library: knowledgeLibrary, writer: knowledgeWriter, history: knowledgeHistory }), { jobs: chatJobs, sender: whatsAppSender, connection: whatsAppConnection, notifier: jobNotifier }), { themes: uiThemes }), { workplace, exportFooter }),
     { jobs: chatJobs },
   );
   // Talk to BotBoy on WhatsApp (whatsapp-chat.ts): "@botboy …" in the

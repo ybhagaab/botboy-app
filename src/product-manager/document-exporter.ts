@@ -18,6 +18,7 @@ import { promisify } from 'node:util';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { addSvgPngFallbacks, prepareExportMedia, type ExportMediaSummary } from './document-media.js';
 
 // Deliberately lazy: resolving execFile at call time keeps this module
 // importable in tests that partially mock child_process.
@@ -163,6 +164,10 @@ ${footerText ? `    @bottom-center { content: ${cssString(footerText)}; font: 8p
   hr { border: 0; border-top: 1px solid #d8dbe1; margin: 2em 0; }
   a { color: #2456c4; }
   h1, h2, h3, h4, tr, pre { break-inside: avoid; }
+  /* Pictures and diagrams (document-media.ts): never wider than the page, and a
+     picture on a line of its own sits centred. */
+  img { max-width: 100%; height: auto; break-inside: avoid; }
+  p > img:only-child { display: block; margin: 0.6em auto; }
 `;
 
 /**
@@ -212,6 +217,7 @@ window.addEventListener('load', () => {
   for (const el of blocks) {
     if (el.closest('table')) continue;                     // Word skips tables
     if (el.tagName === 'LI' && el.querySelector('p')) continue; // loose list: the inner p is the line container
+    if (el.querySelector('img') && !el.textContent.trim()) continue; // a picture or diagram is not a line of text
     const blockRect = el.getBoundingClientRect();
     const range = document.createRange();
     range.selectNodeContents(el);
@@ -259,6 +265,8 @@ export interface DocumentExportResult {
   data: Buffer;
   filename: string;
   mediaType: string;
+  /** Pictures and diagrams (docs/maps/document-media.md); absent when the document has none. */
+  media?: ExportMediaSummary;
 }
 
 function escapeXml(value: string): string {
@@ -302,7 +310,7 @@ export function buildDocxFooterXml(dateText: string, footerText = ''): string {
  * matching this module's local-tools design. Best-effort: any failure leaves
  * the original pandoc output intact.
  */
-async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: string, footerText = ''): Promise<void> {
+async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: string, footerText = '', pngForSvg: ReadonlyMap<string, Buffer> = new Map()): Promise<void> {
   const extractDir = path.join(workDir, 'docx-geometry');
   try {
     await execFileAsync('/usr/bin/unzip', ['-q', docxPath, '-d', extractDir], { timeout: 20_000 });
@@ -410,6 +418,28 @@ async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: 
         (match) => `${match}<w:footerReference w:type="default" r:id="${footerRelId}" />`,
       );
     }
+
+    // Diagrams and SVG pictures: pandoc writes Word's SVG picture with no PNG
+    // for readers that cannot draw SVG; give each one (document-media.ts).
+    if (pngForSvg.size && documentXml.includes('svgBlip')) {
+      try {
+        const relsXml = await fs.readFile(relsPath, 'utf8');
+        const svgByTarget = new Map<string, Buffer>();
+        for (const target of relsXml.match(/Target="media\/[^"]+\.svg"/gi) ?? []) {
+          const relative = target.slice('Target="'.length, -1);
+          try { svgByTarget.set(relative, await fs.readFile(path.join(extractDir, 'word', relative))); } catch { /* not in the package */ }
+        }
+        const withFallbacks = addSvgPngFallbacks({ documentXml, relsXml, contentTypesXml: await fs.readFile(contentTypesPath, 'utf8') }, svgByTarget, pngForSvg);
+        if (withFallbacks.added) {
+          for (const file of withFallbacks.files) await fs.writeFile(path.join(extractDir, file.path), file.data);
+          await fs.writeFile(relsPath, withFallbacks.relsXml, 'utf8');
+          await fs.writeFile(contentTypesPath, withFallbacks.contentTypesXml, 'utf8');
+          documentXml = withFallbacks.documentXml;
+        }
+      } catch (error) {
+        console.warn(`[DocumentExport] SVG fallback pictures skipped: ${error instanceof Error ? error.message : error}`);
+      }
+    }
     await fs.writeFile(documentPath, documentXml, 'utf8');
 
     let stylesXml = await fs.readFile(stylesPath, 'utf8');
@@ -500,6 +530,63 @@ async function applyDocxHouseStyle(docxPath: string, workDir: string, dateText: 
   }
 }
 
+/** Only Word's SVG fallback pictures (no house style): for a .docx that Google converts. */
+async function applySvgFallbacksOnly(docxPath: string, workDir: string, pngForSvg: ReadonlyMap<string, Buffer>): Promise<void> {
+  if (!pngForSvg.size) return;
+  const extractDir = path.join(workDir, 'docx-fallbacks');
+  try {
+    await execFileAsync('/usr/bin/unzip', ['-q', docxPath, '-d', extractDir], { timeout: 20_000 });
+    const documentPath = path.join(extractDir, 'word', 'document.xml');
+    const relsPath = path.join(extractDir, 'word', '_rels', 'document.xml.rels');
+    const contentTypesPath = path.join(extractDir, '[Content_Types].xml');
+    const relsXml = await fs.readFile(relsPath, 'utf8');
+    const svgByTarget = new Map<string, Buffer>();
+    for (const target of relsXml.match(/Target="media\/[^"]+\.svg"/gi) ?? []) {
+      const relative = target.slice('Target="'.length, -1);
+      try { svgByTarget.set(relative, await fs.readFile(path.join(extractDir, 'word', relative))); } catch { /* not in the package */ }
+    }
+    const result = addSvgPngFallbacks({ documentXml: await fs.readFile(documentPath, 'utf8'), relsXml, contentTypesXml: await fs.readFile(contentTypesPath, 'utf8') }, svgByTarget, pngForSvg);
+    if (!result.added) return;
+    for (const file of result.files) await fs.writeFile(path.join(extractDir, file.path), file.data);
+    await fs.writeFile(documentPath, result.documentXml, 'utf8');
+    await fs.writeFile(relsPath, result.relsXml, 'utf8');
+    await fs.writeFile(contentTypesPath, result.contentTypesXml, 'utf8');
+    const rebuiltPath = path.join(workDir, 'output-fallbacks.docx');
+    await execFileAsync('/usr/bin/zip', ['-q', '-r', '-X', rebuiltPath, '.'], { timeout: 20_000, cwd: extractDir });
+    await fs.copyFile(rebuiltPath, docxPath);
+  } catch (error) {
+    console.warn(`[DocumentExport] SVG fallback pictures skipped: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+/**
+ * Markdown with pictures or diagrams as a plain Word file for Google Drive to convert into a Doc
+ * (gdrive_files create kind doc, gdrive_edit content): Drive's Markdown import cannot carry
+ * pictures, its Word import can. No house style (that is for BotBoy's own documents). Null when the
+ * Markdown has neither pictures nor diagrams, or pandoc is missing (the caller keeps Markdown import).
+ */
+export async function markdownToWordForGoogle(markdown: string): Promise<{ data: Buffer; media: ExportMediaSummary } | null> {
+  const pandoc = await resolveBinary('pandoc');
+  if (!pandoc) return null;
+  const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'botboy-google-docx-'));
+  try {
+    const prepared = await prepareExportMedia(markdown, workDir);
+    if (!prepared.summary.pictures && !prepared.summary.diagrams) return null;
+    const inputPath = path.join(workDir, 'input.md');
+    const outputPath = path.join(workDir, 'output.docx');
+    await fs.writeFile(inputPath, prepared.markdown, 'utf8');
+    try {
+      await execFileAsync(pandoc, ['--from=gfm', `--resource-path=${workDir}`, '--to=docx', '--output', outputPath, inputPath], { timeout: EXPORT_TIMEOUT_MS, cwd: workDir });
+    } catch (error) {
+      throw toolFailure('pandoc', error);
+    }
+    await applySvgFallbacksOnly(outputPath, workDir, prepared.pngForSvg);
+    return { data: await fs.readFile(outputPath), media: prepared.summary };
+  } finally {
+    await fs.rm(workDir, { recursive: true, force: true });
+  }
+}
+
 export async function exportDocument(input: {
   title: string;
   content: string;
@@ -529,18 +616,22 @@ export async function exportDocument(input: {
     const dateText = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
     const inputPath = path.join(workDir, 'input.md');
     const headerPath = path.join(workDir, 'header.html');
-    await fs.writeFile(inputPath, content, 'utf8');
+    // Pictures and diagrams land in workDir/media and pandoc runs in workDir,
+    // so every format embeds the same files (document-media.ts).
+    const prepared = await prepareExportMedia(content, workDir);
+    const media = prepared.summary.pictures || prepared.summary.diagrams ? { media: prepared.summary } : {};
+    await fs.writeFile(inputPath, prepared.markdown, 'utf8');
     await fs.writeFile(headerPath, `<style>${buildExportStyle(dateText, footerText)}</style>`, 'utf8');
     // No `--metadata=title`: pandoc renders that as a visible title block in
     // standalone HTML and a Title paragraph in DOCX, duplicating the H1 the
     // document content already opens with (owner report 2026-08-28 — markdown
     // was the only clean export). `pagetitle` below fills the HTML <title>
     // tag only, without entering the document body.
-    const baseArgs = ['--from=gfm'];
+    const baseArgs = ['--from=gfm', `--resource-path=${workDir}`];
 
     const runPandoc = async (args: string[]) => {
       try {
-        await execFileAsync(pandoc, args, { timeout: EXPORT_TIMEOUT_MS });
+        await execFileAsync(pandoc, args, { timeout: EXPORT_TIMEOUT_MS, cwd: workDir });
       } catch (error) {
         throw toolFailure('pandoc', error);
       }
@@ -558,14 +649,14 @@ export async function exportDocument(input: {
     if (format === 'html') {
       const outputPath = path.join(workDir, 'output.html');
       await renderHtml(outputPath);
-      return { data: await fs.readFile(outputPath), filename, mediaType };
+      return { data: await fs.readFile(outputPath), filename, mediaType, ...media };
     }
 
     if (format === 'docx') {
       const outputPath = path.join(workDir, 'output.docx');
       await runPandoc([...baseArgs, '--to=docx', '--output', outputPath, inputPath]);
-      await applyDocxHouseStyle(outputPath, workDir, dateText, footerText);
-      return { data: await fs.readFile(outputPath), filename, mediaType };
+      await applyDocxHouseStyle(outputPath, workDir, dateText, footerText, prepared.pngForSvg);
+      return { data: await fs.readFile(outputPath), filename, mediaType, ...media };
     }
 
     // PDF: print the styled HTML with headless Chrome (present on nearly
@@ -602,7 +693,7 @@ export async function exportDocument(input: {
       } catch (error) {
         throw toolFailure('Chrome PDF printing', error);
       }
-      return { data: await fs.readFile(outputPath), filename, mediaType };
+      return { data: await fs.readFile(outputPath), filename, mediaType, ...media };
     }
 
     const weasyprint = await resolveBinary('weasyprint');
@@ -612,7 +703,7 @@ export async function exportDocument(input: {
       );
     }
     await runPandoc([...baseArgs, `--pdf-engine=${weasyprint}`, `--include-in-header=${headerPath}`, '--output', outputPath, inputPath]);
-    return { data: await fs.readFile(outputPath), filename, mediaType };
+    return { data: await fs.readFile(outputPath), filename, mediaType, ...media };
   } finally {
     await fs.rm(workDir, { recursive: true, force: true });
   }

@@ -28,6 +28,16 @@ function tabsOf(sheet: Spreadsheet): SheetProperties[] {
   return (sheet.sheets ?? []).map(entry => entry.properties).filter(Boolean);
 }
 
+/** A tab's charts, for the read (delete_chart takes these ids). */
+function chartsOf(sheet: Spreadsheet, title: string): Array<{ chartId: number; title?: string; type: string }> {
+  const entry = (sheet.sheets ?? []).find(tab => tab.properties?.title === title);
+  return (entry?.charts ?? []).map(chart => ({
+    chartId: chart.chartId,
+    ...(chart.spec?.title ? { title: redactSecrets(chart.spec.title) } : {}),
+    type: chart.spec?.pieChart ? (chart.spec.pieChart.pieHole ? 'donut' : 'pie') : String(chart.spec?.basicChart?.chartType ?? 'chart').toLowerCase(),
+  }));
+}
+
 export async function readSheet(env: GoogleToolEnv, accountId: string, file: DriveFile, fallback: () => Promise<ToolResult>): Promise<ToolResult> {
   const sheets = env.workspaceFor(accountId)?.sheets;
   if (!sheets) return fallback();
@@ -115,6 +125,7 @@ export async function readSheet(env: GoogleToolEnv, accountId: string, file: Dri
     webViewLink: file.webViewLink,
     tabs: tabs.map(entry => ({ name: entry.title, rows: entry.gridProperties?.rowCount, columns: entry.gridProperties?.columnCount, ...(entry.gridProperties?.frozenRowCount ? { frozenRows: entry.gridProperties.frozenRowCount } : {}) })),
     sheet: tab.title,
+    ...(chartsOf(meta, tab.title).length ? { charts: chartsOf(meta, tab.title) } : {}),
     range,
     ...(shownRows ? { rows: `${firstRow + 1}–${endRow}` } : { rows: 'none (empty here)' }),
     nextStartLine,
@@ -139,7 +150,8 @@ export async function sheetsEdit(env: GoogleToolEnv, located: LocatedFile): Prom
   } catch (error) {
     return failedResult(env, googleErrorFailure(error, false, 'Google Sheets read'));
   }
-  const plan = planSheetEdits(tabsOf(meta), env.args.edits as Record<string, unknown>[]);
+  const chartIds = new Set((meta.sheets ?? []).flatMap(tab => (tab.charts ?? []).map(chart => chart.chartId)));
+  const plan = planSheetEdits(tabsOf(meta), env.args.edits as Record<string, unknown>[], { chartIds });
   if (!plan.ok) return failedResult(env, invalid(plan.message, undefined, 'Fix that edit (read the sheet with gdrive_read if a tab or cell is unclear) and call once more; nothing changed.'));
   // expect: the cells must still hold what the model read.
   if (plan.expects.length) {
@@ -169,8 +181,11 @@ export async function sheetsEdit(env: GoogleToolEnv, located: LocatedFile): Prom
   const results: Record<string, unknown> = {};
   try {
     if (plan.structural.length) {
-      await sheets.batchUpdate(file.id, plan.structural);
+      const answer = await sheets.batchUpdate(file.id, plan.structural);
       done.push('structure');
+      // A new chart's id, in request order (delete_chart and later reads use it).
+      const added = (answer.replies ?? []).map(reply => (reply as { addChart?: { chart?: { chartId?: number } } })?.addChart?.chart?.chartId).filter((chartId): chartId is number => typeof chartId === 'number');
+      if (added.length) results.chartsAdded = added;
     }
     if (plan.sets.length) {
       const answer = await sheets.valuesBatchUpdate(file.id, plan.sets, input);

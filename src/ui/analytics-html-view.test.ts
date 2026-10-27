@@ -84,6 +84,57 @@ describe('chat visuals', () => {
   });
 });
 
+describe('document diagrams (docs/maps/document-media.md)', () => {
+  const blocks = (mermaid: string) => [
+    `<pre><code class="language-mermaid">${mermaid}</code></pre>`,
+    '<pre><code class="language-svg">&lt;svg viewBox="0 0 4 4"/&gt;</code></pre>',
+    '<pre><code class="language-visual">&lt;div&gt;&lt;/div&gt;</code></pre>',
+  ].join('');
+
+  it('draws ```mermaid and ```svg as their exports do (plain SVG labels) and keeps ```visual as code', () => {
+    const win = load() as any;
+    const preview = win.document.createElement('div');
+    preview.innerHTML = blocks('flowchart LR\nA--&gt;B');
+    win.document.body.appendChild(preview);
+    win.BotBoyHtmlViews.mountDocumentVisuals(preview, 'art-1');
+    const frames = [...preview.querySelectorAll('iframe')] as any[];
+    expect(frames).toHaveLength(2);
+    expect(frames[0].srcdoc).toContain('htmlLabels:false');
+    expect(frames[0].getAttribute('sandbox')).toBe('allow-scripts');
+    expect(preview.querySelectorAll('figure.document-visual')).toHaveLength(2);
+    expect(preview.querySelector('code.language-visual')?.closest('figure')).toBeNull();
+    // A chat reply's diagrams keep Mermaid's own labels.
+    expect(win.BotBoyHtmlViews.chatSrcdoc('mermaid', 'flowchart LR', { mode: 'light', colors: {} })).not.toContain('htmlLabels');
+  });
+
+  it('a repaint with the same document keeps each diagram’s frame instead of drawing it again', () => {
+    const win = load() as any;
+    const render = (mermaid: string) => {
+      win.BotBoyHtmlViews.park();
+      win.document.body.querySelector('#preview')?.remove();
+      const preview = win.document.createElement('div');
+      preview.id = 'preview';
+      preview.innerHTML = blocks(mermaid);
+      win.document.body.appendChild(preview);
+      win.BotBoyHtmlViews.mountDocumentVisuals(preview, 'art-1');
+      return [...preview.querySelectorAll('iframe')] as any[];
+    };
+    const first = render('flowchart LR\nA--&gt;B');
+    const second = render('flowchart LR\nA--&gt;B');
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).toBe(first[1]);
+    // A changed diagram gets a new frame; the unchanged one stays.
+    const third = render('flowchart LR\nA--&gt;C');
+    expect(third[0]).not.toBe(first[0]);
+    expect(third[1]).toBe(first[1]);
+    // The old diagram's frame is gone after the next repaint, not kept forever.
+    render('flowchart LR\nA--&gt;C');
+    const lot = win.document.getElementById('analytics-html-parking');
+    expect([...lot.querySelectorAll('iframe')]).not.toContain(first[0]);
+    expect(first[0].isConnected).toBe(false);
+  });
+});
+
 describe('html view checks', () => {
   it('the page scan flags 1,000%+ ratios and NaN, and botboy.warn targets data-bb-metric', async () => {
     const win = load() as any;
