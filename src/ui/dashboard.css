@@ -2070,7 +2070,7 @@ a.data-room-row:hover { background:var(--hover); }
    mask (sides and top only; the sheet has no bottom edge), so it shows only ON the edge. */
 @property --jobs-sheet-angle { syntax:'<angle>'; inherits:false; initial-value:0deg; }
 .jobs-view.running::before {
-  content:""; position:absolute; inset:-1px -1px 0; z-index:1; padding:2px 2px 0; border-radius:inherit; pointer-events:none;
+  content:""; position:absolute; inset:-1px -1px 0; z-index:3; padding:2px 2px 0; border-radius:inherit; pointer-events:none;
   background:conic-gradient(from var(--jobs-sheet-angle), transparent 0deg 290deg, color-mix(in srgb, var(--accent) 92%, transparent) 340deg, transparent 360deg);
   -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor;
   mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite:exclude;
@@ -2093,11 +2093,18 @@ a.data-room-row:hover { background:var(--hover); }
    2026-11-13); its bubbles stay the main chat's own. */
 .jobs-view { top:calc(var(--jobs-sheet-top, 67px) + 8px); background:color-mix(in srgb, var(--accent) 4%, var(--bg-raised)); }
 /* The job's progress stays on top; its thread scrolls under it, and opens at the newest message. */
-.jobs-progress { flex:0 0 auto; max-height:42%; overflow-y:auto; padding:2px 15px 12px; border-bottom:1px solid var(--border); overscroll-behavior:contain; }
+/* The progress sits above the thread (owner request 2026-11-13: a clearer separation). It casts a soft shadow down onto the thread,
+   the thread's top edge fades so a message scrolling under it blurs out instead of being cut at a hairline, and it takes a slightly
+   stronger accent tint (7%, against the sheet's 4%; --muted stays at 4.57:1 or more on the shipped palettes). It is positioned with
+   a z-index so its shadow paints over the thread's bubbles. */
+.jobs-progress { position:relative; z-index:2; flex:0 0 auto; max-height:42%; overflow-y:auto; padding:2px 15px 12px; border-bottom:1px solid var(--border); background:color-mix(in srgb, var(--accent) 7%, var(--bg-raised)); box-shadow:0 10px 14px -10px rgba(0,0,0,.35); overscroll-behavior:contain; }
 .jobs-progress > * { max-width:var(--jobs-column); }
+/* The handle and title bar share the progress tint, so the whole header is one block above its shadow. */
+.jobs-view .jobs-grab, .jobs-view .jobs-sheet-bar { background:color-mix(in srgb, var(--accent) 7%, var(--bg-raised)); }
+.jobs-view .jobs-grab { border-radius:15px 15px 0 0; }
 .jobs-progress-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
 .jobs-view-meta { color:var(--muted); font-size:10.5px; }
-.jobs-view-scroll { position:relative; min-height:0; flex:1; overflow-y:auto; padding:16px 15px 14px; overscroll-behavior:contain; }
+.jobs-view-scroll { position:relative; min-height:0; flex:1; overflow-y:auto; padding:16px 15px 14px; overscroll-behavior:contain; -webkit-mask-image:linear-gradient(to bottom, transparent 0, #000 22px); mask-image:linear-gradient(to bottom, transparent 0, #000 22px); }
 .jobs-newest { position:sticky; bottom:6px; z-index:2; display:block; width:max-content; margin:10px auto 0; padding:5px 12px; border:1px solid var(--border-strong); border-radius:999px; color:var(--soft); background:var(--surface); font:inherit; font-size:11px; box-shadow:0 6px 18px rgba(0,0,0,.3); cursor:pointer; }
 .jobs-newest[hidden] { display:none; }
 .jobs-newest:hover { color:var(--text); background:var(--hover); }

@@ -691,14 +691,17 @@ describe('the dock and sheets: the stylesheet', () => {
     expect(declarations(block, '.jobs-sheet-panel')).toMatchObject({ position: 'absolute', left: '8px', right: '8px', bottom: '0', transform: 'translateY(105%)',
       border: '1px solid color-mix(in srgb, var(--accent) 30%, var(--border-strong))', 'border-bottom': '0' });
     const light = declarations(block, '.jobs-view.running::before');
-    expect(light).toMatchObject({ position: 'absolute', inset: '-1px -1px 0', padding: '2px 2px 0', 'pointer-events': 'none', 'mask-composite': 'exclude', animation: 'jobs-sheet-orbit 9s linear infinite' });
+    expect(light).toMatchObject({ position: 'absolute', inset: '-1px -1px 0', 'z-index': '3', padding: '2px 2px 0', 'pointer-events': 'none', 'mask-composite': 'exclude', animation: 'jobs-sheet-orbit 9s linear infinite' });
     expect(light.background).toContain('var(--accent)');
     expect(declarations(block, '#chat-panel.hidden .jobs-view.running::before')).toEqual({ 'animation-play-state': 'paused' });
     expect(block).toMatch(/@media \(prefers-reduced-motion: reduce\) \{[\s\S]*\.jobs-view\.running::before \{ animation:none;/);
     expect(declarations(block, '.jobs-sheet-panel.open')).toEqual({ transform: 'translateY(0)' });
     // The job's sheet wears the job rows' faint accent wash (owner request 2026-11-13).
     expect(declarations(block, '.jobs-view')).toEqual({ top: 'calc(var(--jobs-sheet-top, 67px) + 8px)', background: 'color-mix(in srgb, var(--accent) 4%, var(--bg-raised))' });
-    expect(declarations(block, '.jobs-view-scroll')).toMatchObject({ 'overflow-y': 'auto', flex: '1' });
+    expect(declarations(block, '.jobs-view-scroll')).toMatchObject({ 'overflow-y': 'auto', flex: '1', 'mask-image': 'linear-gradient(to bottom, transparent 0, #000 22px)' });
+    // The progress casts its shadow over the thread (owner request 2026-11-13): positioned above it, so the bubbles never cover it.
+    expect(declarations(block, '.jobs-view .jobs-grab, .jobs-view .jobs-sheet-bar')).toEqual({ background: 'color-mix(in srgb, var(--accent) 7%, var(--bg-raised))' });
+    expect(declarations(block, '.jobs-progress')).toMatchObject({ position: 'relative', 'z-index': '2', 'box-shadow': '0 10px 14px -10px rgba(0,0,0,.35)', background: 'color-mix(in srgb, var(--accent) 7%, var(--bg-raised))' });
     expect(declarations(block, '.jobs-newest')).toMatchObject({ position: 'sticky' });
   });
 });
