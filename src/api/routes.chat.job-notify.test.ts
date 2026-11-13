@@ -79,11 +79,17 @@ describe('chat loop around job_notify', () => {
       openWindow: async () => true,
     } as unknown as WhatsAppConnection;
     const base: ToolExecutor = {
-      executeTool: vi.fn(async (c) => {
+      executeTool: vi.fn(async (c, context?: ToolExecutionContext) => {
         // The real job_update handler ends the job in the middle of the turn (tool-executor.ts); the closing words come after.
         if (c.function.name === 'job_update' && options.endJobOnUpdate) {
           jobs.end(options.endJobOnUpdate, 'done', 'Study complete');
           return { toolCallId: c.id, content: JSON.stringify({ ok: true, job: { id: options.endJobOnUpdate, status: 'done' } }), isError: false };
+        }
+        // job_update start hands the work off to a new job and records it on the turn (tool-executor.ts › handOffJob).
+        if (c.function.name === 'job_update' && JSON.parse(c.function.arguments).action === 'start') {
+          const started = jobs.start({ goal: context?.currentUserMessage ?? 'g' });
+          context?.startedJobIds?.push(started.id);
+          return { toolCallId: c.id, content: JSON.stringify({ ok: true, job: { id: started.id, number: started.seq } }), isError: false };
         }
         return { toolCallId: c.id, content: JSON.stringify({ ok: false, error: `unknown tool ${c.function.name}` }), isError: true };
       }),
@@ -108,15 +114,18 @@ describe('chat loop around job_notify', () => {
     }));
     return { server, llmClient };
   }
-  const say = (server: express.Express, message: string) => request(server).post('/api/chat/messages').send({ message, stream: true });
+  /** A main chat message, or one sent in a job's own thread (PARALLEL_JOBS_PLAN.md). */
+  const say = (server: express.Express, message: string, jobId?: string) => request(server).post('/api/chat/messages').send({ message, stream: true, ...(jobId ? { jobId } : {}) });
   const chatTools = () => seen.filter((names) => names.includes('run_command') || names.length > 5);
   const lastReply = () => (db.prepare("SELECT content FROM chat_messages WHERE role='assistant' ORDER BY created_at DESC LIMIT 1").get() as any).content as string;
   const ASK = 'start work on this & if it pauses, or any question or stops, send me report on whatsapp please.';
 
-  it('offers the tool, and its guidance, on the owner\'s real request; arming sends one confirmation and turns updates on', async () => {
+  it('offers the tool, and its guidance, on the owner\'s real request; arming sends one confirmation and turns updates on for the job this turn started', async () => {
     const { server, llmClient } = app((call) => (call === 1
-      ? { tool: { name: 'job_notify', arguments: '{"action":"on"}' }, text: '' }
-      : { text: 'Updates are on. I will message you on WhatsApp.' }));
+      ? { tool: { name: 'job_update', arguments: '{"action":"start"}' }, text: '' }
+      : call === 2
+        ? { tool: { name: 'job_notify', arguments: '{"action":"on"}' }, text: '' }
+        : { text: 'Updates are on. I will message you on WhatsApp.' }));
     await say(server, ASK);
     expect(chatTools()[0]).toContain('job_notify');
     const system = llmClient.chatCompletionStream.mock.calls[0][0].messages[0].content as string;
@@ -124,7 +133,8 @@ describe('chat loop around job_notify', () => {
     expect(contexts[0]).toMatchObject({ callerKind: 'interactive' });
     expect(sent).toHaveLength(1);
     expect(sent[0].startsWith('🤖 ')).toBe(true);
-    expect(jobs.activeJob()!.notify).toBeDefined();
+    expect(jobs.activeJobs()).toHaveLength(1);
+    expect(jobs.activeJobs()[0].notify).toBeDefined();
     // A truthful "updates are on" reply is not flagged by the false-claim gate: no corrective note is appended.
     expect(lastReply()).not.toContain('System note');
   });
@@ -134,7 +144,7 @@ describe('chat loop around job_notify', () => {
     await say(server, 'what are my open tasks');
     for (const names of chatTools()) expect(names).not.toContain('job_notify');
     expect(llmClient.chatCompletionStream.mock.calls[0][0].messages[0].content as string).not.toContain('## Telling the owner on WhatsApp');
-    expect(jobs.activeJob()).toBeNull();
+    expect(jobs.activeJobs()).toEqual([]);
   });
 
   it('does not offer the tool when the build has no notifier (nothing could keep the promise)', async () => {
@@ -149,26 +159,30 @@ describe('chat loop around job_notify', () => {
       ? { tool: { name: 'job_notify', arguments: '{"action":"on","to":"+6599999999"}' }, text: '' }
       : { text: "I've sent you a WhatsApp confirmation and updates are now on." }));
     await say(server, ASK);
-    expect(jobs.activeJob()?.notify).toBeUndefined();
+    expect(jobs.activeJobs()).toEqual([]);
     expect(sent).toEqual([]);
     expect(lastReply()).toContain('System note: no data-modifying tool ran in this turn');
   });
 
   it('a truthful "I\'ve sent" after job_notify really armed updates gets no corrective note', async () => {
+    const job = jobs.start({ goal: 'the running job' });
     const { server } = app((call) => (call === 1
       ? { tool: { name: 'job_notify', arguments: '{"action":"on"}' }, text: '' }
       : { text: "I've sent you a WhatsApp confirmation, and updates are on." }));
     await say(server, ASK);
-    expect(jobs.activeJob()!.notify).toBeDefined();
+    expect(jobs.get(job.id)!.notify).toBeDefined();
     expect(sent).toHaveLength(1);
     expect(lastReply()).not.toContain('System note');
   });
 
-  it('keeps the job\'s closing words as the report (only for a job that asked), and wakes the notifier', async () => {
+  it('keeps the job\'s closing words as the report (only for a job that asked, only from its own thread), and wakes the notifier', async () => {
     const job = jobs.start({ goal: 'Study how customers reach the home screen' });
     jobs.setNotify(job.id, true);
     const { server } = app(() => ({ text: '**The study is complete.**\n\nTop finding: Search Back.' }));
-    await say(server, 'any news on the study?');
+    // A main chat message is not the job's turn: its words are not the job's report.
+    await say(server, 'what time is it in Singapore?');
+    expect(jobs.get(job.id)!.lastReply).toBeUndefined();
+    await say(server, 'any news on the study?', job.id);
     expect(jobs.get(job.id)!.lastReply).toBe('**The study is complete.**\n\nTop finding: Search Back.');
     expect(nudge).toHaveBeenCalled();
   });
@@ -176,7 +190,7 @@ describe('chat loop around job_notify', () => {
   it('a job that did not ask keeps no report', async () => {
     const job = jobs.start({ goal: 'quiet job' });
     const { server } = app(() => ({ text: 'Working on it.' }));
-    await say(server, 'status?');
+    await say(server, 'status?', job.id);
     expect(jobs.get(job.id)!.lastReply).toBeUndefined();
   });
 
@@ -188,7 +202,7 @@ describe('chat loop around job_notify', () => {
     const { server } = app((call) => (call === 1
       ? { tool: { name: 'job_update', arguments: '{"action":"done","summary":"Study complete"}' }, text: '' }
       : { text: 'All done. The answer is in the findings file.' }), { endJobOnUpdate: job.id });
-    await say(server, 'wrap up');
+    await say(server, 'wrap up', job.id);
     const ended = jobs.get(job.id)!;
     expect(ended.status).toBe('done');
     expect(ended.lastReply).toBe('All done. The answer is in the findings file.');

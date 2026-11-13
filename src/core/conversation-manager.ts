@@ -37,7 +37,18 @@ export interface ConversationManager {
   saveSummary(sessionId: string, summary: string, fromMsgId: string, toMsgId: string, userMsgCount: number): void;
   getMessagesSinceId(sessionId: string, sinceId: string): StoredConversationMessage[];
   deleteSession(sessionId: string): void;
+  /** The newest active session of this type that is not a job's thread (the main chat for 'chat'). */
   getActiveSessionId(type: SessionType): string | null;
+  /**
+   * A job's own thread (PARALLEL_JOBS_PLAN.md PJ1): the chat session bound to this job, created on first use. The main chat
+   * lookup never returns it, and it never returns the main chat.
+   */
+  threadSessionId(jobId: string): string;
+  /**
+   * Copies messages of `fromSessionId` written at or after `sinceIso` (the newest `limit`, in order) to the end of
+   * `toSessionId`. Used once, to give a job that started before threads existed its own history. Returns how many it copied.
+   */
+  copyMessagesSince(fromSessionId: string, toSessionId: string, sinceIso: string, limit: number): number;
   pruneOldSessions(): void;
 }
 
@@ -79,13 +90,20 @@ export function createConversationManager(db: Database.Database): ConversationMa
     );
   `);
 
+  // A job's thread is a chat session tagged with its job (2026-10-28, PARALLEL_JOBS_PLAN.md); untagged chat sessions are the main chat.
+  const sessionColumns = new Set((db.prepare('PRAGMA table_info(llm_sessions)').all() as Array<{ name: string }>).map(column => column.name));
+  if (!sessionColumns.has('thread_job_id')) db.exec('ALTER TABLE llm_sessions ADD COLUMN thread_job_id TEXT');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_sessions_thread_job ON llm_sessions(thread_job_id) WHERE thread_job_id IS NOT NULL');
+
   const insertSession = db.prepare('INSERT INTO llm_sessions (id, session_type) VALUES (?, ?)');
+  const insertThreadSession = db.prepare("INSERT INTO llm_sessions (id, session_type, thread_job_id) VALUES (?, 'chat', ?)");
+  const selectThreadSession = db.prepare('SELECT id FROM llm_sessions WHERE thread_job_id = ?');
   const insertMessage = db.prepare('INSERT INTO llm_messages (id, session_id, role, content, tool_calls, tool_call_id, token_count) VALUES (?, ?, ?, ?, ?, ?, ?)');
   const selectMessages = db.prepare('SELECT rowid AS message_position, * FROM llm_messages WHERE session_id = ? ORDER BY rowid ASC');
   const deleteSessionStmt = db.prepare('DELETE FROM llm_sessions WHERE id = ?');
   const deleteMessagesStmt = db.prepare('DELETE FROM llm_messages WHERE session_id = ?');
   const updateLastActive = db.prepare("UPDATE llm_sessions SET last_active_at = datetime('now') WHERE id = ?");
-  const selectActiveSession = db.prepare("SELECT id FROM llm_sessions WHERE session_type = ? AND status = 'active' ORDER BY last_active_at DESC LIMIT 1");
+  const selectActiveSession = db.prepare("SELECT id FROM llm_sessions WHERE session_type = ? AND status = 'active' AND thread_job_id IS NULL ORDER BY last_active_at DESC LIMIT 1");
   const selectSummary = db.prepare("SELECT summary, covers_from_msg_id, covers_to_msg_id, user_msg_count FROM chat_summaries WHERE session_id = ? ORDER BY rowid DESC LIMIT 1");
   const insertSummary = db.prepare("INSERT INTO chat_summaries (id, session_id, summary, covers_from_msg_id, covers_to_msg_id, user_msg_count, token_count) VALUES (?, ?, ?, ?, ?, ?, ?)");
   const countUserMsgs = db.prepare("SELECT COUNT(*) as cnt FROM llm_messages WHERE session_id = ? AND role = 'user'");
@@ -226,6 +244,28 @@ export function createConversationManager(db: Database.Database): ConversationMa
     getActiveSessionId(type: SessionType): string | null {
       const row = selectActiveSession.get(type) as any;
       return row?.id ?? null;
+    },
+
+    threadSessionId(jobId: string): string {
+      const existing = selectThreadSession.get(jobId) as { id: string } | undefined;
+      if (existing) return existing.id;
+      const id = uuid();
+      // The unique index makes a second creation for the same job fail; the loser reads the winner's id.
+      try { insertThreadSession.run(id, jobId); } catch { return (selectThreadSession.get(jobId) as { id: string }).id; }
+      return id;
+    },
+
+    copyMessagesSince(fromSessionId: string, toSessionId: string, sinceIso: string, limit: number): number {
+      // created_at is SQLite's datetime('now') (UTC, "YYYY-MM-DD HH:MM:SS"); compare in that form.
+      const since = sinceIso.replace('T', ' ').replace(/\.\d+Z?$|Z$/, '');
+      const rows = (db.prepare(`SELECT * FROM (SELECT rowid AS position, * FROM llm_messages WHERE session_id = ? AND created_at >= ? AND role != 'system'
+        ORDER BY rowid DESC LIMIT ?) ORDER BY position ASC`).all(fromSessionId, since, Math.max(0, limit)) as any[]);
+      const copy = db.transaction(() => {
+        for (const row of rows) insertMessage.run(uuid(), toSessionId, row.role, row.content, row.tool_calls, row.tool_call_id, row.token_count);
+      });
+      copy();
+      if (rows.length) updateLastActive.run(toSessionId);
+      return rows.length;
     },
 
     pruneOldSessions(): void {

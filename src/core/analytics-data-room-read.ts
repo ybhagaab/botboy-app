@@ -489,6 +489,11 @@ function runDirectQueryWorker(input: {
 export function createAnalyticsDataRoomReadService(input: {
   store: AnalyticsDataRoomStore;
   modelContextRuntime?: AnalyticsModelContextRuntime;
+  /**
+   * Adds a matching dataset's origin, readers and add-version steps to its card (data-origins.ts › describeDatasetOrigin; owner
+   * decision 2026-11-10). `full`: one dataset matched, so every query comes complete.
+   */
+  describeOrigin?: (datasetId: string, versionId: string, options: { full: boolean }) => Record<string, unknown>;
 }): AnalyticsDataRoomReadService {
   function list(value: DataRoomDatasetListInput = {}): Record<string, unknown> {
     if (!isRecord(value)) {
@@ -532,7 +537,21 @@ export function createAnalyticsDataRoomReadService(input: {
           undefined,
           false,
         );
-        datasets.push(query ? detailedCatalogCard(source) : compactCatalogIndexCard(source));
+        if (!query) {
+          datasets.push(compactCatalogIndexCard(source));
+          continue;
+        }
+        const card = detailedCatalogCard(source);
+        // Where the rows came from, who reads them, and how to add a version: on the card, never hidden (data-origins.ts).
+        let origin: Record<string, unknown> = {};
+        try {
+          if (input.describeOrigin && typeof card.datasetId === 'string' && typeof card.versionId === 'string') {
+            origin = input.describeOrigin(card.datasetId, card.versionId, { full: ranked.length === 1 });
+          }
+        } catch {
+          origin = {};
+        }
+        datasets.push({ ...card, ...origin });
       } catch {
         unavailableCount += 1;
       }
@@ -549,7 +568,7 @@ export function createAnalyticsDataRoomReadService(input: {
       unavailableCount,
       nextAction: datasets.length
         ? query
-          ? 'Use the exact datasetId/versionId with query_data_room. Each supplied alias exposes a read-only table named <alias>.data.'
+          ? 'Use the exact datasetId/versionId with query_data_room. Each supplied alias exposes a read-only table named <alias>.data. Each card\'s origin says where its rows came from, usedBy names the widgets that read it, and addVersion says how to give it newer data.'
           : 'This is the complete ready catalog. Search by a natural name when exact schema and semantics are needed before query_data_room.'
         : query
           ? 'No ready dataset matched. Use create_data_room_dataset only when a reusable canonical dataset is genuinely missing or not ready.'

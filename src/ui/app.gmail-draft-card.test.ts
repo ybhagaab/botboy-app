@@ -44,7 +44,7 @@ const DRAFT = {
 
 beforeAll(() => {
   const source = [
-    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'), constLine('KNOWLEDGE_MARKER_RE'), constLine('THEME_MARKER_RE'),
+    constLine('LESSON_MARKER_RE'), constLine('GMAIL_DRAFT_MARKER_RE'), constLine('MCP_SERVER_MARKER_RE'), constLine('KNOWLEDGE_MARKER_RE'), constLine('THEME_MARKER_RE'), constLine('JOB_CARD_MARKER_RE'), constLine('JOB_CARD_ONLY_RE'),
     // hydrateChatCards also expands Knowledge change cards (app.knowledge-card.test.ts).
     topLevel('fillKnowledgeCard'), topLevel('paintKnowledgeCard'),
     // ... and theme cards (app.theme-card.test.ts).

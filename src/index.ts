@@ -28,7 +28,7 @@ import { registerWriteProtectedRoots } from './core/protected-local-resources.js
 import { writeDatabaseOpenMarker } from './core/database-open-marker.js';
 import { createMcpManager } from './core/mcp-manager.js';
 import { createMcpServerFinder } from './core/mcp-registry-lookup.js';
-import { sqlContextExportDir } from './core/mcp-profiles.js';
+import { GRASP_PROFILE_ID, SHAREPOINT_MCP_PROFILE_ID, SLACK_MCP_PROFILE_ID, sqlContextExportDir } from './core/mcp-profiles.js';
 import { createSqlContextExportRunner } from './core/analytics-sql-export.js';
 import { createAnalyticsDashboardService, type AnalyticsRunFailureEvent } from './core/analytics-dashboard.js';
 import { createDashboardEtlRunner, etlChatLaneCallable } from './core/analytics-runners.js';
@@ -39,6 +39,7 @@ import { createAnalyticsDataRoomBackupService } from './core/analytics-data-room
 import { createAnalyticsDataRoomService } from './core/analytics-data-room-service.js';
 import { createAnalyticsLocalQueryEngine } from './core/analytics-data-room-query.js';
 import { createAnalyticsDataRoomReadService } from './core/analytics-data-room-read.js';
+import { describeDatasetOrigin, ensureDataOriginTables } from './core/data-origins.js';
 import { createAnalyticsDashboardDataRoomBridge } from './core/analytics-dashboard-data-room.js';
 import { createAnalyticsDerivationService } from './core/analytics-data-room-derivation.js';
 import { createAnalyticsDataRoomScheduler } from './core/analytics-data-room-scheduler.js';
@@ -68,10 +69,13 @@ import { createPromptManager } from './core/prompt-manager.js';
 import { createToolExecutor, defaultEtlResultsDir } from './core/tool-executor.js';
 import { createChatJobStore } from './core/chat-jobs.js';
 import { createEtlRunWatcher } from './core/etl-run-watcher.js';
+import { createJobWaitChecker } from './core/job-waits.js';
 import { CONTINUATION_HEADER, createContinuationBridge, createContinuationRunner } from './core/chat-continuations.js';
 import { withJobMandate } from './core/job-mandate.js';
 import { createKnowledgeLibrary } from './core/knowledge-library.js';
 import { createKnowledgeJobWaker } from './core/knowledge-job-wake.js';
+import { createJobReviewRunner, type JobReviewRunner } from './core/job-review.js';
+import type { ChatJobThinking } from './core/chat-jobs.js';
 import { createKnowledgeMigration } from './core/knowledge-migration.js';
 import { withKnowledgeChatTools } from './core/knowledge-chat-tools.js';
 import { createBrowserHandsService } from './core/browser-hands.js';
@@ -81,9 +85,14 @@ import { markdownToWordForGoogle } from './product-manager/document-exporter.js'
 import { createVisualInspector } from './core/visual-inspector.js';
 import { createProjectArtifactService } from './core/project-artifacts.js';
 import { createEtlQueryRunner, createEtlToolCall } from './core/etl-adhoc.js';
+import { createQueryLedger } from './core/query-ledger.js';
+import { createQueryControl } from './core/query-control.js';
 import { createEtlOnboardingService } from './core/etl-onboarding.js';
+import { createEtlCatalogReader } from './core/etl-data-dictionary.js';
 import { createChatInterface } from './core/chat-interface.js';
 import { createMidwaySentinel } from './core/midway-sentinel.js';
+import { postChatNotice } from './core/chat-notices.js';
+import { cleanupSentinelPileup } from './core/chat-notice-cleanup.js';
 import { createCaptureHealth } from './core/capture-health.js';
 import { createBrowserMonitor } from './monitors/browser-monitor.js';
 import { createBrowserCaptureState } from './core/browser-capture-state.js';
@@ -327,6 +336,13 @@ async function main() {
   registerCaptureExcludedRoots(() => knowledgeExcludedRoots(db));
 
   console.log('✅ Database initialized');
+  // Once per store: the old Midway sentinel's piled-up alerts and "still pending" notes leave the chat, with a backup
+  // (chat-notice-cleanup.ts, owner approval 2026-10-29).
+  {
+    const cleanup = cleanupSentinelPileup(db, { backupDir: path.join(os.homedir(), '.personal-productivity-tracker', 'backups') });
+    if (cleanup.status === 'done' && cleanup.deleted) console.log(`[ChatNotice] removed ${cleanup.deleted} piled-up Midway alert rows (backup: ${cleanup.backupPath})`);
+    if (cleanup.status === 'failed') console.warn(`[ChatNotice] Midway alert cleanup failed: ${cleanup.error}`);
+  }
 
   // ── Toolchain discovery ──
   // Resolve every external CLI tool BotBoy shells out to, persist the map,
@@ -365,14 +381,12 @@ async function main() {
       (error: any) => {
         const detail = String(error?.message ?? error).slice(0, 300);
         console.error(`❌ ${subsystem} background startup failed: ${detail}`);
-        try {
-          const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(
-            id,
-            'assistant',
-            `⚠️ ${subsystem} did not start with the app (${detail}). The dashboard keeps working; check the Connections page or ask me to run a diagnosis.`,
-          );
-        } catch {}
+        postChatNotice(db, {
+          key: `startup:${subsystem.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)}`, topic: 'startup', state: 'open', severity: 'error',
+          title: `${subsystem} didn't start`, labels: [subsystem],
+          next: 'The dashboard keeps working. Check Connections, or ask me to diagnose it.',
+          detail,
+        });
       },
     );
   };
@@ -392,6 +406,9 @@ async function main() {
   // Settings → AI model → Show model thinking: read once per chat turn.
   const chatThinking = createChatThinkingDisplay({ db });
 
+  // BotBoy's own warehouse queries (docs/maps/query-control.md): made before the MCP manager, which marks and records every SQL
+  // call through it (query-ledger.ts › getQueryLedger), and before every ETL runner, which records the runs it submits.
+  const queryLedger = createQueryLedger(db);
   // macOS Keychain through McpManager's secret store.
   const mcpManager = createMcpManager({ db, amazonEmployee: () => workplace.amazonEmployee() });
   startInBackground('Managed MCP runtime', () => mcpManager.start(), '✅ Managed MCP runtime initialized');
@@ -563,9 +580,12 @@ async function main() {
     get providerLocality() { return analyticsImportProviderReceipt(operationProviderDescriptor()).providerLocality; },
     get endpointSha256() { return analyticsImportProviderReceipt(operationProviderDescriptor()).endpointSha256; },
   };
+  ensureDataOriginTables(db);
   const analyticsDataRoomRead = createAnalyticsDataRoomReadService({
     store: analyticsDataRoomStore,
     modelContextRuntime: answerProviderReceipt,
+    // A dataset card carries its origin, its readers and how to add a version (data-origins.ts, owner decision 2026-11-10).
+    describeOrigin: (datasetId, versionId, options) => describeDatasetOrigin(db, datasetId, versionId, options),
   });
   const analyticsJobPlanner = createAnalyticsJobPlanner({
     db,
@@ -648,14 +668,16 @@ async function main() {
   // finished), surface completion into chat so the outcome is never silent.
   // The chat UI picks the message up on its regular history poll.
   chatTerminal.setUnattendedEndListener((ended) => {
-    try {
-      const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const exit = ended.exitCode !== null ? ` (exit code ${ended.exitCode})` : '';
-      const text = `🖥️ Terminal update: “${ended.title}” ended with status **${ended.status}**${exit}. Ask me to check the result if you want it verified.`;
-      db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(id, 'assistant', text);
-    } catch (e: any) {
-      console.warn(`[ChatTerminal] Could not post session-end notification: ${e?.message ?? e}`);
-    }
+    // A compact notice (chat-notices.ts): consecutive terminal endings fold into one bubble in the panel.
+    const ok = ended.status === 'completed' && ended.exitCode === 0;
+    const outcome = ended.status === 'completed'
+      ? (ended.exitCode === 0 || ended.exitCode === null ? 'Done' : `Exit ${ended.exitCode}`)
+      : ended.status === 'timed_out' ? 'Timed out' : ended.status === 'stopped' ? 'Stopped' : `Failed${ended.exitCode !== null ? ` (exit ${ended.exitCode})` : ''}`;
+    postChatNotice(db, {
+      key: 'terminal', topic: 'terminal', state: 'info', severity: ok ? 'info' : 'warning',
+      title: ok ? 'Terminal finished' : 'Terminal ended', labels: [ended.title, outcome],
+      detail: 'Ask me to check the result if you want it verified.',
+    });
   });
   // Content store constructed before the executor so document tools can read
   // stored document content (it only needs the db; the capture pipeline that
@@ -675,10 +697,13 @@ async function main() {
   // user's own Datanet group. Shares the Sentry-self-healing ETL call from
   // etl-adhoc and the chat LLM client for classification/synthesis; exposed
   // to chat (mcp_etl_generate_presets) and the connection page (status/POST).
+  const etlOnboardingCall = createEtlToolCall(mcpManager);
   const etlOnboarding = createEtlOnboardingService({
     db,
-    call: createEtlToolCall(mcpManager),
+    call: etlOnboardingCall,
     llm: llmClient,
+    // The data dictionary reads the warehouse catalog through BotBoy's own scratch ETL runner (etl-data-dictionary.ts).
+    catalog: createEtlCatalogReader({ db, call: etlOnboardingCall }),
   });
   // General browser hands: persistent BotBoy-created tabs in the same debug
   // Chrome profile used by ambient capture. Initialization is best-effort at
@@ -709,8 +734,52 @@ async function main() {
   const chatJobs = createChatJobStore(db);
   const chatContinuations = createContinuationBridge();
   const etlResultsDir = defaultEtlResultsDir();
+  // Stopping BotBoy's own queries (query-control.ts): cancel_query in chat and jobs, and the owner's Running queries in the panel.
+  const queryControl = createQueryControl({
+    db,
+    ledger: queryLedger,
+    mcpManager,
+    etlCall: createEtlToolCall(mcpManager),
+    etlAvailable: () => workplace.amazonEmployee(),
+    isJobRun: (jobId, runId) => chatJobs.isJobRun(jobId, runId),
+    describeJob: (jobId) => {
+      const job = chatJobs.get(jobId);
+      return job ? { number: job.seq > 0 ? job.seq : null, title: job.title } : null;
+    },
+  });
+  // General waits (job-waits.ts, docs/maps/job-waits.md): what a job waits for that ends on its own. The checks only read: an
+  // export's status (a short call off the SQL connection's query lane), a Data Room job's row, the chat terminal, a file in the
+  // files workspace, a connection's health, the clock. The ETL watcher runs them every 30 s; wait_for runs them in its own call.
+  const jobWaitChecker = createJobWaitChecker({
+    filesDir: path.dirname(etlResultsDir),
+    exportStatus: (exportId, signal) => mcpManager.callTool('sql-context', 'export_status', { exportId }, {
+      source: 'job-wait', timeoutMs: 20_000, signal, queryControl: true,
+    }),
+    exportStoppedMessage: (exportId) => queryLedger.exportStoppedMessage(exportId),
+    dataRoomJob: (jobId) => {
+      const row = db.prepare('SELECT status, error_message, next_action FROM analytics_jobs WHERE id = ?').get(jobId) as
+        | { status: string; error_message: string | null; next_action: string | null }
+        | undefined;
+      return row ? { status: row.status, errorMessage: row.error_message, nextAction: row.next_action } : null;
+    },
+    terminal: {
+      get: (sessionId) => chatTerminal.get(sessionId),
+      output: (sessionId, lastChars) => chatTerminal.readSessionOutput(sessionId, lastChars),
+    },
+    connection: (serverId) => mcpManager.getServer(serverId).catch(() => null),
+    probeSqlConnection: async (signal) => {
+      try {
+        const answer = await mcpManager.callTool('sql-context', 'connection_status', {}, { source: 'job-wait', timeoutMs: 30_000, signal, queryControl: true });
+        return { connected: !answer.isError && /^Connected(?:\n|$)/.test(answer.text), detail: answer.text.split('\n')[0]?.slice(0, 200) };
+      } catch {
+        return null;
+      }
+    },
+  });
   const baseToolExecutor = createToolExecutor(db, nodeManager, {
     chatJobs,
+    queryControl,
+    jobWaits: jobWaitChecker,
     etlResultsDir,
     brainStore,
     mcpManager,
@@ -745,6 +814,7 @@ async function main() {
   // WhatsApp updates for a job (job-notifier.ts, job-notify.md): BotBoy's own notifier tells the owner on WhatsApp when a job they asked
   // about needs them or ends. It is no model turn, so it works while a job runs on its own. It shares the sender (one send at a time)
   // with the chat tools and the WhatsApp chat bridge.
+  let jobReviewsRef: JobReviewRunner | null = null;
   const jobNotifier = createJobNotifier({
     jobs: chatJobs,
     sender: whatsAppSender,
@@ -755,6 +825,8 @@ async function main() {
       const sessionId = conversationManager.getActiveSessionId('chat');
       if (sessionId) conversationManager.appendAssistant(sessionId, text);
     },
+    // A pause the main chat has not looked at yet is not the owner's (job-review.ts, built below with the ETL watcher).
+    holdPause: (jobId) => jobReviewsRef?.isPending(jobId) ?? false,
   });
   // withWorkplaceChatTools sits directly inside the mandate: Amazon-only
   // tools are refused while Amazon Employee is off, and export_footer lives there.
@@ -814,14 +886,24 @@ async function main() {
     page: cdpWhatsAppPage(),
     sender: whatsAppSender,
     settings: () => whatsAppConnection.settings(),
-    isTurnActive: () => chatContinuations.isTurnActive(),
+    // The bridge's turns are main chat owner turns: it waits only for another one (job threads never hold it back).
+    isTurnActive: () => chatContinuations.isMainTurnActive(),
     runTurn: async (message, requestId, mode) => {
       const base = `http://${HOST === '::1' ? '[::1]' : '127.0.0.1'}:${PORT}`;
-      const response = await fetch(`${base}/api/chat/messages`, {
+      const send = () => fetch(`${base}/api/chat/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Origin: `http://localhost:${PORT}` },
         body: JSON.stringify({ message, stream: true, requestId, mode }),
       });
+      let response = await send();
+      // One owner turn per thread at a time: a reply still being written in the same thread (the laptop chat, or the job a #N
+      // message names) answers 409 turn_in_progress. Wait for it, then send again, for up to 15 minutes.
+      for (let waited = 0; response.status === 409 && waited < 15 * 60_000; waited += 3_000) {
+        const code = await response.clone().json().then((body: any) => String(body?.code ?? ''), () => '');
+        if (code !== 'turn_in_progress') break;
+        await new Promise(resolve => setTimeout(resolve, 3_000));
+        response = await send();
+      }
       if (!response.ok || !response.body) throw new Error(`chat returned HTTP ${response.status}`);
       const text = await response.text();
       let reply = '';
@@ -843,13 +925,19 @@ async function main() {
     url: `http://${HOST === '::1' ? '[::1]' : '127.0.0.1'}:${PORT}/api/chat/messages`,
     secret: chatContinuations.secret,
     hub: chatContinuations.hub,
-    isTurnActive: () => chatContinuations.isTurnActive(),
-    postNote: (text) => {
-      db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)')
-        .run(`asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 'assistant', text);
-      const sessionId = conversationManager.getActiveSessionId('chat');
+    // Many jobs at once (PARALLEL_JOBS_PLAN.md): a job's automatic turn waits only for an owner turn in its own thread.
+    isOwnerTurnActive: (jobId) => chatContinuations.isOwnerTurnActive(jobId),
+    // The provider wait-in-line is per connection (PJ2).
+    connectionOf: (modelKey) => aiModelSettings.chatModels.connectionOf?.(modelKey || undefined),
+    // A runner note belongs to the job's own thread.
+    postNote: (jobId, text) => {
+      db.prepare('INSERT INTO chat_messages (id, role, content, job_id) VALUES (?, ?, ?, ?)')
+        .run(`asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, 'assistant', text, jobId);
+      const sessionId = chatJobs.get(jobId)?.sessionId;
       if (sessionId) conversationManager.appendAssistant(sessionId, text);
     },
+    // A job stopped at its turn limit is a job update for the main chat (job-review.ts, PARALLEL_JOBS_PLAN.md §12 R2).
+    onPaused: () => jobReviewsRef?.nudge(),
     filesDir: path.dirname(etlResultsDir),
   });
   chatContinuations.bindRunner(continuationRunner);
@@ -868,7 +956,43 @@ async function main() {
     // A stopped or starting a2-analytics is started by the call itself.
     etlAvailable: async () => etlChatLaneCallable(await mcpManager.getServer('a2-analytics').catch(() => null)),
     onRunsFinished: (jobId) => continuationRunner.request(jobId),
+    // A job waiting for a refresh of one of its dashboards wakes when the run ends (§12 R1): a local read of the run table.
+    readDashboardRun: (runId) => analyticsService.getRun(runId),
+    // A job's general waits (docs/maps/job-waits.md), checked every tick whatever the ETL connection says.
+    checkJobWait: (wait) => jobWaitChecker.check(wait),
+    // A job that expired idle says so in the main chat, once (PARALLEL_JOBS_PLAN.md §11 R1).
+    onJobsExpired: () => { chatContinuations.jobDesk()?.deliverReports(); },
   });
+  // The main chat decides on job updates (job-review.ts, PARALLEL_JOBS_PLAN.md §12; owner decision 2026-11-09): BotBoy's turn
+  // limit, a stuck job, a question, a long wait each start ONE main-chat turn of BotBoy's own, on the model and thinking of the
+  // owner's latest main-chat turn, through this server's own chat route with the continuation secret. It starts after final-ready.
+  const MAIN_CHAT_MODEL_KEY = 'chat.main_turn_model.v1';
+  let mainChatModelSeen = '';
+  const mainChatModel = {
+    record(input: { key?: string; thinking: ChatJobThinking }) {
+      const value = JSON.stringify({ key: input.key ?? null, thinking: input.thinking });
+      if (value === mainChatModelSeen) return;
+      mainChatModelSeen = value;
+      setSetting(db, MAIN_CHAT_MODEL_KEY, { key: input.key ?? null, thinking: input.thinking });
+    },
+    read(): { key?: string; thinking: ChatJobThinking } {
+      const stored = getSetting<{ key?: string | null; thinking?: string }>(db, MAIN_CHAT_MODEL_KEY);
+      const thinking = stored?.thinking === 'low' || stored?.thinking === 'high' || stored?.thinking === 'max' ? stored.thinking : 'off';
+      return { ...(typeof stored?.key === 'string' && stored.key ? { key: stored.key } : {}), thinking };
+    },
+  };
+  const jobReviews = createJobReviewRunner({
+    jobs: chatJobs,
+    url: `http://${HOST === '::1' ? '[::1]' : '127.0.0.1'}:${PORT}/api/chat/messages`,
+    secret: chatContinuations.secret,
+    mainOwnerTurnActive: () => chatContinuations.isMainTurnActive(),
+    jobRunning: (jobId) => continuationRunner.isRunning(jobId) || chatContinuations.isOwnerTurnActive(jobId),
+    mainModel: () => mainChatModel.read(),
+    threadReplies: (jobId, limit) => (db.prepare(`SELECT content FROM chat_messages WHERE job_id = ? AND role = 'assistant'
+      ORDER BY rowid DESC LIMIT ?`).all(jobId, Math.max(1, Math.min(10, limit))) as Array<{ content: string }>).map(row => row.content).reverse(),
+    desk: () => chatContinuations.jobDesk(),
+  });
+  jobReviewsRef = jobReviews;
 
   // Backward-compat: llmClient implements sendPrompt() for components not yet migrated
   const acpClient = llmClient; // alias — same interface
@@ -948,11 +1072,18 @@ async function main() {
       '',
       `_Automatic escalation from run ${event.runId} (${event.trigger}, ${event.lane} lane)._`,
     ].join('\n');
+    // The panel draws it as one compact notice (chat-notices.ts); the full diagnosis is its detail, lesson cards included.
+    const notice = {
+      key: `dashboard:${event.dashboardId}`, topic: 'dashboard-refresh', state: 'open', severity: 'error',
+      title: 'Dashboard refresh failed', labels: [event.dashboardTitle, `${event.failures.length} widget${event.failures.length === 1 ? '' : 's'}`],
+      detail: [findingsText, ...(markerBlock.length ? ['', ...markerBlock] : []), '', `_Run ${event.runId} (${event.trigger}, ${event.lane} lane)._`].join('\n'),
+      detailMarkdown: true,
+    };
     // The agent-message route admits only BotBoy itself (its in-memory secret).
     const response = await fetch(`http://localhost:${PORT}/api/chat/agent-message`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', [CONTINUATION_HEADER]: chatContinuations.secret },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, notice }),
     });
     if (!response.ok) throw new Error(`agent-message post failed: HTTP ${response.status}`);
   };
@@ -978,8 +1109,9 @@ async function main() {
     slackTokenConfigured,
     slackConnectedVia: () => (slackTokenConfigured() ? slackCredentials.read().connectedVia ?? 'token' : null),
   });
+  // The sentinel's notices are deterministic (MIDWAY_NOTICES_PLAN.md): no model composes them.
   const midwaySentinel = createMidwaySentinel(
-    { db, mcpManager, chatTerminal, agent, captureHealth },
+    { db, mcpManager, chatTerminal, captureHealth },
     // Cookie-path override for testing the flow without touching the real jar.
     {
       ...(process.env.PPT_MIDWAY_COOKIE_PATH ? { cookiePath: process.env.PPT_MIDWAY_COOKIE_PATH } : {}),
@@ -1623,6 +1755,7 @@ async function main() {
       stop('folder-imports', () => folderImports.stop());
       stop('etl-run-watcher', () => etlRunWatcher.stop());
       stop('job-notifier', () => jobNotifier.stop());
+      stop('job-reviews', () => jobReviews.stop());
       stop('chat-continuations', () => continuationRunner.stop());
       stop('main-thread-watchdog', () => mainThreadWatchdog.stop());
       if (failures.length) throw new Error(`Quiesce failures: ${failures.join('; ')}`);
@@ -1795,9 +1928,16 @@ async function main() {
     storageUsage,
     captureHealth,
     chatJobs,
+    // Running queries in the chat panel: the owner sees and stops any of BotBoy's SQL queries and ETL runs.
+    queryControl,
     // WhatsApp updates for a job: job_notify is offered on turns that ask for it, and a Stop or a closing report wakes the notifier.
     jobNotifyEnabled: true,
     jobNotifier,
+    // The main chat decides on job updates (§12): nudged when a job pauses or a turn ends; it records the main chat's model.
+    jobReviews,
+    mainChatModel,
+    // A notice's Re-authenticate button opens the sentinel's mwinit terminal (MIDWAY_NOTICES_PLAN.md).
+    midwaySentinel,
     chatContinuations,
     knowledgeLibrary,
     knowledgeWriter,
@@ -1860,6 +2000,11 @@ async function main() {
   sharePointSync.start();
   console.log('✅ SharePoint sync scheduled (discovery every 30 min, drain every 20 s)');
 
+  // After the sentinel restarts a connection, or the owner signs in again, that connection's capture runs at once instead
+  // of at its next scheduled run (SharePoint's discovery is every 30 min; Slack backs off up to 5 min) (midway-sentinel.md).
+  midwaySentinel.registerRecheck(SLACK_MCP_PROFILE_ID, () => slackMonitor.checkNow());
+  midwaySentinel.registerRecheck(GRASP_PROFILE_ID, () => graspSync.runNow());
+  midwaySentinel.registerRecheck(SHAREPOINT_MCP_PROFILE_ID, () => sharePointSync.runNow());
   if (process.env.PPT_MIDWAY_SENTINEL !== '0') {
     midwaySentinel.start();
     console.log('✅ Midway sentinel active (auto re-auth flow for session-backed MCPs)');
@@ -1886,13 +2031,18 @@ async function main() {
   // ETL watches resume from SQLite; a finished run continues its job in chat.
   continuationRunner.start();
   knowledgeJobWaker.wakeIfDecided();
+  // A report that never reached the main chat (a restart right after a job finished) lands now, and every job update not yet
+  // decided (one a restart interrupted included) goes to the main chat (PARALLEL_JOBS_PLAN.md §11, §12).
+  chatContinuations.jobDesk()?.deliverReports();
+  jobReviews.start();
   whatsAppChat.start();
   jobNotifier.start();
   // Keep the Mac awake while a turn runs or a job is active (keep-awake.ts).
-  createKeepAwake({ busy: () => chatContinuations.isTurnActive() || Boolean(chatJobs.activeJob()) }).start();
+  createKeepAwake({ busy: () => chatContinuations.isTurnActive() || chatJobs.activeJobs().length > 0 }).start();
   etlRunWatcher.start();
-  const activeJob = chatJobs.activeJob();
-  console.log(`✅ ETL run watcher active (every 30 s${activeJob ? `; job ${activeJob.id} has ${chatJobs.watchesForJob(activeJob.id).filter(watch => watch.status === 'pending').length} run(s) pending` : ''})`);
+  const activeJobs = chatJobs.activeJobs();
+  const pendingRuns = activeJobs.reduce((sum, job) => sum + chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending').length, 0);
+  console.log(`✅ ETL run watcher active (every 30 s${activeJobs.length ? `; ${activeJobs.length} job(s) active (${activeJobs.map(job => `#${job.seq}`).join(', ')}), ${pendingRuns} run(s) pending` : ''})`);
   console.log(`🔍 Tracking your activity. Dashboard: http://${HOST}:${PORT}`);
 
   // Every signal enters the same state machine. The first closes admission

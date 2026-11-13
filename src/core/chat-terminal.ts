@@ -68,6 +68,11 @@ export interface ChatTerminalService {
   get(sessionId: string): McpTerminalSessionSnapshot | null;
   /** Plain-text tail of the session output for the model (ANSI stripped). */
   readOutput(lastChars?: number): { session: McpTerminalSessionSnapshot; output: string } | null;
+  /**
+   * Plain-text tail of one session's output (ANSI stripped), for a job that waits for it (job-waits.ts). It does not count as
+   * the turn having seen the end (no `endObserved`): the wait reads it in the background. Null when BotBoy no longer has it.
+   */
+  readSessionOutput(sessionId: string, lastChars?: number): string | null;
   writeInput(sessionId: string, data: string): void;
   stop(sessionId: string): void;
   subscribe(
@@ -237,6 +242,14 @@ export function createChatTerminalService(): ChatTerminalService {
       const raw = outputs.get(latestSessionId) ?? '';
       const plain = stripAnsi(raw);
       return { session, output: plain.slice(-cap) };
+    },
+
+    readSessionOutput(sessionId, lastChars = MODEL_OUTPUT_CAP) {
+      if (!engine.get(sessionId)) return null;
+      const raw = outputs.get(sessionId);
+      if (raw === undefined) return null;
+      const cap = Math.min(Math.max(lastChars, 200), 20_000);
+      return stripAnsi(raw).slice(-cap);
     },
 
     writeInput(sessionId, data) {

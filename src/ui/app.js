@@ -238,7 +238,12 @@ function initChatModelControl() {
   if (!select) return;
   select.addEventListener('change', () => {
     const value = chatModelChoices.includes(select.value) ? select.value : chatDefaultModelKey;
-    try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
+    // In a job's view the picker is that job's model (PARALLEL_JOBS_PLAN.md PJ5): it changes the job, not the chat's choice.
+    if (window.BotBoyJobs?.currentJobId()) {
+      void window.BotBoyJobs.setModel(value);
+    } else {
+      try { localStorage.setItem(CHAT_MODEL_KEY, value); } catch {}
+    }
     updateChatModelTitle(select);
     updateChatEffortTitle();
   });
@@ -535,9 +540,11 @@ function createChatStreamBubble(chatEl, hooks = {}) {
   msgEl.className = 'chat-msg assistant streaming-live';
   chatEl.appendChild(msgEl);
 
+  // What scrolls: the transcript itself, or a job view's scroller (a job's thread sits under the job's header there).
+  const scrollEl = hooks.scrollEl || chatEl;
   function autoScroll() {
-    const isNearBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 100;
-    if (isNearBottom) chatEl.scrollTop = chatEl.scrollHeight;
+    const isNearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 100;
+    if (isNearBottom) scrollEl.scrollTop = scrollEl.scrollHeight;
   }
 
   // Render segments to DOM — pure function from data to HTML
@@ -576,11 +583,15 @@ function createChatStreamBubble(chatEl, hooks = {}) {
         </div>`;
       }
       if (seg.type === 'text') {
+        // A failure, stop or wait reads as the same compact notice the transcript shows (chat-notices-ui.js).
+        if (seg.notice && window.BotBoyNotices) return window.BotBoyNotices.liveHtml(seg.notice, msgEl.dataset.msgId);
         return `<div class="content-block">${formatContent(seg.content)}</div>`;
       }
       return '';
     }).join('');
   }
+  /** The compact notice a failure or final text is, if any. */
+  const noticeFor = (text, extra) => window.BotBoyNotices?.fromLiveError(text, extra) || null;
 
   function formatContent(raw) {
     return formatMarkdownContent(raw);
@@ -597,6 +608,8 @@ function createChatStreamBubble(chatEl, hooks = {}) {
   /** Applies one SSE event to the bubble. */
   function handle(event) {
     if (!event || typeof event !== 'object') return;
+    // Whoever owns the bubble may follow its steps too (a job's pill previews its owner reply, chat-jobs-ui.js › ownerEvent).
+    if (typeof hooks.onEvent === 'function') hooks.onEvent(event);
     if (event.type === 'thinking') {
       let seg = lastSeg('thinking');
       if (!seg || seg.complete) {
@@ -705,8 +718,12 @@ function createChatStreamBubble(chatEl, hooks = {}) {
           segments[finalTextIndex]._isStatus = false;
         } else {
           segments.push({ type: 'text', content: authoritativeContent });
+          finalTextIndex = segments.length - 1;
         }
+        // The route's fixed failure, stop and wait texts (chat.ts) are notices, never prose.
+        segments[finalTextIndex].notice = window.BotBoyNotices?.noticeOf({ role: 'assistant', content: authoritativeContent }) || null;
       }
+      if (event.message && event.message.id) msgEl.dataset.msgId = event.message.id;
       renderSegments();
       hydrateChatCards(msgEl); // expand any [[lesson:…]] / [[gmail-draft:…]] markers the finished turn produced
       // Mark the bubble as FROZEN so the 5s chat poll doesn't wipe the rich segment UI
@@ -738,7 +755,8 @@ function createChatStreamBubble(chatEl, hooks = {}) {
       renderSegments();
 
     } else if (event.type === 'error') {
-      segments.push({ type: 'text', content: `❌ Error: ${event.error}` });
+      const text = `❌ Error: ${event.error}`;
+      segments.push({ type: 'text', content: text, notice: noticeFor(text) });
       renderSegments();
       freeze();
     }
@@ -766,9 +784,9 @@ function createChatStreamBubble(chatEl, hooks = {}) {
     }
   }
 
-  /** Shows a failure line and freezes the bubble. */
-  function fail(text) {
-    segments.push({ type: 'text', content: text });
+  /** Shows a failure as a compact notice and freezes the bubble. `refusal` is the route's structured {error, nextAction}. */
+  function fail(text, refusal) {
+    segments.push({ type: 'text', content: text, notice: noticeFor(text, refusal) });
     renderSegments();
     freeze();
   }
@@ -783,7 +801,7 @@ function createChatStreamBubble(chatEl, hooks = {}) {
   function finishIfLive(text) {
     if (!isLive()) return;
     if (!segments.length || !segments.some(s => s.type === 'text' && s.content.startsWith('❌'))) {
-      segments.push({ type: 'text', content: text });
+      segments.push({ type: 'text', content: text, notice: noticeFor(text) });
       renderSegments();
     }
     freeze();
@@ -805,7 +823,13 @@ function chatToolResultEffects(event) {
 }
 
 async function sendChat(msg) {
-  const chatEl = document.getElementById('chat-messages');
+  // The composer talks to the thread on screen: the main chat, or the open job's own thread (PARALLEL_JOBS_PLAN.md P2).
+  const jobId = window.BotBoyJobs?.currentJobId() || null;
+  const threadKey = jobId || 'main';
+  const chatEl = (jobId && window.BotBoyJobs.threadElement()) || document.getElementById('chat-messages');
+  // In a job's sheet the thread has its own scroller, under the job's progress.
+  const scrollEl = (jobId && window.BotBoyJobs.scrollElement?.()) || chatEl;
+  if (jobId) chatEl.querySelector('.jobs-empty')?.remove();
 
   // Consume pending image attachments for THIS turn (already uploaded; the
   // body carries their ids). Strip clears immediately — they now belong to
@@ -818,9 +842,9 @@ async function sendChat(msg) {
   // binds that ID to exact message/scope/intent and rejects any collision.
   const requestId = acquireChatRequestId({ replayKey });
 
-  // The owner's message preempts an automatic continuation on the server;
-  // its bubble closes here so the poll can show the persisted note.
-  closeChatLiveBubble();
+  // A message in a job's thread preempts that job's automatic turn on the server; its live bubble goes here, and the next read
+  // shows the persisted note. A main chat message never stops a job.
+  if (jobId) window.BotBoyJobs.dropLive(jobId);
 
   // Append user bubble directly to DOM (no full rebuild — that would wipe frozen assistant bubbles from prior turns)
   const userBubble = document.createElement('div');
@@ -831,9 +855,12 @@ async function sendChat(msg) {
     attachments: turnAttachments.map(a => ({ id: a.id, url: `/api/chat/attachments/${a.id}` })),
   });
   chatEl.appendChild(userBubble);
-  chatEl.scrollTop = chatEl.scrollHeight;
+  scrollEl.scrollTop = scrollEl.scrollHeight;
 
   const bubble = createChatStreamBubble(chatEl, {
+    scrollEl,
+    // A reply in a job's thread also moves that job's pill in the dock: its thinking, tools and words.
+    onEvent: jobId ? (event) => window.BotBoyJobs?.ownerEvent?.(jobId, event) : undefined,
     onToolResult(event) {
       if (event.name === 'create_analytics_dashboard' && /"ok"\s*:\s*true/.test(event.preview || '')) {
         clearChatRequestContext();
@@ -844,18 +871,22 @@ async function sendChat(msg) {
       // Only the authoritative terminal event retires the pending ID.
       // A dropped stream keeps it so an exact manual resend replays.
       completeChatRequestId(requestId);
-      state.chatMessages.push(event.message);
+      if (jobId) window.BotBoyJobs.noteMessage(event.message);
+      else state.chatMessages.push(event.message);
+      // A "#N …" message from the main chat is answered by that job: its reply here is a job row too.
+      const routed = !jobId && /^#(\d+)\b/.exec(msg.trim());
+      if (routed && window.BotBoyJobs?.hasNumber?.(routed[1])) bubble.msgEl.classList.add('job-row');
       // Link the reply's project mentions now rather than on the next poll.
       linkifyRenderedProjectMentions();
     },
   });
-  setChatStreaming(true);
+  setChatStreaming(true, threadKey, requestId);
 
   try {
     const resp = await fetch(`${API}/chat/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg, stream: true, requestId, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...requestContext }),
+      body: JSON.stringify({ message: msg, stream: true, requestId, thinking: chatThinkingLevel(), model: chatModelChoice(), ...(turnAttachments.length ? { attachments: turnAttachments.map(a => a.id) } : {}), ...requestContext, ...(jobId ? { jobId } : {}) }),
     });
 
     if (!resp.ok) {
@@ -865,6 +896,7 @@ async function sendChat(msg) {
       // Server returned non-2xx (e.g. 400). Read error body and surface it on the bubble.
       let errText = `HTTP ${resp.status}`;
       let friendly = '';
+      let refusal = null;
       try {
         const raw = await resp.text();
         errText = raw.slice(0, 500) || errText;
@@ -872,11 +904,12 @@ async function sendChat(msg) {
         const payload = JSON.parse(raw);
         if (payload && typeof payload.error === 'string' && payload.error.trim()) {
           friendly = `⚠️ ${payload.error.trim()}${typeof payload.nextAction === 'string' && payload.nextAction.trim() ? ` ${payload.nextAction.trim()}` : ''}`;
+          refusal = { error: payload.error, nextAction: payload.nextAction };
         }
       } catch {}
       console.error('[sendChat] HTTP error response:', resp.status, errText);
       if (resp.status === 409) void refreshAiModelReadiness();
-      bubble.fail(friendly || `❌ Error ${resp.status}: ${errText}`);
+      bubble.fail(friendly || `❌ Error ${resp.status}: ${errText}`, refusal);
       return;
     }
 
@@ -890,59 +923,20 @@ async function sendChat(msg) {
     console.error('[sendChat] fetch/stream exception:', e);
     bubble.fail(`❌ Error: ${e.message || 'Request failed'}`);
   } finally {
-    setChatStreaming(false);
-    void refreshChatJobStrip();
+    setChatStreaming(false, threadKey, requestId);
+    if (jobId) window.BotBoyJobs?.ownerTurnEnded?.(jobId);
+    refreshChatJobs();
   }
 }
 
-// ── Automatic continuation turns, live (ANALYTICS_AUTONOMY_PLAN.md D2) ──
-// When a watched ETL run finishes, BotBoy continues the job in chat on its
-// own. GET /chat/live replays that turn's events so far, then streams the
-// rest; the bubble renders exactly like an owner turn's.
+// ── Jobs, live (PARALLEL_JOBS_PLAN.md P2) ──
+// Every job runs in its own thread; GET /chat/live streams their automatic turns, and chat-jobs-ui.js draws each one in its
+// own job's sheet (never in the main chat) and previews it on the job's pill. The dock, the drawer, the job sheets and the job
+// cards live there too.
 let chatLiveSource = null;
-let chatLiveTurn = null; // { turnKey, bubble, startedAt }
-
-function closeChatLiveBubble() {
-  if (!chatLiveTurn) return;
-  // A finished bubble stays; an unfinished one gives way to the persisted reply.
-  if (chatLiveTurn.bubble.isLive()) chatLiveTurn.bubble.msgEl.remove();
-  chatLiveTurn = null;
-}
 
 function handleChatLiveMessage(payload) {
-  const chatEl = document.getElementById('chat-messages');
-  if (!chatEl || !payload || typeof payload !== 'object') return;
-  if (payload.kind === 'begin') {
-    const info = payload.info || {};
-    if (typeof info.turnKey !== 'string' || !info.turnKey) return;
-    // A replay (reconnect) of the turn on screen starts its bubble over.
-    if (chatLiveTurn && chatLiveTurn.turnKey === info.turnKey && chatLiveTurn.bubble.isLive()) {
-      chatLiveTurn.bubble.msgEl.remove();
-      chatLiveTurn = null;
-    } else if (chatLiveTurn && chatLiveTurn.turnKey === info.turnKey) {
-      return; // already finished on screen
-    } else {
-      closeChatLiveBubble();
-    }
-    const bubble = createChatStreamBubble(chatEl, {
-      onToolResult: chatToolResultEffects,
-      onDone(event) {
-        if (event.message) state.chatMessages.push(event.message);
-        linkifyRenderedProjectMentions();
-        void refreshChatJobStrip();
-      },
-    });
-    bubble.msgEl.classList.add('continuation');
-    if (typeof info.note === 'string' && info.note) bubble.handle({ type: 'status', text: info.note });
-    chatLiveTurn = { turnKey: info.turnKey, bubble, startedAt: Date.now() };
-    void refreshChatJobStrip();
-  } else if (payload.kind === 'event') {
-    if (!chatLiveTurn || chatLiveTurn.turnKey !== payload.turnKey) return;
-    chatLiveTurn.bubble.handle(payload.event);
-  } else if (payload.kind === 'end') {
-    if (chatLiveTurn && chatLiveTurn.turnKey === payload.turnKey) closeChatLiveBubble();
-    void refreshChatJobStrip();
-  }
+  window.BotBoyJobs?.live(payload);
 }
 
 function connectChatLive() {
@@ -955,112 +949,30 @@ function connectChatLive() {
   };
 }
 
-// ── Owner job strip (chat-jobs.ts): what BotBoy works on, and Stop ──
-function chatJobEsc(value) {
-  return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+/** Something about the jobs may have changed (a reply ended, a card appeared): read them again soon. */
+function refreshChatJobs() {
+  window.BotBoyJobs?.scheduleRefresh(true);
 }
 
-// Locally dismissed "Done" lines (job ids); a new job shows again.
-const chatJobDismissed = new Set();
-
-function chatJobShortGoal(job) {
-  const goal = String(job.goal || '').replace(/\s+/g, ' ').trim();
-  return { goal, shortGoal: goal.length > 120 ? `${goal.slice(0, 117)}…` : goal };
-}
-
-// The strip's border tells the state (dashboard.css, docs/maps/job-continuations.md): `running` = a faint light travels around
-// it, `paused` = all yellow, `done` = all green; a job the owner stopped, or that expired, is `ended` and stays neutral. Each
-// class is set by an explicit boolean, which changes nothing when it is already right, so the 5 s re-render (it rewrites only
-// the strip's children) never restarts a running light.
-function setChatJobStripState(strip, on) {
-  for (const name of ['continuing', 'running', 'paused', 'done', 'ended']) strip.classList.toggle(name, on[name] === true);
-}
-
-function renderChatJobStrip(payload) {
-  const strip = document.getElementById('chat-job-strip');
-  if (!strip) return;
-  const job = payload && payload.job;
-  const recent = payload && payload.recent;
-  if (!job || job.status !== 'active' || !/^cj_[a-f0-9]{24}$/.test(String(job.id || ''))) {
-    // A job that just ended says how it ended until dismissed.
-    if (recent && /^cj_[a-f0-9]{24}$/.test(String(recent.id || '')) && !chatJobDismissed.has(recent.id)) {
-      const { goal, shortGoal } = chatJobShortGoal(recent);
-      const label = recent.status === 'done' ? 'Done' : recent.status === 'stopped' ? 'Stopped' : recent.status === 'expired' ? 'Ended (idle)' : 'Ended';
-      const detail = [goal, recent.endReason || ''].filter(Boolean).join('\n');
-      strip.hidden = false;
-      // Only a job that FINISHED is green; one the owner stopped, or that expired, did not complete and stays neutral.
-      setChatJobStripState(strip, { ended: true, done: recent.status === 'done' });
-      strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${chatJobEsc(label)}:</strong> ${chatJobEsc(shortGoal)}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(recent.status === 'done' ? 'completed' : 'not running')}</span><button type="button" class="button small" data-chat-job-dismiss="${chatJobEsc(recent.id)}" aria-label="Dismiss" title="Hide this line">×</button>`;
-      return;
-    }
-    setChatJobStripState(strip, {});
-    strip.hidden = true;
-    strip.innerHTML = '';
-    return;
+/**
+ * The open view changed (a job's view, or the main chat again): the composer follows. In a job's view the model picker shows
+ * that job's own model (PJ5), the box says who it talks to, and the Send/Stop button shows that thread's own state.
+ */
+function onJobViewChange(job) {
+  const select = document.getElementById('chat-model');
+  if (select) {
+    const key = job ? (job.model?.key || chatDefaultModelKey) : chatModelChoice();
+    if ([...select.options].some(option => option.value === key)) select.value = key;
+    updateChatModelTitle(select);
+    if (job) select.title = `The model job #${job.number} runs on. Changing it here changes the job from its next step.`;
+    select.disabled = Boolean(job) && job.status !== 'active';
   }
-  const waiting = Array.isArray(job.waitingRuns) ? job.waitingRuns : [];
-  const { goal, shortGoal } = chatJobShortGoal(job);
-  // Older servers send no phase: derive it the old way.
-  const phase = job.phase || (job.continuing ? 'working' : waiting.length ? 'waiting' : 'working');
-  const paused = phase === 'paused';
-  // The state stays visible at any panel width; the goal truncates.
-  const progress = job.continuing
-    ? 'continuing now'
-    : phase === 'continuing'
-      ? 'continuing shortly'
-      : phase === 'waiting'
-        ? `waiting for ${waiting.length} ETL run${waiting.length === 1 ? '' : 's'}`
-        : paused ? 'paused, needs you' : 'working';
-  const detail = [
-    goal,
-    ...(paused && job.pauseNote ? [job.pauseNote] : []),
-    ...(job.notifyWhatsApp === true ? ['BotBoy messages you on WhatsApp when this job needs you, finishes, or is stopped.'] : []),
-    ...waiting.map(run => `Run ${run.runId}${run.purpose ? ` (${run.purpose})` : ''}: ${run.remoteStatus || 'submitted'}`),
-    ...(waiting.length && !job.continuing ? [`BotBoy continues on its own when ${waiting.length === 1 ? 'it finishes' : 'they finish'}.`] : []),
-  ].join('\n');
-  strip.hidden = false;
-  setChatJobStripState(strip, { continuing: Boolean(job.continuing), running: !paused, paused });
-  const lead = paused ? 'Paused' : 'Working on';
-  const question = paused && job.pauseNote ? `<span class="chat-job-note">${chatJobEsc(job.pauseNote)}</span>` : '';
-  // "· WhatsApp on" beside the state: the owner can see that BotBoy will message them (job-notify.md).
-  const stateText = job.notifyWhatsApp === true ? `${progress} · WhatsApp on` : progress;
-  strip.innerHTML = `<span class="chat-job-dot" aria-hidden="true"></span><span class="chat-job-text" title="${chatJobEsc(detail)}"><strong>${lead}:</strong> ${chatJobEsc(shortGoal)}${question}</span><span class="chat-job-state" title="${chatJobEsc(detail)}">${chatJobEsc(stateText)}</span><button type="button" class="button small" data-chat-job-stop="${chatJobEsc(job.id)}" title="End this job: BotBoy stops continuing it on its own">${paused ? 'End job' : 'Stop'}</button>`;
+  const input = document.getElementById('chatInput');
+  if (input) input.placeholder = job ? `Message #${job.number} only…` : 'Ask about your workspace…';
+  const prompts = document.querySelector('#chat-panel .assistant-prompts');
+  if (prompts) prompts.hidden = Boolean(job);
+  renderComposerStreaming();
 }
-
-async function refreshChatJobStrip() {
-  let payload;
-  try { payload = await api('/chat/jobs/active'); } catch { return; }
-  renderChatJobStrip(payload);
-  // A live bubble whose turn ended while this tab was disconnected gives way
-  // to the persisted reply (the poll pauses while a bubble is live).
-  if (chatLiveTurn && chatLiveTurn.bubble.isLive() && !(payload && payload.job && payload.job.continuing)
-    && Date.now() - chatLiveTurn.startedAt > 15_000) {
-    closeChatLiveBubble();
-  }
-}
-
-document.addEventListener('click', (event) => {
-  const dismiss = event.target && event.target.closest ? event.target.closest('[data-chat-job-dismiss]') : null;
-  if (!dismiss) return;
-  chatJobDismissed.add(dismiss.getAttribute('data-chat-job-dismiss') || '');
-  const strip = document.getElementById('chat-job-strip');
-  if (strip) { strip.hidden = true; strip.innerHTML = ''; }
-});
-
-document.addEventListener('click', async (event) => {
-  const button = event.target && event.target.closest ? event.target.closest('[data-chat-job-stop]') : null;
-  if (!button) return;
-  const jobId = button.getAttribute('data-chat-job-stop') || '';
-  if (!/^cj_[a-f0-9]{24}$/.test(jobId)) return;
-  button.disabled = true;
-  button.textContent = 'Stopping…';
-  try {
-    await api(`/chat/jobs/${jobId}/stop`, { method: 'POST' });
-  } catch (error) {
-    console.warn('[chatJob] stop failed:', error);
-  }
-  await refreshChatJobStrip();
-});
 
 // ── Stop button for the in-flight chat turn ──
 // Cooperative: the server lets the current model/tool step finish, then the
@@ -1068,11 +980,23 @@ document.addEventListener('click', async (event) => {
 // it SWAPS INTO the send button's slot (identical base styling, stop glyph)
 // so the composer keeps one action button — send when idle, stop while a
 // turn streams. The button disables itself after the click so a slow step
-// cannot collect repeats.
-function setChatStreaming(active) {
+// cannot collect repeats. Each thread streams on its own (the main chat, and
+// every job's view), so the button shows the state of the thread on screen,
+// and Stop names that thread's reply.
+const chatStreams = new Map(); // thread ('main' or a job id) → the request id of its streaming reply
+function currentChatThread() {
+  return window.BotBoyJobs?.currentJobId() || 'main';
+}
+function setChatStreaming(active, threadKey = 'main', requestId = '') {
+  if (active) chatStreams.set(threadKey, requestId);
+  else if (!requestId || chatStreams.get(threadKey) === requestId) chatStreams.delete(threadKey);
+  renderComposerStreaming();
+}
+function renderComposerStreaming() {
   const stopBtn = document.getElementById('chat-stop');
   const sendBtn = document.getElementById('chat-send');
   if (!stopBtn || !sendBtn) return;
+  const active = chatStreams.has(currentChatThread());
   stopBtn.hidden = !active;
   sendBtn.hidden = active;
   stopBtn.disabled = false;
@@ -1082,8 +1006,13 @@ function setChatStreaming(active) {
 window.stopChatTurn = async () => {
   const btn = document.getElementById('chat-stop');
   if (btn) { btn.disabled = true; btn.classList.add('stopping'); btn.title = 'Stopping — finishing the current step…'; }
+  const requestId = chatStreams.get(currentChatThread());
   try {
-    await fetch(`${API}/chat/stop`, { method: 'POST' });
+    await fetch(`${API}/chat/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestId ? { requestId } : {}),
+    });
   } catch (e) {
     console.warn('[stopChatTurn] stop request failed:', e);
     if (btn) { btn.disabled = false; btn.classList.remove('stopping'); }
@@ -1862,6 +1791,17 @@ function(mode) {
 
 // ── Render: Chat (independent) ──
 
+/**
+ * A main-chat row about a job (its report, a question or hand-back, a job that ended idle, a job's reply to a #N message) wears
+ * the running pill's accent, so it stands out from ordinary chat (owner request 2026-11-13). The main chat's own replies (one that
+ * started a job included), the owner's rows and a row that is only a card stay as they are.
+ */
+const JOB_ROW_RE = /\[\[job:cj_[a-f0-9]{24}:(?:report|update|ended)\]\]/;
+function chatRowClass(m) {
+  const content = String(m?.content ?? '');
+  const jobRow = m?.role === 'assistant' && !JOB_CARD_ONLY_RE.test(content) && (JOB_ROW_RE.test(content) || Boolean(m.refJobId));
+  return `chat-msg ${m.role}${jobRow ? ' job-row' : ''}`;
+}
 function renderChat() {
   const el = document.getElementById('chat-messages');
   if (!el) return;
@@ -1880,9 +1820,12 @@ function renderChat() {
     // messages that are already visible in DOM (either as frozen bubbles or as user bubbles
     // that were appended directly during sendChat without a DB id).
     const sig = (role, content) => `${role}:${(content || '').slice(0, 200)}`;
+    const notices = window.BotBoyNotices;
     const existingIds = new Set(
       Array.from(el.querySelectorAll('.chat-msg[data-msg-id]')).map(b => b.dataset.msgId)
     );
+    // A notice line can hold several rows (consecutive notices about one thing fold together).
+    for (const id of notices?.drawnIds(el) ?? []) existingIds.add(id);
     const existingSigs = new Set(
       Array.from(el.querySelectorAll('.chat-msg')).map(b => {
         // Use textContent as a proxy for content comparison — rough but safe for dedup
@@ -1897,8 +1840,10 @@ function renderChat() {
     });
     if (newMessages.length === 0) { hydrateChatCards(el); return; }
     for (const m of newMessages) {
+      // A notice joins the notice line above it when it is about the same thing, or starts its own line.
+      if (notices?.appendTo(el, m)) continue;
       const bubble = document.createElement('div');
-      bubble.className = `chat-msg ${m.role}`;
+      bubble.className = chatRowClass(m);
       if (m.id) bubble.dataset.msgId = m.id;
       bubble.innerHTML = renderChatMsgInner(m);
       el.appendChild(bubble);
@@ -1910,10 +1855,14 @@ function renderChat() {
   }
 
   // No frozen bubbles — safe to do the full rebuild (cold load / refresh case)
-  el.innerHTML = state.chatMessages.map(m => {
+  const plainRow = (m) => {
     const idAttr = m.id ? ` data-msg-id="${m.id}"` : '';
-    return `<div class="chat-msg ${m.role}"${idAttr}>${renderChatMsgInner(m)}</div>`;
-  }).join('');
+    return `<div class="${chatRowClass(m)}"${idAttr}>${renderChatMsgInner(m)}</div>`;
+  };
+  // BotBoy's own notices: consecutive ones about one thing fold into one compact line (chat-notices-ui.js).
+  el.innerHTML = window.BotBoyNotices
+    ? window.BotBoyNotices.transcriptHtml(state.chatMessages, plainRow)
+    : state.chatMessages.map(plainRow).join('');
   hydrateChatCards(el);
   // Cold load / refresh: always scroll to bottom — newest messages should be visible.
   // Use rAF so DOM layout completes (image dims, thinking block rendering) before we measure scrollHeight.
@@ -1945,6 +1894,16 @@ const KNOWLEDGE_MARKER_RE = /\[\[knowledge:(kc_[a-f0-9]{12})\]\]/g;
 // ui_theme_propose replies carry [[theme:<th_id>]]; the chat router appends any marker the model left out
 // (docs/maps/ui-themes.md). The card is the theme proposal's Preview / Keep / Discard card.
 const THEME_MARKER_RE = /\[\[theme:(th_[0-9a-f]{12})\]\]/g;
+// Job cards (PARALLEL_JOBS_PLAN.md P2): the chat router writes [[job:<cj_id>:started|stuck|done]]; chat-jobs-ui.js draws each
+// from the job's live state.
+const JOB_CARD_MARKER_RE = /\[\[job:(cj_[a-f0-9]{24}):(started|stuck|done|report|update|ended)\]\]/g;
+const JOB_CARD_ONLY_RE = /^\s*(?:\[\[job:cj_[a-f0-9]{24}:(?:started|stuck|done|report|update|ended)\]\]\s*)+$/;
+// A job's report, or a quiet line about a job (the main chat's decision on a job update, a job that ended idle), in the main
+// chat (PARALLEL_JOBS_PLAN.md §11, §12): the words, then the job's footer card where the trailing marker is. A report longer
+// than this folds, with "Show all".
+const JOB_UPDATE_RE = /\n*\[\[job:(cj_[a-f0-9]{24}):(report|update|ended)\]\]\s*$/;
+const JOB_REPORT_FOLD_CHARS = 900;
+const JOB_REPORT_FOLD_LINES = 14;
 
 /**
  * Expands every card marker in the chat bubbles under `root`, then fills the
@@ -1964,13 +1923,18 @@ function hydrateChatCards(root) {
     MCP_SERVER_MARKER_RE.lastIndex = 0;
     KNOWLEDGE_MARKER_RE.lastIndex = 0;
     THEME_MARKER_RE.lastIndex = 0;
-    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html) && !KNOWLEDGE_MARKER_RE.test(html) && !THEME_MARKER_RE.test(html)) continue;
+    JOB_CARD_MARKER_RE.lastIndex = 0;
+    if (!LESSON_MARKER_RE.test(html) && !GMAIL_DRAFT_MARKER_RE.test(html) && !MCP_SERVER_MARKER_RE.test(html) && !KNOWLEDGE_MARKER_RE.test(html) && !THEME_MARKER_RE.test(html) && !JOB_CARD_MARKER_RE.test(html)) continue;
     LESSON_MARKER_RE.lastIndex = 0;
     GMAIL_DRAFT_MARKER_RE.lastIndex = 0;
     MCP_SERVER_MARKER_RE.lastIndex = 0;
     KNOWLEDGE_MARKER_RE.lastIndex = 0;
     THEME_MARKER_RE.lastIndex = 0;
+    JOB_CARD_MARKER_RE.lastIndex = 0;
+    // A row that is only a job card shows the card alone (no bubble around it).
+    if (JOB_CARD_ONLY_RE.test(bubble.textContent || '')) bubble.classList.add('job-card-row');
     bubble.innerHTML = html
+      .replace(JOB_CARD_MARKER_RE, (_, id, kind) => `<div class="jobs-card-slot" data-job-card-id="${id}" data-job-card-kind="${kind}"></div>`)
       .replace(LESSON_MARKER_RE, (_, id) => `<div class="lesson-card" data-lesson-id="${id}"><em>Loading lesson…</em></div>`)
       .replace(GMAIL_DRAFT_MARKER_RE, (_, id) => `<div class="gmail-draft-card" data-gmail-draft-id="${id}" aria-live="polite"><em>Loading the Gmail draft…</em></div>`)
       .replace(MCP_SERVER_MARKER_RE, (_, id) => `<div class="mcp-server-card" data-mcp-server-id="${id}" aria-live="polite"><em>Loading the MCP server…</em></div>`)
@@ -1997,6 +1961,7 @@ function hydrateChatCards(root) {
     card.dataset.hydrated = '1';
     void fillThemeCard(card);
   }
+  window.BotBoyJobs?.fillCards(root);
 }
 
 async function fillLessonCard(card) {
@@ -2515,6 +2480,9 @@ document.addEventListener('click', async (event) => {
 // small "via WhatsApp" label, not the note.
 const WHATSAPP_NOTE_RE = /\n*\[Sent from WhatsApp on the owner's phone\.[\s\S]*\]\s*$/;
 function renderChatMsgInner(m) {
+  // BotBoy's own status rows draw as one compact notice (chat-notices-ui.js); the main chat groups them in renderChat.
+  const noticeHtml = window.BotBoyNotices?.singleHtml(m);
+  if (noticeHtml) return noticeHtml;
   let raw = m.content || '';
   if (m.role === 'user' && WHATSAPP_NOTE_RE.test(raw)) {
     raw = raw.replace(WHATSAPP_NOTE_RE, '').trim();
@@ -2529,6 +2497,19 @@ function renderChatMsgInner(m) {
   }
   // Also strip orphan </think> tags
   raw = raw.replace(/<\/?think>/g, '').trim();
+
+  // A job's report (or BotBoy's quiet line about a job): the words, folded when long, and the job's footer card under them, which
+  // says which job it is, what it is doing now, and offers its next steps (hydrateChatCards fills the marker).
+  const update = m.role === 'assistant' ? JOB_UPDATE_RE.exec(raw) : null;
+  if (update) {
+    const body = raw.slice(0, update.index).trim();
+    const report = update[2] === 'report';
+    const long = report && (body.length > JOB_REPORT_FOLD_CHARS || body.split('\n').length > JOB_REPORT_FOLD_LINES);
+    // A report whose words already show above it (the owner's #N reply from the main chat) is the card alone.
+    return (body ? `<div class="job-update-body${report ? '' : ' quiet'}${long ? ' folded' : ''}">${formatMarkdownContent(body)}</div>` : '')
+      + (long ? '<button type="button" class="job-update-more" data-job-update-more aria-expanded="false">Show all</button>' : '')
+      + `<div class="job-update-foot">[[job:${update[1]}:${update[2]}]]</div>`;
+  }
 
   const content = formatMarkdownContent(raw);
 
@@ -2545,7 +2526,10 @@ function renderChatMsgInner(m) {
         return `<a href="${safe}" target="_blank" rel="noopener noreferrer"><img src="${safe}" alt="Attached image" loading="lazy"></a>`;
       }).join('')}</div>`
     : '';
-  return `${attachmentsHtml}${thinkHtml}<div class="content-block">${content}</div>`;
+  // A main chat row about a job (a #N message and that job's reply, PARALLEL_JOBS_PLAN.md PJ3) says which job.
+  const refNumber = m.refJobId && !JOB_CARD_ONLY_RE.test(raw) ? window.BotBoyJobs?.numberOf(m.refJobId) : null;
+  const refHtml = refNumber ? `<span class="chat-job-ref">${m.role === 'user' ? 'to' : 'from'} #${escHtml(String(refNumber))}</span>` : '';
+  return `${refHtml}${attachmentsHtml}${thinkHtml}<div class="content-block">${content}</div>`;
 }
 
 // ── Safe Markdown renderer ──
@@ -3112,7 +3096,9 @@ window.submitNewNode = async () => {
   document.getElementById('newNodeDesc').value = '';
   hideModal();
 };
-window.submitChat = async () => { const el = document.getElementById('chatInput'); let msg = el?.value?.trim(); if (!msg && pendingChatAttachments.length) msg = '(image attached)'; if (!msg) return; el.value = ''; await sendChat(msg); };
+// One reply at a time per thread: while this thread's reply is still being written, Enter keeps the text in the box instead
+// of starting a second turn in the same conversation (the server would refuse it with turn_in_progress).
+window.submitChat = async () => { if (chatStreams.has(currentChatThread())) return; const el = document.getElementById('chatInput'); let msg = el?.value?.trim(); if (!msg && pendingChatAttachments.length) msg = '(image attached)'; if (!msg) return; el.value = ''; await sendChat(msg); };
 // Shared escape-first Markdown renderer, exposed for the Documents view
 // (dashboard.js). All text is escaped before any tags are produced, so
 // rendering hostile document content cannot inject markup.
@@ -4612,10 +4598,22 @@ const handleFileLinkClick = (e) => {
   }
 };
 document.addEventListener('click', handleFileLinkClick);
+// A folded job report opens and closes in place (PARALLEL_JOBS_PLAN.md §11).
+document.addEventListener('click', (event) => {
+  const button = event.target?.closest?.('[data-job-update-more]');
+  const body = button?.previousElementSibling;
+  if (!button || !body?.classList.contains('job-update-body')) return;
+  const open = !body.classList.toggle('folded');
+  button.textContent = open ? 'Show less' : 'Show all';
+  button.setAttribute('aria-expanded', open ? 'true' : 'false');
+});
 document[fileLinkClickHandlerKey] = handleFileLinkClick;
 
 // ── Init ──
 (async () => {
+  // BotBoy's own notices (chat-notices-ui.js), before the first transcript paint: Markdown details through the safe renderer;
+  // Re-authenticate opens the terminal dock.
+  window.BotBoyNotices?.init({ apiBase: API, markdown: formatMarkdownContent, afterReauth: checkChatTerminal });
   // Bind the Slack save button once at boot. Uses the module-scoped selectedIds
   // Set so the click handler always sees the latest pending selection.
   const slackSaveBtn = document.getElementById('slack-sources-save');
@@ -4654,10 +4652,12 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
   initWhatsAppNotice();
   initChatWidthControl();
   initChatAttachments();
+  // The Slack sources panel loads on its own: its conversation list walks Slack's paginated API, and a slow or timed-out Slack
+  // connector held this whole start (the polls below and the jobs UI) for minutes (live 2026-10-29). It touches only that panel.
+  void loadSlackSources().catch(() => {});
   await Promise.all([
     loadRoots(),
     loadChatHistory(),
-    loadSlackSources(),
   ]);
   render();
 
@@ -4703,13 +4703,23 @@ document[fileLinkClickHandlerKey] = handleFileLinkClick;
     } catch {}
   }, 3000);
 
-  // Owner jobs: the job strip, and continuation turns streamed live.
+  // Owner jobs (chat-jobs-ui.js): the dock above the composer, the drawer, the job sheets and cards, and each job's turns live.
+  window.BotBoyJobs?.init({
+    api,
+    apiBase: API,
+    renderMessage: renderChatMsgInner,
+    createBubble: createChatStreamBubble,
+    hydrate: hydrateChatCards,
+    onViewChange: onJobViewChange,
+    setStreaming: setChatStreaming,
+    mainModelKey: () => chatModelChoice(),
+    toolEffects: chatToolResultEffects,
+    send: (text) => sendChat(text),
+  });
   connectChatLive();
-  void refreshChatJobStrip();
 
   // Chat poll — detect new messages from DB
   setInterval(async () => {
-    void refreshChatJobStrip();
     const chatEl = document.getElementById('chat-messages');
     if (chatEl && chatEl.querySelector('.streaming-live')) return;
     // While the server is unreachable the dashboard says so itself (server-link.js);

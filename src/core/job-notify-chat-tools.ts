@@ -44,8 +44,30 @@ export const JOB_NOTIFY_GUIDANCE_BLOCK = [
   '- When the owner asks to be told, messaged, pinged or sent a report on WhatsApp when a job pauses, needs them, finishes or stops, call job_notify with action "on". Do this INSTEAD of promising it yourself: you cannot send WhatsApp messages from the automatic turns that continue a job, but BotBoy itself will, because job_notify records the request.',
   '- job_notify "on" sends the owner one confirmation message first and turns updates on only if that message reached their BotBoy chat. If it returns ok:false, tell the owner exactly what the result says (usually: sign in to WhatsApp Web in BotBoy’s Chrome, then ask again). Never say updates are on unless the result says so.',
   '- BotBoy sends the updates (no turn needed): when the job needs the owner, finishes, is stopped, or expires. The message includes the job’s closing words, so make the last words of a job’s final turn the report the owner should read on a phone: short, plain, the answer first. Do not call whatsapp_send for this.',
-  '- If there is no job yet, job_notify "on" starts one from the owner’s message, so ask for the work in the same message or call job_update afterwards. "off" turns updates off; "status" says whether they are on.',
+  '- Updates belong to one job. In a job\'s own thread, or right after you started a job this turn, that job is meant; with several jobs running in the main chat, pass job with its number (#N). With no job running, start the work first (job_update start), then call job_notify. "off" turns updates off; "status" says whether they are on.',
 ].join('\n');
+
+/** The job a job_notify call means; null when none is running. An error when several run and none was named. */
+export function notifyTarget(jobs: ChatJobStore, rawJob: unknown, context: ToolExecutionContext):
+  { job: ChatJob | null } | { error: string; code: string; nextAction: string } {
+  const active = jobs.activeJobs();
+  if (rawJob !== undefined && rawJob !== null && rawJob !== '') {
+    const seq = Number(String(rawJob).replace(/^#/, ''));
+    const named = Number.isInteger(seq) ? jobs.bySeq(seq) : null;
+    if (!named || named.status !== 'active') {
+      return { code: 'job_not_found', error: `There is no running job #${String(rawJob).replace(/^#/, '')}.`,
+        nextAction: active.length ? `Running jobs: ${active.map(job => `#${job.seq} ${job.title}`).join(', ')}. Call again with one of these numbers.` : 'No job is running.' };
+    }
+    return { job: named };
+  }
+  const own = context.threadJobId ?? context.jobMandate?.jobId;
+  if (own) return { job: jobs.get(own) };
+  const started = context.startedJobIds?.at(-1);
+  if (started) return { job: jobs.get(started) };
+  if (active.length <= 1) return { job: active[0] ?? null };
+  return { code: 'which_job', error: `${active.length} jobs are running; job_notify needs to know which one.`,
+    nextAction: `Ask the owner which job, or call again with job set to its number: ${active.map(job => `#${job.seq} ${job.title}`).join(', ')}.` };
+}
 
 function reply(call: ToolCall, content: unknown, isError = false): ToolResult {
   return { toolCallId: call.id, content: typeof content === 'string' ? content : JSON.stringify(content, null, 1), isError };
@@ -85,11 +107,11 @@ export function withJobNotifyChatTools(base: ToolExecutor, deps: {
       let args: Record<string, unknown>;
       try { args = JSON.parse(call.function.arguments || '{}'); } catch { return failure(call, 'invalid_arguments', 'Arguments must be one JSON object.', 'Call again with {"action":"on"}, {"action":"off"} or {"action":"status"}.'); }
       if (!args || typeof args !== 'object' || Array.isArray(args)) return failure(call, 'invalid_arguments', 'Arguments must be one JSON object.', 'Call again with {"action":"on"}, {"action":"off"} or {"action":"status"}.');
-      const stray = Object.keys(args).filter(key => key !== 'action');
+      const stray = Object.keys(args).filter(key => key !== 'action' && key !== 'job');
       const action = String(args.action ?? '');
       if (stray.length || !['on', 'off', 'status'].includes(action)) {
         return failure(call, 'invalid_arguments', stray.length ? `${stray.slice(0, 3).join(', ')} is not an argument of job_notify.` : 'action must be on, off or status.',
-          'Send only action: "on", "off" or "status". The destination is always the owner’s BotBoy chat; it cannot be chosen.');
+          'Send action: "on", "off" or "status", and job (its number) only when several jobs run. The destination is always the owner’s BotBoy chat; it cannot be chosen.');
       }
 
       const requestKey = `${context.ownerRequestId ?? ''}:${action}`;
@@ -105,7 +127,11 @@ export function withJobNotifyChatTools(base: ToolExecutor, deps: {
         return result;
       };
 
-      const active = deps.jobs.activeJob();
+      // Which job (PARALLEL_JOBS_PLAN.md): the number the model gave, this thread's job, the job this turn just started, or the
+      // only one running. With several running and none named, the owner is asked which.
+      const resolved = notifyTarget(deps.jobs, args.job, context);
+      if ('error' in resolved) return failure(call, resolved.code, resolved.error, resolved.nextAction);
+      const active = resolved.job;
       if (action === 'status') {
         return reply(call, {
           ok: true, tool: 'job_notify', notify: active?.notify ? 'on' : 'off', job: active ? { id: active.id, goal: active.goal.slice(0, 160) } : null,
@@ -134,8 +160,12 @@ export function withJobNotifyChatTools(base: ToolExecutor, deps: {
         return failure(call, 'whatsapp_not_ready', 'BotBoy could not find the BotBoy chat in WhatsApp Web. Updates were NOT turned on.',
           'Tell the owner to check Connections → WhatsApp (the BotBoy chat), then ask again. Do not say updates are on.');
       }
-      // A job to attach to: the active one, or one made from the owner's message (like job_update continue from an owner turn).
-      const job = active ?? deps.jobs.start({ goal: context.currentUserMessage });
+      // A job to attach to. Updates are about a job that runs; with none, start the work first (job_update start).
+      if (!active) {
+        return failure(call, 'no_job', 'No job is running, so there is nothing to send updates about. Updates were NOT turned on.',
+          'If the owner asked for work in this message, start it with job_update start first, then call job_notify on again. Otherwise tell the owner no job is running.');
+      }
+      const job = active;
       const wasOn = Boolean(job.notify);
       if (wasOn) {
         return remember(reply(call, { ok: true, tool: 'job_notify', notify: 'on', already: true, job: { id: job.id, goal: job.goal.slice(0, 160) }, nextAction: 'Updates were already on for this job; nothing new was sent. Tell the owner.' }));

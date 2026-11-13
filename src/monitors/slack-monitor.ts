@@ -84,6 +84,11 @@ export interface SlackMonitor {
   backfillStatus?(): { inFlight: string[] };
   /** Active transport. Optional so pre-polling test doubles stay valid. */
   getCaptureMode?(): SlackCaptureMode;
+  /**
+   * Polls once now, without waiting out the back-off (the Midway sentinel calls it after a new sign-in). The back-off starts
+   * again from the poll interval if that poll fails. Nothing happens before start() or in socket mode.
+   */
+  checkNow?(): Promise<void>;
 }
 
 /**
@@ -125,7 +130,7 @@ export function resolveSlackCaptureMode(
 
 /** Kinds that mean the whole transport failed: one failure stands for every conversation. */
 const TRANSPORT_WIDE_KINDS: ReadonlySet<SlackCallErrorKind> = new Set([
-  'midway_auth', 'service_auth', 'rate_limited', 'network', 'connector_down',
+  'midway_auth', 'service_auth', 'rate_limited', 'network', 'service_error', 'connector_down',
 ]);
 
 /** Longest wait between poll attempts while the transport keeps failing. */
@@ -161,6 +166,8 @@ export interface ReloadableSlackMonitor extends SlackMonitor {
   hasUserToken(): boolean;
   /** The current token WebClient, or undefined without a token. */
   getUserWebClient(): WebClient | undefined;
+  /** SlackMonitor.checkNow, always present here (the current monitor's, or nothing before it exists). */
+  checkNow(): Promise<void>;
 }
 
 export function createSlackMonitor(deps: SlackMonitorDeps): ReloadableSlackMonitor {
@@ -180,6 +187,7 @@ export function createSlackMonitor(deps: SlackMonitorDeps): ReloadableSlackMonit
     backfillChannel: (channelId, opts) => inner.backfillChannel!(channelId, opts),
     backfillStatus: () => inner.backfillStatus!(),
     getCaptureMode: () => inner.getCaptureMode!(),
+    checkNow: () => inner.checkNow?.() ?? Promise.resolve(),
     async reloadUserToken(next) {
       const wasStarted = started;
       if (wasStarted) inner.stop();
@@ -712,6 +720,8 @@ function buildSlackMonitor(deps: SlackMonitorDeps, userToken: string): SlackMoni
   let transportFailures = 0;
   let nextPollAt = 0;
   let lastSignInHealAt = 0;
+  // A failed cycle paused capture; the next good one logs "capture resumed" (checkNow restarts the back-off count).
+  let capturePaused = false;
   // Last logged error per conversation, so a broken conversation logs once.
   const conversationErrors = new Map<string, string>();
 
@@ -886,6 +896,7 @@ function buildSlackMonitor(deps: SlackMonitorDeps, userToken: string): SlackMoni
   /** Record a failed cycle, back off, and self-heal a stuck sign-in once. */
   function recordCycleFailure(err: unknown): void {
     connected = false;
+    capturePaused = true;
     const errorKind = slackErrorKind(err);
     const kind: CaptureFailureKind = errorKind === 'conversation_access' ? 'service_auth' : errorKind;
     const message = describeSlackError(err);
@@ -1008,7 +1019,8 @@ function buildSlackMonitor(deps: SlackMonitorDeps, userToken: string): SlackMoni
 
       connected = true;
       lastPollError = '';
-      if (transportFailures > 0) console.log('[Slack] capture resumed');
+      if (capturePaused) console.log('[Slack] capture resumed');
+      capturePaused = false;
       transportFailures = 0;
       nextPollAt = 0;
       deps.captureHealth?.reportSuccess('slack');
@@ -1147,5 +1159,16 @@ function buildSlackMonitor(deps: SlackMonitorDeps, userToken: string): SlackMoni
     // 'mcp' when the managed MCP carried the last cycle; the configured mode
     // otherwise. The Connections UI shows this as the live transport.
     getCaptureMode: () => (mcpTransportActive ? 'mcp' : captureMode),
+
+    // The Midway sentinel's call after a new sign-in: poll now instead of
+    // waiting out a back-off of up to 5 minutes. A new sign-in is new
+    // information, so a failure after it backs off from the poll interval
+    // again. A cycle already running is left to finish (pollCycle returns).
+    async checkNow(): Promise<void> {
+      if (!pollTimer) return;
+      nextPollAt = 0;
+      transportFailures = 0;
+      await pollCycle();
+    },
   };
 }

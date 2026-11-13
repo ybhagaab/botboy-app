@@ -162,6 +162,8 @@ export function isCrossLaneRetryableFailure(error: string | null | undefined): b
  * connector is unavailable. */
 export function isDashboardLaneUnavailable(error: unknown, lane: DashboardLaneId): boolean {
   const lower = String((error as any)?.message ?? error ?? '').toLowerCase();
+  // A query someone stopped on purpose (query-ledger.ts › stoppedWords) says nothing about the lane, whatever its reason says.
+  if (lower.includes('stopped on purpose')) return false;
   const common = [
     'connection closed',
     'connection refused',

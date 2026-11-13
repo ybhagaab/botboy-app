@@ -84,13 +84,18 @@ export function createKnowledgeJobWaker(options: {
     wakeIfDecided() {
       try {
         if (!options.jobs || !options.changes) return null;
-        const found = decisionsForPausedJob(options.jobs.activeJob(), options.changes);
-        if (!found) return null;
-        const woken = options.jobs.wake(found.jobId, found.reason);
-        if (!woken) return null;
-        log(`[Job] ${found.jobId} woken: ${found.reason.split(DECISION_SEPARATOR)[0]}`);
-        try { options.request?.(found.jobId); } catch { /* the runner's own interval finds the due continuation */ }
-        return found;
+        // Many jobs can be active at once (PARALLEL_JOBS_PLAN.md): each paused one is checked against its own era of cards.
+        let first: JobWake | null = null;
+        for (const job of options.jobs.activeJobs()) {
+          const found = decisionsForPausedJob(job, options.changes);
+          if (!found) continue;
+          const woken = options.jobs.wake(found.jobId, found.reason);
+          if (!woken) continue;
+          log(`[Job] ${found.jobId} woken: ${found.reason.split(DECISION_SEPARATOR)[0]}`);
+          try { options.request?.(found.jobId); } catch { /* the runner's own interval finds the due continuation */ }
+          first ??= found;
+        }
+        return first;
       } catch (error: any) {
         log(`[Job] could not check whether a paused job's Knowledge decision was made: ${String(error?.message ?? error).slice(0, 160)}`);
         return null;

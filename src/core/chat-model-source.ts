@@ -74,6 +74,11 @@ export interface ChatModelSource {
   catalog(): ChatModelCatalogPayload | null;
   /** Resolve a picker key (`default`/empty = the default). null = not offered. */
   resolve(key: unknown): ChatModelBinding | null;
+  /**
+   * The connection a picker key would run on, without building a client (the job scheduler's provider wait-in-line,
+   * PARALLEL_JOBS_PLAN.md PJ2). undefined = not offered.
+   */
+  connectionOf?(key: unknown): string | undefined;
   /** Observe connection replacement or removal. Returns an unsubscribe. */
   onChange(listener: (event: { connectionId: string }) => void): () => void;
 }
@@ -108,6 +113,7 @@ export function createSingleClientChatModelSource(client: LlmClient | undefined)
       );
       return route ? { key: String(key), connectionId: 'active', client: pinned, route } : null;
     },
+    connectionOf: () => (pinLlmClient(client) ? 'active' : undefined),
     onChange(listener) {
       return isLlmClientSwitch(client)
         ? client.onActivate(() => listener({ connectionId: 'active' }))
@@ -201,6 +207,12 @@ export function createConnectionChatModelSource(input: {
         client,
         operation: client.getModelOperation?.(),
       };
+    },
+    connectionOf(key) {
+      if (isDefaultKey(key)) return effectiveDefault()?.connection.id;
+      if (typeof key !== 'string') return undefined;
+      const mapped = LLM_MODEL_KEY_PATTERN.test(key) ? key : legacyKey(key);
+      return mapped ? find(mapped)?.connection.id : undefined;
     },
     onChange: listener => input.onChange(listener),
   };

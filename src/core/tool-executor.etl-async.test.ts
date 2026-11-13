@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, setSetting, type StorageLayer } from './storage.js';
 import { createNodeManager } from './node-manager.js';
 import { createChatJobStore, type ChatJobStore } from './chat-jobs.js';
 import { createDataRoomDatasetParametersSchema } from './analytics-job-tool-schema.js';
+import { resetEtlDownloadsForTests } from './etl-downloads.js';
 import {
   createToolExecutor,
   dataRoomImportRequestId,
@@ -35,6 +37,7 @@ describe('async ETL tools', () => {
     jobs = createChatJobStore(storage.getDb());
     resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'etl-async-'));
     status = 'EXECUTING';
+    resetEtlDownloadsForTests();
   });
   afterEach(() => {
     storage.close();
@@ -76,16 +79,68 @@ describe('async ETL tools', () => {
     try { return JSON.parse(result.content); } catch { return result.content; }
   };
   const owner: ToolExecutionContext = { callerKind: 'interactive', currentUserMessage: 'Weekly PV players for Local', ownerRequestId: 'req-00000001' };
+  /** A main chat turn from the chat route: it can hold provisional jobs and hand jobs off (PARALLEL_JOBS_PLAN.md §6). */
+  const mainTurn = (): ToolExecutionContext => ({ ...owner, heldJobIds: [], startedJobIds: [], turnModelKey: 'team.sol', turnThinking: 'high' });
 
   it('a run that outlives the wait is watched for a job started from the owner request', async () => {
     const exec = executor();
     const outcome = await run(exec, 'mcp_etl_run_query', { sql: 'select 1', waitSeconds: 0, purpose: 'weekly players', ownerRequested: true }, owner);
     expect(outcome).toMatchObject({ ok: false, code: 'alive_handoff', runId: '777001' });
     expect(outcome.nextAction).toContain('BotBoy is watching run 777001');
-    expect(outcome.nextAction).toContain('wait_for_etl_run');
-    const job = jobs.activeJob()!;
+    expect(outcome.nextAction).toContain('wait_for {"kind":"etl_run","id":"777001"');
+    const job = jobs.activeJobs()[0]!;
     expect(job.goal).toBe('Weekly PV players for Local');
     expect(jobs.watch('777001')).toMatchObject({ jobId: job.id, status: 'pending', purpose: 'weekly players', source: 'run_query' });
+  });
+
+  it('a main chat turn\'s runs belong to ONE provisional job it holds, started on the turn\'s model', async () => {
+    const exec = executor();
+    const context = mainTurn();
+    await run(exec, 'mcp_etl_run_query', { sql: 'select 1', waitSeconds: 0, ownerRequested: true }, context);
+    expect(context.heldJobIds).toHaveLength(1);
+    const held = jobs.get(context.heldJobIds![0])!;
+    expect(held).toMatchObject({ seq: 0, status: 'active', modelKey: 'team.sol', thinking: 'high', goal: 'Weekly PV players for Local' });
+    expect(jobs.watch('777001')).toMatchObject({ jobId: held.id });
+    // A second run in the same turn joins the same job.
+    await run(exec, 'wait_for_etl_run', { runId: '888001', waitSeconds: 0 }, context);
+    expect(jobs.watch('888001')).toMatchObject({ jobId: held.id });
+    expect(context.heldJobIds).toHaveLength(1);
+    // In a job's own thread, the runs are that job's.
+    const threadJob = jobs.start({ goal: 'thread job' });
+    await run(exec, 'wait_for_etl_run', { runId: '888002', waitSeconds: 0 }, { ...owner, threadJobId: threadJob.id, heldJobIds: [] });
+    expect(jobs.watch('888002')).toMatchObject({ jobId: threadJob.id });
+  });
+
+  it('job_update start hands off: a numbered job with its first turn due, on the named model or the turn\'s', async () => {
+    const exec = executor();
+    const nudged: string[] = [];
+    const context = { ...mainTurn(), nudgeJobs: (id: string) => nudged.push(id), resolveJobModel: (name: string) => (/sonnet/i.test(name) ? { key: 'anthropic.sonnet', title: 'Claude Sonnet' } : { error: 'No connected model matches.', offered: ['GPT-6.1 Sol'] }) };
+    const plain = await run(exec, 'job_update', { action: 'start', title: 'PV players', nextStep: 'Pull Local weekly' }, context);
+    expect(plain).toMatchObject({ ok: true, job: { number: 1, title: 'PV players', status: 'active' } });
+    expect(plain.note).toMatch(/ONE short sentence/);
+    expect(jobs.get(plain.job.id)).toMatchObject({ modelKey: 'team.sol', thinking: 'high', continueReason: 'The owner just handed this job off from the main chat.', continueRequestedAt: expect.any(String) });
+    const named = await run(exec, 'job_update', { action: 'start', goal: 'Draft the note', model: 'Claude Sonnet' }, context);
+    expect(named).toMatchObject({ ok: true, job: { number: 2, model: 'Claude Sonnet' } });
+    expect(jobs.get(named.job.id)?.modelKey).toBe('anthropic.sonnet');
+    expect(await run(exec, 'job_update', { action: 'start', goal: 'x', model: 'Gemini' }, context)).toMatchObject({ ok: false, code: 'model_not_offered' });
+    expect(context.startedJobIds).toEqual([plain.job.id, named.job.id]);
+    expect(nudged).toEqual([plain.job.id, named.job.id]);
+    expect(jobs.activeJobs()).toHaveLength(2); // the refused start made nothing
+  });
+
+  it('job_update start after the turn ran ETL hands off THAT job: it surfaces with a number instead of a second job', async () => {
+    const exec = executor();
+    const context = mainTurn();
+    await run(exec, 'mcp_etl_run_query', { sql: 'select 1', waitSeconds: 0, ownerRequested: true }, context);
+    const heldId = context.heldJobIds![0];
+    const handed = await run(exec, 'job_update', { action: 'start', title: 'Weekly PV players' }, context);
+    expect(handed.job.id).toBe(heldId);
+    expect(jobs.get(heldId)).toMatchObject({ seq: 1, title: 'Weekly PV players' });
+    // Its run is still pending: the run's finish continues it, so no first turn is made due now.
+    expect(jobs.get(heldId)?.continueRequestedAt).toBeUndefined();
+    expect(context.heldJobIds).toEqual([]);
+    expect(context.startedJobIds).toEqual([heldId]);
+    expect(jobs.activeJobs()).toHaveLength(1);
   });
 
   it('the scratch runner can prioritize an existing run once, and nothing else', async () => {
@@ -106,15 +161,15 @@ describe('async ETL tools', () => {
     expect(outcome).toMatchObject({ ok: true, runId: '777001', rowCount: 1, workspacePath: 'etl-results/adhoc_777001.tsv' });
     expect(fs.existsSync(outcome.savedTo)).toBe(true);
     expect(jobs.watch('777001')).toMatchObject({ status: 'finished', consumedAt: expect.any(String) });
-    expect(jobs.unconsumedFinished(jobs.activeJob()!.id)).toEqual([]);
+    expect(jobs.unconsumedFinished(jobs.activeJobs()[0]!.id)).toEqual([]);
   });
 
   it('a background caller neither starts a job nor watches its run', async () => {
     const outcome = await run(executor(), 'mcp_etl_run_query', { sql: 'select 1', waitSeconds: 0, ownerRequested: true }, { callerKind: 'background', currentUserMessage: 'diagnose' });
     expect(outcome.code).toBe('alive_handoff');
-    expect(jobs.activeJob()).toBeNull();
+    expect(jobs.activeJobs()).toEqual([]);
     expect(jobs.watch('777001')).toBeNull();
-    expect(outcome.nextAction).toContain('wait_for_etl_run');
+    expect(outcome.nextAction).toContain('wait_for {"kind":"etl_run","id":"777001"');
   });
 
   it('wait_for_etl_run returns a finished run and consumes its watch', async () => {
@@ -151,6 +206,94 @@ describe('async ETL tools', () => {
     expect(jobs.watch('777001')).toMatchObject({ status: 'finished', outcome: { remoteStatus: 'ERROR' } });
   });
 
+  it('one download per run: the download tool uses the result BotBoy already has in the files workspace (etl-downloads.ts)', async () => {
+    const mcp = fakeMcp();
+    const exec = executor(mcp);
+    status = 'SUCCESS';
+    // The run finished in a wait: the runner downloaded it as adhoc_777001.tsv.
+    const waited = await run(exec, 'wait_for_etl_run', { runId: '777001', waitSeconds: 0 }, owner);
+    expect(waited).toMatchObject({ ok: true, rowCount: 1, workspacePath: 'etl-results/adhoc_777001.tsv' });
+    expect(mcp.calls.filter(name => name === 'datanet_download_results')).toHaveLength(1);
+    const downloaded = await run(exec, 'mcp_etl_download_results', { runId: '777001' }, owner);
+    const result = JSON.parse(downloaded.result);
+    expect(result).toMatchObject({ runId: '777001', workspacePath: 'etl-results/adhoc_777001.tsv', preview: 'week\tplayers\n2026-W40\t1234\n' });
+    expect(result.reused).toContain('nothing was downloaded again');
+    expect(mcp.calls.filter(name => name === 'datanet_download_results')).toHaveLength(1);
+  });
+
+  it('a download that outlasts the connector is waited for, in the download tool and in wait_for_etl_run alike', async () => {
+    const mcp = fakeMcp();
+    mcp.callTool.mockImplementation(async (_server: string, toolName: string) => {
+      if (toolName === 'datanet_get_job_run_status') return { isError: false, text: JSON.stringify({ status: 'SUCCESS' }), serverId: 'a2-analytics', toolName };
+      if (toolName === 'datanet_download_results') {
+        mcp.calls.push(toolName);
+        // The connector's own 5-minute answer; its background download has not written the file yet.
+        return { isError: false, text: '{"error": "Timeout", "message": "Tool \'datanet_download_results\' exceeded 300s timeout."}', serverId: 'a2-analytics', toolName };
+      }
+      return { isError: true, text: `no fake for ${toolName}`, serverId: 'a2-analytics', toolName };
+    });
+    const exec = executor(mcp);
+    const first = await run(exec, 'mcp_etl_download_results', { runId: '901' }, owner);
+    expect(first).toMatchObject({ ok: false, code: 'download_landing', runId: '901' });
+    expect(first.error).toContain('still downloading');
+    expect(first.nextAction).toContain('Do not download it again');
+    const again = await run(exec, 'mcp_etl_download_results', { runId: '901' }, owner);
+    expect(again).toMatchObject({ code: 'download_landing' });
+    const waited = await run(exec, 'wait_for_etl_run', { runId: '902', waitSeconds: 0 }, owner);
+    expect(waited).toMatchObject({ ok: false, code: 'download_landing', runId: '902' });
+    expect(waited.nextAction).toContain('Do not download it again or resubmit the run');
+    expect(mcp.calls.filter(name => name === 'datanet_download_results')).toHaveLength(2); // one per run, never twice
+  });
+
+  it('the download tool takes its own timed-out download once the file lands, asking the connector once', async () => {
+    const mcp = fakeMcp();
+    mcp.callTool.mockImplementation(async (_server: string, toolName: string) => {
+      if (toolName === 'datanet_get_job_run_status') return { isError: false, text: JSON.stringify({ status: 'SUCCESS' }), serverId: 'a2-analytics', toolName };
+      if (toolName === 'datanet_download_results') {
+        mcp.calls.push(toolName);
+        return { isError: false, text: '{"error": "Timeout", "message": "Tool \'datanet_download_results\' exceeded 300s timeout."}', serverId: 'a2-analytics', toolName };
+      }
+      return { isError: true, text: `no fake for ${toolName}`, serverId: 'a2-analytics', toolName };
+    });
+    let clock = Date.now();
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const exec = executor(mcp);
+      expect(await run(exec, 'mcp_etl_download_results', { runId: '903' }, owner)).toMatchObject({ code: 'download_landing' });
+      // The connector's background download writes the file.
+      const file = path.join(resultsDir, 'files', 'etl-results', 'run_903.tsv');
+      fs.writeFileSync(file, 'week\tplayers\n2026-W41\t99\n');
+      fs.utimesSync(file, new Date(clock), new Date(clock));
+      clock += 1_000;
+      expect(await run(exec, 'mcp_etl_download_results', { runId: '903' }, owner)).toMatchObject({ code: 'download_landing' }); // first sighting
+      clock += 20_000;
+      const landed = await run(exec, 'mcp_etl_download_results', { runId: '903' }, owner);
+      expect(JSON.parse(landed.result)).toMatchObject({ runId: '903', workspacePath: 'etl-results/run_903.tsv', preview: 'week\tplayers\n2026-W41\t99\n' });
+      expect(mcp.calls.filter(name => name === 'datanet_download_results')).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('delete_working_file: a job deletes its own raw download once its gzip copy matches; outside a job it refuses', async () => {
+    const exec = executor();
+    const job = jobs.start({ goal: 'Local study' });
+    const filesDir = path.join(resultsDir, 'files');
+    fs.mkdirSync(path.join(filesDir, 'etl-results'), { recursive: true });
+    const raw = 'uuid\na\nb\n';
+    fs.writeFileSync(path.join(filesDir, 'etl-results', 'adhoc_1.tsv'), raw);
+    fs.writeFileSync(path.join(filesDir, 'etl-results', 'adhoc_1.tsv.gz'), gzipSync(raw));
+    const args = { path: 'etl-results/adhoc_1.tsv', keptCopy: 'etl-results/adhoc_1.tsv.gz' };
+    expect(await run(exec, 'delete_working_file', args, owner)).toMatchObject({ ok: false, code: 'job_required' });
+    expect(fs.existsSync(path.join(filesDir, 'etl-results', 'adhoc_1.tsv'))).toBe(true);
+    const deleted = await run(exec, 'delete_working_file', args, { callerKind: 'continuation', jobMandate: { jobId: job.id, goal: 'Local study' } });
+    expect(deleted).toMatchObject({ ok: true, deleted: 'etl-results/adhoc_1.tsv', keptCopy: 'etl-results/adhoc_1.tsv.gz', bytesFreed: raw.length });
+    expect(fs.existsSync(path.join(filesDir, 'etl-results', 'adhoc_1.tsv'))).toBe(false);
+    // The owner, in the job's own thread, uses the same tool and the same checks.
+    fs.writeFileSync(path.join(filesDir, 'b.tsv'), raw);
+    expect(await run(exec, 'delete_working_file', { path: 'b.tsv', keptCopy: 'etl-results/adhoc_1.tsv.gz' }, { ...owner, threadJobId: job.id })).toMatchObject({ ok: true, deleted: 'b.tsv' });
+  });
+
   it('downloads land in the files workspace and settle a watched run', async () => {
     const exec = executor();
     const job = jobs.start({ goal: 'g' });
@@ -162,41 +305,48 @@ describe('async ETL tools', () => {
     expect(jobs.watch('555')).toMatchObject({ status: 'finished', consumedAt: expect.any(String) });
   });
 
-  it('job_update starts only from an owner turn, records the working set, and closes the job', async () => {
+  it('job_update starts only from an owner turn, records the working set, and closes the job in its own thread', async () => {
     const exec = executor();
     const refused = await run(exec, 'job_update', { action: 'start', goal: 'x' }, { callerKind: 'continuation', jobMandate: { jobId: 'cj_x', goal: 'x' } });
     expect(refused).toMatchObject({ ok: false, code: 'owner_turn_required' });
     const started = await run(exec, 'job_update', { action: 'start', nextStep: 'Pull Local weekly', notes: ['IST weeks'] }, owner);
-    expect(started).toMatchObject({ ok: true, job: { goal: 'Weekly PV players for Local', status: 'active' } });
+    expect(started).toMatchObject({ ok: true, job: { number: 1, title: 'Weekly PV players for Local', status: 'active' } });
     const jobId = started.job.id;
+    expect(jobs.get(jobId)?.goal).toBe('Weekly PV players for Local');
     jobs.addWatch({ runId: '1', jobId, source: 'run_query' });
     const updated = await run(exec, 'job_update', { action: 'update', nextStep: 'Join lanes' }, { callerKind: 'continuation', jobMandate: { jobId, goal: 'g' } });
     expect(updated).toMatchObject({ ok: true, job: { nextStep: 'Join lanes', notes: 1 } });
-    const done = await run(exec, 'job_update', { action: 'done', summary: 'Dashboard dash_1 verified' }, owner);
-    expect(done).toMatchObject({ ok: true, job: { status: 'done' } });
-    expect(done.note).toContain('Runs 1 were still running');
-    expect(jobs.get(jobId)).toMatchObject({ status: 'done', endReason: 'Dashboard dash_1 verified' });
+    // The main chat belongs to no job: done there closes nothing.
     expect(await run(exec, 'job_update', { action: 'done' }, owner)).toMatchObject({ ok: false, code: 'no_active_job' });
+    const done = await run(exec, 'job_update', { action: 'done', summary: 'Dashboard dash_1 verified' }, { ...owner, threadJobId: jobId });
+    expect(done).toMatchObject({ ok: true, job: { status: 'done' } });
+    expect(done.note).toContain('Still pending when it ended: 1. BotBoy stopped waiting for them for this job');
+    expect(jobs.get(jobId)).toMatchObject({ status: 'done', endReason: 'Dashboard dash_1 verified' });
+    expect(await run(exec, 'job_update', { action: 'done' }, { ...owner, threadJobId: jobId })).toMatchObject({ ok: false, code: 'no_active_job' });
   });
 
-  it('job_update continue / needs_owner declare the turn end; continue from an owner turn starts the job', async () => {
+  it('job_update continue / needs_owner declare the turn end in a job\'s thread; continue in the main chat hands a job off', async () => {
     const exec = executor();
-    const started = await run(exec, 'job_update', { action: 'continue', nextStep: 'Pull Local weekly' }, owner);
-    expect(started).toMatchObject({ ok: true, job: { status: 'active', next: 'continue' } });
-    const job = jobs.activeJob()!;
-    expect(job).toMatchObject({ goal: 'Weekly PV players for Local', declaration: 'continue', continueReason: 'Pull Local weekly' });
-    expect(await run(exec, 'job_update', { action: 'needs_owner' }, owner)).toMatchObject({ ok: false, code: 'question_required' });
-    // 'blocked' (first build) is needs_owner: it pauses, it no longer ends the job.
-    const blocked = await run(exec, 'job_update', { action: 'blocked', question: 'Which cohort?' }, { callerKind: 'continuation', jobMandate: { jobId: job.id, goal: 'g' } });
+    const handed = await run(exec, 'job_update', { action: 'continue', nextStep: 'Pull Local weekly' }, owner);
+    expect(handed).toMatchObject({ ok: true, job: { number: 1, status: 'active' } });
+    const job = jobs.get(handed.job.id)!;
+    expect(job).toMatchObject({ goal: 'Weekly PV players for Local', continueRequestedAt: expect.any(String) });
+    expect(job.workingSet.nextStep).toBe('Pull Local weekly');
+    const inThread = { ...owner, threadJobId: job.id };
+    expect(await run(exec, 'job_update', { action: 'needs_owner' }, inThread)).toMatchObject({ ok: false, code: 'question_required' });
+    expect(await run(exec, 'job_update', { action: 'continue', nextStep: 'Build the widgets' }, inThread)).toMatchObject({ ok: true, job: { next: 'continue' } });
+    expect(jobs.get(job.id)).toMatchObject({ declaration: 'continue', continueReason: 'Build the widgets' });
+    // 'blocked' (first build) is needs_owner: it pauses, it no longer ends the job. One-tap answers ride along.
+    const blocked = await run(exec, 'job_update', { action: 'blocked', question: 'Which cohort?', options: ['2025', 'All years'] }, { callerKind: 'continuation', jobMandate: { jobId: job.id, goal: 'g' } });
     expect(blocked).toMatchObject({ ok: true, job: { next: 'needs_owner' } });
-    expect(jobs.get(job.id)).toMatchObject({ status: 'active', declaration: 'needs_owner', pauseNote: 'Which cohort?' });
+    expect(jobs.get(job.id)).toMatchObject({ status: 'active', declaration: 'needs_owner', pauseNote: 'Which cohort?', options: ['2025', 'All years'] });
     expect(await run(exec, 'job_update', { action: 'pause' }, owner)).toContain('action must be one of');
   });
   it('job_update continue never starts a job outside a live owner turn', async () => {
     const exec = executor();
     expect(await run(exec, 'job_update', { action: 'continue' }, { callerKind: 'continuation', jobMandate: { jobId: 'cj_x', goal: 'x' } }))
       .toMatchObject({ ok: false, code: 'no_active_job' });
-    expect(jobs.activeJob()).toBeNull();
+    expect(jobs.activeJobs()).toEqual([]);
   });
   it('ETL and shell tools run on their own bounded waits, not the executor caps', () => {
     for (const name of ['mcp_etl_run_query', 'wait_for_etl_run', 'mcp_etl_download_results']) expect(toolRunsWithoutExecutorCap(name)).toBe(true);

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createChatJobStore, type ChatJobStore } from './chat-jobs.js';
-import { filterToolsForContinuation, isJobScopeTool, JOB_SCOPE_TOOLS, withJobMandate } from './job-mandate.js';
+import { filterToolsForContinuation, filterToolsForReview, isJobScopeTool, JOB_SCOPE_TOOLS, REVIEW_TOOLS, withJobMandate } from './job-mandate.js';
 import type { ToolExecutionContext } from './tool-executor.js';
 
 /**
@@ -94,6 +94,53 @@ describe('job mandate gate', () => {
     expect(offered.map(tool => tool.function.name)).toEqual(['job_update']);
   });
 
+  // The main chat's jobs tool reads and steers every job (PARALLEL_JOBS_PLAN.md §11): a job's automatic turns never get it, so one
+  // job never reads or steers another (PJ1 isolation).
+  it('never admits the main chat\'s jobs tool to a continuation', async () => {
+    expect(JOB_SCOPE_TOOLS.has('jobs')).toBe(false);
+    expect(filterToolsForContinuation([{ function: { name: 'jobs' } }, { function: { name: 'job_update' } }]).map(tool => tool.function.name)).toEqual(['job_update']);
+    const result = await gate().executeTool(call('jobs'), continuation());
+    expect(result.content).not.toContain('ran jobs');
+  });
+
+  // The main chat's own look at a job update (PARALLEL_JOBS_PLAN.md §12, owner decision 2026-11-09): every read it needs and
+  // `jobs`; nothing that changes anything else (the job does its own work; sending, publishing and sharing stay the owner's).
+  it('lets a job update read and use jobs, and refuses every write, run, shell, browser click or send', async () => {
+    const review = (): ToolExecutionContext => ({ callerKind: 'review', reviewJobId: jobId, currentUserMessage: 'Weekly players dashboard' });
+    // The Data Room reads too (owner decision 2026-11-10: the main chat leads a job with the same view of its data).
+    const reads = ['jobs', 'get_analytics_dashboard', 'query_db', 'read_file', 'mcp_etl_job_run', 'mcp_sql_query', 'knowledge_load',
+      'list_data_room_datasets', 'query_data_room'];
+    for (const name of reads) expect((await gate().executeTool(call(name), review())).content, name).toContain(`ran ${name}`);
+    for (const name of ['run_command', 'write_file', 'edit_file', 'mcp_etl_run_query', 'mcp_etl_alter_run', 'wait_for_etl_run', 'refresh_analytics_dashboard',
+      'create_data_room_dataset', 'configure_analytics_widget_source', 'browser_hands', 'gmail_send', 'whatsapp_send', 'job_update', 'job_notify',
+      'knowledge_propose', 'save_product_document',
+      // Reads whose own gates admit only the owner's turn or a job's: the job reads them when the main chat asks it to.
+      'gdrive_read', 'gdrive_search', 'some_future_tool']) {
+      const result = await gate().executeTool(call(name), review());
+      expect(JSON.parse(result.content), name).toMatchObject({ status: 'blocked', code: 'outside_job_update' });
+      expect(result.isError).toBe(true);
+    }
+    expect(inner.executeTool).toHaveBeenCalledTimes(reads.length);
+    // mcp_call_tool runs read-tier only, whatever the model claims.
+    inner.executeTool.mockClear();
+    await gate().executeTool(call('mcp_call_tool', { serverId: 'slack', toolName: 'post_message', ownerRequested: true }), review());
+    expect(JSON.parse(inner.executeTool.mock.calls[0][0].function.arguments)).toMatchObject({ toolName: 'post_message', ownerRequested: false });
+  });
+
+  it('keeps the job update list closed: reads and jobs only, every name a tool the chat offers', async () => {
+    expect(REVIEW_TOOLS.has('jobs')).toBe(true);
+    for (const name of REVIEW_TOOLS) {
+      expect(name).not.toMatch(/^(gmail_|gdrive_(share|edit|files)|gcalendar|sharepoint_|publish_|open_terminal|send_terminal|manage_|mcp_profile_action|mcp_add_custom|mcp_update_custom|ui_theme_|whatsapp_|job_|knowledge_(write|create_set|propose)|write_file|edit_|save_|create_|update_|configure_|refresh_|delete_|run_command|browser_hands|mcp_etl_(run_query|alter_run|submit_run|download_results)|wait_for_etl_run)/);
+    }
+    // Every name is a real chat tool: a typo would silently take a read away from the main chat's look.
+    const { createPromptManager } = await import('./prompt-manager.js');
+    const offered = new Set(createPromptManager().getToolDefinitions('chat', { mainChatTurn: true, knowledgeAvailable: true, driveConnected: true } as any)
+      .map(tool => tool.function.name));
+    expect([...REVIEW_TOOLS].filter(name => !offered.has(name))).toEqual([]);
+    const tools = ['jobs', 'query_db', 'run_command', 'job_update'].map(name => ({ type: 'function', function: { name } }));
+    expect(filterToolsForReview(tools).map(tool => tool.function.name)).toEqual(['jobs', 'query_db']);
+  });
+
   // Owner requests 2026-10-22: a job reads, edits and saves BotBoy documents (a full save included) and clicks and types in
   // the browser in its automatic turns. Sending, publishing and the terminal stay owner turns.
   it('admits document reads, edits and full saves, and browser hands, in a job', () => {
@@ -103,6 +150,13 @@ describe('job mandate gate', () => {
     const offered = filterToolsForContinuation(['read_product_document', 'edit_product_document', 'save_product_document', 'export_product_document', 'browser_hands', 'open_terminal']
       .map(name => ({ function: { name } })));
     expect(offered.map(tool => tool.function.name)).toEqual(['read_product_document', 'edit_product_document', 'save_product_document', 'browser_hands']);
+  });
+
+  // Stopping queries (docs/maps/query-control.md): a job stops the SQL queries and ETL runs it started; the handler keeps a
+  // continuation to the job's own and ignores ownerRequested there. A job update (the main chat's look) never stops anything.
+  it('lets a continuation stop its own queries, and never a job update', () => {
+    expect(isJobScopeTool('cancel_query')).toBe(true);
+    expect(REVIEW_TOOLS.has('cancel_query')).toBe(false);
   });
 
   it('offers a continuation only the job-scope tools', () => {
@@ -123,6 +177,28 @@ describe('job mandate gate', () => {
   });
 
   // The Knowledge library (knowledge-library.md K9, K18): a continuation may read the library and PROPOSE a change (a card);
+  // Disk (owner approval 2026-10-29): an automatic turn deletes a file only through delete_working_file (the job's own file, its
+  // gzip copy checked byte for byte); deleting shell commands are refused, everything else in run_command passes.
+  it('admits delete_working_file and refuses deleting commands in run_command', async () => {
+    expect(JOB_SCOPE_TOOLS.has('delete_working_file')).toBe(true);
+    expect((await gate().executeTool(call('delete_working_file', { path: 'a.tsv', keptCopy: 'a.tsv.gz' }), continuation())).content).toContain('ran delete_working_file');
+    for (const command of [
+      'rm etl-results/adhoc_1.tsv', 'gzip -k a.tsv && rm a.tsv', 'cd etl-results; rm -f a.tsv', '(rm a)', '/bin/rm a', 'ls | xargs rm',
+      'find . -name "*.tsv" -delete', "python3 -c \"import os; os.remove('a.tsv')\"", "python3 -c 'import shutil; shutil.rmtree(\"d\")'",
+      "python3 -c 'from pathlib import Path; Path(\"a\").unlink()'", 'node -e "require(\'fs\').unlinkSync(\'a\')"', 'unlink a', 'git rm a.tsv', 'trash a',
+    ]) {
+      const result = await gate().executeTool(call('run_command', { command }), continuation());
+      expect(JSON.parse(result.content), command).toMatchObject({ status: 'blocked', code: 'outside_job_mandate' });
+      expect(JSON.parse(result.content).nextAction).toContain('delete_working_file');
+    }
+    for (const command of ['gzip -k etl-results/adhoc_1.tsv', 'python3 transform.py', 'duckdb -c "select count(*) from read_csv(\'a.tsv\')"', 'df -h .', 'echo perm', 'grep -rn uuid a.tsv', 'ls -la etl-results']) {
+      expect((await gate().executeTool(call('run_command', { command }), continuation())).content, command).toContain('ran run_command');
+    }
+    // An owner turn is unchanged: the owner is there.
+    const owner = await gate().executeTool(call('run_command', { command: 'rm a.tsv' }), { callerKind: 'interactive', currentUserMessage: 'delete a.tsv' });
+    expect(owner.content).toContain('ran run_command');
+  });
+
   // it can never write or create a set.
   it('lets a continuation read the library and propose, and never write or create a set', () => {
     expect([...JOB_SCOPE_TOOLS].filter(name => name.startsWith('knowledge_')).sort()).toEqual(['knowledge_list', 'knowledge_load', 'knowledge_propose']);

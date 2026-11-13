@@ -99,6 +99,7 @@ describe('no accent colour is baked into the UI', () => {
   it('the pause ring and the button fill are theme tokens with a declared fallback for each shipped palette', () => {
     const css = read('dashboard.css');
     expect(css).toMatch(/\.button\.primary \{[^}]*border-color:var\(--accent-fill-edge\); background:linear-gradient\(180deg,var\(--accent-fill-top\),var\(--accent-fill-bottom\)\)/);
-    expect(css).toMatch(/\.chat-job-strip \{ --job-run:var\(--accent\); --job-pause:var\(--ring-yellow\); --job-done:var\(--green\); \}/);
+    // The jobs dock (its pills took the capsule's place, owner redesign 2026-11-13) reads the same tokens for its rings.
+    expect(css).toMatch(/\.jobs-dock \{ --job-run:var\(--accent\); --job-pause:var\(--ring-yellow\); --job-done:var\(--green\); --job-stuck:var\(--red\);/);
   });
 });

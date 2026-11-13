@@ -322,7 +322,8 @@ function etlOutcome(
         : {}),
     };
   }
-  if (outcome.code === 'alive_handoff' && /^\d+$/.test(String(outcome.runId ?? ''))) {
+  // A run still going, or one whose large result is still downloading (etl-downloads.ts): pending, read again later.
+  if ((outcome.code === 'alive_handoff' || outcome.code === 'download_landing') && /^\d+$/.test(String(outcome.runId ?? ''))) {
     return {
       state: 'pending',
       sourceKind: 'datanet_etl',
@@ -389,6 +390,8 @@ export function createManagedAnalyticsAnswerRuntime(input: {
         sql,
         datasetDate: value.request.dateRange.end,
         onSubmitted: value.onEtlSubmitted,
+        // One of BotBoy's own queries (query-ledger.ts): the owner can stop it under Running queries.
+        origin: { kind: 'data_room', label: 'Data Room answer' },
       });
       return etlOutcome(outcome, now, analyticsSha256(sql));
     }
@@ -396,7 +399,7 @@ export function createManagedAnalyticsAnswerRuntime(input: {
       'sql-context',
       'run_query',
       { sql },
-      { source: 'agent', timeoutMs: sqlTimeoutMs },
+      { source: 'agent', timeoutMs: sqlTimeoutMs, queryOrigin: { kind: 'data_room', label: 'Data Room answer' } },
     );
     if (call.isError) {
       return {

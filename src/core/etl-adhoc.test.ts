@@ -3,7 +3,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { createStorage, StorageLayer, setSetting } from './storage.js';
-import { createEtlQueryRunner, SCRATCH_POOL_FUSE, type EtlToolCall } from './etl-adhoc.js';
+import { createEtlQueryRunner, createEtlToolCall, SCRATCH_POOL_FUSE, type EtlToolCall } from './etl-adhoc.js';
+import { DOWNLOAD_STILL_RUNNING, downloadResult, resetEtlDownloadsForTests } from './etl-downloads.js';
+import { createQueryLedger } from './query-ledger.js';
 
 /**
  * The mcp_etl_run_query composite (etl-analytics A1): a shared scratch-pair
@@ -20,6 +22,7 @@ describe('etl-adhoc query runner', () => {
     setSetting(storage.getDb(), 'grasp_sync.owner_name', 'Bhagat, AB');
     setSetting(storage.getDb(), 'grasp_sync.owner_email', 'ybhagaab@amazon.com');
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'etl-adhoc-test-'));
+    resetEtlDownloadsForTests();
   });
   afterEach(() => {
     storage.close();
@@ -75,6 +78,41 @@ describe('etl-adhoc query runner', () => {
     });
   }
 
+  // BotBoy's own queries (docs/maps/query-control.md): a submitted run is recorded with who started it, its end is recorded by
+  // whichever reader sees it, and a run query control killed is reported as stopped on purpose, never as a failure to retry.
+  it('records a submitted run with who started it, and its end', async () => {
+    const ledger = createQueryLedger(storage.getDb());
+    const fake = fakeEtl();
+    const result = await runner(fake).runQuery({ sql: 'select 1', origin: { kind: 'job', jobId: 'cj_5' }, label: 'Weekly streams' });
+    expect(result.ok).toBe(true);
+    expect(ledger.forRun('555001')).toMatchObject({ id: 'etl:555001', kind: 'etl', origin: 'job', jobId: 'cj_5', label: 'Weekly streams', preview: 'select 1', endState: 'success' });
+  });
+  it('a run query control killed reads as stopped on purpose, with no diagnosis and no retry advice', async () => {
+    const ledger = createQueryLedger(storage.getDb());
+    const fake = fakeEtl();
+    fake.when('datanet_get_job_run_status', () => {
+      ledger.markStopRequested('etl:555001', 'owner', 'wrong market');
+      return { isError: false, text: JSON.stringify({ status: 'KILLED' }) };
+    });
+    const result = await runner(fake).runQuery({ sql: 'select 1', origin: { kind: 'main' } });
+    expect(result).toMatchObject({ ok: false, code: 'remote_failed', runId: '555001', remoteStatus: 'KILLED' });
+    expect(result.error).toContain('Stopped on purpose by the owner');
+    expect(result.error).toContain('Reason: wrong market');
+    expect(result.nextAction).toMatch(/^Do not resubmit run 555001/);
+    expect(fake.countOf('datanet_get_job_run_error')).toBe(0);
+    // The same words from a later read of the run (late reconciliation, the watcher).
+    const read = await runner(fake).readRun!({ runId: '555001' });
+    expect(read.error).toContain('Stopped on purpose by the owner');
+  });
+  it('a KILLED run nobody stopped through BotBoy is diagnosed as before', async () => {
+    createQueryLedger(storage.getDb());
+    const fake = fakeEtl();
+    fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'KILLED' }) }));
+    const result = await runner(fake).runQuery({ sql: 'select 1' });
+    expect(result.ok).toBe(false);
+    expect(result.error).not.toContain('Stopped on purpose');
+    expect(fake.countOf('datanet_get_job_run_error')).toBe(1);
+  });
   it('creates the scratch pair ONCE and reuses it: second query submits without any create calls', async () => {
     const fake = fakeEtl();
     const q = runner(fake);
@@ -358,6 +396,68 @@ describe('etl-adhoc query runner', () => {
     expect(result.rows).toHaveLength(200);
     expect(result.truncated).toBe(true);
     expect(fs.existsSync(String(result.savedTo))).toBe(true);
+  });
+
+  it('LARGE RESULT (2026-10-29): a download that outlasts the connector is awaited, read once it lands, and never asked twice', async () => {
+    const fake = fakeEtl();
+    fake.when('datanet_download_results', () => ({
+      isError: false,
+      text: '{"error": "Timeout", "message": "Tool \'datanet_download_results\' exceeded 300s timeout.", "retryable": false}',
+    }));
+    let t = Date.now();
+    const q = runner(fake, { now: () => t });
+    const first = await q.readRun!({ runId: '13165875416' });
+    expect(first).toMatchObject({ ok: false, code: 'download_landing', runId: '13165875416', remoteStatus: 'SUCCESS' });
+    expect(first.error).toContain('still downloading');
+    expect(first.nextAction).toContain('Do not download it again or resubmit the run');
+    // The connector's background download writes the whole file at the end.
+    const output = path.join(tmpDir, 'adhoc_13165875416.tsv');
+    fs.writeFileSync(output, `uuid\n${Array.from({ length: 5000 }, (_, i) => `id-${i}`).join('\n')}\n`);
+    fs.utimesSync(output, new Date(t), new Date(t));
+    t += 30_000;
+    expect((await q.readRun!({ runId: '13165875416' })).code).toBe('download_landing'); // first sighting
+    t += 30_000;
+    const landed = await q.readRun!({ runId: '13165875416' });
+    expect(landed).toMatchObject({ ok: true, rowCount: 5000, truncated: true, savedTo: output, columns: ['uuid'] });
+    expect(landed.rows).toHaveLength(200);
+    expect(fake.countOf('datanet_download_results')).toBe(1);
+    // Another runner on the same folder (the watcher and the chat tools are separate instances) reads the same file.
+    const other = runner(fake, { now: () => t });
+    expect(await other.readRun!({ runId: '13165875416' })).toMatchObject({ ok: true, rowCount: 5000 });
+    expect(fake.countOf('datanet_download_results')).toBe(1);
+  });
+
+  it('a run whose result the chat tool is still receiving in the same folder (run_<id>.tsv) is not downloaded again', async () => {
+    const fake = fakeEtl();
+    let t = Date.now();
+    const toolFile = path.join(tmpDir, 'run_777.tsv');
+    // The chat tool's download outlasted the connector (tool-executor.ts › downloadEtlTsv).
+    await downloadResult({
+      runId: '777',
+      output: toolFile,
+      download: async () => ({ isError: false, text: '{"error": "Timeout", "message": "exceeded 300s timeout."}' }),
+      now: () => t,
+    });
+    const q = runner(fake, { now: () => t });
+    expect(await q.readRun!({ runId: '777' })).toMatchObject({ ok: false, code: 'download_landing', runId: '777' });
+    fs.writeFileSync(toolFile, 'uuid\nx\ny\n');
+    fs.utimesSync(toolFile, new Date(t), new Date(t));
+    t += 1_000;
+    expect((await q.readRun!({ runId: '777' })).code).toBe('download_landing'); // first sighting
+    t += 30_000;
+    expect(await q.readRun!({ runId: '777' })).toMatchObject({ ok: true, rowCount: 2, savedTo: toolFile });
+    expect(fake.countOf('datanet_download_results')).toBe(0);
+  });
+
+  it('a download timeout names a large result still downloading, never the VPN', async () => {
+    const callTool = async () => { throw new Error('MCP error -32001: Request timed out'); };
+    const call = createEtlToolCall({ callTool } as any);
+    const download = await call('datanet_download_results', { run_id: '1', output: '/tmp/x.tsv' });
+    expect(download.isError).toBe(true);
+    expect(download.text).toContain(DOWNLOAD_STILL_RUNNING);
+    expect(download.text).not.toMatch(/VPN/);
+    const status = await call('datanet_get_job_run_status', { run_id: '1' });
+    expect(status.text).toContain('VPN'); // other calls keep their transport wording
   });
 
   it('uses the dataset date given and defaults to today when omitted', async () => {

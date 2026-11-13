@@ -212,7 +212,11 @@ export interface SqlContextMcpConfigView extends SqlContextMcpConfig {
 }
 
 export interface McpCallOptions {
-  source?: 'api' | 'agent' | 'dashboard' | 'health';
+  /**
+   * `query-control`: query control's own lookups and stops (query-control.ts), never one of BotBoy's queries. `job-wait`: a job
+   * wait's status check (job-waits.ts: an export's status, the SQL connection's check).
+   */
+  source?: 'api' | 'agent' | 'dashboard' | 'health' | 'query-control' | 'job-wait';
   /**
    * Idle window, not a cap: every progress notification from the server
    * restarts it, so a call that keeps reporting (sql-context sends progress
@@ -243,6 +247,17 @@ export interface McpCallOptions {
    * only, and only together with ownerApproved.
    */
   guidedFlow?: boolean;
+  /**
+   * Who started a SQL call, for BotBoy's own query record (query-ledger.ts, docs/maps/query-control.md): the main chat, a job,
+   * a dashboard, the Data Room. Absent: derived from `source`.
+   */
+  queryOrigin?: import('./query-ledger.js').QueryOrigin;
+  /**
+   * INTERNAL ONLY: a call of BotBoy's query control (query-control.ts). It is not marked or recorded as a query, never waits
+   * behind other calls on the server's lane, and is the only call that may signal a session (mcp-policy.ts ›
+   * validateQueryControlSql). Never populated from model arguments: the model-facing tools construct their options without it.
+   */
+  queryControl?: boolean;
 }
 
 export interface McpManager {

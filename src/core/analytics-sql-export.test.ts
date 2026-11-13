@@ -95,7 +95,8 @@ describe('sql-context export runner (Data Room SQL source)', () => {
         maxRows: SQL_EXPORT_MAX_ROWS, maxBytes: SQL_EXPORT_MAX_BYTES,
       },
       // An idle window (progress restarts it), never a cap on the export.
-      options: { source: 'agent', timeoutMs: 35 * 60_000 },
+      // One of BotBoy's own queries (query-ledger.ts): listed under Running queries with what it is.
+      options: { source: 'agent', timeoutMs: 35 * 60_000, queryOrigin: { kind: 'data_room', label: 'Data Room dataset (complete export)' } },
     }]);
     expect(exported).toMatchObject({
       format: 'csv', size: Buffer.byteLength(CSV), sha256: sha256(CSV), rowCount: 2, columns: COLUMNS,

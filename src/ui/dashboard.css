@@ -1978,40 +1978,69 @@ a.data-room-row:hover { background:var(--hover); }
 .chat-ai-model-notice span { min-width:0; flex:1; }
 .chat-ai-model-notice strong { display:block; color:var(--text); font-size:12px; }
 .chat-ai-model-notice .button { flex:0 0 auto; }
-/* Owner job strip: the job BotBoy works on, its waiting ETL runs, and Stop (ANALYTICS_AUTONOMY_PLAN.md). */
-.chat-job-strip { --job-run:var(--accent); --job-pause:var(--ring-yellow); --job-done:var(--green); }
-/* --yellow on a light theme is a dark amber chosen for TEXT (it reads brown on white); a ring needs a gold that reads as yellow and still holds 3:1 on the strip.
-   So the pause ring has its own theme token: --ring-yellow is that gold on the shipped light theme (and on any light theme made in chat) and the plain --yellow on dark ones. */
-.chat-job-strip:not([hidden]) { display:flex; align-items:center; gap:9px; margin:0 15px 8px; padding:8px 10px 8px 11px; border:1px solid var(--border-strong); border-radius:11px; color:var(--soft); background:var(--surface); font-size:11px; line-height:1.45; position:relative; }
-.chat-job-strip .chat-job-dot { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--accent); }
-.chat-job-strip.continuing .chat-job-dot { animation:chat-job-pulse 1.2s ease-in-out infinite; }
-.chat-job-strip .chat-job-text { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.chat-job-strip .chat-job-text strong { color:var(--text); font-weight:600; }
-.chat-job-strip .chat-job-state { flex:0 0 auto; color:var(--muted); white-space:nowrap; }
-.chat-job-strip .button { flex:0 0 auto; }
-/* The border is the state (owner request 2026-10-16). running: a faint violet ring with one light travelling around it.
-   paused: all yellow, still. done: all green, still. A job the owner stopped, or that expired, did not finish: it stays neutral. */
-.chat-job-strip.running { border-color:color-mix(in srgb, var(--job-run) 30%, var(--border-strong)); }
-.chat-job-strip.paused { border-color:var(--job-pause); box-shadow:0 0 0 3px color-mix(in srgb, var(--job-pause) 16%, transparent); }
-.chat-job-strip.done { border-color:var(--job-done); box-shadow:0 0 0 3px color-mix(in srgb, var(--job-done) 14%, transparent); }
-.chat-job-strip.paused .chat-job-dot { background:var(--job-pause); }
-.chat-job-strip.ended .chat-job-dot { background:var(--muted); }
-.chat-job-strip.done .chat-job-dot { background:var(--job-done); }
-/* The light is a soft spot painted on a 2px ring that is cut out of the strip with a mask, so it can only ever show ON the border,
-   whatever the strip's width or height. It sits on a pseudo-element, which the 5 s re-render (it rewrites only the strip's
-   children) never touches, so the light is not restarted. Its centre visits the four corners; the waypoints follow the long edges'
-   share of the perimeter of a one-line strip, so the speed stays about even. */
-.chat-job-strip.running::before {
+/* ── Jobs in the chat panel (owner redesign 2026-11-13, the approved demo `.agents/tasks/jobs-ui-demo/demo.html`;
+   docs/maps/job-continuations.md) ──
+   The main chat stays the plain chat. Jobs live in a dock right above the composer, where the single-job strip was: one job is one
+   full-width pill (what it works on, its state and Stop), two split the row, three take a third each, and more add "+N more", which
+   opens a drawer with every job. Each pill's second line previews what its job is doing now. A job opens as a bottom sheet over the
+   main chat, with the main chat's own bubbles. Normal chat colours only: theme tokens, no job tint (docs/maps/ui-themes.md). */
+/* No jobs surface stretches with the panel at Wide or Expand (owner request 2026-10-29): the dock, the sheets' contents and the cards
+   stop at --jobs-column / --jobs-card-max on the panel's left edge. At the default width all of them fill the panel. */
+#chat-panel { --jobs-card-max:560px; --jobs-column:720px; }
+.jobs-dock { --job-run:var(--accent); --job-pause:var(--ring-yellow); --job-done:var(--green); --job-stuck:var(--red); min-width:0; max-width:var(--jobs-column); display:flex; gap:6px; margin:0 15px 8px; }
+.jobs-dock[hidden] { display:none; }
+.job-pill { position:relative; flex:1 1 0; min-width:0; border:1px solid var(--border-strong); border-radius:11px; color:var(--soft); background:var(--surface); font-size:11px; line-height:1.45; transition:background .15s; }
+.job-pill:hover { background:var(--hover); }
+.job-pill-main { width:100%; min-width:0; display:flex; flex-direction:column; gap:3px; padding:8px 10px 8px 11px; border:0; border-radius:inherit; color:inherit; background:transparent; font:inherit; text-align:left; cursor:pointer; }
+.job-pill-main:focus-visible { outline:2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset:2px; }
+.job-pill-row { min-width:0; display:flex; align-items:center; gap:9px; }
+.job-pill.has-act .job-pill-row { padding-right:64px; }
+.job-pill.has-act.act-x .job-pill-row { padding-right:22px; }
+.job-pill-dot { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--job-run); }
+.job-pill-goal { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.job-pill-goal strong { color:var(--text); font-weight:600; }
+.job-pill-num { margin-right:4px; color:var(--muted); font-weight:600; }
+.job-pill-state { flex:0 0 auto; color:var(--muted); white-space:nowrap; }
+.job-pill-preview { min-width:0; display:flex; align-items:center; gap:6px; padding-left:16px; color:var(--muted); font-size:10.5px; }
+.job-pill-ic { flex:0 0 auto; width:14px; text-align:center; }
+.job-pill-tx { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.job-pill-tx b { color:var(--soft); font-weight:600; }
+.job-pill-preview.fresh .job-pill-tx { animation:jobs-preview-in .3s ease-out; }
+.job-pill-act { position:absolute; top:6px; right:8px; display:flex; }
+.job-pill-act .button.small { min-height:24px; padding:2px 8px; font-size:11px; }
+.jobs-dismiss { height:22px; min-width:22px; padding:0 6px; font-size:13px; }
+/* Two and three jobs share the row: the label, the state words and the one-pill action give way to the title and the preview. */
+.jobs-dock.n2 .job-pill-lead, .jobs-dock.n3 .job-pill-lead, .jobs-dock.n2 .job-pill-state, .jobs-dock.n3 .job-pill-state { display:none; }
+.jobs-dock.n3 .job-pill-main { gap:2px; padding:7px 8px 7px 9px; }
+.jobs-dock.n3 .job-pill-row { gap:7px; }
+.jobs-dock.n3 .job-pill-preview { padding-left:0; font-size:10px; }
+.jobs-dock.n3 .job-pill-num { display:none; }
+/* The border is the state, as the single-job strip had it (owner request 2026-10-16). Running: a faint ring with one light
+   travelling round it. Waiting: a fainter ring, still. Needs you: all yellow. Stuck: all red. Done: all green. Stopped or ended:
+   neutral. Each class is set by an explicit boolean, so a redraw never restarts the light. */
+.job-pill.running { border-color:color-mix(in srgb, var(--job-run) 30%, var(--border-strong)); }
+.job-pill.waiting { border-color:color-mix(in srgb, var(--job-run) 22%, var(--border-strong)); }
+.job-pill.waiting .job-pill-dot { background:color-mix(in srgb, var(--job-run) 55%, var(--muted)); }
+.job-pill.needs { border-color:var(--job-pause); box-shadow:0 0 0 3px color-mix(in srgb, var(--job-pause) 16%, transparent); }
+.job-pill.needs .job-pill-dot { background:var(--job-pause); }
+.job-pill.stuck { border-color:var(--job-stuck); box-shadow:0 0 0 3px color-mix(in srgb, var(--job-stuck) 14%, transparent); }
+.job-pill.stuck .job-pill-dot { background:var(--job-stuck); }
+.job-pill.needs .job-pill-tx, .job-pill.stuck .job-pill-tx { color:var(--text); }
+.job-pill.done { border-color:var(--job-done); box-shadow:0 0 0 3px color-mix(in srgb, var(--job-done) 14%, transparent); }
+.job-pill.done .job-pill-dot { background:var(--job-done); }
+.job-pill.paused .job-pill-dot, .job-pill.ended .job-pill-dot { background:var(--muted); }
+.job-pill.busy .job-pill-dot { animation:chat-job-pulse 1.2s ease-in-out infinite; }
+/* The light is a soft spot painted on a 2px ring cut out of the pill with a mask, so it can only show ON the border, whatever the
+   pill's size. It sits on a pseudo-element no redraw touches. */
+.job-pill.running::before {
   content:""; position:absolute; inset:-1px; padding:2px; border-radius:inherit; pointer-events:none;
   background:radial-gradient(circle closest-side, color-mix(in srgb, var(--job-run) 92%, transparent), transparent) -36px -36px / 72px 72px no-repeat;
   -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor;
   mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite:exclude;
   animation:chat-job-orbit 8s linear infinite;
 }
-/* The chat panel hides by sliding off-screen, not by display:none, so a running job would keep animating where nobody can see it. */
-#chat-panel.hidden .chat-job-strip.running::before { animation-play-state:paused; }
-.chat-job-strip.paused .chat-job-text { white-space:normal; }
-.chat-job-strip .chat-job-note { display:block; color:var(--text); white-space:normal; overflow-wrap:anywhere; max-height:4.4em; overflow:hidden; }
+/* The chat panel hides by sliding off-screen, not by display:none, so a running pill would keep animating where nobody can see it. */
+#chat-panel.hidden .job-pill.running::before, #chat-panel.hidden .job-pill.busy .job-pill-dot { animation-play-state:paused; }
 @keyframes chat-job-pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
 @keyframes chat-job-orbit {
   0%    { background-position:-36px -36px; }
@@ -2020,10 +2049,183 @@ a.data-room-row:hover { background:var(--hover); }
   95%   { background-position:-36px calc(100% + 36px); }
   100%  { background-position:-36px -36px; }
 }
-/* With reduced motion nothing travels: the running ring is lit evenly instead, so the state still reads. */
+@keyframes jobs-preview-in { from { opacity:.25; transform:translateY(3px); } to { opacity:1; transform:none; } }
+/* "+N more" (and BotBoy's running queries): opens the drawer. A dot when a job behind it needs the owner. */
+.jobs-more-btn { position:relative; flex:0 0 auto; min-width:44px; display:grid; place-items:center; align-content:center; gap:1px; padding:0 8px; border:1px solid var(--border-strong); border-radius:11px; color:var(--soft); background:var(--surface); font:inherit; font-size:11px; font-weight:650; cursor:pointer; }
+.jobs-more-btn:hover, .jobs-more-btn[aria-expanded="true"] { color:var(--text); background:var(--hover); }
+.jobs-more-btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.jobs-more-btn small { color:var(--muted); font-size:9px; font-weight:500; white-space:nowrap; }
+.jobs-more-btn.wide { display:inline-flex; gap:8px; height:34px; padding:0 12px 0 6px; font-weight:600; }
+.jobs-more-flag { position:absolute; top:5px; right:5px; width:7px; height:7px; border-radius:50%; background:var(--job-pause); }
+/* Sheets rise from the bottom of the panel up to its header (which stays usable), over a dimmed main chat. */
+.jobs-scrim { position:absolute; left:0; right:0; top:var(--jobs-sheet-top, 67px); bottom:0; z-index:5; background:color-mix(in srgb, var(--bg) 62%, transparent); opacity:0; transition:opacity .22s; }
+.jobs-scrim.open { opacity:1; }
+.jobs-scrim[hidden] { display:none; }
+.jobs-sheet-panel { position:absolute; left:8px; right:8px; bottom:0; z-index:6; min-height:0; display:flex; flex-direction:column; border:1px solid color-mix(in srgb, var(--accent) 30%, var(--border-strong)); border-bottom:0; border-radius:16px 16px 0 0; background:var(--bg-raised); box-shadow:0 -18px 50px rgba(0,0,0,.35); transform:translateY(105%); transition:transform .28s cubic-bezier(.2,.8,.2,1); }
+.jobs-sheet-panel[hidden] { display:none; }
+.jobs-sheet-panel.open { transform:translateY(0); }
+.jobs-sheet-panel.dragging { transition:none; }
+/* The sheets sit 8px inside the panel's sides with a slim edge in the running pill's colour (owner request 2026-11-13). While the
+   open job runs, one light travels round the job sheet's edge, as on its pill: a conic sweep painted on a 2px ring cut out with a
+   mask (sides and top only; the sheet has no bottom edge), so it shows only ON the edge. */
+@property --jobs-sheet-angle { syntax:'<angle>'; inherits:false; initial-value:0deg; }
+.jobs-view.running::before {
+  content:""; position:absolute; inset:-1px -1px 0; z-index:1; padding:2px 2px 0; border-radius:inherit; pointer-events:none;
+  background:conic-gradient(from var(--jobs-sheet-angle), transparent 0deg 290deg, color-mix(in srgb, var(--accent) 92%, transparent) 340deg, transparent 360deg);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite:xor;
+  mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite:exclude;
+  animation:jobs-sheet-orbit 9s linear infinite;
+}
+@keyframes jobs-sheet-orbit { to { --jobs-sheet-angle:360deg; } }
+#chat-panel.hidden .jobs-view.running::before { animation-play-state:paused; }
+.jobs-grab { flex:0 0 auto; display:grid; place-items:center; height:16px; cursor:grab; touch-action:none; }
+.jobs-grab span { width:38px; height:4px; border-radius:4px; background:var(--border-strong); }
+.jobs-sheet-bar { position:relative; flex:0 0 auto; display:flex; align-items:center; gap:4px; padding:0 9px 8px 15px; touch-action:none; }
+.jobs-sheet-bar h2, .jobs-sheet-bar > b { min-width:0; flex:1; margin:0; overflow:hidden; color:var(--text); font-size:13px; font-weight:650; line-height:1.4; text-overflow:ellipsis; white-space:nowrap; outline:none; }
+.jobs-sheet-bar small { margin-left:7px; color:var(--muted); font-size:11px; font-weight:500; }
+.jobs-icon { flex:0 0 auto; height:28px; min-width:28px; padding:0 8px; border:0; border-radius:999px; color:var(--soft); background:transparent; font:inherit; font-size:14px; line-height:1; cursor:pointer; }
+.jobs-icon:hover, .jobs-icon[aria-expanded="true"] { color:var(--text); background:var(--hover); }
+.jobs-icon:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.jobs-drawer { max-height:min(62%, 560px); }
+.jobs-drawer-list { min-height:0; overflow-y:auto; padding:0 0 4px; overscroll-behavior:contain; }
+.jobs-drawer-list > * { max-width:var(--jobs-column); }
+/* A job's sheet takes the same faint accent wash as the job rows in the main chat, so it reads as the job's own (owner request
+   2026-11-13); its bubbles stay the main chat's own. */
+.jobs-view { top:calc(var(--jobs-sheet-top, 67px) + 8px); background:color-mix(in srgb, var(--accent) 4%, var(--bg-raised)); }
+/* The job's progress stays on top; its thread scrolls under it, and opens at the newest message. */
+.jobs-progress { flex:0 0 auto; max-height:42%; overflow-y:auto; padding:2px 15px 12px; border-bottom:1px solid var(--border); overscroll-behavior:contain; }
+.jobs-progress > * { max-width:var(--jobs-column); }
+.jobs-progress-head { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.jobs-view-meta { color:var(--muted); font-size:10.5px; }
+.jobs-view-scroll { position:relative; min-height:0; flex:1; overflow-y:auto; padding:16px 15px 14px; overscroll-behavior:contain; }
+.jobs-newest { position:sticky; bottom:6px; z-index:2; display:block; width:max-content; margin:10px auto 0; padding:5px 12px; border:1px solid var(--border-strong); border-radius:999px; color:var(--soft); background:var(--surface); font:inherit; font-size:11px; box-shadow:0 6px 18px rgba(0,0,0,.3); cursor:pointer; }
+.jobs-newest[hidden] { display:none; }
+.jobs-newest:hover { color:var(--text); background:var(--hover); }
+.jobs-view-composer { flex:0 0 auto; }
+.job-glyph { flex:0 0 auto; width:28px; height:28px; display:grid; place-items:center; border-radius:9px; color:var(--soft); background:var(--surface-2); }
+.job-glyph svg { width:58%; height:58%; }
+.job-glyph.small { width:22px; height:22px; border-radius:7px; }
+.job-glyph.round { width:22px; height:22px; border-radius:50%; }
+.job-glyph.k-data { color:var(--accent); background:var(--accent-soft); }
+.job-glyph.k-doc { color:var(--green); background:var(--green-soft); }
+.job-glyph.k-dash { color:var(--yellow); background:var(--yellow-soft); }
+.jobs-chips { display:flex; flex-wrap:wrap; gap:6px; }
+.jobs-chip { height:28px; padding:0 13px; border:1px solid var(--border-strong); border-radius:999px; color:var(--text); background:var(--surface); font:inherit; font-size:11px; font-weight:600; cursor:pointer; transition:background .15s; }
+.jobs-chip:hover { background:var(--hover); }
+.jobs-chip.primary { color:#fff; border-color:var(--accent-fill-edge); background:linear-gradient(180deg,var(--accent-fill-top),var(--accent-fill-bottom)); }
+.jobs-chip.ghost { border-color:transparent; color:var(--muted); background:transparent; font-weight:500; }
+.jobs-chip.ghost:hover { color:var(--text); background:var(--hover); }
+.jobs-chip:focus-visible, .jobs-row:focus-visible, .jobs-started:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.jobs-group { padding:11px 15px 3px; color:var(--faint); font-size:9.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.jobs-row { width:100%; display:flex; align-items:center; gap:11px; padding:8px 15px; border:0; color:inherit; background:transparent; font:inherit; text-align:left; cursor:pointer; }
+.jobs-row-when { flex:0 0 auto; align-self:flex-start; margin-top:2px; color:var(--faint); font-size:10px; }
+.jobs-row:hover { background:var(--hover); }
+.jobs-row-text { min-width:0; flex:1; }
+.jobs-row-text > b { display:block; overflow:hidden; color:var(--text); font-size:12px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-row-text em { color:var(--faint); font-style:normal; font-weight:500; }
+.jobs-row-text > span { display:block; overflow:hidden; color:var(--muted); font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-row-text > span b { color:var(--soft); font-weight:600; }
+.jobs-dot { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--faint); }
+.jobs-dot.running { background:var(--accent); animation:chat-job-pulse 2.2s ease-in-out infinite; }
+.jobs-dot.waiting { background:color-mix(in srgb, var(--accent) 55%, var(--muted)); }
+.jobs-dot.needs { background:var(--ring-yellow); }
+.jobs-dot.stuck { background:var(--red); }
+.jobs-dot.done { background:var(--green); }
+.jobs-sheet-foot { margin-top:6px; padding:10px 15px 13px; border-top:1px solid var(--border); color:var(--faint); font-size:10.5px; }
+.jobs-empty { margin:0; padding:12px 2px; color:var(--faint); font-size:11px; }
+.jobs-toast { position:absolute; left:50%; bottom:86px; z-index:8; max-width:min(88%, 480px); overflow:hidden; padding:6px 14px; border:1px solid var(--border-strong); border-radius:999px; color:var(--soft); background:var(--bg-raised); box-shadow:0 10px 30px rgba(0,0,0,.3); font-size:11px; text-overflow:ellipsis; white-space:nowrap; transform:translateX(-50%); animation:jobs-fade .2s; pointer-events:none; }
+.jobs-query { display:flex; align-items:flex-start; gap:11px; padding:9px 15px; }
+.jobs-query + .jobs-query { border-top:1px solid var(--border); }
+.jobs-query-text { min-width:0; flex:1; display:grid; gap:2px; }
+.jobs-query-text b { color:var(--text); font-size:12px; font-weight:600; line-height:1.35; overflow-wrap:anywhere; }
+.jobs-query-text span { color:var(--muted); font-size:11px; line-height:1.4; overflow-wrap:anywhere; }
+.jobs-query-text code { overflow:hidden; color:var(--faint); font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-query-note { margin:4px 0 0; color:var(--red); font-size:11px; line-height:1.4; overflow-wrap:anywhere; }
+.jobs-query-act { flex:0 0 auto; display:flex; align-items:center; gap:4px; }
+.jobs-query-busy { padding:0 4px; color:var(--muted); font-size:11px; line-height:28px; }
+.jobs-chip.danger { border-color:color-mix(in srgb, var(--red) 45%, transparent); color:var(--red); background:var(--red-soft); }
+.jobs-chip.danger:hover { background:color-mix(in srgb, var(--red) 18%, transparent); }
+.jobs-query-warn { margin:2px 15px 8px; color:var(--muted); font-size:10.5px; line-height:1.4; overflow-wrap:anywhere; }
+.jobs-queries { display:grid; overflow:hidden; border:1px solid var(--border); border-radius:12px; background:var(--surface); }
+.jobs-queries .jobs-query { padding:9px 11px; }
+.jobs-menu { position:absolute; top:30px; right:8px; z-index:3; width:170px; padding:5px; border:1px solid var(--border-strong); border-radius:12px; background:var(--bg-raised); box-shadow:0 16px 40px rgba(0,0,0,.35); animation:jobs-drop .18s ease; }
+.jobs-menu button { width:100%; display:block; padding:7px 10px; border:0; border-radius:8px; color:var(--soft); background:transparent; font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.jobs-menu button:hover { color:var(--text); background:var(--hover); }
+.jobs-menu .danger { color:var(--red); }
+.jobs-menu hr { margin:4px; border:0; border-top:1px solid var(--border); }
+.jobs-pill { display:inline-flex; padding:2px 9px; border-radius:999px; color:var(--accent); background:var(--accent-soft); font-size:10.5px; font-weight:650; }
+.jobs-pill.needs { color:var(--yellow); background:var(--yellow-soft); }
+.jobs-pill.stuck { color:var(--red); background:var(--red-soft); }
+.jobs-pill.done { color:var(--green); background:var(--green-soft); }
+.jobs-pill.paused, .jobs-pill.ended { color:var(--muted); background:var(--hover); }
+.jobs-now { margin:8px 0 8px; color:var(--text); font-size:12.5px; line-height:1.45; overflow-wrap:anywhere; }
+.jobs-bar { position:relative; height:3px; overflow:hidden; border-radius:3px; background:var(--hover); }
+.jobs-bar::after { content:""; position:absolute; top:0; bottom:0; left:0; width:32%; border-radius:3px; background:linear-gradient(90deg, transparent, var(--accent), transparent); animation:jobs-slide 1.7s ease-in-out infinite; }
+.jobs-bar.needs::after, .jobs-bar.stuck::after, .jobs-bar.done::after, .jobs-bar.paused::after, .jobs-bar.ended::after { width:100%; animation:none; opacity:.6; }
+.jobs-bar.needs::after { background:var(--ring-yellow); }
+.jobs-bar.stuck::after { background:var(--red); }
+.jobs-bar.done::after { background:var(--green); }
+.jobs-bar.paused::after, .jobs-bar.ended::after { background:var(--faint); }
+.jobs-ask { margin-top:12px; padding:11px 13px 12px; border:1px solid color-mix(in srgb, var(--ring-yellow) 55%, transparent); border-radius:12px; background:var(--yellow-soft); }
+.jobs-ask.stuck { border-color:color-mix(in srgb, var(--red) 50%, transparent); background:var(--red-soft); }
+.jobs-ask p { margin:0 0 9px; color:var(--text); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+.jobs-ask-hint { color:var(--muted); font-size:10.5px; }
+.jobs-sec { margin:14px 0 8px; color:var(--faint); font-size:9.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.jobs-outs { display:grid; gap:6px; }
+.jobs-out { display:flex; align-items:center; gap:10px; min-width:0; padding:8px 11px; overflow:hidden; border:1px solid var(--border); border-radius:10px; color:var(--text); background:var(--surface); font-size:11.5px; text-decoration:none; white-space:nowrap; text-overflow:ellipsis; }
+.jobs-out i { margin-left:auto; flex:0 0 auto; color:var(--faint); font-size:10px; font-style:normal; }
+a.jobs-out:hover { border-color:var(--border-strong); }
+.jobs-details { margin-top:12px; padding-top:9px; border-top:1px solid var(--border); }
+.jobs-details summary { color:var(--muted); font-size:11px; cursor:pointer; }
+.jobs-details-body { display:grid; gap:4px; margin-top:8px; color:var(--muted); font-size:10.5px; overflow-wrap:anywhere; }
+.jobs-thread .chat-msg:last-child { margin-bottom:0; }
+.chat-msg.job-card-row { max-width:100%; padding:0; border:0; background:transparent; }
+.jobs-card-slot:empty { display:none; }
+.jobs-started { display:inline-flex; align-items:center; gap:8px; max-width:100%; height:30px; padding:0 11px 0 4px; border:1px solid var(--border); border-radius:999px; color:var(--muted); background:var(--surface); font:inherit; font-size:11px; cursor:pointer; transition:border-color .2s, background .2s; }
+.jobs-started:hover { border-color:var(--border-strong); background:var(--hover); }
+.jobs-started span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-started b { color:var(--soft); font-weight:600; }
+.jobs-card { max-width:var(--jobs-card-max); padding:12px 13px 13px; border:1px solid var(--border); border-radius:13px; background:var(--surface); animation:jobs-drop .3s ease; }
+.jobs-card.done { border-color:color-mix(in srgb, var(--green) 35%, var(--border)); background:color-mix(in srgb, var(--green-soft) 60%, var(--surface)); }
+.jobs-card.stuck { border-color:color-mix(in srgb, var(--red) 40%, var(--border)); background:color-mix(in srgb, var(--red-soft) 60%, var(--surface)); }
+.jobs-card-head { display:flex; align-items:center; gap:9px; }
+.jobs-card-head b { min-width:0; flex:1; overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-badge { flex:0 0 auto; padding:2px 8px; border-radius:999px; font-size:10px; font-weight:700; }
+.jobs-badge.done { color:var(--green); background:var(--green-soft); }
+.jobs-badge.stuck { color:var(--red); background:var(--red-soft); }
+.jobs-badge.ended { color:var(--muted); background:var(--hover); }
+.jobs-card p { margin:8px 0 10px; color:var(--soft); font-size:12px; line-height:1.45; overflow-wrap:anywhere; }
+.jobs-card p.jobs-card-quiet { margin-bottom:0; color:var(--muted); }
+.jobs-card .jobs-outs { margin-bottom:10px; }
+.jobs-card-missing { color:var(--faint); font-size:11px; }
+.chat-job-ref { display:block; margin-bottom:4px; color:var(--accent); font-size:10px; font-weight:650; }
+/* A main-chat row about a job (a report, a question or hand-back, a job that ended, a job's reply to a #N message) takes a faint
+   wash of the running pill's accent and nothing else: no bar, no accent border. It is fainter than the owner's own bubbles
+   (--accent-soft with an accent border), so the two never read alike (owner requests 2026-11-13; app.js › chatRowClass). */
+.chat-msg.assistant.job-row { background:color-mix(in srgb, var(--accent) 4%, var(--surface)); }
+.job-update-body.folded { max-height:15em; overflow:hidden; -webkit-mask-image:linear-gradient(to bottom, #000 70%, transparent); mask-image:linear-gradient(to bottom, #000 70%, transparent); }
+.job-update-body.quiet { color:var(--muted); font-size:12px; }
+.job-update-more { display:block; margin:5px 0 0; padding:0; border:0; color:var(--accent); background:none; font:inherit; font-size:11px; font-weight:600; cursor:pointer; }
+.job-update-foot { margin-top:10px; }
+.jobs-update { max-width:var(--jobs-card-max); padding-top:9px; border-top:1px solid var(--border); }
+.jobs-update-head { display:flex; align-items:center; gap:8px; min-width:0; }
+.jobs-update-head b { min-width:0; flex:1; overflow:hidden; color:var(--soft); font-size:11.5px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.jobs-update .jobs-outs { margin-top:8px; }
+.jobs-update .jobs-chips { margin-top:8px; }
+.jobs-update.quiet .jobs-chip { flex:0 0 auto; }
+.jobs-badge.run { color:var(--accent); background:var(--accent-soft); }
+.jobs-badge.needs { color:var(--yellow); background:var(--yellow-soft); }
+@keyframes jobs-drop { from { opacity:0; transform:translateY(-5px); } to { opacity:1; transform:none; } }
+@keyframes jobs-fade { from { opacity:0; } to { opacity:1; } }
+@keyframes jobs-slide { from { transform:translateX(-100%); } to { transform:translateX(320%); } }
+/* With reduced motion nothing travels, pulses or slides: the running ring is lit evenly, so the state still reads. */
 @media (prefers-reduced-motion: reduce) {
-  .chat-job-strip.continuing .chat-job-dot { animation:none; }
-  .chat-job-strip.running::before { animation:none; background:color-mix(in srgb, var(--job-run) 40%, transparent); }
+  .job-pill.running::before { animation:none; background:color-mix(in srgb, var(--job-run) 40%, transparent); }
+  .jobs-view.running::before { animation:none; background:color-mix(in srgb, var(--accent) 40%, transparent); }
+  .job-pill.busy .job-pill-dot, .jobs-dot.running, .job-pill-preview.fresh .job-pill-tx { animation:none; }
+  .jobs-bar::after { width:100%; animation:none; opacity:.45; }
+  .jobs-sheet-panel, .jobs-scrim { transition:none; }
+  .jobs-card, .jobs-menu, .jobs-toast { animation:none; }
 }
 .chat-msg.assistant.continuation { border-left:2px solid var(--accent-soft); }
 
@@ -2250,3 +2452,50 @@ a.data-room-row:hover { background:var(--hover); }
 .document-rendered .md-image-link { display:table; margin:14px auto; }
 .md-image-missing { display:inline-block; padding:2px 8px; border:1px dashed var(--border-strong); border-radius:6px; color:var(--muted); font-size:11px; line-height:1.6; }
 .document-visual { margin:14px 0; }
+/* Chat notices (MIDWAY_NOTICES_PLAN.md §6, chat-notices-ui.js): BotBoy's own status rows as one small notice each. Line 1 is the
+   toggle (a dot, the title, the time, a chevron), so the title keeps the full width; line 2 holds the labels, the one button and
+   a key next step. The details and the timeline open under it. A row that is only a notice has no bubble around it, and a
+   notice stops at --jobs-card-max like the job cards. */
+.chat-msg.notice-row,
+.chat-msg:has(> .chat-notice:only-child) { max-width:100%; margin-bottom:8px; padding:0; border:0; background:transparent; }
+.chat-msg > .chat-notice:not(:only-child) { margin-top:6px; }
+.chat-notice { max-width:var(--jobs-card-max, 560px); border:1px solid var(--border); border-radius:11px; color:var(--soft); background:var(--surface); font-size:12px; line-height:1.4; }
+.chat-notice.sev-error { border-color:color-mix(in srgb, var(--red) 30%, var(--border)); background:color-mix(in srgb, var(--red-soft) 55%, var(--surface)); }
+.chat-notice.sev-warning { border-color:color-mix(in srgb, var(--yellow) 30%, var(--border)); background:color-mix(in srgb, var(--yellow-soft) 55%, var(--surface)); }
+.chat-notice.fixed, .chat-notice.quiet { background:transparent; }
+.chat-notice-top { min-width:0; display:flex; align-items:center; }
+.chat-notice-top > .chat-notice-action { margin:0 8px 0 2px; }
+.chat-notice-head { min-width:0; flex:1 1 auto; display:flex; align-items:center; gap:8px; padding:7px 10px; border:0; border-radius:10px; color:inherit; background:transparent; font:inherit; text-align:left; cursor:pointer; }
+.chat-notice-head:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.chat-notice-dot { width:7px; height:7px; flex:0 0 auto; border-radius:50%; background:var(--faint); }
+.sev-error .chat-notice-dot { background:var(--red); box-shadow:0 0 0 3px var(--red-soft); }
+.sev-warning .chat-notice-dot { background:var(--yellow); box-shadow:0 0 0 3px var(--yellow-soft); }
+.sev-info .chat-notice-dot { background:var(--muted); }
+.sev-success .chat-notice-dot, .fixed .chat-notice-dot { background:var(--green); box-shadow:0 0 0 3px var(--green-soft); }
+.chat-notice-title { min-width:0; flex:1 1 auto; overflow:hidden; color:var(--text); font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
+.fixed .chat-notice-title, .quiet .chat-notice-title { color:var(--muted); font-weight:600; }
+.chat-notice-count { flex:0 0 auto; padding:0 6px; border-radius:999px; color:var(--muted); background:var(--hover); font-size:10px; font-weight:700; }
+.chat-notice-time { flex:0 0 auto; color:var(--faint); font-size:10.5px; white-space:nowrap; }
+.chat-notice svg.chat-notice-chevron { width:12px; height:12px; flex:0 0 auto; color:var(--faint); }
+.chat-notice.expanded svg.chat-notice-chevron { transform:rotate(90deg); }
+.chat-notice-head:hover .chat-notice-time, .chat-notice-head:hover svg.chat-notice-chevron { color:var(--muted); }
+.chat-notice-sub { min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:5px 6px; margin-top:-3px; padding:0 10px 8px 25px; cursor:pointer; }
+.chat-notice-labels { min-width:0; display:flex; flex-wrap:wrap; gap:4px; }
+.chat-notice-label { max-width:200px; overflow:hidden; padding:1px 7px; border-radius:999px; color:var(--soft); background:var(--hover); font-size:10px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.fixed .chat-notice-label, .quiet .chat-notice-label { color:var(--muted); }
+.chat-notice-label.fixed-label { color:var(--green); background:var(--green-soft); }
+.chat-notice-next-inline { min-width:0; flex:1 1 160px; color:var(--muted); font-size:11px; }
+.chat-notice-action { flex:0 0 auto; margin-left:auto; display:inline-flex; align-items:center; height:26px; padding:0 10px; border:1px solid var(--border-strong); border-radius:8px; color:var(--text); background:var(--surface); font:inherit; font-size:11px; font-weight:650; white-space:nowrap; cursor:pointer; }
+.chat-notice-action:hover { background:var(--hover); }
+.chat-notice-action:disabled { opacity:.6; cursor:default; }
+.chat-notice-status { margin:0; padding:0 12px 8px 25px; color:var(--muted); font-size:11px; }
+.chat-notice-body { display:none; padding:0 12px 10px 25px; color:var(--muted); font-size:11px; line-height:1.5; }
+.chat-notice.expanded .chat-notice-body { display:block; }
+.chat-notice-body p { margin:0 0 5px; }
+.chat-notice-next { color:var(--soft); }
+.chat-notice-detail { overflow-wrap:anywhere; }
+.chat-notice-detail.content-block { color:var(--soft); font-size:11.5px; }
+.chat-notice-timeline { display:grid; gap:3px; margin:6px 0 0; padding:6px 0 0; border-top:1px solid var(--border); list-style:none; }
+.chat-notice-timeline li { min-width:0; display:flex; gap:8px; }
+.chat-notice-timeline time { min-width:58px; flex:0 0 auto; color:var(--faint); }
+.chat-notice-timeline span { min-width:0; overflow-wrap:anywhere; }

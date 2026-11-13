@@ -59,6 +59,9 @@ describe('family labels', () => {
     expect(familyOf('read_product_document')).toBe('documents');
     expect(familyOf('edit_product_document')).toBe('documents');
     expect(familyOf('edit_file')).toBe('files and commands');
+    // A job's thread can quote what the job read; `jobs read` brings it into the main chat (PARALLEL_JOBS_PLAN.md §11).
+    expect(familyOf('jobs')).toBe('job threads');
+    expect(familyOf('job_update')).not.toBe('job threads');
     expect(familyOf('something_new')).toBe('other source');
   });
 

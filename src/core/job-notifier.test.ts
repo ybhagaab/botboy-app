@@ -94,10 +94,16 @@ describe('job notifier', () => {
       jobs.end(expired.id, 'expired', 'idle for 24 hours');
       expect(dueEvents(jobs.get(expired.id)!, clock).map(event => event.kind)).toEqual(['expired']);
 
+      // A job replaced before threads existed (its row says so), and a provisional job whose main chat turn used its results.
       const replaced = jobs.start({ goal: 'c' });
       jobs.setNotify(replaced.id, true);
-      jobs.start({ goal: 'something else the owner asked for' });
+      jobs.end(replaced.id, 'done', 'replaced by a new job');
       expect(jobs.get(replaced.id)).toMatchObject({ status: 'done', endReason: 'replaced by a new job' });
+      const folded = jobs.start({ goal: 'd', provisional: true });
+      jobs.setNotify(folded.id, true);
+      jobs.end(folded.id, 'done', 'answered in the main chat');
+      const foldedAt = Date.parse(jobs.get(folded.id)!.endedAt!);
+      expect(dueEvents(jobs.get(folded.id)!, foldedAt + JOB_NOTIFY_REPORT_WAIT_MS + 60_000)).toEqual([]);
       // Right after, and long after the closing-report wait: a replaced job is never announced as "finished".
       const replacedAt = Date.parse(jobs.get(replaced.id)!.endedAt!);
       expect(dueEvents(jobs.get(replaced.id)!, replacedAt + 1_000)).toEqual([]);
@@ -130,7 +136,8 @@ describe('job notifier', () => {
       jobs.end(job.id, 'done', 'Study complete');
       jobs.recordLastReply(job.id, '**The bounded study is complete.**\n\nTop finding: Search Back.\nkey=AKIAABCDEFGHIJKLMNOP and password: hunter2hunter2');
       const text = messageFor({ key: 'k', kind: 'finished', jobId: job.id }, jobs.get(job.id)!);
-      expect(text).toContain('✅ BotBoy finished: Study how customers reach the home screen');
+      // The message names its job: several can run at once.
+      expect(text).toContain(`✅ BotBoy finished (job #${job.seq}): Study how customers reach the home screen`);
       expect(text).toContain('*The bounded study is complete.*');
       expect(text).toContain('Top finding: Search Back.');
       expect(text).not.toContain('AKIAABCDEFGHIJKLMNOP');
@@ -142,7 +149,8 @@ describe('job notifier', () => {
       const text = messageFor({ key: 'k', kind: 'needs_owner', jobId: job.id }, job);
       expect(text).toContain('⏸ BotBoy needs you');
       expect(text).toContain('*What it needs:* Use the 2025 cohort or all years?');
-      expect(text).toContain('@botboy');
+      // The reply must reach this job, not the main chat: the how-to names its number.
+      expect(text).toContain(`@botboy #${job.seq}`);
       const done = jobs.start({ goal: 'g2' });
       jobs.setNotify(done.id, true);
       jobs.recordLastReply(done.id, 'An old progress note from several turns ago.');
@@ -207,6 +215,27 @@ describe('job notifier', () => {
       expect(jobs.get(job.id)!.notify!.sent).toEqual([{ key: `needs:${job.pausedAt}`, at: expect.any(String), outcome: 'sent' }]);
     });
 
+    it('holds a stuck job\'s pause while BotBoy reviews it, then tells the owner\'s question once (PARALLEL_JOBS_PLAN.md §11 R4)', async () => {
+      const job = pausedJob(120_000, 'The same query failed twice.');
+      storage.getDb().prepare("UPDATE chat_jobs SET pause_kind = 'stuck' WHERE id = ?").run(job.id);
+      const { sender, sent } = senderFake();
+      let reviewing = true;
+      const notifier = createJobNotifier({
+        jobs, sender, connection: connection(), now: () => clock, log: () => {}, holdPause: (id) => reviewing && id === job.id,
+      });
+      await notifier.sweep();
+      expect(sent).toEqual([]);
+      expect(jobs.get(job.id)!.notify!.sent).toEqual([]);
+      // The review found a choice only the owner can make: the same pause is now the owner's question.
+      jobs.askOwner(job.id, 'Use the 2023 or the 2024 cohort?', ['Use 2023', 'Use 2024']);
+      reviewing = false;
+      await notifier.sweep();
+      await notifier.sweep();
+      expect(sent).toHaveLength(1);
+      expect(sent[0].text).toContain('Use the 2023 or the 2024 cohort?');
+      expect(sent[0].text).not.toContain('The same query failed twice.');
+    });
+
     it('survives a restart: the sent record is on the job, so a new notifier sends nothing again', async () => {
       pausedJob(120_000);
       const first = senderFake();
@@ -224,7 +253,7 @@ describe('job notifier', () => {
       const { sender, sent } = senderFake();
       await make(sender).sweep();
       expect(sent).toHaveLength(1);
-      expect(sent[0].text).toContain('⏹ BotBoy stopped: Study how customers reach the home screen');
+      expect(sent[0].text).toContain(`⏹ BotBoy stopped (job #${job.seq}): Study how customers reach the home screen`);
     });
 
     it('sends to the chosen BotBoy chat number, never to anything the job says', async () => {

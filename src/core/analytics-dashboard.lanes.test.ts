@@ -5,8 +5,10 @@ import {
   selectDashboardLane,
   classifyWidgetFailure,
   isCrossLaneRetryableFailure,
+  isDashboardLaneUnavailable,
   isSafeRuntimeQueueChurn,
 } from './analytics-runners.js';
+import { stoppedWords } from './query-ledger.js';
 import type { AnalyticsDashboardService } from './analytics-types.js';
 import type { McpManager, McpServerSnapshot } from './mcp-types.js';
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
@@ -177,6 +179,37 @@ describe('analytics dashboard lanes (A4)', () => {
     expect(run.widgets_succeeded).toBe(1);
   });
 
+  // Running queries (query-control.md): every refresh query names its dashboard and widget, on either lane, so the owner can
+  // tell which one to stop.
+  it('names each refresh query for the owner\'s Running queries, on both lanes', async () => {
+    const origins: unknown[] = [];
+    const mcp = {
+      listServers: async () => [server('sql-context'), server('a2-analytics')],
+      callTool: async (_server: string, _tool: string, args: any, options: any) => {
+        if (args?.sql) origins.push(options?.queryOrigin);
+        return { isError: false, text: SQL_RESULT };
+      },
+    } as unknown as McpManager;
+    const sqlService = createAnalyticsDashboardService({ db: db(), mcpManager: mcp });
+    const sqlDashboard = sqlService.createDashboard({ title: 'Weekly', widgets: [{ kind: 'metric', title: 'Streams', sql: 'SELECT 7' }] } as any);
+    sqlService.enqueueRefresh(sqlDashboard.id, 'manual');
+    expect(await sqlService.processQueuedRuns(1)).toBe(1);
+    expect(origins).toEqual([{ kind: 'dashboard', label: 'Dashboard "Weekly", widget "Streams"' }]);
+    const etlOrigins: unknown[] = [];
+    const runner: QueryRunner = {
+      id: 'etl-adhoc',
+      runQuery: async (input) => {
+        etlOrigins.push(input.origin);
+        return { ok: true, runId: '9003', columns: ['value'], rows: [['1']], rowCount: 1 };
+      },
+    };
+    const etlService = makeService([server('sql-context', { state: 'stopped' }), server('a2-analytics')], runner);
+    const etlDashboard = etlService.createDashboard({ title: 'Weekly ETL', widgets: [{ kind: 'metric', title: 'Streams', sql: 'SELECT 7' }] } as any);
+    etlService.enqueueRefresh(etlDashboard.id, 'manual');
+    expect(await etlService.processQueuedRuns(1)).toBe(1);
+    expect(etlOrigins).toEqual([{ kind: 'dashboard', label: 'Dashboard "Weekly ETL", widget "Streams"' }]);
+  });
+
   it('sql-context running: the ETL runner is never consulted and results carry the sql-mcp lane', async () => {
     const etl = fakeEtlRunner();
     const service = makeService([server('sql-context'), server('a2-analytics')], etl.runner);
@@ -223,6 +256,31 @@ describe('analytics dashboard lanes (A4)', () => {
     }
     const run = db().prepare('SELECT status FROM analytics_runs LIMIT 1').get() as any;
     expect(run.status).toBe('completed');
+  });
+
+  // Owner request 2026-11-10: a dataset made from a refresh's ETL result shows the query it came from (data-origins.ts).
+  it('keeps the SQL of every ETL run a refresh submits, by run id', async () => {
+    const runner: QueryRunner = {
+      id: 'etl-adhoc',
+      runQuery: async ({ sql, onSubmitted }) => {
+        const runId = String(13300000000 + Number(/\d+/.exec(sql)?.[0] ?? 0));
+        await onSubmitted?.(runId);
+        return { ok: true, runId, columns: ['value'], rows: [['42']], rowCount: 1 };
+      },
+    };
+    const service = makeService([server('sql-context', { state: 'stopped' }), server('a2-analytics')], runner);
+    const dashboard = service.createDashboard({
+      title: 'Kept runs',
+      widgets: [{ kind: 'metric', title: 'W1', sql: 'SELECT 1' }, { kind: 'metric', title: 'W2', sql: '  SELECT 2  ' }],
+    } as any);
+    const refresh = service.enqueueRefresh(dashboard.id, 'manual');
+    expect(await service.processQueuedRuns(1)).toBe(1);
+    const [w1, w2] = dashboard.widgets;
+    expect(db().prepare('SELECT run_id, sql, purpose, job_id, dataset_date FROM etl_run_queries ORDER BY run_id').all()).toEqual([
+      { run_id: '13300000001', sql: 'SELECT 1', purpose: `Dashboard refresh ${refresh.id} of ${dashboard.id}, widget ${w1.id} "W1"`, job_id: null, dataset_date: null },
+      { run_id: '13300000002', sql: 'SELECT 2', purpose: `Dashboard refresh ${refresh.id} of ${dashboard.id}, widget ${w2.id} "W2"`, job_id: null, dataset_date: null },
+    ]);
+    expect(widgetResults(dashboard.id).map(widget => widget.result.lane)).toEqual(['etl', 'etl']);
   });
 
   it('a non-ok composite outcome fails only that widget and preserves error + nextAction', async () => {
@@ -291,6 +349,16 @@ describe('cross-lane retry + escalation', () => {
   afterEach(() => storage.close());
 
   const db = () => storage.getDb();
+
+  // A query someone stopped on purpose (query-control.md): never retried on the other lane, never read as a lane outage,
+  // whatever its reason says.
+  it('a widget query stopped on purpose is not retried and says nothing about the lane', () => {
+    const stopped = stoppedWords('owner', 'it is not running the right market; connection refused by the admins');
+    expect(isCrossLaneRetryableFailure(stopped)).toBe(false);
+    expect(isDashboardLaneUnavailable(new Error(stopped), 'sql-mcp')).toBe(false);
+    expect(isDashboardLaneUnavailable(new Error(stopped), 'etl')).toBe(false);
+    expect(isDashboardLaneUnavailable(new Error('connect ECONNREFUSED: connection refused'), 'sql-mcp')).toBe(true);
+  });
 
   it('classifyWidgetFailure: the live incident errors classify correctly', () => {
     // The two real Prime-widget errors from run_48c9ba7b04014d76:

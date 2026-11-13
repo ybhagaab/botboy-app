@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from '../core/storage.js';
 import { createNodeManager } from '../core/node-manager.js';
 import { createConnectionChatModelSource } from '../core/chat-model-source.js';
+import { createChatJobStore, type ChatJobStore } from '../core/chat-jobs.js';
 import { currentLlmModelOperation } from '../core/llm-model-operation.js';
 import { deepSeekModelEntries, teamModelEntries, type LlmConnection } from '../core/llm-model-catalog.js';
 import { createRouter } from './routes.js';
@@ -54,7 +55,7 @@ function connection(id: 'team' | 'deepseek', stream: ReturnType<typeof vi.fn>): 
       };
 }
 
-function setup(db: Database.Database, streams: { team: ReturnType<typeof vi.fn>; deepseek: ReturnType<typeof vi.fn> }, executeTool = vi.fn()) {
+function setup(db: Database.Database, streams: { team: ReturnType<typeof vi.fn>; deepseek: ReturnType<typeof vi.fn> }, executeTool = vi.fn(), chatJobs?: ChatJobStore) {
   const connections = [connection('team', streams.team), connection('deepseek', streams.deepseek)];
   const listeners = new Set<(event: { connectionId: string }) => void>();
   const chatModels = createConnectionChatModelSource({
@@ -73,6 +74,7 @@ function setup(db: Database.Database, streams: { team: ReturnType<typeof vi.fn>;
     llmClient: connections[0].client,
     aiModelSettings: { state: () => 'ready', version: () => 3, status: vi.fn(), chatModels } as any,
     toolExecutor: { executeTool },
+    ...(chatJobs ? { chatJobs } : {}),
     chatInterface: {
       getHistory: () => [],
       sendMessage: async () => ({ message: { id: 'x', role: 'assistant', content: '' } }),
@@ -187,14 +189,21 @@ describe('chat across model connections', () => {
   it('stops only the turns pinned to the connection that changed', async () => {
     const team = hangingStream();
     const deepseek = hangingStream();
-    const { app, emit } = setup(db, { team, deepseek });
+    // Two owner turns at once run in two threads (PARALLEL_JOBS_PLAN.md): the main chat, and job #1 on its own model.
+    const jobs = createChatJobStore(db);
+    const job = jobs.start({ goal: 'a parallel job', modelKey: 'team.sol' });
+    const { app, emit } = setup(db, { team, deepseek }, vi.fn(), jobs);
 
     const onDeepSeek = request(app).post('/api/chat/messages').send({ message: 'long question', stream: true, model: 'deepseek.deepseek-flash' }).then(response => response);
-    const onTeam = request(app).post('/api/chat/messages').send({ message: 'another question', stream: true, model: 'team.sol' }).then(response => response);
+    const onTeam = request(app).post('/api/chat/messages').send({ message: 'another question', stream: true, jobId: job.id }).then(response => response);
     await vi.waitFor(() => {
       expect(deepseek).toHaveBeenCalledTimes(1);
       expect(team).toHaveBeenCalledTimes(1);
     });
+    // A second owner message in a thread that is still replying waits its turn instead of interleaving two turns.
+    const second = await request(app).post('/api/chat/messages').send({ message: 'and also', stream: true, model: 'deepseek.deepseek-flash' });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('turn_in_progress');
 
     emit('deepseek');
     const stopped = await onDeepSeek;

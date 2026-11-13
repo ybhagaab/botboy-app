@@ -171,6 +171,8 @@ export function createSqlContextExportRunner(input: {
         source: 'agent',
         timeoutMs: idleTimeoutMs,
         ...(options.signal ? { signal: options.signal } : {}),
+        // One of BotBoy's own queries (query-ledger.ts): the owner can stop it under Running queries.
+        queryOrigin: { kind: 'data_room', label: 'Data Room dataset (complete export)' },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

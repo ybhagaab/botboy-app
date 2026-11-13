@@ -3673,25 +3673,32 @@ function renderAnalyticsKnowledgeDirSection(ctx) {
  * Refresh is manual-only by design; a run in flight polls every 5s. */
 function renderEtlOnboardingSection(onboarding) {
   const ob = onboarding || { state: 'idle' };
-  let statusLine = 'BotBoy can scan your team\'s Datanet profiles and generate one knowledge preset per business.';
+  let statusLine = 'BotBoy can scan your team\'s Datanet profiles and generate one knowledge preset per business, plus a data dictionary of every table they read.';
   if (ob.state === 'running') {
     const p = ob.progress || {};
     const bits = [];
     if (p.profilesTotal) bits.push(`${number(p.profilesFetched || 0)}/${number(p.profilesTotal)} profiles`);
     if (p.businessesTotal) bits.push(`${number(p.businessesDone || 0)}/${number(p.businessesTotal)} briefs${p.currentBusiness ? ` — ${esc(p.currentBusiness)}` : ''}`);
+    if (p.tablesTotal) bits.push(`${number(p.tablesDone || 0)}/${number(p.tablesTotal)} tables`);
+    if (p.note) bits.push(esc(p.note));
     statusLine = `Generating (${esc(ob.phase || 'working')})${bits.length ? ` · ${bits.join(' · ')}` : ''}…`;
   } else if (ob.state === 'failed') {
     statusLine = `Last run failed: ${esc(ob.error || 'unknown error')}${ob.nextAction ? ` ${esc(ob.nextAction)}` : ''}`;
   } else if (ob.lastResult) {
     const r = ob.lastResult;
-    statusLine = `Last generated ${esc(String(r.finishedAt || '').slice(0, 10))}: ${number(r.presetsWritten)} preset${r.presetsWritten === 1 ? '' : 's'} from ${number(r.profiles)} profiles${(r.businesses || []).length ? ` (${esc(r.businesses.join(', '))})` : ''}.`;
+    const dictionaryError = (r.errors || []).find(error => String(error).startsWith('data dictionary:'));
+    statusLine = `Last generated ${esc(String(r.finishedAt || '').slice(0, 10))}: ${number(r.presetsWritten)} preset${r.presetsWritten === 1 ? '' : 's'} from ${number(r.profiles)} profiles${(r.businesses || []).length ? ` (${esc(r.businesses.join(', '))})` : ''}.`
+      + `${(r.kept || []).length ? ` Kept as written: ${esc(r.kept.join(', '))}.` : ''}`
+      + `${r.dictionary ? ` Data dictionary: ${number(r.dictionary.tables)} tables${r.dictionary.tablesUnwritten ? ` (${number(r.dictionary.tablesUnwritten)} not written yet: Build data dictionary retries them)` : ''}.` : ''}`
+      + `${dictionaryError ? ` ${esc(String(dictionaryError).replace(/^data dictionary:\s*/, 'Data dictionary not built: '))}` : ''}`;
   }
   return `<div style="margin-top:14px;border-top:1px solid var(--line, #333);padding-top:10px">
     <div class="eyebrow">${icon('sparkles', 14)} Preset generation</div>
     <p class="page-subtitle">${statusLine}</p>
     ${ob.state === 'running' ? '' : `<div style="margin-top:8px;display:flex;gap:8px">
       <button class="button small" type="button" data-action="analytics-context-generate">Generate presets</button>
-      ${ob.lastResult ? `<button class="button small ghost" type="button" data-action="analytics-context-regenerate">Regenerate all</button>` : ''}
+      ${ob.lastResult ? `<button class="button small ghost" type="button" data-action="analytics-context-regenerate">Regenerate all</button>
+      <button class="button small ghost" type="button" data-action="analytics-context-dictionary">Build data dictionary</button>` : ''}
     </div>`}
   </div>`;
 }
@@ -9907,13 +9914,16 @@ function bindEvents() {
         if (['profile-settings', 'mcp-settings'].includes(state.route.view)) renderRoute({ preserveScroll: true });
       })();
     }
-    if (action === 'analytics-context-generate' || action === 'analytics-context-regenerate') {
+    if (action === 'analytics-context-generate' || action === 'analytics-context-regenerate' || action === 'analytics-context-dictionary') {
       const regenerate = action === 'analytics-context-regenerate';
+      const dictionary = action === 'analytics-context-dictionary';
       void (async () => {
         try {
-          const payload = await request('/mcp/analytics-context/generate', { method: 'POST', body: { regenerate } });
+          const payload = await request('/mcp/analytics-context/generate', { method: 'POST', body: dictionary ? { dictionary: true } : { regenerate } });
           if (state.mcp.analyticsContext) state.mcp.analyticsContext.onboarding = payload.onboarding;
-          toast(regenerate ? 'Regenerating all presets — this runs for a while' : 'Preset generation started — this runs for a while');
+          toast(dictionary
+            ? 'Building the data dictionary — one catalog query through Datanet, then a few minutes of writing'
+            : regenerate ? 'Regenerating all presets — this runs for a while' : 'Preset generation started — this runs for a while');
         } catch (error) {
           toast(error?.message || 'Could not start preset generation', 'bad');
         }

@@ -741,6 +741,8 @@ export function createMcpRouter(deps: RouterDeps): Router {
         ...(group ? { group } : {}),
         ...(businesses.length ? { businesses } : {}),
         regenerate: req.body?.regenerate === true,
+        // Build data dictionary: rebuild only data-dictionary.md, every preset left as it is.
+        ...(req.body?.dictionary === true ? { dictionary: true } : {}),
       }),
     });
   });

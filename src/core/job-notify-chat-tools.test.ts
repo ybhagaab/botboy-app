@@ -110,13 +110,30 @@ describe('job_notify', () => {
       expect(jobNotifyArmed('job_notify', result.content)).toBe(true);
     });
 
-    it('with no job yet, starts one from the owner\'s message (like job_update continue)', async () => {
-      const { exec } = build();
-      expect(jobs.activeJob()).toBeNull();
+    it('with no job running, arms nothing and says to start the work first (updates belong to one job)', async () => {
+      const { exec, sends } = build();
+      expect(jobs.activeJobs()).toEqual([]);
       const result = parse(await exec.executeTool(call({ action: 'on' }), owner({ currentUserMessage: 'research X, and WhatsApp me when it is done' })));
-      expect(result.ok).toBe(true);
-      expect(jobs.activeJob()).toMatchObject({ goal: 'research X, and WhatsApp me when it is done' });
-      expect(jobs.activeJob()!.notify).toBeDefined();
+      expect(result).toMatchObject({ ok: false, code: 'no_job', effect: 'none' });
+      expect(result.nextAction).toMatch(/job_update start/);
+      expect(jobs.activeJobs()).toEqual([]);
+      expect(sends).toHaveLength(0);
+    });
+
+    it('with several jobs running, picks the named one, this thread\'s, or the one this turn started, and asks otherwise', async () => {
+      const first = jobs.start({ goal: 'first study' });
+      const second = jobs.start({ goal: 'second study' });
+      const { exec, sends } = build();
+      const which = parse(await exec.executeTool(call({ action: 'on' }), owner()));
+      expect(which).toMatchObject({ ok: false, code: 'which_job' });
+      expect(which.nextAction).toContain(`#${first.seq}`);
+      expect(sends).toHaveLength(0);
+      expect(parse(await exec.executeTool(call({ action: 'on', job: second.seq }), owner({ ownerRequestId: 'r-named' }))).job.id).toBe(second.id);
+      expect(parse(await exec.executeTool(call({ action: 'status' }), owner({ threadJobId: first.id }))).job.id).toBe(first.id);
+      expect(parse(await exec.executeTool(call({ action: 'status' }), owner({ startedJobIds: [first.id] }))).job.id).toBe(first.id);
+      expect(parse(await exec.executeTool(call({ action: 'on', job: 99 }), owner()))).toMatchObject({ ok: false, code: 'job_not_found' });
+      expect(jobs.get(second.id)!.notify).toBeDefined();
+      expect(jobs.get(first.id)!.notify).toBeUndefined();
     });
 
     it('does NOT arm, and says so, when WhatsApp Web is not signed in (the promise cannot be kept)', async () => {

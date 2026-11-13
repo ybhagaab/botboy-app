@@ -59,15 +59,57 @@ import { asksAboutAppearance, uiThemeIdFromToolResult, withUiThemeCards } from '
 import { asksForJobNotification, jobNotifyArmed } from '../../core/job-notify-chat-tools.js';
 import {
   authenticateContinuationRequest,
+  authenticateReviewRequest,
   CONTINUATION_HEADER,
   continuationRequestId,
   continuationSecretMatches,
   isContinuationTrigger,
+  networkWaitOf,
+  providerWaitOf,
+  reviewRequestId,
 } from '../../core/chat-continuations.js';
 import { CHAT_HISTORY_OMITTED_NOTE, chatHistoryWindowOptions } from '../../core/chat-history-window.js';
 import { readGmailSendAs } from '../../monitors/gmail-sync.js';
-import { decideTurnSettlement, formatChatJobBlock, recordToolOutcome, type ChatTurnEnd } from '../../core/chat-jobs.js';
-import { filterToolsForContinuation } from '../../core/job-mandate.js';
+import {
+  CHAT_JOB_FOLDED_REASON,
+  chatJobPhase,
+  decideTurnSettlement,
+  detectJobDataWork,
+  formatChatJobBlock,
+  formatJobsList,
+  isDataWorkTool,
+  jobCardMarker,
+  recordToolOutcome,
+  waitLabel,
+  withJobCards,
+  type ChatJob,
+  type ChatJobCardKind,
+  type ChatJobThinking,
+  type ChatJobToolStep,
+  type ChatTurnEnd,
+} from '../../core/chat-jobs.js';
+import { normalizeChatNotice } from '../../core/chat-notices.js';
+import { createJobDesk, type JobDesk } from '../../core/job-desk.js';
+
+
+/** A `jobs message` counts as an effect for the integrity gate only when the job took it (job-desk.ts › messageJob). */
+export function jobsMessageConfirmed(name: string, content: unknown): boolean {
+  if (name !== 'jobs') return false;
+  try {
+    // A message the job took, a job kept going, a question set for the owner: list, read and every refusal are not effects.
+    const parsed = JSON.parse(String(content ?? ''));
+    return parsed.messaged === true || parsed.continued === true || parsed.asked === true;
+  } catch { return false; }
+}
+
+/** The main chat's thread key; a job's thread is keyed by its job id (PARALLEL_JOBS_PLAN.md §6). */
+const MAIN_THREAD = 'main';
+/** How long ended jobs stay in the job list ("Finished today"). */
+const RECENT_JOBS_MS = 12 * 60 * 60_000;
+/** A `#N` at the start of a main chat message sends it to job N (PJ3). */
+const JOB_ROUTE_PREFIX = /^#(\d{1,6})(?![\d\w])[\s,:.-]*/;
+import { filterToolsForContinuation, filterToolsForReview } from '../../core/job-mandate.js';
+import { isSelfHandledReview, reviewDecisionCheck, reviewDecisionOf, reviewStateOpen } from '../../core/job-review.js';
 import { noteToolCalls } from '../../core/knowledge-taint.js';
 import { KNOWLEDGE_CHANGE_TOOLS, knowledgeChangeIdFromToolResult, knowledgeWriteConfirmed, prepareKnowledgeWriteTurn, withKnowledgeCards } from '../../core/knowledge-turn.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
@@ -100,6 +142,7 @@ const KNOWLEDGE_TOOL_STATUS: Record<string, string> = {
 const ETL_TOOL_STATUS: Record<string, string> = {
   mcp_etl_run_query: '⏳ Running the ETL query...',
   wait_for_etl_run: '⏳ Waiting for the ETL run...',
+  wait_for: '⏳ Waiting...',
   mcp_etl_download_results: '⬇️ Downloading the ETL result...',
   run_command: '⚙️ Running the command...',
 };
@@ -208,6 +251,8 @@ export function replyExcerptOf(text: string): string {
 export const CONTINUATION_PREEMPTED_TEXT = '↻ Paused this automatic continuation because you sent a message. The job continues from your message.';
 /** A continuation turn whose job the owner stopped from the chat panel. */
 export const JOB_STOPPED_TEXT = '⏹️ Stopped: you ended this job. Work already done is kept.';
+/** A continuation turn whose job the owner paused from the chat panel (PARALLEL_JOBS_PLAN.md P2). */
+export const JOB_PAUSED_TEXT = '⏸️ Paused: you paused this job. Work already done is kept; resume it from the job menu, or reply here.';
 
 /**
  * Status reads a turn legitimately repeats while a run, job, or dashboard
@@ -246,6 +291,15 @@ export function previewToolArgs(name: string, argumentsJson: string): string {
 export function isPacedStatusRead(toolName: string, argumentsJson: string): boolean {
   if (PACED_STATUS_TOOLS.has(toolName)) return true;
   return toolName === 'create_data_room_dataset' && dataRoomDatasetAction(argumentsJson) === 'status';
+}
+
+/** A wait_for call that also waits server-side (waitSeconds of 30 or more), like wait_for_terminal. */
+export function waitsInCall(argumentsJson: string): boolean {
+  try {
+    return Number(JSON.parse(String(argumentsJson ?? '{}'))?.waitSeconds) >= 30;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -767,8 +821,24 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     connectionId?: string;
     /** Set for a turn BotBoy started to continue an owner job (chat-continuations.ts). */
     continuationJobId?: string;
-    /** Why a continuation ended early: the owner's message, or the owner stopped its job. */
-    endReason?: 'preempted' | 'job_stopped';
+    /** The thread this turn belongs to: MAIN_THREAD or a job id (PARALLEL_JOBS_PLAN.md §6). */
+    threadKey: string;
+    /** A job update turn's decision (§12): message, continue or ask_owner, once the `jobs` tool accepted it. */
+    reviewDecision?: 'message' | 'continue' | 'ask_owner';
+    /** The provider asked BotBoy to slow down (PJ2): the turn's job waits in line instead of counting a failure. */
+    /** A provider limit, or (`network`) the AI model could not be reached: the job waits instead of failing (PJ2). */
+    providerWait?: { retryAfterMs?: number; network?: boolean };
+    /** Jobs this main chat turn handed off (their first turn may run at once) and provisional jobs it holds (none may run yet). */
+    startedJobIds: string[];
+    heldJobIds: string[];
+    /** Jobs whose "started" chip is already in this turn's reply. */
+    cardsShown?: Set<string>;
+    /** This turn's model session (its thread's). */
+    sessionId?: string;
+    /** The owner request id the panel sent (its Stop names it). */
+    requestId?: string;
+    /** Why a continuation ended early: the owner's message, or the owner stopped or paused its job. */
+    endReason?: 'preempted' | 'job_stopped' | 'job_paused';
     startedAt: number;
     /** How the turn ended, for the job settle (unset: the turn never reached the tool loop). */
     jobEnd?: ChatTurnEnd;
@@ -778,6 +848,16 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     replyFull?: string;
     /** Model tool calls this turn. */
     toolCalls?: number;
+    /** The turn called a data tool (chat-jobs.ts › isDataWorkTool): a job it hands off, or becomes, is data work. */
+    dataToolCalled?: boolean;
+    /** A job's turn: its last tool calls, kept on the job for `jobs read` and the main chat's job updates (the thread keeps only prose). */
+    toolTrail?: ChatJobToolStep[];
+    /**
+     * The main chat's own look at a job update (job-review.ts, PARALLEL_JOBS_PLAN.md §12): the job and the state it decides on.
+     * Never an owner turn: it holds no thread for the owner, and the owner's message in the main chat stops it.
+     */
+    reviewJobId?: string;
+    reviewKey?: string;
     abortController: AbortController;
     /** Resolves once the turn has persisted its reply and closed. */
     finished: Promise<void>;
@@ -786,17 +866,132 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   let chatTurnCounter = 0;
   const chatJobs = deps.chatJobs;
   const continuations = deps.chatContinuations;
-  // The continuation runner waits while any chat turn is in progress.
-  continuations?.bindTurnProbe(() => activeChatTurns.size > 0);
+  // An owner turn holds its own thread, and the provisional jobs it started for its ETL runs (they belong to it until it ends).
+  // A job update turn in the main chat is BotBoy's own, not the owner's: it never holds the main chat against him (§12).
+  const ownerTurnIn = (threadKey: string) => [...activeChatTurns.values()].some(turn => !turn.continuationJobId && !turn.reviewJobId
+    && (turn.threadKey === threadKey || turn.heldJobIds.includes(threadKey)));
+  const reviewTurnRunning = () => [...activeChatTurns.values()].some(turn => Boolean(turn.reviewJobId));
+  // Each thread is separate (PARALLEL_JOBS_PLAN.md): a job's continuation waits only for an owner turn in that job's own thread,
+  // and the WhatsApp bridge only for one in the main chat.
+  continuations?.bindTurnProbe({
+    any: () => activeChatTurns.size > 0,
+    mainOwnerTurn: () => ownerTurnIn(MAIN_THREAD),
+    ownerTurnInJob: (jobId) => ownerTurnIn(jobId),
+  });
+  /** Unique transcript ids: parallel turns can finish in the same millisecond. */
+  const transcriptId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  /**
+   * The main chat's desk for jobs (job-desk.ts, PARALLEL_JOBS_PLAN.md §11, §12): a finished job's report, the main chat's messages
+   * to a job, a job's replies, and a job's line with its card when the owner has to act. Bound on the bridge, so the boot, an
+   * expiry and the main chat's job updates (job-review.ts, index.ts) post through the same desk.
+   */
+  const jobDesk: JobDesk | null = chatJobs && deps.db ? createJobDesk({
+    db: deps.db,
+    jobs: chatJobs,
+    mainSessionId: () => deps.conversationManager?.getActiveSessionId('chat') ?? null,
+    appendMainHistory: (sessionId, text) => deps.conversationManager?.appendAssistant(sessionId, text),
+    // Nothing lands in the middle of a main-chat reply: the owner's, or the main chat's own job update (§12).
+    mainOwnerTurnActive: () => ownerTurnIn(MAIN_THREAD) || reviewTurnRunning(),
+    ownerTurnInJob: (jobId) => ownerTurnIn(jobId),
+    preempt: async (jobId) => { await stopContinuationTurns('preempted', jobId); },
+    request: (jobId) => continuations?.runner()?.request(jobId),
+    bump: () => dashboardState.bump(),
+  }) : null;
+  continuations?.bindJobDesk(jobDesk);
+  /**
+   * A job waits for the refreshes of its dashboards that are still running (§12 R1, owner decision 2026-11-09: "waiting on
+   * dashboard refresh shouldn't use a turn"). Read from the run table, never from what the model said: every queued or running
+   * refresh of a dashboard in the job's working set becomes a wait, and the ETL watcher wakes the job when it ends. Never throws.
+   */
+  function watchDashboardRefreshes(jobId: string, trail: ChatJobToolStep[] = []): void {
+    if (!chatJobs || !deps.analyticsService) return;
+    try {
+      const job = chatJobs.get(jobId);
+      if (!job || job.status !== 'active') return;
+      const dashboards = new Map<string, string | undefined>(job.workingSet.dashboards.slice(-8).map(entry => [entry.dashboardId, entry.title]));
+      // A dashboard the turn only read is one the job works with too: job #12 read its dashboard every turn to watch a refresh it
+      // had not started itself (live 2026-11-09), so its refresh is a wait as well.
+      for (const step of trail) {
+        if (step.name !== 'get_analytics_dashboard') continue;
+        try {
+          const dashboardId = JSON.parse(step.args)?.dashboardId;
+          if (typeof dashboardId === 'string' && dashboardId.startsWith('dash_') && !dashboards.has(dashboardId)) dashboards.set(dashboardId, undefined);
+        } catch { /* clipped or malformed arguments name no dashboard */ }
+      }
+      for (const [dashboardId, title] of dashboards) {
+        const dashboard = deps.analyticsService.getDashboard(dashboardId);
+        for (const run of dashboard?.recentRuns ?? []) {
+          if (run.status !== 'queued' && run.status !== 'running') continue;
+          chatJobs.addDashboardWait({ runId: run.id, jobId, dashboardId, title: dashboard?.title ?? title });
+        }
+      }
+    } catch (error: any) {
+      console.warn(`[Job] could not read the dashboard refreshes of ${jobId}: ${error?.message ?? error}`);
+    }
+  }
+  /** A job card in the main chat (started, stuck, done): the panel draws it from the job's live state. Never throws. */
+  function postMainJobCard(jobId: string, kind: ChatJobCardKind): void {
+    if (!deps.db) return;
+    try {
+      deps.db.prepare('INSERT INTO chat_messages (id, role, content, job_id, ref_job_id) VALUES (?, ?, ?, NULL, ?)')
+        .run(transcriptId('job'), 'assistant', jobCardMarker(jobId, kind), jobId);
+      dashboardState.bump();
+    } catch (error: any) {
+      console.warn(`[Job] could not post the ${kind} card for ${jobId}: ${error?.message ?? error}`);
+    }
+  }
+  /** A job's model, as the job list shows it. */
+  const modelTitleOf = (modelKey?: string): string | undefined => {
+    const catalog = chatModels.catalog();
+    if (!catalog) return undefined;
+    const key = modelKey || catalog.defaultKey;
+    return catalog.models.find(model => model.key === key)?.label ?? catalog.models.find(model => model.key === catalog.defaultKey)?.label;
+  };
+  /** A model the owner named for a job ("Claude Sonnet"), matched against the labels the catalog offers (PJ5). */
+  const resolveJobModel = (name: string): { key: string; title: string } | { error: string; offered: string[] } => {
+    const catalog = chatModels.catalog();
+    const models = catalog?.models ?? [];
+    const words = (text: string) => text.toLowerCase().match(/[a-z0-9.]+/g) ?? [];
+    const wanted = words(name);
+    const exact = models.find(model => model.key === name.trim());
+    const matches = exact ? [exact] : models.filter(model => {
+      const have = new Set([...words(model.label), ...words(model.key)]);
+      return wanted.length > 0 && wanted.every(word => have.has(word) || [...have].some(token => token.startsWith(word)));
+    });
+    const pick = matches.find(model => model.key === catalog?.defaultKey) ?? matches[0];
+    if (!pick || !chatModels.resolve(pick.key)) return { error: `No connected model matches "${name.slice(0, 60)}".`, offered: models.map(model => model.label) };
+    return { key: pick.key, title: pick.label };
+  };
 
-  /** Stops running continuation turns (optionally of one job) and waits briefly for them to close. */
-  async function stopContinuationTurns(reason: 'preempted' | 'job_stopped', jobId?: string): Promise<number> {
-    const stopping = [...activeChatTurns.values()].filter(turn => turn.continuationJobId
-      && (!jobId || turn.continuationJobId === jobId) && !turn.stopRequested);
+  /**
+   * Stops one job's running continuation turn and waits briefly for it to close. Stopping or pausing the job also ends an owner
+   * turn in its own thread (everything in the job stops); a preempting owner message is itself the new turn, so only the
+   * continuation stops then.
+   */
+  async function stopContinuationTurns(reason: 'preempted' | 'job_stopped' | 'job_paused', jobId: string): Promise<number> {
+    const stopping = [...activeChatTurns.values()].filter(turn => !turn.stopRequested
+      && (turn.continuationJobId === jobId || (reason !== 'preempted' && turn.threadKey === jobId)));
     for (const turn of stopping) {
       turn.stopRequested = true;
       turn.endReason = reason;
-      turn.abortController.abort(new Error(reason === 'preempted' ? 'The owner sent a message' : 'The owner stopped the job'));
+      turn.abortController.abort(new Error(reason === 'preempted' ? 'The owner sent a message' : reason === 'job_paused' ? 'The owner paused the job' : 'The owner stopped the job'));
+    }
+    if (stopping.length) {
+      await Promise.race([
+        Promise.all(stopping.map(turn => turn.finished)),
+        new Promise<void>(resolve => { const timer = setTimeout(resolve, 8_000); timer.unref?.(); }),
+      ]);
+    }
+    return stopping.length;
+  }
+
+  /** Stops the main chat's running job update (the owner wrote there) and waits briefly for it to close; it is decided again later. */
+  async function stopReviewTurns(): Promise<number> {
+    const stopping = [...activeChatTurns.values()].filter(turn => turn.reviewJobId && !turn.stopRequested);
+    for (const turn of stopping) {
+      turn.stopRequested = true;
+      turn.endReason = 'preempted';
+      turn.abortController.abort(new Error('The owner sent a message'));
     }
     if (stopping.length) {
       await Promise.race([
@@ -808,66 +1003,129 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
   }
 
   /**
+   * How a job update turn ends for its state (§12 Execution): decided (the reply, with the job's card, is in the main chat), or due
+   * again when it did not really happen (the owner wrote, a restart, a provider or network wait, no tool loop at all). Never throws.
+   */
+  function settleReview(input: { jobId: string; key: string; end?: ChatTurnEnd }): void {
+    if (!chatJobs) return;
+    try {
+      const again = !input.end || input.end === 'preempted' || input.end === 'shutdown' || input.end === 'disconnected' || input.end === 'rate_limited';
+      if (again) chatJobs.releaseReview(input.jobId, input.key);
+      else chatJobs.finishReview(input.jobId, input.key);
+      console.log(`[JobReview] ${input.jobId} ${input.key.split(':')[0]}: update turn ended ${input.end ?? 'before its tool loop'} → ${again ? 'due again' : 'decided'}`);
+    } catch (error: any) {
+      console.warn(`[JobReview] settle failed: ${error?.message ?? error}`);
+    }
+  }
+
+  /**
    * The end-of-turn settle (chat-jobs.ts › decideTurnSettlement): the job
    * the turn worked on is done, waits on runs, continues, or pauses. Returns
    * the job id when a continuation is due. Never throws.
    */
   function settleJobAfterTurn(input: {
     end?: ChatTurnEnd;
-    continuationJobId?: string;
+    /** The job whose thread this turn ran in (a continuation's, or an owner turn's in a job thread); absent in the main chat. */
+    jobId?: string;
+    continuation: boolean;
+    /** A main chat owner turn's message: a turn cut off after real work becomes a job of its own. */
     ownerMessage?: string;
+    ownerModelKey?: string;
+    ownerThinking?: ChatJobThinking;
+    /** The turn did data work (analytics mode, or a data tool): a job it becomes is data work. */
+    dataWork?: boolean;
     startedAt: number;
     toolCalls: number;
     replyExcerpt?: string;
     replyFull?: string;
-  }): string | null {
-    if (!chatJobs || !input.end) return null;
+    /** For a rate_limited end: when this connection's job turns may start again. */
+    rateWaitUntil?: string;
+    /** The rate_limited end was a network outage (networkWaitOf), not the provider asking BotBoy to wait. */
+    networkWait?: boolean;
+    /** A job's turn: its last tool calls, kept on the job (the thread history keeps only prose). */
+    trail?: ChatJobToolStep[];
+    /** An owner `#N` message typed in the main chat: its reply shows there too (PJ3). */
+    routedFromMain?: boolean;
+  }): { continueJobId: string | null; createdJob?: ChatJob } {
+    const none = { continueJobId: null };
+    if (!chatJobs || !input.end) return none;
     try {
       const startedIso = new Date(input.startedAt).toISOString();
-      let job = input.continuationJobId ? chatJobs.get(input.continuationJobId) : chatJobs.activeJob();
-      // WhatsApp updates (job-notify.md): the turn's closing words are the report. The job this turn worked on is the active one, or
-      // the one `job_update done` ended during this very turn (its closing report is written after the end). Recorded only for a
-      // job that asked to be told; the notifier then sends it, and a "finished" message waits for it.
-      if (input.replyFull?.trim()) {
-        const worked = job ?? (() => {
-          const ended = chatJobs.lastEnded();
-          return ended?.endedAt && ended.endedAt >= startedIso ? ended : null;
-        })();
-        if (worked?.notify) {
-          chatJobs.recordLastReply(worked.id, input.replyFull);
-          deps.jobNotifier?.nudge();
-        }
+      let job = input.jobId ? chatJobs.get(input.jobId) : null;
+      // WhatsApp updates (job-notify.md): the turn's closing words are the report. The job is this thread's job, still active or
+      // ended by `job_update done` during this very turn (its closing report is written after the end). Recorded only for a job
+      // that asked to be told; the notifier then sends it, and a "finished" message waits for it.
+      if (input.replyFull?.trim() && job?.notify && (job.status === 'active' || (job.endedAt && job.endedAt >= startedIso))) {
+        chatJobs.recordLastReply(job.id, input.replyFull);
+        deps.jobNotifier?.nudge();
       }
-      // A turn that did real work and was cut off becomes a job, so it continues.
-      if (!job && input.ownerMessage?.trim() && input.toolCalls > 0
-        && (input.end === 'ceiling' || input.end === 'failed' || input.end === 'shutdown')) {
-        job = chatJobs.start({ goal: input.ownerMessage });
+      // The main chat's report (PARALLEL_JOBS_PLAN.md §11 R1): a job this turn finished keeps the turn's closing words; the desk
+      // posts them in the main chat once the turn is over.
+      const finishedHere = Boolean(job && job.status === 'done' && job.endedAt && job.endedAt >= startedIso);
+      if (finishedHere && job && input.replyFull?.trim()) {
+        chatJobs.recordReport(job.id, input.replyFull);
+        // The owner's `#N` message from the main chat: this reply already shows there, so the report row is the job's card only.
+        if (input.routedFromMain) jobDesk?.noteReportShown(job.id);
       }
-      if (!job || job.status !== 'active') return null;
+      // A main-chat message asked for this job's reply (`jobs message`): an automatic turn's answer goes back there ("#N replied");
+      // a finished job's report says it instead. An owner turn in the thread answers the owner where they are, so it only clears it.
+      if (job && input.end && input.end !== 'preempted' && input.end !== 'job_stopped' && chatJobs.takeMainReply(job.id, startedIso)) {
+        if (input.continuation && !finishedHere && input.replyFull?.trim()) jobDesk?.postReply(job.id, input.replyFull);
+      }
+      // An owner turn in the thread read the messages waiting when it started (its job block): they are delivered. One that
+      // arrived during the turn was not in that block, so it waits for the next turn.
+      if (job && !input.continuation && job.inbox.length) chatJobs.consumeInbox(job.id, startedIso);
+      // A main chat turn that did real work and was cut off becomes a job, so it carries on in its own thread.
+      let createdJob: ChatJob | undefined;
+      if (!job && !input.continuation && input.ownerMessage?.trim() && input.toolCalls > 0
+        && (input.end === 'ceiling' || input.end === 'failed' || input.end === 'shutdown' || input.end === 'rate_limited')) {
+        createdJob = chatJobs.start({
+          goal: input.ownerMessage,
+          ...(input.ownerModelKey ? { modelKey: input.ownerModelKey } : {}),
+          ...(input.ownerThinking ? { thinking: input.ownerThinking } : {}),
+          dataWork: input.dataWork === true || detectJobDataWork([input.ownerMessage]),
+        });
+        job = createdJob;
+      }
+      if (!job || job.status !== 'active') return none;
       const declared = job.declaredAt && job.declaredAt >= startedIso ? job.declaration : undefined;
-      const owner = !input.continuationJobId;
-      // The owner only chatted (no tools, no declaration) while the job was paused: it stays paused.
-      if (owner && input.end === 'answered' && !declared && input.toolCalls === 0
+      const owner = !input.continuation;
+      // The owner only chatted (no tools, no declaration) while the job was paused or stuck: it stays that way. A message that
+      // answers the job's own question is different: the job goes on (the settle below decides how).
+      if (owner && input.end === 'answered' && !declared && input.toolCalls === 0 && job.pauseKind !== 'question'
         && job.createdAt < startedIso && job.pausedAt && job.pausedAt < startedIso) {
-        return null;
+        return none;
       }
       const note = declared === 'needs_owner' ? job.pauseNote : declared === 'continue' ? job.continueReason : undefined;
       if (owner) chatJobs.ownerResumed(job.id);
+      // What the turn ran stays on the job (the thread keeps only prose), and a refresh of one of its dashboards still running
+      // becomes a wait: the job spends no turn checking on it (§12 R1).
+      if (input.trail?.length) chatJobs.recordTurnTools(job.id, input.trail);
+      watchDashboardRefreshes(job.id, input.trail);
+      const pending = chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending');
       const settlement = decideTurnSettlement({
         end: input.end,
         declaration: declared,
         declarationNote: note,
-        pendingRuns: chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending').length,
+        pendingRuns: pending.length,
+        pendingDashboardRuns: pending.filter(watch => watch.source === 'dashboard').length,
         undeclaredEnds: owner ? 0 : job.undeclaredEnds,
         failedTurns: owner ? 0 : job.failedTurns,
         replyExcerpt: input.replyExcerpt,
+        ...(input.rateWaitUntil ? { rateWaitUntil: input.rateWaitUntil } : {}),
+        ...(input.networkWait ? { waitReason: 'network' as const } : {}),
       });
       chatJobs.settle(job.id, settlement, input.end);
-      console.log(`[Job] ${job.id} turn ended ${input.end}${declared ? ` (declared ${declared})` : ''} → ${settlement.action}`);
-      return settlement.action === 'continue' ? job.id : null;
+      const waiting = settlement.action === 'continue' && settlement.notBefore
+        ? ` (waiting for ${input.networkWait ? 'the network' : 'the provider'} until ${settlement.notBefore})`
+        : '';
+      console.log(`[Job] #${job.seq} ${job.id} turn ended ${input.end}${declared ? ` (declared ${declared})` : ''} → ${settlement.action}${waiting}`);
+      // A pause BotBoy made, or a question, is a job update for the main chat to decide on (§12 R2): the end of every turn nudges
+      // the job updates (below, after the turn has left activeChatTurns), so nothing more is needed here.
+      return { continueJobId: settlement.action === 'continue' ? job.id : null, ...(createdJob ? { createdJob } : {}) };
     } catch (error: any) {
       console.warn(`[Job] settle failed: ${error?.message ?? error}`);
-      return null;
+      return none;
     }
   }
 
@@ -885,10 +1143,20 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     }
   });
 
-  router.post('/chat/stop', (_req: Request, res: Response) => {
+  // Stop the owner's own reply. With several jobs running (PARALLEL_JOBS_PLAN.md), a plain Stop ends only owner turns, never a
+  // job's automatic turn; `jobId` also stops that job's automatic turn (pause or stop a job with its own controls).
+  router.post('/chat/stop', (req: Request, res: Response) => {
+    // The panel names the reply it is showing (its request id), so Stop in one view never ends a turn in another.
+    const requestId = typeof req.body?.requestId === 'string' ? req.body.requestId.trim() : '';
+    const jobId = typeof req.body?.jobId === 'string' ? req.body.jobId.trim() : '';
     let stopped = 0;
     for (const turn of activeChatTurns.values()) {
-      if (!turn.stopRequested) {
+      const target = requestId
+        ? !turn.continuationJobId && !turn.reviewJobId && turn.requestId === requestId
+        : jobId
+          ? turn.threadKey === jobId || turn.continuationJobId === jobId
+          : !turn.continuationJobId && !turn.reviewJobId;
+      if (target && !turn.stopRequested) {
         turn.stopRequested = true;
         turn.abortController.abort();
         stopped++;
@@ -897,52 +1165,133 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.json({ ok: true, stopped, active: activeChatTurns.size });
   });
 
-  // ── Owner jobs (ANALYTICS_AUTONOMY_PLAN.md, chat-jobs.ts) ──
-  // The chat panel shows the active job with its waiting runs and a Stop.
-  router.get('/chat/jobs/active', (_req: Request, res: Response) => {
+  // ── Owner jobs (PARALLEL_JOBS_PLAN.md, chat-jobs.ts) ──
+  // The chat panel lists every job with what it is doing, derived from what actually runs (never just "active").
+  // A job the main chat is deciding on reads as working: it is being looked at, not waiting for the owner (§12). So does a pause
+  // BotBoy made that the main chat has not decided yet (owner report 2026-11-09: its question kept showing as a card); the owner
+  // sees it when the main chat hands it to him, or after DECISION_HIDE_MAX_MS whatever happened.
+  const jobRunning = (jobId: string) => Boolean(continuations?.runner()?.isRunning(jobId)) || ownerTurnIn(jobId)
+    || Boolean(deps.jobReviews?.awaitsDecision ? deps.jobReviews.awaitsDecision(jobId) : deps.jobReviews?.isReviewing(jobId));
+  const jobPhaseOf = (job: ChatJob) => chatJobPhase(job, {
+    running: jobRunning(job.id),
+    pendingRuns: chatJobs ? chatJobs.watchesForJob(job.id).filter(watch => watch.status === 'pending').length : 0,
+  });
+  function jobView(job: ChatJob) {
+    const watches = chatJobs?.watchesForJob(job.id) ?? [];
+    const phase = job.status === 'active' ? jobPhaseOf(job) : null;
+    return {
+      id: job.id,
+      number: job.seq,
+      title: job.title,
+      goal: job.goal,
+      status: job.status,
+      phase,
+      model: { key: job.modelKey ?? '', title: modelTitleOf(job.modelKey) ?? null },
+      thinking: job.thinking,
+      createdAt: job.createdAt,
+      lastActivityAt: job.lastActivityAt,
+      endedAt: job.endedAt ?? null,
+      endReason: job.endReason ?? null,
+      continuationCount: job.continuationCount,
+      nextStep: job.workingSet.nextStep ?? null,
+      // The owner's question (needs you) or what stopped it, with the one-tap answers when the job offered some.
+      pauseNote: phase === 'needs_owner' || phase === 'stuck' || phase === 'paused' ? (job.pauseNote ?? 'Nothing is running. Reply in the job to continue.') : null,
+      options: phase === 'needs_owner' ? (job.options ?? []) : [],
+      // A finished job's one-tap follow-ups, shown with its report in the main chat (§11 R1, R2).
+      nextSteps: job.status === 'done' ? (job.nextSteps ?? []) : [],
+      providerWaitUntil: phase === 'provider_wait' ? (job.rateWaitUntil ?? null) : null,
+      // Everything the job waits for (docs/maps/job-waits.md), each with its kind and its name in the owner's words.
+      waitingRuns: watches.filter(watch => watch.status === 'pending').map(watch => ({
+        runId: watch.runId,
+        kind: watch.source === 'dashboard' ? 'dashboard_refresh' : watch.source === 'job_wait' ? (watch.kind ?? 'wait') : 'etl_run',
+        label: waitLabel(watch),
+        purpose: watch.purpose ?? null,
+        remoteStatus: watch.remoteStatus ?? null,
+        submittedAt: watch.submittedAt,
+        ...(watch.source === 'job_wait' && watch.kind === 'time' ? { at: watch.target } : {}),
+      })),
+      finishedRuns: watches.filter(watch => watch.status === 'finished').length,
+      results: {
+        files: job.workingSet.files.slice(-10),
+        datasets: job.workingSet.datasets.slice(-8),
+        dashboards: job.workingSet.dashboards.slice(-8),
+      },
+      // The owner asked to be told on WhatsApp (job-notify.md): the panel says so, so the promise is visible, not only remembered.
+      notifyWhatsApp: Boolean(job.notify),
+    };
+  }
+
+  router.get('/chat/jobs', (_req: Request, res: Response) => {
     res.set('Cache-Control', 'no-store');
-    if (!chatJobs) return res.json({ job: null, version: 0 });
-    const job = chatJobs.activeJob();
-    if (!job) {
-      // A job that ended in the last 10 minutes still shows how it ended.
-      const last = chatJobs.lastEnded();
-      const recent = last?.endedAt && Date.now() - Date.parse(last.endedAt) < 10 * 60_000
-        ? { id: last.id, goal: last.goal, status: last.status, endedAt: last.endedAt, endReason: last.endReason ?? null }
-        : null;
-      return res.json({ job: null, recent, version: chatJobs.version() });
-    }
-    const watches = chatJobs.watchesForJob(job.id);
-    const running = continuations?.runner()?.running();
-    const pendingRuns = watches.filter(watch => watch.status === 'pending').length;
-    // What BotBoy is actually doing, derived from what is running (never just "active").
-    const phase = (running && running.jobId === job.id) || activeChatTurns.size > 0 ? 'working'
-      : job.continueRequestedAt ? 'continuing'
-      : pendingRuns ? 'waiting'
-      : 'paused';
+    if (!chatJobs) return res.json({ version: 0, jobs: [], recent: [] });
     res.json({
       version: chatJobs.version(),
-      job: {
-        id: job.id,
-        goal: job.goal,
-        status: job.status,
-        continuationCount: job.continuationCount,
-        createdAt: job.createdAt,
-        lastActivityAt: job.lastActivityAt,
-        nextStep: job.workingSet.nextStep ?? null,
-        waitingRuns: watches.filter(watch => watch.status === 'pending').map(watch => ({
-          runId: watch.runId,
-          purpose: watch.purpose ?? null,
-          remoteStatus: watch.remoteStatus ?? null,
-          submittedAt: watch.submittedAt,
-        })),
-        finishedRuns: watches.filter(watch => watch.status === 'finished').length,
-        continuing: Boolean(running && running.jobId === job.id),
-        phase,
-        pauseNote: phase === 'paused' ? (job.pauseNote ?? 'Nothing is running. Reply in chat to continue.') : null,
-        // The owner asked to be told on WhatsApp (job-notify.md): the strip says so, so the promise is visible, not only remembered.
-        notifyWhatsApp: Boolean(job.notify),
-      },
+      // A provisional job (an ETL run inside a main chat turn that is still running) is the turn's own business until it ends.
+      jobs: chatJobs.activeJobs().filter(job => job.seq > 0).map(jobView),
+      recent: chatJobs.recentlyEnded(new Date(Date.now() - RECENT_JOBS_MS).toISOString(), 20).map(jobView),
     });
+  });
+
+  router.get('/chat/jobs/:id', (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store');
+    if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
+    const job = chatJobs.get(paramStr(req.params.id));
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    const live = continuations?.hub.current().find(turn => turn.info.jobId === job.id);
+    res.json({
+      version: chatJobs.version(),
+      job: jobView(job),
+      history: typeof chat?.getJobHistory === 'function' ? chat.getJobHistory(job.id, Math.min(500, parseInt(String(req.query.limit)) || 200)) : [],
+      activity: chatJobs.watchesForJob(job.id).map(watch => ({ runId: watch.runId, purpose: watch.purpose ?? null, status: watch.status, remoteStatus: watch.remoteStatus ?? null, submittedAt: watch.submittedAt, finishedAt: watch.finishedAt ?? null })),
+      liveTurnKey: live?.info.turnKey ?? null,
+    });
+  });
+
+  // Pause and Resume are owner controls, like Stop: only the rendered chat panel may use them.
+  router.post('/chat/jobs/:id/pause', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Pausing a job', 'Use Pause in the job\'s menu in the chat panel.')) return;
+    if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
+    const jobId = paramStr(req.params.id);
+    const job = chatJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.status !== 'active') return res.status(409).json({ error: 'This job has ended.', code: 'job_not_active' });
+    continuations?.runner()?.forget(jobId);
+    const stoppedTurns = await stopContinuationTurns('job_paused', jobId);
+    // The stopped turn's own settle does nothing ('job_stopped'), so the pause written here stands.
+    const paused = chatJobs.pauseByOwner(jobId);
+    dashboardState.bump();
+    res.json({ ok: true, job: paused ? jobView(paused) : null, stoppedTurns });
+  });
+
+  router.post('/chat/jobs/:id/resume', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Resuming a job', 'Use Resume in the job\'s menu in the chat panel.')) return;
+    if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
+    const jobId = paramStr(req.params.id);
+    const job = chatJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.status !== 'active') return res.status(409).json({ error: 'This job has ended.', code: 'job_not_active' });
+    chatJobs.ownerResumed(jobId);
+    const resumed = chatJobs.requestTurn(jobId, 'The owner resumed the job from the chat panel.');
+    continuations?.runner()?.request(jobId);
+    dashboardState.bump();
+    res.json({ ok: true, job: resumed ? jobView(resumed) : null });
+  });
+
+  // A job's model can change between its turns (PJ5): the next turn, automatic or the owner's, runs on it.
+  router.put('/chat/jobs/:id/model', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Changing a job\'s model', 'Use the model picker in the job\'s view in the chat panel.')) return;
+    if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
+    const jobId = paramStr(req.params.id);
+    const job = chatJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (job.status !== 'active') return res.status(409).json({ error: 'This job has ended.', code: 'job_not_active' });
+    const key = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+    if (key && key !== 'default' && !chatModels.resolve(key)) {
+      return res.status(400).json({ error: 'That model is not offered by any connected provider.', code: 'model_not_offered' });
+    }
+    chatJobs.touch(jobId, { modelKey: key === 'default' ? '' : key });
+    dashboardState.bump();
+    res.json({ ok: true, job: jobView(chatJobs.get(jobId)!) });
   });
 
   // Stop is an owner control: only the rendered chat panel may end a job.
@@ -961,6 +1310,46 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     res.json({ ok: true, job: { id: jobId, status: ended?.status ?? job.status }, stoppedTurns });
   });
 
+  // ── Running queries (docs/maps/query-control.md; owner request 2026-11-12) ──
+  // Every SQL query and Datanet ETL run BotBoy has running, whoever started it: the chat panel lists them, and the owner's Stop
+  // ends any of them. Only BotBoy's own: a query is listed only when BotBoy's record or its SQL marker says BotBoy sent it.
+  router.get('/chat/queries', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerRequest(req, res, 'Running queries')) return;
+    res.set('Cache-Control', 'no-store');
+    const control = deps.queryControl;
+    if (!control) return res.json({ available: false, queries: [], checkedAt: new Date().toISOString(), warnings: [] });
+    try {
+      const listing = await control.list({ fresh: req.query.fresh === '1' });
+      const jobId = typeof req.query.jobId === 'string' ? req.query.jobId.trim() : '';
+      res.json({
+        available: true,
+        checkedAt: listing.checkedAt,
+        warnings: listing.warnings,
+        queries: (jobId ? listing.queries.filter(query => query.jobId === jobId) : listing.queries)
+          .map(query => ({ ...query, startedBy: control.starterOf(query) })),
+      });
+    } catch (error) {
+      res.status(500).json({ error: `BotBoy could not list its running queries: ${(error as Error)?.message ?? String(error)}` });
+    }
+  });
+
+  // Stop is the owner's: only the rendered chat panel may stop a query this way (a model stops its own with cancel_query).
+  router.post('/chat/queries/stop', async (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Stopping a query', 'Use Stop under Running queries in the chat panel.')) return;
+    const control = deps.queryControl;
+    if (!control) return res.status(503).json({ ok: false, code: 'unavailable', error: 'Stopping queries is unavailable in this BotBoy.' });
+    const id = typeof req.body?.id === 'string' ? req.body.id.trim() : '';
+    if (!id || id.length > 200) {
+      return res.status(400).json({ ok: false, code: 'query_id_required', error: 'Say which query to stop (its id from the Running queries list).' });
+    }
+    try {
+      const receipt = await control.stop(id, { kind: 'owner' });
+      res.status(receipt.ok ? 200 : receipt.code === 'not_running' ? 404 : receipt.code === 'unavailable' ? 503 : 409).json(receipt);
+    } catch (error) {
+      res.status(500).json({ ok: false, id, code: 'stop_failed', error: `BotBoy could not stop it: ${(error as Error)?.message ?? String(error)}`, nextAction: 'Open Running queries again: it shows whether the query still runs.' });
+    }
+  });
+
   // Live view of a running continuation turn: a replay of its events so far,
   // then each new event. The panel renders it like its own streamed turn.
   router.get('/chat/live', (req: Request, res: Response) => {
@@ -975,8 +1364,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       if (res.writableEnded) return;
       try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* the viewer left */ }
     };
-    const current = continuations.hub.current();
-    if (current && !current.ended) {
+    // Every running automatic turn, each in its own job's thread (PJ1).
+    for (const current of continuations.hub.current()) {
       send({ kind: 'begin', info: current.info, replay: true });
       for (const event of current.events) send({ kind: 'event', turnKey: current.info.turnKey, event });
     }
@@ -1006,10 +1395,30 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     if (!requireLocalOwnerRequest(req, res, 'Chat')) return;
     if (!chat) return res.status(503).json({ error: 'Chat not available' });
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    // A job update the main chat decides on (job-review.ts, PARALLEL_JOBS_PLAN.md §12) carries the same secret and a `review` body.
+    // It is BotBoy's own turn in the main chat, never the owner's; a wrong secret or an unclaimed state is refused.
+    const reviewAuth = authenticateReviewRequest({
+      secret: continuations?.secret,
+      header: req.get(CONTINUATION_HEADER),
+      body,
+      jobs: chatJobs,
+    });
+    if (reviewAuth && !reviewAuth.ok) {
+      return res.status(reviewAuth.status).json({ error: reviewAuth.error, code: reviewAuth.code });
+    }
+    const review = reviewAuth?.ok ? reviewAuth : undefined;
+    if (review) {
+      if (body.stream !== true || (Array.isArray(body.attachments) && body.attachments.length)) {
+        return res.status(400).json({ error: 'A job update is a streamed turn without attachments.' });
+      }
+      // The owner goes first in the main chat, and one job update runs at a time there.
+      if (ownerTurnIn(MAIN_THREAD)) return res.status(409).json({ error: 'The owner is talking in the main chat.', code: 'owner_turn_active' });
+      if (reviewTurnRunning()) return res.status(409).json({ error: 'Another job update is running.', code: 'review_turn_active' });
+    }
     // A continuation turn (chat-continuations.ts) carries BotBoy's in-memory
     // secret. A wrong secret or an ended job is refused; it is never treated
     // as the owner. Without the header this is an ordinary owner turn.
-    const continuationAuth = authenticateContinuationRequest({
+    const continuationAuth = review ? null : authenticateContinuationRequest({
       secret: continuations?.secret,
       header: req.get(CONTINUATION_HEADER),
       body,
@@ -1019,20 +1428,65 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       return res.status(continuationAuth.status).json({ error: continuationAuth.error, code: continuationAuth.code });
     }
     const continuation = continuationAuth?.ok ? continuationAuth : undefined;
+    /** BotBoy's own turn (a job's continuation, or the main chat's job update): no owner row, no owner authority. */
+    const automatic = Boolean(continuation || review);
     if (continuation) {
       if (body.stream !== true || (Array.isArray(body.attachments) && body.attachments.length)) {
         return res.status(400).json({ error: 'A continuation is a streamed turn without attachments.' });
       }
-      // The owner goes first: the runner retries after the owner's turn.
-      if ([...activeChatTurns.values()].some(turn => !turn.continuationJobId)) {
-        return res.status(409).json({ error: 'An owner turn is in progress.', code: 'owner_turn_active' });
+      // The owner goes first in the job's own thread: the runner retries after the owner's turn there. Turns in the main chat
+      // and in other jobs' threads never hold it back (PARALLEL_JOBS_PLAN.md §6).
+      if (ownerTurnIn(continuation.job.id)) {
+        return res.status(409).json({ error: 'An owner turn is in progress in this job.', code: 'owner_turn_active' });
+      }
+      // One turn per job at a time.
+      if ([...activeChatTurns.values()].some(turn => turn.continuationJobId === continuation.job.id)) {
+        return res.status(409).json({ error: 'This job already has a turn running.', code: 'job_turn_active' });
       }
     }
-    const message = typeof body.message === 'string' ? body.message.trim() : '';
+    const rawMessage = typeof body.message === 'string' ? body.message.trim() : '';
     const stream = body.stream === true;
-    // Continuations always run in general mode with the job's own tools.
-    const requestedMode = continuation ? undefined : body.mode;
-    if (!message) return res.status(400).json({ error: 'message is required' });
+    // Continuations and job updates always run in general mode with their own tools.
+    const requestedMode = automatic ? undefined : body.mode;
+    if (!rawMessage) return res.status(400).json({ error: 'message is required' });
+
+    // ── Thread binding (PARALLEL_JOBS_PLAN.md §6) ──
+    // A continuation runs in its job's thread. An owner message names a job with `jobId` (the job's view in the chat panel) or
+    // a `#N` prefix (the main chat, PJ3). Everything else is the main chat, which belongs to no job.
+    let threadJob: ChatJob | null = continuation ? continuation.job : null;
+    /** A `#N` message typed in the main chat: it runs in the job's thread, and both sides show it (replies come back where typed). */
+    let routedFromMain = false;
+    let message = rawMessage;
+    if (!automatic && chatJobs) {
+      const requestedJobId = typeof body.jobId === 'string' ? body.jobId.trim() : '';
+      if (requestedJobId) {
+        threadJob = chatJobs.get(requestedJobId);
+        if (!threadJob) return res.status(404).json({ error: 'That job does not exist.', code: 'job_not_found' });
+      } else {
+        const routed = JOB_ROUTE_PREFIX.exec(rawMessage);
+        const target = routed ? chatJobs.bySeq(Number(routed[1])) : null;
+        // An unknown number stays a main chat message: the model can say there is no such job.
+        if (routed && target) {
+          threadJob = target;
+          routedFromMain = true;
+          message = rawMessage.slice(routed[0].length).trim() || rawMessage;
+        }
+      }
+      // A follow-up to a job that ended reopens it: the owner is continuing that work in its own thread.
+      if (threadJob && threadJob.status !== 'active' && stream) {
+        threadJob = chatJobs.reopen(threadJob.id) ?? threadJob;
+      }
+    }
+    const threadKey = threadJob ? threadJob.id : MAIN_THREAD;
+    // One owner turn per thread at a time: a second message while a reply is still being written would interleave two turns in
+    // one conversation.
+    if (!automatic && stream && ownerTurnIn(threadKey)) {
+      return res.status(409).json({
+        error: threadJob ? `BotBoy is still replying in job #${threadJob.seq}.` : 'BotBoy is still replying in this chat.',
+        code: 'turn_in_progress',
+        nextAction: 'Wait for the reply to finish, or press Stop, then send again.',
+      });
+    }
     // A fresh install has no AI model until the owner adds a key in
     // Settings → AI model. Say so plainly before admitting a turn instead of
     // failing mid-stream with a provider credential error.
@@ -1096,10 +1550,13 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // One connection and model serve this whole turn: every tool-loop
     // iteration and provider-bound replay (encrypted reasoning) use the client
     // resolved here, even if the owner changes Settings mid-turn.
-    // A continuation reuses the job's last owner model (D4); if the owner has
-    // since removed it, the default serves instead of refusing the turn.
-    const chatBinding = chatModels.resolve(body.model) ?? (continuation ? chatModels.resolve(undefined) : null);
-    if (!chatBinding && body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
+    // A continuation reuses the job's model (D4). An owner turn in a job's thread runs on the job's own model too (PJ5: a job's
+    // model is chosen when it starts or in its view, never by the main chat's picker). If the owner has since removed that
+    // model, the default serves instead of refusing the turn.
+    // A job update runs on the model of the owner's latest main-chat turn (job-review.ts › mainModel), the default when it is gone.
+    const requestedModel = !continuation && threadJob ? (threadJob.modelKey || undefined) : body.model;
+    const chatBinding = chatModels.resolve(requestedModel) ?? (continuation || threadJob || review ? chatModels.resolve(undefined) : null);
+    if (!chatBinding && !threadJob && body.model !== undefined && body.model !== null && body.model !== '' && body.model !== 'default') {
       const offered = chatModels.catalog()?.models.map(model => model.key) ?? [];
       const allowed = ['default', ...offered].filter((key, index, keys) => keys.indexOf(key) === index);
       return res.status(400).json({ error: `model must be one of: ${allowed.join(', ')}` });
@@ -1123,14 +1580,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     // Owner report 2026-08-27: an unrelated message sent while a dashboard was
     // open+refreshing got forced into analytics mode and queued behind the
     // refresh's MCP calls.
-    const modeResolution = continuation
+    const modeResolution = automatic
       ? { mode: 'general' as const, via: 'default' as const }
       : resolveConversationMode({ requestedMode, modeHint: body.modeHint, message });
     const conversationMode = modeResolution.mode;
     const analyticsIntent = conversationMode === 'analytics_dashboard' && (
       body.intent === 'create' || (requestedMode === undefined && detectAnalyticsCreateIntent(message))
     ) ? 'create' as const : undefined;
-    const routeEditAction = analyticsIntent === 'create' || continuation
+    const routeEditAction = analyticsIntent === 'create' || automatic
       ? undefined
       : routeAnalyticsWidgetEditAction(message);
     let ownerRequestId: string | undefined;
@@ -1140,7 +1597,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // One stable request identity per continuation turn of the job.
         ownerRequestId = continuation
           ? continuationRequestId(continuation.job.id, continuation.ordinal)
-          : normalizeOwnerRequestId(body.requestId);
+          : review
+            ? reviewRequestId(review.job.id, review.key)
+            : normalizeOwnerRequestId(body.requestId);
         // Ambient scope is promoted only for a deictic edit ("this widget").
         // It is context for the model, never an authority gate: whatever the
         // selection count, the model resolves the target (or asks), and the
@@ -1175,9 +1634,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
     // SSE streaming mode
     if (stream) {
-      // The owner's message comes first: a running continuation stops (its
-      // note lands before this message) and the job continues from here.
-      if (!continuation) await stopContinuationTurns('preempted');
+      // The owner's message in a job's thread comes first: that job's running continuation stops (its note lands before this
+      // message) and the job continues from here. A main chat message never stops a job.
+      if (!automatic && threadJob) await stopContinuationTurns('preempted', threadJob.id);
+      // The owner's message in the main chat comes first there too: a job update the main chat is deciding on stops (it is decided
+      // again after this turn; what it already did stays).
+      if (!automatic && !threadJob) await stopReviewTurns();
 
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -1196,17 +1658,54 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       res.once('finish', () => clearInterval(turnHeartbeat));
 
       const db = deps.db;
+      const threadJobId = threadJob?.id ?? null;
       // A continuation's trigger is BotBoy's, not the owner's: it goes to the
-      // model's history only, and the reply carries the ↻ note instead.
-      if (db && !continuation) db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json) VALUES (?, ?, ?, ?)').run(
-        `user-${Date.now()}`, 'user', message, attachmentIds.length ? JSON.stringify(attachmentIds) : null,
-      );
-      /** What the transcript shows: a continuation's reply leads with its ↻ note. */
-      const forTranscript = (text: string): string => (continuation?.note ? `${continuation.note}\n\n${text}` : text);
-      // D4: the job keeps the model and thinking of the owner's latest turn.
-      const jobModelKey = body.model === undefined || body.model === null || body.model === '' || body.model === 'default'
-        ? ''
-        : (chatBinding?.key ?? '');
+      // model's history only, and the reply carries the ↻ note instead. An owner row lands in its thread; a `#N` message typed in
+      // the main chat shows there too, marked with its job (replies come back where the owner typed, PJ3).
+      if (db && !automatic) {
+        const insertUser = db.prepare('INSERT INTO chat_messages (id, role, content, attachments_json, job_id, ref_job_id) VALUES (?, ?, ?, ?, ?, ?)');
+        const attachmentsJson = attachmentIds.length ? JSON.stringify(attachmentIds) : null;
+        insertUser.run(transcriptId('user'), 'user', message, attachmentsJson, threadJobId, null);
+        if (routedFromMain && threadJobId) insertUser.run(transcriptId('user'), 'user', rawMessage, attachmentsJson, null, threadJobId);
+      }
+      /**
+       * What the transcript shows: a continuation's reply leads with its ↻ note; the main chat's decision on a job update leads with
+       * what happened and ends with the job's card, which shows what the job is doing now (§12 R3).
+       */
+      const forTranscript = (text: string): string => (continuation?.note
+        ? `${continuation.note}\n\n${text}`
+        : review
+          ? `${review.note ? `${review.note}\n\n` : ''}${text}\n\n${jobCardMarker(review.job.id, 'update')}`
+          : text);
+      /** The reply carries a "started" chip for each job this turn handed off (PARALLEL_JOBS_PLAN.md P2). */
+      const withStartedJobCards = (content: string): string => {
+        const ids = turnState.startedJobIds.filter(id => chatJobs?.get(id)?.seq);
+        if (!ids.length) return content;
+        turnState.cardsShown = new Set([...(turnState.cardsShown ?? []), ...ids]);
+        return withJobCards(content, ids, 'started');
+      };
+      /** Writes one reply to its thread (and, for a `#N` message from the main chat, to the main chat too). Returns its id. */
+      const persistReply = (content: string): string => {
+        const id = transcriptId('asst');
+        if (!db) return id;
+        // A job update the main chat handled itself leaves no row in the main chat: the job's thread has its words (job-review.ts).
+        if (review && isSelfHandledReview(turnState.reviewDecision)) return id;
+        const insert = db.prepare('INSERT INTO chat_messages (id, role, content, job_id, ref_job_id) VALUES (?, ?, ?, ?, ?)');
+        // A job update's decision is about its job: ref_job_id marks the main-chat row, like a job's report.
+        insert.run(id, 'assistant', content, threadJobId, review ? review.job.id : null);
+        // A `#N` message streams where it was typed (the main chat), so the reply the stream reports is the main chat's copy.
+        if (routedFromMain && threadJobId) {
+          insert.run(`${id}-m`, 'assistant', content, null, threadJobId);
+          return `${id}-m`;
+        }
+        return id;
+      };
+      // PJ5: a job started in a main chat turn defaults to the main chat's model; in a job's own thread the job keeps its model.
+      const jobModelKey = threadJob
+        ? (threadJob.modelKey ?? '')
+        : body.model === undefined || body.model === null || body.model === '' || body.model === 'default'
+          ? ''
+          : (chatBinding?.key ?? '');
 
       const turnId = `turn-${++chatTurnCounter}-${Date.now()}`;
       let resolveTurnFinished: () => void = () => {};
@@ -1216,11 +1715,20 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         disconnected: false,
         ...(chatBinding ? { connectionId: chatBinding.connectionId } : {}),
         ...(continuation ? { continuationJobId: continuation.job.id } : {}),
+        ...(review ? { reviewJobId: review.job.id, reviewKey: review.key } : {}),
+        threadKey,
+        startedJobIds: [],
+        heldJobIds: [],
+        ...(ownerRequestId && !automatic ? { requestId: ownerRequestId } : {}),
         startedAt: Date.now(),
         abortController: new AbortController(),
         finished: new Promise<void>((resolve) => { resolveTurnFinished = resolve; }),
       };
       activeChatTurns.set(turnId, turnState);
+      // The main chat's job updates run on the model and thinking of the owner's latest turn there (job-review.ts › mainModel).
+      if (!automatic && !threadJob) {
+        try { deps.mainChatModel?.record({ ...(jobModelKey ? { key: jobModelKey } : {}), thinking: thinkingLevel ?? 'off' }); } catch { /* a preference, never a reason to fail the turn */ }
+      }
       const unregisterShutdownWork = deps.shutdown?.registerWork({
         id: turnId,
         kind: 'chat_turn',
@@ -1249,27 +1757,53 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // `continuation` is never `interactive`, so live-turn-only tools
         // (Gmail, terminals, publication) stay closed to it.
         const toolExecutionContext: ToolExecutionContext = {
-          currentUserMessage: continuation ? continuation.job.goal : message,
-          callerKind: continuation ? 'continuation' : 'interactive',
+          // A job update works for its job's request; it is never the owner's message.
+          currentUserMessage: continuation ? continuation.job.goal : review ? review.job.goal : message,
+          callerKind: continuation ? 'continuation' : review ? 'review' : 'interactive',
           ...(continuation ? { jobMandate: { jobId: continuation.job.id, goal: continuation.job.goal } } : {}),
+          ...(review ? { reviewJobId: review.job.id } : {}),
+          // An owner turn in a job's own thread works for that job; the main chat belongs to none (PARALLEL_JOBS_PLAN.md).
+          ...(!continuation && threadJob ? { threadJobId: threadJob.id } : {}),
+          // Shared with the turn state: the probe, the reply's cards and the end-of-turn settle read what the tools added.
+          ...(!automatic ? { startedJobIds: turnState.startedJobIds } : {}),
+          ...(!automatic && !threadJob ? { heldJobIds: turnState.heldJobIds } : {}),
+          turnModelKey: continuation ? (continuation.job.modelKey ?? '') : jobModelKey,
+          turnThinking: continuation ? continuation.job.thinking : (thinkingLevel ?? 'off'),
+          // A job this turn hands off is data work when the turn is (analytics mode, or a data tool before the hand-off).
+          turnDataWork: () => conversationMode === 'analytics_dashboard' || turnState.dataToolCalled === true,
+          resolveJobModel,
+          nudgeJobs: (jobId: string) => continuations?.runner()?.request(jobId),
+          // The main chat steers jobs (`jobs message` / `continue`, §11 R3, §12 R3): from an owner turn there, with the owner's words of
+          // this turn, or from its own look at a job update, as itself. A job's own turns never get these.
+          ...(!continuation && !threadJob && !review && jobDesk ? {
+            messageJob: (jobId: string, text: string) => jobDesk.messageJob(jobId, text, { from: 'main_chat', ownerWords: message }),
+            continueJob: (jobId: string) => jobDesk.continueJob(jobId, { from: 'main_chat' }),
+          } : {}),
+          ...(review && jobDesk ? {
+            messageJob: (jobId: string, text: string) => jobDesk.messageJob(jobId, text, { from: 'review' }),
+            continueJob: (jobId: string) => jobDesk.continueJob(jobId, { from: 'review' }),
+            askOwner: (jobId: string, question: string, options: string[]) => jobDesk.askOwner(jobId, question, options),
+          } : {}),
+          jobPhase: (job: ChatJob) => (job.status === 'active' ? jobPhaseOf(job) : null),
           abortSignal: activeChatTurns.get(turnId)?.abortController.signal,
           ...(ownerRequestId ? { ownerRequestId } : {}),
           ...(authoritativeAnalyticsScope ? { authoritativeAnalyticsScope } : {}),
-          ...(projectScope && !continuation ? {
+          ...(projectScope && !automatic ? {
             authoritativeProjectIds: [projectScope.projectId],
             projectContextSource: projectScope.source,
           } : {}),
         };
         // Themes (docs/maps/ui-themes.md): ui_theme_propose is offered, and accepted, only on a live owner turn about how BotBoy
         // looks, or in the minutes after a proposal (a follow-up like "warmer"). A continuation never gets it.
-        const uiThemeTurn = !continuation && Boolean(deps.uiThemes) && (asksAboutAppearance(message) || Boolean(deps.uiThemes?.hasRecentProposal()));
+        const uiThemeTurn = !automatic && Boolean(deps.uiThemes) && (asksAboutAppearance(message) || Boolean(deps.uiThemes?.hasRecentProposal()));
         if (uiThemeTurn) toolExecutionContext.uiThemeTurn = true;
         // WhatsApp updates for a job (docs/maps/job-notify.md): job_notify is offered only on a live owner turn that asks to be told
         // when a job needs them or ends (or switches updates off). A continuation never gets it; the notifier sends the messages.
-        const jobNotifyTurn = !continuation && Boolean(deps.jobNotifyEnabled) && asksForJobNotification(message, chatJobs?.activeJob() ?? null);
+        const jobNotifyTurn = !automatic && Boolean(deps.jobNotifyEnabled)
+          && asksForJobNotification(message, threadJob ?? (chatJobs?.activeJobs().length === 1 ? chatJobs.activeJobs()[0] : null));
 
         if (!llmClient || !toolExecutor) {
-          if (continuation) {
+          if (automatic) {
             res.write(`data: ${JSON.stringify({ type: 'error', error: 'Chat tools are unavailable' })}\n\n`);
             res.end();
             return;
@@ -1280,11 +1814,29 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           return;
         }
 
-        // Get or create persistent chat session
-        let sessionId = convManager?.getActiveSessionId('chat');
-        if (!sessionId && convManager) {
-          sessionId = convManager.createSession('chat');
+        // The model session of this turn's thread: the main chat's, or the job's own (PARALLEL_JOBS_PLAN.md §6). Two threads never
+        // share a session, so parallel turns never interleave one conversation.
+        let sessionId: string | null | undefined;
+        if (threadJob && convManager && chatJobs && typeof convManager.threadSessionId === 'function') {
+          sessionId = threadJob.sessionId ?? null;
+          if (!sessionId) {
+            sessionId = convManager.threadSessionId(threadJob.id);
+            chatJobs.setSession(threadJob.id, sessionId);
+            // A job that began in the main chat (before threads, or from a main chat turn cut off mid-work) brings the main chat's
+            // messages since it started, so its first turn in its own thread keeps the context.
+            const mainSession = convManager.getActiveSessionId('chat');
+            if (mainSession && typeof convManager.copyMessagesSince === 'function') {
+              const copied = convManager.copyMessagesSince(mainSession, sessionId, threadJob.createdAt, 40);
+              if (copied) console.log(`[Job] #${threadJob.seq} ${threadJob.id}: its thread starts with ${copied} message(s) from the main chat`);
+            }
+          }
+        } else {
+          sessionId = convManager?.getActiveSessionId('chat');
+          if (!sessionId && convManager) {
+            sessionId = convManager.createSession('chat');
+          }
         }
+        if (sessionId) turnState.sessionId = sessionId;
         // Build the system prompt. Dashboard creation has an explicit mode:
         // its managed MCP/schema preflight is mechanical, so iteration-zero
         // prose cannot bypass discovery just because the model chose no tool.
@@ -1405,21 +1957,26 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               return undefined;
             })
           : undefined;
-        // The active job (the owner's request, the mandate, the working set)
-        // rides every owner and continuation turn (ANALYTICS_AUTONOMY_PLAN.md).
-        const turnJob = continuation ? chatJobs?.get(continuation.job.id) ?? null : chatJobs?.activeJob() ?? null;
+        // This thread's job (the owner's request, the mandate, the working set) rides every turn in its thread. The main chat gets
+        // the compact JOBS list instead: it knows what runs, never a job's thread (PARALLEL_JOBS_PLAN.md §4).
+        const turnJob = threadJob ? chatJobs?.get(threadJob.id) ?? null : null;
         const gmailAccountsBlock = formatGmailAccountsBlock((deps.gmailConnection?.accounts() ?? []).map(account => ({
           ...account,
           sendAs: deps.db ? readGmailSendAs(deps.db, account.id).filter(identity => identity.email !== account.email).map(identity => identity.email) : [],
         })));
         const jobBlock = turnJob?.status === 'active' && chatJobs
           ? formatChatJobBlock(turnJob, chatJobs.watchesForJob(turnJob.id), { continuation: Boolean(continuation) })
-          : undefined;
+          : !threadJob && chatJobs
+            ? formatJobsList(chatJobs.activeJobs().map(job => ({ job, phase: jobPhaseOf(job) })), {
+              modelTitle: modelTitleOf,
+              recent: chatJobs.recentlyEnded(new Date(Date.now() - RECENT_JOBS_MS).toISOString(), 5),
+            })
+            : undefined;
         if (turnJob?.status === 'active' && chatJobs && !continuation) {
           chatJobs.touch(turnJob.id, { modelKey: jobModelKey, thinking: thinkingLevel });
           // This owner turn sees the finished runs in its job block, so no
-          // continuation follows for them.
-          for (const watch of chatJobs.unconsumedFinished(turnJob.id)) chatJobs.consumeWatch(watch.runId);
+          // continuation follows for them (a dashboard refresh: for this job only, another job may wait for it too).
+          for (const watch of chatJobs.unconsumedFinished(turnJob.id)) chatJobs.consumeWatch(watch.runId, turnJob.id);
         }
         // The Knowledge library: one standing line when it has sets, plus the matched set's file table when this message
         // (or the active job's goal) is about one. The tools are offered once the library exists. A slow or unreadable
@@ -1432,7 +1989,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           try {
             const jobGoal = turnJob?.status === 'active' ? turnJob.goal : undefined;
             const routed = await knowledgeLibrary.routeTurn({
-              message: continuation ? continuation.job.goal : message,
+              message: continuation ? continuation.job.goal : review ? review.job.goal : message,
               ...(jobGoal && !continuation ? { jobGoal } : {}),
               analyticsMode: conversationMode === 'analytics_dashboard' || KNOWLEDGE_DATA_JOB_RE.test(jobGoal ?? continuation?.job.goal ?? ''),
               loadedFiles: analyticsBriefing?.presets ?? [],
@@ -1448,8 +2005,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         // never offered the write tools (it may only propose).
         let knowledgeWriteAvailable = false;
         if (knowledgeAvailable) {
+          // A job update, like a continuation, is never offered the write tools.
           const prepared = await prepareKnowledgeWriteTurn({
-            message, continuation: Boolean(continuation), ...(turnJob?.status === 'active' ? { jobGoal: turnJob.goal } : {}),
+            message, continuation: automatic, ...(turnJob?.status === 'active' ? { jobGoal: turnJob.goal } : {}),
             matchedSetId: knowledgeMatchedSetId, context: toolExecutionContext,
           }, { writer: deps.knowledgeWriter, changes: deps.knowledgeChanges });
           knowledgeWriteAvailable = prepared.writeAvailable;
@@ -1473,6 +2031,14 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           calendarConnected: (deps.gmailConnection?.accounts() ?? []).some(account => account.canUseCalendar && !account.needsReconnect),
           uiThemeAvailable: uiThemeTurn,
           jobNotifyAvailable: jobNotifyTurn,
+          // A job's own turn (its thread or an automatic turn): delete_working_file is offered (job-working-files.ts).
+          jobTurn: turnJob?.status === 'active',
+          // The main chat (an owner turn there, or its own look at a job update): the jobs tool is offered (§11 R3, §12 R3).
+          mainChatTurn: !continuation && !threadJob,
+          // The main chat's look at a job update: the JOB UPDATES section, and only REVIEW_TOOLS (job-mandate.ts).
+          reviewTurn: Boolean(review),
+          // The job this turn works for, or decides on, is data work: its prompt carries the detailed dashboard and Data Room rules.
+          jobDataWork: turnJob?.status === 'active' ? turnJob.dataWork : review ? chatJobs?.get(review.job.id)?.dataWork === true : false,
           amazonEmployee: turnAmazonEmployee,
         };
         const systemPrompt = promptManager
@@ -1616,7 +2182,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const chatTools = promptManager ? promptManager.getToolDefinitions('chat', promptContext) : [];
         // A continuation is offered only the job-scope tools (job-mandate.ts);
         // the mandate gate refuses anything else regardless.
-        const tools = continuation ? filterToolsForContinuation(chatTools) : chatTools;
+        const tools = continuation ? filterToolsForContinuation(chatTools) : review ? filterToolsForReview(chatTools) : chatTools;
 
         // Chat replies don't need the global 16K completion budget; capping at
         // 4K frees ~12K tokens of input headroom so the pre-flight trimmer
@@ -1663,7 +2229,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const WRITE_TOOLS = new Set([
           'create_item', 'update_item', 'assign_item', 'create_node', 'write_file', 'edit_file', 'run_command', 'save_mcp_analysis', 'save_product_document', 'edit_product_document',
           'create_analytics_dashboard', 'update_analytics_dashboard', 'edit_analytics_dashboard', 'configure_analytics_widget_source', 'create_data_room_dataset', 'configure_analytics_schedule', 'refresh_analytics_dashboard',
-          'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer',
+          'browser_hands', 'browser_screenshot', 'publish_static_artifact_to_harmony', 'export_footer', 'delete_working_file', 'jobs',
           ...GMAIL_WRITE_TOOLS,
           ...WHATSAPP_WRITE_TOOLS,
           ...GOOGLE_WRITE_TOOLS,
@@ -1694,6 +2260,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         let analyticsWidgetEditReceipt: Record<string, any> | undefined;
         let totalModelToolCalls = 0;
         let visualInspectionRetryUsed = false;
+        // A job update's decision (§12): a `jobs` message, continue or ask_owner the tool accepted, and its one internal check.
+        let reviewDecided = false;
+        let reviewDecisionRetryUsed = false;
         const pendingVisualAssetIds = new Set<string>(attachmentVisualAssets.map(asset => String(asset.assetId)));
         // One semantic rebuild per live turn. Unlike the transient retry, this
         // removes rejected image bytes and asks the model to resume the SAME
@@ -2000,6 +2569,21 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             // Strip <think> tags from saved content — thinking is stored separately
             let content = rawContent.replace(/<think>[\s\S]*?<\/think>\s*/g, '').replace(/<\/?think>/g, '').trim();
 
+            // ── Job update decision check (§12; owner report 2026-11-09) ──
+            // An update about a job BotBoy paused ends with a decision: guidance, a fresh round, or a one-tap question for the
+            // owner. A reply that leaves the job paused without one gets a single internal check; a second such reply stands.
+            if (review && !reviewDecided && !reviewDecisionRetryUsed && !toolsDisabled) {
+              const current = chatJobs?.get(review.job.id);
+              if (current && reviewStateOpen(current, review.key)) {
+                reviewDecisionRetryUsed = true;
+                console.warn(`[JobReview] #${current.seq} ${current.id}: the update replied without deciding; one more pass`);
+                try { res.write(`data: ${JSON.stringify({ type: 'retry', reason: 'job_update_decision', message: 'Deciding on the job...' })}\n\n`); } catch {}
+                messages.push({ role: 'assistant', content });
+                messages.push({ role: 'user', content: reviewDecisionCheck(current) });
+                continue;
+              }
+            }
+
             // ── Visual evidence gate ──
             // A manifest/path is not pixel inspection. Attachment and browser
             // producers add exact asset IDs here; only a successful composite
@@ -2100,9 +2684,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             turnState.jobEnd = toolsDisabled ? 'repeat_breaker' : 'answered';
             turnState.replyExcerpt = replyExcerptOf(content);
             turnState.replyFull = content;
-            content = forTranscript(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes));
-            const assistantId = `asst-${Date.now()}`;
-            if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
+            content = forTranscript(withStartedJobCards(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(content, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes)));
+            const assistantId = persistReply(content);
             if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
             res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content, reasoning: (turnShowThinking && streamResult.reasoning) || undefined, createdAt: new Date().toISOString() } })}\n\n`);
             res.end();
@@ -2268,6 +2851,9 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
             const repeatExempt =
               pacedStatusRead ||
               tc.function.name === 'wait_for_etl_run' ||
+              // wait_for waits server-side only when asked to (waitSeconds); the same no-wait call again is a poll, and the
+              // repeat breaker stops it like any other (docs/maps/job-waits.md).
+              (tc.function.name === 'wait_for' && waitsInCall(tc.function.arguments)) ||
               tc.function.name === 'wait_for_terminal' ||
               tc.function.name === 'read_terminal' ||
               tc.function.name === 'browser_hands' ||
@@ -2430,6 +3016,19 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               } finally {
                 if (blockingKeepalive) clearInterval(blockingKeepalive);
               }
+              // The main chat decided on the job update it was started for (§12).
+              if (review && tc.function?.name === 'jobs') {
+                const decision = reviewDecisionOf(String(tc.function?.arguments ?? ''), String(result?.content ?? ''));
+                if (decision) { reviewDecided = true; turnState.reviewDecision = decision; }
+              }
+              // A data tool in this turn makes a job it hands off, or becomes, data work (owner decision 2026-11-10).
+              if (isDataWorkTool(String(tc.function?.name ?? ''))) turnState.dataToolCalled = true;
+              // A job's turn keeps its last tool calls on the job, for `jobs read` and the main chat's job updates (§12).
+              if (threadJob) {
+                const trail = (turnState.toolTrail ??= []);
+                trail.push({ name: String(tc.function?.name ?? ''), args: String(tc.function?.arguments ?? '').slice(0, 400), result: String(result?.content ?? '').slice(0, 1_200) });
+                if (trail.length > 16) trail.shift();
+              }
               if (tc.function.name === 'get_document_writing_guide') {
                 documentAuthoringThink = true;
               }
@@ -2459,7 +3058,10 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
                       // The footer counts only for a confirmed set (get and refusals never do).
                       : tc.function.name === 'export_footer'
                         ? exportFooterSetConfirmed(String(result?.content ?? ''))
-                        : true;
+                        // A job message counts only when the job took it (list and read never do).
+                        : tc.function.name === 'jobs'
+                          ? jobsMessageConfirmed(tc.function.name, result?.content)
+                          : true;
               }
               const knowledgeChangeId = knowledgeChangeIdFromToolResult(tc.function.name, result?.content);
               if (knowledgeChangeId) knowledgeChangeIds.add(knowledgeChangeId);
@@ -2490,7 +3092,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               }
               // The job's working set keeps what this call produced (files,
               // datasets, dashboards) for later turns and continuations.
-              const recordJobId = continuation?.job.id ?? chatJobs?.activeJob()?.id;
+              // The turn's own job: a continuation's, this thread's, or the main chat turn's provisional ETL job.
+              const recordJobId = continuation?.job.id ?? threadJob?.id ?? turnState.heldJobIds[0];
               if (chatJobs && recordJobId && !result?.isError) {
                 try {
                   recordToolOutcome(chatJobs, recordJobId, tc.function.name, tc.function.arguments, String(result?.content ?? ''));
@@ -2676,8 +3279,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
               analyticsWidgetEditReceipt = receipt;
               turnState.jobEnd = 'answered';
               turnState.replyExcerpt = replyExcerptOf(content);
-              const assistantId = `asst-${Date.now()}`;
-              if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(assistantId, 'assistant', content);
+              const assistantId = persistReply(content);
               if (convManager && sessionId) convManager.appendAssistant(sessionId, content);
               res.write(`data: ${JSON.stringify({ type: 'done', message: { id: assistantId, role: 'assistant', content, createdAt: new Date().toISOString() } })}\n\n`);
               res.end();
@@ -2707,8 +3309,15 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         const endReason = turnState.endReason;
         turnState.jobEnd = providerChanged ? 'provider_changed'
           : endReason === 'preempted' ? 'preempted'
-          : endReason === 'job_stopped' ? 'job_stopped'
+          : endReason === 'job_stopped' || endReason === 'job_paused' ? 'job_stopped'
           : stoppedByUser ? 'owner_stopped' : 'ceiling';
+        // A job update the owner's message (or a model change in Settings) stopped leaves nothing in the main chat: it is decided
+        // again after his turn.
+        if (review && (endReason === 'preempted' || providerChanged)) {
+          turnState.jobEnd = 'preempted';
+          try { res.end(); } catch {}
+          return;
+        }
         res.write(`data: ${JSON.stringify({ type: 'status', text: providerChanged ? '⏹️ AI model changed in Settings — stopping...' : endReason ? '⏹️ Stopping...' : stoppedByUser ? '⏹️ Stopping — summarizing progress...' : '📝 Wrapping up with what I found...' })}\n\n`);
         let finalContent = providerChanged
           ? PROVIDER_CHANGED_STOP_TEXT
@@ -2716,6 +3325,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           ? CONTINUATION_PREEMPTED_TEXT
           : endReason === 'job_stopped'
           ? JOB_STOPPED_TEXT
+          : endReason === 'job_paused'
+          ? JOB_PAUSED_TEXT
           : stoppedByUser
           ? '⏹️ Stopped at your request. The work done so far is preserved above; tell me when to continue.'
           : chatJobs
@@ -2757,9 +3368,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
         } catch (err: any) {
           console.warn(`[Chat] Cap-synthesis call failed: ${err?.message ?? err}`);
         }
-        finalContent = forTranscript(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes));
-        const capId = `asst-${Date.now()}`;
-        if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(capId, 'assistant', finalContent);
+        finalContent = forTranscript(withStartedJobCards(withUiThemeCards(withKnowledgeCards(withMcpServerCards(withGmailDraftCards(finalContent, gmailDraftIds), mcpServerCardIds), knowledgeChangeIds, deps.knowledgeChanges), themeProposalIds, deps.uiThemes)));
+        const capId = persistReply(finalContent);
         if (convManager && sessionId) convManager.appendAssistant(sessionId, finalContent);
         res.write(`data: ${JSON.stringify({ type: 'done', message: { id: capId, role: 'assistant', content: finalContent, createdAt: new Date().toISOString() } })}\n\n`);
         res.end();
@@ -2769,35 +3379,73 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           turnState.jobEnd = interrupted?.disconnected && !interrupted?.shutdownRequested && !deps.shutdown?.isShuttingDown() ? 'disconnected' : 'shutdown';
           console.log(`[Chat] Turn ${turnId} ended during ${interrupted?.disconnected ? 'client disconnect' : 'process shutdown'}; no retry or synthetic failure was persisted`);
           try { res.end(); } catch {}
+        } else if (review && interrupted?.stopRequested && (interrupted.endReason === 'preempted' || interrupted.providerChanged)) {
+          // The owner wrote in the main chat, or changed its model in Settings: this job update stops without a trace and is
+          // decided again after his turn (on the model the main chat uses then).
+          turnState.jobEnd = 'preempted';
+          try { res.end(); } catch {}
         } else if (interrupted?.stopRequested) {
           turnState.jobEnd = interrupted.providerChanged ? 'provider_changed'
             : interrupted.endReason === 'preempted' ? 'preempted'
-            : interrupted.endReason === 'job_stopped' ? 'job_stopped' : 'owner_stopped';
-          const stopId = `asst-${Date.now()}`;
+            : interrupted.endReason === 'job_stopped' || interrupted.endReason === 'job_paused' ? 'job_stopped' : 'owner_stopped';
           const stopText = forTranscript(interrupted.providerChanged
             ? PROVIDER_CHANGED_STOP_TEXT
             : interrupted.endReason === 'preempted'
               ? CONTINUATION_PREEMPTED_TEXT
               : interrupted.endReason === 'job_stopped'
                 ? JOB_STOPPED_TEXT
-                : '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.');
-          if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(stopId, 'assistant', stopText);
+                : interrupted.endReason === 'job_paused'
+                  ? JOB_PAUSED_TEXT
+                  : '⏹️ Stopped at your request. Work already completed is preserved; tell me when to continue.');
+          const stopId = persistReply(stopText);
           try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: stopId, role: 'assistant', content: stopText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           try { res.end(); } catch {}
         } else {
-          turnState.jobEnd = 'failed';
-          console.error(`[Chat] Stream error:`, messageWithTransportCodes(err) || err, err?.stack ? `\n${err.stack}` : '');
+          // PJ2: a provider limit (after the client's own bounded resends) is a wait, never a failure of the job.
+          const providerWait = providerWaitOf(err);
+          // The work carries on by itself: a job's turn, or a main chat turn that already did tool work (it becomes a job). A job
+          // update is BotBoy's own and is simply decided again later.
+          const carriesOn = Boolean(continuation || threadJob) || (!review && (turnState.toolCalls ?? 0) > 0);
+          // So is a network outage, for work that carries on by itself (owner approval 2026-10-29): an immediate retry only
+          // fails again, and two failures in a row used to leave the job stuck.
+          const networkWait = !providerWait && (carriesOn || Boolean(review)) && networkWaitOf(err);
+          turnState.jobEnd = providerWait || networkWait ? 'rate_limited' : 'failed';
+          if (providerWait) {
+            turnState.providerWait = providerWait;
+            console.warn(`[Chat] Turn ${turnId}: the AI provider asked BotBoy to slow down (${String(err?.message ?? err).slice(0, 200)})`);
+          } else if (networkWait) {
+            turnState.providerWait = { network: true };
+            console.warn(`[Chat] Turn ${turnId}: BotBoy could not reach the AI model (${String(messageWithTransportCodes(err) || err?.message || err).slice(0, 200)}); the job waits and tries again`);
+          } else {
+            console.error(`[Chat] Stream error:`, messageWithTransportCodes(err) || err, err?.stack ? `\n${err.stack}` : '');
+          }
           // Honest failure surfacing (2026-09-03: a provider 500 killed a turn
           // and the user saw pure silence after reload). Persist a visible
           // assistant message so the failed turn exists in history — work done
           // by earlier tool iterations (file edits, submitted runs) is real and
-          // survives even though the turn died.
-          try {
-            const failId = `asst-${Date.now()}`;
-            const failText = forTranscript(continuation
-              ? `⚠️ This automatic continuation failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Work completed before the failure is in place. Reply in chat to continue the job.`
-              : `⚠️ This turn failed before I could finish: ${String(err?.message || err).slice(0, 200)}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`);
-            if (db) db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(failId, 'assistant', failText);
+          // survives even though the turn died. A job update that hit a provider or network wait shows nothing: it is decided again
+          // later. Any other failure of one shows the job's card, so the owner hears about the job anyway (§12 Execution).
+          if (review && (providerWait || networkWait)) {
+            // nothing in the main chat
+          } else try {
+            const reason = String(err?.message || err).slice(0, 200);
+            const failText = forTranscript(review
+              ? `⚠️ I could not finish looking at this job (${reason}). It stays as it is; reply in #${review.job.seq} to steer it.`
+              : providerWait
+              ? carriesOn
+                ? '⏳ The AI provider asked BotBoy to slow down. This work waits its turn and carries on by itself; nothing done so far is lost.'
+                : `⏳ The AI provider is limiting requests right now (${reason}). Please send your message again in a minute.`
+              : networkWait
+                // chat-notices-ui.js › legacyNotice recognises this exact shape: change both together.
+                ? `⏳ BotBoy couldn't reach the AI model (${reason}). This work waits and carries on by itself when the connection is back; nothing done so far is lost.`
+              : continuation
+                ? `⚠️ This automatic turn failed before I could finish: ${reason}. Work completed before the failure is in place.`
+                : threadJob
+                  ? `⚠️ This turn failed before I could finish: ${reason}. Work completed before the failure is in place, and the job tries again by itself.`
+                  : carriesOn
+                    ? `⚠️ This turn failed before I could finish: ${reason}. Any file edits or runs I completed are in place, and the work carries on as a job by itself.`
+                    : `⚠️ This turn failed before I could finish: ${reason}. Any file edits or runs I completed before the failure are still in place. Please resend your message to continue.`);
+            const failId = persistReply(failText);
             try { res.write(`data: ${JSON.stringify({ type: 'done', message: { id: failId, role: 'assistant', content: failText, createdAt: new Date().toISOString() } })}\n\n`); } catch {}
           } catch {
             try { res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`); } catch {}
@@ -2807,28 +3455,108 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
       } finally {
         res.off('close', handleResponseClose);
         unregisterShutdownWork?.();
-        // D4: a job this owner turn started (or continued) keeps its model
-        // and thinking for the continuations that follow.
-        if (chatJobs && !continuation) {
+        const runner = continuations?.runner();
+        // PJ2: a provider limit puts this connection's job turns in line; a turn the provider answered releases the line.
+        let rateWaitUntil: string | undefined;
+        if (turnState.providerWait) {
+          rateWaitUntil = runner?.providerLimited(chatBinding?.connectionId, turnState.providerWait.retryAfterMs, turnState.providerWait.network ? 'network' : 'limit');
+        } else if (turnState.jobEnd === 'answered' || turnState.jobEnd === 'ceiling' || turnState.jobEnd === 'repeat_breaker') {
+          runner?.providerClear(chatBinding?.connectionId);
+        }
+        // D4: an owner turn in a job's thread keeps its thinking level for the turns that follow (its model is the job's own).
+        if (chatJobs && !continuation && threadJob) {
           try {
-            const active = chatJobs.activeJob();
-            if (active) chatJobs.touch(active.id, { modelKey: jobModelKey, thinking: thinkingLevel });
+            chatJobs.touch(threadJob.id, { thinking: thinkingLevel ?? 'off' });
           } catch (error: any) {
             console.warn(`[Chat] Job touch failed: ${error?.message ?? error}`);
           }
         }
-        const settledContinue = settleJobAfterTurn({
+        const startedIso = new Date(turnState.startedAt).toISOString();
+        const cutOff = (turnState.toolCalls ?? 0) > 0
+          && (turnState.jobEnd === 'ceiling' || turnState.jobEnd === 'failed' || turnState.jobEnd === 'shutdown' || turnState.jobEnd === 'rate_limited');
+        // Provisional jobs this main chat turn held for its ETL runs (PARALLEL_JOBS_PLAN.md §6): a job whose runs outlived the turn,
+        // or that the turn was cut off on, gets its number and carries on in its own thread; one whose results the turn used
+        // folds away unseen.
+        const surfaced: string[] = [];
+        if (chatJobs) {
+          for (const heldId of turnState.heldJobIds) {
+            try {
+              const held = chatJobs.get(heldId);
+              if (!held || held.status !== 'active') continue;
+              const outlived = chatJobs.watchesForJob(heldId).some(watch => watch.status === 'pending') || chatJobs.unconsumedFinished(heldId).length > 0;
+              if (outlived || cutOff) {
+                chatJobs.surface(heldId);
+                surfaced.push(heldId);
+              } else {
+                chatJobs.end(heldId, 'done', CHAT_JOB_FOLDED_REASON);
+              }
+            } catch (error: any) {
+              console.warn(`[Job] could not settle held job ${heldId}: ${error?.message ?? error}`);
+            }
+          }
+        }
+        // A job update settles its state, never a job: what it did to the job went through `jobs` (job-desk.ts).
+        if (review) settleReview({ jobId: review.job.id, key: review.key, end: turnState.jobEnd });
+        const settled = review ? { continueJobId: null } as { continueJobId: string | null; createdJob?: ChatJob } : settleJobAfterTurn({
           end: turnState.jobEnd,
-          continuationJobId: continuation?.job.id,
-          ownerMessage: continuation ? undefined : message,
+          jobId: threadJob?.id ?? surfaced[0],
+          continuation: Boolean(continuation),
+          // A main chat turn cut off after real work becomes a job, unless it already handed the work to one.
+          ownerMessage: !continuation && !threadJob && !surfaced.length && !turnState.startedJobIds.length ? message : undefined,
+          ownerModelKey: jobModelKey,
+          ownerThinking: thinkingLevel ?? 'off',
+          dataWork: conversationMode === 'analytics_dashboard' || turnState.dataToolCalled === true,
           startedAt: turnState.startedAt,
           toolCalls: turnState.toolCalls ?? 0,
           replyExcerpt: turnState.replyExcerpt,
           replyFull: turnState.replyFull,
+          ...(rateWaitUntil ? { rateWaitUntil } : {}),
+          ...(turnState.providerWait?.network ? { networkWait: true } : {}),
+          ...(turnState.toolTrail?.length ? { trail: turnState.toolTrail } : {}),
+          ...(routedFromMain ? { routedFromMain: true } : {}),
         });
+        const releasedJobIds = [...new Set([...turnState.startedJobIds, ...surfaced, ...(settled.createdJob ? [settled.createdJob.id] : [])])];
+        if (chatJobs) {
+          try {
+            // A job this turn started brings the turn's own messages into its thread, so its first turn there has the context.
+            const convManager = deps.conversationManager;
+            if (convManager && turnState.sessionId && typeof convManager.threadSessionId === 'function' && typeof convManager.copyMessagesSince === 'function') {
+              for (const id of releasedJobIds) {
+                const job = chatJobs.get(id);
+                if (!job || job.sessionId) continue;
+                const thread = convManager.threadSessionId(id);
+                chatJobs.setSession(id, thread);
+                convManager.copyMessagesSince(turnState.sessionId, thread, startedIso, 20);
+              }
+            }
+            // The main chat's cards: a chip for each job this turn started whose chip is not already under its reply. A job this
+            // turn finished posts its report through the desk (below, once the turn is over); a job it left stuck goes to BotBoy's
+            // review first, and the stuck card comes only when no review is wired in (§11 R1, R4).
+            for (const id of releasedJobIds) if (!turnState.cardsShown?.has(id)) postMainJobCard(id, 'started');
+            const worked = threadJob ? chatJobs.get(threadJob.id) : surfaced[0] ? chatJobs.get(surfaced[0]) : null;
+            if (worked?.seq) {
+              if (!jobDesk && worked.status === 'done' && worked.endedAt && worked.endedAt >= startedIso) postMainJobCard(worked.id, 'done');
+              else if (!deps.jobReviews && worked.status === 'active' && worked.pausedAt && worked.pausedAt >= startedIso && worked.pauseKind === 'stuck') postMainJobCard(worked.id, 'stuck');
+            }
+          } catch (error: any) {
+            console.warn(`[Job] end-of-turn bookkeeping failed: ${error?.message ?? error}`);
+          }
+        }
         activeChatTurns.delete(turnId);
         resolveTurnFinished();
-        if (settledContinue) continuations?.runner()?.request(settledContinue);
+        // What waited for an owner reply in the main chat lands now, then any report due (a job this turn finished, one that
+        // finished while the owner was talking here). Never throws.
+        try { jobDesk?.flush(); } catch (error: any) { console.warn(`[Job] report delivery failed: ${error?.message ?? error}`); }
+        // The owner's turn in a job's own thread ended: messages the main chat sent the job meanwhile go to it now.
+        if (!continuation && !review && threadJob && jobDesk) {
+          void jobDesk.ownerTurnEnded(threadJob.id).catch((error: any) => console.warn(`[Job] waiting main-chat messages failed: ${error?.message ?? error}`));
+        }
+        // A job update this turn made due (a job it paused or left stuck), or one that waited for it (the owner was talking in the
+        // main chat, another update ran), may run now.
+        deps.jobReviews?.nudge();
+        if (settled.continueJobId) runner?.request(settled.continueJobId);
+        // A job this turn released may start now (a hand-off's first turn, a job with results it has not seen).
+        for (const id of releasedJobIds) runner?.request(id);
       }
       return;
     }
@@ -2851,6 +3579,15 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
 
   // ── Agent-initiated messages (agent can push messages to chat) ──
 
+  // A notice's Re-authenticate button (MIDWAY_NOTICES_PLAN.md): an owner control, so only the rendered chat panel may press it.
+  router.post('/chat/midway-reauth', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Opening Midway re-authentication', 'Use Re-authenticate on the notice in the chat panel.')) return;
+    if (!deps.midwaySentinel) return res.status(503).json({ error: 'Midway re-authentication is unavailable.', code: 'unavailable' });
+    const result = deps.midwaySentinel.openReauth();
+    if (!result.ok) return res.status(409).json(result);
+    res.json(result);
+  });
+
   router.post('/chat/agent-message', (req: Request, res: Response) => {
     // BotBoy's own producers (dashboard escalation) carry the in-memory
     // secret; nothing else may post as the assistant.
@@ -2862,9 +3599,12 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     const db = deps.db;
     if (!db) return res.status(503).json({ error: 'DB not available' });
     const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    db.prepare('INSERT INTO chat_messages (id, role, content) VALUES (?, ?, ?)').run(id, 'assistant', message);
+    // An optional notice (chat-notices.ts): the panel draws the row as one compact line; `message` stays the readable text.
+    const notice = req.body?.notice === undefined ? null : normalizeChatNotice(req.body.notice);
+    if (req.body?.notice !== undefined && !notice) return res.status(400).json({ error: 'notice is malformed' });
+    db.prepare('INSERT INTO chat_messages (id, role, content, notice_json) VALUES (?, ?, ?, ?)').run(id, 'assistant', message, notice ? JSON.stringify(notice) : null);
     dashboardState.bump();
-    res.json({ id, role: 'assistant', content: message });
+    res.json({ id, role: 'assistant', content: message, ...(notice ? { notice } : {}) });
   });
 
   // ── Chat-embedded interactive terminal ──

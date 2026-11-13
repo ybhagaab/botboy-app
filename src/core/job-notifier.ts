@@ -18,7 +18,7 @@
  * with a backoff and a small budget; after that the owner is told in the laptop chat. WhatsApp not signed in, or the sender
  * busy, leaves the event untouched (no attempt is spent). At most `JOB_NOTIFY_MAX_PER_HOUR` messages per job per hour.
  */
-import { CHAT_JOB_REPLACED_REASON, type ChatJob, type ChatJobStore } from './chat-jobs.js';
+import { CHAT_JOB_FOLDED_REASON, CHAT_JOB_REPLACED_REASON, type ChatJob, type ChatJobStore } from './chat-jobs.js';
 import { redactSecrets } from './sensitive-files.js';
 import { REPLY_PREFIX, toWhatsAppText } from './whatsapp-chat.js';
 import { WhatsAppSendError, type WhatsAppContact, type WhatsAppSender } from './whatsapp-send.js';
@@ -69,7 +69,7 @@ export function dueEvents(job: ChatJob, nowMs: number): JobNotifyEvent[] {
     if (job.pausedAt && !job.continueRequestedAt && nowMs - Date.parse(job.pausedAt) >= JOB_NOTIFY_PAUSE_GRACE_MS) {
       events.push({ key: `needs:${job.pausedAt}`, kind: 'needs_owner', jobId: job.id });
     }
-  } else if (job.endedAt && job.endReason !== CHAT_JOB_REPLACED_REASON) {
+  } else if (job.endedAt && job.endReason !== CHAT_JOB_REPLACED_REASON && job.endReason !== CHAT_JOB_FOLDED_REASON) {
     const kind: JobNotifyKind = job.status === 'done' ? 'finished' : job.status === 'expired' ? 'expired' : 'stopped';
     if (kind === 'finished') {
       // `job_update done` ends the job mid-turn and drops every earlier report (chat-jobs.ts › endJob); the closing report is written
@@ -90,10 +90,12 @@ const GOAL_CHARS = 140;
  */
 export function messageFor(event: JobNotifyEvent, job: ChatJob): string {
   const goal = clip(job.goal, GOAL_CHARS);
-  const lead = event.kind === 'needs_owner' ? '⏸ BotBoy needs you'
-    : event.kind === 'finished' ? '✅ BotBoy finished'
-      : event.kind === 'expired' ? '⌛ BotBoy ended an idle job'
-        : '⏹ BotBoy stopped';
+  // Several jobs can run at once (PARALLEL_JOBS_PLAN.md): every message names its job, so a reply can reach the right one.
+  const which = job.seq ? ` (job #${job.seq})` : '';
+  const lead = event.kind === 'needs_owner' ? `⏸ BotBoy needs you${which}`
+    : event.kind === 'finished' ? `✅ BotBoy finished${which}`
+      : event.kind === 'expired' ? `⌛ BotBoy ended an idle job${which}`
+        : `⏹ BotBoy stopped${which}`;
   const parts = [`${lead}: ${goal}`];
   if (event.kind === 'needs_owner' && job.pauseNote) parts.push(`*What it needs:* ${clip(job.pauseNote, 600)}`);
   if (event.kind === 'finished' && job.endReason) parts.push(`*Outcome:* ${clip(job.endReason, 400)}`);
@@ -103,7 +105,11 @@ export function messageFor(event: JobNotifyEvent, job: ChatJob): string {
   // what is here was written after it: the closing report. A pause carries the reply of the turn that paused.
   const report = job.lastReply ? toWhatsAppText(redactSecrets(job.lastReply)) : '';
   if (report && event.kind !== 'expired') parts.push(report);
-  if (event.kind === 'needs_owner') parts.push('Answer here with @botboy and your reply, or in BotBoy on your laptop.');
+  if (event.kind === 'needs_owner') {
+    parts.push(job.seq
+      ? `Answer here with @botboy #${job.seq} and your reply, or in BotBoy on your laptop.`
+      : 'Answer here with @botboy and your reply, or in BotBoy on your laptop.');
+  }
   let text = parts.join('\n\n').trim();
   if (text.length > JOB_NOTIFY_MESSAGE_CHARS) {
     text = `${text.slice(0, JOB_NOTIFY_MESSAGE_CHARS - 70).trimEnd()}…\n\n(The full report is in BotBoy’s chat on your laptop.)`;
@@ -113,7 +119,7 @@ export function messageFor(event: JobNotifyEvent, job: ChatJob): string {
 
 /** The text sent to confirm that updates are on. Sent by the tool, so a promise is never made that cannot be kept. */
 export function confirmationMessage(job: ChatJob): string {
-  return `${REPLY_PREFIX}Updates are on for: ${clip(job.goal, GOAL_CHARS)}\n\nBotBoy will message this chat when the job needs you, finishes, or is stopped. These come from BotBoy itself, so they arrive even while it works on its own.`;
+  return `${REPLY_PREFIX}Updates are on for${job.seq ? ` job #${job.seq}` : ''}: ${clip(job.goal, GOAL_CHARS)}\n\nBotBoy will message this chat when the job needs you, finishes, or is stopped. These come from BotBoy itself, so they arrive even while it works on its own.`;
 }
 
 export interface JobNotifierDeps {
@@ -123,6 +129,11 @@ export interface JobNotifierDeps {
   connection: Pick<WhatsAppConnection, 'settings' | 'status'>;
   /** A visible note in the laptop chat (an event that could not be sent). */
   postNote?: (text: string) => void;
+  /**
+   * The main chat has not finished looking at this job's pause yet (job-review.ts › isPending, PARALLEL_JOBS_PLAN.md §12): it is not
+   * the owner's yet. The main chat either gets the job going (nothing to tell) or leaves it to the owner, who is then told as usual.
+   */
+  holdPause?: (jobId: string) => boolean;
   now?: () => number;
   log?: (line: string) => void;
   intervalMs?: number;
@@ -204,6 +215,7 @@ export function createJobNotifier(deps: JobNotifierDeps): JobNotifier {
       const retry = candidate.notify?.retry;
       for (const event of dueEvents(candidate, now())) {
         if (retry && retry.key === event.key && Date.parse(retry.notBefore) > now()) continue;
+        if (event.kind === 'needs_owner' && deps.holdPause?.(candidate.id)) continue;
         if (!underCap(candidate.id)) {
           log(`[JobNotify] ${candidate.id}: ${JOB_NOTIFY_MAX_PER_HOUR} messages in the last hour; holding ${event.kind}`);
           break;

@@ -152,10 +152,24 @@
     <div id="chat-whatsapp-notice" class="chat-ai-model-notice" role="status" hidden><span><strong>WhatsApp is not open</strong> BotBoy can only read and send WhatsApp messages while WhatsApp Web is open in its Chrome window.</span><button type="button" class="button small primary" id="chat-whatsapp-open">Open WhatsApp</button></div>
     <div id="chat-messages" aria-live="polite"></div>
     <div id="chat-terminal-dock" class="hidden" role="region" aria-label="Embedded terminal session"></div>
-    <div id="chat-job-strip" class="chat-job-strip" role="status" aria-live="polite" hidden></div>
+    <div id="chat-jobs-dock" class="jobs-dock" role="region" aria-label="Jobs" hidden></div>
     <div class="assistant-prompts"><button type="button" data-prompt="Summarize what changed and cite the relevant evidence.">Summarize changes</button><button type="button" data-prompt="What needs my attention next?">What needs attention?</button><button type="button" data-prompt="Draft a concise status update.">Draft an update</button></div>
     <div id="chat-attach-strip" hidden aria-label="Pending image attachments"></div>
     <div id="chat-input-area"><button type="button" id="chat-attach" onclick="document.getElementById('chatAttachFile').click()" aria-label="Attach images" title="Attach images — or paste one into the message box"><svg><use href="#i-paperclip"/></svg></button><input type="file" id="chatAttachFile" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden><textarea id="chatInput" placeholder="Ask about your workspace…" autocomplete="off" rows="1" enterkeyhint="send"></textarea><button type="button" id="chat-stop" onclick="stopChatTurn()" aria-label="Stop the current response" title="Stop — BotBoy finishes the current step, then summarizes progress" hidden><svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true"><rect x="1" y="1" width="10" height="10" rx="2.5" fill="currentColor"/></svg></button><button type="button" id="chat-send" onclick="submitChat()" aria-label="Send message"><svg><use href="#i-send"/></svg></button></div>
+    <div id="chat-jobs-scrim" class="jobs-scrim" hidden></div>
+    <section id="chat-jobs-drawer" class="jobs-sheet-panel jobs-drawer" role="dialog" aria-labelledby="chat-jobs-drawer-title" aria-hidden="true" hidden>
+      <div class="jobs-grab" data-jobs-drag aria-hidden="true"><span></span></div>
+      <div class="jobs-sheet-bar" data-jobs-drag><b id="chat-jobs-drawer-title">Jobs</b><button type="button" class="jobs-icon" data-jobs-close aria-label="Close the list">⌄</button></div>
+      <div id="chat-jobs-drawer-list" class="jobs-drawer-list"></div>
+    </section>
+    <section id="chat-job-view" class="jobs-sheet-panel jobs-view" role="dialog" aria-labelledby="chat-job-title" aria-hidden="true" hidden>
+      <div class="jobs-grab" data-jobs-drag aria-hidden="true"><span></span></div>
+      <div class="jobs-sheet-bar jobs-view-top" data-jobs-drag><h2 id="chat-job-title" tabindex="-1"></h2><button type="button" id="chat-job-more" class="jobs-icon jobs-more" data-jobs-menu aria-label="Job options" aria-haspopup="menu" aria-expanded="false">⋯</button><button type="button" class="jobs-icon" data-jobs-back aria-label="Collapse the job" title="Back to the chat">⌄</button><div id="chat-job-menu"></div></div>
+      <div id="chat-job-chrome" class="jobs-progress"></div>
+      <div id="chat-job-scroll" class="jobs-view-scroll"><div id="chat-job-thread" class="jobs-thread" aria-live="polite"></div><button type="button" id="chat-job-newest" class="jobs-newest" hidden>↓ Newest</button></div>
+      <div id="chat-job-composer" class="jobs-view-composer"></div>
+    </section>
+    <div id="chat-jobs-toast" class="jobs-toast" role="status" hidden></div>
   </aside>
 
   <nav class="mobile-nav" aria-label="Mobile navigation"><a href="#/today" data-mobile-view="today"><svg><use href="#i-home"/></svg><span>Today</span></a><a href="#/inbox" data-mobile-view="inbox"><svg><use href="#i-inbox"/></svg><span>Inbox</span></a><a href="#/areas" data-mobile-view="area"><svg><use href="#i-folder"/></svg><span>Areas</span></a><button type="button" data-action="open-command"><svg><use href="#i-search"/></svg><span>Search</span></button><button type="button" data-action="toggle-assistant"><svg><use href="#i-bot"/></svg><span>BotBoy</span></button></nav>
@@ -172,6 +186,8 @@
   <script src="./vendor/vega-interpreter.js"></script>
   <script src="./project-layouts.js"></script>
   <script src="./ui-theme.js"></script>
+  <script src="./chat-jobs-ui.js"></script>
+  <script src="./chat-notices-ui.js"></script>
   <script type="module" src="./app.js"></script>
   <script src="./analytics-html-view.js"></script>
   <script src="./knowledge-ui.js"></script>

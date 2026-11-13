@@ -27,6 +27,8 @@ export type CaptureFailureKind =
   | 'service_auth'
   | 'rate_limited'
   | 'network'
+  /** An HTTP 5xx: a server answered and failed. Not the network, and nothing to fix on this Mac. */
+  | 'service_error'
   | 'connector_down'
   | 'unexpected_response'
   | 'unknown';
@@ -122,10 +124,16 @@ const CAUSES: Record<CaptureFailureKind, string> = {
   service_auth: 'The service rejected BotBoy’s sign-in',
   rate_limited: 'The service asked BotBoy to slow down',
   network: 'The service or network is not reachable',
+  service_error: 'The service is returning errors',
   connector_down: 'The connection is not running',
   unexpected_response: 'The connection answered in a format BotBoy can’t read',
   unknown: 'Capture keeps failing',
 };
+
+/** The owner-facing cause of a failure kind, one short sentence ("The service is returning errors"). */
+export function captureFailureCause(kind: CaptureFailureKind): string {
+  return CAUSES[kind] ?? CAUSES.unknown;
+}
 
 /** How the Slack user token was saved: Sign in with Slack, a pasted token, or none. */
 export type SlackConnectedVia = 'oauth' | 'token' | null;
@@ -154,7 +162,7 @@ function nextActionFor(
     if (source === 'slack' && kind === 'service_auth') {
       return 'Open Connections → Slack → Manage and save a new Slack user token.';
     }
-    if (source === 'slack' && kind !== 'rate_limited' && kind !== 'network') {
+    if (source === 'slack' && kind !== 'rate_limited' && kind !== 'network' && kind !== 'service_error') {
       return 'Open Connections → Slack → Manage and check the Slack user token.';
     }
     if (kind === 'service_auth' && source !== 'gmail') return `Restart the ${SOURCE_NAMES[source]} connection.`;
@@ -182,6 +190,8 @@ function nextActionFor(
       return 'Nothing to do: BotBoy slows down and retries.';
     case 'network':
       return 'Check your network or VPN. BotBoy retries automatically.';
+    case 'service_error':
+      return 'Nothing to fix on this Mac: the service itself is failing. BotBoy keeps retrying.';
     case 'connector_down':
       return 'Open the connection page and start the connection.';
     case 'unexpected_response':
@@ -192,11 +202,24 @@ function nextActionFor(
 }
 
 /**
- * Deterministic failure classification from error text. Midway comes first:
- * its message also carries a 401, and it has the one fix the owner must run.
+ * Words of a request that never got an answer: DNS, refused, reset, unreachable. The Midway sentinel reads call failures with
+ * these same words (midway-sentinel.ts › classifyMidwayFailure), so capture health and the sentinel agree on what the network is.
+ */
+export const NETWORK_FAILURE_WORDS = /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|socket hang up|fetch failed|failed to execute request|network error|network is unreachable/i;
+/** An HTTP 5xx: a server answered and failed, so the network works. */
+const SERVICE_ERROR = /status(?: code)?:? 5\d\d\b|\bHTTP\/?[\d.]* 5\d\d\b|\b50[234]\b|internal server error|bad gateway|service unavailable|gateway time-?out/i;
+
+/**
+ * Deterministic failure classification from error text. The network comes first: a request that never got an answer may
+ * still name Midway or mwinit, because the step that failed was the sign-in. Then Midway: its message also carries a 401,
+ * and it has the one fix the owner must run.
  */
 export function classifyCaptureFailure(message: string): CaptureFailureKind {
   const text = String(message ?? '');
+  // 2026-11-12: SharePoint's "Midway SAML authentication failed (Step 3, HTTP network error). Run 'mwinit -f'" (20 in a day,
+  // during network drops) had read as a Midway sign-in failure, so the Midway notice named SharePoint and its warning said to
+  // run mwinit. An HTTP 5xx answer that also names a reset is the service (below), not the network.
+  if (NETWORK_FAILURE_WORDS.test(text) && !SERVICE_ERROR.test(text)) return 'network';
   if (/mwinit|authenticationRequired|Request to IDP URL|midway[^\n]{0,80}\b(?:401|expired|authenticat|session)/i.test(text)) {
     return 'midway_auth';
   }
@@ -204,9 +227,11 @@ export function classifyCaptureFailure(message: string): CaptureFailureKind {
   if (/invalid_auth|not_authed|missing_scope|token_expired|token_revoked|account_inactive|invalid_grant|invalid_client|unauthorized_client|invalid_token|AADSTS\d+|silent authorize|\b401\b|unauthori[sz]ed|unauthenticated|authentication failed|session has expired|no valid tokens|\b403\b|forbidden/i.test(text)) {
     return 'service_auth';
   }
-  if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|getaddrinfo|socket hang up|fetch failed|network error|network is unreachable|status(?: code)? 5\d\d\b|\b50[234]\b|timed? ?out|timeout/i.test(text)) {
-    return 'network';
-  }
+  // An HTTP 5xx means a server answered and failed, so the network works (2026-11-11: Slack's "Request failed with status
+  // code 500" for half an hour after a sign-in had read "check your network or VPN").
+  if (SERVICE_ERROR.test(text)) return 'service_error';
+  // A request that ran out of time (the words of one that got no answer at all matched first).
+  if (/timed? ?out|timeout/i.test(text)) return 'network';
   if (/no active transport|not running|is not installed|profile (?:missing|stopped|failed|degraded|needs_configuration)|connection closed|transport (?:closed|unavailable)/i.test(text)) {
     return 'connector_down';
   }

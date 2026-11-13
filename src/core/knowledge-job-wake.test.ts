@@ -56,7 +56,7 @@ describe('waking a job once the card it waited on is decided', () => {
   it('applying the card wakes the paused job: the pause is cleared and a continuation is due, with the decision as its reason', () => {
     const { job, changeId } = pausedJobWithCard();
     expect(job.pausedAt).toBeTruthy();
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).toBeNull(); // still waiting: nothing to do yet
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).toBeNull(); // still waiting: nothing to do yet
     clockAt(10);
     changes.update(changeId, { status: 'applied' });
     const request = vi.fn();
@@ -86,7 +86,7 @@ describe('waking a job once the card it waited on is decided', () => {
     const { job, changeId } = pausedJobWithCard();
     clockAt(10);
     changes.update(changeId, { status: 'dismissed' });
-    const found = decisionsForPausedJob(jobs.activeJob(), changes)!;
+    const found = decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)!;
     expect(found).toMatchObject({ jobId: job.id, applied: [], dismissed: ['Create the set analytics/ott-discovery-cx-analysis-methodology'] });
     expect(found.reason).toContain('The owner dismissed "Create the set analytics/ott-discovery-cx-analysis-methodology", which this job was waiting on.');
     expect(found.reason).toContain('Dismissed changes wrote nothing.');
@@ -102,10 +102,10 @@ describe('waking a job once the card it waited on is decided', () => {
     pause(job);
     clockAt(10);
     changes.update(first, { status: 'dismissed' });
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).toBeNull(); // the second still waits
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).toBeNull(); // the second still waits
     clockAt(11);
     changes.update(second, { status: 'applied' });
-    const found = decisionsForPausedJob(jobs.activeJob(), changes)!;
+    const found = decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)!;
     expect(found.applied).toEqual(['Edit methods.md in ott']);
     expect(found.dismissed).toEqual(['Create the set analytics/ott-discovery-cx-analysis-methodology']);
     expect(found.reason.split(DECISION_SEPARATOR)[0]).toBe('The owner decided on the Knowledge changes this job was waiting on: applied "Edit methods.md in ott", dismissed "Create the set analytics/ott-discovery-cx-analysis-methodology".');
@@ -121,10 +121,10 @@ describe('waking a job once the card it waited on is decided', () => {
     pause(job);
     clockAt(5);
     changes.update(applied, { status: 'applied' });
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).toBeNull();
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).toBeNull();
     clockAt(6);
     changes.update(held, { status: 'dismissed' });
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).not.toBeNull();
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).not.toBeNull();
   });
 
   it('a decision stamped at the very instant of the pause still counts, so equal timestamps never lose the wake-up', () => {
@@ -134,7 +134,7 @@ describe('waking a job once the card it waited on is decided', () => {
     clockAt(3);
     pause(job);
     changes.update(changeId, { status: 'applied' }); // the same clock reading as the pause
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).not.toBeNull();
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).not.toBeNull();
   });
 
   it('counts the other cards that still wait, from before the job, and does not let them block the wake', () => {
@@ -148,7 +148,7 @@ describe('waking a job once the card it waited on is decided', () => {
     pause(job);
     clockAt(10);
     changes.update(changeId, { status: 'applied' });
-    const found = decisionsForPausedJob(jobs.activeJob(), changes)!;
+    const found = decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)!;
     expect(found.reason).toContain('1 other Knowledge change still waits for the owner.');
   });
 });
@@ -170,7 +170,7 @@ describe('what must NOT wake a job', () => {
     clockAt(10);
     changes.update(before, { status: 'applied' });
     changes.update(after, { status: 'applied' });
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).toBeNull();
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).toBeNull();
     expect(jobs.get(job.id)!.pausedAt).toBeTruthy();
   });
 
@@ -180,13 +180,28 @@ describe('what must NOT wake a job', () => {
     const changeId = stage();
     clockAt(5);
     changes.update(changeId, { status: 'applied' });
-    expect(decisionsForPausedJob(jobs.activeJob(), changes)).toBeNull(); // not paused: its own turn will see the state
+    expect(decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)).toBeNull(); // not paused: its own turn will see the state
     clockAt(2);
     jobs.settle(job.id, { action: 'continue', reason: 'More to do.' }, 'answered');
     expect(decisionsForPausedJob(jobs.get(job.id), changes)).toBeNull(); // a continuation is already due
     jobs.end(job.id, 'done', 'finished');
     expect(decisionsForPausedJob(jobs.get(job.id), changes)).toBeNull();
     expect(decisionsForPausedJob(null, changes)).toBeNull();
+  });
+
+  it('with several jobs, wakes each paused job whose own cards are decided, and leaves a running job alone', () => {
+    const { job: first, changeId } = pausedJobWithCard();
+    clockAt(4);
+    const running = jobs.start({ goal: 'A job that is still working' });
+    clockAt(10);
+    changes.update(changeId, { status: 'applied' });
+    const request = vi.fn();
+    const found = createKnowledgeJobWaker({ jobs, changes, request, log: () => undefined }).wakeIfDecided();
+    expect(found?.jobId).toBe(first.id);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith(first.id);
+    expect(jobs.get(first.id)?.continueRequestedAt).toBeTruthy();
+    expect(jobs.get(running.id)?.continueRequestedAt).toBeUndefined();
   });
 
   it('missing stores wake nothing and never throw, and a failing runner does not undo the wake', () => {
@@ -234,7 +249,7 @@ describe('the store method and the turn it starts', () => {
     const { job, changeId } = pausedJobWithCard();
     clockAt(10);
     changes.update(changeId, { status: 'applied' });
-    const reason = decisionsForPausedJob(jobs.activeJob(), changes)!.reason;
+    const reason = decisionsForPausedJob(jobs.activeJobs()[0] ?? null, changes)!.reason;
     const trigger = buildSelfContinuationTrigger(jobs.get(job.id)!, reason, []);
     expect(trigger.note).toBe('↻ Continued automatically: you applied "Create the set analytics/ott-discovery-cx-analysis-methodology", which this job was waiting on.');
     expect(trigger.message).toContain('Why this turn started: The owner applied "Create the set analytics/ott-discovery-cx-analysis-methodology", which this job was waiting on. Applied changes are saved');

@@ -109,6 +109,35 @@ describe('Slack poll cycle failure handling', () => {
     expect(restarts).toEqual([]);
   });
 
+  it('checkNow polls at once inside the back-off, and a failure after it backs off from the poll interval again', async () => {
+    historyReply = channelId => [{ channelId, error: MIDWAY_401 }];
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    monitor = createSlackMonitor({ db: storage.getDb(), mcpManager: mcpManager(), captureHealth });
+    await monitor.checkNow!(); // before start(): nothing
+    expect(historyCalls).toEqual([]);
+    await monitor.start();
+    for (let i = 0; i < 4; i++) { await vi.advanceTimersByTimeAsync(5 * 60_000); await settle(); }
+    const before = historyCalls.length; // the back-off has reached 5 minutes
+
+    // Signed in again, but the service now fails: the check runs at once, and the next try comes at the poll interval.
+    historyReply = channelId => [{ channelId, error: 'Request failed with status code 500' }];
+    await monitor.checkNow!();
+    expect(historyCalls).toHaveLength(before + 1);
+    expect(reports.at(-1)).toEqual({ kind: 'failure', failureKind: 'service_error', reason: expect.stringContaining('status code 500') });
+    // The next try is the first poll tick at least 90 s later (a 5-minute back-off would allow none in these 3 minutes).
+    await vi.advanceTimersByTimeAsync(180_000);
+    await settle();
+    expect(historyCalls).toHaveLength(before + 2);
+
+    // The service recovers: the next check captures, and the pause is logged as over.
+    historyReply = okHistory;
+    await monitor.checkNow!();
+    expect(reports.at(-1)).toEqual({ kind: 'success' });
+    expect(log.mock.calls.some(call => String(call[0]) === '[Slack] capture resumed')).toBe(true);
+    log.mockRestore();
+  });
+
   it('skips a conversation it cannot read and still polls the rest', async () => {
     historyReply = channelId => (channelId === 'C1'
       ? [{ channelId, result: { ok: false, error: 'channel_not_found' } }]

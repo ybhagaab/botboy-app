@@ -52,6 +52,19 @@ describe('ETL run watcher', () => {
     expect(finished).toEqual([jobId, jobId]);
   });
 
+  it('announces every job with a finished run, not only one (several jobs run at once)', async () => {
+    const other = jobs.start({ goal: 'Second study' }).id;
+    jobs.addWatch({ runId: '111', jobId, source: 'run_query' });
+    jobs.addWatch({ runId: '112', jobId: other, source: 'run_query' });
+    const readRun = vi.fn(async (runId: string): Promise<QueryRunResult> => ({
+      ok: true, runId, remoteStatus: 'SUCCESS', columns: ['x'], rows: [['1']], rowCount: 1, truncated: false, savedTo: `/f/${runId}.tsv`, resultBytes: 10,
+    }));
+    const { instance, finished } = watcher(readRun);
+    await instance.tick();
+    expect(finished.slice(-2).sort()).toEqual([jobId, other].sort());
+    expect(jobs.watch('111')?.jobId).toBe(jobId);
+    expect(jobs.watch('112')?.jobId).toBe(other);
+  });
   it('keeps polling a running or unreadable run, and stores a failure with its diagnosis', async () => {
     jobs.addWatch({ runId: '201', jobId, source: 'run_query' });
     let state: QueryRunResult = { ok: false, code: 'alive_handoff', runId: '201', remoteStatus: 'EXECUTING' };
@@ -75,6 +88,32 @@ describe('ETL run watcher', () => {
     expect(jobs.watch('301')?.status).toBe('pending');
     await instance.tick();
     expect(jobs.watch('301')).toMatchObject({ status: 'finished', outcome: { remoteStatus: 'SUCCESS', error: expect.stringContaining('mcp_etl_download_results') } });
+  });
+
+  it('a result still downloading is a wait, not a failure: polled quietly, logged once, finished when it lands', async () => {
+    jobs.addWatch({ runId: '351', jobId, source: 'run_query' });
+    const logs: string[] = [];
+    let result: QueryRunResult = { ok: false, code: 'download_landing', runId: '351', remoteStatus: 'SUCCESS', error: 'still downloading' };
+    const instance = createEtlRunWatcher({ jobs, readRun: async () => result, etlAvailable: async () => true, onRunsFinished: () => {}, log: line => logs.push(line) });
+    for (let i = 0; i < 5; i++) await instance.tick();
+    expect(jobs.watch('351')).toMatchObject({ status: 'pending', pollFailures: 0 });
+    expect(logs.filter(line => line.includes('still downloading'))).toHaveLength(1);
+    result = { ok: true, runId: '351', remoteStatus: 'SUCCESS', columns: ['uuid'], rows: [['a']], rowCount: 39_689_626, truncated: true, savedTo: '/f/adhoc_351.tsv', resultBytes: 1_803_987_196 };
+    await instance.tick();
+    expect(jobs.watch('351')).toMatchObject({ status: 'finished', outcome: { remoteStatus: 'SUCCESS', rowCount: 39_689_626 } });
+  });
+
+  it('download tries are counted apart from status-read failures (a run with 100 of them still gets three downloads)', async () => {
+    jobs.addWatch({ runId: '361', jobId, source: 'run_query' });
+    for (let i = 0; i < 100; i++) jobs.markPolled('361', { failed: true });
+    expect(jobs.watch('361')?.pollFailures).toBe(100);
+    const { instance } = watcher(async () => ({ ok: false, code: 'download_failed', runId: '361', remoteStatus: 'SUCCESS', error: 'connection closed' }));
+    await instance.tick();
+    await instance.tick();
+    expect(jobs.watch('361')?.status).toBe('pending');
+    await instance.tick();
+    expect(jobs.watch('361')).toMatchObject({ status: 'finished', outcome: { error: expect.stringContaining('after 3 tries') } });
+    expect(jobs.watch('361')?.outcome?.error).toContain('never resubmit the run');
   });
 
   it('reads nothing while the ETL connection is unavailable, and survives a throwing read', async () => {
@@ -143,10 +182,89 @@ describe('ETL run watcher', () => {
     await instance.tick();
     expect(etlAvailable).not.toHaveBeenCalled();
   });
+  it('names the jobs that just expired after a day idle, once (the main chat gets a line for each), and survives a throwing hook', async () => {
+    const other = jobs.start({ goal: 'Still busy' }).id;
+    storage.getDb().prepare('UPDATE chat_jobs SET last_activity_at = ? WHERE id = ?').run(new Date(Date.now() - 25 * 60 * 60_000).toISOString(), jobId);
+    const expired: string[][] = [];
+    const instance = createEtlRunWatcher({ jobs, readRun: vi.fn(), etlAvailable: async () => true, onRunsFinished: () => {}, onJobsExpired: ids => expired.push(ids), log: () => {} });
+    await instance.tick();
+    await instance.tick();
+    expect(expired).toEqual([[jobId]]);
+    expect(jobs.get(jobId)!.status).toBe('expired');
+    expect(jobs.get(other)!.status).toBe('active');
+    const third = jobs.start({ goal: 'Idle too' }).id;
+    storage.getDb().prepare('UPDATE chat_jobs SET last_activity_at = ? WHERE id = ?').run(new Date(Date.now() - 25 * 60 * 60_000).toISOString(), third);
+    const logs: string[] = [];
+    const throwing = createEtlRunWatcher({ jobs, readRun: vi.fn(), etlAvailable: async () => true, onRunsFinished: () => {}, onJobsExpired: () => { throw new Error('desk gone'); }, log: line => logs.push(line) });
+    await expect(throwing.tick()).resolves.toBeUndefined();
+    expect(logs.join('\n')).toContain('expiry note failed: desk gone');
+  });
 
   it('maps run results to outcomes', () => {
     expect(outcomeFromReadRun({ ok: false, code: 'alive_handoff', remoteStatus: 'WAITING_FOR_RESOURCES' })).toBe('pending');
     expect(outcomeFromReadRun({ ok: false, code: 'remote_failed', remoteStatus: 'DELETED', error: 'gone' })).toEqual({ remoteStatus: 'DELETED', error: 'gone' });
     expect(outcomeFromReadRun({ ok: false, code: 'download_failed', remoteStatus: 'SUCCESS' })).toBe('download_failed');
+  });
+});
+
+/**
+ * A job waits for a refresh of one of its dashboards without spending turns (PARALLEL_JOBS_PLAN.md §12 R1, owner decision
+ * 2026-11-09): the watcher reads the local run table every tick, whatever the ETL connection and the Workplace setting say,
+ * stores how the refresh ended, and wakes the job like a finished ETL run.
+ */
+describe('ETL run watcher: dashboard refreshes', () => {
+  let storage: StorageLayer;
+  let jobs: ChatJobStore;
+  let jobId: string;
+  beforeEach(() => {
+    storage = createStorage(':memory:');
+    storage.initialize();
+    jobs = createChatJobStore(storage.getDb());
+    jobId = jobs.start({ goal: 'Refresh the downloads dashboard' }).id;
+  });
+  afterEach(() => storage.close());
+
+  it('wakes the job when its refresh ends, never checks the ETL connection for it, and keeps doing so while ETL is off', async () => {
+    jobs.addDashboardWait({ runId: 'run_abd1cfcd40e545fe', jobId, dashboardId: 'dash_1', title: 'Downloads' });
+    let run: { status: string; widgetCount?: number; widgetsSucceeded?: number; error?: string } | null = { status: 'running', widgetCount: 6, widgetsSucceeded: 2 };
+    const etlAvailable = vi.fn(async () => true);
+    const readRun = vi.fn();
+    const finished: string[] = [];
+    let enabled = false;
+    const instance = createEtlRunWatcher({
+      jobs, readRun: readRun as any, etlAvailable, enabled: () => enabled, onRunsFinished: id => finished.push(id), log: () => {},
+      readDashboardRun: () => run,
+    });
+    await instance.tick();
+    expect(jobs.watchesForJob(jobId)).toMatchObject([{ status: 'pending' }]);
+    expect(finished).toEqual([]);
+    run = { status: 'completed', widgetCount: 6, widgetsSucceeded: 5, error: 'One widget failed: lane down' };
+    await instance.tick();
+    expect(jobs.watchesForJob(jobId)).toMatchObject([{ status: 'finished', outcome: { remoteStatus: 'COMPLETED', widgetCount: 6, widgetsSucceeded: 5, error: 'One widget failed: lane down' } }]);
+    expect(finished).toEqual([jobId]);
+    enabled = true;
+    await instance.tick();
+    expect(finished).toEqual([jobId, jobId]); // announced until a turn consumes it
+    expect(etlAvailable).not.toHaveBeenCalled();
+    expect(readRun).not.toHaveBeenCalled();
+    jobs.consumeWatch('run_abd1cfcd40e545fe', jobId);
+    await instance.tick();
+    expect(finished).toEqual([jobId, jobId]);
+  });
+
+  it('a refresh that is gone ends the wait with what to do; an unreadable one waits for the next tick', async () => {
+    jobs.addDashboardWait({ runId: 'run_0000ffff', jobId, dashboardId: 'dash_1' });
+    let read: () => any = () => { throw new Error('database is locked'); };
+    const logs: string[] = [];
+    const instance = createEtlRunWatcher({
+      jobs, readRun: vi.fn() as any, etlAvailable: async () => false, onRunsFinished: () => {}, log: line => logs.push(line),
+      readDashboardRun: () => read(),
+    });
+    await instance.tick();
+    expect(jobs.watchesForJob(jobId)).toMatchObject([{ status: 'pending' }]);
+    expect(logs.join('\n')).toContain('dashboard refresh run_0000ffff read failed: database is locked');
+    read = () => null;
+    await instance.tick();
+    expect(jobs.watchesForJob(jobId)).toMatchObject([{ status: 'finished', outcome: { remoteStatus: 'MISSING', error: expect.stringContaining('The dashboard run is gone') } }]);
   });
 });

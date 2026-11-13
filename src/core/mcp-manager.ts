@@ -31,6 +31,7 @@ import {
   type RemoteTransportKind,
 } from './mcp-remote-transport.js';
 import { classifyMcpTool, validateMcpToolCall } from './mcp-policy.js';
+import { QueryStoppedReason, backgroundExportOf, getQueryLedger, isConnectionLost, isTrackedSqlTool, markControlSql, markSql, type QueryOrigin } from './query-ledger.js';
 import {
   A2_ANALYTICS_PROFILE_ID,
   buildCustomServerDefinition,
@@ -1101,13 +1102,16 @@ export function createMcpManager(options: {
     operation: () => Promise<T>,
     source = 'system',
     signal?: AbortSignal,
+    /** Query control's short lookups and stops: never wait behind the long queries they may be stopping. */
+    bypassLane = false,
   ): Promise<T> {
     const limit = concurrencyLimitFor(serverId);
     const sourceLimit = sourceLimitFor(serverId, source);
     runtime.pendingCalls += 1;
     try {
       while (
-        callLaneBlocked({
+        !bypassLane
+        && callLaneBlocked({
           inFlight: runtime.inFlightCalls,
           limit,
           sourceInFlight: runtime.inFlightBySource.get(source) ?? 0,
@@ -1158,12 +1162,16 @@ export function createMcpManager(options: {
     const callId = randomUUID();
     const started = Date.now();
     const inputHash = sha256(JSON.stringify(args));
+    const queryLedger = getQueryLedger(db);
+    /** Set when this call is one of BotBoy's tracked warehouse queries (query-ledger.ts): its own stop controller. */
+    let stopper: AbortController | null = null;
 
     try {
       refuseHidden(serverId);
-      const validatedArgs = validateMcpToolCall(profile.kind, toolName, args, {
+      let validatedArgs = validateMcpToolCall(profile.kind, toolName, args, {
         ownerApproved: options.ownerApproved === true,
         guidedFlow: options.guidedFlow === true,
+        queryControl: options.queryControl === true,
       });
       const runtime = options.expectedRuntime ?? await ensureReady(serverId);
       if (runtime.expectedClose || runtimes.get(serverId) !== runtime) {
@@ -1179,8 +1187,26 @@ export function createMcpManager(options: {
         VALUES (?, ?, ?, ?, ?, ?, 'running')
       `).run(callId, serverId, toolName, risk, options.source ?? 'api', inputHash);
 
+      // BotBoy's own warehouse queries (query-ledger.ts, docs/maps/query-control.md): the SQL carries this call's id as its first
+      // comment, so the warehouse's query history names the call even after BotBoy lost it; the call is recorded with who
+      // started it; and it gets a stop controller of its own beside the caller's signal (a stop cancels the call, and the
+      // connector cancels the warehouse query).
+      let signal = options.signal;
+      if (options.queryControl === true && profile.kind === 'sql-context' && typeof validatedArgs.sql === 'string') {
+        // Query control's own lookup or stop: marked as such, never as a query of BotBoy's (query-ledger.ts › SQL_CONTROL_MARKER).
+        validatedArgs = { ...validatedArgs, sql: markControlSql(validatedArgs.sql) };
+      } else if (queryLedger && profile.kind === 'sql-context' && isTrackedSqlTool(toolName)
+        && typeof validatedArgs.sql === 'string') {
+        stopper = new AbortController();
+        signal = options.signal ? AbortSignal.any([options.signal, stopper.signal]) : stopper.signal;
+        queryLedger.beginSql({
+          callId, serverId, toolName, origin: options.queryOrigin ?? originForSource(options.source), sql: validatedArgs.sql, controller: stopper,
+        });
+        validatedArgs = { ...validatedArgs, sql: markSql(callId, validatedArgs.sql) };
+      }
+      const sentArgs = validatedArgs;
       const callOn = (target: RuntimeState) => queueRuntimeCall(serverId, target, () => target.client.callTool(
-        { name: toolName, arguments: validatedArgs },
+        { name: toolName, arguments: sentArgs },
         undefined,
         {
           // An idle window, never a cap on active work: asking for progress
@@ -1189,9 +1215,9 @@ export function createMcpManager(options: {
           timeout: options.timeoutMs ?? 60_000,
           resetTimeoutOnProgress: true,
           onprogress: () => {},
-          ...(options.signal ? { signal: options.signal } : {}),
+          ...(signal ? { signal } : {}),
         },
-      ), options.source ?? 'api', options.signal);
+      ), options.source ?? 'api', signal, options.queryControl === true);
       let response: Awaited<ReturnType<typeof callOn>>;
       try {
         response = await callOn(runtime);
@@ -1225,6 +1251,19 @@ export function createMcpManager(options: {
         extracted.isError ? extracted.text.slice(0, 2000) : null,
         callId,
       );
+      if (stopper) {
+        // An export started with wait:false returned at once, but its query runs on in the connection: the row stays open as a
+        // background export until it ends (query-ledger.ts › holdForExport, docs/maps/job-waits.md).
+        const background = !extracted.isError && toolName === 'export_query' ? backgroundExportOf(extracted.text) : null;
+        if (background) queryLedger?.holdForExport(callId, background);
+        else {
+          queryLedger?.endSql(callId, !extracted.isError ? 'completed' : isConnectionLost(extracted.text) ? 'lost' : 'failed',
+            extracted.isError ? extracted.text : undefined);
+        }
+      } else if (queryLedger && profile.kind === 'sql-context' && toolName === 'export_status' && typeof sentArgs.exportId === 'string') {
+        // Whoever reads an export's status (the model, a job's wait, query control), an ended export ends its row.
+        queryLedger.noteExportStatus(sentArgs.exportId, extracted);
+      }
       return {
         serverId,
         toolName,
@@ -1235,6 +1274,15 @@ export function createMcpManager(options: {
       };
     } catch (error) {
       if (error instanceof RuntimeBusyError) throw error;
+      // Stopped through query control: the caller is told it was on purpose, in words that keep a dashboard from retrying it.
+      const stopped = stopper?.signal.aborted ? stopper.signal.reason : null;
+      if (stopped instanceof QueryStoppedReason) {
+        queryLedger?.endSql(callId, 'stopped', stopped.message);
+        db.prepare(`
+          UPDATE mcp_tool_calls SET status = 'failed', duration_ms = ?, error = ?, completed_at = datetime('now') WHERE id = ?
+        `).run(Date.now() - started, stopped.message, callId);
+        throw new Error(stopped.message);
+      }
       const recordFailedCall = (status: 'blocked' | 'failed', message: string): void => {
         db.prepare(`
           INSERT INTO mcp_tool_calls
@@ -1251,9 +1299,15 @@ export function createMcpManager(options: {
       }
       const message = truncateError(error);
       const status = /blocked|not approved|read-only|not allowed|explicit owner request/i.test(message) ? 'blocked' : 'failed';
+      if (stopper) queryLedger?.endSql(callId, options.signal?.aborted ? 'cancelled' : isConnectionLost(message) ? 'lost' : 'failed', message);
       recordFailedCall(status, message);
       throw new Error(message);
     }
+  }
+
+  /** Who started a SQL call that did not say: a dashboard refresh, or BotBoy at large. */
+  function originForSource(source: string | undefined): QueryOrigin {
+    return source === 'dashboard' ? { kind: 'dashboard' } : { kind: 'botboy' };
   }
 
   async function checkConnection(

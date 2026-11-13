@@ -115,11 +115,21 @@ describe('chat job notify record', () => {
     expect(ids).not.toContain(quiet.id);
   });
 
-  it('a job replaced by a new one stays a candidate, but owes nothing (the notifier filters it by its end reason)', () => {
+  it('a new job no longer replaces an armed one (PJ1): both stay active, and only the armed one is a candidate', () => {
     const since = new Date(Date.now() - 6 * 3_600_000).toISOString();
     const first = jobs.start({ goal: 'first' });
     jobs.setNotify(first.id, true);
-    jobs.start({ goal: 'the owner asked for something else' });
+    const second = jobs.start({ goal: 'the owner asked for something else' });
+    expect(jobs.notifyCandidates(since).map(job => job.id)).toEqual([first.id]);
+    expect(jobs.get(first.id)).toMatchObject({ status: 'active' });
+    expect(jobs.get(second.id)?.notify).toBeUndefined();
+  });
+
+  it('a job that ended as replaced (before threads) stays a candidate, but owes nothing (the notifier filters it by its end reason)', () => {
+    const since = new Date(Date.now() - 6 * 3_600_000).toISOString();
+    const first = jobs.start({ goal: 'first' });
+    jobs.setNotify(first.id, true);
+    jobs.end(first.id, 'done', 'replaced by a new job');
     expect(jobs.notifyCandidates(since).map(job => job.id)).toContain(first.id);
     expect(jobs.get(first.id)).toMatchObject({ status: 'done', endReason: 'replaced by a new job' });
   });

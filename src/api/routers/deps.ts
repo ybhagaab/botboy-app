@@ -172,10 +172,22 @@ export interface RouterDeps {
   appUpdater?: import('../../core/app-update.js').AppUpdater;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
   chatJobs?: ChatJobStore;
+  /** BotBoy's own running SQL queries and ETL runs, and stopping them (query-control.ts): the panel's Running queries. */
+  queryControl?: Pick<import('../../core/query-control.js').QueryControl, 'list' | 'stop' | 'starterOf'>;
   /** True when the WhatsApp job notifier is wired (index.ts): job_notify is then offered on turns that ask for it. */
   jobNotifyEnabled?: boolean;
   /** The notifier, so a job that just paused or ended is told about without waiting for the next sweep. */
   jobNotifier?: Pick<import('../../core/job-notifier.js').JobNotifier, 'nudge'>;
+  /**
+   * The main chat's look at job updates (job-review.ts, PARALLEL_JOBS_PLAN.md §12): nudged when a job pauses or a turn ends, asked
+   * whether it is deciding on a job now. Absent: a stuck job's card goes to the main chat as before.
+   */
+  jobReviews?: Pick<import('../../core/job-review.js').JobReviewRunner, 'nudge' | 'isReviewing'>
+    & Partial<Pick<import('../../core/job-review.js').JobReviewRunner, 'awaitsDecision'>>;
+  /** Remembers the model and thinking of the owner's latest main-chat turn: the main chat's job updates run on them. */
+  mainChatModel?: { record(input: { key?: string; thinking: import('../../core/chat-jobs.js').ChatJobThinking }): void };
+  /** The Midway sentinel: a notice's Re-authenticate button opens its mwinit terminal (MIDWAY_NOTICES_PLAN.md). */
+  midwaySentinel?: Pick<import('../../core/midway-sentinel.js').MidwaySentinel, 'openReauth'>;
   /** The Knowledge library: sets, loads, status, routing (knowledge-library.ts). */
   knowledgeLibrary?: import('../../core/knowledge-library.js').KnowledgeLibrary;
   /** The write path (P2): the composite writer, its History and the staged-changes store. */

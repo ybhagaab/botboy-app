@@ -277,3 +277,32 @@ describe('a2-analytics blocked tier (unconditional)', () => {
     }
   });
 });
+
+/**
+ * Query control (docs/maps/query-control.md) may signal one numbered session; nothing else may. The model's SQL never can:
+ * queryControl is set only by query-control.ts, never from model arguments.
+ */
+describe('query control SQL', () => {
+  it('admits exactly SELECT pg_cancel_backend(<n>) / pg_terminate_backend(<n>) through queryControl on run_query', () => {
+    for (const sql of ['SELECT pg_terminate_backend(1073826734)', 'SELECT pg_cancel_backend(12)', '  SELECT pg_terminate_backend(5)  ']) {
+      expect(validateMcpToolCall('sql-context', 'run_query', { sql }, { queryControl: true }).sql).toBe(sql.trim());
+    }
+    expect(validateMcpToolCall('sql-context', 'run_query', { sql: 'SELECT pid FROM stv_recents' }, { queryControl: true }).sql).toBe('SELECT pid FROM stv_recents');
+  });
+
+  it('refuses every other shape of a session signal, and every signal without queryControl or on another tool', () => {
+    for (const sql of [
+      'SELECT pg_terminate_backend(pg_backend_pid())',
+      'SELECT pg_terminate_backend(1), 1',
+      'SELECT pg_terminate_backend(1); SELECT 1',
+      'SELECT pg_terminate_backend(1234567890123)',
+      'select PG_TERMINATE_BACKEND(1)',
+      'SELECT pid, pg_terminate_backend(pid) FROM stv_recents',
+      'DELETE FROM t',
+    ]) {
+      expect(() => validateMcpToolCall('sql-context', 'run_query', { sql }, { queryControl: true }), sql).toThrow();
+    }
+    expect(() => validateMcpToolCall('sql-context', 'run_query', { sql: 'SELECT pg_terminate_backend(1)' }, { ownerApproved: true })).toThrow(/blocked/);
+    expect(() => validateMcpToolCall('sql-context', 'export_query', { sql: 'SELECT pg_terminate_backend(1)' }, { queryControl: true })).toThrow(/blocked/);
+  });
+});

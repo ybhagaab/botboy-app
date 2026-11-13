@@ -1,3 +1,5 @@
+import type { ChatNotice } from './chat-notices.js';
+
 // ── Work Item Types ──
 
 export type WorkItemType =
@@ -114,6 +116,12 @@ export interface ChatMessage {
   actionsPerformed?: ChatAction[];
   /** Image attachments on user messages: id + servable URL for thumbnails. */
   attachments?: { id: string; url: string }[];
+  /** The job thread this row belongs to (absent: the main chat). */
+  jobId?: string;
+  /** A main-chat row about a job: a message the owner sent it with #N, or that job's reply. */
+  refJobId?: string;
+  /** BotBoy's own status row (chat-notices.ts): the panel draws it as one compact notice. */
+  notice?: ChatNotice;
   createdAt: Date;
 }
 

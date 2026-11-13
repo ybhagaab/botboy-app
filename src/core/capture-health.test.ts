@@ -5,6 +5,7 @@ import { classifyCaptureFailure, createCaptureHealth, sanitizeCaptureReason } fr
 // Real error texts seen from BotBoy's connectors (URLs shortened).
 const MIDWAY_401 = 'Error: Request to IDP URL https://midway-auth.amazon.com/SSO/redirect?client_id=abc&state=xyz&nonce=123 did not redirect. Status code: 401. You may need to authenticate by running mwinit.';
 const SHAREPOINT_NOTICE = 'sharepoint_list_shared_with_me returned non-JSON output (=== UNTRUSTED CONTENT BOUNDARY ===\nThe following content comes from';
+const SHAREPOINT_SAML_NETWORK = "sharepoint_list_shared_with_me failed: Error: Midway SAML authentication failed (Step 3, HTTP network error). Run 'mwinit -f' to refresh credentials. If on a Cloud Desktop, use 'mwinit -o'. Target: https://amazon.sharepoint.com";
 
 describe('classifyCaptureFailure', () => {
   it('names the fix the owner must run for a Midway session expiry, ahead of its 401', () => {
@@ -18,7 +19,7 @@ describe('classifyCaptureFailure', () => {
     expect(classifyCaptureFailure('bad response: {"ok":false,"error":"invalid_auth"}')).toBe('service_auth');
     expect(classifyCaptureFailure('Silent authorize did not return a code (AADSTS50058)')).toBe('service_auth');
     expect(classifyCaptureFailure('sharepoint_list_shared_with_me failed: Error: getaddrinfo ENOTFOUND amazon-my.sharepoint.com')).toBe('network');
-    expect(classifyCaptureFailure('inbox: MCP error -32603: API request failed with status 504')).toBe('network');
+    expect(classifyCaptureFailure('Error: Request failed with status code 502 (ECONNRESET)')).toBe('service_error');
     expect(classifyCaptureFailure(SHAREPOINT_NOTICE)).toBe('unexpected_response');
     expect(classifyCaptureFailure('docx comments response was not JSON')).toBe('unexpected_response');
     expect(classifyCaptureFailure('SharePoint connection: profile incompatible')).toBe('unexpected_response');
@@ -39,8 +40,40 @@ describe('classifyCaptureFailure', () => {
     expect(classifyCaptureFailure('Gmail token refresh failed (HTTP 400 invalid_grant: Token has been expired or revoked.). Google ended BotBoy’s access to this account (revoked, expired, or the password changed). Choose Reconnect.')).toBe('service_auth');
     expect(classifyCaptureFailure('Gmail message failed (HTTP 403 userRateLimitExceeded: User-rate limit exceeded)')).toBe('rate_limited');
     expect(classifyCaptureFailure('Gmail message failed (HTTP 429 rateLimitExceeded)')).toBe('rate_limited');
-    expect(classifyCaptureFailure('Gmail profile failed (HTTP 503 backendError)')).toBe('network');
-    expect(classifyCaptureFailure('Gmail history returned an unreadable (non-JSON) response (HTTP 502)')).toBe('network');
+    // Google answered with a server error: the network works (they read as network trouble before 2026-11-11).
+    expect(classifyCaptureFailure('Gmail profile failed (HTTP 503 backendError)')).toBe('service_error');
+    expect(classifyCaptureFailure('Gmail history returned an unreadable (non-JSON) response (HTTP 502)')).toBe('service_error');
+  });
+
+  it('LIVE (2026-11-11): an HTTP 5xx is the service failing, never the network or VPN', () => {
+    // Slack's connection for 30 minutes after a sign-in, and GRASP's own wording.
+    expect(classifyCaptureFailure('list_channels: Error: Request failed with status code 500')).toBe('service_error');
+    expect(classifyCaptureFailure('inbox: MCP error -32603: API request failed with status 504')).toBe('service_error');
+    expect(classifyCaptureFailure('MCP error -32603: failed to retrieve emails: API request failed with status 503')).toBe('service_error');
+    expect(classifyCaptureFailure('HTTP/1.1 500 Internal Server Error')).toBe('service_error');
+    expect(classifyCaptureFailure('upstream said: Bad Gateway')).toBe('service_error');
+    expect(classifyCaptureFailure('Service Unavailable')).toBe('service_error');
+    expect(classifyCaptureFailure('504 Gateway Time-out')).toBe('service_error');
+    expect(classifyCaptureFailure('history C1: r1 status: 500')).toBe('service_error'); // the Slack MCP's batch wording
+    // A Midway or sign-in failure that also carries a status keeps its own fix, and a timeout stays the network.
+    expect(classifyCaptureFailure(MIDWAY_401)).toBe('midway_auth');
+    expect(classifyCaptureFailure('history: Request failed with status code 401: invalid_auth')).toBe('service_auth');
+    expect(classifyCaptureFailure('MCP error -32001: Request timed out')).toBe('network');
+    expect(classifyCaptureFailure('read 4501 messages, then ECONNRESET')).toBe('network');
+  });
+
+  it('LIVE (2026-11-12): SharePoint’s SAML "HTTP network error" is the network, never a Midway sign-in', () => {
+    // The two SharePoint texts behind 20 failures in a day, during network drops. Both name mwinit.
+    expect(classifyCaptureFailure(SHAREPOINT_SAML_NETWORK)).toBe('network');
+    expect(classifyCaptureFailure("Error: Second Midway SAML round trip failed (Step 7, HTTP network error). Run 'mwinit -f' to refresh credentials. If on a Cloud Desktop, use 'mwinit -o'. Target: https://amazon.sharepoint.com")).toBe('network');
+    // GRASP's own network failure is the network too (it read as unknown), as the Midway sentinel reads it.
+    expect(classifyCaptureFailure('inbox: MCP error -32603: failed to retrieve emails: failed to execute request: Get "https://midway-api.us-east-2.prod.mail.grasp.amazon.dev/graph/api/v1.0/me"')).toBe('network');
+    // A sign-in step that got no answer is the network; one that got an answer and refused is still the sign-in.
+    expect(classifyCaptureFailure('authentication failed: connect ECONNREFUSED 127.0.0.1:443')).toBe('network');
+    expect(classifyCaptureFailure("Error: SAML form chain failed (Steps 4-6). Run 'mwinit -f' to refresh credentials. If on a Cloud Desktop, use 'mwinit -o'. Target: https://amazon.sharepoint.com ()")).toBe('midway_auth');
+    expect(classifyCaptureFailure(MIDWAY_401)).toBe('midway_auth');
+    // An HTTP 5xx answer that also names a reset is the service.
+    expect(classifyCaptureFailure('Error: Request failed with status code 502 (ECONNRESET)')).toBe('service_error');
   });
 
   it('recognizes a connection that is not running, and leaves the rest unknown', () => {
@@ -115,6 +148,33 @@ describe('capture health streaks', () => {
     // A report from before the sentinel's last recovery does not count.
     expect(health.needsMidwayReauth('slack', clock.value)).toBe(false);
     expect(health.needsMidwayReauth('slack', clock.value - 1)).toBe(true);
+  });
+
+  it('a service returning errors says so, and never sends the owner to the network or VPN', () => {
+    const health = make();
+    const reason = 'list_channels: Error: Request failed with status code 500';
+    health.reportFailure('slack', { kind: classifyCaptureFailure(reason), reason });
+    clock.value += minutes(6);
+    health.reportFailure('slack', { kind: classifyCaptureFailure(reason), reason });
+    const [issue] = health.issues();
+    expect(issue).toMatchObject({
+      source: 'slack', kind: 'service_error', cause: 'The service is returning errors',
+      nextAction: 'Nothing to fix on this Mac: the service itself is failing. BotBoy keeps retrying.',
+    });
+    expect(`${issue.cause} ${issue.nextAction}`).not.toMatch(/network|VPN|mwinit/i);
+    // A stored streak of the new kind survives a restart of BotBoy.
+    expect(make().sources().find(entry => entry.source === 'slack')).toMatchObject({ kind: 'service_error', consecutiveFailures: 2 });
+  });
+
+  it('a SharePoint discovery that lost the network while signing in names the network, never mwinit', () => {
+    const health = make();
+    health.reportFailure('sharepoint', { kind: classifyCaptureFailure(SHAREPOINT_SAML_NETWORK), reason: SHAREPOINT_SAML_NETWORK });
+    clock.value += minutes(30);
+    health.reportFailure('sharepoint', { kind: classifyCaptureFailure(SHAREPOINT_SAML_NETWORK), reason: SHAREPOINT_SAML_NETWORK });
+    const [issue] = health.issues();
+    expect(issue).toMatchObject({ source: 'sharepoint', kind: 'network', nextAction: 'Check your network or VPN. BotBoy retries automatically.' });
+    expect(issue.nextAction).not.toMatch(/mwinit/);
+    expect(health.needsMidwayReauth('sharepoint')).toBe(false);
   });
 
   it('tells the owner GRASP’s own sign-in fix, without a restart it says it does not need', () => {
@@ -215,7 +275,7 @@ describe('capture health while Amazon Employee is off (Settings → Workplace)',
 
   it('never names mwinit or Midway for any source or kind while off', () => {
     amazon = false;
-    const kinds = ['midway_auth', 'service_auth', 'rate_limited', 'network', 'connector_down', 'unexpected_response', 'unknown'] as const;
+    const kinds = ['midway_auth', 'service_auth', 'rate_limited', 'network', 'service_error', 'connector_down', 'unexpected_response', 'unknown'] as const;
     for (const kind of kinds) {
       storage.close();
       storage = createStorage(':memory:');
@@ -226,6 +286,15 @@ describe('capture health while Amazon Employee is off (Settings → Workplace)',
         expect(`${issue.cause} ${issue.nextAction}`, `${issue.source}/${kind}`).not.toMatch(/mwinit|Midway/i);
       }
     }
+  });
+
+  it('while off, a Slack service returning errors is still the service, never the token', () => {
+    amazon = false;
+    const health = make();
+    streak(health, 'slack', 'service_error');
+    expect(health.issues()[0]).toMatchObject({
+      kind: 'service_error', nextAction: 'Nothing to fix on this Mac: the service itself is failing. BotBoy keeps retrying.',
+    });
   });
 
   it('hides a stale Slack streak while off without a token, and shows it again with one or when on', () => {

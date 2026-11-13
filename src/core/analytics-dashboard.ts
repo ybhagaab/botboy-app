@@ -15,6 +15,7 @@ import {
 import type { QueryRunner, QueryRunResult } from './etl-adhoc.js';
 import type { AnalyticsDataRoomReadService, DataRoomQueryInput } from './analytics-data-room-read.js';
 import { AnalyticsDataRoomError } from './analytics-data-room-store.js';
+import { backfillWidgetSourceHistory, ensureDataOriginTables, recordEtlRunQuery, recordWidgetSourceChange } from './data-origins.js';
 import {
   AnalyticsDashboardDataRoomError,
   type AnalyticsDashboardDataRoomBridge,
@@ -695,6 +696,11 @@ export function createAnalyticsDashboardService(options: {
   onRunFailure?: (event: AnalyticsRunFailureEvent) => Promise<void>;
 }): AnalyticsDashboardService {
   const db = options.db;
+  // Widget source history (data-origins.ts): kept on every source change from now on, and recovered once from the refresh history
+  // for widgets that moved to the Data Room before BotBoy kept it.
+  ensureDataOriginTables(db);
+  const recoveredSources = backfillWidgetSourceHistory(db);
+  if (recoveredSources) console.log(`[Analytics] recovered the earlier warehouse query of ${recoveredSources} Data Room widget(s) from their refresh history`);
   const mcpManager = options.mcpManager;
   const etlRunner = options.etlRunner;
   const dataRoom = options.dataRoom;
@@ -1374,6 +1380,23 @@ export function createAnalyticsDashboardService(options: {
           expected: { kind: 'relation', description: 'Value equals the widget revision at transaction commit.' }, received: input.expectedWidgetRevision, includeReceivedValue: true,
         }));
       }
+      // The source it replaced stays on the widget's record, complete (owner decision 2026-11-10: "keep the original queries please
+      // when moving to data room"); get_analytics_dashboard and the dataset card show it (data-origins.ts).
+      const previousSource = isPlainObject(currentConfig.dataSource) ? currentConfig.dataSource as Record<string, unknown> : null;
+      const previousKind = previousSource?.kind === 'data_room_query' ? 'data_room_query' as const : 'warehouse_sql' as const;
+      recordWidgetSourceChange(db, {
+        widgetId,
+        dashboardId,
+        widgetRevision: currentRevision,
+        previous: previousKind === 'data_room_query'
+          ? { kind: previousKind, sql: typeof previousSource?.sql === 'string' ? previousSource.sql : null,
+            datasetId: typeof previousSource?.datasetId === 'string' ? previousSource.datasetId : null,
+            versionId: typeof previousSource?.versionId === 'string' ? previousSource.versionId : null }
+          : { kind: previousKind, sql: current.sql_query ?? null, preset: current.preset ?? null },
+        next: descriptor.kind === 'data_room_query'
+          ? { kind: 'data_room_query', sql: descriptor.sql, datasetId: descriptor.datasetId }
+          : { kind: 'warehouse_sql', sql: sqlQuery },
+      });
       run = enqueueDashboard(getDashboard(dashboardId)!, 'agent', [widgetId]);
     }).immediate();
     const widget = mapWidget(db.prepare('SELECT * FROM analytics_widgets WHERE id = ?').get(widgetId));
@@ -3302,7 +3325,7 @@ export function createAnalyticsDashboardService(options: {
       applyLateEtlRemoteFailure(record, outcome);
       return;
     }
-    const delay = outcome.code === 'alive_handoff' ? LATE_ETL_RECHECK_MS : LATE_ETL_RETRY_MS;
+    const delay = outcome.code === 'alive_handoff' || outcome.code === 'download_landing' ? LATE_ETL_RECHECK_MS : LATE_ETL_RETRY_MS;
     returnLateEtlPending(record, outcome, delay);
   }
 
@@ -3318,6 +3341,18 @@ export function createAnalyticsDashboardService(options: {
       }
     }));
     return claimed.length;
+  }
+
+  /** What a refresh query is, in the owner's Running queries list (query-ledger.ts): `Dashboard "Weekly", widget "Streams"`. */
+  function dashboardQueryLabel(row: any): string {
+    let dashboard = '';
+    try {
+      dashboard = String((db.prepare('SELECT title FROM analytics_dashboards WHERE id = ?').get(String(row?.dashboard_id ?? '')) as any)?.title ?? '');
+    } catch {
+      // A label only: a missing title never stops the refresh.
+    }
+    const widget = String(row?.title ?? '').trim();
+    return `${dashboard ? `Dashboard "${dashboard}"` : 'Dashboard refresh'}${widget ? `, widget "${widget}"` : ''}`;
   }
 
   async function executeRunWidget(row: any, lane: DashboardLaneId = 'sql-mcp'): Promise<AnalyticsWidgetResult> {
@@ -3413,9 +3448,23 @@ export function createAnalyticsDashboardService(options: {
     // own actionable message (run machine semantics unchanged).
     if (lane === 'etl' && etlRunner) {
       const startedAtMs = Date.now();
-      const outcome = await etlRunner.runQuery({ sql });
+      const outcome = await etlRunner.runQuery({
+        sql,
+        // One of BotBoy's own queries (query-ledger.ts): listed under Running queries, so the owner can stop a refresh run.
+        origin: { kind: 'dashboard', label: dashboardQueryLabel(row) },
+        // The run's SQL is kept by run id, like a chat run's (data-origins.ts): a dataset made from this run's result shows the
+        // query it came from. recordEtlRunQuery never throws, so the run's own checkpoint handling is unchanged.
+        onSubmitted: (runId: string) => {
+          recordEtlRunQuery(db, {
+            runId,
+            sql,
+            purpose: `Dashboard refresh ${row.run_id} of ${row.dashboard_id}, widget ${row.widget_id} "${String(row.title ?? '')}"`,
+          });
+        },
+      });
       if (!outcome.ok) {
-        if (outcome.code === 'alive_handoff' && /^\d+$/.test(String(outcome.runId ?? ''))) {
+        // A run still going, or one whose large result is still downloading (etl-downloads.ts): late reconciliation reads it again.
+        if ((outcome.code === 'alive_handoff' || outcome.code === 'download_landing') && /^\d+$/.test(String(outcome.runId ?? ''))) {
           throw new EtlAliveHandoffError(outcome);
         }
         throw new Error([outcome.error, outcome.nextAction].filter(Boolean).join(' — ') || 'Datanet ETL query failed');
@@ -3427,7 +3476,7 @@ export function createAnalyticsDashboardService(options: {
       'sql-context',
       'run_query',
       { sql },
-      { source: 'dashboard', timeoutMs: queryTimeoutMs },
+      { source: 'dashboard', timeoutMs: queryTimeoutMs, queryOrigin: { kind: 'dashboard', label: dashboardQueryLabel(row) } },
     );
     if (call.isError) {
       // A sql-context whose PROCESS is up but whose warehouse connection is

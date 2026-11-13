@@ -15,6 +15,7 @@ import {
   createAnalyticsDashboardDataRoomBridge,
 } from './analytics-dashboard-data-room.js';
 import { AnalyticsWidgetEditError, createAnalyticsDashboardService } from './analytics-dashboard.js';
+import { describeDatasetOrigin, originalWarehouseQuery, widgetSourceHistory } from './data-origins.js';
 import { analyticsRequestSha256 } from './analytics-data-room-policy.js';
 import { createWorkspaceCatalogService } from './workspace-catalog.js';
 import type {
@@ -2284,6 +2285,68 @@ describe('analytics dashboard direct Data Room widget sources', () => {
     expect(current.recentRuns).toEqual([]);
   });
 
+  // Owner decision 2026-11-10: a dataset's card says who reads it, the query each reader had before, and how to add a version.
+  it('puts the widgets that read a dataset, with the queries they had before, on its card', () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({ title: 'Cards', widgets: [{ kind: 'line', title: 'Daily', sql: 'SELECT 1' }] });
+    const [widget] = dashboard.widgets;
+    environment.dashboards.configureWidgetSource(dashboard.id, widget.id, { expectedWidgetRevision: widget.revision, source: roomSource() as any });
+    const read = createAnalyticsDataRoomReadService({
+      store: environment.store,
+      describeOrigin: (datasetId, versionId, options) => describeDatasetOrigin(environment.db, datasetId, versionId, options),
+    });
+    const listed = read.list({ query: roomSource().datasetId }) as any;
+    expect(listed.datasets).toHaveLength(1);
+    const [card] = listed.datasets;
+    expect(card.usedBy).toEqual([expect.objectContaining({
+      dashboardId: dashboard.id, widgetId: widget.id, originalQuery: expect.objectContaining({ kind: 'warehouse_sql', sql: 'SELECT 1' }),
+    })]);
+    expect(card.origin).toMatchObject({ versionId: card.versionId, sources: [] });
+    expect(card.origin.note).toContain('no record of the job that made this version');
+    expect(typeof card.addVersion).toBe('string');
+    expect(listed.nextAction).toContain('addVersion says how to give it newer data');
+  });
+
+  it('gives sizes and digests, with the call that reads them whole, when several datasets match', () => {
+    const environment = readyEnvironment();
+    environment.room.registerDataset(sourceDefinition('ds_r4_sessions'));
+    ingest(environment, V1_ROWS, 0, 'ds_r4_sessions');
+    const dashboard = environment.dashboards.createDashboard({ title: 'Cards', widgets: [{ kind: 'line', title: 'Daily', sql: 'SELECT 1' }] });
+    const [widget] = dashboard.widgets;
+    environment.dashboards.configureWidgetSource(dashboard.id, widget.id, { expectedWidgetRevision: widget.revision, source: roomSource() as any });
+    const read = createAnalyticsDataRoomReadService({
+      store: environment.store,
+      describeOrigin: (datasetId, versionId, options) => describeDatasetOrigin(environment.db, datasetId, versionId, options),
+    });
+    // Both datasets are named "R4 events".
+    const listed = read.list({ query: 'R4 events' }) as any;
+    expect(listed.datasets.map((card: any) => card.datasetId).sort()).toEqual(['ds_r4_events', 'ds_r4_sessions']);
+    const card = listed.datasets.find((entry: any) => entry.datasetId === 'ds_r4_events');
+    const [reader] = card.usedBy;
+    expect(reader.originalQuery).toMatchObject({ kind: 'warehouse_sql', chars: 'SELECT 1'.length, readWith: expect.stringContaining('ds_r4_events') });
+    expect(reader.originalQuery.sql).toBeUndefined();
+    // One match reads it whole.
+    const one = read.list({ query: 'ds_r4_events' }) as any;
+    expect(one.datasets).toHaveLength(1);
+    expect(one.datasets[0].usedBy[0].originalQuery).toMatchObject({ sql: 'SELECT 1' });
+  });
+
+  it('gives a widget that moved to the Data Room before BotBoy kept sources its earlier query back at boot', () => {
+    const environment = readyEnvironment();
+    const dashboard = environment.dashboards.createDashboard({ title: 'Older', widgets: [{ kind: 'line', title: 'Daily', sql: 'SELECT 41' }] });
+    const [widget] = dashboard.widgets;
+    const run = environment.dashboards.enqueueRefresh(dashboard.id, 'manual');
+    // The move as an earlier build made it: the widget's source changed and nothing kept the old one.
+    environment.db.prepare('UPDATE analytics_widgets SET sql_query = NULL, config_json = ? WHERE id = ?')
+      .run(JSON.stringify({ dataSource: { version: 1, ...roomSource() } }), widget.id);
+    expect(widgetSourceHistory(environment.db, widget.id)).toEqual([]);
+    createAnalyticsDashboardService({
+      db: environment.db, mcpManager: environment.mcp.manager, dataRoom: environment.bridge,
+      dataRoomRead: createAnalyticsDataRoomReadService({ store: environment.store }),
+    });
+    expect(originalWarehouseQuery(environment.db, widget.id)).toMatchObject({ kind: 'warehouse_sql', sql: 'SELECT 41', recoveredFromRunId: run.id });
+  });
+
   it('configures one widget through the same resolver and loads it locally', async () => {
     const environment = readyEnvironment();
     const dashboard = environment.dashboards.createDashboard({
@@ -2296,6 +2359,9 @@ describe('analytics dashboard direct Data Room widget sources', () => {
     expect(failure).toMatchObject({ code: 'not_found', mutationApplied: false });
     expect(failure.issues[0].path).toBe('source.datasetId');
 
+    // The refused change kept nothing.
+    expect(widgetSourceHistory(environment.db, widget.id)).toEqual([]);
+
     const mutation = environment.dashboards.configureWidgetSource(dashboard.id, widget.id, {
       expectedWidgetRevision: widget.revision, source: roomSource() as any,
     });
@@ -2306,6 +2372,19 @@ describe('analytics dashboard direct Data Room widget sources', () => {
       sql: undefined,
       result: { rows: DAILY_ROWS, source: { provider: 'data-room-query' } },
     });
+    // Owner decision 2026-11-10: the warehouse query it had stays on the widget's record, complete.
+    expect(widgetSourceHistory(environment.db, widget.id)).toEqual([expect.objectContaining({
+      kind: 'warehouse_sql', sql: 'SELECT 1', widgetRevision: widget.revision, replacedByKind: 'data_room_query',
+    })]);
+    // Moving it back keeps the Data Room source it had, newest first.
+    const current = environment.dashboards.getDashboard(dashboard.id)!.widgets[0];
+    environment.dashboards.configureWidgetSource(dashboard.id, widget.id, {
+      expectedWidgetRevision: current.revision, source: { kind: 'warehouse_sql', sql: 'SELECT 2' } as any,
+    });
+    expect(widgetSourceHistory(environment.db, widget.id).map(record => [record.kind, record.datasetId ?? record.sql])).toEqual([
+      ['data_room_query', roomSource().datasetId],
+      ['warehouse_sql', 'SELECT 1'],
+    ]);
   });
 });
 

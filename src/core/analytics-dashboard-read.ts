@@ -13,6 +13,65 @@
  */
 import type { AnalyticsDashboard, AnalyticsWidget } from './analytics-types.js';
 import type { DashboardIssue } from './analytics-dashboard-issues.js';
+import { originSummary, type DataOriginSource, type WidgetSourceRecord } from './data-origins.js';
+
+/** What the sources summary needs to look up (tool-executor.ts wires it to the Data Room catalog and data-origins.ts). */
+export interface DashboardSourceLookups {
+  dataset(datasetId: string): { name?: string; headVersionId?: string; watermark?: string } | null;
+  originalQuery(widgetId: string): WidgetSourceRecord | undefined;
+  origin(versionId: string): DataOriginSource[];
+}
+
+/**
+ * The model's view of where a dashboard's data comes from (owner decision 2026-11-10: "summary for sources can be non-ui shown
+ * data for dashboards"): which widgets run warehouse queries and through which lane they last loaded, which read Data Room
+ * datasets (newest version, data through, origin, the query the widget had before), and which are text or pages. Never shown in
+ * the UI; get_analytics_dashboard puts it first.
+ */
+export function dashboardSourcesForModel(dashboard: AnalyticsDashboard, lookups: DashboardSourceLookups): Record<string, unknown> {
+  const warehouse: Array<Record<string, unknown>> = [];
+  const dataRoom: Array<Record<string, unknown>> = [];
+  const staticWidgets: Array<Record<string, unknown>> = [];
+  const lanes = new Map<string, number>();
+  const datasets = new Set<string>();
+  for (const widget of dashboard.widgets) {
+    const state = widget.lastError ? 'failed' : widget.result ? 'loaded' : 'not_loaded';
+    const source = widget.config?.dataSource as Record<string, unknown> | undefined;
+    if (widget.kind === 'text' || widget.kind === 'html') {
+      staticWidgets.push({ widgetId: widget.id, title: widget.title, kind: widget.kind });
+    } else if (source?.kind === 'data_room_query' && typeof source.datasetId === 'string') {
+      const datasetId = source.datasetId;
+      datasets.add(datasetId);
+      const dataset = lookups.dataset(datasetId);
+      const shown = (widget.result?.source as { versionId?: string } | undefined)?.versionId;
+      const origin = dataset?.headVersionId ? originSummary(lookups.origin(dataset.headVersionId)) : undefined;
+      const before = lookups.originalQuery(widget.id);
+      dataRoom.push({
+        widgetId: widget.id, title: widget.title, state, datasetId,
+        ...(dataset?.name ? { datasetName: dataset.name } : {}),
+        ...(dataset?.headVersionId ? { newestVersionId: dataset.headVersionId } : {}),
+        ...(shown ? { shownVersionId: shown } : {}),
+        ...(dataset?.watermark ? { dataThrough: dataset.watermark } : {}),
+        ...(origin ? { origin } : {}),
+        ...(before?.sql ? { originalQuery: `${before.kind}, ${before.sql.length.toLocaleString('en-US')} chars, kept on the widget (read the widget whole for its SQL)` }
+          : before?.preset ? { originalQuery: `${before.kind} preset ${before.preset}, kept on the widget` } : {}),
+      });
+    } else {
+      const lane = widget.result?.lane;
+      if (lane) lanes.set(lane, (lanes.get(lane) ?? 0) + 1);
+      warehouse.push({ widgetId: widget.id, title: widget.title, state, ...(lane ? { lastLane: lane } : {}) });
+    }
+  }
+  const laneText = [...lanes].map(([lane, count]) => `${lane} ${count}`).join(', ');
+  return {
+    summary: `${dashboard.widgets.length} widgets: ${warehouse.length} read warehouse queries${laneText ? ` (last loaded through ${laneText})` : ''}, ${dataRoom.length} read Data Room datasets (${datasets.size} dataset${datasets.size === 1 ? '' : 's'}), ${staticWidgets.length} are text or pages.`,
+    refresh: 'A refresh re-runs each warehouse query on the lane that is ready at that moment (the DATA LANE NOTICE) and re-reads each Data Room widget at its dataset\'s newest version; text and pages have no source. A Data Room widget gets newer data when its dataset gets a new version.',
+    ...(warehouse.length ? { warehouse } : {}),
+    ...(dataRoom.length ? { dataRoom } : {}),
+    ...(staticWidgets.length ? { static: staticWidgets } : {}),
+    readMore: 'get_analytics_dashboard with dashboardId and widgetId returns one widget whole: its full SQL and the sources it had before. list_data_room_datasets with a dataset ID returns its origin with the complete query, the widgets that read it, and how to add a version.',
+  };
+}
 
 /** Room below the 40,000-character tool-result cap for its truncation note. */
 export const MODEL_READ_BUDGET_CHARS = 38_000;
@@ -97,20 +156,25 @@ function dashboardSummary(
   };
 }
 
-/** The whole dashboard when it fits, else every widget's settings with a few sample rows. */
+/**
+ * The whole dashboard when it fits, else every widget's settings with a few sample rows. `sources`
+ * (dashboardSourcesForModel) leads either way.
+ */
 export function dashboardReadForModel(
   dashboard: AnalyticsDashboard,
   issues: DashboardIssue[],
   budget = MODEL_READ_BUDGET_CHARS,
+  extras: { sources?: Record<string, unknown> } = {},
 ): string {
-  const full = { ...dashboard, issues };
+  const lead = extras.sources ? { sources: extras.sources } : {};
+  const full = { ...lead, ...dashboard, issues };
   const pretty = JSON.stringify(full, null, 1);
   if (pretty.length <= budget) return pretty;
   const compact = JSON.stringify(full);
   if (compact.length <= budget) return compact;
   let text = '';
   for (const level of SUMMARY_LEVELS) {
-    text = JSON.stringify(dashboardSummary(dashboard, issues, level));
+    text = JSON.stringify({ ...lead, ...dashboardSummary(dashboard, issues, level) });
     if (text.length <= budget) return text;
   }
   return text;
@@ -141,9 +205,11 @@ export function widgetReadForModel(
   dashboard: AnalyticsDashboard,
   widget: AnalyticsWidget,
   issues: DashboardIssue[],
-  options: { htmlOffset?: number } = {},
+  options: { htmlOffset?: number; extras?: Record<string, unknown> } = {},
   budget = MODEL_READ_BUDGET_CHARS,
 ): string {
+  // Where the widget's data comes from (its earlier sources complete, its dataset's origin): part of every read of it.
+  const extras = options.extras ?? {};
   const head = {
     id: dashboard.id,
     title: dashboard.title,
@@ -161,7 +227,7 @@ export function widgetReadForModel(
     return JSON.stringify({ ok: false, error: `htmlOffset ${htmlOffset} is past the end of the page (${html.length} characters).`, nextAction: 'Use an htmlOffset smaller than the page length, or 0 for the start.' });
   }
   if (!htmlOffset) {
-    const whole = { dashboard: head, widget, issues: own };
+    const whole = { dashboard: head, widget, ...extras, issues: own };
     const pretty = JSON.stringify(whole, null, 1);
     if (pretty.length <= budget) return pretty;
     const compact = JSON.stringify(whole);
@@ -187,6 +253,7 @@ export function widgetReadForModel(
       ...(note ? { readNote: note } : {}),
       ...(part ? { htmlPart: part } : {}),
       widget: { ...widget, config, ...(result ? { result } : {}) },
+      ...extras,
       issues: own,
     });
   };

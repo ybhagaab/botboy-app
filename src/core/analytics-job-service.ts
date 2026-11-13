@@ -2886,6 +2886,8 @@ export function createAnalyticsJobService(input: {
       outcome = await input.etlRunner.runQuery({
         sql: source.sql,
         ...(source.datasetDate ? { datasetDate: source.datasetDate } : {}),
+        // One of BotBoy's own queries (query-ledger.ts): the owner can stop it under Running queries.
+        origin: { kind: 'data_room', label: 'Data Room dataset' },
         onSubmitted: runId => {
           input.jobStore.checkpoint({
             attemptId,
@@ -2895,7 +2897,8 @@ export function createAnalyticsJobService(input: {
       });
     }
     if (!outcome.ok) {
-      if ((outcome.code === 'alive_handoff' || outcome.code === 'status_unavailable') && outcome.runId) {
+      // download_landing: the run succeeded and its large result is still downloading (etl-downloads.ts); read it again later.
+      if ((outcome.code === 'alive_handoff' || outcome.code === 'status_unavailable' || outcome.code === 'download_landing') && outcome.runId) {
         input.jobStore.waitNode({
           nodeId: node.id,
           attemptId,

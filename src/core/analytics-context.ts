@@ -286,6 +286,111 @@ export type LoadAnalyticsContextResult =
   | { ok: true; name: string; source: AnalyticsContextSource; content: string; truncated: boolean }
   | { ok: false; error: string };
 
+/** The line that marks BotBoy's data dictionary (etl-data-dictionary.ts › renderDataDictionary). */
+export const DATA_DICTIONARY_MARKER = '<!-- botboy:data-dictionary v1 -->';
+
+export interface KnowledgeParts {
+  /** Sections whose heading names one of these tables (schema.table or the bare name). */
+  tables?: string[];
+  /** Every line that holds this word, under its section heading. */
+  find?: string;
+}
+
+const MAX_FIND_LINES = 160;
+const MAX_PART_CHARS = 40_000;
+
+/**
+ * Part of a knowledge file (owner decision 2026-11-10: the data dictionary is one file, read in parts, so it scales with the
+ * estate). `tables` returns the sections whose heading names a table; `find` every line holding a word, grouped under its
+ * section heading; a data dictionary loaded with neither returns only its index. Null means: the whole file, as before.
+ */
+export function selectKnowledgeParts(raw: string, parts: KnowledgeParts = {}): string | null {
+  const wanted = (parts.tables ?? []).map(name => String(name ?? '').trim().replace(/^`|`$/g, '').toLowerCase()).filter(Boolean).slice(0, 12);
+  const term = String(parts.find ?? '').trim().toLowerCase().slice(0, 120);
+  const dictionary = raw.includes(DATA_DICTIONARY_MARKER);
+  if (!wanted.length && !term && !dictionary) return null;
+  const lines = raw.split('\n');
+  const headings: Array<{ line: number; level: number; text: string }> = [];
+  lines.forEach((line, index) => {
+    const match = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (match) headings.push({ line: index, level: match[1].length, text: match[2].replace(/`/g, '').trim().toLowerCase() });
+  });
+  const sectionEnd = (position: number) => {
+    const next = headings.slice(position + 1).find(heading => heading.level <= headings[position].level);
+    return next ? next.line : lines.length;
+  };
+  // A data dictionary's table entries are its level-2 headings named schema.table.
+  const isTableHeading = (heading: { level: number; text: string }) => heading.level === 2 && /^[a-z0-9_$]+\.[a-z0-9_$]+$/.test(heading.text);
+  if (!wanted.length && !term) {
+    const first = headings.find(isTableHeading);
+    if (!first) return raw;
+    const count = headings.filter(isTableHeading).length;
+    return `${lines.slice(0, first.line).join('\n').trimEnd()}\n\n[Index only: this file holds ${count} table entries. Read entries with tables:["<table>"], or search every table with find:"<column, ID or word>".]`;
+  }
+  const out: string[] = [];
+  if (wanted.length) {
+    const picked = new Set<number>();
+    const misses: string[] = [];
+    for (const name of wanted) {
+      const bare = name.split('.').pop()!;
+      const matches = headings.map((heading, position) => ({ heading, position })).filter(({ heading }) => (dictionary
+        ? isTableHeading(heading) && (heading.text === name || heading.text.endsWith(`.${bare}`))
+        : heading.text.includes(bare)));
+      if (!matches.length) misses.push(name);
+      for (const { position } of matches) picked.add(position);
+    }
+    for (const position of [...picked].sort((a, b) => a - b)) out.push(lines.slice(headings[position].line, sectionEnd(position)).join('\n').trimEnd());
+    if (misses.length) out.push(`[Not in this file: ${misses.join(', ')}${dictionary ? '. The Index lists every table this dictionary covers.' : '.'}]`);
+  }
+  if (term) {
+    // The section a line belongs to: in a dictionary its table entry, elsewhere its nearest heading.
+    const sectionOf = (index: number) => {
+      let found = -1;
+      for (let position = 0; position < headings.length && headings[position].line <= index; position += 1) {
+        if (!dictionary || headings[position].level <= 2) found = position;
+      }
+      return found;
+    };
+    const groups = new Map<number, number[]>();
+    let shown = 0;
+    let more = 0;
+    lines.forEach((line, index) => {
+      if (!line.toLowerCase().includes(term)) return;
+      const position = sectionOf(index);
+      // The index repeats what the table entries say; a dictionary search reads the entries.
+      if (dictionary && (position < 0 || !isTableHeading(headings[position]))) return;
+      if (shown >= MAX_FIND_LINES) { more += 1; return; }
+      shown += 1;
+      const list = groups.get(position) ?? [];
+      list.push(index);
+      groups.set(position, list);
+    });
+    if (groups.size === 0) {
+      out.push(`[find "${term}": no matches${dictionary ? ". This dictionary covers the tables the team's ETL profiles read; a table no profile reads is not in it" : ''}.]`);
+    } else {
+      out.push(`[find "${term}": ${shown + more} matching line${shown + more === 1 ? '' : 's'} in ${groups.size} section${groups.size === 1 ? '' : 's'}${more ? `; the first ${shown} are shown, use a narrower word for the rest` : ''}.]`);
+      for (const [position, indexes] of groups) {
+        const headingLine = position >= 0 ? headings[position].line : -1;
+        const block: string[] = headingLine >= 0 ? [lines[headingLine]] : [];
+        const rest = indexes.filter(index => index !== headingLine);
+        const rows = rest.filter(index => lines[index].startsWith('| `'));
+        const other = rest.filter(index => !lines[index].startsWith('| `'));
+        if (dictionary && position >= 0) {
+          const purpose = lines.slice(headingLine, sectionEnd(position)).find(line => line.startsWith("**What it's for:**"));
+          if (purpose && !other.some(index => lines[index] === purpose)) block.push(purpose);
+        }
+        block.push(...other.map(index => lines[index]));
+        if (rows.length) block.push(...(dictionary ? ['| Column | Type | Profiles | Meaning |', '|---|---|---|---|'] : []), ...rows.map(index => lines[index]));
+        out.push(block.join('\n'));
+      }
+    }
+  }
+  const text = out.join('\n\n');
+  return text.length > MAX_PART_CHARS
+    ? `${text.slice(0, MAX_PART_CHARS)}\n\n[Cut at ${MAX_PART_CHARS} characters: ask for fewer tables or a narrower word.]`
+    : text;
+}
+
 /**
  * Load ONE file with the provenance header. Traversal-safe, size-capped. In library mode it also refuses a symbolic link
  * or a path whose real path leaves the directory, answers "not found" for the root `GUIDE.md` (not a catalog entry), and
@@ -295,6 +400,7 @@ export function loadAnalyticsContext(
   db: Database.Database,
   name: string,
   maxChars = DEFAULT_MAX_CHARS,
+  parts: KnowledgeParts = {},
 ): LoadAnalyticsContextResult {
   const cleaned = String(name ?? '').trim();
   if (!cleaned) return { ok: false, error: 'name required — call mcp_analytics_list_context for the available files' };
@@ -339,10 +445,12 @@ export function loadAnalyticsContext(
     ?? (cleaned.startsWith(`presets${path.sep}`) || cleaned.startsWith('presets/') ? 'etl-derived'
       : cleaned.startsWith(`lessons${path.sep}`) || cleaned.startsWith('lessons/') ? 'lesson'
         : 'user-dropped');
-  const truncated = raw.length > maxChars;
+  // A part of the file when one is asked for, and a data dictionary's index by default (selectKnowledgeParts).
+  const text = selectKnowledgeParts(raw, parts) ?? raw;
+  const truncated = text.length > maxChars;
   const body = truncated
-    ? `${raw.slice(0, maxChars)}\n\n[Truncated at ${maxChars} of ${raw.length} characters — the full file is at ${fullPath}.]`
-    : raw;
+    ? `${text.slice(0, maxChars)}\n\n[Truncated at ${maxChars} of ${text.length} characters — the full file is at ${fullPath}.]`
+    : text;
   const header = analyticsContextHeader(cleaned, source);
   return { ok: true, name: cleaned, source, content: `${header}${body}`, truncated };
 }

@@ -126,6 +126,20 @@ export function validateReadOnlySql(sqlValue: unknown): string {
   return sql;
 }
 
+/** The one statement shape query control may send besides a read: signal one numbered session. */
+const BACKEND_SIGNAL_SQL = /^SELECT pg_(?:cancel|terminate)_backend\(\d{1,12}\)$/;
+
+/**
+ * INTERNAL: what BotBoy's query control (query-control.ts) runs on the SQL connection: a read-only lookup of the warehouse's
+ * running queries, or exactly `SELECT pg_cancel_backend(<n>)` / `SELECT pg_terminate_backend(<n>)` for a session it proved is
+ * one of BotBoy's own. Reachable only through the queryControl call option, which no model argument can set: the read-only wall
+ * still refuses both functions in every other call (FORBIDDEN_SQL_FUNCTIONS).
+ */
+export function validateQueryControlSql(sqlValue: unknown): string {
+  if (typeof sqlValue === 'string' && BACKEND_SIGNAL_SQL.test(sqlValue.trim())) return sqlValue.trim();
+  return validateReadOnlySql(sqlValue);
+}
+
 /**
  * GRASP read operations, curated from the server's published tool set.
  * Everything outside this set (and the generic read patterns) mutates
@@ -388,7 +402,7 @@ export function validateMcpToolCall(
   serverKind: string,
   toolName: string,
   args: Record<string, unknown>,
-  options: { ownerApproved?: boolean; guidedFlow?: boolean } = {},
+  options: { ownerApproved?: boolean; guidedFlow?: boolean; queryControl?: boolean } = {},
 ): Record<string, unknown> {
   // The "never" tier: unconditional for raw calls, regardless of
   // ownerApproved. The word "blocked" in the message is load-bearing —
@@ -425,7 +439,9 @@ export function validateMcpToolCall(
   // list: any sql-context call carrying `sql` is checked, whatever its name.
   if (serverKind === 'sql-context'
     && (SQL_CONTEXT_SQL_TOOLS.has(toolName) || Object.prototype.hasOwnProperty.call(args, 'sql'))) {
-    return { ...args, sql: validateReadOnlySql(args.sql) };
+    // Query control's own run_query may also signal one session of BotBoy's (validateQueryControlSql); nothing else may.
+    const check = options.queryControl === true && toolName === 'run_query' ? validateQueryControlSql : validateReadOnlySql;
+    return { ...args, sql: check(args.sql) };
   }
   return args;
 }

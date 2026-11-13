@@ -95,7 +95,7 @@ describe('background gates while Amazon Employee is off', () => {
     await (watcher as any).tick?.();
     expect(readRun).not.toHaveBeenCalled();
     const mcpManager = new Proxy({}, { get: () => vi.fn(() => { throw new Error('read'); }) }) as any;
-    const sentinel = createMidwaySentinel({ db: storage.getDb(), mcpManager, chatTerminal: {} as any, agent: {} as any }, { active: () => false });
+    const sentinel = createMidwaySentinel({ db: storage.getDb(), mcpManager, chatTerminal: {} as any }, { active: () => false });
     await expect(sentinel.tick()).resolves.toBeUndefined();
   });
 });

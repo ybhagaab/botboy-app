@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createNodeManager } from './node-manager.js';
 import { createToolExecutor, sqlToolTimeoutMs, type ToolExecutionContext } from './tool-executor.js';
+import { fileQueryKey } from './data-origins.js';
 
 /**
  * Direct MCP calls from chat: the model uses the connector's own tools
@@ -70,6 +71,10 @@ describe('direct MCP calls from chat', () => {
     });
     expect(callTool).toHaveBeenCalledWith('sql-context', 'export_query', expect.any(Object),
       expect.objectContaining({ source: 'agent', timeoutMs: sqlToolTimeoutMs('export_query'), signal: abort.signal }));
+    // The query behind the file is kept (data-origins.ts), and its absolute path finds it too.
+    expect(storage.getDb().prepare('SELECT sql, server_id, tool_name FROM data_file_queries WHERE path = ?').get(relative))
+      .toEqual({ sql: 'SELECT day, orders FROM daily', server_id: 'sql-context', tool_name: 'export_query' });
+    expect(fileQueryKey(file)).toBe(relative);
   });
 
   it('marks a JSONL export as analysis-only and ignores files outside the workspace', async () => {

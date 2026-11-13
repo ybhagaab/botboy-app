@@ -948,6 +948,14 @@ export function migrateManagedMcpAndAnalytics(db: Database.Database): void {
     (db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>).map(column => column.name),
   );
   if (!chatMessageColumns.has('attachments_json')) db.exec('ALTER TABLE chat_messages ADD COLUMN attachments_json TEXT;');
+  // Parallel jobs (2026-10-28, PARALLEL_JOBS_PLAN.md): job_id is the thread a row belongs to (NULL = the main chat);
+  // ref_job_id marks a main-chat row about a job (a message the owner sent to it with #N, and its reply).
+  if (!chatMessageColumns.has('job_id')) db.exec('ALTER TABLE chat_messages ADD COLUMN job_id TEXT;');
+  if (!chatMessageColumns.has('ref_job_id')) db.exec('ALTER TABLE chat_messages ADD COLUMN ref_job_id TEXT;');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_chat_messages_job ON chat_messages(job_id, created_at);');
+  // Chat notices (2026-10-29, MIDWAY_NOTICES_PLAN.md §6): BotBoy's own status rows carry a small structured record the panel
+  // draws as one compact line; NULL for every ordinary message.
+  if (!chatMessageColumns.has('notice_json')) db.exec('ALTER TABLE chat_messages ADD COLUMN notice_json TEXT;');
 
   const migratedRunColumns = new Set(
     (db.prepare('PRAGMA table_info(analytics_runs)').all() as Array<{ name: string }>).map(column => column.name),

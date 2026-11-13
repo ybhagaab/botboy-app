@@ -36,6 +36,8 @@ import { getSetting, setSetting } from './storage.js';
 import { resolveOwnerIdentity } from './owner-identity.js';
 import { isSentryAuthShapedError, primeDatanetSentrySession } from './sentry-session.js';
 import type { McpManager } from './mcp-types.js';
+import { DOWNLOAD_STILL_RUNNING, downloadResult, knownResult, landingError, landingNextAction, summarizeResultFile } from './etl-downloads.js';
+import { getQueryLedger, type QueryOrigin } from './query-ledger.js';
 
 /** Raw ETL tool call with the Sentry self-heal built in (see createEtlToolCall). */
 export type EtlToolCall = (
@@ -80,6 +82,14 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
         // bare "MCP error -32001: Request timed out" — mid-run network loss
         // with no next action named).
         if (/timed?\s?out|-32001/i.test(message)) {
+          // A download that outlasts the call is usually a large result, not the network: the connector keeps downloading in
+          // the background and writes the file when every part has arrived (etl-downloads.ts).
+          if (toolName === 'datanet_download_results') {
+            return {
+              isError: true,
+              text: `Error: the Datanet download did not answer within ${Math.round(ETL_TOOL_TIMEOUT_MS / 60_000)} min; ${DOWNLOAD_STILL_RUNNING}. Datanet's connector stops waiting after 5 minutes but finishes a large download in the background and writes the file once every part has arrived. Do not download it again: wait for the file.`,
+            };
+          }
           return {
             isError: true,
             text: `Error: the Datanet ETL call ${toolName} timed out after ${Math.round(ETL_TOOL_TIMEOUT_MS / 60_000)} min — the transport, not the query. Likely the corp network/VPN dropped or Datanet is unresponsive. Check connectivity, then retry ONCE. If a run was already submitted, poll it (mcp_etl_run_status / mcp_etl_latest_run) instead of resubmitting — Datanet collapses duplicate queued runs.`,
@@ -100,7 +110,11 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
   };
 }
 
-export type QueryRunResultCode = 'alive_handoff' | 'submission_unknown' | 'remote_failed' | 'status_unavailable' | 'download_failed';
+/**
+ * `download_landing`: the run succeeded and its result is still downloading in the connector's background (etl-downloads.ts).
+ * Like `alive_handoff` it is not a failure: read the run again later; never download it again or resubmit.
+ */
+export type QueryRunResultCode = 'alive_handoff' | 'submission_unknown' | 'remote_failed' | 'status_unavailable' | 'download_failed' | 'download_landing';
 
 export interface QueryRunResult {
   ok: boolean;
@@ -137,6 +151,10 @@ export interface QueryRunner {
     pollBudgetMs?: number;
     /** Stops WAITING (never the remote run); an aborted wait returns alive_handoff. */
     signal?: AbortSignal;
+    /** Who started the run, for BotBoy's own query record (query-ledger.ts). Absent: BotBoy at large. */
+    origin?: QueryOrigin;
+    /** A few owner-facing words naming the run in the Running queries list. */
+    label?: string;
   }): Promise<QueryRunResult>;
   readRun?(input: { runId: string }): Promise<QueryRunResult>;
   /**
@@ -443,37 +461,55 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     }
   }
 
+  /**
+   * One download per run, read in chunks (etl-downloads.ts): a download that outlasts the connector's 5 minutes is awaited
+   * (`download_landing`), never requested again while it may still be running, and a result of any size is summarized in one
+   * streaming pass (it was read whole, which failed above 512 MB: live 2026-10-29, a 1.8 GB export downloaded four times).
+   */
   async function downloadRun(runId: string): Promise<QueryRunResult> {
     fs.mkdirSync(downloadDir, { recursive: true });
     const output = path.join(downloadDir, `adhoc_${runId}.tsv`);
-    const download = await call('datanet_download_results', { run_id: runId, output });
-    if (download.isError || !fs.existsSync(output)) {
+    // The run's result this folder already has or is still receiving, under any name (the chat tool's run_<id>.tsv too).
+    const download = knownResult(runId, downloadDir, now) ?? await downloadResult({
+      runId,
+      output,
+      download: () => call('datanet_download_results', { run_id: runId, output }),
+      now,
+    });
+    if (download.state === 'landing') {
+      return {
+        ok: false,
+        code: 'download_landing',
+        runId,
+        remoteStatus: 'SUCCESS',
+        error: landingError(runId, download.sinceMs),
+        nextAction: landingNextAction(runId),
+      };
+    }
+    if (download.state === 'failed') {
       return {
         ok: false,
         code: 'download_failed',
         runId,
         remoteStatus: 'SUCCESS',
-        error: `Run ${runId} succeeded but the download failed: ${firstLine(download.text)}`,
-        nextAction: `Retry reading this existing run once; do not resubmit it. Results purge over time, so recover it promptly.`,
+        error: `Run ${runId} succeeded but the download failed: ${firstLine(download.error)}`,
+        nextAction: download.expired
+          ? 'BotBoy asks for the download once more on its next read of this run; never resubmit it.'
+          : `Retry reading this existing run once; do not resubmit it. Results purge over time, so recover it promptly.`,
       };
     }
-    const bytes = fs.readFileSync(output);
-    const raw = bytes.toString('utf8');
-    const lines = raw.split('\n').filter(line => line.length > 0);
-    const columns = (lines[0] ?? '').split('\t');
-    const body = lines.slice(1);
-    const rows = body.slice(0, maxRows).map(line => line.split('\t'));
+    const summary = await summarizeResultFile(download.output, maxRows);
     return {
       ok: true,
       runId,
       remoteStatus: 'SUCCESS',
-      columns,
-      rows,
-      rowCount: body.length,
-      truncated: body.length > maxRows,
-      savedTo: output,
-      resultBytes: bytes.length,
-      resultSha256: createHash('sha256').update(bytes).digest('hex'),
+      columns: summary.columns,
+      rows: summary.rows,
+      rowCount: summary.rowCount,
+      truncated: summary.truncated,
+      savedTo: download.output,
+      resultBytes: summary.bytes,
+      resultSha256: summary.sha256,
     };
   }
 
@@ -510,7 +546,10 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         nextAction: 'Retry this read later; do not resubmit the query.',
       };
     }
+    getQueryLedger(db)?.endEtl(runId, remoteStatus);
     if (remoteStatus === 'SUCCESS') return downloadRun(runId);
+    const stopped = remoteStatus === 'KILLED' ? stoppedOnPurpose(runId) : null;
+    if (stopped) return stopped;
     if (remoteStatus === 'ERROR' || remoteStatus === 'KILLED') {
       const diagnose = await call('datanet_get_job_run_error', { run_id: runId });
       const diagnosed = parseJson(diagnose.text);
@@ -546,6 +585,23 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     };
   }
 
+  /**
+   * A KILLED run that BotBoy's query control stopped (query-ledger.ts): its reader says so, with "Do not resubmit", so a dashboard
+   * never retries it on the other lane and a model never runs it again on its own (docs/maps/query-control.md).
+   */
+  function stoppedOnPurpose(runId: string): QueryRunResult | null {
+    const words = getQueryLedger(db)?.stoppedMessage(runId);
+    if (!words) return null;
+    return {
+      ok: false,
+      code: 'remote_failed',
+      runId,
+      remoteStatus: 'KILLED',
+      error: `Run ${runId} KILLED. ${words}`,
+      nextAction: `Do not resubmit run ${runId}'s query: it was stopped on purpose. Ask the owner before running it again.`,
+    };
+  }
+
   async function runQuery(input: {
     sql: string;
     datasetDate?: string;
@@ -553,6 +609,8 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     onSubmitted?: (runId: string) => Promise<void> | void;
     pollBudgetMs?: number;
     signal?: AbortSignal;
+    origin?: QueryOrigin;
+    label?: string;
   }): Promise<QueryRunResult> {
     const waitBudgetMs = input.pollBudgetMs !== undefined && Number.isFinite(input.pollBudgetMs)
       ? Math.max(0, input.pollBudgetMs)
@@ -627,6 +685,8 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         nextAction: 'Do not resubmit. Check the scratch job run history and reconcile an exact run ID first.',
       };
     }
+    // One of BotBoy's own queries now (query-ledger.ts): listed in Running queries, stoppable by who started it and by the owner.
+    getQueryLedger(db)?.beginEtl({ runId, ...(input.origin ? { origin: input.origin } : {}), sql: sqlBody, ...(input.label ? { label: input.label } : {}) });
     if (input.onSubmitted) {
       try {
         await input.onSubmitted(runId);
@@ -657,7 +717,10 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       const poll = await call('datanet_get_job_run_status', { run_id: runId });
       if (poll.isError) continue; // transient poll failures never kill the run
       status = String(parseJson(poll.text).status ?? '').toUpperCase() || status;
-      if (status === 'SUCCESS' || status === 'ERROR' || status === 'KILLED' || status === 'DELETED') break;
+      if (status === 'SUCCESS' || status === 'ERROR' || status === 'KILLED' || status === 'DELETED') {
+        getQueryLedger(db)?.endEtl(runId, status);
+        break;
+      }
       if (!prioritized && status === 'WAITING_FOR_RESOURCES' && now() >= prioritizeAt) {
         prioritized = true; // once, whatever the outcome — never a loop
         const bump = await call('datanet_alter_run', {
@@ -679,6 +742,8 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         nextAction: 'Submit the query again ONCE, after confirming no other run is in flight for the ad-hoc job (mcp_etl_latest_run). If the new run is deleted too, stop and report.',
       };
     }
+    const stopped = status === 'KILLED' ? stoppedOnPurpose(runId) : null;
+    if (stopped) return stopped;
     if (status === 'ERROR' || status === 'KILLED') {
       const diagnose = await call('datanet_get_job_run_error', { run_id: runId });
       const diagnosed = parseJson(diagnose.text);
