@@ -150,8 +150,8 @@ dependencies with it. Then it:
 3. connects the authenticated team gateway (GPT-5.6 Terra by default) plus
    any OpenAI, DeepSeek or Anthropic (Claude) key saved in **Settings → AI model**;
 4. loads the server-approved chat model catalog: GPT-5.6 Terra, Luna, and Sol;
-   GPT-6 Astra, Sol, and Luna; and GPT-6.1 Sol on the team gateway, plus each
-   saved key's own models;
+   GPT-6 Astra, Sol, and Luna; GPT-6.1 Sol; and Claude Opus 5.5, Opus 5,
+   Sonnet 5 and Opus 4.8 on the team gateway, plus each saved key's own models;
 5. builds BotBoy when the build is missing or stale;
 6. starts a provisional local boot page while connections and stores initialize;
 7. opens `http://localhost:7778` only after the final dashboard endpoint is
@@ -162,7 +162,9 @@ The gateway deployment name still contains `luna`; that is infrastructure
 naming, not the selected default model. The default remains GPT-5.6 Terra.
 Approved GPT-6 and GPT-6.1 additions use the same Cognito token URL, OAuth scope, and
 allowlisted client identity across the approved team gateways, so existing
-teammates do not need a replacement credential attachment.
+teammates do not need a replacement credential attachment. The Claude models on
+the team gateway use that same credential too: they need no Anthropic key and
+appear in the chat menu under **Team gateway** and in **Background work**.
 
 ### Your own OpenAI, DeepSeek or Claude API key
 

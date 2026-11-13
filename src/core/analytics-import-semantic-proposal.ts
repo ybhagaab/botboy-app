@@ -431,12 +431,13 @@ function providerLocality(endpoint: string, providerId: string): ProviderLocalit
 }
 
 /**
- * The sampling temperature the receipt records. BotBoy asks for 0 and every provider but Anthropic receives it;
- * Anthropic never gets a `temperature` (several current models reject it with a 400), so the receipt records NULL there:
- * repeatability rests on the strict schema, the local validators and owner approval, not on temperature 0.
+ * The sampling temperature the receipt records. BotBoy asks for 0 and every Responses model receives it; a Messages
+ * model (Claude, on an Anthropic key or the team gateway) never gets a `temperature` (several current models reject it
+ * with a 400), so the receipt records NULL there: repeatability rests on the strict schema, the local validators and
+ * owner approval, not on temperature 0.
  */
-export function importModelTemperature(providerId: string): 0 | null {
-  return providerId === 'anthropic' ? null : 0;
+export function importModelTemperature(providerId: string, apiMode?: string): 0 | null {
+  return providerId === 'anthropic' || apiMode === 'messages' ? null : 0;
 }
 export interface ImportProviderDescriptor {
   id: string;
@@ -1991,7 +1992,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
       model: provider.model,
       providerLocality: locality,
       endpointSha256,
-      modelTemperature: importModelTemperature(provider.id),
+      modelTemperature: importModelTemperature(provider.id, provider.apiMode),
       content: 'Bounded worksheet structure, semantic labels, and representative cell values plus one complete analytics context family.',
       // D4: any connected provider may read workbook evidence; the receipt keeps provenance.
       allowed: true,
@@ -2211,7 +2212,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         profile.parseSha256, profile.profileSha256, profile.rowsetSha256, profile.schemaSha256,
         extra.contextFamily ?? null, extra.contextSelectionSha256 ?? null, extra.contextReceiptsJson ?? null, extra.contextBundleSha256 ?? null,
         extra.llmOperationId ?? null, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION, extra.promptSha256 ?? null,
-        runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, runtime.endpointSha256, runtime.locality, importModelTemperature(runtime.provider.id), ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
+        runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, runtime.endpointSha256, runtime.locality, importModelTemperature(runtime.provider.id, runtime.provider.apiMode), ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION,
         extra.responseSha256 ?? null, extra.finishReason ?? null,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, extra.evidenceJson ?? null, stableAnalyticsJson(canonicalUnresolved), at, row.id, row.state_revision,
         ANALYTICS_IMPORT_TRANSFORM_VERSION,
@@ -2337,7 +2338,7 @@ export function createAnalyticsImportSemanticProposalService(input: {
         parsed.profile.parseSha256, parsed.profile.profileSha256, parsed.profile.rowsetSha256, parsed.profile.schemaSha256,
         preparedReceipt.relativePath, preparedReceipt.sha256, preparedReceipt.bytes, context.family, context.selectionSha256,
         stableAnalyticsJson(context.receipts), context.bundleSha256, operationId, ANALYTICS_IMPORT_PROPOSAL_PROMPT_VERSION,
-        promptSha256, runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, endpointSha256, locality, importModelTemperature(runtime.provider.id),
+        promptSha256, runtime.provider.id, runtime.provider.model, runtime.provider.apiMode, endpointSha256, locality, importModelTemperature(runtime.provider.id, runtime.provider.apiMode),
         ANALYTICS_IMPORT_DISCLOSURE_POLICY_VERSION, responseSha256, response.finishReason,
         ANALYTICS_IMPORT_PROPOSAL_VALIDATOR_VERSION, proposalJson, sha256(proposalJson), definitionJson, contractJson,
         built.definition.contract.contractSha256, stableAnalyticsJson(built.evidence), at, at, row.id, current.state_revision,

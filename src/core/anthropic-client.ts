@@ -10,6 +10,9 @@
  * Rules this file keeps:
  *   - The key goes only to the configured endpoint (`ANTHROPIC_API_ENDPOINT` in production), in `x-api-key`, built
  *     by `anthropicRequestHeaders` from a value that passes the key shape. A route's `endpoint` or `headers` are ignored.
+ *   - On the team gateway (`team-claude.ts`) there is no Anthropic key: `authorize` (the gateway's OAuth authorizer)
+ *     supplies the Authorization header for the configured gateway endpoint only, a 401 drops its cached token and
+ *     resends once, and `health` borrows the team client's health (no probe or timer of its own).
  *   - Provider text passes `redactProviderSecrets` before any throw or log; a non-JSON error body is never shown.
  *   - One SSE path serves `chatCompletionStream` and `chatCompletion`.
  *   - No `temperature` and no beta header in production (the recovery retry's opt-in is off by default).
@@ -23,6 +26,7 @@ import {
   LlmQuotaExhaustedError,
   LlmRateLimitedError,
   abortableDelay,
+  type LlmRequestAuthorizer,
   isLlmPayloadTooLargeError,
   isLlmProviderLimitError,
   redactProviderSecrets,
@@ -51,6 +55,7 @@ import {
 } from './llm-usage.js';
 import {
   ANTHROPIC_API_ENDPOINT,
+  ANTHROPIC_VERSION,
   anthropicRequestHeaders,
   deriveProfile,
   type AnthropicModelProfile,
@@ -58,6 +63,7 @@ import {
 import {
   AnthropicApiError,
   classifyAnthropicHttpError,
+  forTeamGateway,
   isAnthropicApiError,
   type AnthropicErrorClassification,
 } from './anthropic-errors.js';
@@ -93,8 +99,18 @@ const BETA_HEADER = 'anthropic-beta';
 const BINDING_BETA = 'thinking-binding-controls-2026-08-01';
 
 export interface AnthropicClientOptions {
-  /** The owner's key. Held only here, used only to build request headers. */
-  apiKey: string;
+  /** The owner's key. Held only here, used only to build request headers. Omitted only with `authorize`. */
+  apiKey?: string;
+  /**
+   * The team gateway's request authorizer (a Bearer JWT from the teammate's existing gateway credential), used instead of
+   * an Anthropic key. It may expose `invalidate()`: a 401 drops the cached token and the request is sent once more.
+   */
+  authorize?: LlmRequestAuthorizer;
+  /**
+   * Health of the endpoint this client shares with another client (the team gateway serves GPT and Claude): read
+   * from that client, so this one runs no probe and no timer of its own.
+   */
+  health?: { isAvailable(): boolean; healthCheck(): Promise<boolean> };
   /** The connection's model profiles by id, read per call so a refreshed list applies at once. */
   profiles: () => ReadonlyMap<string, AnthropicModelProfile>;
   /** Top-level prompt caching for interactive calls that send tools (D8). Default on. */
@@ -148,6 +164,7 @@ export function createAnthropicLlmClient(
   usageService?: LlmUsageService,
 ): LlmClient {
   const usage = usageService ?? createNoopLlmUsageService();
+  if (!options.authorize && !options.apiKey) throw new Error('The Claude client needs an Anthropic key or the gateway authorizer.');
   const endpoint = (config.ecs.endpoint || ANTHROPIC_API_ENDPOINT).replace(/\/+$/, '');
   const defaultModel = config.ecs.model;
   const guard = options.guard ?? createReplayGuard(options.recoveryDropBlockFirst === undefined ? {} : { recoveryDropBlockFirst: options.recoveryDropBlockFirst });
@@ -157,6 +174,12 @@ export function createAnthropicLlmClient(
   const maximumRequestBytes = Number.isFinite(configuredMaximum) && configuredMaximum > 0 ? Math.floor(configuredMaximum) : FALLBACK_MAX_REQUEST_BYTES;
   const idleMs = config.streamIdleTimeoutMs ?? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
   const doFetch = (input: string, init: RequestInit) => (options.fetchImpl ?? globalThis.fetch)(input, init);
+  /** The request's auth and version headers: the owner's key, or the gateway's Bearer token for exactly this URL and body. */
+  async function authHeaders(url: string, method: 'GET' | 'POST', body: string | undefined, json: boolean): Promise<Record<string, string>> {
+    if (!options.authorize) return anthropicRequestHeaders(options.apiKey ?? '', { json });
+    const granted = await options.authorize({ url, method, ...(body !== undefined ? { body } : {}) });
+    return { ...granted, 'anthropic-version': ANTHROPIC_VERSION, ...(json ? { 'content-type': 'application/json' } : {}) };
+  }
 
   let healthy = false;
   let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -174,7 +197,7 @@ export function createAnthropicLlmClient(
   async function probe(): Promise<boolean> {
     try {
       const response = await doFetch(`${endpoint}/v1/models?limit=1`, {
-        headers: anthropicRequestHeaders(options.apiKey),
+        headers: await authHeaders(`${endpoint}/v1/models?limit=1`, 'GET', undefined, false),
         signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       });
       await response.body?.cancel().catch(() => undefined);
@@ -190,8 +213,10 @@ export function createAnthropicLlmClient(
   }
 
   async function runHealthCheck(): Promise<void> {
-    healthy = await probe();
+    healthy = options.health ? await options.health.healthCheck() : await probe();
   }
+  /** Shared health (the team gateway): the other client's view, with this client's own failures marking nothing. */
+  const isHealthy = (): boolean => (options.health ? options.health.isAvailable() : healthy);
 
   // ── Building one request ──
 
@@ -266,10 +291,17 @@ export function createAnthropicLlmClient(
   }
 
   async function sendOnce(prepared: Prepared, context: NormalizedLlmUsageContext, signal: AbortSignal | undefined): Promise<SentRequest & { classification?: AnthropicErrorClassification }> {
-    const headers: Record<string, string> = {
-      ...anthropicRequestHeaders(options.apiKey, { json: true }),
+    const headersFor = async (): Promise<Record<string, string>> => ({
+      ...(await authHeaders(prepared.url, 'POST', prepared.bodyStr, true)),
       ...(prepared.step === 'drop_block' ? { [BETA_HEADER]: BINDING_BETA } : {}),
-    };
+    });
+    let headers: Record<string, string>;
+    try {
+      headers = await headersFor();
+    } catch (error) {
+      // The gateway token could not be minted: no request went out. Its words never carry the client secret.
+      throw new Error(redactProviderSecrets(error instanceof Error ? error.message : String(error)));
+    }
     const handle = usage.beginAttempt(context, {
       endpointKey: 'ecs',
       provider: config.providerId ?? 'anthropic',
@@ -283,6 +315,13 @@ export function createAnthropicLlmClient(
     let response: Response;
     try {
       response = await doFetch(prepared.url, { method: 'POST', headers, body: prepared.bodyStr, ...(signal ? { signal } : {}) });
+      // The gateway refused a cached token (rotated, revoked or expired early): mint a fresh one and send once more.
+      if (response.status === 401 && options.authorize?.invalidate) {
+        await response.body?.cancel().catch(() => undefined);
+        options.authorize.invalidate();
+        headers = await headersFor();
+        response = await doFetch(prepared.url, { method: 'POST', headers, body: prepared.bodyStr, ...(signal ? { signal } : {}) });
+      }
     } catch (error) {
       usage.failAttempt(handle, { errorClass: usageErrorClass(error, 'FetchError'), usage: emptyProviderUsage() });
       // A cancellation is control flow and keeps its identity; any other transport error is rethrown with secrets removed.
@@ -293,7 +332,9 @@ export function createAnthropicLlmClient(
     }
     if (response.ok) return { response, handle, prepared };
     const text = await response.text().catch(() => '');
-    const classification = classifyAnthropicHttpError(response.status, response.headers, text);
+    const classified = classifyAnthropicHttpError(response.status, response.headers, text);
+    // On the team gateway there is no Anthropic key or account to fix: name the gateway instead.
+    const classification = options.authorize ? forTeamGateway(classified) : classified;
     usage.failAttempt(handle, { httpStatus: response.status, errorClass: `HTTP_${response.status}`, usage: emptyProviderUsage() });
     return { response, handle, prepared, classification };
   }
@@ -416,7 +457,7 @@ export function createAnthropicLlmClient(
         closeFailed('MissingResponseBody');
         throw new Error('No response body for streaming');
       }
-      if (!settings.healthNeutral) healthy = true;
+      if (!settings.healthNeutral && !options.health) healthy = true;
 
       const toolsOffered = (request.tools?.length ?? 0) > 0;
       const reducer = createAnthropicStreamReducer({
@@ -497,7 +538,7 @@ export function createAnthropicLlmClient(
     } catch (error) {
       // External cancellation is local control flow: never health, never a retryable flap.
       if (request.signal?.aborted) throw error;
-      if (!settings.healthNeutral && !request.route && marksHealth(error)) healthy = false;
+      if (!settings.healthNeutral && !options.health && !request.route && marksHealth(error)) healthy = false;
       throw error;
     }
   }
@@ -517,9 +558,12 @@ export function createAnthropicLlmClient(
     };
   }
 
-  runHealthCheck().catch(() => {});
-  if (config.healthCheckIntervalMs > 0) {
-    healthTimer = setInterval(() => runHealthCheck().catch(() => {}), config.healthCheckIntervalMs);
+  // Shared health needs no probe here: the team client already runs its own.
+  if (!options.health) {
+    runHealthCheck().catch(() => {});
+    if (config.healthCheckIntervalMs > 0) {
+      healthTimer = setInterval(() => runHealthCheck().catch(() => {}), config.healthCheckIntervalMs);
+    }
   }
 
   const client: LlmClient = {
@@ -557,9 +601,9 @@ export function createAnthropicLlmClient(
       return client.sendPrompt(messages.map(message => message.content).join('\n'), usageContext ?? { workload: 'background' });
     },
     async initialize(): Promise<void> {},
-    isAvailable: () => healthy,
-    getActiveEndpoint: () => (healthy ? 'ecs' : 'none'),
-    getActiveModel: () => (healthy ? defaultModel : undefined),
+    isAvailable: () => isHealthy(),
+    getActiveEndpoint: () => (isHealthy() ? 'ecs' : 'none'),
+    getActiveModel: () => (isHealthy() ? defaultModel : undefined),
     getDialect: () => 'openai',
     getApiMode: () => 'messages',
     getMaxCompletionTokens: () => config.defaults.maxCompletionTokens,
@@ -570,7 +614,7 @@ export function createAnthropicLlmClient(
     )),
     async healthCheck(): Promise<boolean> {
       await runHealthCheck();
-      return healthy;
+      return isHealthy();
     },
     close(): void {
       if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }

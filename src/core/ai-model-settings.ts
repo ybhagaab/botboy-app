@@ -87,6 +87,8 @@ import {
   qualifiedModelKey,
   teamConnectionLabel,
   teamModelEntries,
+  teamClaudeModelEntries,
+  closeConnectionClients,
   type DeepSeekModelProfile,
   type LlmConnection,
   type LlmConnectionId,
@@ -711,7 +713,7 @@ function identityFor(connection: LlmConnection, entry: LlmModelEntry): LlmRuntim
     providerId: connection.provider.id,
     endpoint: connection.provider.endpoint,
     model: entry.model,
-    apiMode: connection.provider.apiMode,
+    apiMode: entry.apiMode ?? connection.provider.apiMode,
     maxContextTokens: entry.capabilities.contextWindow,
     source: connection.source,
   };
@@ -757,19 +759,32 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
 
   function buildTeamConnection(client: LlmClient): LlmConnection {
     const provider = deps.envProvider;
+    // Claude on the team gateway (team-claude.ts): its own Messages client, the GPT client's health, the same credential.
+    const claude = provider.teamClaude
+      ? {
+          targetPrefix: provider.teamClaude.targetPrefix,
+          client: provider.teamClaude.createClient({
+            health: { isAvailable: () => client.isAvailable(), healthCheck: () => client.healthCheck() },
+            usageService: deps.usageService,
+          }),
+        }
+      : undefined;
     return {
       id: 'team',
       label: teamConnectionLabel(provider.id),
       source: 'environment',
       client,
       provider: descriptor(provider),
-      models: teamModelEntries({
-        providerId: provider.id,
-        defaultModel: client.getDefaultModel(),
-        maxContextTokens: provider.maxContextTokens,
-        maxCompletionTokens: client.getMaxCompletionTokens?.() ?? 16_384,
-        env,
-      }),
+      models: [
+        ...teamModelEntries({
+          providerId: provider.id,
+          defaultModel: client.getDefaultModel(),
+          maxContextTokens: provider.maxContextTokens,
+          maxCompletionTokens: client.getMaxCompletionTokens?.() ?? 16_384,
+          env,
+        }),
+        ...(claude ? teamClaudeModelEntries(claude) : []),
+      ],
       version: ++connectionCounter,
     };
   }
@@ -1102,7 +1117,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     rebindRoles();
     for (const connection of retired) {
       emitConnectionChange(connection.id);
-      try { connection.client.close(); } catch { /* closing a finished client is best effort */ }
+      closeConnectionClients(connection);
     }
   }
 
@@ -1468,7 +1483,7 @@ export async function createAiModelSettingsService(deps: AiModelSettingsDeps): P
     removeOpenAiKey: () => service.removeApiKey('openai'),
     close() {
       for (const connection of connections.values()) {
-        try { connection.client.close(); } catch { /* best effort */ }
+        closeConnectionClients(connection);
       }
     },
   };

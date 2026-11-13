@@ -369,6 +369,47 @@ function providerWaitMs(headers: Pick<Headers, 'get'>): number | undefined {
 }
 
 /**
+ * Owner-facing words for Claude on the team gateway (`team-claude.ts`): there is no Anthropic key or account to fix,
+ * so the key- and billing-level texts name the gateway and the teammate's own next step instead. Class, retry, health
+ * and every other field stay exactly as classified; 400s keep their Claude-specific words.
+ */
+const TEAM_GATEWAY_TEXT: Partial<Record<AnthropicErrorKind, { message: string; nextAction: string }>> = {
+  auth_rejected: {
+    message: 'The team gateway did not accept your BotBoy credential, even with a fresh sign-in.',
+    nextAction: 'Run ./start.sh --doctor. If it reports the gateway credential rejected, ask the BotBoy owner for new credentials.',
+  },
+  quota_exhausted: {
+    message: 'The team gateway reported a usage limit for Claude.',
+    nextAction: 'Pick a GPT model for now, and tell the BotBoy owner.',
+  },
+  forbidden: {
+    message: 'The team gateway is not allowed to use that Claude model.',
+    nextAction: 'Pick another model, and tell the BotBoy owner.',
+  },
+  model_unavailable: {
+    message: 'That Claude model is not available on the team gateway right now.',
+    nextAction: 'Pick another model, and tell the BotBoy owner (a model Bedrock added later needs a gateway target sync).',
+  },
+  rate_limited: {
+    message: 'Amazon Bedrock is rate-limiting Claude on the team gateway right now.',
+    nextAction: 'Wait a minute, then try again.',
+  },
+  overloaded: {
+    message: 'Claude on Amazon Bedrock is temporarily overloaded.',
+    nextAction: 'Try again in a minute.',
+  },
+  server_error: {
+    message: 'The team gateway had a temporary problem reaching Claude.',
+    nextAction: 'Try again in a minute.',
+  },
+};
+
+export function forTeamGateway(classification: AnthropicErrorClassification): AnthropicErrorClassification {
+  const text = TEAM_GATEWAY_TEXT[classification.kind];
+  return text ? { ...classification, ...text } : classification;
+}
+
+/**
  * Classify one non-2xx Anthropic answer (D10). `headers` supplies `retry-after`
  * and `request-id`; `bodyText` is the raw body (JSON error object or anything);
  * `context` says whether the answer came from the model list or a generation.

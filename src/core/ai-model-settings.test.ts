@@ -222,6 +222,25 @@ describe('Settings → AI model connections', () => {
   const storedFile = () => JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
   const posts = (host: Fakes['requests'][number]['host']) => fakes.requests.filter(entry => entry.host === host && entry.method === 'POST');
 
+  it('lists Claude on the team gateway after GPT, and a background role or a chat turn runs it over Messages', async () => {
+    const settings = await service();
+    const team = settings.status().connections.find(connection => connection.id === 'team')!;
+    expect(team.models.map(model => model.key)).toEqual([
+      'team.terra', 'team.luna', 'team.sol',
+      'team.claude-opus-5-5', 'team.claude-opus-5', 'team.claude-sonnet-5', 'team.claude-opus-4-8',
+    ]);
+    const status = await settings.setRole('processing', { modelKey: 'team.claude-sonnet-5' });
+    expect(status.roles.processing).toMatchObject({ modelKey: 'team.claude-sonnet-5', thinkingOff: 'native_without_tools' });
+    expect(settings.client.identity()).toMatchObject({ providerId: 'gateway', model: 'bedrock-mantle-luna/anthropic.claude-sonnet-5', apiMode: 'messages' });
+    expect(settings.client.getApiMode?.()).toBe('messages');
+    const binding = settings.chatModels.resolve('team.claude-opus-5-5')!;
+    expect(binding.connectionId).toBe('team');
+    expect(binding.operation?.provider).toMatchObject({ id: 'gateway', model: 'bedrock-mantle-luna/anthropic.claude-opus-5-5', apiMode: 'messages' });
+    // The team default and its health are the GPT client's: nothing about Claude changes Automatic.
+    await settings.setRole('processing', { modelKey: '' });
+    expect(settings.status().roles.processing).toMatchObject({ modelKey: 'team.terra', chosen: false });
+  });
+
   it('starts on the team gateway when no key is saved', async () => {
     const settings = await service();
     const status = settings.status();
@@ -1441,12 +1460,26 @@ describe('Settings → AI model connections', () => {
         const status = await settings.saveApiKey('anthropic', FAKE_ANTHROPIC_KEY);
         const claudeRows = status.connections.find(connection => connection.id === 'anthropic')!.models;
         expect(claudeRows.map(model => [model.key, model.thinkingOff])).toEqual(EXPECTED);
+        // Claude on the team gateway (team-claude.ts) carries it too; no GPT, OpenAI or DeepSeek row does.
+        const TEAM_CLAUDE_EXPECTED = [
+          ['team.claude-opus-5-5', 'lowest_effort'],
+          ['team.claude-opus-5', 'native_without_tools'],
+          ['team.claude-sonnet-5', 'native_without_tools'],
+          ['team.claude-opus-4-8', 'native_without_tools'],
+        ];
+        const teamRows = status.connections.find(connection => connection.id === 'team')!.models;
+        expect(teamRows.filter(model => model.key.startsWith('team.claude-')).map(model => [model.key, model.thinkingOff])).toEqual(TEAM_CLAUDE_EXPECTED);
         for (const connection of status.connections.filter(entry => entry.id !== 'anthropic')) {
-          for (const model of connection.models) expect(model, `${connection.id}: ${model.key}`).not.toHaveProperty('thinkingOff');
+          for (const model of connection.models.filter(entry => !entry.key.startsWith('team.claude-'))) {
+            expect(model, `${connection.id}: ${model.key}`).not.toHaveProperty('thinkingOff');
+          }
         }
         const catalog = settings.chatModels.catalog()!;
         expect(catalog.models.filter(model => model.group === 'anthropic').map(model => [model.key, model.thinkingOff])).toEqual(EXPECTED);
-        for (const model of catalog.models.filter(entry => entry.group !== 'anthropic')) expect(model, model.key).not.toHaveProperty('thinkingOff');
+        expect(catalog.models.filter(model => model.key.startsWith('team.claude-')).map(model => [model.key, model.thinkingOff])).toEqual(TEAM_CLAUDE_EXPECTED);
+        for (const model of catalog.models.filter(entry => entry.group !== 'anthropic' && !entry.key.startsWith('team.claude-'))) {
+          expect(model, model.key).not.toHaveProperty('thinkingOff');
+        }
         // The field is a closed word: nothing about routes, endpoints or keys comes with it.
         expect(JSON.stringify(catalog)).not.toMatch(/api\.anthropic|127\.0\.0\.1|x-api-key|sk-ant|route/);
       });

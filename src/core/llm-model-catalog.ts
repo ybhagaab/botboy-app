@@ -14,7 +14,7 @@
  * role, and the document-writing role each hold such a client, so no
  * consumer needs to know which provider it is talking to.
  */
-import type { ChatCompletionRequest, LlmClient, LlmRequestRoute } from './llm-client.js';
+import type { ChatCompletionRequest, LlmApiMode, LlmClient, LlmRequestRoute } from './llm-client.js';
 import type { LlmModelCapabilities, LlmModelOperation, LlmProviderDescriptor } from './llm-model-operation.js';
 import { deriveProfile, type AnthropicModelProfile } from './anthropic-models.js';
 import {
@@ -26,6 +26,7 @@ import {
   resolveBlessedModelRoute,
   type ChatModelCatalog,
 } from './inference-provider.js';
+import { TEAM_CLAUDE_FAMILY, TEAM_CLAUDE_MODELS, teamClaudeProfile, teamClaudeWireModel } from './team-claude.js';
 
 export type LlmConnectionId = 'team' | 'openai' | 'deepseek' | 'anthropic';
 /** Picker and Settings order. Claude comes last, so existing Automatic behavior is unchanged. */
@@ -64,6 +65,13 @@ export interface LlmModelEntry {
   readonly isConnectionDefault: boolean;
   readonly preview: boolean;
   readonly capabilities: LlmModelCapabilities;
+  /**
+   * The client that serves this model when it is not the connection's own (Claude on the team gateway speaks
+   * Messages, the connection's GPT client speaks Responses). The connection owns it and closes it with its own.
+   */
+  readonly client?: LlmClient;
+  /** The wire API of `client`, when it differs from the connection's. */
+  readonly apiMode?: LlmApiMode;
 }
 
 export interface LlmConnection {
@@ -82,6 +90,15 @@ export interface LlmConnection {
   readonly roleDefaultModels?: { readonly processing?: string };
   /** Bumps whenever this connection is replaced; chat turns pin it. */
   readonly version: number;
+}
+
+/** Stop the connection's client and every model client it owns (each once). Best effort: a finished client may throw. */
+export function closeConnectionClients(connection: LlmConnection): void {
+  const clients = new Set<LlmClient>([connection.client]);
+  for (const entry of connection.models) if (entry.client) clients.add(entry.client);
+  for (const client of clients) {
+    try { client.close(); } catch { /* closing a finished client is best effort */ }
+  }
 }
 
 export function connectionDefaultEntry(connection: LlmConnection): LlmModelEntry | undefined {
@@ -148,6 +165,36 @@ export function teamModelEntries(input: {
       capabilities: blessed
         ? { images: true, contextWindow: input.maxContextTokens, maxOutputTokens: 128_000 }
         : { contextWindow: input.maxContextTokens, maxOutputTokens: Math.max(input.maxCompletionTokens, 32_768) },
+    };
+  });
+}
+
+/**
+ * Claude on the team gateway (`team-claude.ts`): one entry per team Claude model, after the GPT entries, served by
+ * the connection's Claude client. Never the connection default, so every call carries its route (a Claude failure
+ * never marks the shared endpoint's health). `thinkingOff` records how Off behaves on that model, as for a key.
+ */
+export function teamClaudeModelEntries(claude: { targetPrefix: string; client: LlmClient }): LlmModelEntry[] {
+  return TEAM_CLAUDE_MODELS.map(model => {
+    const profile = teamClaudeProfile(model);
+    const wire = teamClaudeWireModel(claude.targetPrefix, model);
+    return {
+      key: qualifiedModelKey('team', model.key),
+      connectionId: 'team' as const,
+      label: model.label,
+      family: TEAM_CLAUDE_FAMILY,
+      model: wire,
+      route: { model: wire },
+      isConnectionDefault: false,
+      preview: false,
+      capabilities: {
+        ...(profile.images !== undefined ? { images: profile.images } : {}),
+        contextWindow: profile.contextWindow,
+        maxOutputTokens: profile.maxOutputTokens,
+        thinkingOff: deriveProfile(profile).thinkingOff,
+      },
+      client: claude.client,
+      apiMode: 'messages' as const,
     };
   });
 }
@@ -385,7 +432,8 @@ export function bindLlmModel(
   entry: LlmModelEntry,
   options: BindLlmModelOptions = {},
 ): LlmClient {
-  const base = connection.client;
+  // A model with its own client (Claude on the team gateway) is served by it; every other model by the connection's.
+  const base = entry.client ?? connection.client;
   const thinking = options.thinking ?? 'off';
   const route = options.alwaysRoute || !entry.isConnectionDefault ? entry.route : undefined;
   const modelMaxOutput = entry.capabilities.maxOutputTokens;
@@ -415,7 +463,7 @@ export function bindLlmModel(
     chatCompletionPrimary: request => base.chatCompletionPrimary(adapt(request)),
     getMaxRequestBytes: () => base.getMaxRequestBytes(),
     // The connection anchor: legacy catalog helpers resolve routes against it.
-    getDefaultModel: () => base.getDefaultModel(),
+    getDefaultModel: () => connection.client.getDefaultModel(),
     getProviderId: () => base.getProviderId?.() ?? connection.provider.id,
     getAvailableModels: () => base.getAvailableModels?.(),
     getProviderIssue: () => base.getProviderIssue?.(),
@@ -449,7 +497,7 @@ export function bindLlmModel(
     connectionId: connection.id,
     modelKey: entry.key,
     label: entry.label,
-    provider: Object.freeze({ ...connection.provider, model: entry.model }),
+    provider: Object.freeze({ ...connection.provider, model: entry.model, apiMode: entry.apiMode ?? connection.provider.apiMode }),
     capabilities: entry.capabilities,
     client: bound,
   });

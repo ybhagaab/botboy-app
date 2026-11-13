@@ -12,6 +12,12 @@ import { createOAuthClientCredentialsAuthorizer } from './oauth-authorizer.js';
 import type { LlmUsageService } from './llm-usage.js';
 import { ANTHROPIC_API_ENDPOINT, type AnthropicModelProfile } from './anthropic-models.js';
 import { ANTHROPIC_STREAM_IDLE_TIMEOUT_MS, createAnthropicLlmClient } from './anthropic-client.js';
+import {
+  TEAM_CLAUDE_MODELS,
+  gatewayMessagesBase,
+  teamClaudeProfiles,
+  teamClaudeWireModel,
+} from './team-claude.js';
 
 /**
  * Application-level inference provider.
@@ -44,6 +50,22 @@ export interface InferenceProvider {
   readonly maxContextTokens: number;
   readonly localFallbackEnabled: boolean;
   createClient(options?: { usageService?: LlmUsageService }): LlmClient;
+  /** Team gateway only: Claude on the same gateway target and credential (`team-claude.ts`). */
+  readonly teamClaude?: TeamClaudeFactory;
+}
+
+/**
+ * The Claude models the team gateway's Mantle connector target forwards, reached with the gateway's own credential
+ * (no Anthropic key). The client it builds speaks Messages to `…/inference/v1/messages`, borrows the GPT client's
+ * health (no probe, no timer) and records usage as provider `gateway`, API mode `messages`.
+ */
+export interface TeamClaudeFactory {
+  /** The gateway target every Claude wire id starts with (`bedrock-mantle-luna/`). */
+  readonly targetPrefix: string;
+  createClient(options: {
+    health: { isAvailable(): boolean; healthCheck(): Promise<boolean> };
+    usageService?: LlmUsageService;
+  }): LlmClient;
 }
 
 interface SharedProviderOptions {
@@ -221,6 +243,19 @@ function gatewayTargetPrefix(model: string): string | null {
   // Local/Hugging Face model paths are rejected later unless their suffix is
   // one of the exact proven provider-default profiles.
   return slash > 0 && !model.startsWith('/') ? model.slice(0, slash + 1) : null;
+}
+
+/**
+ * The gateway target Claude rides: the one the gateway default model names, and only when that default is a GPT-5.6
+ * profile on it (the general Mantle connector target that forwards every Mantle model). A default on any other
+ * target (the GPT-6 target rewrites only `/v1/responses`) or a model outside the profiles offers no Claude.
+ */
+export function teamClaudeTargetPrefix(providerDefaultModel: string): string | null {
+  const target = gatewayTargetPrefix(providerDefaultModel);
+  if (!target) return null;
+  const onConnector = BLESSED_CHAT_MODELS.some(model => model.route === 'provider-default'
+    && providerDefaultModel === `${target}${model.bareId}`);
+  return onConnector ? target : null;
 }
 
 function validatedTarget(value: string | undefined, setting: string): string {
@@ -809,6 +844,55 @@ export function createAnthropicInferenceProvider(options: AnthropicInferenceOpti
   };
 }
 
+/**
+ * Claude through the team gateway (owner request 2026-11-13): the gateway's Messages path, the gateway's request
+ * authorizer (the teammate's existing credential; a 401 drops its cached token once), profiles from the known-model
+ * table (Mantle's Anthropic path lists no models), the same runtime settings names as every provider, and the
+ * Messages stream idle default (280 s) unless the environment sets one.
+ */
+export function createTeamClaudeFactory(input: {
+  gatewayEndpoint: string;
+  targetPrefix: string;
+  authorize: LlmRequestAuthorizer;
+  env?: NodeJS.ProcessEnv;
+  /** Test seam only: the HTTP client every request uses (default: the global fetch). */
+  fetchImpl?: typeof fetch;
+}): TeamClaudeFactory {
+  const env = input.env ?? process.env;
+  const profiles = teamClaudeProfiles(input.targetPrefix);
+  const defaultModel = teamClaudeWireModel(input.targetPrefix, TEAM_CLAUDE_MODELS[0]);
+  const defaultEffort = reasoningSetting(env.BOTBOY_INFERENCE_REASONING_EFFORT) ?? 'low';
+  const settings: SharedProviderOptions = {
+    endpoint: gatewayMessagesBase(input.gatewayEndpoint),
+    model: defaultModel,
+    apiMode: 'messages',
+    dialect: 'openai',
+    reasoningEffort: defaultEffort,
+    maxContextTokens: profiles.get(defaultModel)?.contextWindow ?? GATEWAY_MAX_CONTEXT_TOKENS,
+    ...runtimeSettingsFromEnv(env, { streamIdleTimeoutMs: ANTHROPIC_STREAM_IDLE_TIMEOUT_MS }),
+    // Claude has no local fallback: a gateway outage must never answer from another model.
+    localFallback: false,
+  };
+  const config: LlmConfig = { ...buildLlmConfig(settings, { authMode: 'apiKey' }), providerId: 'gateway' };
+  const promptCaching = (env.BOTBOY_ANTHROPIC_PROMPT_CACHE ?? '').trim().toLowerCase() !== 'off';
+  const factory: TeamClaudeFactory = {
+    targetPrefix: input.targetPrefix,
+    createClient: ({ health, usageService }) => createAnthropicLlmClient(
+      config,
+      {
+        authorize: input.authorize,
+        health,
+        profiles: () => profiles,
+        promptCaching,
+        defaultEffort,
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+      },
+      usageService,
+    ),
+  };
+  return Object.freeze(factory);
+}
+
 function inferProvider(env: NodeJS.ProcessEnv): InferenceProviderId {
   const endpoint = (env.BOTBOY_INFERENCE_ENDPOINT || env.VLLM_ENDPOINT)?.trim();
   const authMode = env.VLLM_AUTH_MODE?.trim().toLowerCase();
@@ -951,7 +1035,8 @@ export function createInferenceProviderFromEnv(
           ?? (id === 'gateway' ? GATEWAY_DEFAULT_SCOPE : undefined),
       })
     : undefined;
-  return createOpenAiCompatibleInferenceProvider({
+  const apiKey = env.BOTBOY_INFERENCE_API_KEY || env.VLLM_API_KEY;
+  const created = createOpenAiCompatibleInferenceProvider({
     id,
     endpoint,
     model: env.BOTBOY_INFERENCE_MODEL || env.VLLM_MODEL || providerDefaults.model,
@@ -959,8 +1044,18 @@ export function createInferenceProviderFromEnv(
       env.BOTBOY_INFERENCE_DIALECT ?? env.VLLM_DIALECT,
       providerDefaults.dialect,
     ),
-    apiKey: env.BOTBOY_INFERENCE_API_KEY || env.VLLM_API_KEY,
+    apiKey,
     requestAuthorizer,
     ...shared,
   });
+  if (id !== 'gateway') return created;
+  // Claude rides the same gateway target with the same credential: the one OAuth authorizer (and its token cache)
+  // serves GPT and Claude alike.
+  const claudeTarget = teamClaudeTargetPrefix(created.model);
+  const claudeAuthorizer = requestAuthorizer ?? (apiKey ? createStaticBearerAuthorizer(apiKey) : undefined);
+  if (!claudeTarget || !claudeAuthorizer) return created;
+  return {
+    ...created,
+    teamClaude: createTeamClaudeFactory({ gatewayEndpoint: endpoint, targetPrefix: claudeTarget, authorize: claudeAuthorizer, env }),
+  };
 }
