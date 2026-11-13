@@ -16,9 +16,13 @@ import {
   toggleDocumentReviewState,
 } from './document-reader.js';
 import {
+  GOOGLE_DRIVE,
+  SHAREPOINT,
   defaultPublicationDraft,
+  locationPlace,
   publicationAttemptCanApply,
   publicationEffectLabel,
+  publicationPlace,
   publicationPresentation,
   publicationStageRequest,
 } from './document-publication.js';
@@ -1705,14 +1709,22 @@ function renderProjectDocuments(projectId) {
   // after Approve + Sync here. The typed publication action—not origin copy—
   // decides whether Sync creates a copy or versions an existing exact target.
   const creations = entry.stagedCreations || [];
+  // Each card names where it lands (owner report 2026-11-13: Drive copies read as SharePoint ones).
+  const creationPlaces = [...new Set(creations.map(creation => providerPlace(creation.destinationProvider)))];
+  const creationIntro = creationPlaces.length === 1 && creationPlaces[0] === SHAREPOINT
+    ? 'Exact SharePoint create/update actions. Nothing is complete until guarded upload, exact-byte verification, and capture linkage succeed.'
+    : `Exact ${creationPlaces.length === 1 ? creationPlaces[0] : 'SharePoint and Google Drive'} create/update actions. Nothing is complete until the upload is verified by reading it back and the copy is captured.`;
   const creationBlock = creations.length ? `
-    <div class="section-heading"><div><h2>Awaiting publication</h2><p>Exact SharePoint create/update actions. Nothing is complete until guarded upload, exact-byte verification, and capture linkage succeed.</p></div><span class="pill blue">${creations.length}</span></div>
+    <div class="section-heading"><div><h2>Awaiting publication</h2><p>${esc(creationIntro)}</p></div><span class="pill blue">${creations.length}</span></div>
     <section class="card pad">${creations.map(creation => {
     const statusTone = { pending: '', approved: 'blue', conflicted: 'warn' }[creation.status] || '';
     const canRender = typeof window.formatMarkdownContent === 'function';
     const isUpdate = creation.publicationAction === 'update_existing';
     const cardBusy = publicationProjectBlocked || publicationOperationBusy(creation.sourceArtifactId, creation.id, creation.docKey);
-    const actionLabel = isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy';
+    const place = providerPlace(creation.destinationProvider);
+    const actionLabel = place === GOOGLE_DRIVE
+      ? (isUpdate ? 'Update Google Drive file' : 'Create new Google Drive copy')
+      : (isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy');
     return `<article style="display:flex; flex-direction:column; gap:8px; padding:10px 0; border-bottom:1px solid var(--border);">
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <strong>${esc(creation.fileName)}</strong>
@@ -1730,12 +1742,12 @@ function renderProjectDocuments(projectId) {
         </details>
         <div style="display:flex; gap:6px;">
           ${creation.status === 'pending' ? `
-            <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" ${cardBusy ? 'disabled' : ''}>Approve</button>
-            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" ${cardBusy ? 'disabled' : ''}>Reject</button>` : ''}
+            <button class="button small primary" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="approve" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" data-provider="${attr(creation.destinationProvider || '')}" ${cardBusy ? 'disabled' : ''}>Approve</button>
+            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" data-provider="${attr(creation.destinationProvider || '')}" ${cardBusy ? 'disabled' : ''}>Reject</button>` : ''}
           ${creation.status === 'conflicted' ? `
-            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" data-conflict="true" ${cardBusy ? 'disabled' : ''}>Dismiss conflict</button>` : ''}
+            <button class="button small" type="button" data-action="creation-decide" data-id="${attr(creation.id)}" data-decision="reject" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" data-provider="${attr(creation.destinationProvider || '')}" data-conflict="true" ${cardBusy ? 'disabled' : ''}>Dismiss conflict</button>` : ''}
           ${creation.status === 'approved' && (!creation.publicationStatus || creation.publicationStatus === 'approved') ? `
-            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" ${cardBusy ? 'disabled' : ''}>${icon('refresh', 12)} ${isUpdate ? 'Update SharePoint version' : 'Create SharePoint copy'}</button>` : ''}
+            <button class="button small primary" type="button" data-action="creation-sync" data-dockey="${attr(creation.docKey)}" data-project="${attr(projectId)}" data-artifact="${attr(creation.sourceArtifactId || '')}" data-update="${isUpdate ? 'true' : 'false'}" data-provider="${attr(creation.destinationProvider || '')}" ${cardBusy ? 'disabled' : ''}>${icon('refresh', 12)} ${esc(publicationEffectLabel(isUpdate ? 'update_existing' : 'create', { final: true, place }))}</button>` : ''}
         </div>
       </article>`;
   }).join('')}</section>` : '';
@@ -1792,7 +1804,7 @@ function renderProjectDocuments(projectId) {
   }).join('')}</section>` : '';
 
   if (!docs.length && !creations.length && !authoredChains.length) {
-    return `<section class="card"><div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No project documents yet</h3><p>Authored BotBoy documents and SharePoint references filed to this project appear here.</p></div></section>`;
+    return `<section class="card"><div class="empty-state today-empty"><span class="source-icon">${icon('file', 18)}</span><h3>No project documents yet</h3><p>${amazonEmployeeOn() ? 'Authored BotBoy documents and SharePoint references filed to this project appear here.' : 'Authored BotBoy documents filed to this project appear here.'}</p></div></section>`;
   }
   if (!docs.length) return `${authoredBlock}${creationBlock}`;
   const rows = docs.map(doc => {
@@ -4724,6 +4736,12 @@ function drivePublishAvailable() {
   }
   return Array.isArray(accounts) && accounts.some(account => account.connection?.canPublishDrive === true);
 }
+/** Where a document can be published now: SharePoint while Amazon Employee is on, Google Drive while it is connected to publish. */
+function publicationAvailability() {
+  return { sharepoint: amazonEmployeeOn(), drive: drivePublishAvailable() };
+}
+/** The destination a publication row or button acts on ('gdrive' or anything else, which is SharePoint). */
+const providerPlace = (provider) => (provider === 'gdrive' ? GOOGLE_DRIVE : SHAREPOINT);
 function amazonEmployeeOn() {
   return state.workplace?.amazonEmployee !== false;
 }
@@ -7582,7 +7600,7 @@ async function stageDocumentPublication(artifactId, { basePublicationId = '' } =
   }
 }
 
-async function decideDocumentPublication({ artifactId, pendingEditId, decision, projectId = '', isUpdate = false, isConflict = false }) {
+async function decideDocumentPublication({ artifactId, pendingEditId, decision, projectId = '', isUpdate = false, isConflict = false, provider = '' }) {
   const operationKey = `decision:${pendingEditId}:${artifactId}`;
   if (!pendingEditId || state.documents.publicationBusy.has(operationKey)) return;
   state.documents.publicationBusy.add(operationKey);
@@ -7594,9 +7612,11 @@ async function decideDocumentPublication({ artifactId, pendingEditId, decision, 
     if (publicationRouteRelevant(artifactId, projectId)) {
       if (decision === 'approve') {
         const snapshot = result.remoteSnapshot;
-        toast(isUpdate
-          ? `Update approved against item ${snapshot?.itemId || 'the current SharePoint version'} — the write has not started.`
-          : 'New SharePoint copy approved — the write has not started.');
+        toast(provider === 'gdrive'
+          ? `${isUpdate ? 'Google Drive update' : 'New Google Drive copy'} approved — the write has not started.`
+          : isUpdate
+            ? `Update approved against item ${snapshot?.itemId || 'the current SharePoint version'} — the write has not started.`
+            : 'New SharePoint copy approved — the write has not started.');
       } else {
         toast(isConflict ? 'Publication conflict dismissed.' : 'Publication request rejected.');
       }
@@ -7616,7 +7636,7 @@ async function decideDocumentPublication({ artifactId, pendingEditId, decision, 
   }
 }
 
-async function applyDocumentPublication({ artifactId, docKey, projectId = '', isUpdate = false }) {
+async function applyDocumentPublication({ artifactId, docKey, projectId = '', isUpdate = false, provider = '' }) {
   const operationKey = `sync:${docKey}:${artifactId}`;
   if (!docKey || state.documents.publicationBusy.has(operationKey)) return;
   state.documents.publicationBusy.add(operationKey);
@@ -7647,9 +7667,11 @@ async function applyDocumentPublication({ artifactId, docKey, projectId = '', is
   } else if (result?.retrying) {
     if (relevant) toast(result.note || 'The file is locked; BotBoy will retry the approved write automatically.');
   } else if (result?.verifiedOnReadBack && (result.uploaded || result.alreadyCurrent)) {
-    if (relevant) toast(isUpdate
-      ? `SharePoint version ${result.alreadyCurrent ? 'was already current' : 'updated'} — exact bytes and item verified.`
-      : 'SharePoint copy created and verified.');
+    if (relevant) toast(provider === 'gdrive'
+      ? (isUpdate ? `Google Drive file ${result.alreadyCurrent ? 'was already current' : 'updated'} and verified.` : 'Google Drive copy created and verified.')
+      : isUpdate
+        ? `SharePoint version ${result.alreadyCurrent ? 'was already current' : 'updated'} — exact bytes and item verified.`
+        : 'SharePoint copy created and verified.');
   } else {
     const message = result?.results?.[0]?.reason || 'The publication did not complete; review its receipt.';
     if (state.route.view === 'documents' && state.route.artifactId === artifactId) state.documents.publicationError = message;
@@ -7749,7 +7771,9 @@ function renderDocumentListPane(selectedArtifactId) {
 
 function renderDocumentPublicationPanel(artifact, view, documents) {
   if (!view) return '';
-  const presentation = publicationPresentation(view);
+  const available = publicationAvailability();
+  const place = publicationPlace(view, available);
+  const presentation = publicationPresentation(view, { place });
   const open = documents.publicationOpen;
   const triggerOrigin = ['status', 'toolbar', 'summary'].includes(documents.publicationTrigger)
     ? documents.publicationTrigger
@@ -7776,7 +7800,7 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
       ? view.blockReason
       : attempt.conflictReason || attempt.lastError || documents.publicationError;
     const effectNote = attempt.effectCertainty === 'none'
-      ? 'No SharePoint write has occurred for this attempt.'
+      ? `No ${place} write has occurred for this attempt.`
       : attempt.effectCertainty === 'verified_remote_effect'
         ? 'A remote effect was verified; do not create another attempt until this receipt is reconciled.'
         : 'A remote write may have occurred; review the receipt before taking another action.';
@@ -7784,11 +7808,11 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     if (view.phase === 'blocked_unassigned') {
       actions = '';
     } else if (view.phase === 'pending') {
-      actions = `<button class="button primary" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="approve" ${busy ? 'disabled' : ''}>${busy ? 'Checking SharePoint…' : 'Approve'}</button><button class="button ghost" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="reject" ${busy ? 'disabled' : ''}>Reject</button>`;
+      actions = `<button class="button primary" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="approve" ${busy ? 'disabled' : ''}>${busy ? (place === SHAREPOINT ? 'Checking SharePoint…' : 'Approving…') : 'Approve'}</button><button class="button ghost" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="reject" ${busy ? 'disabled' : ''}>Reject</button>`;
     } else if (attempt.destination?.effectUnknown) {
       actions = `<button class="button primary" type="button" data-action="documents-publication-check-drive" data-publication="${attr(attempt.publicationId)}" ${busy ? 'disabled' : ''}>${busy ? 'Checking Drive…' : 'Check Drive'}</button>`;
     } else if (publicationAttemptCanApply(view)) {
-      actions = `<button class="button primary" type="button" data-action="documents-publication-sync" data-dockey="${attr(attempt.docKey)}" ${busy ? 'disabled' : ''}>${busy ? 'Writing and verifying…' : esc(publicationEffectLabel(attempt.action, { final: true }))}</button>`;
+      actions = `<button class="button primary" type="button" data-action="documents-publication-sync" data-dockey="${attr(attempt.docKey)}" ${busy ? 'disabled' : ''}>${busy ? 'Writing and verifying…' : esc(publicationEffectLabel(attempt.action, { final: true, place }))}</button>`;
     } else if (view.phase === 'conflicted') {
       actions = `<button class="button ghost" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="reject" ${busy ? 'disabled' : ''}>Dismiss conflict</button>${isUpdate ? `<button class="button" type="button" data-action="documents-publication-retry" data-base="${attr(attempt.basePublicationId || '')}" ${busy ? 'disabled' : ''}>Prepare update again</button>` : ''}`;
     } else {
@@ -7802,7 +7826,7 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     const modeChoice = updateBases.length
       ? `<div class="document-publication-mode" role="group" aria-label="Publication type"><button class="button small ${updateMode ? 'active' : ''}" type="button" data-action="documents-publication-mode" data-mode="update_existing" aria-pressed="${updateMode ? 'true' : 'false'}">Update existing</button><button class="button small ${updateMode ? '' : 'active'}" type="button" data-action="documents-publication-mode" data-mode="create" aria-pressed="${updateMode ? 'false' : 'true'}">Create another copy</button></div>`
       : '';
-    const updateForm = `<fieldset class="document-publication-fieldset"><legend>Choose the SharePoint file to update</legend>${updateBases.map((location, index) => `<label class="document-publication-choice"><input type="radio" name="document-publication-base" value="${attr(location.publicationId)}" data-publication-base ${draft.basePublicationId === location.publicationId || (!draft.basePublicationId && updateBases.length === 1 && index === 0) ? 'checked' : ''}><span><strong>${esc(location.serverRelativeUrl.split('/').pop() || 'SharePoint document')}</strong>${pathLine(location.serverRelativeUrl)}<small>${String(location.format || '').toUpperCase()} · contains an older artifact</small></span></label>`).join('')}</fieldset><div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage update for review'}</button></div>`;
+    const updateForm = `<fieldset class="document-publication-fieldset"><legend>${esc(place ? `Choose the ${place} file to update` : 'Choose the published file to update')}</legend>${updateBases.map((location, index) => `<label class="document-publication-choice"><input type="radio" name="document-publication-base" value="${attr(location.publicationId)}" data-publication-base ${draft.basePublicationId === location.publicationId || (!draft.basePublicationId && updateBases.length === 1 && index === 0) ? 'checked' : ''}><span><strong>${esc(location.serverRelativeUrl.split('/').pop() || `${locationPlace(location)} document`)}</strong>${pathLine(location.serverRelativeUrl)}<small>${String(location.format || '').toUpperCase()} · contains an older artifact</small></span></label>`).join('')}</fieldset><div class="document-publication-actions"><button class="button primary" type="button" data-action="documents-publication-stage" ${busy ? 'disabled' : ''}>${busy ? 'Staging…' : 'Stage update for review'}</button></div>`;
     // Where it lands: SharePoint only with Amazon Employee ON; Drive only when connected.
     const driveChoices = Array.isArray(artifact?.publicationDestinations) ? artifact.publicationDestinations : [];
     const useDrive = draft.provider === 'gdrive' || (!amazonEmployeeOn() && driveChoices.length > 0);
@@ -7819,7 +7843,15 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     body = `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span><strong>${number(blockers.length)} unresolved publication receipts</strong><br>${blockers.map(entry => `${documentStateLabel(entry.publicationStatus)} · ${entry.serverRelativeUrl}`).map(esc).join('<br>')}</span></div>${body}`;
   }
 
-  return `<section class="document-publication-surface${toneClass} ${open ? 'is-open' : ''}" aria-labelledby="document-publication-summary-label" ${busy ? 'aria-busy="true"' : ''}><header class="document-publication-summary"><span class="document-publication-summary-icon">${icon(view.phase === 'complete' ? 'check' : view.phase === 'conflicted' || view.phase === 'failed' ? 'alert' : 'link', 15)}</span><span><strong id="document-publication-summary-label">${esc(presentation.label)}</strong><small>${esc(presentation.summary)}</small></span><button class="button small ghost ${open && triggerOrigin === 'summary' ? 'is-publication-origin' : ''}" type="button" data-action="documents-publication-toggle" data-publication-trigger="summary" aria-haspopup="dialog" aria-controls="document-publication-dialog" aria-expanded="${open ? 'true' : 'false'}">${esc(presentation.button)}</button></header></section><dialog id="document-publication-dialog" class="document-publication-overlay" aria-labelledby="document-publication-heading" aria-describedby="document-publication-description" ${busy ? 'aria-busy="true"' : ''}><section class="document-publication-drawer"><header class="document-publication-drawer-header"><div><h3 id="document-publication-heading" class="document-publication-heading" tabindex="-1">SharePoint publication</h3><p id="document-publication-description" class="document-publication-intro">Reviewing or staging here does not write SharePoint. The final physical-effect button remains separate.</p></div><button class="icon-button document-publication-drawer-close" type="button" data-action="documents-publication-close" aria-label="Close SharePoint publication">${icon('x', 15)}</button></header><div id="document-publication-panel" class="document-publication-panel" data-scroll-key="documents:publication:${attr(artifact.artifactId)}">${body}</div><span class="visually-hidden" aria-live="polite">${busy ? 'Publication action in progress' : ''}</span></section></dialog>`;
+  // The drawer's heading names its destination. Not published with both offered: the one picked in the form (SharePoint unless
+  // Drive is picked, as the picker defaults). Copies in both places: neutral.
+  const hasCopies = Array.isArray(view.completedLocations) && view.completedLocations.length > 0;
+  const drawerPlace = place ?? (attempt || hasCopies ? null : draft.provider === 'gdrive' ? GOOGLE_DRIVE : SHAREPOINT);
+  const drawerHeading = drawerPlace ? `${drawerPlace} publication` : 'Publication';
+  const drawerIntro = drawerPlace === SHAREPOINT
+    ? 'Reviewing or staging here does not write SharePoint. The final physical-effect button remains separate.'
+    : `Reviewing or staging here does not change ${drawerPlace || 'anything outside BotBoy'}. The final step stays a separate button.`;
+  return `<section class="document-publication-surface${toneClass} ${open ? 'is-open' : ''}" aria-labelledby="document-publication-summary-label" ${busy ? 'aria-busy="true"' : ''}><header class="document-publication-summary"><span class="document-publication-summary-icon">${icon(view.phase === 'complete' ? 'check' : view.phase === 'conflicted' || view.phase === 'failed' ? 'alert' : 'link', 15)}</span><span><strong id="document-publication-summary-label">${esc(presentation.label)}</strong><small>${esc(presentation.summary)}</small></span><button class="button small ghost ${open && triggerOrigin === 'summary' ? 'is-publication-origin' : ''}" type="button" data-action="documents-publication-toggle" data-publication-trigger="summary" aria-haspopup="dialog" aria-controls="document-publication-dialog" aria-expanded="${open ? 'true' : 'false'}">${esc(presentation.button)}</button></header></section><dialog id="document-publication-dialog" class="document-publication-overlay" aria-labelledby="document-publication-heading" aria-describedby="document-publication-description" ${busy ? 'aria-busy="true"' : ''}><section class="document-publication-drawer"><header class="document-publication-drawer-header"><div><h3 id="document-publication-heading" class="document-publication-heading" tabindex="-1">${esc(drawerHeading)}</h3><p id="document-publication-description" class="document-publication-intro">${esc(drawerIntro)}</p></div><button class="icon-button document-publication-drawer-close" type="button" data-action="documents-publication-close" aria-label="Close ${attr(drawerHeading)}">${icon('x', 15)}</button></header><div id="document-publication-panel" class="document-publication-panel" data-scroll-key="documents:publication:${attr(artifact.artifactId)}">${body}</div><span class="visually-hidden" aria-live="polite">${busy ? 'Publication action in progress' : ''}</span></section></dialog>`;
 }
 
 function renderDocumentDetailPane(artifactId) {
@@ -7877,8 +7909,9 @@ function renderDocumentDetailPane(artifactId) {
   const publicationView = artifact.publicationState && typeof artifact.publicationState === 'object'
     ? artifact.publicationState
     : null;
-  const publicationCopy = publicationPresentation(publicationView);
-  // SharePoint publication is an Amazon internal path (publicationFact keeps history).
+  // The words name where it lands: SharePoint while Amazon Employee is on, Google Drive while connected (both: neutral).
+  const publicationCopy = publicationPresentation(publicationView, { place: publicationPlace(publicationView, publicationAvailability()) });
+  // Publishing shows while SharePoint (Amazon Employee) or Google Drive can take it; publicationFact keeps history either way.
   const publishButton = editing || !publicationView || !(amazonEmployeeOn() || drivePublishAvailable())
     ? ''
     : `<button class="button small document-publication-toggle ${documents.publicationOpen ? 'active' : ''} ${documents.publicationOpen && documents.publicationTrigger === 'toolbar' ? 'is-publication-origin' : ''}" type="button" data-action="documents-publication-toggle" data-publication-trigger="toolbar" aria-haspopup="dialog" aria-expanded="${documents.publicationOpen ? 'true' : 'false'}" aria-controls="document-publication-dialog">${icon('link', 13)} ${esc(publicationCopy.button)}</button>`;
@@ -9454,6 +9487,7 @@ function bindEvents() {
         projectId: target.dataset.project || '',
         isUpdate: target.dataset.update === 'true',
         isConflict: target.dataset.conflict === 'true',
+        provider: target.dataset.provider || '',
       });
     }
     if (action === 'creation-sync') {
@@ -9462,6 +9496,7 @@ function bindEvents() {
         docKey: target.dataset.dockey || '',
         projectId: target.dataset.project || '',
         isUpdate: target.dataset.update === 'true',
+        provider: target.dataset.provider || '',
       });
     }
     if (action === 'doc-comment-filter') {
@@ -9641,6 +9676,7 @@ function bindEvents() {
         projectId: artifact?.projectId || '',
         isUpdate: attempt?.action === 'update_existing',
         isConflict: artifact?.publicationState?.phase === 'conflicted',
+        provider: attempt?.destination?.provider || '',
       });
     }
     if (action === 'documents-publication-check-drive') {
@@ -9666,6 +9702,7 @@ function bindEvents() {
         docKey: target.dataset.dockey || attempt?.docKey || '',
         projectId: artifact?.projectId || '',
         isUpdate: attempt?.action === 'update_existing',
+        provider: attempt?.destination?.provider || '',
       });
     }
     if (action === 'documents-publication-refresh') {

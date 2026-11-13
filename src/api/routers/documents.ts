@@ -122,6 +122,8 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         ...(publication ? {
           publicationId: publication.publicationId,
           publicationAction: publication.action,
+          // Where it lands, so the project card names Google Drive or SharePoint (owner report 2026-11-13).
+          destinationProvider: publication.destinationProvider,
           basePublicationId: publication.basePublicationId,
           sourceArtifactId: publication.artifactId,
           publicationStatus: publication.status,
