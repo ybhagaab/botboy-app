@@ -39,6 +39,21 @@ export function requireLocalOwnerRequest(
   return true;
 }
 
+/**
+ * A read of the owner's own work (job history and job threads) answers only this loopback app. A same-origin page GET
+ * carries no Origin, so a DNS-rebinding page passes the socket check; its Host header still names the attacker's host
+ * name, so the Host must be a loopback name too.
+ */
+export function requireLocalOwnerRead(req: Request, res: Response, label = 'This read'): boolean {
+  if (!requireLocalOwnerRequest(req, res, label)) return false;
+  const host = req.get('host') ?? '';
+  if (!/^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$/i.test(host)) {
+    res.status(403).json({ error: `${label} answers only BotBoy's own pages on this Mac.` });
+    return false;
+  }
+  return true;
+}
+
 export function requireLocalOwnerMutation(req: Request, res: Response): boolean {
   return requireLocalOwnerRequest(req, res, 'Analytics owner mutation');
 }

@@ -466,6 +466,7 @@
     const title = groups || !queries ? 'Jobs' : 'Running queries';
     put($('chat-jobs-drawer-title'), `${esc(title)}${counts && title === 'Jobs' ? `<small>${esc(counts)}</small>` : ''}`);
     put($('chat-jobs-drawer-list'), `${groups || (queries ? '' : '<p class="jobs-empty">No jobs yet.</p>')}${queries}`
+      + `<a class="jobs-drawer-history" href="#/jobs" data-jobs-history-link>All jobs, with what each one made <span aria-hidden="true">→</span></a>`
       + `<div class="jobs-sheet-foot">Ask in chat to start a job. Begin a message with #${esc(state.jobs[0]?.number ?? 2)} to talk to that job.</div>`);
   }
 
@@ -975,9 +976,12 @@
       for (const job of state.answering) if (!active.some(entry => entry.id === job && entry.phase === 'needs_owner')) state.answering.delete(job);
       // A job picked up again shows again, even if its earlier pill was dismissed.
       for (const job of active) if (state.dismissed.delete(job.id)) saveDismissed();
+      const moved = state.loaded && state.version !== payload.version;
       state.jobs = active;
       state.recent = recent;
       state.version = payload.version;
+      // The Jobs page (#/jobs) reads its list again when jobs change; an event, so it needs no poll of its own.
+      if (moved) window.dispatchEvent(new CustomEvent('botboy:jobs-changed'));
       state.loaded = true;
       if (state.viewId && state.view) state.view.job = byId(state.viewId) || state.view.job;
       renderAll();
@@ -1128,6 +1132,8 @@
     if (!target) return;
     if (state.menuOpen && !target.closest('.jobs-menu') && !target.closest('[data-jobs-menu]')) { state.menuOpen = false; renderView(); }
     if (target.closest('#chat-jobs-scrim')) { closeDrawer(); closeJob(); return; }
+    // The link to the Jobs page navigates the workspace; the drawer gets out of the way.
+    if (target.closest('[data-jobs-history-link]')) { closeDrawer(); return; }
     const button = target.closest('[data-jobs-open],[data-jobs-drawer],[data-jobs-close],[data-jobs-back],[data-jobs-menu],[data-jobs-pause],[data-jobs-resume],[data-jobs-stop],[data-jobs-pill-stop],[data-jobs-pill-resume],[data-jobs-dismiss],[data-jobs-answer],[data-jobs-step],[data-queries-stop],[data-queries-keep],#chat-job-newest');
     if (!button || !button.closest('#chat-panel')) return;
     const data = button.dataset;

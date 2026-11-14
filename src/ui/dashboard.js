@@ -3,6 +3,7 @@
 // workflows; this module owns the new shell, routing, and read-model rendering.
 
 import { nextTodayFocusIndex, renderTodayView, todayPaneHandoffDelta } from './today.js';
+import { renderJobsHistoryFilters, renderJobsHistoryList, renderJobsHistoryPage } from './jobs-history.js';
 import {
   boundedDocumentCountLabel,
   boundedDocumentScopeLabel,
@@ -249,6 +250,8 @@ const state = {
   lastThemeVersion: null,
   // Settings → Appearance and the saved themes (docs/maps/ui-themes.md). `data` is GET /ui-theme.
   uiTheme: { data: null, error: '', notice: '', busy: false, renaming: '', confirmingDelete: '', pendingFocus: '' },
+  // #/jobs (docs/maps/job-history.md): one page of rows at a time, the owner's words and filter, and the one open row.
+  jobsHistory: { jobs: null, counts: null, next: '', query: '', status: 'all', openId: '', fullSummary: '', error: '', loading: false, loadingMore: false, requestId: 0 },
 };
 
 const areaColors = ['#9d8cff', '#6faef5', '#56d69a', '#f3ba63', '#ed7fbd', '#f1a34f', '#7ac9c3', '#ae91d1', '#8f929a'];
@@ -360,7 +363,7 @@ function parseRoute() {
   // Workbench reader: #/doc/<base64url(docKey)> — distinct from #/documents
   // (the product-manager writing workspace).
   if (parts[0] === 'doc' && parts[1]) return { view: 'doc-reader', docId: parts[1] };
-  if (['inbox', 'channels', 'connections', 'pipeline', 'settings', 'nodes'].includes(parts[0])) return { view: parts[0] };
+  if (['inbox', 'channels', 'connections', 'pipeline', 'settings', 'nodes', 'jobs'].includes(parts[0])) return { view: parts[0] };
   return { view: 'not-found' };
 }
 
@@ -997,6 +1000,7 @@ function renderSidebar() {
     ['dashboards', 'activity', 'Dashboards', '#/dashboards', state.analytics.items?.length ? String(state.analytics.items.length) : ''],
     ['data-room', 'database', 'Data Room', '#/data-room', state.analytics.dataRoomList?.datasets?.length ? String(state.analytics.dataRoomList.datasets.length) : ''],
     ['documents', 'file', 'Documents', '#/documents', state.documents.items?.length ? String(state.documents.items.length) : ''],
+    ['jobs', 'clock', 'Jobs', '#/jobs', ''],
     ['connections', 'link', 'Connections', '#/connections', ''],
     ['pipeline', 'activity', 'System health', '#/pipeline', state.health?.totalFailures ? String(state.health.totalFailures) : ''],
     ['settings', 'settings', 'Settings', '#/settings', ''],
@@ -4907,6 +4911,124 @@ async function saveAiModelRole(select) {
   }
 }
 
+// ── Jobs (#/jobs, docs/maps/job-history.md) ──
+// jobs-history.js holds the pure renderers; this block owns the state, the requests and the handlers. Every request is a read.
+// The page refetches when it opens, when the owner searches, filters or asks for older jobs, and when the chat panel's own
+// job poll sees the jobs change (the botboy:jobs-changed event): it has no timer of its own.
+function jobsHistoryHelpers() {
+  return {
+    esc, attr, icon, pageHead,
+    // The chat panel's Markdown: it escapes text and admits only in-app routes, BotBoy files and http(s) links.
+    markdown: text => (typeof window.formatMarkdownContent === 'function' ? window.formatMarkdownContent(text) : `<p>${esc(text)}</p>`),
+  };
+}
+
+function jobsHistoryModel() {
+  return { ...state.jobsHistory, now: new Date() };
+}
+
+/** Repaints only the list and the filter counts, so the search box keeps its focus and caret while the owner types. */
+function paintJobsHistoryList() {
+  if (state.route.view !== 'jobs') return;
+  const list = document.getElementById('jobs-history-list');
+  const filters = document.getElementById('jobs-history-filters');
+  if (!list || !filters) {
+    renderRoute({ preserveScroll: true });
+    return;
+  }
+  const model = jobsHistoryModel();
+  const helpers = jobsHistoryHelpers();
+  list.innerHTML = renderJobsHistoryList(model, helpers);
+  filters.innerHTML = renderJobsHistoryFilters(model, helpers);
+}
+
+/** Reads the first page (or, with `older`, the next one) for the owner's words and filter; a newer request wins. */
+async function loadJobsHistory({ older = false } = {}) {
+  const h = state.jobsHistory;
+  const requestId = ++h.requestId;
+  h.loading = true;
+  if (older) {
+    if (!h.next) return;
+    h.loadingMore = true;
+    paintJobsHistoryList();
+  }
+  const params = new URLSearchParams();
+  if (h.query.trim()) params.set('q', h.query.trim());
+  if (h.status !== 'all') params.set('status', h.status);
+  if (older) params.set('before', h.next);
+  try {
+    const page = await request(`/chat/jobs/history${params.toString() ? `?${params}` : ''}`);
+    if (requestId !== h.requestId) return;
+    const rows = Array.isArray(page?.jobs) ? page.jobs : [];
+    h.jobs = older ? [...(h.jobs || []), ...rows.filter(row => !(h.jobs || []).some(seen => seen.id === row.id))] : rows;
+    h.counts = page?.counts || null;
+    h.next = typeof page?.next === 'string' ? page.next : '';
+    h.error = '';
+  } catch (error) {
+    if (requestId !== h.requestId) return;
+    h.error = String(error?.payload?.error || error?.message || error || 'Unknown error');
+  } finally {
+    if (requestId === h.requestId) {
+      h.loading = false;
+      h.loadingMore = false;
+      paintJobsHistoryList();
+    }
+  }
+}
+
+let jobsHistorySearchTimer = null;
+function onJobsHistorySearch(input) {
+  state.jobsHistory.query = input.value;
+  // A synchronized view filter, not unsaved authored text: background freshness is not frozen by it.
+  input.defaultValue = input.value;
+  clearTimeout(jobsHistorySearchTimer);
+  jobsHistorySearchTimer = setTimeout(() => { void loadJobsHistory(); }, 220);
+}
+
+function jobsHistoryAction(action, target) {
+  const h = state.jobsHistory;
+  const id = target.dataset.jobId || '';
+  if (action === 'jobs-toggle') {
+    h.openId = h.openId === id ? '' : id;
+    h.fullSummary = '';
+    paintJobsHistoryList();
+    document.querySelector(`[data-job-row="${CSS.escape(id)}"] .jobs-history-head`)?.focus({ preventScroll: true });
+    return;
+  }
+  if (action === 'jobs-summary') {
+    h.fullSummary = h.fullSummary === id ? '' : id;
+    paintJobsHistoryList();
+    return;
+  }
+  if (action === 'jobs-filter') {
+    const status = target.dataset.status;
+    if (!['all', 'done', 'stopped'].includes(status) || status === h.status) return;
+    h.status = status;
+    h.openId = '';
+    void loadJobsHistory();
+    return;
+  }
+  if (action === 'jobs-clear') {
+    Object.assign(h, { query: '', status: 'all', openId: '' });
+    const input = document.querySelector('[data-jobs-search]');
+    if (input) { input.value = ''; input.defaultValue = ''; }
+    void loadJobsHistory();
+    return;
+  }
+  if (action === 'jobs-more') { void loadJobsHistory({ older: true }); return; }
+  if (action === 'jobs-retry') { void loadJobsHistory(); return; }
+  if (action === 'jobs-open-chat') {
+    // The job's own sheet in the chat panel: its progress, its thread, and the box that picks it up again.
+    toggleAssistant(true);
+    window.BotBoyJobs?.openJob?.(id, { focus: true });
+  }
+}
+
+// The chat panel's job poll saw the jobs change (one started, finished or was stopped): the open page reads its first page again.
+window.addEventListener('botboy:jobs-changed', () => {
+  if (state.route.view === 'jobs' && !state.jobsHistory.loadingMore) void loadJobsHistory();
+});
+
 // ── Settings → Knowledge (docs/maps/knowledge-library.md K12) ──
 // knowledge-ui.js (window.BotBoyKnowledge) holds the pure renderers; this block owns the state, the requests and the
 // handlers. Every write below is an owner click on a same-origin page. The page refetches only when the version poll sees
@@ -8772,6 +8894,7 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (routeChanged && state.route.view === 'workplace-settings') void loadWorkplace({ render: true });
   if (routeChanged && state.route.view === 'appearance-settings') void loadUiTheme({ render: true });
   if (routeChanged && state.route.view === 'knowledge-settings') enterKnowledgePage();
+  if (routeChanged && state.route.view === 'jobs') void loadJobsHistory();
   // Claim outer-scroll ownership before ANY renderer/loader early return.
   // A true navigation always starts clean and permanently cancels a delayed
   // hard-reload restore, even if the owner later returns to the same hash.
@@ -8868,6 +8991,11 @@ function renderRoute({ preserveScroll = false, userAction = false } = {}) {
   if (state.route.view === 'workplace-settings') html = renderWorkplaceSettings();
   if (state.route.view === 'appearance-settings') html = renderAppearanceSettings();
   if (state.route.view === 'knowledge-settings') html = renderKnowledgeSettings();
+  if (state.route.view === 'jobs') {
+    // A page opened straight at #/jobs (a fresh tab, a reload) has no route change to start its read: the first render does.
+    if (!state.jobsHistory.jobs && !state.jobsHistory.loading && !state.jobsHistory.error) void loadJobsHistory();
+    html = renderJobsHistoryPage(jobsHistoryModel(), jobsHistoryHelpers());
+  }
   if (state.route.view === 'not-found') html = errorView('This workspace route does not exist. Use the navigation to open a known view.');
   window.BotBoyHtmlViews?.park();
   view.innerHTML = html;
@@ -9240,6 +9368,7 @@ function bindEvents() {
     if (action === 'toggle-assistant') toggleAssistant();
     if (action === 'close-assistant') toggleAssistant(false);
     if (action === 'toggle-theme') toggleTheme();
+    if (action.startsWith('jobs-')) jobsHistoryAction(action, target);
     if (action === 'workplace-toggle') void saveWorkplaceToggle();
     if (action === 'theme-apply') void applyUiTheme(target.dataset.themeId);
     if (action === 'theme-rename') startThemeRename(target.dataset.themeId);
@@ -10304,6 +10433,10 @@ function bindEvents() {
   document.addEventListener('input', event => {
     if (event.target?.matches?.('[data-control-input]')) {
       updateAnalyticsControlDraft(event.target);
+      return;
+    }
+    if (event.target?.matches?.('[data-jobs-search]')) {
+      onJobsHistorySearch(event.target);
       return;
     }
     if (event.target?.matches?.('[data-document-search]')) {

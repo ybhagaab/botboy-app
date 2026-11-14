@@ -85,6 +85,10 @@ export interface ChatJobWorkingSet {
   dashboards: Array<{ dashboardId: string; title?: string; at: string }>;
   /** Library files this job loaded, so a continuation knows what to load again (knowledge-library.md K9). */
   knowledge: Array<{ set: string; file: string; sha256: string; at: string }>;
+  /** BotBoy documents this job saved or edited: the newest version of each (an edit replaces its parent; job-history.md). */
+  documents: Array<{ artifactId: string; title?: string; at: string }>;
+  /** Google Drive files this job created, uploaded or copied (gdrive_files receipts; job-history.md). */
+  drive: Array<{ fileId: string; name?: string; kind?: string; url?: string; at: string }>;
 }
 
 /**
@@ -405,6 +409,20 @@ export function waitName(watch: EtlRunWatch): string {
   return `ETL run ${watch.runId}${watch.purpose ? ` (${clip(watch.purpose, 120)})` : ''}`;
 }
 
+/** The job history filter: every job, the finished ones, or the ones that ended without finishing (stopped or expired). */
+export type ChatJobHistoryStatus = 'all' | 'done' | 'stopped';
+export interface ChatJobHistoryPage {
+  jobs: ChatJob[];
+  /** The cursor for the next, older page; absent on the last one. */
+  next?: string;
+  /** How many jobs match the words, per filter (the page's filter counts). */
+  counts: { all: number; done: number; stopped: number };
+}
+const HISTORY_PAGE = 30;
+const HISTORY_CURSOR_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\|(cj_[a-f0-9]{24})$/;
+/** `%`, `_` and the escape itself are literal in the owner's words. */
+const likePattern = (words: string) => `%${words.replace(/[\\%_]/g, char => `\\${char}`)}%`;
+
 export interface ChatJobStore {
   /** Every active job, by number (PJ1: many at once). */
   activeJobs(): ChatJob[];
@@ -514,7 +532,18 @@ export interface ChatJobStore {
   recordNotifyOutcome(jobId: string, key: string, outcome: 'sent' | 'unknown' | 'gave_up' | { retryAt: string; attempts: number }): void;
   /** Jobs that asked to be told and may still owe a message: every active armed job, and armed jobs that ended recently. */
   notifyCandidates(sinceIso: string): ChatJob[];
-  recordFile(jobId: string, filePath: string, label?: string): void;
+  /** A file the job produced. `dataWork: false` for a file that says nothing about data work (write_file, edit_file). */
+  recordFile(jobId: string, filePath: string, label?: string, options?: { dataWork?: boolean }): void;
+  /** A BotBoy document version the job saved; an edit (`parentArtifactId`) replaces its parent's entry. */
+  recordDocument(jobId: string, entry: { artifactId: string; parentArtifactId?: string; title?: string }): void;
+  /** A Google Drive file the job created, uploaded or copied. */
+  recordDriveFile(jobId: string, entry: { fileId: string; name?: string; kind?: string; url?: string }): void;
+  /**
+   * The job history page (job-history.md): every job the owner saw, newest first, kept for good. Leaves out only a provisional
+   * job, which belongs to its main-chat turn until it surfaces and folds away into that reply when it does not. `query` matches
+   * the title, the owner's words, the report and the end reason; `before` is the previous page's `next` cursor.
+   */
+  history(input?: { query?: string; status?: ChatJobHistoryStatus; before?: string; limit?: number }): ChatJobHistoryPage;
   recordDataset(jobId: string, entry: { datasetId?: string; versionId?: string; jobId?: string; title?: string }): void;
   recordDashboard(jobId: string, entry: { dashboardId: string; title?: string }): void;
   recordKnowledge(jobId: string, entry: { set: string; file: string; sha256: string }): void;
@@ -567,7 +596,7 @@ function clip(value: unknown, max: number): string {
 }
 
 function emptyWorkingSet(): ChatJobWorkingSet {
-  return { notes: [], files: [], datasets: [], dashboards: [], knowledge: [] };
+  return { notes: [], files: [], datasets: [], dashboards: [], knowledge: [], documents: [], drive: [] };
 }
 
 function parseWorkingSet(raw: unknown): ChatJobWorkingSet {
@@ -580,6 +609,8 @@ function parseWorkingSet(raw: unknown): ChatJobWorkingSet {
       datasets: Array.isArray(value.datasets) ? value.datasets : [],
       dashboards: Array.isArray(value.dashboards) ? value.dashboards : [],
       knowledge: Array.isArray(value.knowledge) ? value.knowledge : [],
+      documents: Array.isArray(value.documents) ? value.documents.filter((entry: any) => typeof entry?.artifactId === 'string') : [],
+      drive: Array.isArray(value.drive) ? value.drive.filter((entry: any) => typeof entry?.fileId === 'string') : [],
     };
   } catch {
     return emptyWorkingSet();
@@ -1061,6 +1092,32 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
     recentlyEnded: (sinceIso, limit = 20) => (db.prepare(`SELECT * FROM chat_jobs WHERE status != 'active' AND ended_at >= ? AND seq IS NOT NULL
       ORDER BY ended_at DESC LIMIT ?`).all(sinceIso, Math.max(1, Math.min(100, limit))) as any[]).map(row => rowToJob(row)!),
     get: (jobId) => rowToJob(selectJob.get(jobId)),
+    history(input = {}) {
+      // Every job the owner saw. A provisional job (no number) is its main-chat turn's until it surfaces; one that folded away
+      // into that turn's reply was never a job. Jobs from before numbers (no number, ended) are real jobs and stay.
+      const visible = `NOT (seq IS NULL AND (status = 'active' OR end_reason = ?))`;
+      const words = String(input.query ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      const match = words ? ` AND (title LIKE ? ESCAPE '\\' OR goal LIKE ? ESCAPE '\\' OR report_text LIKE ? ESCAPE '\\' OR end_reason LIKE ? ESCAPE '\\')` : '';
+      const matchArgs = words ? Array(4).fill(likePattern(words)) : [];
+      const counted = db.prepare(`SELECT COUNT(*) AS total, COALESCE(SUM(status = 'done'), 0) AS done,
+          COALESCE(SUM(status IN ('stopped', 'expired')), 0) AS stopped
+        FROM chat_jobs WHERE ${visible}${match}`).get(CHAT_JOB_FOLDED_REASON, ...matchArgs) as any;
+      const status = input.status === 'done' || input.status === 'stopped' ? input.status : 'all';
+      const statusSql = status === 'done' ? ` AND status = 'done'` : status === 'stopped' ? ` AND status IN ('stopped', 'expired')` : '';
+      const cursor = HISTORY_CURSOR_RE.exec(String(input.before ?? ''));
+      const cursorSql = cursor ? ' AND (created_at < ? OR (created_at = ? AND id < ?))' : '';
+      const cursorArgs = cursor ? [cursor[1], cursor[1], cursor[2]] : [];
+      const limit = Math.max(1, Math.min(100, Math.floor(Number(input.limit) || HISTORY_PAGE)));
+      const rows = db.prepare(`SELECT * FROM chat_jobs WHERE ${visible}${match}${statusSql}${cursorSql}
+        ORDER BY created_at DESC, id DESC LIMIT ?`).all(CHAT_JOB_FOLDED_REASON, ...matchArgs, ...cursorArgs, limit + 1) as any[];
+      const jobs = rows.slice(0, limit).map(row => rowToJob(row)!);
+      const last = jobs[jobs.length - 1];
+      return {
+        jobs,
+        ...(rows.length > limit && last ? { next: `${last.createdAt}|${last.id}` } : {}),
+        counts: { all: Number(counted?.total) || 0, done: Number(counted?.done) || 0, stopped: Number(counted?.stopped) || 0 },
+      };
+    },
     bySeq: (seq) => (Number.isInteger(seq) && seq > 0 ? rowToJob(selectBySeq.get(seq)) : null),
     start,
     markDataWork,
@@ -1379,7 +1436,7 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
         ORDER BY last_activity_at DESC LIMIT 20`).all(sinceIso) as any[];
       return rows.map(row => rowToJob(row)).filter((job): job is ChatJob => Boolean(job?.notify));
     },
-    recordFile(jobId, filePath, label) {
+    recordFile(jobId, filePath, label, options = {}) {
       const clean = clip(filePath, 1_000);
       if (!clean) return;
       mutateWorkingSet(jobId, (set) => {
@@ -1387,8 +1444,36 @@ export function createChatJobStore(db: Database.Database): ChatJobStore {
         set.files.push({ path: clean, ...(label ? { label: clip(label, 160) } : {}), at: nowIso() });
         if (set.files.length > MAX_LIST) set.files = set.files.slice(-MAX_LIST);
       });
-      // Only ETL results are recorded here (recordToolOutcome): the job does data work.
-      markDataWork(jobId);
+      // ETL results and exports mean data work; a file the job wrote itself (write_file, edit_file) says nothing about it.
+      if (options.dataWork !== false) markDataWork(jobId);
+    },
+    recordDocument(jobId, entry) {
+      const artifactId = clip(entry.artifactId, 200);
+      if (!artifactId) return;
+      mutateWorkingSet(jobId, (set) => {
+        const replaced = set.documents.find(doc => doc.artifactId === artifactId || (entry.parentArtifactId && doc.artifactId === entry.parentArtifactId));
+        set.documents = set.documents.filter(doc => doc !== replaced);
+        const title = entry.title ? clip(entry.title, 160) : replaced?.title;
+        set.documents.push({ artifactId, ...(title ? { title } : {}), at: nowIso() });
+        if (set.documents.length > MAX_LIST) set.documents = set.documents.slice(-MAX_LIST);
+      });
+    },
+    recordDriveFile(jobId, entry) {
+      const fileId = clip(entry.fileId, 200);
+      if (!fileId) return;
+      // Only Google's own https file links are kept: a link is opened by the owner's click.
+      const url = typeof entry.url === 'string' && /^https:\/\/(?:docs|drive)\.google\.com\//.test(entry.url) ? clip(entry.url, 500) : undefined;
+      mutateWorkingSet(jobId, (set) => {
+        set.drive = set.drive.filter(file => file.fileId !== fileId);
+        set.drive.push({
+          fileId,
+          ...(entry.name ? { name: clip(entry.name, 160) } : {}),
+          ...(entry.kind ? { kind: clip(entry.kind, 40) } : {}),
+          ...(url ? { url } : {}),
+          at: nowIso(),
+        });
+        if (set.drive.length > MAX_LIST) set.drive = set.drive.slice(-MAX_LIST);
+      });
     },
     recordDataset(jobId, entry) {
       if (!entry.datasetId && !entry.jobId) return;
@@ -1651,6 +1736,12 @@ export function formatChatJobBlock(job: ChatJob, watches: EtlRunWatch[], options
   if (set.dashboards.length) {
     lines.push('Dashboards:', ...set.dashboards.slice(-8).map(dashboard => `- ${dashboard.dashboardId}${dashboard.title ? ` — ${dashboard.title}` : ''}`));
   }
+  if (set.documents.length) {
+    lines.push('Documents (newest version of each; edit with edit_product_document):', ...set.documents.slice(-6).map(doc => `- ${doc.artifactId}${doc.title ? ` — ${clip(doc.title, 120)}` : ''}`));
+  }
+  if (set.drive.length) {
+    lines.push('Google Drive files:', ...set.drive.slice(-6).map(file => `- ${file.fileId}${file.name ? ` — ${clip(file.name, 120)}` : ''}`));
+  }
   if (set.knowledge.length) {
     lines.push('Knowledge used (load again with knowledge_load if the task needs it):', ...set.knowledge.slice(-8).map(entry => `- ${entry.set}/${entry.file}`));
   }
@@ -1766,8 +1857,9 @@ function unwrapEnvelope(value: any): any {
 
 /**
  * Records what a finished tool call produced into the job's working set:
- * downloaded files, Data Room datasets/jobs, and dashboards. Defensive: an
- * unrecognized result shape records nothing.
+ * downloaded and written files, Data Room datasets/jobs, dashboards, BotBoy
+ * documents and Google Drive files (the job history's outputs, job-history.md).
+ * Defensive: an unrecognized result shape records nothing.
  */
 export function recordToolOutcome(store: ChatJobStore, jobId: string, toolName: string, argsJson: string, resultContent: string): void {
   // knowledge_load answers with the fenced file as plain text, so its outcome is read from the fence's opening tag.
@@ -1803,6 +1895,32 @@ export function recordToolOutcome(store: ChatJobStore, jobId: string, toolName: 
     const analyticsJobId = typeof result.jobId === 'string' && /^aj_[a-f0-9]{32}$/.test(result.jobId) ? result.jobId : undefined;
     const title = typeof result.dataset?.title === 'string' ? result.dataset.title : undefined;
     if (datasetId || analyticsJobId) store.recordDataset(jobId, { datasetId, versionId, jobId: analyticsJobId, title });
+    return;
+  }
+  // A file the job wrote or edited in the files workspace is its output (write_file is called once per chunk: one entry).
+  if ((toolName === 'write_file' || toolName === 'edit_file') && typeof result.path === 'string') {
+    store.recordFile(jobId, result.path, undefined, { dataWork: false });
+    return;
+  }
+  // A saved document version; an edit's new version replaces its parent in the list.
+  if ((toolName === 'save_product_document' || toolName === 'edit_product_document')
+    && result.persisted === true && typeof result.artifactId === 'string') {
+    store.recordDocument(jobId, {
+      artifactId: result.artifactId,
+      ...(typeof result.parentArtifactId === 'string' ? { parentArtifactId: result.parentArtifactId } : {}),
+      ...(typeof result.title === 'string' ? { title: result.title } : {}),
+    });
+    return;
+  }
+  // A Drive file the job made (created, uploaded or copied); renames, moves and trash change no output list.
+  if (toolName === 'gdrive_files' && result.ok === true && ['created', 'uploaded', 'copied'].includes(result.status)
+    && typeof result.fileId === 'string') {
+    store.recordDriveFile(jobId, {
+      fileId: result.fileId,
+      ...(typeof result.name === 'string' ? { name: result.name } : {}),
+      ...(typeof result.kind === 'string' ? { kind: result.kind } : {}),
+      ...(typeof result.webViewLink === 'string' ? { url: result.webViewLink } : {}),
+    });
     return;
   }
   // Every dashboard the job changes or refreshes is the job's: the job waits for its refreshes (§12 R1).

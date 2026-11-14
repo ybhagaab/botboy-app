@@ -9,6 +9,8 @@
  * was moved verbatim from routes.ts during the July 2026 router split.
  */
 
+import os from 'node:os';
+import path from 'node:path';
 import { exportFooterSetConfirmed } from '../../core/workplace-chat-tools.js';
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
@@ -113,7 +115,8 @@ import { isSelfHandledReview, reviewDecisionCheck, reviewDecisionOf, reviewState
 import { noteToolCalls } from '../../core/knowledge-taint.js';
 import { KNOWLEDGE_CHANGE_TOOLS, knowledgeChangeIdFromToolResult, knowledgeWriteConfirmed, prepareKnowledgeWriteTurn, withKnowledgeCards } from '../../core/knowledge-turn.js';
 import type { ToolExecutionContext } from '../../core/tool-executor.js';
-import { requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
+import { requireLocalOwnerRead, requireLocalOwnerRequest, requireLocalOwnerUiRequest } from './local-owner.js';
+import { createJobHistory, type JobHistory } from '../../core/job-history.js';
 import { endResponseAtShutdown } from '../../core/shutdown-coordinator.js';
 import { messageWithTransportCodes } from '../../core/transport-errors.js';
 
@@ -1221,7 +1224,8 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     };
   }
 
-  router.get('/chat/jobs', (_req: Request, res: Response) => {
+  router.get('/chat/jobs', (req: Request, res: Response) => {
+    if (!requireLocalOwnerRead(req, res, 'The job list')) return;
     res.set('Cache-Control', 'no-store');
     if (!chatJobs) return res.json({ version: 0, jobs: [], recent: [] });
     res.json({
@@ -1232,7 +1236,35 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
     });
   });
 
+  // The job history page (docs/maps/job-history.md): every job, kept for good, with what it found and what it made. Registered
+  // before /chat/jobs/:id, which would otherwise read "history" as a job id.
+  const jobHistory: JobHistory | null = chatJobs && deps.db ? createJobHistory({
+    db: deps.db,
+    jobs: chatJobs,
+    filesDir: path.join(os.homedir(), '.personal-productivity-tracker', 'files'),
+    phaseOf: jobPhaseOf,
+    modelTitle: modelTitleOf,
+  }) : null;
+  router.get('/chat/jobs/history', (req: Request, res: Response) => {
+    if (!requireLocalOwnerRead(req, res, 'Job history')) return;
+    res.set('Cache-Control', 'no-store');
+    if (!jobHistory) return res.json({ jobs: [], counts: { all: 0, done: 0, stopped: 0 } });
+    const status = req.query.status === 'done' || req.query.status === 'stopped' ? req.query.status : 'all';
+    try {
+      res.json(jobHistory.page({
+        query: typeof req.query.q === 'string' ? req.query.q : '',
+        status,
+        before: typeof req.query.before === 'string' ? req.query.before : '',
+        limit: Number(req.query.limit) || undefined,
+      }));
+    } catch (error) {
+      console.error(`[Jobs] History read failed: ${error instanceof Error ? error.message : String(error)}`);
+      res.status(500).json({ error: 'BotBoy could not read the job history.', nextAction: 'Reload the page. If it keeps failing, check /tmp/ppt.log.' });
+    }
+  });
+
   router.get('/chat/jobs/:id', (req: Request, res: Response) => {
+    if (!requireLocalOwnerRead(req, res, 'A job')) return;
     res.set('Cache-Control', 'no-store');
     if (!chatJobs) return res.status(503).json({ error: 'Jobs are unavailable' });
     const job = chatJobs.get(paramStr(req.params.id));
