@@ -126,11 +126,30 @@ export function createDashboardRouter(
         artifactRowId: number;
         createdAt: string;
       };
-      return [documents.artifactCount, documents.artifactRowId, documents.createdAt].join(':');
+      return [documents.artifactCount, documents.artifactRowId, documents.createdAt, publicationsVersion()].join(':');
     } catch {
       // Product-document migrations may not have created the table yet.
       return '0';
     }
+  }
+
+  /**
+   * Publication receipts and SharePoint lock waits (sharepoint-lock-waits.ts): an open publication card follows a write that
+   * waited for its file, landed or stopped, without a reload.
+   */
+  function publicationsVersion(): string {
+    const read = (sql: string): string => {
+      try {
+        const row = db!.prepare(sql).get() as { n: number; at: string | null } | undefined;
+        return `${row?.n ?? 0}.${row?.at ?? ''}`;
+      } catch {
+        return '0'; // the table does not exist yet in this store
+      }
+    };
+    return [
+      read('SELECT COUNT(*) AS n, MAX(updated_at) AS at FROM product_document_publications'),
+      read('SELECT COUNT(*) AS n, MAX(last_try_at) AS at FROM sharepoint_lock_waits'),
+    ].join('/');
   }
 
   function currentAnalyticsVersion(): string {

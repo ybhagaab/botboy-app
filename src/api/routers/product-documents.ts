@@ -9,6 +9,7 @@ import {
   isPandocInstalled,
   resolveBrewExecutable,
 } from '../../product-manager/document-exporter.js';
+import { getLockWaitStore } from '../../core/sharepoint-lock-waits.js';
 import { exportableContent } from '../../product-manager/citation-markers.js';
 import {
   ProductDocumentGenerationError,
@@ -139,7 +140,7 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
       artifactId: artifact.artifactId,
       ...(artifact.projectId ? { projectId: artifact.projectId } : {}),
       projectStatus: artifact.projectId && deps.db ? project?.status ?? 'missing' : null,
-    }, publications);
+    }, publications, deps.db ? { lockWaitFor: docKey => getLockWaitStore(deps.db!).get(docKey) } : {});
   };
 
   const publicationDestinationDefault = () => deps.db

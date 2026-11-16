@@ -1,4 +1,5 @@
 import type { PendingEdit, PendingEditStatus } from '../core/pending-edits.js';
+import { isNotWrittenError, type LockWait } from '../core/sharepoint-lock-waits.js';
 import type {
   ProductDocumentPublication,
   ProductDocumentPublicationAction,
@@ -14,6 +15,8 @@ export type ProductDocumentPublicationPhase =
   | 'pending'
   | 'approved'
   | 'in_flight'
+  /** The write was refused because someone has the SharePoint file open; BotBoy tries again (sharepoint-lock-waits.ts). */
+  | 'waiting_for_file'
   | 'conflicted'
   | 'failed'
   | 'complete';
@@ -87,6 +90,8 @@ export interface ProductDocumentPublicationAttemptView {
   updatedAt: string;
   effectCertainty: 'none' | 'possible_remote_effect' | 'verified_remote_effect';
   destination?: DriveDestinationView;
+  /** BotBoy is waiting for the SharePoint file to be closed: how long, how many tries, the next one. */
+  lockWait?: LockWait;
 }
 
 export interface ProductDocumentPublicationView {
@@ -122,6 +127,8 @@ function effectCertainty(publication: ProductDocumentPublication): ProductDocume
     || publication.status === 'capture_failed' || publication.status === 'identity_mismatch') {
     return 'verified_remote_effect';
   }
+  // A write SharePoint or Drive did not take (a locked file, a not-written answer) changed nothing remotely.
+  if (publication.status === 'upload_failed' && isNotWrittenError(publication.lastError)) return 'none';
   if (publication.status === 'uploaded_unverified' || publication.status === 'verification_failed'
     || publication.status === 'upload_failed') {
     return 'possible_remote_effect';
@@ -129,7 +136,7 @@ function effectCertainty(publication: ProductDocumentPublication): ProductDocume
   return 'none';
 }
 
-function attemptView(publication: ProductDocumentPublication, pending: PendingEdit | null): ProductDocumentPublicationAttemptView {
+function attemptView(publication: ProductDocumentPublication, pending: PendingEdit | null, lockWait: LockWait | null = null): ProductDocumentPublicationAttemptView {
   return {
     publicationId: publication.publicationId,
     pendingEditId: publication.pendingEditId,
@@ -156,6 +163,7 @@ function attemptView(publication: ProductDocumentPublication, pending: PendingEd
     updatedAt: publication.updatedAt,
     effectCertainty: effectCertainty(publication),
     ...driveDestination(publication),
+    ...(lockWait ? { lockWait } : {}),
   };
 }
 
@@ -192,11 +200,20 @@ function attemptPriority(publication: ProductDocumentPublication, selectedArtifa
  * Raw history remains available separately; this projection never deletes or
  * rewrites receipts and never guesses a physical location from title text.
  */
+export interface PublicationViewOptions {
+  /** The open wait for a SharePoint file that someone has open (sharepoint-lock-waits.ts › LockWaitStore.get). */
+  lockWaitFor?: (docKey: string) => LockWait | null;
+}
 export function buildProductDocumentPublicationView(
   artifact: ArtifactPublicationIdentity,
   publications: ProductDocumentPublication[],
   findPendingEdit: (pendingEditId: string) => PendingEdit | null,
+  options: PublicationViewOptions = {},
 ): ProductDocumentPublicationView {
+  // Only an export still waiting to be written can be waiting for its file.
+  const waitOf = (publication: ProductDocumentPublication) => (publication.status === 'exported' && publication.destinationProvider !== 'gdrive'
+    ? options.lockWaitFor?.(publication.docKey) ?? null
+    : null);
   const ordered = [...publications].sort(newestFirst);
   const locationByDocKey = new Map<string, ProductDocumentPublicationLocationView>();
   for (const publication of ordered) {
@@ -233,7 +250,7 @@ export function buildProductDocumentPublicationView(
     }))
     .filter(entry => entry.priority >= 0)
     .sort((left, right) => right.priority - left.priority || newestFirst(left.publication, right.publication))
-    .map(entry => attemptView(entry.publication, entry.pending));
+    .map(entry => attemptView(entry.publication, entry.pending, waitOf(entry.publication)));
   const attempt = blockers[0] ?? null;
   const attemptPublication = attempt ? ordered.find(publication => publication.publicationId === attempt.publicationId) ?? null : null;
   const attemptPending = attemptPublication ? findPendingEdit(attemptPublication.pendingEditId) : null;
@@ -249,6 +266,7 @@ export function buildProductDocumentPublicationView(
 
   let phase: ProductDocumentPublicationPhase;
   if (projectBlocked) phase = 'blocked_unassigned';
+  else if (attemptPublication && attempt?.lockWait) phase = 'waiting_for_file';
   else if (attemptPublication) phase = phaseForAttempt(attemptPublication, attemptPending);
   else if (currentLocationCount > 0) phase = 'complete';
   else if (updateBases.length === 1) phase = 'update_ready';
@@ -273,10 +291,12 @@ export function buildProductDocumentPublicationView(
 export function buildProductDocumentPublicationViewFromService(
   artifact: ArtifactPublicationIdentity,
   service: ProductDocumentPublicationService,
+  options: PublicationViewOptions = {},
 ): ProductDocumentPublicationView {
   return buildProductDocumentPublicationView(
     artifact,
     service.listByChain(artifact.artifactId),
     pendingEditId => service.findPendingEdit(pendingEditId),
+    options,
   );
 }

@@ -85,4 +85,17 @@ describe('generated-document publication view model', () => {
       phase: 'failed', attempt: { docKey: 'x', publicationStatus: 'verification_failed', pendingStatus: 'conflicted' },
     })).toBe(false);
   });
+
+  // Owner report 2026-11-16: an update refused because reviewers had the file open read "Publication phase recorded", and once
+  // BotBoy stopped retrying the card had no way to write it.
+  it('a write waiting for its file says so and can be tried now; an export never written is never a dead end', () => {
+    expect(publicationPresentation({ phase: 'waiting_for_file' })).toEqual({
+      phase: 'waiting_for_file', label: 'Waiting for the file to close', tone: 'warn', button: 'See the wait',
+      summary: 'Someone has the file open in Word or a browser, so SharePoint refuses the update. BotBoy writes it once the file is closed.',
+    });
+    expect(publicationAttemptCanApply({ phase: 'waiting_for_file', attempt: { docKey: 'x' } })).toBe(true);
+    expect(publicationAttemptCanApply({ phase: 'in_flight', attempt: { docKey: 'x', publicationStatus: 'exported', pendingStatus: 'approved' } })).toBe(true);
+    expect(publicationAttemptCanApply({ phase: 'in_flight', attempt: { docKey: 'x', publicationStatus: 'uploaded_unverified', pendingStatus: 'approved' } })).toBe(false);
+    expect(publicationAttemptCanApply({ phase: 'in_flight', attempt: { docKey: 'x', publicationStatus: 'exported', pendingStatus: 'synced' } })).toBe(false);
+  });
 });

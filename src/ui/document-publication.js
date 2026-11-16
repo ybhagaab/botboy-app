@@ -64,6 +64,12 @@ const PHASE_COPY = Object.freeze({
     button: 'Finish publication',
     tone: 'good',
   }),
+  waiting_for_file: (place) => ({
+    label: 'Waiting for the file to close',
+    summary: `Someone has the file open in Word or a browser, so ${place || 'SharePoint'} refuses the update. BotBoy writes it once the file is closed.`,
+    button: 'See the wait',
+    tone: 'warn',
+  }),
   in_flight: () => ({
     label: 'Publication phase recorded',
     summary: 'A durable receipt exists; refresh to reconcile its current state.',
@@ -185,7 +191,10 @@ export function publicationAttemptCanReject(view) {
 
 export function publicationAttemptCanApply(view) {
   if (!view?.attempt?.docKey) return false;
-  if (view.phase === 'approved') return true;
+  // Waiting for a locked file: the same button tries now.
+  if (view.phase === 'approved' || view.phase === 'waiting_for_file') return true;
+  // An export that was never written (its wait ended, or BotBoy stopped mid-way): the guarded write checks the target first.
+  if (view.phase === 'in_flight' && view.attempt.publicationStatus === 'exported' && view.attempt.pendingStatus === 'approved') return true;
   return view.phase === 'failed'
     && view.attempt.publicationStatus === 'upload_failed'
     && view.attempt.pendingStatus === 'approved';

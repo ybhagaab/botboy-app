@@ -266,7 +266,7 @@ describe('documents router', () => {
       const response = await request(app).post('/api/documents/sync').send({ docKey: DOC_KEY });
       expect(response.status).toBe(202);
       expect(response.body.retrying).toBe(true);
-      expect(response.body.note).toMatch(/retry automatically/);
+      expect(response.body.note).toMatch(/Nothing was written\. BotBoy tries again every 4 minutes for the first hour, then every 15 minutes, for up to 24 hours/);
       // Edit unchanged — still approved, lands when the lock clears.
       expect(response.body.edits[0].status).toBe('approved');
 

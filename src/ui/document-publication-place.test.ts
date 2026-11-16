@@ -22,7 +22,7 @@ function constLine(name: string): string {
 
 function panel(input: { amazon: boolean; drive: boolean; view: any; artifact?: any; draft?: any }): string {
   const source = [
-    constLine('providerPlace'), topLevel('publicationAvailability'), topLevel('renderDocumentPublicationPanel'),
+    constLine('providerPlace'), topLevel('publicationAvailability'), topLevel('lockWaitClock'), topLevel('lockWaitText'), topLevel('renderDocumentPublicationPanel'),
     'return renderDocumentPublicationPanel;',
   ].join('\n');
   // eslint-disable-next-line no-new-func
@@ -125,5 +125,49 @@ describe('the reader\'s publication drawer', () => {
     expect(project.match(/data-provider="\$\{attr\(creation\.destinationProvider \|\| ''\)\}"/g)).toHaveLength(4);
     const server = readFileSync(path.join(process.cwd(), 'src/api/routers/documents.ts'), 'utf8');
     expect(server).toContain('destinationProvider: publication.destinationProvider,');
+  });
+});
+
+// Owner report 2026-11-16: reviewers had the PRD open; the card said "Publication phase recorded" with only Refresh status.
+describe('a publication waiting for its SharePoint file to be closed', () => {
+  const now = new Date();
+  const at = (minutes: number) => new Date(now.getTime() + minutes * 60_000).toISOString();
+  const attempt = {
+    action: 'update_existing', pendingEditId: 'pe1', docKey: 'amazon-my.sharepoint.com/personal/u/Documents/PRD.docx', publicationStatus: 'exported',
+    pendingStatus: 'approved', effectCertainty: 'none', artifactId: 'art_1', format: 'docx', serverRelativeUrl: '/personal/u/Documents/PRD.docx',
+  };
+  it('says why, what BotBoy does and until when, that nothing was written, and offers Try now and Stop waiting', () => {
+    const html = panel({ amazon: true, drive: false, view: {
+      phase: 'waiting_for_file', completedLocations: [sharePointCopy], updateBases: [], currentLocationCount: 0,
+      attempt: { ...attempt, lockWait: { tries: 11, startedAt: at(-42), lastTryAt: at(-1), nextTryAt: at(3), endsAt: at(24 * 60 - 42) } },
+    } });
+    expect(html).toContain('<strong id="document-publication-summary-label">Waiting for the file to close</strong>');
+    expect(html).toContain('>Waiting for the file to close</span>');
+    expect(html).toContain('Someone has this file open in Word or a browser, so SharePoint refuses changes until everyone closes it (and for up to 10 minutes after). Nothing was written. BotBoy has tried 11 times since ');
+    expect(html).toMatch(/; next try at \d{1,2}:\d\d(?:\s?[AP]M)?\. It keeps trying until \w{3} \d{1,2}:\d\d(?:\s?[AP]M)? and tells you in chat how it ends\./);
+    expect(html).toContain('No SharePoint write has occurred for this attempt.');
+    expect(html).toContain('data-action="documents-publication-sync"');
+    expect(html).toContain('>Try now</button>');
+    expect(html).toContain('data-action="documents-publication-stop-wait" data-dockey="amazon-my.sharepoint.com/personal/u/Documents/PRD.docx"');
+    expect(html).not.toContain('Refresh status');
+  });
+  it('words a wait whose times are missing without empty gaps', () => {
+    const source = [topLevel('lockWaitClock'), topLevel('lockWaitText'), 'return lockWaitText;'].join('\n');
+    // eslint-disable-next-line no-new-func
+    const text = new Function(source)() as (wait: any) => string;
+    expect(text({ retrying: true, attempts: 18 })).toBe('Someone has this file open in Word or a browser, so SharePoint refuses changes until everyone closes it (and for up to 10 minutes after). Nothing was written. BotBoy has tried 18 times. It keeps trying and writes the change once the file is closed.');
+  });
+  it('after the wait ends without the write, the card says nothing was written and offers the update again', () => {
+    const html = panel({ amazon: true, drive: false, view: {
+      phase: 'failed', completedLocations: [sharePointCopy], updateBases: [], currentLocationCount: 0,
+      attempt: { ...attempt, publicationStatus: 'upload_failed', lastError: 'Not written: you stopped waiting for the file to be closed (11 tries since 18:17). Nothing changed in SharePoint.' },
+    } });
+    expect(html).toContain('Not written: you stopped waiting for the file to be closed');
+    expect(html).toContain('No SharePoint write has occurred for this attempt.');
+    expect(html).toContain('>Update SharePoint version</button>');
+    // An export never written with no wait open (BotBoy stopped mid-way) is not a dead end either.
+    const stranded = panel({ amazon: true, drive: false, view: { phase: 'in_flight', completedLocations: [sharePointCopy], updateBases: [], currentLocationCount: 0, attempt } });
+    expect(stranded).toContain('>Update SharePoint version</button>');
+    expect(stranded).not.toContain('Refresh status');
   });
 });

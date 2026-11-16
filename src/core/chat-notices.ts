@@ -13,7 +13,7 @@ import { sanitizeCaptureReason } from './capture-health.js';
 import { redactSensitiveText } from './prompt-redaction.js';
 
 /** Which story a notice belongs to: consecutive notices of one topic fold into one bubble in the panel. */
-export type ChatNoticeTopic = 'midway' | 'connection' | 'terminal' | 'startup' | 'dashboard-refresh';
+export type ChatNoticeTopic = 'midway' | 'connection' | 'terminal' | 'startup' | 'dashboard-refresh' | 'sharepoint-write';
 export type ChatNoticeState = 'open' | 'resolved' | 'info';
 export type ChatNoticeSeverity = 'error' | 'warning' | 'info' | 'success';
 /** What the notice's one button does. Only code-owned kinds; the panel maps each to a fixed owner control. */
@@ -48,7 +48,7 @@ export interface ChatNotice {
 
 export type ChatNoticeInput = Omit<ChatNotice, 'v' | 'labels' | 'key'> & { labels?: string[]; key?: string };
 
-const TOPICS: ReadonlySet<string> = new Set(['midway', 'connection', 'terminal', 'startup', 'dashboard-refresh']);
+const TOPICS: ReadonlySet<string> = new Set(['midway', 'connection', 'terminal', 'startup', 'dashboard-refresh', 'sharepoint-write']);
 const STATES: ReadonlySet<string> = new Set(['open', 'resolved', 'info']);
 const SEVERITIES: ReadonlySet<string> = new Set(['error', 'warning', 'info', 'success']);
 const ACTIONS: ReadonlySet<string> = new Set(['midway_reauth', 'open_route']);

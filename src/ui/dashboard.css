@@ -1723,6 +1723,9 @@ html[data-document-transition="library"]::view-transition-new(botboy-document-li
 .document-publication-snapshot strong { color:var(--muted); font-size:8.5px; text-transform:uppercase; letter-spacing:.05em; }
 .document-publication-snapshot small,.document-publication-snapshot code,.document-publication-snapshot time { min-width:0; color:var(--soft); background:transparent; font-size:9.5px; overflow-wrap:anywhere; }
 .document-publication-alert { display:flex; align-items:flex-start; gap:8px; padding:9px 10px; border:1px solid color-mix(in srgb,var(--yellow) 30%,var(--border)); border-radius:9px; color:var(--yellow); background:color-mix(in srgb,var(--yellow) 7%,var(--surface)); font-size:10px; line-height:1.45; }
+/* Waiting for a SharePoint file to be closed: the amber frame of an alert, body text in the normal ink (a long sentence). */
+.document-publication-wait { color:var(--text); font-size:11px; }
+.document-publication-wait svg { color:var(--yellow); flex:0 0 auto; margin-top:1px; }
 .document-publication-certainty { margin:0; color:var(--muted); font-size:9.5px; line-height:1.4; }
 .document-publication-actions { display:flex; align-items:center; flex-wrap:wrap; gap:7px; margin-top:2px; }
 .document-publication-empty { display:flex; align-items:flex-start; gap:10px; padding:12px; border:1px dashed var(--border-strong); border-radius:10px; color:var(--muted); }

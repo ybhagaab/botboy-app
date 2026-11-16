@@ -48,6 +48,15 @@ import { createHash, randomUUID } from 'crypto';
 import { exportDocument } from '../../product-manager/document-exporter.js';
 import { exportableContent } from '../../product-manager/citation-markers.js';
 import {
+  NOT_WRITTEN_PREFIX,
+  createLockWaitRunner,
+  getLockWaitStore,
+  lockWaitNotice,
+  type LockWait,
+  type LockWaitEnd,
+} from '../../core/sharepoint-lock-waits.js';
+import { postChatNotice } from '../../core/chat-notices.js';
+import {
   publicationRemoteReceipt,
   sha256Buffer,
   type PublicationRemoteSnapshot,
@@ -81,6 +90,15 @@ function persistPublicationExport(publicationId: string, sha256: string, filenam
   fs.renameSync(temp, file);
 }
 
+/** "14:05" in the Mac's local time, for the words about a lock wait. */
+function lockClock(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+}
+function fileNameOfDocKey(docKey: string): string {
+  const last = docKey.split('/').pop() || docKey;
+  try { return decodeURIComponent(last).slice(0, 80); } catch { return last.slice(0, 80); }
+}
 function isDriveDocKey(docKey: string): boolean {
   return docKey.startsWith('gdrive://');
 }
@@ -190,11 +208,8 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       // Edit-mode optimistic-concurrency token (E2): sha of the content the
       // reader shows; edit-save echoes it and 409s when the base moved.
       contentSha256: createHash('sha256').update(String(view.content ?? ''), 'utf8').digest('hex'),
-      // Lock-retry state (declared below; closures evaluate at request time).
-      syncRetry: (() => {
-        const entry = lockRetries.get(docKey);
-        return entry ? { retrying: true, attempts: entry.attempts, startedAt: entry.startedAt } : null;
-      })(),
+      // Lock-wait state (sharepoint-lock-waits.ts; the reader's banner).
+      syncRetry: lockWaitPayload(docKey),
     });
   });
 
@@ -923,6 +938,16 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
             filename: currentPublication.exportFilename,
             mediaType: publication.format === 'md' ? 'text/markdown' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
           };
+          // Trying again after a write that did not land (a locked file, a refused upload): the checks above just proved the
+          // target is still the approved snapshot (or still absent), so the earlier try changed nothing and the receipt goes
+          // back to exported before this write (recordUploaded follows exported only).
+          if (currentPublication.status === 'upload_failed') {
+            deps.productDocumentPublications?.recordExport(publication.publicationId, {
+              sha256: currentPublication.exportSha256!,
+              bytes: cached.length,
+              filename: currentPublication.exportFilename,
+            }, undefined, { noRemoteEffectProven: true });
+          }
         } else {
           canonicalExport = await exportDocument({
             title: sourceArtifact.title,
@@ -1298,7 +1323,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
       if (!remoteItemId) {
         const outcome = await plug.write({ target, bytes: exported.data, filename: exported.filename, idempotencyKey, publicationId: publication.publicationId });
         if (outcome.kind === 'not_written') {
-          publications.recordFailure(publication.publicationId, 'upload_failed', `Not written: ${outcome.reason}`);
+          publications.recordFailure(publication.publicationId, 'upload_failed', `${NOT_WRITTEN_PREFIX}${outcome.reason}`);
           return { status: 'failed', error: `Google Drive did not take the upload (safe to Sync again): ${outcome.reason}` };
         }
         if (outcome.kind === 'unknown') {
@@ -1514,50 +1539,88 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     }
   });
 
-  // ── Lock retry (soak find #2, 2026-08-25) ────────────────────────────────
-  // SharePoint refuses whole-file uploads while ANYONE has an editing
-  // session on the doc (Word or browser co-authoring) and holds the lock up
-  // to ~10 min after the last close. Docs under active team review are
-  // therefore locked for hours — bouncing the owner is useless. A locked
-  // sync self-retries in the background and lands the moment the document
-  // goes quiet. In-memory (a restart drops the timer; edits stay approved
-  // and the owner can re-press Sync).
-  // Env override exists for tests (real chain, millisecond interval).
-  const LOCK_RETRY_INTERVAL_MS = (() => {
-    const override = parseInt(process.env.PPT_LOCK_RETRY_INTERVAL_MS || '', 10);
-    return Number.isFinite(override) && override > 0 ? override : 4 * 60_000;
-  })();
-  const LOCK_RETRY_MAX_ATTEMPTS = 30; // ~2 hours of coverage
-  const lockRetries = new Map<string, { attempts: number; startedAt: string; timer: NodeJS.Timeout }>();
+  // ── Lock waits (soak find #2 2026-08-25; durable since 2026-11-16) ──────
+  // SharePoint refuses whole-file uploads while ANYONE has an editing session
+  // on the doc (Word or browser co-authoring) and holds the lock up to ~10 min
+  // after the last close, so docs under team review stay locked for hours.
+  // A refused write waits in `sharepoint_lock_waits` (sharepoint-lock-waits.ts):
+  // tried again every 4 min for an hour, then every 15 min, up to 24 h, across
+  // restarts; one write per document at a time; how it ended reaches the
+  // publication card and, when it ended by itself, a chat notice.
+  const lockWaits = deps.db ? getLockWaitStore(deps.db) : null;
+  const lockRunner = lockWaits ? createLockWaitRunner({
+    store: lockWaits,
+    sync: runDocumentSync,
+    onEnd: lockWaitEnded,
+    isShuttingDown: () => deps.shutdown?.isShuttingDown() === true,
+    resumeDelayMs: (() => {
+      const override = parseInt(process.env.PPT_LOCK_RESUME_DELAY_MS || '', 10);
+      return Number.isFinite(override) && override >= 0 ? override : 90_000;
+    })(),
+  }) : null;
+  lockRunner?.resume();
 
-  function scheduleLockRetry(docKey: string, attempts: number): void {
-    const existing = lockRetries.get(docKey);
-    if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => { void retryTick(docKey); }, LOCK_RETRY_INTERVAL_MS);
-    timer.unref?.();
-    lockRetries.set(docKey, { attempts, startedAt: existing?.startedAt ?? new Date().toISOString(), timer });
+  /** The open wait, as the reader banner, the publication card and `GET /documents/sync-retry` show it. */
+  function lockWaitPayload(docKey: string) {
+    const wait = docKey && lockWaits ? lockWaits.get(docKey) : null;
+    return wait
+      ? { retrying: true, attempts: wait.tries, tries: wait.tries, startedAt: wait.startedAt, lastTryAt: wait.lastTryAt, nextTryAt: wait.nextTryAt, endsAt: wait.endsAt, writing: lockRunner?.isBusy(docKey) ?? false }
+      : null;
   }
 
-  async function retryTick(docKey: string): Promise<void> {
-    const entry = lockRetries.get(docKey);
-    if (!entry) return;
+  /** The publication a document's approved creation belongs to, while its export waits to be written. */
+  function waitingPublicationOf(docKey: string): ProductDocumentPublication | null {
+    if (!deps.db || !deps.productDocumentPublications) return null;
+    const creation = listPendingEdits(deps.db, docKey).find(edit => edit.operation === 'createDocument' && edit.status === 'approved');
+    const publication = creation ? deps.productDocumentPublications.findByPendingEdit(creation.id) : null;
+    return publication && publication.destinationProvider !== 'gdrive' ? publication : null;
+  }
+
+  /** A wait ended without the write landing: the card says nothing was written and offers the write again. */
+  function markNotWritten(docKey: string, reason: string): void {
+    const publication = waitingPublicationOf(docKey);
+    if (publication?.status !== 'exported') return;
     try {
-      const outcome = await runDocumentSync(docKey);
-      if (outcome.status === 'locked' && entry.attempts + 1 < LOCK_RETRY_MAX_ATTEMPTS) {
-        scheduleLockRetry(docKey, entry.attempts + 1);
-        return;
-      }
-      lockRetries.delete(docKey);
-      if (outcome.status === 'done') {
-        console.log(`[Documents] lock-retry sync landed for ${docKey} after ${entry.attempts + 1} attempt(s)`);
-      } else if (outcome.status === 'locked') {
-        console.warn(`[Documents] lock-retry gave up for ${docKey} after ${LOCK_RETRY_MAX_ATTEMPTS} attempts — edits stay approved`);
-      }
+      deps.productDocumentPublications!.recordFailure(publication.publicationId, 'upload_failed', `${NOT_WRITTEN_PREFIX}${reason}`);
     } catch (error) {
-      lockRetries.delete(docKey);
-      console.warn(`[Documents] lock-retry failed for ${docKey}: ${(error as Error).message}`);
+      console.warn(`[Documents] could not record the ended wait for ${docKey}: ${(error as Error).message}`);
     }
   }
+
+  function lockWaitEnded(docKey: string, wait: LockWait, end: LockWaitEnd): void {
+    const span = `${wait.tries} ${wait.tries === 1 ? 'try' : 'tries'} since ${lockClock(wait.startedAt)}`;
+    if (end.kind === 'gave_up') markNotWritten(docKey, `the file stayed open in Word or a browser for 24 hours, so SharePoint refused every write (${span}). Nothing changed in SharePoint.`);
+    else if (end.kind === 'stopped') markNotWritten(docKey, `you stopped waiting for the file to be closed (${span}). Nothing changed in SharePoint.`);
+    else if (end.kind === 'failed' && !end.effectUnknown) markNotWritten(docKey, end.error);
+    console.log(`[Documents] lock wait for ${docKey} ended: ${end.kind} after ${span}`);
+    if (!deps.db) return;
+    // A publication's notice opens its BotBoy document (its card has the buttons); reader edits open the SharePoint file's reader.
+    const artifactId = publicationArtifactOf(docKey);
+    const readerRoute = `#/doc/${Buffer.from(docKey, 'utf8').toString('base64url')}`;
+    const notice = lockWaitNotice({
+      docKey,
+      fileName: fileNameOfDocKey(docKey),
+      wait,
+      end,
+      publication: Boolean(artifactId),
+      route: artifactId ? `#/documents/${artifactId}` : readerRoute.length <= 200 ? readerRoute : null,
+      clock: lockClock,
+      nowIso: new Date().toISOString(),
+    });
+    if (notice) postChatNotice(deps.db, notice);
+  }
+
+  /** The BotBoy document whose publication waited on this file, if any (the newest attempt). */
+  function publicationArtifactOf(docKey: string): string | null {
+    try {
+      const row = deps.db!.prepare('SELECT artifact_id FROM product_document_publications WHERE doc_key = ? ORDER BY updated_at DESC LIMIT 1').get(docKey) as { artifact_id: string } | undefined;
+      return row?.artifact_id ?? null;
+    } catch {
+      return null; // no publications table in this store
+    }
+  }
+
+  const LOCKED_NOTE = 'Someone has this file open in Word or a browser, and SharePoint refuses changes until everyone closes it (and for up to 10 minutes after). Nothing was written. BotBoy tries again every 4 minutes for the first hour, then every 15 minutes, for up to 24 hours, and writes the approved version the moment the file is free.';
 
   router.post('/documents/sync', async (req: Request, res: Response) => {
     if (!deps.db) return res.status(503).json({ error: 'database unavailable' });
@@ -1568,20 +1631,23 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
     // The final Drive write is the owner's explicit Sync in the rendered UI.
     if (isDriveDocKey(docKey) && !requireLocalOwnerUiRequest(req, res, 'Syncing to Google Drive', 'Use Sync on the publication card.')) return;
 
-    const outcome = await runDocumentSync(docKey);
+    const { outcome, wait } = lockRunner ? await lockRunner.syncNow(docKey) : { outcome: await runDocumentSync(docKey), wait: null };
+    if (outcome.status === 'busy') {
+      return res.status(409).json({ code: 'sync_running', error: 'BotBoy is writing this document right now. Check again in a minute.', ...(wait ? { wait } : {}) });
+    }
     if (outcome.status === 'nothing-approved') return res.status(400).json({ error: 'no approved edits to sync' });
     if (outcome.status === 'failed') return res.status(502).json({ error: outcome.error });
     if (outcome.status === 'locked') {
-      scheduleLockRetry(docKey, 0);
-      return res.status(202).json({
-        retrying: true,
-        note: 'Someone has the document open in Word or a browser (SharePoint holds an editing lock, and keeps it up to ~10 minutes after the last person closes). BotBoy will retry automatically every few minutes for the next 2 hours and publish the approved edits the moment the document is free — nothing else to do.',
-        edits: listPendingEdits(deps.db, docKey),
-      });
+      if (!wait) {
+        return res.status(409).json({
+          code: 'file_locked',
+          error: 'The file is still open in Word or a browser, and BotBoy has waited 24 hours, so it stopped trying. Nothing was written. Press it again once the file is closed.',
+          edits: listPendingEdits(deps.db, docKey),
+        });
+      }
+      return res.status(202).json({ retrying: true, note: LOCKED_NOTE, wait, edits: listPendingEdits(deps.db, docKey) });
     }
 
-    const existingRetry = lockRetries.get(docKey);
-    if (existingRetry) { clearTimeout(existingRetry.timer); lockRetries.delete(docKey); }
     res.json({
       uploaded: outcome.uploaded,
       alreadyCurrent: outcome.alreadyCurrent ?? false,
@@ -1598,10 +1664,20 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
 
   router.get('/documents/sync-retry', (req: Request, res: Response) => {
     const docKey = String(req.query.docKey ?? '').trim();
-    const entry = docKey ? lockRetries.get(docKey) : undefined;
-    res.json(entry ? { retrying: true, attempts: entry.attempts, startedAt: entry.startedAt } : { retrying: false });
+    res.json(lockWaitPayload(docKey) ?? { retrying: false });
   });
 
+  // The owner stops waiting for a locked file (the publication card's Stop): nothing is written; the card offers the write again.
+  router.post('/documents/sync-retry/stop', (req: Request, res: Response) => {
+    if (!requireLocalOwnerUiRequest(req, res, 'Stopping the wait for a SharePoint file', 'Use Stop on the publication card.')) return;
+    const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};
+    const docKey = String(body.docKey ?? '').trim();
+    if (!docKey) return res.status(400).json({ error: 'docKey required' });
+    const stopped = lockRunner?.stop(docKey) ?? null;
+    res.json(stopped
+      ? { stopped: true, wait: stopped, note: 'Stopped waiting. Nothing was written to SharePoint; the approved version stays ready to write.' }
+      : { stopped: false, note: 'BotBoy was not waiting for this file.' });
+  });
   router.post('/documents/refresh', async (req: Request, res: Response) => {
     if (!deps.sharePointSync) return res.status(503).json({ error: 'document sync unavailable' });
     const body = req.body && typeof req.body === 'object' ? req.body as Record<string, unknown> : {};

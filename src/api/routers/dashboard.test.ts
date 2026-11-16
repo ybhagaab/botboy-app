@@ -143,3 +143,37 @@ describe('dashboard browser capture version', () => {
     expect(await versionOf(() => { throw new Error('boom'); })).not.toHaveProperty('browserCaptureVersion');
   });
 });
+describe('dashboard documents version', () => {
+  // An open publication card follows a write that waits for its SharePoint file, lands, or stops (2026-11-16).
+  it('changes when a publication receipt moves or a SharePoint lock wait counts a try or ends', async () => {
+    const storage = createStorage(':memory:');
+    storage.initialize();
+    try {
+      const db = storage.getDb();
+      db.exec(`CREATE TABLE product_document_artifacts (artifact_id TEXT PRIMARY KEY, created_at TEXT);
+        CREATE TABLE product_document_publications (publication_id TEXT PRIMARY KEY, updated_at TEXT);
+        INSERT INTO product_document_artifacts VALUES ('a1', '2026-11-16T09:00:00Z');
+        INSERT INTO product_document_publications VALUES ('p1', '2026-11-16T10:17:00Z');`);
+      const { createLockWaitStore } = await import('../../core/sharepoint-lock-waits.js');
+      const waits = createLockWaitStore(db);
+      const app = express();
+      app.use('/api', createDashboardRouter(createDashboardState(), db));
+      const version = async () => (await request(app).get('/api/dashboard/version')).body.documentsVersion as string;
+      const first = await version();
+      expect(await version()).toBe(first);
+      db.prepare("UPDATE product_document_publications SET updated_at = '2026-11-16T10:17:05Z'").run();
+      const moved = await version();
+      expect(moved).not.toBe(first);
+      waits.noteRefused('doc', Date.parse('2026-11-16T10:17:05Z'));
+      const waiting = await version();
+      expect(waiting).not.toBe(moved);
+      waits.noteRefused('doc', Date.parse('2026-11-16T10:21:05Z'));
+      const counted = await version();
+      expect(counted).not.toBe(waiting);
+      waits.end('doc');
+      expect(await version()).not.toBe(counted);
+    } finally {
+      storage.close();
+    }
+  });
+});

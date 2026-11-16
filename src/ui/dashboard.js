@@ -2162,7 +2162,7 @@ function pendingEditsSection(data, docKey, syncing) {
   // Background lock-retry active: the doc was locked (a teammate's editing
   // session) when Sync ran; the server keeps retrying until it frees up.
   const retryBanner = data.syncRetry?.retrying
-    ? `<div class="pill blue" style="margin-bottom:10px; display:inline-flex; align-items:center; gap:6px;">${icon('refresh', 12)} Document locked by an active editing session — auto-retrying sync (attempt ${Number(data.syncRetry.attempts) + 1}, since ${esc(relativeTime(data.syncRetry.startedAt))}). Approved edits publish when it frees up.</div>`
+    ? `<div class="pill blue" style="margin-bottom:10px; display:inline-flex; align-items:center; gap:6px;">${icon('refresh', 12)} ${esc(lockWaitText(data.syncRetry))}</div>`
     : '';
   // Propose-a-change form retired (E2/D9): Edit mode and selection-assist
   // replaced it. The lane remains the review/audit surface.
@@ -7369,6 +7369,25 @@ function documentArtifactFromPayload(payload, expectedArtifactId) {
   };
 }
 
+/** "14:05", or "Tue 14:05" on another day (local time). */
+function lockWaitClock(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return date.toDateString() === new Date().toDateString() ? time : `${date.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+}
+/** The words for a write that waits for its SharePoint file to be closed (sharepoint-lock-waits.ts). */
+function lockWaitText(wait) {
+  const tries = Number(wait.tries ?? wait.attempts) || 1;
+  const since = lockWaitClock(wait.startedAt);
+  const next = lockWaitClock(wait.nextTryAt);
+  const until = lockWaitClock(wait.endsAt);
+  return `Someone has this file open in Word or a browser, so SharePoint refuses changes until everyone closes it (and for up to 10 minutes after). `
+    + `Nothing was written. BotBoy has tried ${tries} ${tries === 1 ? 'time' : 'times'}${since ? ` since ${since}` : ''}`
+    + `${wait.writing ? ' and is trying now' : next ? `; next try at ${next}` : ''}.`
+    + `${until ? ` It keeps trying until ${until} and tells you in chat how it ends.` : ' It keeps trying and writes the change once the file is closed.'}`;
+}
+
 function documentStateLabel(value) {
   const normalized = String(value || 'unknown').replaceAll('_', ' ').trim().toLowerCase();
   return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : 'Unknown';
@@ -7929,6 +7948,10 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     let actions = '';
     if (view.phase === 'blocked_unassigned') {
       actions = '';
+    } else if (view.phase === 'waiting_for_file') {
+      // Someone has the SharePoint file open (sharepoint-lock-waits.ts): try now, or stop waiting (nothing is written either way
+      // until SharePoint takes the write).
+      actions = `<button class="button primary" type="button" data-action="documents-publication-sync" data-dockey="${attr(attempt.docKey)}" ${busy ? 'disabled' : ''}>${busy ? 'Trying…' : 'Try now'}</button><button class="button ghost" type="button" data-action="documents-publication-stop-wait" data-dockey="${attr(attempt.docKey)}" ${busy ? 'disabled' : ''}>Stop waiting</button>`;
     } else if (view.phase === 'pending') {
       actions = `<button class="button primary" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="approve" ${busy ? 'disabled' : ''}>${busy ? (place === SHAREPOINT ? 'Checking SharePoint…' : 'Approving…') : 'Approve'}</button><button class="button ghost" type="button" data-action="documents-publication-decide" data-id="${attr(attempt.pendingEditId)}" data-decision="reject" ${busy ? 'disabled' : ''}>Reject</button>`;
     } else if (attempt.destination?.effectUnknown) {
@@ -7940,7 +7963,9 @@ function renderDocumentPublicationPanel(artifact, view, documents) {
     } else {
       actions = `<button class="button ghost" type="button" data-action="documents-publication-refresh" ${busy ? 'disabled' : ''}>Refresh status</button>`;
     }
-    body = `<div class="document-publication-attempt"><div class="document-publication-effect"><span class="pill${toneClass}">${esc(statusCopy)}</span><strong>${attempt.destination ? (isUpdate ? 'Update Google Drive file' : 'Create Google Drive copy') : isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy'}</strong>${pathLine(attempt.serverRelativeUrl)}<small>Official artifact ${esc(String(attempt.artifactId).slice(0, 12))}… · ${String(attempt.format || '').toUpperCase()}</small></div>${snapshot}${error ? `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}<p class="document-publication-certainty">${esc(effectNote)}</p><div class="document-publication-actions">${actions}</div></div>`;
+    const wait = view.phase === 'waiting_for_file' ? attempt.lockWait : null;
+    const waitNote = wait ? `<div class="document-publication-alert document-publication-wait" role="status">${icon('refresh', 14)}<span>${esc(lockWaitText(wait))}</span></div>` : '';
+    body = `<div class="document-publication-attempt"><div class="document-publication-effect"><span class="pill${toneClass}">${esc(wait ? 'Waiting for the file to close' : statusCopy)}</span><strong>${attempt.destination ? (isUpdate ? 'Update Google Drive file' : 'Create Google Drive copy') : isUpdate ? 'Update existing SharePoint version' : 'Create new SharePoint copy'}</strong>${pathLine(attempt.serverRelativeUrl)}<small>Official artifact ${esc(String(attempt.artifactId).slice(0, 12))}… · ${String(attempt.format || '').toUpperCase()}</small></div>${snapshot}${waitNote}${error ? `<div class="document-publication-alert" role="alert">${icon('alert', 14)}<span>${esc(error)}</span></div>` : ''}<p class="document-publication-certainty">${esc(effectNote)}</p><div class="document-publication-actions">${actions}</div></div>`;
   } else if (view.phase === 'blocked_unassigned') {
     body = `<div class="document-publication-empty">${icon('folder', 20)}<div><strong>Publication unavailable</strong><p>${esc(view.blockReason || 'Assign this document chain to an active or paused project before publishing it.')}</p></div></div>`;
   } else {
@@ -9838,6 +9863,20 @@ function bindEvents() {
       const artifactId = state.route.artifactId || '';
       void loadDocument(artifactId, { force: true });
     }
+    if (action === 'documents-publication-stop-wait') {
+      const artifactId = state.route.artifactId || '';
+      const projectId = state.documents.details.get(artifactId)?.projectId || '';
+      const docKey = target.dataset.dockey || '';
+      void (async () => {
+        try {
+          const payload = await request('/documents/sync-retry/stop', { method: 'POST', body: { docKey } });
+          toast(payload.note || 'Stopped waiting. Nothing was written to SharePoint.');
+        } catch (error) {
+          toast(`Stop waiting: ${error.message}`, 'bad');
+        }
+        await refreshDocumentPublicationSurfaces(artifactId, projectId);
+      })();
+    }
     if (action === 'documents-toggle-library') {
       if (!state.route.artifactId) return;
       const isMobile = typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 820px)').matches;
@@ -10856,6 +10895,12 @@ async function pollVersion() {
         state.lastDocumentsVersion = previousDocumentsVersion;
       } else if (state.route.view === 'documents') {
         await loadDocuments({ force: true, renderAfter: false });
+        // An open document whose publication is writing or waiting for its SharePoint file follows it (lock waits).
+        const openArtifactId = state.route.artifactId || '';
+        const openPhase = openArtifactId ? state.documents.details.get(openArtifactId)?.publicationState?.phase : '';
+        if (openPhase === 'waiting_for_file' || openPhase === 'in_flight') {
+          await loadDocument(openArtifactId, { force: true, renderAfter: false });
+        }
         if (state.documents.error) {
           // Structured retry: keep the old tracker until a later poll proves
           // that the newly-versioned library was loaded successfully.
