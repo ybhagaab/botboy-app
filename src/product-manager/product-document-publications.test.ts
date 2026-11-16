@@ -55,6 +55,29 @@ describe('product-document publication ledger', () => {
     return { artifact, store, publications, db: storage.getDb() };
   }
 
+  // Owner report 2026-11-16: publishing the Walk the Store pack (15 pictures) to SharePoint failed at staging with the old
+  // builder's "images are not supported in created documents (v1)", though the Word export embeds pictures.
+  it('a document with pictures stages as Word for SharePoint or Drive; a Markdown copy refuses with the way out', () => {
+    const { artifact, store, publications, db } = fixture();
+    const pictured = { ...artifact, artifactId: 'artifact-pictured', content: '# Catalog strategy\n\nThe first open, step by step.\n\n![Notification request: MX bottom sheet](/api/files/walk-the-store/screens/s02.jpg)\n\nMost users allow it.' } as ProductDocumentArtifact;
+    store.save(pictured);
+    const word = publications.stage({
+      artifactId: pictured.artifactId, projectId: 'p1', action: 'create', format: 'docx', title: pictured.title,
+      targetFolder: '/personal/u_amazon_com/Documents/Published',
+    });
+    expect(word.publication).toMatchObject({ status: 'staged', serverRelativeUrl: '/personal/u_amazon_com/Documents/Published/Catalog strategy.docx' });
+    expect(listPendingEdits(db, word.publication.docKey)[0]).toMatchObject({ id: word.pendingEdit.id, status: 'pending' });
+    const drive = publications.stage({
+      artifactId: pictured.artifactId, projectId: 'p1', action: 'create', format: 'docx', title: pictured.title,
+      destination: { provider: 'gdrive', accountId: 'default', folderId: 'botboy', storedAs: 'docx' },
+    });
+    expect(drive.publication).toMatchObject({ status: 'staged', destinationProvider: 'gdrive' });
+    expect(() => publications.stage({
+      artifactId: pictured.artifactId, projectId: 'p1', action: 'create', format: 'md', title: pictured.title,
+      targetFolder: '/personal/u_amazon_com/Documents/Published',
+    })).toThrow('This document has pictures, and a Markdown (.md) copy cannot carry them. Publish it as Word (.docx), which embeds them.');
+  });
+
   it('stages exact artifact lineage and advances only through receipt-backed states', () => {
     const { artifact, publications, db } = fixture();
     const staged = publications.stage({

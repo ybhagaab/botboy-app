@@ -55,6 +55,12 @@ export interface CreatePendingEditInput {
   originNote?: string;
   /** Internal publication-only waiver: the exact existing target is bound by a typed publication receipt. */
   allowExistingTarget?: boolean;
+  /**
+   * Internal publication-only: the uploaded bytes come from the canonical exporter (document-exporter.ts), which embeds
+   * pictures and diagrams, never from `buildDocxFromMarkdown`, so that builder's picture limit does not apply
+   * (product-document-publications.ts › stage; owner report 2026-11-16).
+   */
+  canonicalExport?: boolean;
 }
 
 const TABLE_SCHEMA = `(
@@ -175,7 +181,7 @@ export function createPendingEdit(db: Database.Database, input: CreatePendingEdi
     }
     const content = String(input.createContent ?? '');
     if (content.trim().length < 30) throw new Error('createContent must be at least 30 characters of real content');
-    if (/!\[[^\]]*\]\(/.test(content)) {
+    if (!input.canonicalExport && /!\[[^\]]*\]\(/.test(content)) {
       throw new Error('images are not supported in created documents (v1) — remove image references or link to them as URLs');
     }
     // The corpus must not already know this document — creation would

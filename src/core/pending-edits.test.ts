@@ -89,6 +89,9 @@ describe('createDocument staging', () => {
       .toThrow(/at least 30 characters/);
     expect(() => createPendingEdit(db, { ...creation, createContent: 'A plan with an embedded image reference ![diagram](local.png) inside.' }))
       .toThrow(/images are not supported/);
+    // An official publication's bytes come from the canonical exporter, which embeds pictures: no builder limit.
+    expect(createPendingEdit(db, { ...creation, docKey: 'sp:pictured', serverRelativeUrl: '/x/pictured.docx', canonicalExport: true, createContent: 'A plan with an embedded image reference ![diagram](local.png) inside.' }))
+      .toMatchObject({ operation: 'createDocument', status: 'pending' });
 
     // Corpus collision: the docKey already exists as a captured document.
     db.prepare(`

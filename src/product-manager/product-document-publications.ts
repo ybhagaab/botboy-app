@@ -635,6 +635,10 @@ export function createProductDocumentPublicationService(
         throw new Error('The requested project does not own this artifact chain. Relink the chain explicitly before publishing.');
       }
       if (input.format !== 'md' && input.format !== 'docx') throw new Error('Publication format must be md or docx.');
+      // The Word export embeds a document's pictures; a Markdown copy would carry only addresses inside BotBoy (/api/files/…).
+      if (input.format === 'md' && /!\[[^\]]*\]\(/.test(artifact.content)) {
+        throw new Error('This document has pictures, and a Markdown (.md) copy cannot carry them. Publish it as Word (.docx), which embeds them.');
+      }
       if (input.action !== 'create' && input.action !== 'update_existing') {
         throw new Error('Publication action must be create or update_existing.');
       }
@@ -823,6 +827,7 @@ export function createProductDocumentPublicationService(
           createContent: artifact.content,
           projectId: artifact.projectId,
           allowExistingTarget: input.action === 'update_existing',
+          canonicalExport: true, // the canonical exporter makes the bytes (documents.ts › canonicalExport / driveExport)
           originNote: `official artifact ${artifact.artifactId} · ${actionLabel}${input.purpose ? ` · ${input.purpose}` : ''}`.slice(0, 300),
         }, createdAt);
         insert.run(
@@ -889,6 +894,7 @@ export function createProductDocumentPublicationService(
           createContent: artifact.content,
           projectId: artifact.projectId,
           allowExistingTarget: true,
+          canonicalExport: true, // records an earlier canonical export; nothing is built
           originNote: `owner-approved legacy publication repair · ${input.repairNote}`.slice(0, 300),
         }, at);
         decidePendingEdit(db, pending.id, 'approved', at);
