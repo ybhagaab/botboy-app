@@ -52,6 +52,22 @@ export function isSentryAuthShapedError(text: string | null | undefined): boolea
   return /SentryRedirectException|sentry\.amazon\.com\/SSO\/redirect|HTTP Status 401|Non-JSON response.{0,40}(401|<!doctype)|NotAuthorizedException|mwinit|307 Temporary Redirect|"_raw":\s*"<html/i.test(text);
 }
 
+/**
+ * What BotBoy calls a Datanet answer that is its sign-in page (a 307 to Midway), wherever it reports one: the cause, never
+ * "Datanet did not answer". Live 2026-11-14: Amazon's device check lapsed and every status read came back as that page for
+ * three hours while Running queries said Datanet did not answer (docs/maps/query-control.md).
+ */
+export const DATANET_SIGN_IN_REFUSED = 'Datanet sign-in refused (Amazon device check or Midway expired)';
+
+/** The owner's next step for a refused Datanet sign-in (the same remedy the Midway sentinel names for Datanet). */
+export const DATANET_SIGN_IN_FIX = 'run mwinit -o -s in Terminal (or Connections → Datanet ETL → Refresh Midway + Sentry)';
+
+/** Whether a Datanet ETL answer is a refused sign-in: BotBoy's own words for one (etl-adhoc.ts › createEtlToolCall), or the raw page. */
+export function isDatanetSignInRefusal(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.includes(DATANET_SIGN_IN_REFUSED) || isSentryAuthShapedError(text);
+}
+
 /** True when the shared Midway jar already holds an unexpired Sentry session
  * row for the Datanet service (cheap pre-check to skip needless primes).
  * Only domains, names, and expiries are read — never values. */

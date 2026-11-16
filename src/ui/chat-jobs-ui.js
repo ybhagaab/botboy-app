@@ -434,10 +434,19 @@
     }, 120);
   }
 
+  /**
+   * A one-tap action (a job's answer or next step): tinted so it stands apart from the files beside it, its label clipped on
+   * screen (`.jobs-chip.action`), and the whole text in its data attribute and tooltip, so a tap sends all of it (owner report
+   * 2026-11-14).
+   */
+  function actionChip(kind, text, jobId) {
+    return `<button type="button" class="jobs-chip action" data-jobs-${kind}="${esc(text)}" data-jobs-job="${esc(jobId)}" title="${esc(text)}"><span class="jobs-chip-label">${esc(text)}</span></button>`;
+  }
+
   /** The one-tap answers; outside the job's own sheet, also a way into it. */
   function answerChips(job, { withOpen = true } = {}) {
     const options = Array.isArray(job.options) ? job.options : [];
-    const chips = options.map(option => `<button type="button" class="jobs-chip" data-jobs-answer="${esc(option)}" data-jobs-job="${esc(job.id)}">${esc(option)}</button>`).join('');
+    const chips = options.map(option => actionChip('answer', option, job.id)).join('');
     const open = withOpen
       ? `<button type="button" class="jobs-chip ${options.length ? 'ghost' : 'primary'}" data-jobs-open="${esc(job.id)}" data-jobs-focus="1">${options.length ? 'Open job' : 'Answer'}</button>`
       : '';
@@ -553,7 +562,7 @@
       return `<div class="jobs-update quiet">${top}<button type="button" class="jobs-chip ghost" data-jobs-open="${esc(job.id)}">Open job</button></div></div>`;
     }
     const steps = job.status === 'done' && Array.isArray(job.nextSteps) ? job.nextSteps : [];
-    const chips = steps.map(step => `<button type="button" class="jobs-chip" data-jobs-step="${esc(step)}" data-jobs-job="${esc(job.id)}">${esc(step)}</button>`).join('');
+    const chips = steps.map(step => actionChip('step', step, job.id)).join('');
     return `<div class="jobs-update">${top}</div>${resultsList(job)}<div class="jobs-chips">${chips}<button type="button" class="jobs-chip ghost" data-jobs-open="${esc(job.id)}">Open job</button></div></div>`;
   }
   function cardHtml(job, kind) {

@@ -31,6 +31,8 @@ import type { RouterDeps } from '../api/routers/deps.js';
 const V1 = '# Plan\n\nThe first version of the plan that BotBoy publishes to Drive.';
 const V2 = '# Plan\n\nThe second version of the plan, published as the next revision.';
 const DOCX_BYTES = (text: string) => Buffer.from(`PK-fake-docx:${text}`);
+const CITED = '# Plan\n\nUsage doubled [c1][c2], and churn fell [c1].';
+const CITED_PUBLISHED = '# Plan\n\nUsage doubled, and churn fell.';
 
 describe('docTokens', () => {
   it('normalizes quotes, dashes, bullets, numbering, and table separators', () => {
@@ -95,6 +97,7 @@ describe('Drive publication: stage → approve → Sync → receipt', () => {
   let app: express.Express;
   let canPublish: boolean;
   let captures: Array<Record<string, string>>;
+  let exported: string[];
 
   beforeEach(() => {
     storage = createStorage(':memory:');
@@ -105,17 +108,22 @@ describe('Drive publication: stage → approve → Sync → receipt', () => {
     db.prepare("INSERT INTO projects (id, title, one_liner, brain_path, status) VALUES ('p1', 'Plan', '', '/tmp/plan-brain', 'active')").run();
     db.exec(`
       CREATE TABLE product_document_artifacts (artifact_id TEXT PRIMARY KEY, parent_artifact_id TEXT);
-      INSERT INTO product_document_artifacts VALUES ('a1', NULL), ('a2', 'a1');
+      INSERT INTO product_document_artifacts VALUES ('a1', NULL), ('a2', 'a1'), ('a3', NULL);
     `);
     const artifacts = new Map<string, ProductDocumentArtifact>([
       ['a1', { artifactId: 'a1', persisted: true, projectId: 'p1', title: 'Plan', content: V1 } as ProductDocumentArtifact],
       ['a2', { artifactId: 'a2', parentArtifactId: 'a1', persisted: true, projectId: 'p1', title: 'Plan', content: V2 } as ProductDocumentArtifact],
+      ['a3', {
+        artifactId: 'a3', persisted: true, projectId: 'p1', title: 'Plan', content: CITED,
+        citations: [{ id: 'c1', label: 'Thread' }, { id: 'c2', label: 'Email' }],
+      } as ProductDocumentArtifact],
     ]);
     const productDocuments = { getArtifact: (id: string) => artifacts.get(id) ?? null } as unknown as ProductDocumentService;
     publications = createProductDocumentPublicationService(db, productDocuments);
     drive = createFakeDrive();
     canPublish = true;
     captures = [];
+    exported = [];
     const plug = createGoogleDriveDestination({ clientFor: () => drive, canPublish: () => canPublish, accounts: () => ['default'] });
     app = express();
     app.use(express.json());
@@ -125,7 +133,10 @@ describe('Drive publication: stage → approve → Sync → receipt', () => {
       productDocumentService: productDocuments,
       productDocumentPublications: publications,
       publicationDestinations: createPublicationDestinations({ gdrive: plug }),
-      publicationExporter: async ({ content }) => ({ data: DOCX_BYTES(content), filename: 'Plan.docx' }),
+      publicationExporter: async ({ content }) => {
+        exported.push(content);
+        return { data: DOCX_BYTES(content), filename: 'Plan.docx' };
+      },
       gdriveSync: {
         captureFile: async (_account: string, fileId: string, meta: Record<string, string>) => {
           captures.push({ fileId, ...meta });
@@ -171,6 +182,20 @@ describe('Drive publication: stage → approve → Sync → receipt', () => {
     expect(driveDocs()[0].appProperties).toEqual({ botboyPublicationId: done.publicationId, botboyIdempotency: done.idempotencyKey });
     expect(captures).toHaveLength(1);
     expect(captures[0]).toMatchObject({ publicationId: done.publicationId, docKey: done.docKey, sourceArtifactId: 'a1' });
+  });
+
+  // Owner request 2026-11-16: the reader's [c1] chips are noise in a published file.
+  it('publishes the document without its citation markers, and the Google Doc text check reads the same words', async () => {
+    const staged = stage('a3');
+    const synced = await approveAndSync(staged);
+    expect(synced.status).toBe(200);
+    expect(exported).toEqual([CITED_PUBLISHED]);
+    const done = publications.get(staged.publication.publicationId)!;
+    expect(done.status).toBe('complete');
+    expect(done.exportMd5).toBe(createHash('md5').update(DOCX_BYTES(CITED_PUBLISHED)).digest('hex'));
+    const tokens = sourceTokensFromMarkdown(CITED_PUBLISHED);
+    expect(tokens).not.toContain('c1');
+    expect({ count: done.exportTokenCount, sha: done.exportTokensSha256 }).toEqual({ count: tokens.length, sha: tokensSha256(tokens) });
   });
 
   it('persists the idempotency key before any network call and keeps it across retries; SharePoint rows have none', async () => {

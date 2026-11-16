@@ -895,6 +895,40 @@ describe('a job\'s report in the main chat (PARALLEL_JOBS_PLAN.md §11)', () => 
     jobs.fillCards(document);
     expect(document.querySelectorAll('#chat-messages [data-jobs-answer]')).toHaveLength(0);
   });
+
+  // Owner report 2026-11-14: next steps sit beside the job's files and looked alike, and a tap sent a cut-off message.
+  it('a next step or an answer stands apart from the files, clips only its label, and a tap sends the whole text', async () => {
+    const step = 'Submit P1 only, report back before P2 and P3, then rerun the September comparison against the warehouse counts';
+    const answer = 'Submit P1 only, report back before P2 and P3 are submitted';
+    const send = vi.fn(async () => {});
+    listPayload = { jobs: [job({ id: JOB_B, number: 2, title: 'Cradle pulls', phase: 'needs_owner', pauseNote: 'Which pulls?', options: [answer] })], recent: [job({
+      status: 'done', phase: null, endedAt: '2026-11-08T10:00:00.000Z', nextSteps: [step],
+      results: { files: [{ path: '/files/study-note.md', label: 'Note' }], datasets: [], dashboards: [] },
+    })], version: 2 };
+    jobs.init({ send });
+    try {
+      await jobs.refresh();
+      const foot = footSlot(JOB_A, 'report');
+      const asking = footSlot(JOB_B, 'update');
+      jobs.fillCards(document);
+      const stepChip = foot.querySelector('[data-jobs-step]') as HTMLButtonElement;
+      expect(stepChip.classList.contains('action')).toBe(true);
+      expect(foot.querySelector('.jobs-out')!.classList.contains('action')).toBe(false);
+      expect(foot.querySelector('[data-jobs-open]')!.classList.contains('action')).toBe(false);
+      expect(stepChip.querySelector('.jobs-chip-label')!.textContent).toBe(step);
+      expect(stepChip.title).toBe(step);
+      stepChip.click();
+      expect(send).toHaveBeenCalledWith(`#1 ${step}`);
+      const answerChip = asking.querySelector('[data-jobs-answer]') as HTMLButtonElement;
+      expect(answerChip.classList.contains('action')).toBe(true);
+      expect(answerChip.title).toBe(answer);
+      answerChip.click();
+      await vi.waitFor(() => expect(fetchCalls).toHaveLength(1));
+      expect(fetchCalls[0]).toMatchObject({ url: '/api/chat/messages', body: { message: answer, jobId: JOB_B } });
+    } finally {
+      jobs.init({ send: undefined });
+    }
+  });
 });
 
 // Owner request 2026-11-13: the job rows the main chat keeps stand out in the running pill's accent.

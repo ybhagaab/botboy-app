@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -389,3 +390,28 @@ describe('pictures in a document (document-media.md)', () => {
     expect(plain.body.media).toBeUndefined();
   });
 });
+
+// Owner request 2026-11-16: "[c1] etc. in the exported version become noise". The chat's export is the official file.
+describe('export_product_document', () => {
+  it('writes the file without citation markers and its receipt hashes those bytes; the document keeps them', async () => {
+    const f = fixture();
+    const saved = await savedLaunch(f);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'botboy-doc-export-home-'));
+    cleanup.push(home);
+    const homedir = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    try {
+      const { body, isError } = await f.run('export_product_document', { artifactId: saved.artifactId, format: 'markdown', ownerRequested: true });
+      expect(isError).toBe(false);
+      const written = fs.readFileSync(body.filePath, 'utf8');
+      expect(body.filePath.startsWith(home)).toBe(true);
+      expect(written).toContain('Partner events now arrive from our servers.\n');
+      expect(written).toContain('| Paid marketing | Aditya Singhal | Campaigns |');
+      expect(written).not.toMatch(/\[c\d\]/);
+      expect(body.sha256).toBe(createHash('sha256').update(written).digest('hex'));
+      expect(f.service.getArtifact(saved.artifactId)?.content).toBe(LAUNCH);
+    } finally {
+      homedir.mockRestore();
+    }
+  });
+});
+

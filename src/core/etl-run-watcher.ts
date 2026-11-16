@@ -20,6 +20,7 @@
 import type { ChatJobStore, EtlRunOutcome, EtlRunWatch } from './chat-jobs.js';
 import type { QueryRunResult } from './etl-adhoc.js';
 import { JOB_WAIT_CHECK_EVERY_MS, timedOutOutcome, type JobWaitCheck } from './job-waits.js';
+import { DATANET_SIGN_IN_REFUSED } from './sentry-session.js';
 
 export const ETL_WATCH_INTERVAL_MS = 30_000;
 /** Downloads of a SUCCESS run retried this many ticks before reporting failure. */
@@ -97,6 +98,8 @@ export function createEtlRunWatcher(options: EtlRunWatcherOptions): EtlRunWatche
   let stopped = false;
   /** Runs whose still-downloading result was logged once. */
   const landingLogged = new Set<string>();
+  /** Runs whose reads Datanet refuses at sign-in: logged once until a read works again (the run itself goes on). */
+  const signInLogged = new Set<string>();
   /** Failed downloads per SUCCESS run (in memory: a restart gives a run three fresh tries). */
   const downloadFailures = new Map<string, number>();
 
@@ -190,6 +193,11 @@ export function createEtlRunWatcher(options: EtlRunWatcherOptions): EtlRunWatche
           const outcome = outcomeFromReadRun(result);
           if (outcome === 'pending') {
             options.jobs.markPolled(watch.runId, { remoteStatus: result.remoteStatus, failed: result.code === 'status_unavailable' });
+            if (!result.signInRefused) signInLogged.delete(watch.runId);
+            else if (!signInLogged.has(watch.runId)) {
+              signInLogged.add(watch.runId);
+              log(`[EtlWatch] run ${watch.runId}: ${DATANET_SIGN_IN_REFUSED}; BotBoy keeps waiting and reads it again once Datanet answers`);
+            }
             // A large result is still arriving in the connector's background: waited for, never downloaded again (etl-downloads.ts).
             if (result.code === 'download_landing' && !landingLogged.has(watch.runId)) {
               landingLogged.add(watch.runId);

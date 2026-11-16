@@ -46,6 +46,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { exportDocument } from '../../product-manager/document-exporter.js';
+import { exportableContent } from '../../product-manager/citation-markers.js';
 import {
   publicationRemoteReceipt,
   sha256Buffer,
@@ -925,7 +926,7 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
         } else {
           canonicalExport = await exportDocument({
             title: sourceArtifact.title,
-            content: sourceArtifact.content,
+            content: exportableContent(sourceArtifact), // citation markers stay in BotBoy (citation-markers.ts)
             format: publication.format === 'md' ? 'markdown' : 'docx',
             footerText: deps.exportFooter?.effective() ?? '',
           });
@@ -1168,19 +1169,21 @@ export function createDocumentsRouter(deps: RouterDeps): Router {
   }
 
   /** The pinned DOCX export (cached bytes, else exported once) plus the Drive pins beside it. Local only. */
-  async function driveExport(publication: ProductDocumentPublication, artifact: { title: string; content: string }): Promise<{ data: Buffer; filename: string }> {
+  async function driveExport(publication: ProductDocumentPublication, artifact: { title: string; content: string; citations?: ReadonlyArray<{ id: string }> }): Promise<{ data: Buffer; filename: string }> {
     const publications = deps.productDocumentPublications!;
     const current = publications.get(publication.publicationId) ?? publication;
     const cached = loadPublicationExport(current);
+    // Citation markers stay in BotBoy (citation-markers.ts); the text check below reads the same words the file carries.
+    const content = exportableContent(artifact);
     const exported = cached && current.exportFilename
       ? { data: cached, filename: current.exportFilename }
-      : await (deps.publicationExporter ?? exportDocument)({ title: artifact.title, content: artifact.content, format: 'docx', footerText: deps.exportFooter?.effective() ?? '' });
+      : await (deps.publicationExporter ?? exportDocument)({ title: artifact.title, content, format: 'docx', footerText: deps.exportFooter?.effective() ?? '' });
     const sha256 = sha256Buffer(exported.data);
     if (!cached) persistPublicationExport(publication.publicationId, sha256, exported.filename, exported.data);
     if (current.status === 'approved' || current.status === 'upload_failed' || current.status === 'exported') {
       publications.recordExport(publication.publicationId, { sha256, bytes: exported.data.length, filename: exported.filename }, undefined, { noRemoteEffectProven: true });
     }
-    const tokens = sourceTokensFromMarkdown(artifact.content);
+    const tokens = sourceTokensFromMarkdown(content);
     publications.recordDestinationPins(publication.publicationId, {
       md5: createHash('md5').update(exported.data).digest('hex'),
       tokenCount: tokens.length,

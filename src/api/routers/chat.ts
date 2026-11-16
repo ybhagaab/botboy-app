@@ -1809,7 +1809,7 @@ export function createChatRouter(deps: RouterDeps, dashboardState: DashboardStat
           // this turn, or from its own look at a job update, as itself. A job's own turns never get these.
           ...(!continuation && !threadJob && !review && jobDesk ? {
             messageJob: (jobId: string, text: string) => jobDesk.messageJob(jobId, text, { from: 'main_chat', ownerWords: message }),
-            continueJob: (jobId: string) => jobDesk.continueJob(jobId, { from: 'main_chat' }),
+            continueJob: (jobId: string) => jobDesk.continueJob(jobId, { from: 'main_chat', ownerWords: message }),
           } : {}),
           ...(review && jobDesk ? {
             messageJob: (jobId: string, text: string) => jobDesk.messageJob(jobId, text, { from: 'review' }),

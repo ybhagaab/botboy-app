@@ -10,6 +10,7 @@ import {
   JOB_MESSAGE_REASON,
   JOB_REPORT_CHARS,
   JOB_REVIEW_REASON,
+  MAX_ONE_TAP_CHARS,
   type ChatJobStore,
 } from './chat-jobs.js';
 
@@ -28,6 +29,18 @@ describe('job reports and messages', () => {
   });
   afterEach(() => storage.close());
 
+  // Owner report 2026-11-14: a tap sent "Submit P1 only, report back before P2 an" (one-tap text was cut at 40 and 60 characters).
+  it('a next step and a one-tap answer are kept whole, so a tap sends what the job wrote', () => {
+    const step = 'Submit P1 only, report back before P2 and P3, then rerun the September comparison against the warehouse counts';
+    const answer = 'Submit P1 only, report back before P2 and P3 are submitted';
+    const done = jobs.start({ goal: 'Study' });
+    jobs.end(done.id, 'done', 'ok', { nextSteps: [step, 'y'.repeat(400)] });
+    expect(jobs.get(done.id)?.nextSteps).toEqual([step, 'y'.repeat(MAX_ONE_TAP_CHARS)]);
+    const asking = jobs.start({ goal: 'Pulls' });
+    jobs.declare(asking.id, 'needs_owner', 'Which Cradle pulls should I submit?', ['Submit P1, P2 and P3 now', answer, 'Hold all pulls and keep the plan']);
+    jobs.settle(asking.id, { action: 'pause', note: 'Which Cradle pulls should I submit?', kind: 'question' }, 'answered');
+    expect(jobs.get(asking.id)?.options).toEqual(['Submit P1, P2 and P3 now', answer, 'Hold all pulls and keep the plan']);
+  });
   it('a done job keeps its report and next steps, and is claimed for the main chat exactly once', () => {
     const job = jobs.start({ goal: 'Health check' });
     jobs.end(job.id, 'done', 'All connections checked', { nextSteps: ['Restore Outlook sync.', 'restore outlook sync', 'Clear the capture backlog', 'Retry SQL', 'A fourth'] });
@@ -135,8 +148,9 @@ describe('job reports and messages', () => {
     expect(jobs.get(job.id)!.inbox.map(message => message.text)).toEqual(Array.from({ length: JOB_INBOX_MAX }, (_, i) => `message ${i + 2}`));
   });
 
-  it('next steps are short and distinct', () => {
-    expect(cleanNextSteps(['  Rerun February.  ', 'rerun february', '', 7, 'x'.repeat(80)])).toEqual(['Rerun February', '7', 'x'.repeat(60)]);
+  it('next steps are whole up to the bound, and distinct', () => {
+    expect(cleanNextSteps(['  Rerun February.  ', 'rerun february', '', 7, 'x'.repeat(80)])).toEqual(['Rerun February', '7', 'x'.repeat(80)]);
+    expect(cleanNextSteps(['x'.repeat(MAX_ONE_TAP_CHARS + 50)])).toEqual(['x'.repeat(MAX_ONE_TAP_CHARS)]);
     expect(cleanNextSteps('not a list')).toEqual([]);
   });
 

@@ -22,8 +22,10 @@
  * the receipt says stopped, already finished, or still running, with the next step.
  */
 import type Database from 'better-sqlite3';
+import { isDatanetCancelled, isDatanetStopping } from './datanet-run-states.js';
 import type { McpManager } from './mcp-types.js';
 import type { EtlToolCall } from './etl-adhoc.js';
+import { DATANET_SIGN_IN_FIX, DATANET_SIGN_IN_REFUSED, isDatanetSignInRefusal } from './sentry-session.js';
 import {
   ETL_TERMINAL_STATES,
   QueryStoppedReason,
@@ -151,6 +153,13 @@ const sqliteUtc = (ms: number): string => new Date(ms).toISOString().slice(0, 19
 /** The SQL a statement runs, without the connector's cursor wrapper or BotBoy's marker. */
 const sqlOf = (text: string): string => firstLine(text.replace(DECLARE_PREFIX, '').replace(/^\s*\/\*\s*botboy:[^*]*\*\/\s*/i, ''), 200);
 
+/** A Datanet run's status as query control reads it: its state, or null (`signIn`: Datanet refused BotBoy's sign-in). */
+interface EtlStatusRead {
+  status: string | null;
+  error?: string;
+  signIn?: boolean;
+}
+
 /** A background export's status as query control reads it: its state (`unknown`: the connection no longer tracks it), or null. */
 interface ExportRead {
   state: string | null;
@@ -213,7 +222,7 @@ export function createQueryControl(deps: QueryControlDeps): QueryControl {
   const freshCacheMs = deps.freshCacheMs ?? 3_000;
   let warehouseCache: WarehouseRead | null = null;
   let warehouseReading: Promise<WarehouseRead> | null = null;
-  const etlStatusCache = new Map<string, { at: number; status: string | null; error?: string }>();
+  const etlStatusCache = new Map<string, { at: number } & EtlStatusRead>();
   const exportStatusCache = new Map<string, { at: number; read: ExportRead }>();
   /** The database is not Redshift: only the calls BotBoy is waiting on can be listed and stopped. */
   let warehouseUnsupported = false;
@@ -365,19 +374,25 @@ export function createQueryControl(deps: QueryControlDeps): QueryControl {
     return matches.length === 1 ? matches[0] : null;
   }
 
-  async function etlStatus(runId: string, fresh: boolean): Promise<{ status: string | null; error?: string }> {
+  /**
+   * `force`: ask Datanet now, whatever was read a moment ago (right after a stop, the state may have just changed). `signIn`:
+   * Datanet answered with its sign-in page, so the state is not known and the owner's sign-in is the fix (sentry-session.ts).
+   */
+  async function etlStatus(runId: string, fresh: boolean, force = false): Promise<EtlStatusRead> {
     const cached = etlStatusCache.get(runId);
-    if (cached && now() - cached.at < (fresh ? freshCacheMs : pollCacheMs)) return cached;
+    if (!force && cached && now() - cached.at < (fresh ? freshCacheMs : pollCacheMs)) return cached;
     if (!deps.etlCall) return { status: null, error: 'the Datanet ETL connection is not available' };
-    let result: { status: string | null; error?: string };
+    let result: EtlStatusRead;
     try {
       const poll = await deps.etlCall('datanet_get_job_run_status', { run_id: runId });
-      if (poll.isError) result = { status: null, error: firstLine(poll.text) };
-      else {
-        let status = '';
+      let status = '';
+      if (!poll.isError) {
         try { status = String(JSON.parse(poll.text.slice(Math.max(0, poll.text.indexOf('{'))))?.status ?? '').toUpperCase(); } catch { /* below */ }
-        result = status ? { status } : { status: null, error: `no status in ${firstLine(poll.text, 80)}` };
       }
+      if (status) result = { status };
+      else if (isDatanetSignInRefusal(poll.text)) result = { status: null, signIn: true, error: DATANET_SIGN_IN_REFUSED };
+      else if (poll.isError) result = { status: null, error: firstLine(poll.text) };
+      else result = { status: null, error: `no status in ${firstLine(poll.text, 80)}` };
     } catch (error: any) {
       result = { status: null, error: firstLine(error?.message ?? error) };
     }
@@ -557,13 +572,15 @@ export function createQueryControl(deps: QueryControlDeps): QueryControl {
       const checked = openEtl.slice(0, MAX_ETL_READS);
       const statuses = await mapLimit(checked, ETL_READ_CONCURRENCY, row => etlStatus(row.runId!, fresh));
       let unreadable = 0;
+      let refused = 0;
       checked.forEach((row, index) => {
         const status = statuses[index];
         if (status.status && ETL_TERMINAL_STATES.has(status.status)) {
           ledger.endEtl(row.runId!, status.status);
           return;
         }
-        if (!status.status) unreadable += 1;
+        if (!status.status && status.signIn) refused += 1;
+        else if (!status.status) unreadable += 1;
         const job = jobOf(row.jobId);
         queries.push({
           id: row.id,
@@ -580,6 +597,8 @@ export function createQueryControl(deps: QueryControlDeps): QueryControl {
           ...(status.status ? { remoteStatus: status.status } : {}),
         });
       });
+      // A refused sign-in is named as such, with its fix: "did not answer" sent the owner looking at the network (2026-11-14).
+      if (refused) warnings.push(`${DATANET_SIGN_IN_REFUSED} for ${refused} ETL run${refused === 1 ? '' : 's'}; ${refused === 1 ? 'it is' : 'they are'} listed as still running until Datanet answers. To fix it, ${DATANET_SIGN_IN_FIX}, then check again.`);
       if (unreadable) warnings.push(`Datanet did not answer for ${unreadable} ETL run${unreadable === 1 ? '' : 's'}; ${unreadable === 1 ? 'it is' : 'they are'} listed as still running.`);
       if (openEtl.length > MAX_ETL_READS) warnings.push(`Only the newest ${MAX_ETL_READS} unfinished ETL runs were checked.`);
     }
@@ -735,45 +754,78 @@ export function createQueryControl(deps: QueryControlDeps): QueryControl {
     const by = byOf(actor);
     ledger.markStopRequested(query.id, by, reason);
     const who = by === 'owner' ? 'the owner' : by === 'owner-chat' ? 'the owner, asked in chat' : by === 'main' ? 'the main chat' : 'the job that started it';
-    let kill: { isError: boolean; text: string };
-    try {
-      kill = await deps.etlCall('datanet_alter_run', {
-        run_id: runId,
-        action: 'KILL_SESSION', // Datanet validates action names case-sensitively (tool-executor.ts › mcp_etl_alter_run)
-        reason: `BotBoy: stopped by ${who}${reason ? `: ${reason}` : ''}`.slice(0, 256),
-      }, { ownerApproved: true });
-    } catch (error: any) {
-      kill = { isError: true, text: firstLine(error?.message ?? error) };
+    const steps: string[] = [];
+    // Datanet already ends this run (CANCELLING): a second kill is not sent; BotBoy only checks that it ends.
+    if (isDatanetStopping(query.remoteStatus)) {
+      steps.push(`Datanet was already cancelling run ${runId}; no second stop was sent.`);
+    } else {
+      let kill: { isError: boolean; text: string };
+      try {
+        kill = await deps.etlCall('datanet_alter_run', {
+          run_id: runId,
+          action: 'KILL_SESSION', // Datanet validates action names case-sensitively (tool-executor.ts › mcp_etl_alter_run)
+          reason: `BotBoy: stopped by ${who}${reason ? `: ${reason}` : ''}`.slice(0, 256),
+        }, { ownerApproved: true });
+      } catch (error: any) {
+        kill = { isError: true, text: firstLine(error?.message ?? error) };
+      }
+      if (kill.isError) {
+        // Refused: perhaps it ended a moment ago. Its state says which; an ended run is reported as such, never as a failed stop.
+        const after = (await etlStatus(runId, true, true)).status;
+        if (after && ETL_TERMINAL_STATES.has(after)) return endedEtl(query, runId, after, [`Datanet did not take the stop (${firstLine(kill.text, 160)}): the run had already ended.`]);
+        ledger.clearStopRequest(query.id);
+        if (isDatanetSignInRefusal(kill.text)) {
+          return {
+            ok: false, id: query.id, kind: 'etl', code: 'stop_failed', what: query.label,
+            error: `${DATANET_SIGN_IN_REFUSED}, so Datanet did not get the stop; run ${runId} keeps running.`,
+            nextAction: `Ask the owner to ${DATANET_SIGN_IN_FIX}, then stop it once more.`,
+          };
+        }
+        return {
+          ok: false, id: query.id, kind: 'etl', code: 'stop_failed', what: query.label,
+          error: `Datanet did not take the stop: ${firstLine(kill.text)}`,
+          nextAction: `Check run ${runId} (mcp_etl_job_run), then try once more.`,
+        };
+      }
+      steps.push(`Asked Datanet to kill run ${runId}.`);
     }
-    if (kill.isError) {
-      ledger.clearStopRequest(query.id);
-      return {
-        ok: false, id: query.id, kind: 'etl', code: 'stop_failed', what: query.label,
-        error: `Datanet did not take the stop: ${firstLine(kill.text)}`,
-        nextAction: `Check run ${runId} (mcp_etl_job_run), then try once more.`,
-      };
-    }
-    const steps = [`Asked Datanet to kill run ${runId}.`];
+    // A killed run reads CANCELLING, then CANCELLED (datanet-run-states.ts).
     let status: string | null = null;
+    let signIn = false;
     for (const wait of [2000, 3000, 5000, 5000]) {
       await sleep(wait);
-      status = (await etlStatus(runId, true)).status;
+      const read = await etlStatus(runId, true, true);
+      status = read.status;
+      signIn = read.signIn === true;
       if (status && ETL_TERMINAL_STATES.has(status)) break;
     }
+    if (status && ETL_TERMINAL_STATES.has(status)) return endedEtl(query, runId, status, steps);
     const checkedAt = new Date(now()).toISOString();
-    if (status && ETL_TERMINAL_STATES.has(status)) ledger.endEtl(runId, status);
-    if (status === 'KILLED' || status === 'DELETED') {
-      ledger.markStopped(query.id);
-      return { ok: true, id: query.id, kind: 'etl', state: 'stopped', what: query.label, steps, verified: true, checkedAt };
-    }
-    if (status === 'SUCCESS' || status === 'ERROR') {
-      ledger.clearStopRequest(query.id);
-      return { ok: true, id: query.id, kind: 'etl', state: 'already_finished', what: query.label, steps: [...steps, `It had already ended ${status} before the stop took effect.`], verified: true, checkedAt };
+    if (isDatanetStopping(status)) {
+      // Taken and under way: the row stays open until Datanet says CANCELLED, which the list's next check records.
+      return {
+        ok: true, id: query.id, kind: 'etl', state: 'stopped', what: query.label, steps, verified: false, checkedAt,
+        nextAction: `Datanet is cancelling run ${runId}; it leaves Running queries once Datanet finishes (usually within a few minutes).`,
+      };
     }
     return {
       ok: true, id: query.id, kind: 'etl', state: 'still_running', what: query.label, steps, verified: false, checkedAt,
-      nextAction: `Datanet took the stop but still shows run ${runId} as ${status ?? 'unknown'}; check Running queries again in a minute.`,
+      nextAction: signIn
+        ? `Datanet took the stop, then refused BotBoy's sign-in when it checked run ${runId} (Amazon device check or Midway expired), so whether it ended is not known. To fix it, ${DATANET_SIGN_IN_FIX}, then check Running queries again.`
+        : `Datanet took the stop but still shows run ${runId} as ${status ?? 'unknown'}; check Running queries again in a minute.`,
     };
+  }
+
+  /** The receipt for a run Datanet reports ended: CANCELLED or DELETED is stopped, SUCCESS or ERROR had finished first. */
+  function endedEtl(query: RunningQuery, runId: string, status: string, steps: string[]): StopReceipt {
+    const checkedAt = new Date(now()).toISOString();
+    ledger.endEtl(runId, status);
+    if (isDatanetCancelled(status) || status === 'DELETED') {
+      ledger.markStopped(query.id);
+      return { ok: true, id: query.id, kind: 'etl', state: 'stopped', what: query.label, steps, verified: true, checkedAt };
+    }
+    ledger.clearStopRequest(query.id);
+    return { ok: true, id: query.id, kind: 'etl', state: 'already_finished', what: query.label, steps: [...steps, `It had already ended ${status} before the stop took effect.`], verified: true, checkedAt };
   }
 
   /** The running query an id names: BotBoy's id, an ETL run id, or a warehouse session or statement id. */

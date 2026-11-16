@@ -6,6 +6,7 @@ import type { ToolCall } from '../core/llm-client.js';
 import type { ToolExecutionContext, ToolExecutor, ToolResult } from '../core/tool-executor.js';
 import { changedLineText } from '../core/exact-text-edits.js';
 import { DocumentExportError, exportDocument, isDocumentExportFormat } from './document-exporter.js';
+import { exportableContent } from './citation-markers.js';
 import { checkDocumentMedia, findDocumentMedia, type DocumentMediaCheck } from './document-media.js';
 import { ProductDocumentEditError } from './document-service.js';
 import { documentVersionOf, productDocumentListForModel, productDocumentReadForModel } from './document-read.js';
@@ -350,7 +351,7 @@ export function withProductDocumentChatTools(
         try {
           const exported = await exportDocument({
             title: artifact.title,
-            content: artifact.content,
+            content: exportableContent(artifact), // citation markers stay in BotBoy (citation-markers.ts)
             format: args.format,
             footerText: options.footerText?.() ?? '',
           });

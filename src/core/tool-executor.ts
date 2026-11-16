@@ -1,5 +1,6 @@
 import { dashboardIssues, viewIssueReports } from './analytics-dashboard-issues.js';
 import { dashboardReadForModel, dashboardSourcesForModel, MODEL_READ_BUDGET_CHARS, widgetReadForModel, type DashboardSourceLookups } from './analytics-dashboard-read.js';
+import { isDatanetCancelled } from './datanet-run-states.js';
 /**
  * Tool Executor — executes tool calls returned by the LLM.
  * Replaces kiro-cli's built-in bash/file tools with sandboxed, scoped operations.
@@ -948,6 +949,9 @@ const SELF_BOUNDED_ETL_TOOLS = new Set(['mcp_etl_run_query', 'wait_for_etl_run',
 export function toolRunsWithoutExecutorCap(toolName: string): boolean {
   return MCP_CALL_TOOLS.has(toolName) || SELF_BOUNDED_ETL_TOOLS.has(toolName);
 }
+
+/** cancel_query sends a stop and then checks it (query-control.ts): the list's fresh reads, the stop, and up to ~25 s of checks. */
+export const CANCEL_QUERY_TIMEOUT_MS = 120_000;
 
 /** run_command's own limit is 10 minutes (execFile timeout); the executor allows a little more. */
 export const RUN_COMMAND_EXECUTOR_TIMEOUT_MS = 610_000;
@@ -3555,7 +3559,8 @@ export function createToolExecutor(
           : `Run ${outcome.runId} is still running. Call wait_for {"kind":"etl_run","id":"${outcome.runId}","waitSeconds":300} to keep waiting; never resubmit it.`)
         : outcome.code === 'download_landing' && outcome.runId
           ? landingNextAction(outcome.runId)
-          : outcome.code === 'remote_failed' && outcome.remoteStatus !== 'DELETED'
+          // A failed run is fixed and run again; a cancelled one (stopped on purpose) keeps its own "Do not resubmit" step.
+          : outcome.code === 'remote_failed' && outcome.remoteStatus !== 'DELETED' && !isDatanetCancelled(outcome.remoteStatus)
             ? 'Fix the root cause named in error and run the corrected query. Keep fixing while each failure has a new root cause; when the same failure repeats three times, stop and report it.'
             : outcome.nextAction;
       return etlRunPayload({ ...outcome, ...(nextAction ? { nextAction } : {}) }, {
@@ -3767,7 +3772,7 @@ export function createToolExecutor(
       const runId = String(args.runId ?? '').trim();
       const reason = String(args.reason ?? '').trim();
       // A kill is a stop on purpose like cancel_query's (query-ledger.ts): recorded before it is sent, so whoever reads the run
-      // KILLED next reports it as stopped, never as a failure to fix and resubmit.
+      // CANCELLED next (Datanet's end state for a kill) reports it as stopped, never as a failure to fix and resubmit.
       const ledger = action === 'kill' && /^\d+$/.test(runId) ? getQueryLedger(db) : null;
       const record = ledger?.forRun(runId) ? `etl:${runId}` : null;
       const origin = queryOriginOf(context);
@@ -5611,6 +5616,10 @@ export function createToolExecutor(
             // Checks a gzip copy of up to a few GB before it deletes (job-working-files.ts).
             : name === 'delete_working_file'
               ? DELETE_WORKING_FILE_TIMEOUT_MS
+            // A stop is sent, then checked (Datanet takes 10-15 s to say CANCELLED; the warehouse a few reads): under the 10 s
+            // default every stop the model made ended "Tool timeout (10s)" with its effect unknown (live 2026-11-14).
+            : name === 'cancel_query'
+              ? CANCEL_QUERY_TIMEOUT_MS
             : name.startsWith('mcp_')
             ? 95_000
             : name.startsWith('browser_') ? 65_000 : TIMEOUT;

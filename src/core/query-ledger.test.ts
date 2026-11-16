@@ -110,10 +110,24 @@ describe('the query ledger', () => {
     ledger.beginEtl({ runId: '13236042515', origin: { kind: 'main' } });
     expect(ledger.forRun('13236042515')).toMatchObject({ id: 'etl:13236042515', kind: 'etl', origin: 'job', jobId: 'cj_2', label: 'Weekly streams', preview: 'SELECT 2' });
     expect(ledger.get('etl:not-a-run')).toBeNull();
-    ledger.endEtl('13236042515', 'EXECUTING');
-    expect(ledger.forRun('13236042515')?.endedAt).toBeNull();
-    ledger.endEtl('13236042515', 'killed');
-    expect(ledger.forRun('13236042515')).toMatchObject({ endState: 'killed' });
+    // Datanet's own states (datanet-run-states.ts): CANCELLING is a stop under way, CANCELLED an end; there is no KILLED.
+    for (const going of ['EXECUTING', 'WAITING_FOR_RESOURCES', 'CANCELLING', 'PUBLISHING', 'KILLED']) {
+      ledger.endEtl('13236042515', going);
+      expect(ledger.forRun('13236042515')?.endedAt, going).toBeNull();
+    }
+    ledger.endEtl('13236042515', 'cancelled');
+    expect(ledger.forRun('13236042515')).toMatchObject({ endState: 'cancelled' });
+  });
+
+  it('a cancelled run BotBoy was asked to stop ends as stopped, even when the stop\'s own check never saw it end', () => {
+    ledger.beginEtl({ runId: '13257595845', origin: { kind: 'job', jobId: 'cj_5' } });
+    ledger.markStopRequested('etl:13257595845', 'owner');
+    ledger.endEtl('13257595845', 'CANCELLED');
+    expect(ledger.forRun('13257595845')).toMatchObject({ endState: 'stopped', stoppedBy: 'owner' });
+    expect(ledger.openSince('2000-01-01T00:00:00.000Z').map(row => row.id)).not.toContain('etl:13257595845');
+    ledger.beginEtl({ runId: '13257595846', origin: { kind: 'main' } });
+    ledger.endEtl('13257595846', 'ERROR');
+    expect(ledger.forRun('13257595846')).toMatchObject({ endState: 'error' });
   });
 
   it('a run stopped on purpose is reported in words that keep it from being resubmitted', () => {

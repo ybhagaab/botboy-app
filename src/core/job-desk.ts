@@ -19,6 +19,17 @@ import type Database from 'better-sqlite3';
 import { randomBytes } from 'node:crypto';
 import { jobCardMarker, JOB_INBOX_MAX, JOB_MESSAGE_REASON, JOB_REVIEW_REASON, MAX_REVIEW_ROUNDS, type ChatJob, type ChatJobStore } from './chat-jobs.js';
 
+/**
+ * The owner's own words name job #N: "#5", "# 5", "job 5", "job #5", "jobs 5 and 7", "job no. 5", "job number 5" (never #55 or
+ * job 15). A stopped job opens again from the main chat only on these (refusalFor).
+ */
+export function ownerNamesJob(words: string | undefined | null, seq: number): boolean {
+  if (!words || !Number.isInteger(seq) || seq <= 0) return false;
+  const n = String(seq);
+  return new RegExp(`(?:^|[^\\w#])#\\s?${n}(?!\\d)`).test(words)
+    || new RegExp(`\\bjobs?\\s*(?:no\\.?|number|num\\.?|#)?\\s*${n}(?!\\d)`, 'i').test(words);
+}
+
 export interface JobDeskDeps {
   db: Database.Database;
   jobs: ChatJobStore;
@@ -63,7 +74,8 @@ export interface JobDesk {
   noteReportShown(jobId: string): void;
   messageJob(jobId: string, text: string, input: { from: JobDeskSource; ownerWords?: string }): Promise<JobMessageResult>;
   /** Keeps a job going as it is (`jobs continue`): a pause BotBoy made clears, with a fresh round of turns (§12 R3). */
-  continueJob(jobId: string, input: { from: JobDeskSource }): Promise<JobMessageResult>;
+  /** `ownerWords`: the owner's own message of this main-chat turn (a stopped job opens again only when it names the job). */
+  continueJob(jobId: string, input: { from: JobDeskSource; ownerWords?: string }): Promise<JobMessageResult>;
   /** The main chat found a choice only the owner can make: the job asks him, with one-tap answers (the "needs you" banner). */
   askOwner(jobId: string, question: string, options: string[]): JobMessageResult;
   /** The job's reply to a main-chat message ("#N replied"). */
@@ -154,17 +166,20 @@ export function createJobDesk(deps: JobDeskDeps): JobDesk {
 
   const refuse = (code: JobMessageCode, error: string, nextAction: string): JobMessageResult => ({ ok: false, code, error, nextAction });
 
+
   /**
    * What stops the main chat from acting on a job, or null. Both sources: the owner first (he is talking to the job), and a job he
-   * stopped stays stopped. The main chat's own look (`review`) also never reopens an ended job, never overrides a pause he made,
-   * and stops once it has kept the job going MAX_REVIEW_ROUNDS times without him.
+   * stopped stays stopped until his own word picks it up again. The main chat's own look (`review`) also never reopens an ended
+   * job, never overrides a pause he made, and stops once it has kept the job going MAX_REVIEW_ROUNDS times without him.
    */
-  function refusalFor(job: ChatJob | null, from: JobDeskSource, options: { ownerTurn?: boolean } = {}): JobMessageResult | null {
+  function refusalFor(job: ChatJob | null, from: JobDeskSource, options: { ownerTurn?: boolean; ownerWords?: string } = {}): JobMessageResult | null {
     if (!job || !job.seq) return refuse('job_not_found', 'There is no such job.', 'Call jobs {"action":"list"} for the jobs and their numbers.');
-    // A job the owner stopped stays stopped until the owner picks it up again themselves (a #N message); a finished or expired
+    // A job the owner stopped opens again only on his own word: a message of his that names it (owner decision 2026-11-14: "let
+    // main chat reopen a stopped job, when my own message names it"), in the main chat or as a #N message. A finished or expired
     // job takes a follow-up from the owner's main-chat turn like one from its own thread.
-    if (job.status === 'stopped') {
-      return refuse('job_stopped', `The owner stopped #${job.seq}.`, `If the owner wants it to carry on, tell them to start a message with #${job.seq}.`);
+    if (job.status === 'stopped' && !(from === 'main_chat' && ownerNamesJob(options.ownerWords, job.seq))) {
+      return refuse('job_stopped', `The owner stopped #${job.seq}, and their message in this turn does not name it.`,
+        `Tell the owner #${job.seq} is stopped and opens again when their own message names it (for example "restart #${job.seq}" or "job ${job.seq}: carry on").`);
     }
     if (from === 'review') {
       if (job.status !== 'active') return refuse('job_not_active', `#${job.seq} has ended.`, 'Nothing to decide: tell the owner in one line how it ended.');
@@ -196,7 +211,7 @@ export function createJobDesk(deps: JobDeskDeps): JobDesk {
     const clean = String(text ?? '').trim();
     if (job?.seq && !clean) return refuse('empty_message', 'The message is empty.', 'Say what the job should do.');
     const fromMain = input.from === 'main_chat';
-    const refused = refusalFor(job, input.from, { ownerTurn: !fromMain });
+    const refused = refusalFor(job, input.from, { ownerTurn: !fromMain, ...(fromMain ? { ownerWords: input.ownerWords } : {}) });
     if (refused || !job) return refused!;
     if (fromMain && deps.ownerTurnInJob(job.id)) {
       // The owner is talking to the job in its own thread: the message waits for that reply to end (ownerTurnEnded).
@@ -252,9 +267,9 @@ export function createJobDesk(deps: JobDeskDeps): JobDesk {
     });
   }
 
-  async function continueJob(jobId: string, input: { from: JobDeskSource }): Promise<JobMessageResult> {
+  async function continueJob(jobId: string, input: { from: JobDeskSource; ownerWords?: string }): Promise<JobMessageResult> {
     const job = jobs.get(jobId);
-    const refused = refusalFor(job, input.from);
+    const refused = refusalFor(job, input.from, input.from === 'main_chat' ? { ownerWords: input.ownerWords } : {});
     if (refused || !job) return refused!;
     // A question waits for an answer: the main chat answers it (message) or leaves it for the owner.
     if (input.from === 'review' && job.pausedAt && job.pauseKind === 'question') {

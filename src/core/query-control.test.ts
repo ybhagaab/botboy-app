@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import { createQueryControl, type QueryActor, type RunningQuery } from './query-control.js';
 import { QueryStoppedReason, createQueryLedger, markControlSql, markSql } from './query-ledger.js';
 import { validateMcpToolCall } from './mcp-policy.js';
+import { DATANET_SIGN_IN_REFUSED } from './sentry-session.js';
 
 /**
  * Stopping BotBoy's own queries (docs/maps/query-control.md). The warehouse is a fake that answers the exact lookups query
@@ -395,18 +396,84 @@ describe('stopping a SQL query', () => {
 });
 
 describe('stopping an ETL run', () => {
-  it('asks Datanet to kill it, checks it ended KILLED, and leaves words that keep it from being resubmitted', async () => {
+  it('asks Datanet to kill it, checks it ended CANCELLED, and leaves words that keep it from being resubmitted', async () => {
     const t = setup();
     t.ledger.beginEtl({ runId: '77', origin: { kind: 'job', jobId: 'cj_5' }, label: 'Weekly streams' });
     t.etl.status.set('77', 'EXECUTING');
-    t.etl.onKill = (run) => t.etl.status.set(run, 'KILLED');
+    // Datanet's real answer to KILL_SESSION (live 2026-11-14): CANCELLING, then CANCELLED.
+    t.etl.onKill = (run) => t.etl.status.set(run, 'CANCELLED');
+    const began = t.now();
     const receipt = await t.control.stop('77', { kind: 'job', jobId: 'cj_5' }, 'superseded');
     expect(receipt).toMatchObject({ ok: true, kind: 'etl', state: 'stopped', verified: true, id: 'etl:77' });
+    // The first check after the kill asks Datanet, never the list's answer from a moment before: confirmed after one 2 s wait.
+    expect(t.now() - began).toBe(2_000);
     expect(t.etl.killed).toEqual([{ args: { run_id: '77', action: 'KILL_SESSION', reason: 'BotBoy: stopped by the job that started it: superseded' }, options: { ownerApproved: true } }]);
     expect(t.ledger.stoppedMessage('77')).toMatch(/Stopped on purpose by the job that started it\. Reason: superseded\. Do not resubmit/);
     expect(t.ledger.forRun('77')).toMatchObject({ endState: 'stopped' });
   });
 
+  it('the owner\'s case (2026-11-14): runs Datanet already cancelled leave Running queries at the next look, as stopped', async () => {
+    const t = setup();
+    for (const run of ['13254562333', '13254867361', '13257595845']) {
+      t.ledger.beginEtl({ runId: run, origin: { kind: 'job', jobId: 'cj_5' }, label: `Split ${run}` });
+      t.etl.status.set(run, 'CANCELLED');
+    }
+    // Two of them had a stop request whose check never saw them end; one was cancelled from the main chat's own kill.
+    t.ledger.markStopRequested('etl:13257595845', 'owner');
+    t.ledger.markStopRequested('etl:13254867361', 'owner');
+    const listing = await t.control.list({ fresh: true });
+    expect(listing.queries).toEqual([]);
+    expect(t.ledger.forRun('13257595845')).toMatchObject({ endState: 'stopped' });
+    expect(t.ledger.forRun('13254562333')).toMatchObject({ endState: 'cancelled' });
+    // Asked to stop one now, BotBoy says it had already ended instead of failing.
+    expect(await t.control.stop('13257595845', { kind: 'owner' })).toMatchObject({ ok: true, state: 'already_finished' });
+    expect(t.etl.killed).toEqual([]);
+  });
+  it('a run Datanet is already cancelling gets no second kill; the stop is confirmed when Datanet says CANCELLED', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '78', origin: { kind: 'main' } });
+    t.etl.status.set('78', 'CANCELLING');
+    let reads = 0;
+    t.etlCall.mockImplementation(async (tool: string, args: Record<string, unknown>) => {
+      if (tool !== 'datanet_get_job_run_status') throw new Error(`no ${tool} expected`);
+      reads += 1;
+      return { isError: false, text: JSON.stringify({ status: reads >= 3 ? 'CANCELLED' : 'CANCELLING', run: args.run_id }) };
+    });
+    const receipt = await t.control.stop('78', { kind: 'owner' });
+    expect(receipt).toMatchObject({ ok: true, state: 'stopped', verified: true });
+    expect(receipt.steps?.[0]).toMatch(/already cancelling run 78; no second stop was sent/);
+    expect(t.ledger.forRun('78')).toMatchObject({ endState: 'stopped' });
+  });
+  it('a kill Datanet is still carrying out reads as stop sent; the run stays listed (cancelling) until Datanet ends it', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '79', origin: { kind: 'main' } });
+    t.etl.status.set('79', 'EXECUTING');
+    t.etl.onKill = (run) => t.etl.status.set(run, 'CANCELLING');
+    const receipt = await t.control.stop('79', { kind: 'owner' });
+    expect(receipt).toMatchObject({ ok: true, state: 'stopped', verified: false });
+    expect(receipt.nextAction).toMatch(/Datanet is cancelling run 79; it leaves Running queries once Datanet finishes/);
+    const listed = await t.control.list({ fresh: true });
+    expect(listed.queries.map(query => [query.id, query.remoteStatus])).toEqual([['etl:79', 'CANCELLING']]);
+    t.etl.status.set('79', 'CANCELLED');
+    t.advance(4_000); // past the fresh read cache (3 s)
+    expect((await t.control.list({ fresh: true })).queries).toEqual([]);
+    expect(t.ledger.forRun('79')).toMatchObject({ endState: 'stopped' });
+  });
+  it('a refused kill on a run that ended meanwhile is reported as ended, never as a failed stop', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '80', origin: { kind: 'main' } });
+    t.etl.status.set('80', 'EXECUTING');
+    t.etlCall.mockImplementation(async (tool: string) => {
+      if (tool === 'datanet_alter_run') {
+        t.etl.status.set('80', 'CANCELLED');
+        return { isError: true, text: 'KILL_SESSION is not a possible action for run 80' };
+      }
+      return { isError: false, text: JSON.stringify({ status: t.etl.status.get('80') }) };
+    });
+    const receipt = await t.control.stop('80', { kind: 'owner' });
+    expect(receipt).toMatchObject({ ok: true, state: 'stopped', verified: true });
+    expect(receipt.steps?.[0]).toMatch(/Datanet did not take the stop .*the run had already ended/);
+  });
   it('a run that finished first is reported as finished, and is not marked stopped', async () => {
     const t = setup();
     t.ledger.beginEtl({ runId: '77', origin: { kind: 'main' } });
@@ -427,5 +494,59 @@ describe('stopping an ETL run', () => {
     expect(receipt).toMatchObject({ ok: false, code: 'stop_failed' });
     expect(receipt.error).toContain('not authorized');
     expect(t.ledger.stoppedMessage('77')).toBeNull();
+  });
+});
+
+/**
+ * A refused Datanet sign-in (live 2026-11-14): Amazon's device check lapsed, and every status read came back as Datanet's
+ * sign-in page for three hours while Running queries said "Datanet did not answer". The cause and its fix are named instead.
+ */
+describe('a refused Datanet sign-in', () => {
+  // The page as the a2 connector wraps it (isError false), and BotBoy's own words for it (etl-adhoc.ts › createEtlToolCall).
+  const PAGE = '{\n  "_raw": "<html>\\n<head><title>307 Temporary Redirect</title></head>\\n<body>\\n<center><h1>307 Temporary Redirect</h1></center>\\n</body>\\n</html>\\n"\n}';
+  const REFUSED = `Error: ${DATANET_SIGN_IN_REFUSED}: Datanet answered with its sign-in page, so the Datanet ETL connection needs re-authentication; Datanet did not act on this call.`;
+  const answers = (byRun: Record<string, { isError: boolean; text: string }>) => async (tool: string, args: Record<string, unknown>) => {
+    if (tool !== 'datanet_get_job_run_status') return { isError: true, text: REFUSED };
+    return byRun[String(args.run_id)] ?? { isError: true, text: 'Datanet timed out' };
+  };
+  it('names the cause and its fix in Running queries, apart from runs Datanet did not answer for, and ends nothing', async () => {
+    const t = setup();
+    for (const run of ['77', '78', '79']) t.ledger.beginEtl({ runId: run, origin: { kind: 'job', jobId: 'cj_5' } });
+    t.etlCall.mockImplementation(answers({ 77: { isError: false, text: PAGE }, 78: { isError: true, text: REFUSED } }));
+    const listing = await t.control.list({ fresh: true });
+    expect(listing.queries.map(query => [query.id, query.remoteStatus ?? null]).sort()).toEqual([['etl:77', null], ['etl:78', null], ['etl:79', null]]);
+    expect(listing.warnings).toEqual([
+      'Datanet sign-in refused (Amazon device check or Midway expired) for 2 ETL runs; they are listed as still running until Datanet answers. To fix it, run mwinit -o -s in Terminal (or Connections → Datanet ETL → Refresh Midway + Sentry), then check again.',
+      'Datanet did not answer for 1 ETL run; it is listed as still running.',
+    ]);
+    for (const run of ['77', '78', '79']) expect(t.ledger.forRun(run)?.endState ?? null).toBeNull();
+  });
+  it('one run refused reads in the singular', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '77', origin: { kind: 'main' } });
+    t.etlCall.mockImplementation(answers({ 77: { isError: false, text: PAGE } }));
+    expect((await t.control.list({ fresh: true })).warnings).toEqual([
+      'Datanet sign-in refused (Amazon device check or Midway expired) for 1 ETL run; it is listed as still running until Datanet answers. To fix it, run mwinit -o -s in Terminal (or Connections → Datanet ETL → Refresh Midway + Sentry), then check again.',
+    ]);
+  });
+  it('a stop Datanet never got because of its sign-in says so, names the fix, and marks nothing stopped', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '77', origin: { kind: 'main' } });
+    t.etlCall.mockImplementation(answers({}));
+    const receipt = await t.control.stop('etl:77', { kind: 'owner' });
+    expect(receipt).toMatchObject({ ok: false, code: 'stop_failed' });
+    expect(receipt.error).toBe(`${DATANET_SIGN_IN_REFUSED}, so Datanet did not get the stop; run 77 keeps running.`);
+    expect(receipt.nextAction).toBe('Ask the owner to run mwinit -o -s in Terminal (or Connections → Datanet ETL → Refresh Midway + Sentry), then stop it once more.');
+    expect(t.ledger.stoppedMessage('77')).toBeNull();
+  });
+  it('a stop Datanet took, whose check is then refused at sign-in, says the end is not known and names the fix', async () => {
+    const t = setup();
+    t.ledger.beginEtl({ runId: '77', origin: { kind: 'main' } });
+    t.etlCall.mockImplementation(async (tool: string) => (tool === 'datanet_alter_run'
+      ? { isError: false, text: '{"ok":true}' }
+      : { isError: false, text: PAGE }));
+    const receipt = await t.control.stop('etl:77', { kind: 'owner' });
+    expect(receipt).toMatchObject({ ok: true, state: 'still_running', verified: false });
+    expect(receipt.nextAction).toBe("Datanet took the stop, then refused BotBoy's sign-in when it checked run 77 (Amazon device check or Midway expired), so whether it ended is not known. To fix it, run mwinit -o -s in Terminal (or Connections → Datanet ETL → Refresh Midway + Sentry), then check Running queries again.");
   });
 });

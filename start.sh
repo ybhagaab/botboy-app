@@ -2762,8 +2762,51 @@ startup_safety_allows_takeover() {
   return 1
 }
 
+# Before a restart: whether it may cut Datanet off. The running a2-analytics connector keeps its Datanet (Sentry) sign-in;
+# a restart starts a new one, which signs in again through the Midway cookie jar, and Midway refuses that while Amazon's
+# device check (the jar's amazon_enterprise_access rows, 2 hours at a time) has lapsed (live 2026-11-14: lapsed 14:57,
+# restart 18:33, Datanet refused until 21:36). Checked only on a Mac that uses Datanet (the connector's sign-in file
+# exists); reads cookie names, domains and expiries, never values. A device check lapsing within 10 minutes counts.
+# Same rule and words as src/core/restart-sign-in.ts. It only warns; the restart goes on.
+restart_sign_in_warning() {
+  local jar="${BOTBOY_MIDWAY_COOKIE_FILE:-$HOME/.midway/cookie}"
+  local sentry="${BOTBOY_DATANET_SENTRY_COOKIE_FILE:-$HOME/.a2data/datanet_sentry_cookie}"
+  [ -r "$jar" ] && [ -e "$sentry" ] || return 0
+  local now="${BOTBOY_TEST_NOW_EPOCH:-$(date +%s)}"
+  local expiry
+  expiry="$(awk '
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^#HttpOnly_/) line = substr(line, 11)
+      else if (line == "" || line ~ /^#/) next
+      n = split(line, f, /[ \t]+/)
+      if (n < 6 || tolower(f[1]) !~ /midway/ || f[6] != "amazon_enterprise_access" || f[5] !~ /^[0-9]+$/) next
+      seen = 1
+      if (f[5] + 0 == 0) live = 1
+      else if (f[5] + 0 > latest + 0) latest = f[5]
+    }
+    END { if (seen && live) print 0; else if (seen) print latest }
+  ' "$jar" 2>/dev/null)" || return 0
+  [[ "$expiry" =~ ^[0-9]+$ ]] && [ "$expiry" -gt 0 ] || return 0
+  [ "$expiry" -le $((now + 600)) ] || return 0
+  local when
+  when="$(date -r "$expiry" +%H:%M)"
+  if [ "$(date -r "$expiry" +%Y-%m-%d)" != "$(date -r "$now" +%Y-%m-%d)" ]; then
+    when="$(date -r "$expiry" +%b) $((10#$(date -r "$expiry" +%d))) $when"
+  fi
+  if [ "$expiry" -le "$now" ]; then
+    echo "⚠️  Amazon's device check lapsed at $when. Datanet still works on its earlier sign-in, but a restart makes it sign in again, which may be refused until you run mwinit -o -s. Run it first to avoid that."
+  else
+    echo "⚠️  Amazon's device check lapses at $when. A restart makes Datanet sign in again, which may be refused once it lapses, until you run mwinit -o -s. Run it first to avoid that."
+  fi
+  return 0
+}
+
 safe_takeover() {
   startup_safety_allows_takeover || return 1
+  # Only a restart can cut Datanet off: say so before the running server stops.
+  [ -z "$(discover_tracker_pids)" ] || restart_sign_in_warning
   stop_existing_server
   local result=$?
   if [ "$result" = "1" ]; then
@@ -2790,6 +2833,11 @@ if [ -n "${BOTBOY_TEST_EXISTING_CLEANUP_PID:-}" ]; then
 fi
 if [ "${BOTBOY_TEST_STARTUP_SAFETY_CHECK:-0}" = "1" ]; then
   startup_safety_allows_takeover
+  exit $?
+fi
+# Prints the restart's sign-in warning, if any; stops nothing.
+if [ "${BOTBOY_TEST_RESTART_SIGN_IN:-0}" = "1" ]; then
+  restart_sign_in_warning
   exit $?
 fi
 # Prints what a takeover would signal; signals nothing.

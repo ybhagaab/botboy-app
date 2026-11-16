@@ -9,6 +9,7 @@ import {
   isPandocInstalled,
   resolveBrewExecutable,
 } from '../../product-manager/document-exporter.js';
+import { exportableContent } from '../../product-manager/citation-markers.js';
 import {
   ProductDocumentGenerationError,
   ProductDocumentRequestError,
@@ -349,7 +350,8 @@ export function createProductDocumentsRouter(deps: RouterDeps): Router {
     try {
       const artifact = service.getArtifact(artifactId);
       if (!artifact) return res.status(404).json({ error: 'Product-document artifact not found.' });
-      const exported = await exportDocument({ title: artifact.title, content: artifact.content, format, footerText: deps.exportFooter?.effective() ?? '' });
+      // Citation markers stay in BotBoy: the download carries none (citation-markers.ts).
+      const exported = await exportDocument({ title: artifact.title, content: exportableContent(artifact), format, footerText: deps.exportFooter?.effective() ?? '' });
       res.set('Content-Type', exported.mediaType);
       res.set('Content-Disposition', `attachment; filename="${exported.filename}"`);
       return res.send(exported.data);

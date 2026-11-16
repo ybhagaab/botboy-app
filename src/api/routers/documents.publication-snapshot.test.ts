@@ -53,7 +53,7 @@ describe('publication approval remote snapshot', () => {
     return app;
   }
 
-  function setupUpdate(options: { target?: string; format?: 'md' | 'docx'; baseRemoteItemId?: string | null } = {}): {
+  function setupUpdate(options: { target?: string; format?: 'md' | 'docx'; baseRemoteItemId?: string | null; v2?: Partial<ProductDocumentArtifact> } = {}): {
     productDocuments: ProductDocumentService;
     publications: ProductDocumentPublicationService;
     staged: ReturnType<ProductDocumentPublicationService['stage']>;
@@ -80,7 +80,7 @@ describe('publication approval remote snapshot', () => {
       } as ProductDocumentArtifact],
       ['artifact-v2', {
         artifactId: 'artifact-v2', parentArtifactId: 'artifact-v1', persisted: true,
-        projectId: 'p1', title: 'Catalog strategy', content: V2,
+        projectId: 'p1', title: 'Catalog strategy', content: V2, ...options.v2,
       } as ProductDocumentArtifact],
     ]);
     const productDocuments = {
@@ -325,6 +325,54 @@ describe('publication approval remote snapshot', () => {
       verifiedRemoteSha256: sha256Buffer(Buffer.from(V2)),
       capturedWorkItemId: 'capture-v2',
     });
+  });
+
+  // Owner request 2026-11-16: the reader's [c1] chips are noise in a published file.
+  it('publishes the document without its citation markers and verifies those exact bytes', async () => {
+    const cited = '# Catalog strategy\n\nThe exact V2 artifact becomes the next version [c1][c2], with one owner [c1].';
+    const published = '# Catalog strategy\n\nThe exact V2 artifact becomes the next version, with one owner.';
+    const { productDocuments, publications, staged } = setupUpdate({
+      v2: { content: cited, citations: [{ id: 'c1', label: 'Thread' }, { id: 'c2', label: 'Email' }] } as Partial<ProductDocumentArtifact>,
+    });
+    const state = { itemId: '140', remote: Buffer.from(V1), etag: 'etag-v1', version: '1.0', modified: '2026-09-16T01:00:00Z' };
+    const writes: Array<Record<string, unknown>> = [];
+    const mcpManager = {
+      callTool: async (_server: string, tool: string, args: Record<string, unknown>) => {
+        if (tool === 'sharepoint_list_files') return { text: listedIdentity(state), isError: false };
+        if (tool === 'sharepoint_read_file') {
+          writeFileSync(String(args.savePath), state.remote);
+          return { text: '{}', isError: false };
+        }
+        if (tool === 'sharepoint_write_file') {
+          writes.push(args);
+          state.remote = Buffer.from(String(args.content ?? ''));
+          state.etag = 'etag-v2';
+          state.version = '2.0';
+          state.modified = '2026-09-16T03:00:00Z';
+          return { text: JSON.stringify({ Id: 140, eTag: state.etag }), isError: false };
+        }
+        throw new Error(`unexpected tool ${tool}`);
+      },
+    };
+    const sharePointSync = {
+      enqueueByPath: () => ({ queued: true, docKey: staged.publication.docKey }),
+      drainNow: async () => {
+        publications.recordCapture(staged.publication.publicationId, 'capture-v2', staged.publication.docKey);
+        return 1;
+      },
+    };
+    const app = appWith({ mcpManager: mcpManager as never, sharePointSync: sharePointSync as never, productDocumentService: productDocuments, productDocumentPublications: publications });
+    await request(app).post(`/api/documents/pending-edits/${staged.pendingEdit.id}/approve`).send({}).expect(200);
+    const synced = await request(app).post('/api/documents/sync').send({ docKey: staged.publication.docKey }).expect(200);
+    expect(synced.body).toMatchObject({ uploaded: true, verifiedOnReadBack: true });
+    expect(writes).toHaveLength(1);
+    expect(state.remote.toString('utf8')).toBe(published);
+    expect(publications.get(staged.publication.publicationId)).toMatchObject({
+      status: 'complete',
+      exportSha256: sha256Buffer(Buffer.from(published)),
+      verifiedRemoteSha256: sha256Buffer(Buffer.from(published)),
+    });
+    expect(productDocuments.getArtifact('artifact-v2')?.content).toBe(cited);
   });
 
   it('blocks post-approval drift before write and records one actionable target conflict', async () => {

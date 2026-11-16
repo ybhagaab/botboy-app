@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createNodeManager } from './node-manager.js';
-import { createToolExecutor, type ToolExecutionContext } from './tool-executor.js';
+import { CANCEL_QUERY_TIMEOUT_MS, createToolExecutor, type ToolExecutionContext } from './tool-executor.js';
 import { createQueryLedger, type QueryLedger } from './query-ledger.js';
 import { createQueryControl, type QueryControl } from './query-control.js';
 
@@ -56,6 +56,26 @@ describe('cancel_query', () => {
     flight(DASH, { kind: 'dashboard', label: 'Dashboard "Weekly", widget "Streams"' });
   };
 
+  it('a stop that takes longer than 10 s still answers with its receipt: cancel_query has its own limit (live 2026-11-14)', async () => {
+    vi.useFakeTimers();
+    try {
+      const slow = {
+        list: async () => ({ queries: [], checkedAt: new Date().toISOString(), warnings: [] }),
+        stop: () => new Promise(resolve => setTimeout(() => resolve({ ok: true, id: 'etl:77', kind: 'etl', state: 'stopped', verified: true }), 25_000)),
+        mayStop: () => true,
+        starterOf: () => 'the main chat',
+      } as unknown as QueryControl;
+      const pending = createToolExecutor(storage.getDb(), createNodeManager(storage.getDb()), { mcpManager: { callTool } as any, queryControl: slow })
+        .executeTool({ id: 'cq-slow', type: 'function', function: { name: 'cancel_query', arguments: JSON.stringify({ action: 'cancel', id: '77', ownerRequested: true }) } }, owner());
+      await vi.advanceTimersByTimeAsync(25_000);
+      const result = await pending;
+      expect(result.content).not.toMatch(/Tool timeout/);
+      expect(JSON.parse(result.content)).toMatchObject({ ok: true, state: 'stopped', verified: true });
+      expect(CANCEL_QUERY_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('a job\'s own turn lists and stops only its own queries; ownerRequested never widens it there', async () => {
     seed();
     const listed = await run({ action: 'list' }, continuation('cj_5'));

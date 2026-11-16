@@ -170,6 +170,8 @@ export interface RouterDeps {
   };
   /** In-app update for botboy-app installs (app-update.ts). */
   appUpdater?: import('../../core/app-update.js').AppUpdater;
+  /** Tests only: whether a restart now may cut Datanet off (default: restart-sign-in.ts › readRestartSignInRisk). */
+  restartSignInRisk?: () => import('../../core/restart-sign-in.js').RestartSignInRisk;
   /** Owner jobs and their watched ETL runs (chat-jobs.ts). */
   chatJobs?: ChatJobStore;
   /** BotBoy's own running SQL queries and ETL runs, and stopping them (query-control.ts): the panel's Running queries. */

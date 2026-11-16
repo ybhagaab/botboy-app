@@ -87,15 +87,15 @@ describe('etl-adhoc query runner', () => {
     expect(result.ok).toBe(true);
     expect(ledger.forRun('555001')).toMatchObject({ id: 'etl:555001', kind: 'etl', origin: 'job', jobId: 'cj_5', label: 'Weekly streams', preview: 'select 1', endState: 'success' });
   });
-  it('a run query control killed reads as stopped on purpose, with no diagnosis and no retry advice', async () => {
+  it('a run query control stopped (Datanet: CANCELLED) reads as stopped on purpose, with no diagnosis and no retry advice', async () => {
     const ledger = createQueryLedger(storage.getDb());
     const fake = fakeEtl();
     fake.when('datanet_get_job_run_status', () => {
       ledger.markStopRequested('etl:555001', 'owner', 'wrong market');
-      return { isError: false, text: JSON.stringify({ status: 'KILLED' }) };
+      return { isError: false, text: JSON.stringify({ status: 'CANCELLED' }) };
     });
     const result = await runner(fake).runQuery({ sql: 'select 1', origin: { kind: 'main' } });
-    expect(result).toMatchObject({ ok: false, code: 'remote_failed', runId: '555001', remoteStatus: 'KILLED' });
+    expect(result).toMatchObject({ ok: false, code: 'remote_failed', runId: '555001', remoteStatus: 'CANCELLED' });
     expect(result.error).toContain('Stopped on purpose by the owner');
     expect(result.error).toContain('Reason: wrong market');
     expect(result.nextAction).toMatch(/^Do not resubmit run 555001/);
@@ -104,14 +104,27 @@ describe('etl-adhoc query runner', () => {
     const read = await runner(fake).readRun!({ runId: '555001' });
     expect(read.error).toContain('Stopped on purpose by the owner');
   });
-  it('a KILLED run nobody stopped through BotBoy is diagnosed as before', async () => {
+  it('a run someone cancelled in Datanet ends at once, is never resubmitted on BotBoy\'s own say-so, and needs no diagnosis', async () => {
+    const ledger = createQueryLedger(storage.getDb());
+    const fake = fakeEtl();
+    fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'CANCELLED' }) }));
+    const result = await runner(fake).runQuery({ sql: 'select 1' });
+    expect(result).toMatchObject({ ok: false, code: 'remote_failed', remoteStatus: 'CANCELLED' });
+    expect(result.error).toMatch(/cancelled in Datanet, not through BotBoy/);
+    expect(result.error).not.toContain('Stopped on purpose');
+    expect(result.nextAction).toMatch(/^Do not resubmit run 555001/);
+    expect(fake.countOf('datanet_get_job_run_error')).toBe(0);
+    expect(ledger.forRun('555001')).toMatchObject({ endState: 'cancelled' });
+    const read = await runner(fake).readRun!({ runId: '555001' });
+    expect(read).toMatchObject({ ok: false, code: 'remote_failed', remoteStatus: 'CANCELLED' });
+  });
+
+  it('a run Datanet is still cancelling is still in flight: the poll waits on, and the pair stays busy', async () => {
     createQueryLedger(storage.getDb());
     const fake = fakeEtl();
-    fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'KILLED' }) }));
-    const result = await runner(fake).runQuery({ sql: 'select 1' });
-    expect(result.ok).toBe(false);
-    expect(result.error).not.toContain('Stopped on purpose');
-    expect(fake.countOf('datanet_get_job_run_error')).toBe(1);
+    fake.when('datanet_get_job_run_status', () => ({ isError: false, text: JSON.stringify({ status: 'CANCELLING' }) }));
+    const read = await runner(fake).readRun!({ runId: '555001' });
+    expect(read).toMatchObject({ ok: false, code: 'alive_handoff', remoteStatus: 'CANCELLING' });
   });
   it('creates the scratch pair ONCE and reuses it: second query submits without any create calls', async () => {
     const fake = fakeEtl();

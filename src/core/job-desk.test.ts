@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createStorage, type StorageLayer } from './storage.js';
 import { createChatJobStore, JOB_CONTINUE_REASON, JOB_MESSAGE_REASON, JOB_REVIEW_REASON, MAX_REVIEW_ROUNDS, type ChatJobStore } from './chat-jobs.js';
-import { createJobDesk, REPORT_CATCH_UP_MS, type JobDeskDeps } from './job-desk.js';
+import { createJobDesk, ownerNamesJob, REPORT_CATCH_UP_MS, type JobDeskDeps } from './job-desk.js';
 
 /**
  * The main chat's desk for jobs (PARALLEL_JOBS_PLAN.md §11, owner decisions 2026-11-08): a finished job's own report reaches the
@@ -254,6 +254,45 @@ describe('job desk', () => {
     expect(result.ok === false && result.nextAction).toContain(`#${job.seq}`);
     expect(jobs.get(job.id)).toMatchObject({ status: 'stopped', inbox: [] });
     expect(rows()).toEqual([]);
+  });
+
+  it('a job the owner stopped opens again from the main chat when the owner\'s own message names it (owner decision 2026-11-14)', async () => {
+    const job = jobs.start({ goal: 'g', title: 'OTT CX behaviour study' });
+    jobs.end(job.id, 'stopped', 'stopped by the owner');
+    const words = `go ahead & restart #${job.seq}, and check the Cradle query`;
+    const result = await makeDesk().messageJob(job.id, 'Carry on from the saved plan.', { from: 'main_chat', ownerWords: words });
+    expect(result).toMatchObject({ ok: true, job: { reopened: true, status: 'active' } });
+    expect(jobs.get(job.id)).toMatchObject({ status: 'active', inbox: [{ text: 'Carry on from the saved plan.', ownerWords: words }] });
+    // continue works the same way.
+    const other = jobs.start({ goal: 'g', title: 'Second' });
+    jobs.end(other.id, 'stopped', 'stopped by the owner');
+    expect(await makeDesk().continueJob(other.id, { from: 'main_chat', ownerWords: `job ${other.seq}: carry on` }))
+      .toMatchObject({ ok: true, job: { reopened: true } });
+    expect(jobs.get(other.id)!.status).toBe('active');
+  });
+
+  it('the owner\'s words must name THIS job, and BotBoy\'s own look never reopens a stopped job, whatever words it carries', async () => {
+    const job = jobs.start({ goal: 'g', title: 'Stopped one' });
+    jobs.end(job.id, 'stopped', 'stopped by the owner');
+    for (const words of ['restart it please', `restart #${job.seq}0`, `job 1${job.seq}`, `restart the job`]) {
+      const result = await makeDesk().messageJob(job.id, 'Carry on.', { from: 'main_chat', ownerWords: words });
+      expect(result, words).toMatchObject({ ok: false, code: 'job_stopped' });
+      expect(result.ok === false && result.nextAction, words).toContain(`restart #${job.seq}`);
+    }
+    expect(await makeDesk().continueJob(job.id, { from: 'review', ownerWords: `restart #${job.seq}` })).toMatchObject({ ok: false, code: 'job_stopped' });
+    expect(await makeDesk().messageJob(job.id, 'Carry on.', { from: 'review', ownerWords: `restart #${job.seq}` })).toMatchObject({ ok: false, code: 'job_stopped' });
+    expect(jobs.get(job.id)).toMatchObject({ status: 'stopped', inbox: [] });
+  });
+
+  it('names a job by #N, "# N", job N, job #N, jobs N and M, job no. N or job number N, and never by a longer number', () => {
+    for (const words of ['#5', 'restart #5,', '(#5)', '# 5 go', 'job 5', 'Job #5', 'the job5 queries', 'jobs 5 and 21', 'job no. 5', 'job number 5', "#5's queries"]) {
+      expect(ownerNamesJob(words, 5), words).toBe(true);
+    }
+    for (const words of ['#55', 'job 15', 'job 50', 'a#5', 'restart it', '', '5', 'step 5']) {
+      expect(ownerNamesJob(words, 5), words).toBe(false);
+    }
+    expect(ownerNamesJob('#5', 0)).toBe(false);
+    expect(ownerNamesJob(undefined, 5)).toBe(false);
   });
 
   it('when the step that gave way had paused the job by itself, the message\'s turn is made due again', async () => {

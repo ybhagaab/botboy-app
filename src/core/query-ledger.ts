@@ -19,6 +19,7 @@
  * manager notes every one), so query control lists and stops it like any other query.
  */
 import type Database from 'better-sqlite3';
+import { DATANET_TERMINAL_STATES } from './datanet-run-states.js';
 import { randomUUID } from 'node:crypto';
 import { NETWORK_FAILURE_WORDS } from './capture-health.js';
 
@@ -118,8 +119,8 @@ export function isConnectionLost(message: unknown): boolean {
     || /could not reach the database server|connection terminated|connection (?:ended|closed|reset)|server closed the connection|terminating connection|lost the (?:database )?connection/i.test(text);
 }
 
-/** Datanet run states that end a run. */
-export const ETL_TERMINAL_STATES = new Set(['SUCCESS', 'ERROR', 'KILLED', 'DELETED']);
+/** Datanet run states that end a run (datanet-run-states.ts: Datanet's own list; a stopped run ends CANCELLED). */
+export const ETL_TERMINAL_STATES = DATANET_TERMINAL_STATES;
 
 /** An export's status as sql-context's export_status (or a background export_query) answers it. */
 export interface SqlExportStatus {
@@ -207,7 +208,7 @@ export interface QueryLedger {
    */
   sqlSuspects(sinceIso: string, recentSinceIso: string): QueryRecord[];
   /**
-   * Query control is about to stop it: who and why, recorded BEFORE the stop is sent, so a reader that sees the run KILLED a
+   * Query control is about to stop it: who and why, recorded BEFORE the stop is sent, so a reader that sees the run CANCELLED a
    * moment later already reports it as stopped on purpose.
    */
   markStopRequested(id: string, by: string, reason?: string): void;
@@ -215,7 +216,7 @@ export interface QueryLedger {
   clearStopRequest(id: string): void;
   /** The stop was confirmed: the query no longer runs. */
   markStopped(id: string): void;
-  /** For a run query control stopped: the words its reader reports instead of the bare KILLED status. */
+  /** For a run query control stopped: the words its reader reports instead of the bare CANCELLED status. */
   stoppedMessage(runId: string): string | null;
   /** For a background export query control stopped: the words its reader reports instead of a bare "cancelled". */
   exportStoppedMessage(exportId: string): string | null;
@@ -370,10 +371,12 @@ export function createQueryLedger(db: Database.Database, options: { now?: () => 
     endEtl(runId, remoteStatus, note) {
       const status = String(remoteStatus ?? '').toUpperCase();
       if (!ETL_TERMINAL_STATES.has(status)) return;
+      // A run BotBoy was asked to stop that Datanet then cancelled is stopped: the stop worked, even when its check timed out.
       safely('the end of an ETL run', () => db.prepare(`UPDATE query_ledger SET ended_at = COALESCE(ended_at, ?),
-          end_state = CASE WHEN end_state = 'stopped' THEN end_state ELSE ? END, end_note = COALESCE(end_note, ?)
+          end_state = CASE WHEN end_state = 'stopped' OR (? = 'CANCELLED' AND stopped_by IS NOT NULL) THEN 'stopped' ELSE ? END,
+          end_note = COALESCE(end_note, ?)
         WHERE run_id = ? AND kind = 'etl'`)
-        .run(iso(), status.toLowerCase(), note ? fold(note, 300) : null, String(runId)));
+        .run(iso(), status, status.toLowerCase(), note ? fold(note, 300) : null, String(runId)));
     },
     inFlight: () => [...flights.values()],
     inFlightById: (id) => flights.get(id),

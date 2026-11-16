@@ -50,7 +50,12 @@ export const JOB_CONTINUE_REASON = 'BotBoy\'s main chat looked at this job and d
 export const JOB_REPORT_CHARS = 8_000;
 /** Next steps a finished job offers as one-tap buttons in the main chat. */
 export const MAX_NEXT_STEPS = 3;
-const MAX_NEXT_STEP_CHARS = 60;
+/**
+ * How long a one-tap answer or next step may be. A tap sends the whole text to the job, so this is a bound, never a label
+ * width: the button clips its label on screen (dashboard.css › .jobs-chip.action) and keeps the whole text. Owner report
+ * 2026-11-14: at 40 and 60 characters a tap sent "Submit P1 only, report back before P2 an".
+ */
+export const MAX_ONE_TAP_CHARS = 300;
 /** Messages from the main chat waiting for a job's next turn (newest kept), and how long one may be. */
 export const JOB_INBOX_MAX = 5;
 export const JOB_INBOX_TEXT_CHARS = 2_000;
@@ -646,7 +651,6 @@ const FIRST_BOOT_NUMBERED_ENDED_MS = 12 * 60 * 60_000;
 /** A last word that only joins to what was cut off (the title keeps at least its first word). */
 const TRAILING_JOINER = /\s+(?:a|an|the|and|or|but|of|to|for|from|with|without|using|via|in|on|at|by|into|over|about|as|that|which|so)$/i;
 const MAX_OPTIONS = 4;
-const MAX_OPTION_CHARS = 40;
 
 /**
  * A short name from the owner's words when the model gave none: the first clause, polite openers dropped, at most six words.
@@ -674,13 +678,13 @@ function parseOptions(raw: unknown): string[] | undefined {
   }
 }
 
-/** Cleans a finished job's next steps: short, distinct, at most three (each is a message the owner sends with one tap). */
+/** Cleans a finished job's next steps: whole (up to MAX_ONE_TAP_CHARS), distinct, at most three (each is a message the owner sends with one tap). */
 export function cleanNextSteps(steps: unknown): string[] {
   if (!Array.isArray(steps)) return [];
   const seen = new Set<string>();
   const clean: string[] = [];
   for (const step of steps) {
-    const text = clip(step, MAX_NEXT_STEP_CHARS).replace(/[.;,]+$/, '');
+    const text = clip(step, MAX_ONE_TAP_CHARS).replace(/[.;,]+$/, '');
     if (!text || seen.has(text.toLowerCase())) continue;
     seen.add(text.toLowerCase());
     clean.push(text);
@@ -723,13 +727,13 @@ function keepText(text: unknown, max: number): string {
   return String(text ?? '').replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, max).trim();
 }
 
-/** Cleans one-tap answers: short, distinct, at most four. */
+/** Cleans one-tap answers: whole (up to MAX_ONE_TAP_CHARS), distinct, at most four. */
 export function cleanJobOptions(options: unknown): string[] {
   if (!Array.isArray(options)) return [];
   const seen = new Set<string>();
   const clean: string[] = [];
   for (const option of options) {
-    const text = clip(option, MAX_OPTION_CHARS);
+    const text = clip(option, MAX_ONE_TAP_CHARS);
     if (!text || seen.has(text.toLowerCase())) continue;
     seen.add(text.toLowerCase());
     clean.push(text);

@@ -19,13 +19,14 @@ const html = readFileSync(path.join(process.cwd(), 'src/ui/index.html'), 'utf8')
 const MESSAGE = 'BotBoy has stopped or is restarting. Open BotBoy from Applications to continue.';
 
 type Mode = 'up' | 'down' | 'starting' | 'stopping' | 'broken';
-const server = { mode: 'up' as Mode, bootId: 'boot-1', pollsAnswered: 0 };
+const server = { mode: 'up' as Mode, bootId: 'boot-1', pollsAnswered: 0, signInLapsed: false, updateRefused: false, updateStarts: [] as unknown[] };
+const LAPSED = "Amazon's device check lapsed at 23:36. Datanet still works on its earlier sign-in, but a restart makes it sign in again, which may be refused until you run mwinit -o -s. Run it first to avoid that.";
 
 function json(status: number, body: unknown) {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-async function fakeFetch(input: unknown, init?: { method?: string }) {
+async function fakeFetch(input: unknown, init?: { method?: string; body?: unknown }) {
   const { pathname } = new URL(String(input), 'http://localhost:7778');
   if (server.mode === 'down') throw new TypeError('Failed to fetch');
   if (server.mode === 'starting' && pathname.startsWith('/api/')) return json(503, { booting: true, uptimeMs: 1000 });
@@ -41,7 +42,13 @@ async function fakeFetch(input: unknown, init?: { method?: string }) {
   if (pathname === '/api/chat/history') return json(200, [{ id: 'm1', role: 'user', content: 'hello there' }, { id: 'm2', role: 'assistant', content: 'hi' }]);
   if (pathname === '/api/chat/jobs/active') return json(200, { job: null, recent: null });
   if (pathname === '/api/app-update/status') return json(200, { supported: true, available: true, updating: false, behind: 1 });
-  if (pathname === '/api/app-update/start') return json(200, { ok: true, message: 'Updating. BotBoy will restart on its own.' });
+  if (pathname === '/api/app-update/start') {
+    const body = init?.body ? JSON.parse(String(init.body)) : {};
+    server.updateStarts.push(body);
+    if (server.updateRefused) return json(409, { ok: false, code: 'update_running', error: 'An update is already running.' });
+    if (server.signInLapsed && body.confirmed !== true) return json(409, { ok: false, code: 'sign_in_lapsed', error: LAPSED, confirm: 'Update anyway?' });
+    return json(200, { ok: true, message: 'Updating. BotBoy will restart on its own.' });
+  }
   if (pathname === '/api/nodes/roots' || pathname === '/api/areas' || pathname === '/api/projects') return json(200, []);
   return json(200, init?.method === 'POST' ? { ok: true } : {});
 }
@@ -83,6 +90,9 @@ async function bootPage(hash = '#/settings/workplace') {
   server.mode = 'up';
   server.bootId = 'boot-1';
   server.pollsAnswered = 0;
+  server.signInLapsed = false;
+  server.updateRefused = false;
+  server.updateStarts = [];
   navigations.length = 0;
   unhandled.length = 0;
   FakeEventSource.instances.length = 0;
@@ -281,5 +291,57 @@ describe('server restarted (stopping 503, gone, starting 503, new boot)', () => 
     await waitUntil(() => navigations.length > 0, 12);
     expect(navigations).toEqual(['reload']);
     expect(banner().textContent).toBe('');
+  });
+});
+
+// An update restarts BotBoy; while Amazon's device check has lapsed that may cut Datanet off, so the button asks first
+// (docs/maps/midway-sentinel.md › Restart sign-in check; src/core/restart-sign-in.ts).
+describe('the Update button while Amazon\'s device check has lapsed', () => {
+  it('asks first with the reason; Cancel starts nothing and leaves the button as it was', async () => {
+    await bootPage();
+    await seconds(20);
+    server.signInLapsed = true;
+    const confirm = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirm);
+    const button = document.getElementById('app-update-button') as HTMLButtonElement;
+    button.click();
+    await seconds(1);
+    expect(confirm).toHaveBeenCalledWith(`${LAPSED}\n\nUpdate anyway?`);
+    expect(server.updateStarts).toEqual([{}]);
+    expect(button.textContent).toContain('Update available');
+    expect(button.disabled).toBe(false);
+  });
+  it('OK starts the update, saying it was confirmed', async () => {
+    await bootPage();
+    await seconds(20);
+    server.signInLapsed = true;
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    const button = document.getElementById('app-update-button') as HTMLButtonElement;
+    button.click();
+    await seconds(1);
+    expect(server.updateStarts).toEqual([{}, { confirmed: true }]);
+    expect(button.textContent).toContain('Updating');
+  });
+  it('any other refusal is reported as before, without asking', async () => {
+    await bootPage();
+    await seconds(20);
+    server.updateRefused = true;
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    (document.getElementById('app-update-button') as HTMLButtonElement).click();
+    await seconds(1);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(server.updateStarts).toEqual([{}]);
+    expect(document.body.textContent).toContain('Update did not start: HTTP 409 — An update is already running.');
+  });
+  it('with the device check fine, it asks nothing', async () => {
+    await bootPage();
+    await seconds(20);
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    (document.getElementById('app-update-button') as HTMLButtonElement).click();
+    await seconds(1);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(server.updateStarts).toEqual([{}]);
   });
 });

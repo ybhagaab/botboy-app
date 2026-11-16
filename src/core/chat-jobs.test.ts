@@ -13,6 +13,7 @@ import {
   recordToolOutcome,
   withJobCards,
   workspaceRelativePath,
+  MAX_ONE_TAP_CHARS,
   type ChatJobStore,
 } from './chat-jobs.js';
 
@@ -410,9 +411,9 @@ describe('chat job settle state', () => {
 
   it('a question keeps its one-tap answers until the job moves on; any other pause offers none', () => {
     const job = jobs.start({ goal: 'g' });
-    jobs.declare(job.id, 'needs_owner', 'Short or long?', ['Short', ' Long ', 'short', 'x'.repeat(60), 'A', 'B']);
+    jobs.declare(job.id, 'needs_owner', 'Short or long?', ['Short', ' Long ', 'short', 'x'.repeat(400), 'A', 'B']);
     jobs.settle(job.id, { action: 'pause', note: 'Short or long?', kind: 'question' }, 'answered');
-    expect(jobs.get(job.id)).toMatchObject({ pauseKind: 'question', options: ['Short', 'Long', 'x'.repeat(40), 'A'] });
+    expect(jobs.get(job.id)).toMatchObject({ pauseKind: 'question', options: ['Short', 'Long', 'x'.repeat(MAX_ONE_TAP_CHARS), 'A'] });
     jobs.ownerResumed(job.id);
     expect(jobs.get(job.id)?.options).toBeUndefined();
     jobs.declare(job.id, 'needs_owner', 'Which?', ['One', 'Two']);

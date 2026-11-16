@@ -27,6 +27,7 @@
  * EtlQueryRunner by availability. Only the interface ships now (A4 parked).
  */
 import { isAmazonEmployeeOffError } from './workplace.js';
+import { DATANET_IN_FLIGHT_STATES, isDatanetCancelled, isDatanetTerminal } from './datanet-run-states.js';
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
@@ -34,7 +35,13 @@ import path from 'path';
 import { createHash } from 'node:crypto';
 import { getSetting, setSetting } from './storage.js';
 import { resolveOwnerIdentity } from './owner-identity.js';
-import { isSentryAuthShapedError, primeDatanetSentrySession } from './sentry-session.js';
+import {
+  DATANET_SIGN_IN_FIX,
+  DATANET_SIGN_IN_REFUSED,
+  isDatanetSignInRefusal,
+  isSentryAuthShapedError,
+  primeDatanetSentrySession,
+} from './sentry-session.js';
 import type { McpManager } from './mcp-types.js';
 import { DOWNLOAD_STILL_RUNNING, downloadResult, knownResult, landingError, landingNextAction, summarizeResultFile } from './etl-downloads.js';
 import { getQueryLedger, type QueryOrigin } from './query-ledger.js';
@@ -47,6 +54,8 @@ export type EtlToolCall = (
 ) => Promise<{ isError: boolean; text: string; serverId?: string; toolName?: string }>;
 
 export const ETL_TOOL_TIMEOUT_MS = 5 * 60_000;
+
+const SIGN_IN_REMEDY = 'Tell the owner to run `mwinit -o -s` (or use Connections → Datanet ETL → Refresh Midway + Sentry), then retry this tool.';
 
 /**
  * The one way BotBoy talks to the a2-analytics server: policy-gated call
@@ -99,12 +108,14 @@ export function createEtlToolCall(mcpManager: McpManager): EtlToolCall {
       }
       const prime = await primeDatanetSentrySession();
       if (!prime.ok) {
-        return { isError: true, text: `Error: the Datanet ETL connection needs re-authentication and the silent Kerberos re-prime failed (${prime.reason}). Tell the owner to run \`mwinit -o -s\` (or use Connections → Datanet ETL → Refresh Midway + Sentry), then retry this tool.` };
+        return { isError: true, text: `Error: ${DATANET_SIGN_IN_REFUSED}, and the silent Kerberos re-prime failed (${prime.reason}), so the Datanet ETL connection needs re-authentication; Datanet did not act on this call. ${SIGN_IN_REMEDY}` };
       }
       result = await call();
     }
     if (isSentryAuthShapedError(result.text)) {
-      return { isError: true, text: 'Error: the Datanet ETL connection needs re-authentication. Tell the owner to run `mwinit -o -s` (or use Connections → Datanet ETL → Refresh Midway + Sentry), then retry this tool.' };
+      // The words name the cause (query-control.ts and readRun read them with isDatanetSignInRefusal); "needs
+      // re-authentication" stays for analytics-runners.ts › lane availability and the chat guidance.
+      return { isError: true, text: `Error: ${DATANET_SIGN_IN_REFUSED}: Datanet answered with its sign-in page, so the Datanet ETL connection needs re-authentication; Datanet did not act on this call. ${SIGN_IN_REMEDY}` };
     }
     return { isError: result.isError, text: result.text, serverId: result.serverId, toolName: result.toolName };
   };
@@ -131,6 +142,8 @@ export interface QueryRunResult {
   resultSha256?: string;
   /** alive_handoff from runQuery: the queue rescue (one PRIORITIZE) already ran. */
   prioritized?: boolean;
+  /** Datanet answered the status read with its sign-in page (sentry-session.ts › DATANET_SIGN_IN_REFUSED): the run is unaffected. */
+  signInRefused?: boolean;
   /** Non-ok: what happened, in one line the model can act on. */
   error?: string;
   /** Non-ok: the exact next action. Never leaves the model guessing. */
@@ -202,8 +215,8 @@ function ledgerFor(db: Database.Database): Set<string> {
 
 /** Run-states that occupy a pair's job (submitting under these risks
  * Datanet's duplicate-collapse and SQL-revision clobber). */
-const IN_FLIGHT_STATES = new Set(['NEW', 'SUBMITTED', 'RUNNABLE', 'EXECUTING',
-  'WAITING_FOR_RESOURCES', 'WAITING_FOR_REQUIREMENTS', 'WAITING_FOR_DEPENDENCIES']);
+// Every state that is not terminal, CANCELLING included: Datanet's own list (datanet-run-states.ts).
+const IN_FLIGHT_STATES = DATANET_IN_FLIGHT_STATES;
 
 export interface EtlAdhocOptions {
   db: Database.Database;
@@ -527,6 +540,18 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       };
     }
     const poll = await call('datanet_get_job_run_status', { run_id: runId });
+    const remoteStatus = poll.isError ? '' : String(parseJson(poll.text).status ?? '').toUpperCase();
+    if (!remoteStatus && isDatanetSignInRefusal(poll.text)) {
+      // A refused sign-in is not a run failure: the run goes on in Datanet, and the read works again once the owner signs in.
+      return {
+        ok: false,
+        code: 'status_unavailable',
+        runId,
+        signInRefused: true,
+        error: `${DATANET_SIGN_IN_REFUSED}, so BotBoy could not read run ${runId}; the run itself is not affected.`,
+        nextAction: `Do not resubmit the query. Ask the owner to ${DATANET_SIGN_IN_FIX}, then read this run again.`,
+      };
+    }
     if (poll.isError) {
       return {
         ok: false,
@@ -536,7 +561,6 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         nextAction: 'Retry this read later; do not resubmit the query.',
       };
     }
-    const remoteStatus = String(parseJson(poll.text).status ?? '').toUpperCase();
     if (!remoteStatus) {
       return {
         ok: false,
@@ -548,9 +572,9 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     }
     getQueryLedger(db)?.endEtl(runId, remoteStatus);
     if (remoteStatus === 'SUCCESS') return downloadRun(runId);
-    const stopped = remoteStatus === 'KILLED' ? stoppedOnPurpose(runId) : null;
-    if (stopped) return stopped;
-    if (remoteStatus === 'ERROR' || remoteStatus === 'KILLED') {
+    // A stopped run ends CANCELLED (there is no KILLED in Datanet): stopped on purpose, or cancelled by someone in Datanet.
+    if (isDatanetCancelled(remoteStatus)) return stoppedOnPurpose(runId) ?? cancelledRun(runId);
+    if (remoteStatus === 'ERROR') {
       const diagnose = await call('datanet_get_job_run_error', { run_id: runId });
       const diagnosed = parseJson(diagnose.text);
       const detail = diagnose.isError
@@ -586,8 +610,9 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
   }
 
   /**
-   * A KILLED run that BotBoy's query control stopped (query-ledger.ts): its reader says so, with "Do not resubmit", so a dashboard
-   * never retries it on the other lane and a model never runs it again on its own (docs/maps/query-control.md).
+   * A CANCELLED run that BotBoy's query control (or a kill BotBoy sent) stopped (query-ledger.ts): its reader says so, with "Do not
+   * resubmit", so a dashboard never retries it on the other lane and a model never runs it again on its own
+   * (docs/maps/query-control.md).
    */
   function stoppedOnPurpose(runId: string): QueryRunResult | null {
     const words = getQueryLedger(db)?.stoppedMessage(runId);
@@ -596,9 +621,20 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
       ok: false,
       code: 'remote_failed',
       runId,
-      remoteStatus: 'KILLED',
-      error: `Run ${runId} KILLED. ${words}`,
+      remoteStatus: 'CANCELLED',
+      error: `Run ${runId} CANCELLED. ${words}`,
       nextAction: `Do not resubmit run ${runId}'s query: it was stopped on purpose. Ask the owner before running it again.`,
+    };
+  }
+  /** A CANCELLED run BotBoy did not stop: someone cancelled it in Datanet. It is never resubmitted on BotBoy's own say-so. */
+  function cancelledRun(runId: string): QueryRunResult {
+    return {
+      ok: false,
+      code: 'remote_failed',
+      runId,
+      remoteStatus: 'CANCELLED',
+      error: `Run ${runId} CANCELLED. It was cancelled in Datanet, not through BotBoy, so it has no result.`,
+      nextAction: `Do not resubmit run ${runId}'s query on your own: someone cancelled it on purpose. Ask the owner before running it again.`,
     };
   }
 
@@ -710,14 +746,21 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
     const prioritizeAt = now() + prioritizeAfterMs;
     let prioritized = false;
     let status = 'SUBMITTED';
+    /** The last status read was a refused sign-in: the state below is the last one Datanet gave, not its current one. */
+    let signInRefused = false;
     while (now() < deadline && !input.signal?.aborted) {
       // Never sleep past the deadline: a short wait still gets its last poll.
       await sleep(Math.max(0, Math.min(pollIntervalMs, deadline - now())), input.signal);
       if (input.signal?.aborted) break;
       const poll = await call('datanet_get_job_run_status', { run_id: runId });
-      if (poll.isError) continue; // transient poll failures never kill the run
-      status = String(parseJson(poll.text).status ?? '').toUpperCase() || status;
-      if (status === 'SUCCESS' || status === 'ERROR' || status === 'KILLED' || status === 'DELETED') {
+      const read = poll.isError ? '' : String(parseJson(poll.text).status ?? '').toUpperCase();
+      if (!read) {
+        signInRefused = isDatanetSignInRefusal(poll.text);
+        continue; // failed poll reads never kill the run
+      }
+      signInRefused = false;
+      status = read;
+      if (isDatanetTerminal(status)) {
         getQueryLedger(db)?.endEtl(runId, status);
         break;
       }
@@ -742,9 +785,8 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         nextAction: 'Submit the query again ONCE, after confirming no other run is in flight for the ad-hoc job (mcp_etl_latest_run). If the new run is deleted too, stop and report.',
       };
     }
-    const stopped = status === 'KILLED' ? stoppedOnPurpose(runId) : null;
-    if (stopped) return stopped;
-    if (status === 'ERROR' || status === 'KILLED') {
+    if (isDatanetCancelled(status)) return stoppedOnPurpose(runId) ?? cancelledRun(runId);
+    if (status === 'ERROR') {
       const diagnose = await call('datanet_get_job_run_error', { run_id: runId });
       const diagnosed = parseJson(diagnose.text);
       const detail = diagnose.isError
@@ -768,11 +810,16 @@ export function createEtlQueryRunner(options: EtlAdhocOptions): QueryRunner {
         code: 'alive_handoff',
         runId,
         remoteStatus: status,
-        error: input.signal?.aborted
-          ? `Run ${runId} is still ${status || 'running'}; this call stopped waiting.`
-          : `Run ${runId} still ${status || 'running'} after ${waited}.`,
-        nextAction: `Do NOT resubmit — the run is alive. Dashboard consumers automatically reconcile this exact run when it succeeds; interactive callers can check it with mcp_etl_job_run (runId ${runId}).`,
+        error: signInRefused
+          ? `Run ${runId} was last seen ${status || 'running'}; then ${DATANET_SIGN_IN_REFUSED}, so BotBoy cannot read its state now. The run itself is not affected.`
+          : input.signal?.aborted
+            ? `Run ${runId} is still ${status || 'running'}; this call stopped waiting.`
+            : `Run ${runId} still ${status || 'running'} after ${waited}.`,
+        nextAction: signInRefused
+          ? `Do NOT resubmit — the run goes on in Datanet. Ask the owner to ${DATANET_SIGN_IN_FIX}, then check it with mcp_etl_job_run (runId ${runId}).`
+          : `Do NOT resubmit — the run is alive. Dashboard consumers automatically reconcile this exact run when it succeeds; interactive callers can check it with mcp_etl_job_run (runId ${runId}).`,
         ...(prioritized ? { prioritized: true } : {}),
+        ...(signInRefused ? { signInRefused: true } : {}),
       };
     }
 

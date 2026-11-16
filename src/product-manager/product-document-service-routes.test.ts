@@ -800,6 +800,17 @@ describe('artifact deletion and local export', () => {
     await request(app).get('/api/product-documents/absent/export?format=markdown').expect(404);
   });
 
+  // Owner request 2026-11-16: the reader's [c1] chips are noise in a downloaded file.
+  it('a download carries no citation markers; the stored document keeps them', async () => {
+    const { store, service } = storeBackedService();
+    const content = '# Export me\n\nUsage doubled [c1][c2], and churn fell [c1].\n\n`grid[c1]` stays.';
+    store.save({ ...fakeArtifact('cited-doc', undefined, content), citations: [{ id: 'c1', label: 'Slack' }, { id: 'c2', label: 'Email' }] } as any);
+    const response = await request(buildApp(service))
+      .get('/api/product-documents/cited-doc/export?format=markdown')
+      .expect(200);
+    expect(response.text).toBe('# Export me\n\nUsage doubled, and churn fell.\n\n`grid[c1]` stays.');
+    expect(service.getArtifact('cited-doc')?.content).toBe(content);
+  });
   it('converts to HTML through the local pandoc install when available', async (ctx) => {
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');

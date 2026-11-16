@@ -11077,8 +11077,21 @@ initialize();
     updating = true;
     button.disabled = true;
     paint('updating');
+    const start = (confirmed) => request('/app-update/start', { method: 'POST', body: confirmed ? { confirmed: true } : {} });
     try {
-      const result = await request('/app-update/start', { method: 'POST', body: {} });
+      let result;
+      try {
+        result = await start(false);
+      } catch (error) {
+        // An update restarts BotBoy; while Amazon's device check has lapsed, that may cut Datanet off (restart-sign-in.ts).
+        if (error.code !== 'sign_in_lapsed') throw error;
+        if (!window.confirm(`${error.payload?.error || 'A restart now may cut Datanet off.'}\n\n${error.payload?.confirm || 'Update anyway?'}`)) {
+          updating = false;
+          void refresh();
+          return;
+        }
+        result = await start(true);
+      }
       toast(result?.message || 'Updating. BotBoy will restart on its own.');
     } catch (error) {
       updating = false;
